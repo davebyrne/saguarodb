@@ -162,6 +162,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "saguarodb-buffer"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "saguarodb-common",
+]
+
+[[package]]
 name = "saguarodb-catalog"
 version = "0.1.0"
 dependencies = [
