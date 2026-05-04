@@ -196,8 +196,9 @@ For each accepted TCP connection:
 4. Handle startup/SSL/terminate through protocol state.
 5. For query messages, run `QueryService` using the blocking thread pool.
 6. Encode and write server messages.
-7. On protocol recoverable error, send `ErrorResponse` and `ReadyForQuery`.
-8. On Terminate or unrecoverable IO error, close connection.
+7. On query execution errors, send `ErrorResponse` and `ReadyForQuery` and keep the connection open.
+8. On protocol decode errors, send `ErrorResponse` and `ReadyForQuery`, then close the connection because the codec buffer state may be unrecoverable.
+9. On Terminate or unrecoverable IO error, close connection.
 
 ## Graceful Shutdown
 

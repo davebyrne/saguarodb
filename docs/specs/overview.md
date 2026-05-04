@@ -405,8 +405,9 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
    - `DataRow` (one per result row) for SELECT
    - `CommandComplete` (e.g., `INSERT 0 1`, `SELECT 5`)
    - `ReadyForQuery`
-4. **Error handling:** If a query fails, server sends `ErrorResponse` then `ReadyForQuery`. The connection stays open.
-5. **Termination:** Client sends `Terminate`. Server closes connection.
+4. **Query error handling:** If a query fails, server sends `ErrorResponse` then `ReadyForQuery`. The connection stays open.
+5. **Protocol decode error handling:** If decoding client bytes fails, server sends `ErrorResponse` then `ReadyForQuery` and closes the connection because the codec buffer state may be unrecoverable.
+6. **Termination:** Client sends `Terminate`. Server closes connection.
 
 ### V1 Protocol Scope — What We Skip
 

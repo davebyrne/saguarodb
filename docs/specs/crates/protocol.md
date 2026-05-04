@@ -104,6 +104,8 @@ On error:
 2. Encode `ReadyForQuery`.
 3. Keep connection open unless protocol state is unrecoverable.
 
+The codec may return errors after buffering bytes. In v1 the server treats any decode error as connection-fatal: it encodes one `ErrorResponse`, encodes `ReadyForQuery`, and closes the TCP connection instead of attempting to reuse the codec state.
+
 ## Type Encoding
 
 `ColumnInfo.data_type` maps to PostgreSQL type OIDs:

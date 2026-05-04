@@ -63,6 +63,12 @@ impl TestServer {
         decode_simple_query_response(&response)
     }
 
+    pub async fn connect_raw(&self) -> Result<TcpStream> {
+        TcpStream::connect(self.addr).await.map_err(|err| {
+            common::DbError::io(format!("failed to connect to test server: {err}"))
+        })
+    }
+
     pub async fn force_checkpoint(&self) -> Result<()> {
         let app = self.app.clone();
         tokio::task::spawn_blocking(move || run_checkpoint(&app.components))

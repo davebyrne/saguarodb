@@ -4,7 +4,7 @@ use support::{TestServer, WorkspaceGraph};
 
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
@@ -56,6 +56,23 @@ async fn e2e_create_insert_select_update_delete_explain() {
         .unwrap()
         .unwrap_rows();
     assert!(explain[0][0].as_ref().unwrap().contains("IndexScan"));
+}
+
+#[tokio::test]
+async fn protocol_decode_error_sends_error_and_closes_connection() {
+    let server = TestServer::start().await.unwrap();
+    let mut stream = server.connect_raw().await.unwrap();
+
+    stream.write_all(b"!").await.unwrap();
+
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("server did not close connection after protocol error")
+        .unwrap();
+
+    assert!(read > 0);
+    assert_eq!(response[0], b'E');
 }
 
 #[test]

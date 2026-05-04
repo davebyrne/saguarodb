@@ -36,7 +36,7 @@ pub async fn handle_connection(_socket: TcpStream, _app: Arc<AppState>) -> Resul
                     &[error_response(&err), ServerMessage::ReadyForQuery],
                 )
                 .await?;
-                continue;
+                return Ok(());
             }
         };
 
