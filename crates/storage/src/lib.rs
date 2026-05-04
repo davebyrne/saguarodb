@@ -444,7 +444,13 @@ mod tests {
         let err = harness.storage.insert(&ctx, 2, row).unwrap_err();
 
         assert!(err.message.contains("row is too large for a data page"));
-        assert!(harness.buffer.iter_pages().unwrap().all(|page| page.file_id != 2));
+        assert!(
+            harness
+                .buffer
+                .iter_pages()
+                .unwrap()
+                .all(|page| page.file_id != 2)
+        );
     }
 
     #[test]

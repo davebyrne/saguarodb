@@ -74,17 +74,13 @@ impl QueryService {
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                if let Err(rollback_err) =
-                    self.rollback_pre_durable(txn_id, Some(catalog_before))
-                {
+                if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
                     self.fatal_pre_durable_rollback_failure(rollback_err);
                 }
                 return Err(err);
             }
             Err(_) => {
-                if let Err(rollback_err) =
-                    self.rollback_pre_durable(txn_id, Some(catalog_before))
-                {
+                if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
                     self.fatal_pre_durable_rollback_failure(rollback_err);
                 }
                 return Err(DbError::internal("statement execution panicked"));

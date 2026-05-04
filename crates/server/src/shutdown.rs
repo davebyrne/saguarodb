@@ -242,7 +242,10 @@ mod tests {
 
         let err = run_graceful_shutdown(app.clone()).await.unwrap_err();
 
-        assert!(err.message.contains("timed out waiting for in-flight queries"));
+        assert!(
+            err.message
+                .contains("timed out waiting for in-flight queries")
+        );
         assert_eq!(app.checkpoint_count_for_test(), 0);
         assert!(!app.wal_flushed_for_test());
     }

@@ -64,9 +64,9 @@ impl TestServer {
     }
 
     pub async fn connect_raw(&self) -> Result<TcpStream> {
-        TcpStream::connect(self.addr).await.map_err(|err| {
-            common::DbError::io(format!("failed to connect to test server: {err}"))
-        })
+        TcpStream::connect(self.addr)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to connect to test server: {err}")))
     }
 
     pub async fn force_checkpoint(&self) -> Result<()> {
