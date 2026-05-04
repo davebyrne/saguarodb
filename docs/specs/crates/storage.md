@@ -68,10 +68,15 @@ V1 page header:
 ```text
 PageID: 4 bytes
 PageType: 1 byte
+PageVersion: 1 byte
 NumSlots: 2 bytes
 FreeSpace: 2 bytes
 Checksum: 4 bytes
 ```
+
+`PageVersion` is `1` for the v1 page format; unknown versions are rejected as page corruption.
+
+V1 development builds do not migrate unversioned page headers. Existing page files without `PageVersion = 1` are rejected as corrupt during snapshot load/recovery.
 
 No `PageLSN` in v1. The snapshot/WAL model avoids incremental page recovery.
 

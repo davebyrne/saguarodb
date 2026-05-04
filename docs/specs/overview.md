@@ -1093,10 +1093,10 @@ Every operation takes a `StatementContext`. In V1 this carries only the autocomm
 ### Page Format (8KB Pages)
 
 ```
-+----------+----------+----------+-----------+----------+
-| PageID   | PageType | NumSlots | FreeSpace | Checksum |
-| 4 bytes  | 1 byte   | 2 bytes  | 2 bytes   | 4 bytes  |
-+----------+----------+----------+-----------+----------+
++----------+----------+-------------+----------+-----------+----------+
+| PageID   | PageType | PageVersion | NumSlots | FreeSpace | Checksum |
+| 4 bytes  | 1 byte   | 1 byte      | 2 bytes  | 2 bytes   | 4 bytes  |
++----------+----------+-------------+----------+-----------+----------+
 | Slot Array  (offset, length pairs — grows downward)    |
 +--------------------------------------------------------+
 | Free Space                                             |
@@ -1108,6 +1108,10 @@ Every operation takes a `StatementContext`. In V1 this carries only the autocomm
 Slotted page design. Slot array at the top points to variable-length rows packed at the bottom. Deleting marks the slot as dead. Pages can be compacted when free space is fragmented.
 
 **Checksum:** CRC32 computed over entire page content (excluding the checksum field). Verified on every read from disk. Recomputed on every flush to disk.
+
+**PageVersion:** `1` for the v1 page format. Unknown versions are rejected as page corruption.
+
+V1 development builds do not migrate unversioned page headers. Existing page files without `PageVersion = 1` are rejected as corrupt during snapshot load/recovery.
 
 **No PageLSN:** Because V1 uses a logical WAL with snapshot checkpoints, there is no per-page LSN. Dirty pages are never flushed individually — only as a complete snapshot. The `dirty_txn_id` is tracked in the buffer pool's page descriptor (in memory, not on disk) for future use by `FlushPolicy`. A future physical WAL would add a `PageLSN` field to the page header and enable incremental page flushing.
 

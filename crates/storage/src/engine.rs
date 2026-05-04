@@ -673,7 +673,7 @@ fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {
 }
 
 fn page_overhead() -> usize {
-    13 + 6
+    page::HEADER_LEN + page::SLOT_LEN
 }
 
 fn undefined_table(table: TableId) -> DbError {

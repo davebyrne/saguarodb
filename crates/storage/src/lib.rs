@@ -369,7 +369,7 @@ mod tests {
         let large_row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8160)),
+                Value::Text("x".repeat(8159)),
                 Value::Null,
             ],
         };
@@ -428,10 +428,30 @@ mod tests {
     }
 
     #[test]
+    fn insert_rejects_row_too_large_before_allocating_page() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        let schema = big_text_schema();
+        harness.storage.create_table(&ctx, &schema).unwrap();
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("x".repeat(8160)),
+                Value::Null,
+            ],
+        };
+
+        let err = harness.storage.insert(&ctx, 2, row).unwrap_err();
+
+        assert!(err.message.contains("row is too large for a data page"));
+        assert!(harness.buffer.iter_pages().unwrap().all(|page| page.file_id != 2));
+    }
+
+    #[test]
     fn page_reports_no_space_when_only_existing_slot_boundary_remains() {
         let mut page = PageData::default();
         crate::page::init_page(&mut page.0, 0);
-        crate::page::insert_row(&mut page.0, &vec![0; 8173]).unwrap();
+        crate::page::insert_row(&mut page.0, &vec![0; 8172]).unwrap();
 
         assert!(!crate::page::has_space_for(&page.0, 1).unwrap());
     }
@@ -445,7 +465,7 @@ mod tests {
         let large_row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8160)),
+                Value::Text("x".repeat(8159)),
                 Value::Null,
             ],
         };

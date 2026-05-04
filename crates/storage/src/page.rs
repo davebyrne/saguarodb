@@ -2,14 +2,16 @@ use buffer::PAGE_SIZE;
 use common::{DbError, PageNum, Result, SqlState};
 
 pub const PAGE_TYPE_DATA: u8 = 1;
+const PAGE_VERSION: u8 = 1;
 
-const HEADER_LEN: usize = 13;
+pub(crate) const HEADER_LEN: usize = 14;
 const PAGE_ID_OFFSET: usize = 0;
 const PAGE_TYPE_OFFSET: usize = 4;
-const NUM_SLOTS_OFFSET: usize = 5;
-const FREE_SPACE_OFFSET: usize = 7;
-const CHECKSUM_OFFSET: usize = 9;
-const SLOT_LEN: usize = 6;
+const PAGE_VERSION_OFFSET: usize = 5;
+const NUM_SLOTS_OFFSET: usize = 6;
+const FREE_SPACE_OFFSET: usize = 8;
+const CHECKSUM_OFFSET: usize = 10;
+pub(crate) const SLOT_LEN: usize = 6;
 const SLOT_DEAD: u16 = 1;
 const SLOT_LIVE: u16 = 2;
 
@@ -37,6 +39,7 @@ pub fn init_page(data: &mut [u8; PAGE_SIZE], page_id: PageNum) {
     data.fill(0);
     write_u32(data, PAGE_ID_OFFSET, page_id);
     data[PAGE_TYPE_OFFSET] = PAGE_TYPE_DATA;
+    data[PAGE_VERSION_OFFSET] = PAGE_VERSION;
     write_u16(data, NUM_SLOTS_OFFSET, 0);
     write_u16(data, FREE_SPACE_OFFSET, HEADER_LEN as u16);
     write_checksum(data);
@@ -45,6 +48,12 @@ pub fn init_page(data: &mut [u8; PAGE_SIZE], page_id: PageNum) {
 pub fn validate(data: &[u8; PAGE_SIZE]) -> Result<PageHeader> {
     if data[PAGE_TYPE_OFFSET] != PAGE_TYPE_DATA {
         return Err(corrupt_page("unexpected page type"));
+    }
+    if data[PAGE_VERSION_OFFSET] != PAGE_VERSION {
+        return Err(corrupt_page(format!(
+            "unsupported page version {}",
+            data[PAGE_VERSION_OFFSET]
+        )));
     }
     let stored_checksum = read_u32(data, CHECKSUM_OFFSET);
     if stored_checksum != checksum(data) {
@@ -238,4 +247,42 @@ fn write_u32(data: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
 
 fn corrupt_page(message: impl Into<String>) -> common::DbError {
     DbError::storage(SqlState::InternalError, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, init_page, validate,
+        write_checksum,
+    };
+    use buffer::PageData;
+
+    #[test]
+    fn init_page_sets_page_format_version() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 7);
+
+        assert_eq!(data.0[PAGE_VERSION_OFFSET], PAGE_VERSION);
+    }
+
+    #[test]
+    fn validate_rejects_wrong_page_format_version() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 7);
+        data.0[PAGE_VERSION_OFFSET] = PAGE_VERSION + 1;
+        write_checksum(&mut data.0);
+
+        let err = validate(&data.0).unwrap_err();
+        assert!(err.message.contains("unsupported page version"));
+    }
+
+    #[test]
+    fn validate_rejects_unversioned_legacy_page_header() {
+        let mut data = PageData::default();
+        data.0[PAGE_TYPE_OFFSET] = PAGE_TYPE_DATA;
+        data.0[PAGE_VERSION_OFFSET] = 0;
+
+        let err = validate(&data.0).unwrap_err();
+        assert!(err.message.contains("unsupported page version"));
+    }
 }
