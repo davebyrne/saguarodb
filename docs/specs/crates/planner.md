@@ -299,8 +299,8 @@ pub enum PhysicalPlan {
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan> },
     Delete { table: TableId, source: Box<PhysicalPlan> },
-    SeqScan { table: TableId, filter: Option<BoundExpr> },
-    IndexScan { table: TableId, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
+    SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
+    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -327,6 +327,7 @@ pub enum PhysicalPlan {
 - Primary-key range predicate becomes `IndexScan { index: PRIMARY_KEY_INDEX_ID, range: KeyRange::Range, filter }`.
 - `filter` stores residual predicates not consumed by the primary-key range. For `WHERE id = 7 AND name = 'Ada'`, the range is exact primary key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
 - Otherwise scans are `SeqScan`.
+- `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 - Joins are left-to-right nested loop joins. V1 supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
 - Sort and aggregate are blocking operators.
 - Projection pushdown may be disabled in initial v1 implementation. If enabled, expressions must be slot-rebased against child output schemas.

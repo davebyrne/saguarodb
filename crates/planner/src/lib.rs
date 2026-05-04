@@ -270,6 +270,18 @@ mod tests {
     }
 
     #[test]
+    fn format_explain_does_not_depend_on_previous_planning_cache() {
+        let physical = PhysicalPlan::SeqScan {
+            table: 7,
+            table_name: "users".to_string(),
+            filter: None,
+        };
+
+        let text = format_explain(&physical);
+        assert!(text.contains("users(7)"));
+    }
+
+    #[test]
     fn physical_planner_uses_index_scan_for_text_primary_key_equality() {
         let catalog = catalog_with_text_key_table();
         let stmt = parse("select label from codes where code = 'abc'").unwrap();

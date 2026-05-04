@@ -1,7 +1,6 @@
 use std::ops::Bound;
 
 use crate::PhysicalPlan;
-use crate::physical::table_name_for_explain;
 use common::{Key, KeyRange};
 
 pub fn format_explain(plan: &PhysicalPlan) -> String {
@@ -20,33 +19,38 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!("{padding}DropTable table={table}\n"));
         }
         PhysicalPlan::Insert { table, source, .. } => {
-            output.push_str(&format!("{padding}Insert table={}\n", table_label(*table)));
+            output.push_str(&format!("{padding}Insert table={table}\n"));
             format_node(source, indent + 1, output);
         }
         PhysicalPlan::Update { table, source, .. } => {
-            output.push_str(&format!("{padding}Update table={}\n", table_label(*table)));
+            output.push_str(&format!("{padding}Update table={table}\n"));
             format_node(source, indent + 1, output);
         }
         PhysicalPlan::Delete { table, source } => {
-            output.push_str(&format!("{padding}Delete table={}\n", table_label(*table)));
+            output.push_str(&format!("{padding}Delete table={table}\n"));
             format_node(source, indent + 1, output);
         }
-        PhysicalPlan::SeqScan { table, filter } => {
+        PhysicalPlan::SeqScan {
+            table,
+            table_name,
+            filter,
+        } => {
             output.push_str(&format!(
                 "{padding}SeqScan table={} filter={}\n",
-                table_label(*table),
+                table_label(*table, table_name),
                 if filter.is_some() { "yes" } else { "none" }
             ));
         }
         PhysicalPlan::IndexScan {
             table,
+            table_name,
             index,
             range,
             filter,
         } => {
             output.push_str(&format!(
                 "{padding}IndexScan table={} index={} range={} filter={}\n",
-                table_label(*table),
+                table_label(*table, table_name),
                 index,
                 fmt_key_range(range),
                 if filter.is_some() { "yes" } else { "none" }
@@ -116,10 +120,8 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
     }
 }
 
-fn table_label(table: u32) -> String {
-    table_name_for_explain(table)
-        .map(|name| format!("{name}({table})"))
-        .unwrap_or_else(|| table.to_string())
+fn table_label(table: u32, table_name: &str) -> String {
+    format!("{table_name}({table})")
 }
 
 fn fmt_key_range(range: &KeyRange) -> String {

@@ -859,8 +859,8 @@ pub enum PhysicalPlan {
     Delete { table: TableId, source: Box<PhysicalPlan> },
 
     // Access methods
-    SeqScan { table: TableId, filter: Option<BoundExpr> },
-    IndexScan { table: TableId, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
+    SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
+    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
 
     // Join algorithms
     NestedLoopJoin {
@@ -891,7 +891,7 @@ pub enum PhysicalPlan {
 
 The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column access is by slot index (`row.values[slot]`) — O(1), no lookups. The `BindingId` and `ColumnId` fields in `InputRef` exist only for EXPLAIN output and debugging.
 
-V1 has one index identifier: `PRIMARY_KEY_INDEX_ID = 0`. The physical planner uses that value for every primary-key `IndexScan`. `IndexScan.filter` holds residual predicates not consumed by the primary-key range. For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`.
+V1 has one index identifier: `PRIMARY_KEY_INDEX_ID = 0`. The physical planner uses that value for every primary-key `IndexScan`. `IndexScan.filter` holds residual predicates not consumed by the primary-key range. For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 
 The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a future cost-based optimizer replaces only `physical_plan`, choosing among multiple physical alternatives per logical operator. The binder and logical planner are unchanged.
 

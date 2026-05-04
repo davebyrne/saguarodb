@@ -1,6 +1,4 @@
-use std::collections::HashMap;
 use std::ops::Bound;
-use std::sync::{Mutex, OnceLock};
 
 use common::{
     ColumnId, ColumnInfo, IndexId, Key, KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result,
@@ -35,10 +33,12 @@ pub enum PhysicalPlan {
     },
     SeqScan {
         table: TableId,
+        table_name: String,
         filter: Option<BoundExpr>,
     },
     IndexScan {
         table: TableId,
+        table_name: String,
         index: IndexId,
         range: KeyRange,
         filter: Option<BoundExpr>,
@@ -175,10 +175,6 @@ pub fn physical_plan(
     }
 }
 
-pub(crate) fn table_name_for_explain(table: TableId) -> Option<String> {
-    table_names().lock().ok()?.get(&table).cloned()
-}
-
 fn plan_scan(
     table: TableId,
     filter: Option<BoundExpr>,
@@ -190,10 +186,14 @@ fn plan_scan(
             format!("table id {table} does not exist"),
         )
     })?;
-    remember_table_name(schema.id, schema.name);
+    let table_name = schema.name.clone();
 
     let Some(primary_key) = schema.primary_key.first().copied() else {
-        return Ok(PhysicalPlan::SeqScan { table, filter });
+        return Ok(PhysicalPlan::SeqScan {
+            table,
+            table_name,
+            filter,
+        });
     };
 
     if let Some(filter_expr) = filter {
@@ -201,6 +201,7 @@ fn plan_scan(
             let residual = residual_filter(filter_expr, &candidate.consumed);
             return Ok(PhysicalPlan::IndexScan {
                 table,
+                table_name: table_name.clone(),
                 index: PRIMARY_KEY_INDEX_ID,
                 range: candidate.range,
                 filter: residual,
@@ -208,11 +209,13 @@ fn plan_scan(
         }
         Ok(PhysicalPlan::SeqScan {
             table,
+            table_name,
             filter: Some(filter_expr),
         })
     } else {
         Ok(PhysicalPlan::SeqScan {
             table,
+            table_name,
             filter: None,
         })
     }
@@ -353,15 +356,4 @@ fn reverse_comparison(op: BinOp) -> Option<BinOp> {
         BinOp::GtEq => Some(BinOp::LtEq),
         _ => None,
     }
-}
-
-fn remember_table_name(table: TableId, name: String) {
-    if let Ok(mut names) = table_names().lock() {
-        names.insert(table, name);
-    }
-}
-
-fn table_names() -> &'static Mutex<HashMap<TableId, String>> {
-    static TABLE_NAMES: OnceLock<Mutex<HashMap<TableId, String>>> = OnceLock::new();
-    TABLE_NAMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
