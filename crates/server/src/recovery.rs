@@ -147,13 +147,16 @@ fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
             max_txn_id = max_txn_id.max(txn_id);
         }
     }
-    Ok(max_txn_id + 1)
+    max_txn_id
+        .checked_add(1)
+        .ok_or_else(|| DbError::wal(common::SqlState::InternalError, "transaction id overflow"))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
+    use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     #[tokio::test]
     async fn recovery_replays_committed_records_after_snapshot_lsn() {
@@ -179,5 +182,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn next_txn_id_rejects_retained_u64_max_txn_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: u64::MAX,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+
+        let err = super::next_txn_id(&wal, 0).unwrap_err();
+        assert!(err.message.contains("transaction id overflow"));
     }
 }

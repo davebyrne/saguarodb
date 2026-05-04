@@ -79,7 +79,7 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 
 Recovery mode must not append WAL records.
 
-Recovery computes `next_txn_id` from all retained WAL records with stored `LSN > checkpoint_lsn` by calling `WalManager::replay_from(checkpoint_lsn)`, not from `replay_committed_from`. Include committed operations, uncommitted operations, and `Commit` records; ignore only records with `txn_id = 0`. `ServerComponents.next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. This prevents a new statement from reusing an old uncommitted `txn_id` and accidentally making pre-crash records look committed.
+Recovery computes `next_txn_id` from all retained WAL records with stored `LSN > checkpoint_lsn` by calling `WalManager::replay_from(checkpoint_lsn)`, not from `replay_committed_from`. Include committed operations, uncommitted operations, and `Commit` records; ignore only records with `txn_id = 0`. `ServerComponents.next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. This prevents a new statement from reusing an old uncommitted `txn_id` and accidentally making pre-crash records look committed.
 
 ## Query Service Wiring
 
