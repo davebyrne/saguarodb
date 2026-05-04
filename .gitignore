@@ -1,4 +1,7 @@
 docs/superpowers
 target
 data
+.agents
+.claude
+.codex
 
