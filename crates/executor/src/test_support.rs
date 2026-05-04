@@ -1,0 +1,429 @@
+use catalog::{CatalogManager, MemoryCatalog};
+use common::{
+    ColumnInfo, DataType, DbError, Key, KeyRange, ParsedColumnDef, Result, Row, RowId, SqlState,
+    StatementContext, StoredRow, TableId, TableSchema, Value,
+};
+use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
+use std::collections::BTreeMap;
+use std::ops::Bound;
+use std::sync::Mutex;
+use storage::{RowIterator, SchemaOperations, StorageEngine};
+
+use crate::{ExecutionContext, ExecutionResult, QueryEngine};
+
+pub struct ExecutorHarness {
+    catalog: MemoryCatalog,
+    storage: MemoryStorage,
+    engine: QueryEngine,
+}
+
+impl ExecutorHarness {
+    pub fn with_users() -> Self {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                    },
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let storage = MemoryStorage::empty();
+        storage
+            .create_table(&StatementContext { txn_id: 0 }, &schema)
+            .unwrap();
+        Self {
+            catalog,
+            storage,
+            engine: QueryEngine,
+        }
+    }
+
+    pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
+        let statement = parser::parse(sql)?;
+        let bound = bind(&statement, &self.catalog)?;
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, &self.catalog)?;
+        let is_read = is_read_plan(&physical);
+        let statement = StatementContext {
+            txn_id: if is_read { 0 } else { 1 },
+        };
+        let ctx = ExecutionContext {
+            statement,
+            catalog: &self.catalog,
+            storage: &self.storage,
+            schema_ops: &self.storage,
+        };
+        let result = self.engine.execute(&ctx, &physical);
+        if is_read {
+            return result;
+        }
+
+        match result {
+            Ok(result) => {
+                self.storage.commit_txn(statement.txn_id)?;
+                Ok(result)
+            }
+            Err(err) => {
+                let _ = self.storage.rollback_txn(statement.txn_id);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn select_rows(&self, sql: &str) -> Result<Vec<Row>> {
+        match self.execute(sql)? {
+            ExecutionResult::Query { rows, .. } => Ok(rows),
+            _ => Err(common::DbError::internal("expected query result")),
+        }
+    }
+}
+
+fn is_read_plan(plan: &PhysicalPlan) -> bool {
+    !matches!(
+        plan,
+        PhysicalPlan::CreateTable { .. }
+            | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::Insert { .. }
+            | PhysicalPlan::Update { .. }
+            | PhysicalPlan::Delete { .. }
+    )
+}
+
+#[derive(Default)]
+pub struct MemoryStorage {
+    state: Mutex<MemoryStorageState>,
+}
+
+#[derive(Default)]
+struct MemoryStorageState {
+    schemas: BTreeMap<TableId, TableSchema>,
+    rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
+    savepoints: BTreeMap<u64, MemoryStorageSnapshot>,
+}
+
+#[derive(Clone)]
+struct MemoryStorageSnapshot {
+    schemas: BTreeMap<TableId, TableSchema>,
+    rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
+}
+
+impl MemoryStorage {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+impl StorageEngine for MemoryStorage {
+    fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let key = key_for_row(&schema, &row)?;
+        let rows = state.rows.entry(table).or_default();
+        if rows.contains_key(&key) {
+            return Err(DbError::storage(
+                SqlState::UniqueViolation,
+                "duplicate primary key",
+            ));
+        }
+        let row_id = row_id_for_len(rows.len())?;
+        rows.insert(key, row);
+        Ok(row_id)
+    }
+
+    fn get(&self, _ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        Ok(state
+            .rows
+            .get(&table)
+            .and_then(|rows| rows.get(key))
+            .cloned())
+    }
+
+    fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        Ok(state
+            .rows
+            .get_mut(&table)
+            .map(|rows| rows.remove(key).is_some())
+            .unwrap_or(false))
+    }
+
+    fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let replacement_key = key_for_row(&schema, &row)?;
+        if &replacement_key != key {
+            return Err(DbError::execute(
+                SqlState::DatatypeMismatch,
+                "primary key updates are not supported",
+            ));
+        }
+        let Some(rows) = state.rows.get_mut(&table) else {
+            return Ok(false);
+        };
+        if !rows.contains_key(key) {
+            return Ok(false);
+        }
+        rows.insert(key.clone(), row);
+        Ok(true)
+    }
+
+    fn scan(&self, _ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let rows = state.rows.get(&table).map(stored_rows).unwrap_or_default();
+        Ok(Box::new(MemoryRowIterator {
+            schema: column_info(&schema),
+            rows,
+            index: 0,
+        }))
+    }
+
+    fn scan_range(
+        &self,
+        _ctx: &StatementContext,
+        table: TableId,
+        range: &KeyRange,
+    ) -> Result<Box<dyn RowIterator>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let rows = state
+            .rows
+            .get(&table)
+            .map(|rows| {
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, (key, _))| key_in_range(key, range))
+                    .map(|(index, (key, row))| stored_row(index, key, row))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Box::new(MemoryRowIterator {
+            schema: column_info(&schema),
+            rows,
+            index: 0,
+        }))
+    }
+
+    fn rollback_txn(&self, txn_id: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        if let Some(snapshot) = state.savepoints.remove(&txn_id) {
+            state.schemas = snapshot.schemas;
+            state.rows = snapshot.rows;
+        }
+        Ok(())
+    }
+
+    fn commit_txn(&self, txn_id: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        state.savepoints.remove(&txn_id);
+        Ok(())
+    }
+}
+
+impl SchemaOperations for MemoryStorage {
+    fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        state.schemas.insert(schema.id, schema.clone());
+        state.rows.entry(schema.id).or_default();
+        Ok(())
+    }
+
+    fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        state.schemas.remove(&table);
+        state.rows.remove(&table);
+        Ok(())
+    }
+}
+
+fn begin_txn(state: &mut MemoryStorageState, txn_id: u64) {
+    if txn_id == 0 || state.savepoints.contains_key(&txn_id) {
+        return;
+    }
+    state.savepoints.insert(
+        txn_id,
+        MemoryStorageSnapshot {
+            schemas: state.schemas.clone(),
+            rows: state.rows.clone(),
+        },
+    );
+}
+
+struct MemoryRowIterator {
+    schema: Vec<ColumnInfo>,
+    rows: Vec<StoredRow>,
+    index: usize,
+}
+
+impl RowIterator for MemoryRowIterator {
+    fn next(&mut self) -> Result<Option<StoredRow>> {
+        let Some(row) = self.rows.get(self.index).cloned() else {
+            return Ok(None);
+        };
+        self.index += 1;
+        Ok(Some(row))
+    }
+
+    fn schema(&self) -> &[ColumnInfo] {
+        &self.schema
+    }
+}
+
+fn key_for_row(schema: &TableSchema, row: &Row) -> Result<Key> {
+    let primary_key = schema
+        .primary_key
+        .first()
+        .ok_or_else(|| DbError::internal("table has no primary key"))?;
+    let slot = schema
+        .columns
+        .iter()
+        .position(|column| column.id == *primary_key)
+        .ok_or_else(|| DbError::internal("primary key column is missing"))?;
+    let value = row
+        .values
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| DbError::internal("row is missing primary key slot"))?;
+    if matches!(value, Value::Null) {
+        return Err(DbError::execute(
+            SqlState::NotNullViolation,
+            "primary key cannot be NULL",
+        ));
+    }
+    Ok(Key(vec![value]))
+}
+
+fn stored_rows(rows: &BTreeMap<Key, Row>) -> Vec<StoredRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, (key, row))| stored_row(index, key, row))
+        .collect()
+}
+
+fn stored_row(index: usize, key: &Key, row: &Row) -> StoredRow {
+    StoredRow {
+        row_id: row_id_for_len(index).unwrap_or(RowId {
+            page_num: u32::MAX,
+            slot_num: u16::MAX,
+        }),
+        key: key.clone(),
+        row: row.clone(),
+    }
+}
+
+fn row_id_for_len(len: usize) -> Result<RowId> {
+    let slot_num = u16::try_from(len).map_err(|_| DbError::internal("too many test rows"))?;
+    Ok(RowId {
+        page_num: 0,
+        slot_num,
+    })
+}
+
+fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {
+    schema
+        .columns
+        .iter()
+        .map(|column| ColumnInfo {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            table_id: Some(schema.id),
+            column_id: Some(column.id),
+        })
+        .collect()
+}
+
+fn key_in_range(key: &Key, range: &KeyRange) -> bool {
+    match range {
+        KeyRange::All => true,
+        KeyRange::Exact(exact) => key == exact,
+        KeyRange::Range { start, end } => {
+            bound_contains_start(start, key) && bound_contains_end(end, key)
+        }
+    }
+}
+
+fn bound_contains_start(bound: &Bound<Key>, key: &Key) -> bool {
+    match bound {
+        Bound::Included(start) => key >= start,
+        Bound::Excluded(start) => key > start,
+        Bound::Unbounded => true,
+    }
+}
+
+fn bound_contains_end(bound: &Bound<Key>, key: &Key) -> bool {
+    match bound {
+        Bound::Included(end) => key <= end,
+        Bound::Excluded(end) => key < end,
+        Bound::Unbounded => true,
+    }
+}
+
+fn undefined_table(table: TableId) -> DbError {
+    DbError::storage(
+        SqlState::UndefinedTable,
+        format!("table id {table} does not exist"),
+    )
+}
