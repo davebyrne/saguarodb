@@ -74,17 +74,27 @@ impl QueryService {
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                self.rollback_pre_durable(txn_id, Some(catalog_before));
+                if let Err(rollback_err) =
+                    self.rollback_pre_durable(txn_id, Some(catalog_before))
+                {
+                    self.fatal_pre_durable_rollback_failure(rollback_err);
+                }
                 return Err(err);
             }
             Err(_) => {
-                self.rollback_pre_durable(txn_id, Some(catalog_before));
+                if let Err(rollback_err) =
+                    self.rollback_pre_durable(txn_id, Some(catalog_before))
+                {
+                    self.fatal_pre_durable_rollback_failure(rollback_err);
+                }
                 return Err(DbError::internal("statement execution panicked"));
             }
         };
 
         if let Err(err) = self.append_and_flush_commit(txn_id) {
-            self.rollback_pre_durable(txn_id, Some(catalog_before));
+            if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
+                self.fatal_pre_durable_rollback_failure(rollback_err);
+            }
             return Err(err);
         }
 
@@ -119,18 +129,27 @@ impl QueryService {
         Ok(())
     }
 
-    fn rollback_pre_durable(&self, txn_id: u64, catalog_before: Option<catalog::CatalogSnapshot>) {
+    fn rollback_pre_durable(
+        &self,
+        txn_id: u64,
+        catalog_before: Option<catalog::CatalogSnapshot>,
+    ) -> Result<()> {
         if let Err(err) = self.components.storage.rollback_txn(txn_id) {
-            eprintln!("storage rollback failed for txn {txn_id}: {err}");
+            return Err(DbError::internal(format!(
+                "storage rollback failed for txn {txn_id}: {err}",
+            )));
         }
         if let Err(err) = self.components.buffer_pool.rollback(txn_id) {
-            eprintln!("buffer rollback failed for txn {txn_id}: {err}");
+            return Err(DbError::internal(format!(
+                "buffer rollback failed for txn {txn_id}: {err}",
+            )));
         }
-        if let Some(snapshot) = catalog_before
-            && let Err(err) = self.components.catalog.restore(snapshot)
-        {
-            eprintln!("catalog restore failed for txn {txn_id}: {err}");
+        if let Some(snapshot) = catalog_before {
+            self.components.catalog.restore(snapshot).map_err(|err| {
+                DbError::internal(format!("catalog restore failed for txn {txn_id}: {err}"))
+            })?;
         }
+        Ok(())
     }
 
     fn cleanup_after_durable_commit(&self, txn_id: u64) -> Result<()> {
@@ -141,6 +160,12 @@ impl QueryService {
 
     fn fatal_after_durable_commit(&self, err: DbError) -> ! {
         eprintln!("fatal cleanup failure after durable commit: {err}");
+        let _ = self.components.wal.flush();
+        std::process::exit(1);
+    }
+
+    fn fatal_pre_durable_rollback_failure(&self, err: DbError) -> ! {
+        eprintln!("fatal rollback failure before durable commit: {err}");
         let _ = self.components.wal.flush();
         std::process::exit(1);
     }
@@ -171,6 +196,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use catalog::CatalogSnapshot;
     use common::{SqlState, Value};
 
     use crate::app::AppState;
@@ -263,6 +291,24 @@ mod tests {
             panic!("expected query result");
         };
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_pre_durable_reports_catalog_restore_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let service = super::QueryService::new(app.components.clone());
+        let invalid_snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("ghost".to_string(), 7)]),
+            tables_by_id: HashMap::new(),
+            next_table_id: 1,
+        };
+
+        let err = service
+            .rollback_pre_durable(99, Some(invalid_snapshot))
+            .unwrap_err();
+
+        assert!(err.message.contains("catalog restore failed"));
     }
 
     #[tokio::test]

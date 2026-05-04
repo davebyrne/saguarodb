@@ -109,7 +109,7 @@ Write statement protocol:
 1. Acquire write guard.
 2. Allocate `txn_id`.
 3. Execute storage/catalog operations.
-4. If execution fails, call `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` and return error.
+4. If execution fails, call `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog `restore` when needed, then return error.
 5. Append WAL `Commit`.
 6. Flush WAL.
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure.
@@ -119,6 +119,8 @@ Write statement protocol:
 11. Return success.
 
 For DDL, catalog and storage mutations are part of the same statement-level commit. `CreateTable` and `DropTable` WAL replay must update both catalog and storage. Normal DDL execution must restore the previous catalog state if storage mutation, WAL append, or WAL flush fails before the commit record is durable.
+
+If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails before the commit record is durable, the server treats that as fatal. It logs the rollback failure, attempts to flush WAL, and exits instead of returning to service with possibly visible partial statement state.
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback and must not restore the catalog. Treat it as a fatal internal error: log it, flush WAL, and terminate the process because recovery will replay the durable commit.
 

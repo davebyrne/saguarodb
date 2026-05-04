@@ -96,6 +96,8 @@ For failed write statements:
 2. Server query orchestration calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`.
 3. Uncommitted WAL records remain but are ignored by recovery.
 
+If rollback cleanup fails before the commit record is durable, the server treats the process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits. Uncommitted WAL records remain ignored by recovery because no durable `Commit` record exists.
+
 ## Checkpoint Interaction
 
 The snapshot manager manifest contains the authoritative `checkpoint_lsn`. WAL `Checkpoint` records are metadata only.

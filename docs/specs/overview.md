@@ -1471,7 +1471,7 @@ All writes are serialized through the `ConcurrencyController`. The protocol for 
 1. Acquire exclusive write guard via `controller.begin_write()`
 2. Assign a statement-level `txn_id`
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete). Buffer pool saves before-images on first page touch.
-4. If execution fails: `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`, return error to client, drop write guard. Done.
+4. If execution fails: `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog restore when needed; return error to client and drop write guard if rollback cleanup succeeds. If rollback cleanup fails before the commit record is durable, log the rollback failure, attempt to flush WAL, and exit because the process may contain visible partial statement state.
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
@@ -1504,8 +1504,11 @@ The buffer pool saves a before-image (copy of the page data) on the first write 
 2. ... (statement fails mid-execution) ...
 3. `storage.rollback_txn(txn_id)` — restores primary-key directories and table metadata
 4. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
-5. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery
-6. Error returned to client
+5. Catalog restore returns DDL metadata to the pre-statement snapshot when catalog state changed
+6. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery
+7. Error returned to client
+
+If any rollback cleanup step fails before the commit record is durable, the server treats process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits instead of returning to service.
 
 **Why before-images, not snapshot reload:** A page may have been dirtied by a prior *committed* transaction that has not yet been snapshotted. Reloading from the snapshot file would lose that committed change. Before-images capture the page state *at the moment this txn_id first touched it*, which correctly preserves prior committed modifications.
 
