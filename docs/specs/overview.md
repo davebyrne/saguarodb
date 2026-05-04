@@ -1444,7 +1444,7 @@ pub trait WalManager: Send + Sync {
 
 `replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the manifest `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already included in the snapshot. `replay_committed_from` returns committed logical operation records only (`Insert`, `Update`, `Delete`, `CreateTable`, `DropTable`); it never yields `Commit` or `Checkpoint` metadata records.
 
-`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
+`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
 
 `bytes_after(lsn)` is server checkpoint accounting only. It counts encoded bytes for retained WAL records with stored `LSN > lsn`; if `lsn` predates the retained WAL after truncation, it returns the encoded byte size of all retained records.
 
@@ -1522,7 +1522,7 @@ The checkpoint writes a complete, consistent snapshot to **new files** via the `
 6. `let metadata = snapshot_manager.commit_snapshot(writer, checkpoint_lsn)` — this fsyncs all files, writes the manifest atomically, fsyncs the directory, and returns the durable manifest metadata
 7. `buffer_pool.mark_all_clean()` — all pages are now reflected in the snapshot
 8. Append `WalRecord { txn_id: 0, kind: Checkpoint { generation: metadata.generation, checkpoint_lsn } }` record to WAL (metadata is not required for recovery, but v1 writes it for observability and WAL tests)
-9. Flush WAL, then truncate WAL before `checkpoint_lsn`
+9. Flush WAL, then truncate WAL before `checkpoint_lsn`; WAL truncation fsyncs the replacement rename in the parent directory before reopening the WAL or replacing retained-record in-memory state
 10. `snapshot_manager.cleanup_old_snapshots()`
 11. Drop write guard
 

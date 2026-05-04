@@ -29,6 +29,8 @@ struct WalState {
     fail_next_flush: Option<String>,
     #[cfg(test)]
     fail_next_post_write_seek: Option<String>,
+    #[cfg(test)]
+    fail_next_parent_sync: Option<String>,
 }
 
 #[derive(Clone)]
@@ -115,6 +117,8 @@ impl FileWalManager {
                 fail_next_flush: None,
                 #[cfg(test)]
                 fail_next_post_write_seek: None,
+                #[cfg(test)]
+                fail_next_parent_sync: None,
             }),
         })
     }
@@ -312,6 +316,11 @@ impl WalManager for FileWalManager {
             ))
         })?;
 
+        if let Err(err) = sync_parent_dir_after_wal_replace(&self.path, &mut state) {
+            state.poisoned = Some(err.message.clone());
+            return Err(err);
+        }
+
         let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
             Ok(file) => file,
             Err(err) => {
@@ -343,10 +352,6 @@ impl WalManager for FileWalManager {
             .sum();
         state.committed_txns = committed_transactions(&state.records, state.flushed_lsn);
         state.pending_commits = pending_commits(&state.records, state.flushed_lsn);
-        if let Err(err) = sync_parent_dir(&self.path) {
-            state.poisoned = Some(err.message.clone());
-            return Err(err);
-        }
 
         Ok(())
     }
@@ -401,6 +406,15 @@ impl FileWalManager {
     pub(crate) fn fail_next_post_write_seek_for_test(&self, message: impl Into<String>) {
         self.state.lock().unwrap().fail_next_post_write_seek = Some(message.into());
     }
+
+    pub(crate) fn fail_next_parent_sync_for_test(&self, message: impl Into<String>) {
+        self.state.lock().unwrap().fail_next_parent_sync = Some(message.into());
+    }
+
+    pub(crate) fn flushed_lsn_result_for_test(&self) -> Result<Lsn> {
+        let state = self.lock_state()?;
+        Ok(state.flushed_lsn)
+    }
 }
 
 fn committed_transactions(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
@@ -446,6 +460,15 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
             })?;
     }
     Ok(())
+}
+
+fn sync_parent_dir_after_wal_replace(path: &Path, _state: &mut WalState) -> Result<()> {
+    #[cfg(test)]
+    if let Some(message) = _state.fail_next_parent_sync.take() {
+        return Err(DbError::io(message));
+    }
+
+    sync_parent_dir(path)
 }
 
 fn rollback_append(file: &mut File, offset: u64, path: &Path) -> Result<()> {
@@ -499,4 +522,32 @@ fn rollback_unflushed(state: &mut WalState, path: &Path) -> Result<()> {
     state.last_offset = state.flushed_offset;
     state.pending_commits.clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{WalManager, WalRecord, WalRecordKind};
+
+    use super::FileWalManager;
+
+    #[test]
+    fn truncate_before_parent_sync_failure_poisons_wal_before_state_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 1,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        wal.fail_next_parent_sync_for_test("parent sync failed");
+
+        let err = wal.truncate_before(1).unwrap_err();
+        assert!(err.message.contains("parent sync failed"));
+
+        let err = wal.flushed_lsn_result_for_test().unwrap_err();
+        assert!(err.message.contains("parent sync failed"));
+    }
 }
