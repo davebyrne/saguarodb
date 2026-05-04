@@ -208,9 +208,8 @@ On SIGINT/SIGTERM:
 
 1. Stop accepting new connections.
 2. Wait for in-flight queries up to `Config.shutdown_timeout_ms`.
-3. Run checkpoint.
-4. Flush WAL.
-5. Close files and exit.
+3. If all in-flight queries finish before the timeout, run checkpoint, flush WAL, close files, and exit successfully.
+4. If the timeout expires, skip checkpoint and skip the final WAL flush, return an internal timeout error, and let process shutdown proceed without running finalization concurrently with in-flight query execution. Successful write statements still flush their own commit records before returning.
 
 If checkpoint fails during shutdown, log the error and exit. WAL durability still preserves committed changes.
 

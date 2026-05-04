@@ -131,15 +131,17 @@ pub async fn run_graceful_shutdown(_app: Arc<AppState>) -> Result<()> {
     app.components.shutdown.stop_accepting();
     let timeout = Duration::from_millis(app.components.config.shutdown_timeout_ms);
     let idle_result = app.components.shutdown.wait_for_idle(timeout).await;
-    if idle_result.is_ok() {
-        if let Err(err) = run_checkpoint(&app.components) {
-            eprintln!("checkpoint failed during shutdown: {err}");
-        }
-    } else {
-        eprintln!("shutdown timed out waiting for in-flight queries; skipping checkpoint");
+    if let Err(err) = idle_result {
+        eprintln!(
+            "shutdown timed out waiting for in-flight queries; skipping checkpoint and final WAL flush"
+        );
+        return Err(err);
+    }
+
+    if let Err(err) = run_checkpoint(&app.components) {
+        eprintln!("checkpoint failed during shutdown: {err}");
     }
     app.components.wal.flush()?;
-    idle_result?;
     Ok(())
 }
 
@@ -151,6 +153,7 @@ mod tests {
     use crate::app::AppState;
     use crate::config::Config;
     use crate::shutdown::{ShutdownState, run_graceful_shutdown};
+    use wal::{WalRecord, WalRecordKind};
 
     #[tokio::test]
     async fn graceful_shutdown_waits_for_in_flight_query_before_checkpoint() {
@@ -219,7 +222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graceful_shutdown_flushes_without_checkpoint_after_idle_timeout() {
+    async fn graceful_shutdown_timeout_skips_checkpoint_and_final_wal_flush() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             data_dir: dir.path().to_path_buf(),
@@ -227,16 +230,21 @@ mod tests {
             ..Config::default()
         };
         let app = Arc::new(crate::recovery::open_app(config).unwrap());
-        app.query_service
-            .execute_sql("create table users (id integer primary key)")
+        app.components
+            .wal
+            .append(WalRecord {
+                lsn: 0,
+                txn_id: 1,
+                kind: WalRecordKind::Commit,
+            })
             .unwrap();
         let _guard = app.components.shutdown.begin_query().unwrap();
 
         let err = run_graceful_shutdown(app.clone()).await.unwrap_err();
 
-        assert!(err.message.contains("timed out waiting"));
+        assert!(err.message.contains("timed out waiting for in-flight queries"));
         assert_eq!(app.checkpoint_count_for_test(), 0);
-        assert!(app.wal_flushed_for_test());
+        assert!(!app.wal_flushed_for_test());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -248,8 +256,13 @@ mod tests {
             ..Config::default()
         };
         let app = Arc::new(crate::recovery::open_app(config).unwrap());
-        app.query_service
-            .execute_sql("create table users (id integer primary key)")
+        app.components
+            .wal
+            .append(WalRecord {
+                lsn: 0,
+                txn_id: 1,
+                kind: WalRecordKind::Commit,
+            })
             .unwrap();
         let _in_flight = app.components.shutdown.begin_query().unwrap();
         let statement_guard = app.components.concurrency.begin_read().unwrap();
@@ -265,6 +278,6 @@ mod tests {
         let result = timed.expect("shutdown blocked on checkpoint behind statement guard");
         let err = result.unwrap().unwrap_err();
         assert!(err.message.contains("timed out waiting"));
-        assert!(app.wal_flushed_for_test());
+        assert!(!app.wal_flushed_for_test());
     }
 }
