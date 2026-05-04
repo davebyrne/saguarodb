@@ -7,6 +7,7 @@ members = [
   "crates/parser",
   "crates/planner",
   "crates/executor",
+  "crates/protocol",
   "crates/storage",
   "crates/wal",
   "crates/snapshot",
