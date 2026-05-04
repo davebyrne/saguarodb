@@ -194,6 +194,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::DuplicateTable => "42P07",
         SqlState::DatatypeMismatch => "42804",
         SqlState::DivisionByZero => "22012",
+        SqlState::NumericValueOutOfRange => "22003",
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
         SqlState::IoError => "58030",

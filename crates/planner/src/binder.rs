@@ -917,7 +917,7 @@ fn validate_aggregate_usage(
 ) -> Result<()> {
     let aggregate_context = !group_by.is_empty()
         || columns.iter().any(|item| contains_aggregate(&item.expr))
-        || having.is_some_and(contains_aggregate)
+        || having.is_some()
         || order_by.iter().any(|item| contains_aggregate(&item.expr));
 
     if !aggregate_context {

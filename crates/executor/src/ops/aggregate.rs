@@ -4,6 +4,7 @@ use common::{ColumnInfo, DbError, ExecRow, Result, Row, SqlState, Value};
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
 use crate::eval_expr;
+use crate::expr::integer_overflow;
 use crate::query::{PlanExecutor, collect_all};
 
 pub struct AggregateOp<'a> {
@@ -132,8 +133,8 @@ fn integer_fold_aggregate(
         match value {
             Value::Null => {}
             Value::Integer(value) => {
-                sum += value;
-                count += 1;
+                sum = sum.checked_add(value).ok_or_else(integer_overflow)?;
+                count = count.checked_add(1).ok_or_else(integer_overflow)?;
             }
             _ => {
                 return Err(DbError::execute(

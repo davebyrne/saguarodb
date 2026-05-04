@@ -113,7 +113,10 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
     match op {
         UnaryOp::Neg => match value {
             Value::Null => Ok(Value::Null),
-            Value::Integer(value) => Ok(Value::Integer(-value)),
+            Value::Integer(value) => value
+                .checked_neg()
+                .map(Value::Integer)
+                .ok_or_else(integer_overflow),
             _ => datatype_mismatch("unary minus requires integer"),
         },
         UnaryOp::Not => sql_not(value),
@@ -124,23 +127,27 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Integer(left), Value::Integer(right)) => match op {
-            BinOp::Add => Ok(Value::Integer(left + right)),
-            BinOp::Sub => Ok(Value::Integer(left - right)),
-            BinOp::Mul => Ok(Value::Integer(left * right)),
+            BinOp::Add => checked_integer(left.checked_add(right)),
+            BinOp::Sub => checked_integer(left.checked_sub(right)),
+            BinOp::Mul => checked_integer(left.checked_mul(right)),
             BinOp::Div if right == 0 => Err(DbError::execute(
                 SqlState::DivisionByZero,
                 "division by zero",
             )),
-            BinOp::Div => Ok(Value::Integer(left / right)),
+            BinOp::Div => checked_integer(left.checked_div(right)),
             BinOp::Mod if right == 0 => Err(DbError::execute(
                 SqlState::DivisionByZero,
                 "division by zero",
             )),
-            BinOp::Mod => Ok(Value::Integer(left % right)),
+            BinOp::Mod => checked_integer(left.checked_rem(right)),
             _ => unreachable!(),
         },
         _ => datatype_mismatch("arithmetic operands must be integers"),
     }
+}
+
+fn checked_integer(value: Option<i64>) -> Result<Value> {
+    value.map(Value::Integer).ok_or_else(integer_overflow)
 }
 
 pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
@@ -377,4 +384,11 @@ fn aggregate_name(func: AggregateFunc) -> &'static str {
 
 pub(crate) fn datatype_mismatch<T>(message: impl Into<String>) -> Result<T> {
     Err(DbError::execute(SqlState::DatatypeMismatch, message))
+}
+
+pub(crate) fn integer_overflow() -> DbError {
+    DbError::execute(
+        SqlState::NumericValueOutOfRange,
+        "integer value out of range",
+    )
 }

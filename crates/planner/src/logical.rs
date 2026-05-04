@@ -128,7 +128,7 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             .columns
             .iter()
             .any(|item| contains_aggregate(&item.expr))
-        || select.having.as_ref().is_some_and(contains_aggregate)
+        || select.having.is_some()
         || select
             .order_by
             .iter()

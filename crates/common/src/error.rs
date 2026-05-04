@@ -31,6 +31,7 @@ pub enum SqlState {
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,
+    NumericValueOutOfRange,
     NotNullViolation,
     UniqueViolation,
     IoError,

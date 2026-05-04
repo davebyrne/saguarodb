@@ -51,6 +51,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
   - unknown or ambiguous column: `SqlState::UndefinedColumn`
   - type mismatch: `SqlState::DatatypeMismatch`
   - division by zero: `SqlState::DivisionByZero`
+  - integer overflow: `SqlState::NumericValueOutOfRange`
   - null constraint violation: `SqlState::NotNullViolation`
   - duplicate table: `SqlState::DuplicateTable`
   - duplicate primary key: `SqlState::UniqueViolation`

@@ -324,6 +324,28 @@ mod tests {
     }
 
     #[test]
+    fn binder_treats_having_as_aggregate_context() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users having false").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        assert!(err.message.contains("GROUP BY"));
+    }
+
+    #[test]
+    fn logical_planner_applies_non_aggregate_having() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select count(*) from users having false").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let text = format!("{logical:?}");
+
+        assert!(text.contains("Aggregate"));
+        assert!(text.contains("Filter"));
+    }
+
+    #[test]
     fn binder_types_case_from_later_non_null_branch() {
         let catalog = catalog_with_users();
         let stmt =

@@ -99,7 +99,7 @@ V1 evaluator handles:
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
 
-Division by zero returns `SqlState::DivisionByZero`.
+Division by zero returns `SqlState::DivisionByZero`. Integer overflow in scalar arithmetic or integer aggregate accumulation returns `SqlState::NumericValueOutOfRange`.
 
 V1 expression semantics:
 

@@ -1,3 +1,4 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -69,12 +70,16 @@ impl QueryService {
         let catalog_before = self.components.catalog.snapshot()?;
         let ctx = self.execution_context(txn_id);
 
-        let result = self.engine.execute(&ctx, &physical);
+        let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {
-            Ok(result) => result,
-            Err(err) => {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
                 self.rollback_pre_durable(txn_id, Some(catalog_before));
                 return Err(err);
+            }
+            Err(_) => {
+                self.rollback_pre_durable(txn_id, Some(catalog_before));
+                return Err(DbError::internal("statement execution panicked"));
             }
         };
 
@@ -193,6 +198,71 @@ mod tests {
             .execute_sql("select id, name from users")
             .unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn overflowing_update_rolls_back_prior_row_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql("create table nums (id integer primary key, val integer)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into nums (id, val) values (1, 1)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into nums (id, val) values (2, 9223372036854775807)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("update nums set val = val + 1")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+
+        let executor::ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select id, val from nums order by id")
+            .unwrap()
+        else {
+            panic!("expected query result");
+        };
+        assert_eq!(
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+            vec![
+                vec![Value::Integer(1), Value::Integer(1)],
+                vec![Value::Integer(2), Value::Integer(i64::MAX)],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn having_without_group_by_is_not_silently_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("select id from users having false")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+
+        let executor::ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select count(*) from users having false")
+            .unwrap()
+        else {
+            panic!("expected query result");
+        };
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]

@@ -230,6 +230,7 @@ pub enum SqlState {
     DuplicateTable,             // 42P07
     DatatypeMismatch,           // 42804
     DivisionByZero,             // 22012
+    NumericValueOutOfRange,     // 22003
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
     IoError,                    // 58030

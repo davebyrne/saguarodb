@@ -15,7 +15,7 @@ pub use result::ExecutionResult;
 #[cfg(test)]
 mod tests {
     use common::{DataType, ExecRow, Key, Row, RowId, RowIdentity, SqlState, Value};
-    use planner::{BinOp, BoundExpr};
+    use planner::{BinOp, BoundExpr, UnaryOp};
 
     use crate::ops::{join_rows, project_row};
     use crate::test_support::ExecutorHarness;
@@ -96,6 +96,53 @@ mod tests {
 
         let err = eval_expr(&expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::DivisionByZero);
+    }
+
+    #[test]
+    fn integer_overflow_returns_sqlstate() {
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let expr = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::Literal {
+                value: Value::Integer(i64::MAX),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            op: BinOp::Add,
+            right: Box::new(BoundExpr::Literal {
+                value: Value::Integer(1),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        let err = eval_expr(&expr, &row).unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+    }
+
+    #[test]
+    fn unary_integer_overflow_returns_sqlstate() {
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let expr = BoundExpr::UnaryOp {
+            op: UnaryOp::Neg,
+            expr: Box::new(BoundExpr::Literal {
+                value: Value::Integer(i64::MIN),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        let err = eval_expr(&expr, &row).unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
     #[test]
@@ -286,6 +333,21 @@ mod tests {
                 values: vec![Value::Integer(1), Value::Text("Ada".to_string())]
             }]
         );
+    }
+
+    #[test]
+    fn sum_overflow_returns_sqlstate() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (9223372036854775807, 'Max')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'One')")
+            .unwrap();
+
+        let err = harness.execute("select sum(id) from users").unwrap_err();
+
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
     #[test]
