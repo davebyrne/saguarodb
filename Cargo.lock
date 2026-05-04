@@ -361,8 +361,12 @@ dependencies = [
 name = "saguarodb-storage"
 version = "0.1.0"
 dependencies = [
- "parking_lot",
+ "crc32fast",
+ "saguarodb-buffer",
  "saguarodb-common",
+ "saguarodb-wal",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -5,5 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+buffer = { package = "saguarodb-buffer", path = "../buffer" }
 common = { package = "saguarodb-common", path = "../common" }
-parking_lot.workspace = true
+wal = { package = "saguarodb-wal", path = "../wal" }
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
