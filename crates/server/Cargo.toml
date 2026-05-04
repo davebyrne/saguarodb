@@ -1,0 +1,25 @@
+[package]
+name = "saguarodb-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "saguarodb"
+path = "src/main.rs"
+
+[dependencies]
+buffer = { package = "saguarodb-buffer", path = "../buffer" }
+catalog = { package = "saguarodb-catalog", path = "../catalog" }
+common = { package = "saguarodb-common", path = "../common" }
+executor = { package = "saguarodb-executor", path = "../executor" }
+parser = { package = "saguarodb-parser", path = "../parser" }
+planner = { package = "saguarodb-planner", path = "../planner" }
+protocol = { package = "saguarodb-protocol", path = "../protocol" }
+snapshot = { package = "saguarodb-snapshot", path = "../snapshot" }
+storage = { package = "saguarodb-storage", path = "../storage" }
+wal = { package = "saguarodb-wal", path = "../wal" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
