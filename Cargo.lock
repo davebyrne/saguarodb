@@ -197,6 +197,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "saguarodb-storage"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "saguarodb-common",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
