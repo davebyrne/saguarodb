@@ -5,64 +5,112 @@ precedence.
 
 ## Project Context
 
-- The project is SaguaroDB, even though the checkout directory may be named
+- The project is SaguaroDB, even when the checkout directory is named
   `clementedb`.
-- Implement SaguaroDB v1 according to
-  `docs/superpowers/plans/2026-05-03-saguarodb-v1-implementation.md`.
-- Treat `docs/specs/overview.md` and `docs/specs/crates/*.md` as authoritative
-  source specs. If the plan and specs disagree, stop and resolve the mismatch
-  before implementing.
+- SaguaroDB v1 is implemented as a Rust workspace with a PostgreSQL simple-query
+  server, SQL parse/bind/plan/execute pipeline, page-backed storage, logical
+  WAL, manifest snapshots, and crash recovery.
+- The old task-by-task implementation plan is historical and is not a source of
+  truth. Do not depend on `docs/superpowers/**`; those files are not project
+  documentation in git and may be absent.
 
-## Implementation Workflow
+## Authoritative Documentation
+
+- Treat `docs/specs/overview.md` as the system-level specification.
+- Treat `docs/specs/crates/*.md` as the crate-level API and behavior contracts.
+- Treat `docs/specs/rust-style.md` as the Rust style, testing, and durability
+  convention guide.
+- If code and specs disagree, stop and surface the mismatch before changing
+  behavior. Do not silently update code or specs to paper over the conflict.
+- Update the relevant spec in the same change when intentionally changing a
+  public contract, SQL behavior, durable format, startup option, or crate
+  responsibility.
+
+## Repository Workflow
 
 - Run commands from the repository root.
-- When implementing the v1 plan, use `superpowers:subagent-driven-development`
-  or `superpowers:executing-plans` and execute the plan task by task.
-- Create one branch per plan task, starting from the latest `develop`, using a
-  name such as `task-01-common` or `task-09-page-backed-storage`.
-- Use a dedicated fresh agent context per task when available, to keep task
-  context bounded.
-- Use each task's listed checkpoint commands and commit message.
-- Review the branch with a fresh reviewer context that reads this file, the
-  implementation plan, relevant specs, and the branch diff.
-- The review should look for correctness bugs, architectural drift, dependency
-  boundary violations, maintenance problems, missing tests, and unnecessary
-  complexity.
-- Fix all non-pedantic review findings, rerun verification, and repeat review
-  until there are no blocking findings.
-- Document any accepted residual minor issues before review acceptance.
-- After a task branch is reviewed and accepted, merge it into `develop` before
-  starting the next task branch.
+- Work from `develop` unless the user asks otherwise.
+- Keep changes scoped to the requested behavior. Avoid unrelated refactors,
+  formatting churn, and cleanup outside touched areas.
+- Preserve user changes already present in the worktree. Do not revert files you
+  did not intentionally edit.
+- Keep `Cargo.lock` committed when any Cargo manifest changes.
+- Keep root `Cargo.toml` workspace membership in sync when adding, removing, or
+  renaming crates.
+- Runtime data belongs in ignored directories such as `data/` or `/tmp`, not in
+  git.
 
-## Rust Workspace Rules
+## Workspace And Crate Boundaries
 
-- Keep public APIs aligned with the crate specs.
-- When a task creates a crate, add it to root `Cargo.toml` workspace members
-  before running that task's first Cargo command.
-- Include `Cargo.toml` in checkpoints when workspace membership changes.
-- Include `Cargo.lock` whenever any Cargo manifest changes.
-- Run `cargo fmt --all` before each checkpoint.
-- Run the narrow package test first, then broader workspace tests after each
-  vertical slice.
-- `cargo clippy --workspace --all-targets -- -D warnings` is recommended before
-  review or merge.
-
-## Dependency Boundaries
-
+- Crates and responsibilities are documented in `docs/specs/crates/README.md`.
+- Cargo package names use the `saguarodb-*` prefix. Internal dependencies should
+  use short aliases such as `common`, `storage`, and `wal`.
+- Keep dependency edges aligned with `docs/specs/overview.md`.
+- `common` is the leaf crate for shared IDs, values, rows, errors, execution
+  context, and cross-crate traits.
+- `server` is the binary/root wiring crate. No library crate may depend on
+  `server`.
 - Do not let `parser` depend on `catalog`.
 - Do not let `planner` depend on `storage`.
 - Do not let `storage` depend on `planner`.
-- Do not let any library crate depend on `server`.
 - `planner` may depend on `parser` for internal AST types.
+- Normal storage operations append WAL records. Recovery operations must not
+  append WAL records.
 
-## Durability And SQL Semantics
+## SQL And Durability Rules
 
-- Commit `rust-toolchain.toml` in Task 1.
-- Commit `Cargo.lock`; this workspace includes the `saguarodb-server` binary.
-- Implement fsync behavior from the start, including WAL flush, snapshot commit,
-  manifest swap, and checkpoint paths.
-- Do not implement implicit casts. Type mismatches return
+- Preserve the v1 SQL subset unless the specs are intentionally updated:
+  `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `SELECT` with v1 clauses
+  and joins, `UPDATE`, `DELETE`, and `EXPLAIN`.
+- Unsupported parsed forms should be rejected by the binder or server with
+  structured `common::DbError` values and accurate SQLSTATE codes.
+- Do not introduce implicit casts. Type mismatches return
   `SqlState::DatatypeMismatch`, except `NULL` is valid where the target
   expression or column is nullable.
-- Normalize unquoted SQL identifiers to lowercase. Reject quoted identifiers in
-  v1 with `ErrorKind::Parse` and `SqlState::SyntaxError`.
+- Normalize unquoted SQL identifiers to lowercase. Quoted identifiers remain
+  unsupported in v1 unless the specs change.
+- Preserve autocommit semantics. The server owns statement guards, transaction
+  ID allocation, WAL commit records, WAL flush, rollback before durable commit,
+  cleanup after durable commit, and checkpoint triggering.
+- Preserve fsync-sensitive ordering for WAL flush, snapshot writes, manifest
+  swap, WAL checkpoint records, WAL truncation, and graceful shutdown.
+- Be conservative with durable formats. WAL, manifest, snapshot, and page/row
+  encodings need versioning/checksum behavior consistent with their specs.
+
+## Testing And Verification
+
+- Prefer focused tests in the crate that owns the behavior.
+- Use server integration tests for cross-crate SQL, protocol, checkpoint, and
+  recovery behavior.
+- Run narrow package tests first for the crate you changed, then broaden as risk
+  increases.
+- Before handing off substantial changes, run:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+- If a verification command cannot run, record the exact command and reason.
+- Do not claim a fix is complete until relevant verification has run or the
+  limitation is explicitly documented.
+
+## Running The Server
+
+- Start the server from the repository root with:
+
+```bash
+cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev --port 5433
+```
+
+- Defaults are `--data-dir ./data`, `--port 5433`,
+  `--buffer-pool-frames 1024`, `--checkpoint-every-n-commits 100`,
+  `--checkpoint-wal-bytes 67108864`, and `--shutdown-timeout-ms 30000`.
+- The server listens on `0.0.0.0:<port>` and runs in the foreground. Stop it with
+  `Ctrl-C` or SIGTERM for graceful shutdown.
+- Connect with `psql` using SSL disabled, for example:
+
+```bash
+psql "host=127.0.0.1 port=5433 user=saguarodb dbname=saguarodb sslmode=disable"
+```
