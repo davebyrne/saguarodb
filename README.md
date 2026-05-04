@@ -356,3 +356,8 @@ docs/specs/crates/*.md
 
 If behavior and specs disagree, resolve the mismatch deliberately instead of
 silently drifting the implementation away from the documented contracts.
+
+## License
+
+SaguaroDB is licensed under the GNU General Public License version 3 or later.
+See [COPYING](COPYING) for the full license text.
