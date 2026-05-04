@@ -1140,7 +1140,7 @@ Files are named by stable numeric ID, not by user-visible names. This avoids ren
 **Generation:** A monotonically increasing integer. Each completed checkpoint writes to a new generation directory.
 
 **Manifest (the single source of truth for which snapshot is current):**
-- `data/manifest.dat` — contains: current generation number, checkpoint LSN, table IDs, manifest version, and checksum
+- `data/manifest.dat` — contains a versioned binary envelope with magic `SGMF`, manifest version, payload length, CRC32 over the exact stored JSON payload bytes, and a payload containing current generation number, checkpoint LSN, and sorted table IDs
 
 The manifest is updated atomically via write-to-temp + rename (atomic on POSIX). Recovery reads the manifest to find the current snapshot. See Snapshot Checkpoint below for the full protocol.
 
@@ -1319,6 +1319,8 @@ pub trait SnapshotManager: Send + Sync {
 ```
 
 Table file names are deterministic (`table_<TableId>.tbl`) and are not separately exposed in `SnapshotMetadata`. The on-disk manifest may store only table IDs because the file name can be derived from the table ID.
+
+Manifest decode validates the binary envelope magic, version, payload length, checksum over the exact stored payload bytes, JSON payload, and strictly ascending table IDs. Legacy JSON-object manifests are rejected rather than migrated in v1 development builds.
 
 ### SnapshotWriter
 

@@ -55,12 +55,17 @@ Repeated PageCount times:
   PageData: 8192 bytes
 ```
 
-Manifest stores:
+Manifest bytes use a versioned binary envelope:
 
-- generation
-- checkpoint LSN
-- table IDs
-- checksum/version for manifest integrity
+- magic: `SGMF` (4 bytes)
+- version: little-endian `u32`, v1 = `1`
+- payload length: little-endian `u32`
+- payload checksum: little-endian CRC32 over the exact payload bytes
+- payload: UTF-8 JSON containing `generation`, `checkpoint_lsn`, and sorted `tables`
+
+Decode must reject magic mismatch, unsupported versions, length mismatch, checksum mismatch, malformed payload JSON, unsorted table IDs, and duplicate table IDs.
+
+V1 development builds do not migrate the older JSON-object manifest format. A manifest that does not start with `SGMF` is rejected as corrupt, and users must rebuild the data directory from a compatible snapshot/WAL set.
 
 Table file names are deterministic (`table_<TableId>.tbl`) and are not separately exposed in `SnapshotMetadata`. The on-disk manifest may store only table IDs because the file name can be derived from the table ID.
 
