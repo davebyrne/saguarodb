@@ -1222,7 +1222,7 @@ impl PageWriteGuard {
 }
 ```
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, ...)` advances this counter to at least `page_num + 1`, and rollback of a new page removes the page but does not need to reuse its page number in v1.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number in v1.
 
 Guards are owned types (no lifetime parameter) — same rationale as the concurrency controller guards. They hold `Arc` references to the buffer pool frame internally, which keeps `BufferPool` object-safe. The Arc overhead is one reference count per page access, negligible compared to the I/O it represents.
 

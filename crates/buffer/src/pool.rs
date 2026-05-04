@@ -135,11 +135,36 @@ impl MemoryBufferPool {
         Some(read_guard(file_id, page_num, frame))
     }
 
-    fn insert_clean_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()> {
+    fn insert_loaded_read_page(
+        &self,
+        file_id: FileId,
+        page_num: PageNum,
+        data: PageData,
+    ) -> Result<PageReadGuard> {
+        let frame = {
+            let mut state = self.state.lock();
+            let frame = state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
+            state.advance_next_page_num(file_id, page_num);
+            frame.pin();
+            frame
+        };
+        Ok(read_guard(file_id, page_num, frame))
+    }
+
+    fn insert_loaded_write_page(
+        &self,
+        file_id: FileId,
+        page_num: PageNum,
+        txn_id: u64,
+        data: PageData,
+    ) -> Result<Arc<Frame>> {
         let mut state = self.state.lock();
-        state.insert_frame(self.frame_count, file_id, page_num, data, false)?;
+        let frame = state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
         state.advance_next_page_num(file_id, page_num);
-        Ok(())
+        state.record_before_image(txn_id, file_id, page_num, &frame);
+        frame.mark_dirty(txn_id);
+        frame.pin();
+        Ok(frame)
     }
 
     fn insert_clean_page_if_absent(
@@ -149,9 +174,7 @@ impl MemoryBufferPool {
         data: PageData,
     ) -> Result<()> {
         let mut state = self.state.lock();
-        if !state.frames.contains_key(&(file_id, page_num)) {
-            state.insert_frame(self.frame_count, file_id, page_num, data, false)?;
-        }
+        state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
         state.advance_next_page_num(file_id, page_num);
         Ok(())
     }
@@ -182,12 +205,7 @@ impl BufferPool for MemoryBufferPool {
         }
 
         match self.page_loader.load_page(file_id, page_num)? {
-            Some(data) => {
-                self.insert_clean_page(file_id, page_num, data)?;
-                self.read_resident_page(file_id, page_num).ok_or_else(|| {
-                    Self::storage_internal_error("page not found after loader insert")
-                })
-            }
+            Some(data) => self.insert_loaded_read_page(file_id, page_num, data),
             None => Err(Self::storage_internal_error(format!(
                 "page not found: file_id={file_id}, page_num={page_num}"
             ))),
@@ -204,13 +222,7 @@ impl BufferPool for MemoryBufferPool {
             frame
         } else {
             match self.page_loader.load_page(file_id, page_num)? {
-                Some(data) => {
-                    self.insert_clean_page_if_absent(file_id, page_num, data)?;
-                    self.prepare_write_frame(file_id, page_num, txn_id)
-                        .ok_or_else(|| {
-                            Self::storage_internal_error("page not found after loader insert")
-                        })?
-                }
+                Some(data) => self.insert_loaded_write_page(file_id, page_num, txn_id, data)?,
                 None => {
                     return Err(Self::storage_internal_error(format!(
                         "page not found: file_id={file_id}, page_num={page_num}"
@@ -247,7 +259,7 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()> {
-        self.insert_clean_page(file_id, page_num, data)
+        self.insert_clean_page_if_absent(file_id, page_num, data)
     }
 
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>> {
@@ -379,6 +391,35 @@ impl PoolState {
         }
 
         let frame = Arc::new(Frame::new(file_id, page_num, data, dirty));
+        self.frames.insert(key, frame.clone());
+        self.clock_order.push(key);
+        Ok(frame)
+    }
+
+    fn insert_frame_if_absent(
+        &mut self,
+        frame_count: usize,
+        file_id: FileId,
+        page_num: PageNum,
+        data: PageData,
+    ) -> Result<Arc<Frame>> {
+        let key = (file_id, page_num);
+        if let Some(frame) = self.frames.get(&key) {
+            frame.reference_bit.store(true, Ordering::Release);
+            return Ok(frame.clone());
+        }
+
+        if frame_count == 0 {
+            return Err(MemoryBufferPool::storage_internal_error(
+                "buffer pool has zero frames",
+            ));
+        }
+
+        if self.frames.len() >= frame_count {
+            self.evict_one_clean_unpinned()?;
+        }
+
+        let frame = Arc::new(Frame::new(file_id, page_num, data, false));
         self.frames.insert(key, frame.clone());
         self.clock_order.push(key);
         Ok(frame)
@@ -676,6 +717,36 @@ mod tests {
         let page = pool.new_page(7, 1).unwrap();
 
         assert_eq!(page.page_num(), 4);
+    }
+
+    #[test]
+    fn load_page_does_not_overwrite_resident_dirty_page() {
+        let pool = MemoryBufferPool::empty(8);
+        pool.load_page(1, 0, data_with_first_byte(1)).unwrap();
+
+        {
+            let mut page = pool.write_page(1, 0, 77).unwrap();
+            page.data_mut()[0] = 9;
+        }
+
+        pool.load_page(1, 0, data_with_first_byte(2)).unwrap();
+
+        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 9);
+        pool.rollback(77).unwrap();
+        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 1);
+    }
+
+    #[test]
+    fn read_page_loader_result_is_pinned_before_returning() {
+        let loader = Arc::new(TestPageLoader::new([((2, 5), data_with_first_byte(5))]));
+        let pool = MemoryBufferPool::new(1, Box::new(NeverFlush), loader);
+
+        let guard = pool.read_page(2, 5).unwrap();
+        let err = pool.load_page(2, 6, data_with_first_byte(6)).unwrap_err();
+
+        assert_eq!(guard.data()[0], 5);
+        assert_eq!(err.kind, ErrorKind::Storage);
+        assert_eq!(err.code, SqlState::InternalError);
     }
 
     #[test]

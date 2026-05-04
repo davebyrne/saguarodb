@@ -53,7 +53,7 @@ In production, the server supplies a `SnapshotPageLoader` that wraps `SnapshotMa
 
 `MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageLoader` returning `Ok(None)`.
 
-`load_page` inserts a clean page at an exact `(FileId, PageNum)` during snapshot loading. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool. Snapshot writing combines dirty pages from `iter_pages` with clean pages copied from current snapshot files.
+`load_page(file_id, page_num, data)` is used during snapshot loading. If the page is not resident, it inserts `data` as a clean frame. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool. Snapshot writing combines dirty pages from `iter_pages` with clean pages copied from current snapshot files.
 
 `commit(txn_id)` is cleanup-only: it discards before-images and new-page tracking after WAL flush succeeds. It must not perform I/O and should not fail for a valid `txn_id`. If it fails after a durable WAL commit, server treats that as fatal and does not roll back.
 
