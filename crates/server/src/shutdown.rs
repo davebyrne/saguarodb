@@ -91,6 +91,12 @@ impl ShutdownState {
     }
 }
 
+impl Default for ShutdownState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for InFlightQueryGuard {
     fn drop(&mut self) {
         if self.state.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {

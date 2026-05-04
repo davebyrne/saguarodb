@@ -1,17 +1,10 @@
-mod app;
-mod checkpoint;
-mod config;
-mod connection;
-mod query;
-mod recovery;
-mod shutdown;
-
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use common::{DbError, Result};
-use config::{ConfigAction, parse_args, usage};
+use saguarodb_server::config::{ConfigAction, parse_args, usage};
+use saguarodb_server::{app, connection, recovery, shutdown};
 use tokio::net::TcpListener;
 
 #[tokio::main]
