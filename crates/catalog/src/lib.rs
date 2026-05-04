@@ -25,9 +25,13 @@ pub trait CatalogManager: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use common::{ColumnDef, DataType, ErrorKind, ParsedColumnDef, SqlState, TableSchema};
 
-    use crate::{CatalogManager, MemoryCatalog, deserialize_catalog, serialize_catalog};
+    use crate::{
+        CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
+    };
 
     fn id_column(nullable: bool) -> ParsedColumnDef {
         ParsedColumnDef {
@@ -107,7 +111,138 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn restore_rejects_name_index_without_table() {
+        let catalog = MemoryCatalog::empty();
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("ghost".to_string(), 7)]),
+            tables_by_id: HashMap::new(),
+            next_table_id: 1,
+        };
+
+        let err = catalog.restore(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("catalog snapshot"));
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_next_table_id_that_reuses_existing_id() {
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 3,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("next_table_id"));
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_composite_primary_key() {
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "tenant".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![0, 1],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 4,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("primary key"));
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_nullable_primary_key_column() {
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: true,
+            }],
+            primary_key: vec![0],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 4,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("primary key"));
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_non_contiguous_column_ids() {
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+            }],
+            primary_key: vec![1],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 4,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("column id"));
+    }
+
+    #[test]
+    fn duplicate_primary_key_column_is_rejected_with_syntax_error() {
+        let catalog = MemoryCatalog::empty();
+
+        let err = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string(), "id".to_string()],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::SyntaxError);
     }
 
     #[test]

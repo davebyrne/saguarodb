@@ -158,6 +158,16 @@ mod tests {
     }
 
     #[test]
+    fn binder_rejects_duplicate_primary_key_column_with_syntax_error() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create table teams (id integer, primary key (id, id))").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_rejects_nested_aggregates() {
         let catalog = catalog_with_users();
         let stmt = parse("select sum(count(*)) from users").unwrap();

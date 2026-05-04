@@ -59,8 +59,9 @@ Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snaps
 ## Create Table Rules
 
 - Table name must be unique.
-- Column names must be unique within table.
+- Column names must be unique within table; duplicate column definitions return `SqlState::SyntaxError`.
 - Primary key column names must exist.
+- Duplicate primary-key column names return `SqlState::SyntaxError`.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
@@ -76,6 +77,8 @@ On startup:
 3. Recovery replays post-snapshot `CreateTable` and `DropTable` records into both catalog and storage using `apply_create_table` and `apply_drop_table`.
 
 Catalog mutations update memory immediately. Durability before snapshot is provided by WAL records.
+
+`restore` and startup loading must validate catalog snapshots before installing them. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
 
 ## WAL Interaction
 

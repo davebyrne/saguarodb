@@ -39,6 +39,15 @@ pub fn bind(statement: &Statement, catalog: &dyn CatalogManager) -> Result<Bound
             columns,
             primary_key,
         } => {
+            let mut seen_primary_key_names = HashSet::new();
+            for primary_key_name in primary_key {
+                if !seen_primary_key_names.insert(primary_key_name) {
+                    return Err(plan_error(
+                        SqlState::SyntaxError,
+                        format!("duplicate primary key column {primary_key_name}"),
+                    ));
+                }
+            }
             if primary_key.len() != 1 {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,

@@ -34,6 +34,11 @@ impl MemoryCatalog {
         }
     }
 
+    pub fn try_from_snapshot(snapshot: CatalogSnapshot) -> Result<Self> {
+        validate_snapshot(&snapshot)?;
+        Ok(Self::from_snapshot(snapshot))
+    }
+
     fn read_snapshot(&self) -> Result<RwLockReadGuard<'_, CatalogSnapshot>> {
         self.snapshot
             .read()
@@ -83,6 +88,7 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()> {
+        validate_snapshot(&snapshot)?;
         *self.write_snapshot()? = snapshot;
         Ok(())
     }
@@ -155,7 +161,7 @@ fn build_schema(
     for (index, column) in columns.into_iter().enumerate() {
         if !seen_names.insert(column.name.clone()) {
             return Err(DbError::plan(
-                SqlState::DatatypeMismatch,
+                SqlState::SyntaxError,
                 format!("duplicate column {}", column.name),
             ));
         }
@@ -177,7 +183,7 @@ fn build_schema(
     for primary_key_name in primary_key {
         if !seen_primary_key_names.insert(primary_key_name.clone()) {
             return Err(DbError::plan(
-                SqlState::DatatypeMismatch,
+                SqlState::SyntaxError,
                 format!("duplicate primary key column {primary_key_name}"),
             ));
         }
@@ -203,6 +209,113 @@ fn build_schema(
         columns: assigned_columns,
         primary_key: primary_key_ids,
     })
+}
+
+fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut max_table_id = 0;
+
+    for (name, id) in &snapshot.tables_by_name {
+        let schema = snapshot.tables_by_id.get(id).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog snapshot name index {name} points to missing table id {id}",
+            ))
+        })?;
+        if &schema.name != name || schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot name/id mismatch for table {name}",
+            )));
+        }
+    }
+
+    for (id, schema) in &snapshot.tables_by_id {
+        if schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table id key {id} does not match schema id {}",
+                schema.id
+            )));
+        }
+        if snapshot.tables_by_name.get(&schema.name) != Some(id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} is missing from name index",
+                schema.name
+            )));
+        }
+        validate_schema(schema)?;
+        max_table_id = max_table_id.max(*id);
+    }
+
+    let required_next = max_table_id
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog snapshot table id overflow"))?;
+    if snapshot.next_table_id < required_next {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_table_id {} is less than required {required_next}",
+            snapshot.next_table_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_schema(schema: &TableSchema) -> Result<()> {
+    let mut column_ids = HashSet::new();
+    let mut column_names = HashSet::new();
+    for (expected_id, column) in schema.columns.iter().enumerate() {
+        let expected_id: ColumnId = expected_id
+            .try_into()
+            .map_err(|_| DbError::internal("catalog snapshot column id overflow"))?;
+        if column.id != expected_id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has column id {} at position {}, expected {}",
+                schema.name,
+                column.id,
+                usize::from(expected_id),
+                expected_id
+            )));
+        }
+        if !column_ids.insert(column.id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has duplicate column id {}",
+                schema.name, column.id
+            )));
+        }
+        if !column_names.insert(column.name.clone()) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has duplicate column {}",
+                schema.name, column.name
+            )));
+        }
+    }
+
+    if schema.primary_key.len() != 1 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} must have exactly one primary key column in v1",
+            schema.name
+        )));
+    }
+    let mut primary_key_ids = HashSet::new();
+    for column_id in &schema.primary_key {
+        let Some(column) = schema.columns.iter().find(|column| column.id == *column_id) else {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} primary key references missing column {}",
+                schema.name, column_id
+            )));
+        };
+        if column.nullable {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} primary key column {} is nullable",
+                schema.name, column_id
+            )));
+        }
+        if !primary_key_ids.insert(*column_id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} has duplicate primary key column {}",
+                schema.name, column_id
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn reject_duplicate_table_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {

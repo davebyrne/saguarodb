@@ -36,9 +36,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
         .map(|snapshot| snapshot.metadata.checkpoint_lsn)
         .unwrap_or(0);
     let catalog: Arc<dyn CatalogManager> = match loaded {
-        Some(snapshot) => Arc::new(MemoryCatalog::from_snapshot(deserialize_catalog(
+        Some(snapshot) => Arc::new(MemoryCatalog::try_from_snapshot(deserialize_catalog(
             &snapshot.catalog_bytes,
-        )?)),
+        )?)?),
         None => Arc::new(MemoryCatalog::empty()),
     };
 
