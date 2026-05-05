@@ -118,6 +118,9 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - Prefer importing crate-local public types from the crate root when that matches the public API.
 - Use clear domain names: `catalog`, `schema`, `row`, `key`, `txn_id`, `checkpoint_lsn`.
 - Avoid abbreviations except established database terms such as `LSN`, `DDL`, `DML`, and `WAL`.
+- Use leading-underscore names only for values that are intentionally unused. If a function
+  parameter is read, name it directly; do not accept `_name` and immediately rebind it as
+  `name`.
 - Comments should explain non-obvious invariants, recovery ordering, lock ordering, or wire-format details.
 - Do not comment obvious assignments or restate type names.
 

@@ -11,9 +11,7 @@ use tokio::net::TcpStream;
 
 use crate::app::AppState;
 
-pub async fn handle_connection(_socket: TcpStream, _app: Arc<AppState>) -> Result<()> {
-    let mut socket = _socket;
-    let app = _app;
+pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Result<()> {
     let mut codec = PostgresCodec::new();
     let mut state = PostgresConnectionState::new();
     let mut buf = [0; 8192];

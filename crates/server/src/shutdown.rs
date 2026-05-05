@@ -60,7 +60,7 @@ impl ShutdownState {
         self.accepting.load(Ordering::Acquire)
     }
 
-    pub async fn wait_for_idle(&self, _timeout: Duration) -> Result<()> {
+    pub async fn wait_for_idle(&self, timeout: Duration) -> Result<()> {
         let wait = async {
             loop {
                 if self.in_flight.load(Ordering::Acquire) == 0 {
@@ -71,7 +71,7 @@ impl ShutdownState {
                 self.notify_idle.notified().await;
             }
         };
-        tokio::time::timeout(_timeout, wait)
+        tokio::time::timeout(timeout, wait)
             .await
             .map_err(|_| DbError::internal("timed out waiting for in-flight queries"))?;
         Ok(())
@@ -126,8 +126,7 @@ pub async fn wait_for_shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-pub async fn run_graceful_shutdown(_app: Arc<AppState>) -> Result<()> {
-    let app = _app;
+pub async fn run_graceful_shutdown(app: Arc<AppState>) -> Result<()> {
     app.components.shutdown.stop_accepting();
     let timeout = Duration::from_millis(app.components.config.shutdown_timeout_ms);
     let idle_result = app.components.shutdown.wait_for_idle(timeout).await;

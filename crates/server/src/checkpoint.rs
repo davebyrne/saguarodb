@@ -13,8 +13,7 @@ pub struct CheckpointState {
     pub commits_since_checkpoint: AtomicU64,
 }
 
-pub fn run_checkpoint(_components: &ServerComponents) -> Result<()> {
-    let components = _components;
+pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     let _guard = components.concurrency.begin_write()?;
     let checkpoint_lsn = components.wal.flushed_lsn();
     let live_tables = components.catalog.list_tables()?;
@@ -68,8 +67,7 @@ pub fn run_checkpoint(_components: &ServerComponents) -> Result<()> {
     Ok(())
 }
 
-pub fn record_commit_and_maybe_checkpoint(_components: &ServerComponents) -> Result<()> {
-    let components = _components;
+pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Result<()> {
     let commits = components
         .checkpoint
         .commits_since_checkpoint

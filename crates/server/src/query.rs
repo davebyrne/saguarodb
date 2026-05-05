@@ -25,8 +25,8 @@ impl QueryService {
         }
     }
 
-    pub fn execute_sql(&self, _sql: &str) -> Result<ExecutionResult> {
-        let statement = parser::parse(_sql)?;
+    pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
+        let statement = parser::parse(sql)?;
         match statement_class(&statement)? {
             StatementClass::Read => self.execute_read(&statement),
             StatementClass::Write => self.execute_write(&statement),

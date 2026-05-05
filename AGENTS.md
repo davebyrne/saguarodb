@@ -37,6 +37,9 @@ precedence.
 - Keep `Cargo.lock` committed when any Cargo manifest changes.
 - Keep root `Cargo.toml` workspace membership in sync when adding, removing, or
   renaming crates.
+- Use leading-underscore parameter or binding names only for intentionally
+  unused values. Do not accept `_name` and immediately shadow it as `name`;
+  name used parameters directly.
 - Runtime data belongs in ignored directories such as `data/` or `/tmp`, not in
   git.
 
