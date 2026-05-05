@@ -369,15 +369,10 @@ impl PoolState {
         dirty: bool,
     ) -> Result<Arc<Frame>> {
         let key = (file_id, page_num);
-        if let Some(frame) = self.frames.get(&key) {
-            *frame.data.write() = data;
-            if dirty {
-                frame.dirty.store(true, Ordering::Release);
-            } else {
-                frame.mark_clean();
-            }
-            frame.reference_bit.store(true, Ordering::Release);
-            return Ok(frame.clone());
+        if self.frames.contains_key(&key) {
+            return Err(DbError::internal(format!(
+                "page already resident: file_id={file_id}, page_num={page_num}"
+            )));
         }
 
         if frame_count == 0 {
@@ -734,6 +729,25 @@ mod tests {
         assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 9);
         pool.rollback(77).unwrap();
         assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 1);
+    }
+
+    #[test]
+    fn insert_frame_rejects_resident_page_key() {
+        let mut state = PoolState::default();
+        state
+            .insert_frame(8, 1, 0, PageData::default(), false)
+            .unwrap();
+        let mut replacement = PageData::default();
+        replacement.0[0] = 9;
+
+        let err = match state.insert_frame(8, 1, 0, replacement, true) {
+            Ok(_) => panic!("expected resident page rejection"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("already resident"));
+        assert_eq!(state.frames.get(&(1, 0)).unwrap().data.read().0[0], 0);
     }
 
     #[test]

@@ -300,7 +300,8 @@ mod tests {
 
         let snapshot = catalog.snapshot().unwrap();
         let bytes = serialize_catalog(&snapshot).unwrap();
-        let restored = MemoryCatalog::from_snapshot(deserialize_catalog(&bytes).unwrap());
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
 
         restored
             .create_table(

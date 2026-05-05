@@ -28,7 +28,7 @@ impl MemoryCatalog {
         })
     }
 
-    pub fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
+    fn from_snapshot(snapshot: CatalogSnapshot) -> Self {
         Self {
             snapshot: RwLock::new(snapshot),
         }

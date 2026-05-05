@@ -736,6 +736,9 @@ fn bind_in_list(
     list: &[Expr],
     negated: bool,
 ) -> Result<BoundExpr> {
+    if matches!(expr, Expr::Literal(Value::Null)) {
+        return bind_null_in_list(ctx, expr, list, negated);
+    }
     let expr = bind_expr(ctx, expr, None)?;
     let mut nullable = expr.nullable();
     let mut bound_list = Vec::with_capacity(list.len());
@@ -745,6 +748,55 @@ fn bind_in_list(
         nullable |= item.nullable();
         bound_list.push(item);
     }
+    Ok(BoundExpr::InList {
+        expr: Box::new(expr),
+        list: bound_list,
+        negated,
+        data_type: DataType::Boolean,
+        nullable,
+    })
+}
+
+fn bind_null_in_list(
+    ctx: &mut BindContext,
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+) -> Result<BoundExpr> {
+    let mut inferred_type = None;
+    let mut nullable = true;
+    let mut bound_list = vec![None; list.len()];
+
+    for (index, item) in list.iter().enumerate() {
+        if matches!(item, Expr::Literal(Value::Null)) && inferred_type.is_none() {
+            continue;
+        }
+        let item = bind_expr(ctx, item, inferred_type.clone())?;
+        if let Some(data_type) = &inferred_type {
+            require_type(&item, data_type.clone())?;
+        } else {
+            inferred_type = Some(item.data_type());
+        }
+        nullable |= item.nullable();
+        bound_list[index] = Some(item);
+    }
+
+    let data_type = inferred_type.ok_or_else(|| {
+        plan_error(
+            SqlState::DatatypeMismatch,
+            "NULL literal requires a type context",
+        )
+    })?;
+    let expr = bind_expr(ctx, expr, Some(data_type.clone()))?;
+    let bound_list = bound_list
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.map(Ok)
+                .unwrap_or_else(|| bind_expr(ctx, &list[index], Some(data_type.clone())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(BoundExpr::InList {
         expr: Box::new(expr),
         list: bound_list,

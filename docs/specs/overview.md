@@ -610,7 +610,7 @@ All three phases are separate modules within the `planner` crate. V1 implements 
 
 ### Phase 1: Binder
 
-The binder performs all semantic analysis and name resolution. Its output is a `BoundStatement` — a fully validated, ID-resolved, slot-assigned representation of the query. No downstream phase does name lookups or type checking.
+The binder performs semantic analysis and name resolution. Its output is a `BoundStatement` — a validated, ID-resolved, slot-assigned representation of the query. No downstream phase does name lookups. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
 
 The binder:
 - Resolves table names to `TableId` via the catalog
@@ -783,7 +783,7 @@ pub enum BoundExpr {
 }
 ```
 
-Every `BoundExpr` variant carries its resolved output type and nullability. Binder fills these fields before logical planning, including typed `Value::Null` literals from context; if a V1 `NULL` literal has no valid typing context, binder rejects it with `SqlState::DatatypeMismatch`. The detailed metadata rules live in `docs/specs/crates/planner.md` and are authoritative for implementation.
+Every `BoundExpr` variant carries its resolved output type and nullability. Binder fills these fields before logical planning, including typed `Value::Null` literals from context; if a V1 `NULL` literal has no valid typing context, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression. The detailed metadata rules live in `docs/specs/crates/planner.md` and are authoritative for implementation.
 
 ### Phase 2: Logical Planner
 
@@ -1227,7 +1227,7 @@ impl PageWriteGuard {
 }
 ```
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number in v1.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The fresh-page insertion path rejects an already resident `(file_id, page_num)` with an internal error instead of overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number in v1.
 
 Guards are owned types (no lifetime parameter) — same rationale as the concurrency controller guards. They hold `Arc` references to the buffer pool frame internally, which keeps `BufferPool` object-safe. The Arc overhead is one reference count per page access, negligible compared to the I/O it represents.
 
@@ -1619,7 +1619,7 @@ pub struct TableSchema {
 }
 ```
 
-`ColumnDef` (with `id`, `name`, `data_type`, `nullable`) and `DataType` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`.
+`ColumnDef` (with `id`, `name`, `data_type`, `nullable`) and `DataType` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only.
 
 The catalog is the authority for name-to-ID resolution. IDs are stable and never reused (monotonically increasing). The binder resolves all names to IDs so that the planner, executor, and storage engine work exclusively with IDs.
 

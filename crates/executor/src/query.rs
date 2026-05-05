@@ -194,6 +194,7 @@ fn execute_insert(
             let mut values = vec![Value::Null; schema.columns.len()];
             for (column, value) in columns.iter().zip(source_row.row.values) {
                 let slot = column_slot(&schema, *column)?;
+                validate_value_type(&schema.columns[slot], &value)?;
                 values[slot] = value;
             }
             validate_not_null(&schema, &values)?;
@@ -350,6 +351,28 @@ fn validate_not_null(schema: &TableSchema, values: &[Value]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    let matches_type = matches!(
+        (&column.data_type, value),
+        (DataType::Integer, Value::Integer(_))
+            | (DataType::Text, Value::Text(_))
+            | (DataType::Boolean, Value::Boolean(_))
+    );
+    if matches_type {
+        return Ok(());
+    }
+    Err(DbError::execute(
+        SqlState::DatatypeMismatch,
+        format!(
+            "expected column {} to receive {:?}, got {:?}",
+            column.name, column.data_type, value
+        ),
+    ))
 }
 
 pub(crate) fn collect_all(source: &mut dyn PlanExecutor) -> Result<Vec<ExecRow>> {

@@ -29,7 +29,7 @@ pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
 
 ## Binder Contract
 
-Binder output is fully resolved. No downstream phase performs name lookup or type checking.
+Binder output is fully resolved. No downstream phase performs name lookup. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
 
 Binder responsibilities:
 
@@ -190,7 +190,7 @@ pub enum BoundExpr {
 }
 ```
 
-Every `BoundExpr` variant carries its resolved output `data_type` and `nullable` value. Binder assigns these fields before logical planning, and logical/physical planning preserves them when rewriting expressions. `slot` is the runtime access path for `InputRef` and `LocalRef`; `input` and `column` are for debugging, EXPLAIN, and future rebinding. A `Value::Null` literal is typed by context during binding; if no context can determine a valid V1 `DataType`, binder rejects it with `SqlState::DatatypeMismatch`.
+Every `BoundExpr` variant carries its resolved output `data_type` and `nullable` value. Binder assigns these fields before logical planning, and logical/physical planning preserves them when rewriting expressions. `slot` is the runtime access path for `InputRef` and `LocalRef`; `input` and `column` are for debugging, EXPLAIN, and future rebinding. A `Value::Null` literal is typed by context during binding; if no context can determine a valid V1 `DataType`, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression, and rejects the expression only when the list also provides no type context.
 
 Expression metadata rules:
 

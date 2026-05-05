@@ -78,7 +78,7 @@ On startup:
 
 Catalog mutations update memory immediately. Durability before snapshot is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
 
 ## WAL Interaction
 

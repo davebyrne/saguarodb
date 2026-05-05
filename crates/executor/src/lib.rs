@@ -14,12 +14,17 @@ pub use result::ExecutionResult;
 
 #[cfg(test)]
 mod tests {
-    use common::{DataType, ExecRow, Key, Row, RowId, RowIdentity, SqlState, Value};
-    use planner::{BinOp, BoundExpr, UnaryOp};
+    use catalog::{CatalogManager, MemoryCatalog};
+    use common::{
+        ColumnInfo, DataType, ExecRow, Key, ParsedColumnDef, Row, RowId, RowIdentity, SqlState,
+        StatementContext, Value,
+    };
+    use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
     use crate::ops::{join_rows, project_row};
-    use crate::test_support::ExecutorHarness;
-    use crate::{ExecutionResult, eval_expr};
+    use crate::test_support::{ExecutorHarness, MemoryStorage};
+    use crate::{ExecutionContext, ExecutionResult, QueryEngine, eval_expr};
+    use storage::SchemaOperations;
 
     #[test]
     fn boolean_and_uses_sql_null_semantics() {
@@ -333,6 +338,76 @@ mod tests {
                 values: vec![Value::Integer(1), Value::Text("Ada".to_string())]
             }]
         );
+    }
+
+    #[test]
+    fn insert_rejects_runtime_value_type_mismatch() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                    },
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let storage = MemoryStorage::empty();
+        storage
+            .create_table(&StatementContext { txn_id: 0 }, &schema)
+            .unwrap();
+        let ctx = ExecutionContext {
+            statement: StatementContext { txn_id: 1 },
+            catalog: &catalog,
+            storage: &storage,
+            schema_ops: &storage,
+        };
+        let plan = PhysicalPlan::Insert {
+            table: schema.id,
+            columns: vec![0, 1],
+            source: Box::new(PhysicalPlan::Values {
+                rows: vec![vec![
+                    BoundExpr::Literal {
+                        value: Value::Text("not-an-integer".to_string()),
+                        data_type: DataType::Text,
+                        nullable: false,
+                    },
+                    BoundExpr::Literal {
+                        value: Value::Text("Ada".to_string()),
+                        data_type: DataType::Text,
+                        nullable: false,
+                    },
+                ]],
+                output_schema: vec![
+                    ColumnInfo {
+                        name: "id".to_string(),
+                        data_type: DataType::Text,
+                        table_id: None,
+                        column_id: None,
+                    },
+                    ColumnInfo {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        table_id: None,
+                        column_id: None,
+                    },
+                ],
+            }),
+        };
+
+        let err = QueryEngine.execute(&ctx, &plan).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        assert!(err.message.contains("expected column id"));
     }
 
     #[test]

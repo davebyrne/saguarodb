@@ -121,6 +121,7 @@ Aggregate execution follows planner return-type rules: `COUNT` returns `0` for e
 `INSERT`:
 
 - Build row values in table column order.
+- Validate runtime values match destination column types. `NULL` is accepted at this step and checked by nullability validation.
 - Validate non-null constraints.
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.

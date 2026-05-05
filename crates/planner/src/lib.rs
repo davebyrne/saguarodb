@@ -148,6 +148,29 @@ mod tests {
     }
 
     #[test]
+    fn binder_types_null_in_list_from_list_values() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where null in (1, 2)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(BoundExpr::InList { ref expr, nullable: true, .. })
+                if matches!(
+                    expr.as_ref(),
+                    BoundExpr::Literal {
+                        value: Value::Null,
+                        data_type: DataType::Integer,
+                        nullable: true
+                    }
+                )
+        ));
+    }
+
+    #[test]
     fn binder_rejects_composite_primary_key_for_v1() {
         let catalog = catalog_with_users();
         let stmt =
