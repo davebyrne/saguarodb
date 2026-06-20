@@ -337,6 +337,7 @@ pub enum ClientMessage {
 
 /// Outgoing message to a client (encoded by the protocol layer)
 pub enum ServerMessage {
+    SslAccepted,                // single 'S' byte
     SslRejected,                // single 'N' byte
     AuthenticationOk,
     ParameterStatus { key: String, value: String },
@@ -418,7 +419,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 
 ### PostgreSQL Wire Encoding Details
 
-All integer fields are big-endian. All server messages except SSL rejection are one-byte tag plus a four-byte length that includes the length field but not the tag. SSL rejection is exactly the single byte `N`.
+All integer fields are big-endian. All server messages except the SSL negotiation reply are one-byte tag plus a four-byte length that includes the length field but not the tag. The SSL negotiation reply is exactly a single byte: `S` for acceptance, `N` for rejection.
 
 - Client `SSLRequest`: startup-style packet with length `8` and code `80877103`.
 - Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; V1 reads `user` and optional `database`.

@@ -22,6 +22,7 @@ pub enum ClientMessage {
 }
 
 pub enum ServerMessage {
+    SslAccepted,
     SslRejected,
     AuthenticationOk,
     ParameterStatus { key: String, value: String },
@@ -65,7 +66,10 @@ pub trait ConnectionState: Send {
 
 ## Startup Flow
 
-1. Client may send SSLRequest. Server responds with `SslRejected` (`N` byte).
+1. Client may send SSLRequest. The protocol layer decodes it and encodes the
+   negotiation reply the server selects: `SslAccepted` (`S` byte) when the
+   server has TLS configured, otherwise `SslRejected` (`N` byte). The protocol
+   layer does not perform the TLS handshake; `server` owns it.
 2. Client sends StartupMessage.
 3. Server sends:
    - `AuthenticationOk`
@@ -118,7 +122,7 @@ V1 sends text format for all columns.
 
 ## PostgreSQL Wire Encoding Details
 
-All integer fields are big-endian. All server messages except `SslRejected` are one-byte tag plus a four-byte length that includes the length field but not the tag. `SslRejected` is exactly the single byte `b'N'`.
+All integer fields are big-endian. All server messages except `SslAccepted` and `SslRejected` are one-byte tag plus a four-byte length that includes the length field but not the tag. `SslAccepted` is exactly the single byte `b'S'` and `SslRejected` is exactly the single byte `b'N'`.
 
 Client messages:
 
@@ -150,13 +154,15 @@ Text value encoding:
 - Prepared statements.
 - Binary row format.
 - Authentication.
-- TLS beyond explicit SSL rejection.
+- Performing the TLS handshake itself. The protocol layer only encodes the
+  `SslAccepted`/`SslRejected` negotiation byte; `server` owns the handshake.
 - CancelRequest.
 - COPY.
 
 ## Acceptance Tests
 
-- Decodes SSLRequest and encodes single-byte `N`.
+- Decodes SSLRequest and encodes single-byte `N` for `SslRejected`.
+- Encodes single-byte `S` for `SslAccepted`.
 - Decodes StartupMessage and emits expected startup responses.
 - Decodes simple Query.
 - Encodes RowDescription for all v1 data types with PostgreSQL OIDs, text format, and `table_oid = 0`.

@@ -104,6 +104,12 @@ mod tests {
     }
 
     #[test]
+    fn encodes_ssl_accepted_as_single_s_byte() {
+        let codec = PostgresCodec::new();
+        assert_eq!(codec.encode(&ServerMessage::SslAccepted), b"S".to_vec());
+    }
+
+    #[test]
     fn startup_state_emits_authentication_parameters_and_ready() {
         let mut state = PostgresConnectionState::new();
         let messages = state

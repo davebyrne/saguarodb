@@ -13,6 +13,7 @@ pub enum ClientMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerMessage {
+    SslAccepted,
     SslRejected,
     AuthenticationOk,
     ParameterStatus {

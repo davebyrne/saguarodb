@@ -133,6 +133,7 @@ impl ProtocolCodec for PostgresCodec {
 
     fn encode(&self, msg: &ServerMessage) -> Vec<u8> {
         match msg {
+            ServerMessage::SslAccepted => b"S".to_vec(),
             ServerMessage::SslRejected => b"N".to_vec(),
             ServerMessage::AuthenticationOk => {
                 let mut body = Vec::new();
