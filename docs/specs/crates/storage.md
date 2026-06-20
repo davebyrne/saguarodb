@@ -102,6 +102,16 @@ Page body:
 
 Serialization uses catalog `TableSchema` column order.
 
+## Heap Page Store
+
+`HeapPageStore` is the mutable page home for in-place dirty-page flushing. It
+implements `buffer::PageStore` over one file per table at `<data>/heap/<file_id>.heap`,
+storing page `n` at byte offset `n * PAGE_SIZE` with positioned reads/writes.
+`load_page` returns a complete page or `None` (missing file or beyond-EOF / short
+tail); `write_page` writes in place without fsync; `sync_all` fsyncs all open heap
+files and the directory. It is introduced for the redo-WAL/flushing model and
+becomes the buffer pool's backing store when recovery and checkpoint adopt it.
+
 ## WAL Interaction
 
 Normal storage and schema operations append logical WAL records before mutating pages or table metadata:

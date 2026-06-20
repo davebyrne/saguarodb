@@ -428,6 +428,7 @@ dependencies = [
  "saguarodb-wal",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

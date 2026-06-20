@@ -1,11 +1,13 @@
 mod codec;
 mod engine;
+mod heap;
 mod page;
 mod recovery;
 mod traits;
 
 pub use codec::{decode_row, encode_row};
 pub use engine::{PageBackedStorageEngine, StorageMode};
+pub use heap::HeapPageStore;
 pub use traits::{RecoveryOperations, RowIterator, SchemaOperations, StorageEngine};
 
 #[cfg(test)]

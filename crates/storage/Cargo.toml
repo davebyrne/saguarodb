@@ -11,3 +11,6 @@ wal = { package = "saguarodb-wal", path = "../wal" }
 crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -35,6 +35,11 @@ pub trait PageLoader: Send + Sync {
     fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>>;
 }
 
+pub trait PageStore: PageLoader {
+    fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()>;
+    fn sync_all(&self) -> Result<()>;
+}
+
 pub trait BufferPool: Send + Sync {
     fn read_page(&self, file_id: FileId, page_num: PageNum) -> Result<PageReadGuard>;
     fn write_page(&self, file_id: FileId, page_num: PageNum, txn_id: u64) -> Result<PageWriteGuard>;
@@ -50,6 +55,8 @@ pub trait BufferPool: Send + Sync {
 `MemoryBufferPool::new(frame_count, flush_policy, page_loader)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageLoader>`. `read_page` first checks resident frames; on a miss it calls `page_loader.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
 
 In production, the server supplies a `SnapshotPageLoader` that wraps `SnapshotManager::current_table_pages(file_id as TableId)` and returns the matching `page_num` when present. The `buffer` crate defines only the trait; it does not depend on `snapshot`.
+
+`PageStore` extends `PageLoader` with `write_page` and `sync_all` for in-place dirty-page flushing. `storage::HeapPageStore` implements it over one file per table (`<data>/heap/<file_id>.heap`, page `n` at byte offset `n * PAGE_SIZE`, positioned I/O). `write_page` does not fsync; `sync_all` fsyncs all open heap files and the directory. It is the mutable page home for the redo-WAL/flushing model; the buffer pool and server adopt it as the backing store when that cutover lands.
 
 `MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageLoader` returning `Ok(None)`.
 
