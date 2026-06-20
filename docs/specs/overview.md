@@ -261,7 +261,7 @@ pub struct StatementContext {
 /// trait signature.
 pub struct PageFlushInfo {
     pub dirty_txn_id: u64,
-    pub page_lsn: Option<Lsn>,  // checkpoint passes None (WAL already flushed); eviction-steal will pass the page-LSN.
+    pub page_lsn: Option<Lsn>,  // reserved; checkpoint and eviction-steal pass None (a committed page is already WAL-durable).
 }
 
 /// Abstraction so the buffer pool can decide whether a dirty page is safe to
@@ -308,7 +308,7 @@ pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
 All layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves names to IDs and assigns physical slot positions via the catalog. The logical planner, physical planner, executor, and storage engine never do name lookups — they work exclusively with stable IDs and slot indices.
 
-`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; checkpoint uses it via `flush_committed_pages` to flush dirty pages in place to the heap. Eviction-flush-on-steal (flushing during eviction to remove the in-RAM working-set ceiling) is a planned follow-up.
+`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; checkpoint uses it via `flush_committed_pages` to flush dirty pages in place to the heap, and eviction-flush-on-steal uses it to steal committed dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
 
 ## 3. Wire Protocol
 
@@ -1247,7 +1247,7 @@ pub trait PageLoader: Send + Sync {
 
 On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` is inserted as a clean frame; `None` returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`; loader I/O failures propagate as `ErrorKind::Io`. In production, the server supplies a `HeapPageStore` (a `PageStore`) that reads page `n` of table `file_id` from `data/heap/<file_id>.heap`. `MemoryBufferPool::empty(frame_count)` is a test helper using a never-flush policy and a no-op store that returns `Ok(None)`.
 
-- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_committed_pages` (checkpoint) consults it per dirty page: V1's `WalFlushPolicy` admits committed (or txn 0) pages whose page-LSN is WAL-durable. The same policy will gate eviction-flush-on-steal when that lands.
+- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_committed_pages` (checkpoint) consults it per dirty page: V1's `WalFlushPolicy` admits committed (or txn 0) pages whose page-LSN is WAL-durable. The same policy gates eviction-flush-on-steal.
 
 ### Eviction: Clock Algorithm (Single-Bit)
 
@@ -1255,17 +1255,16 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 - Each frame has a reference bit, set on access
 - On sweep: if bit is 1, clear to 0 and skip. If bit is 0 and unpinned, check dirty flag.
 - **If clean:** evict immediately. The page can be re-read from its heap file if needed later.
-- **If dirty:** skip. V1 does not yet evict dirty pages; they stay in memory until the checkpoint flushes them to the heap and clears their dirty flag. (Eviction-flush-on-steal is a planned follow-up.)
-- If all frames are dirty and pinned, the buffer pool returns an error (out of frames). This is the V1 memory limitation.
+- **If dirty:** when stealing is enabled, steal it if the `FlushPolicy` admits it (committed): flush the page to its heap home outside the pool lock, then evict. A page the policy refuses (uncommitted), or any dirty page when stealing is off, is skipped. The server enables stealing only after recovery.
+- If no frame can be freed — every frame is pinned, or every unpinned frame is dirty and unflushable (uncommitted, or stealing disabled during recovery) — the buffer pool returns an out-of-frames error.
 
-### V1 Limitation: Working Set Must Fit in Buffer Pool
+### Working Set and the Buffer Pool
 
-Between checkpoints, all dirty pages must remain in memory. With V1's single-writer autocommit:
+During normal operation the working set is not bound by the pool size: eviction-flush-on-steal writes committed dirty pages to the heap and evicts them, so a large dataset spills rather than erroring. With V1's single-writer autocommit:
 - Each statement dirtys a modest number of pages
-- After commit, pages are dirty but committed — they stay in memory until the next checkpoint
-- Checkpoints flush dirty pages to the heap and clear their dirty flags, making those frames eligible for eviction again
-- The buffer pool default (1024 frames = 8MB) is adequate for small-to-medium datasets
-- For larger datasets, increase the buffer pool size or checkpoint more frequently
+- After commit, pages are dirty but committed — they stay in memory until a checkpoint flushes them in place or an eviction steals them
+- The buffer pool default (1024 frames = 8MB) keeps a small-to-medium working set resident; larger sets spill to the heap
+- **Recovery** still requires its redo working set to fit (stealing is off until recovery completes); too small a buffer fails loudly
 
 ### Concurrency
 
@@ -1321,11 +1320,10 @@ This gives the invariants:
 3. Checkpoint cost is O(pages changed), not O(database size).
 
 **Trade-offs:**
-- v1 keeps dirty pages resident between checkpoints (eviction is clean-only), so the working set must fit in the buffer pool until eviction-flush-on-steal lands.
+- Normal operation spills committed dirty pages to the heap via eviction-flush-on-steal; recovery still requires its redo working set to fit in the buffer pool.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
 **Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
-- **Eviction-flush-on-steal** — flush committed, WAL-durable dirty pages during eviction to remove the in-RAM working-set ceiling. The `FlushPolicy` + PageLSN machinery is already in place.
 - **MVCC** — the reserved row-format version byte carries future `xmin`/`xmax`; the redo WAL is the prerequisite.
 
 ### WAL Record Format
@@ -1405,7 +1403,7 @@ pub trait WalManager: Send + Sync {
 
 One rule ensures redo-only recovery is correct:
 
-**In-place page flushing.** Dirty committed pages are written back to their heap file by the checkpoint (and, in a future step, by eviction). Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo.
+**In-place page flushing.** Dirty committed pages are written back to their heap file by the checkpoint and by eviction-steal. Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo.
 
 The WAL is the source of durability between checkpoints:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
@@ -1524,7 +1522,7 @@ impl PageBackedStorageEngine {
 4. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them), DDL via `RecoveryOperations`.
 5. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small for the working set), then `rebuild_directories`.
 6. If records were replayed: checkpoint to persist the redone state and advance the boundary.
-7. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
+7. Enable eviction-flush-on-steal (`buffer.enable_stealing()`), then switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
 **Idempotency:** PageLSN gating applies each record's effect at most once, so replay is safe even when the heap already reflects some post-boundary work (e.g. a partially completed prior checkpoint).
 
@@ -1704,5 +1702,4 @@ Loaded from command-line args only in V1. No environment-variable or config-file
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **INSERT ... SELECT:** `InsertSource::Query` variant exists in the AST. The logical/physical plans already model inserts as `source: Box<LogicalPlan>` / `source: Box<PhysicalPlan>`, so this can be enabled later by binding query sources.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.
-- **Eviction-flush-on-steal:** V1 flushes dirty pages only at checkpoint, so the working set must fit in the buffer pool between checkpoints. A follow-up flushes committed, WAL-durable dirty pages during eviction (using the existing `FlushPolicy` + PageLSN machinery), removing the memory limitation without changing the `WalManager` or `BufferPool` traits.
 - **Additional Data Types:** `DataType` and `Value` enums are extensible. Row serialization format supports new types via the null bitmap + column data pattern.

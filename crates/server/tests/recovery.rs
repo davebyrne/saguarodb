@@ -223,6 +223,43 @@ async fn recovery_fails_loudly_when_buffer_too_small() {
     assert!(err.message.contains("buffer pool is too small"));
 }
 
+#[tokio::test]
+async fn committed_pages_spill_to_heap_under_buffer_pressure() {
+    let dir = tempfile::tempdir().unwrap();
+    // A small pool with checkpoints effectively disabled: the committed working
+    // set must exceed the pool, so eviction-flush-on-steal spills pages to the
+    // heap during normal operation rather than erroring out of frames.
+    let config = saguarodb_server::config::Config {
+        data_dir: dir.path().to_path_buf(),
+        port: 0,
+        buffer_pool_frames: 4,
+        checkpoint_every_n_commits: 1_000_000,
+        checkpoint_wal_bytes: 1 << 30,
+        shutdown_timeout_ms: 1_000,
+    };
+    let app = saguarodb_server::recovery::open_app(config).unwrap();
+    app.query_service
+        .execute_sql("create table big (id integer primary key, payload text)")
+        .unwrap();
+
+    // Each row is large enough to fill its own page, so ten rows need far more
+    // than four frames.
+    let payload = "x".repeat(7000);
+    for id in 1..=10 {
+        app.query_service
+            .execute_sql(&format!(
+                "insert into big (id, payload) values ({id}, '{payload}')"
+            ))
+            .unwrap();
+    }
+
+    let result = app
+        .query_service
+        .execute_sql("select id from big order by id")
+        .unwrap();
+    assert_eq!(result.row_count(), 10);
+}
+
 /// Overwrite the first page of every heap file with garbage, simulating a torn
 /// write that leaves the on-disk page corrupt.
 fn corrupt_heap_pages(data_dir: &Path) {

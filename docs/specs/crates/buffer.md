@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`buffer` manages in-memory page frames, page latches, dirty tracking, statement rollback, and in-place dirty-page flushing to a `PageStore`. V1 does not yet evict dirty pages; they are made clean by the checkpoint that flushes them to the heap.
+`buffer` manages in-memory page frames, page latches, dirty tracking, statement rollback, and in-place dirty-page flushing to a `PageStore`. Eviction can steal (flush, then evict) committed dirty pages once stealing is enabled, so the committed working set is not bound by the pool size during normal operation.
 
 ## Depends On
 
@@ -17,7 +17,7 @@
 - Page size: 8192 bytes.
 - Frames are addressed by `(FileId, PageNum)`.
 - The buffer pool reads pages from the heap files through an injected `PageStore`.
-- Dirty pages remain in memory until a checkpoint flushes them to the heap, or until rollback.
+- Dirty pages remain in memory until a checkpoint flushes them to the heap, an eviction steals them, or rollback discards them.
 
 ## Public API
 
@@ -51,10 +51,11 @@ pub trait BufferPool: Send + Sync {
     fn commit(&self, txn_id: u64) -> Result<()>;
     fn flush_committed_pages(&self) -> Result<()>;
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
+    fn enable_stealing(&self);
 }
 ```
 
-`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`).
+`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it only after recovery completes.
 
 `MemoryBufferPool::new(frame_count, flush_policy, page_loader)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageLoader>`. `read_page` first checks resident frames; on a miss it calls `page_loader.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
 
@@ -135,8 +136,11 @@ This preserves committed in-memory changes from earlier transactions that have n
 V1 uses clock eviction:
 
 - Clean, unpinned pages may be evicted (re-read from the heap on demand).
-- Dirty pages are not evicted in v1: `flush_committed_pages` (checkpoint) is the only path that writes dirty pages to the heap. Eviction-flush-on-steal (using `FlushPolicy` during eviction to remove the in-RAM working-set ceiling) is deferred.
-- If all candidate frames are dirty or pinned, return a storage/buffer error.
+- When stealing is enabled (`enable_stealing`), a committed dirty unpinned page that the `FlushPolicy` admits is *stolen*: flushed to its heap home, then evicted. The flush write happens outside the pool lock — the victim is pinned as a reservation, written, then evicted on re-lock if no reader pinned it meanwhile (otherwise another victim is tried). This removes the in-RAM working-set ceiling during normal operation. Because a committed page's WAL is already flushed through its commit record, a committed page is always WAL-durable, so the policy needs only the committed check.
+- A dirty page the policy refuses (uncommitted), or any pinned page, is skipped.
+- If no frame can be freed (all pinned, or all dirty and unflushable), return a storage/buffer error.
+
+Stealing is off until `enable_stealing`. The server enables it only after recovery, so recovery's preload and directory rebuild see the full working set and a too-small buffer fails loudly instead of silently spilling.
 
 ## Checkpoint Interaction
 
@@ -144,12 +148,12 @@ Checkpoint holds the global write guard, so no statement mutates pages concurren
 
 ## Invariants
 
-- No dirty page is evicted in v1.
-- A page is never written to the heap before its redo records are WAL-durable (`flush_committed_pages` runs after `wal.flush()` at checkpoint).
+- Uncommitted dirty pages are never written to the heap; only committed (hence WAL-durable) dirty pages are stolen.
+- A page is never written to the heap before its redo records are WAL-durable: checkpoint flushes after `wal.flush()`, and eviction-steal only flushes committed pages.
 - Rollback restores page state to exactly what it was before the failed transaction first touched each page, and re-arms `needs_fpi`.
 - New pages from failed transactions are not visible after rollback.
 - Commit does not flush pages; it only discards rollback metadata.
-- Checkpoint is the only operation that marks committed dirty pages clean.
+- A committed dirty page is marked clean only when it is flushed to the heap — in place by checkpoint, or immediately before eviction by a steal.
 
 ## Acceptance Tests
 
@@ -157,6 +161,8 @@ Checkpoint holds the global write guard, so no statement mutates pages concurren
 - Rollback restores a page that was already dirty from a prior committed txn.
 - Rollback invalidates pages allocated by the failed txn.
 - Commit discards before-images but leaves pages dirty.
-- Dirty pages are skipped by eviction.
+- A committed dirty page is stolen (flushed then evicted) when stealing is enabled.
+- A dirty page the policy refuses, or any dirty page when stealing is disabled, is not evicted (error when no other victim).
+- A committed working set larger than the pool spills to the heap and reads back correctly.
 - `mark_all_clean` makes previously dirty pages evictable.
 - `iter_pages` returns in-memory page data for the directory rebuild.

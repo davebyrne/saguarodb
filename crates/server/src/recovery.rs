@@ -103,6 +103,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
     if replay_applied {
         run_checkpoint(&components)?;
     }
+    // Recovery (preload, redo, directory rebuild) ran with stealing disabled so a
+    // too-small buffer fails loudly instead of silently dropping pages. Normal
+    // operation may now flush+evict committed dirty pages to bound memory use.
+    components.buffer_pool.enable_stealing();
     components.storage.set_mode(StorageMode::Normal)?;
 
     Ok(AppState {

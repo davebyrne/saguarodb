@@ -32,8 +32,8 @@ This directory decomposes the overview spec into crate-level contracts for v1 im
 - Cargo package names use the `saguarodb-*` prefix, but internal `Cargo.toml` dependencies use short aliases such as `common`, `storage`, and `wal`.
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.
-- V1 does not yet evict dirty pages; they become clean after the checkpoint flushes them in place to the heap. Eviction-flush-on-steal is a follow-up.
-- V1 uses a physiological redo WAL with per-page LSNs and in-place heap files. Eviction-flush-on-steal and MVCC are future work behind existing traits.
+- Eviction can steal committed dirty pages (flush, then evict) once stealing is enabled after recovery; checkpoint also flushes dirty pages in place to the heap.
+- V1 uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal. MVCC is future work behind existing traits.
 
 ## V1 Test Strategy
 

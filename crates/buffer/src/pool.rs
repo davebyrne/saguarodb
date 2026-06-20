@@ -116,6 +116,11 @@ pub trait BufferPool: Send + Sync {
     /// is marked dirty under the recovery txn id (0) so it is flushed by the
     /// post-recovery checkpoint.
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
+
+    /// Allow eviction to flush+evict committed dirty pages (steal). The server
+    /// enables this only after recovery, so recovery's directory rebuild sees the
+    /// full working set and a too-small buffer still fails loudly.
+    fn enable_stealing(&self);
 }
 
 pub struct MemoryBufferPool {
@@ -123,6 +128,9 @@ pub struct MemoryBufferPool {
     flush_policy: Box<dyn FlushPolicy>,
     store: Arc<dyn PageStore>,
     state: Mutex<PoolState>,
+    /// When true, eviction may flush a committed dirty page to its home and evict
+    /// it (steal). Off during recovery so the directory rebuild sees all pages.
+    stealing: AtomicBool,
 }
 
 impl MemoryBufferPool {
@@ -136,6 +144,7 @@ impl MemoryBufferPool {
             flush_policy,
             store,
             state: Mutex::new(PoolState::default()),
+            stealing: AtomicBool::new(false),
         }
     }
 
@@ -153,19 +162,84 @@ impl MemoryBufferPool {
         Some(read_guard(file_id, page_num, frame))
     }
 
+    /// Run `attempt` under the pool lock. `Ok(Some)` succeeds; `Ok(None)` means the
+    /// pool is full, so free one frame (flushing a committed dirty victim outside
+    /// the lock when stealing is enabled) and retry.
+    fn with_room<T>(
+        &self,
+        mut attempt: impl FnMut(&mut PoolState) -> Result<Option<T>>,
+    ) -> Result<T> {
+        loop {
+            let outcome = {
+                let mut state = self.state.lock();
+                attempt(&mut state)?
+            };
+            match outcome {
+                Some(value) => return Ok(value),
+                None => self.make_room()?,
+            }
+        }
+    }
+
+    /// Free one frame. A clean unpinned frame is dropped under the lock; a
+    /// committed dirty victim (stealing enabled and the flush policy admits it)
+    /// is flushed to its home outside the lock, then evicted.
+    fn make_room(&self) -> Result<()> {
+        loop {
+            let victim = {
+                let mut state = self.state.lock();
+                if state.frames.len() < self.frame_count {
+                    return Ok(());
+                }
+                match state.reclaim_victim(
+                    self.stealing.load(Ordering::Acquire),
+                    self.flush_policy.as_ref(),
+                ) {
+                    ReclaimOutcome::FreedClean => return Ok(()),
+                    ReclaimOutcome::ReservedDirty(frame) => frame,
+                    ReclaimOutcome::NoVictim => {
+                        return Err(Self::storage_internal_error(
+                            "no unpinned frame available for eviction",
+                        ));
+                    }
+                }
+            };
+
+            // Flush the reserved victim to its home without holding the lock. No
+            // writer runs concurrently (the concurrency controller serializes the
+            // single writer against readers), so this committed page's bytes are
+            // stable during the write; a concurrent reader may pin it, detected
+            // below. The reservation pin keeps another eviction from racing it.
+            let data = victim.data.read().clone();
+            self.store
+                .write_page(victim.file_id, victim.page_num, &data)?;
+
+            let mut state = self.state.lock();
+            victim.unpin(); // release the flush reservation
+            if victim.pin_count.load(Ordering::Acquire) == 0 {
+                victim.mark_clean();
+                state.remove_frame((victim.file_id, victim.page_num));
+                return Ok(());
+            }
+            // A reader pinned the victim during the flush; try another frame.
+        }
+    }
+
     fn insert_loaded_read_page(
         &self,
         file_id: FileId,
         page_num: PageNum,
         data: PageData,
     ) -> Result<PageReadGuard> {
-        let frame = {
-            let mut state = self.state.lock();
-            let frame = state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
+        let frame = self.with_room(|state| {
+            let Some(frame) = state.get_or_insert_clean(self.frame_count, file_id, page_num, &data)
+            else {
+                return Ok(None);
+            };
             state.advance_next_page_num(file_id, page_num);
             frame.pin();
-            frame
-        };
+            Ok(Some(frame))
+        })?;
         Ok(read_guard(file_id, page_num, frame))
     }
 
@@ -176,13 +250,17 @@ impl MemoryBufferPool {
         txn_id: u64,
         data: PageData,
     ) -> Result<Arc<Frame>> {
-        let mut state = self.state.lock();
-        let frame = state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
-        state.advance_next_page_num(file_id, page_num);
-        state.record_before_image(txn_id, file_id, page_num, &frame);
-        frame.mark_dirty(txn_id);
-        frame.pin();
-        Ok(frame)
+        self.with_room(|state| {
+            let Some(frame) = state.get_or_insert_clean(self.frame_count, file_id, page_num, &data)
+            else {
+                return Ok(None);
+            };
+            state.advance_next_page_num(file_id, page_num);
+            state.record_before_image(txn_id, file_id, page_num, &frame);
+            frame.mark_dirty(txn_id);
+            frame.pin();
+            Ok(Some(frame))
+        })
     }
 
     fn insert_clean_page_if_absent(
@@ -191,10 +269,16 @@ impl MemoryBufferPool {
         page_num: PageNum,
         data: PageData,
     ) -> Result<()> {
-        let mut state = self.state.lock();
-        state.insert_frame_if_absent(self.frame_count, file_id, page_num, data)?;
-        state.advance_next_page_num(file_id, page_num);
-        Ok(())
+        self.with_room(|state| {
+            if state
+                .get_or_insert_clean(self.frame_count, file_id, page_num, &data)
+                .is_none()
+            {
+                return Ok(None);
+            }
+            state.advance_next_page_num(file_id, page_num);
+            Ok(Some(()))
+        })
     }
 
     fn prepare_write_frame(
@@ -252,17 +336,12 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard> {
-        let (page_num, frame) = {
-            let mut state = self.state.lock();
+        let (page_num, frame) = self.with_room(|state| {
+            if state.frames.len() >= self.frame_count {
+                return Ok(None);
+            }
             let page_num = state.next_page_num(file_id);
-            let frame = state.insert_frame(
-                self.frame_count,
-                file_id,
-                page_num,
-                PageData::default(),
-                true,
-                false,
-            )?;
+            let frame = state.insert_fresh_frame(file_id, page_num)?;
             frame.mark_dirty(txn_id);
             state.advance_next_page_num(file_id, page_num);
             state
@@ -272,8 +351,8 @@ impl BufferPool for MemoryBufferPool {
                 .new_pages
                 .push((file_id, page_num));
             frame.pin();
-            (page_num, frame)
-        };
+            Ok(Some((page_num, frame)))
+        })?;
         Ok(write_guard(file_id, page_num, frame))
     }
 
@@ -353,6 +432,10 @@ impl BufferPool for MemoryBufferPool {
         Ok(())
     }
 
+    fn enable_stealing(&self) {
+        self.stealing.store(true, Ordering::Release);
+    }
+
     fn flush_committed_pages(&self) -> Result<()> {
         // Collect dirty frames under the lock, then do I/O without holding it.
         let dirty: Vec<Arc<Frame>> = {
@@ -421,62 +504,47 @@ impl PoolState {
             .or_insert(next);
     }
 
-    fn insert_frame(
+    /// Return the resident frame for `(file_id, page_num)`, or insert `data` as a
+    /// clean frame if there is room. `None` means the pool is full; the caller
+    /// frees a frame and retries. A resident page is returned unchanged (bytes,
+    /// dirty state, and rollback metadata are left intact).
+    fn get_or_insert_clean(
         &mut self,
         frame_count: usize,
         file_id: FileId,
         page_num: PageNum,
-        data: PageData,
-        dirty: bool,
-        needs_fpi: bool,
-    ) -> Result<Arc<Frame>> {
+        data: &PageData,
+    ) -> Option<Arc<Frame>> {
+        let key = (file_id, page_num);
+        if let Some(frame) = self.frames.get(&key) {
+            frame.reference_bit.store(true, Ordering::Release);
+            return Some(frame.clone());
+        }
+        if self.frames.len() >= frame_count {
+            return None;
+        }
+        let frame = Arc::new(Frame::new(file_id, page_num, data.clone(), false, true));
+        self.frames.insert(key, frame.clone());
+        self.clock_order.push(key);
+        Some(frame)
+    }
+
+    /// Insert a freshly allocated dirty page, rejecting an already-resident key.
+    /// The caller guarantees there is room before allocating the page number.
+    fn insert_fresh_frame(&mut self, file_id: FileId, page_num: PageNum) -> Result<Arc<Frame>> {
         let key = (file_id, page_num);
         if self.frames.contains_key(&key) {
             return Err(DbError::internal(format!(
                 "page already resident: file_id={file_id}, page_num={page_num}"
             )));
         }
-
-        if frame_count == 0 {
-            return Err(MemoryBufferPool::storage_internal_error(
-                "buffer pool has zero frames",
-            ));
-        }
-
-        if self.frames.len() >= frame_count {
-            self.evict_one_clean_unpinned()?;
-        }
-
-        let frame = Arc::new(Frame::new(file_id, page_num, data, dirty, needs_fpi));
-        self.frames.insert(key, frame.clone());
-        self.clock_order.push(key);
-        Ok(frame)
-    }
-
-    fn insert_frame_if_absent(
-        &mut self,
-        frame_count: usize,
-        file_id: FileId,
-        page_num: PageNum,
-        data: PageData,
-    ) -> Result<Arc<Frame>> {
-        let key = (file_id, page_num);
-        if let Some(frame) = self.frames.get(&key) {
-            frame.reference_bit.store(true, Ordering::Release);
-            return Ok(frame.clone());
-        }
-
-        if frame_count == 0 {
-            return Err(MemoryBufferPool::storage_internal_error(
-                "buffer pool has zero frames",
-            ));
-        }
-
-        if self.frames.len() >= frame_count {
-            self.evict_one_clean_unpinned()?;
-        }
-
-        let frame = Arc::new(Frame::new(file_id, page_num, data, false, true));
+        let frame = Arc::new(Frame::new(
+            file_id,
+            page_num,
+            PageData::default(),
+            true,
+            false,
+        ));
         self.frames.insert(key, frame.clone());
         self.clock_order.push(key);
         Ok(frame)
@@ -485,10 +553,20 @@ impl PoolState {
     fn remove_frame(&mut self, key: PageKey) {
         self.frames.remove(&key);
         self.clock_order.retain(|candidate| *candidate != key);
+        self.fix_clock_hand();
+    }
+
+    fn advance_clock_hand(&mut self) {
         if !self.clock_order.is_empty() {
-            self.clock_hand %= self.clock_order.len();
-        } else {
+            self.clock_hand = (self.clock_hand + 1) % self.clock_order.len();
+        }
+    }
+
+    fn fix_clock_hand(&mut self) {
+        if self.clock_order.is_empty() {
             self.clock_hand = 0;
+        } else {
+            self.clock_hand %= self.clock_order.len();
         }
     }
 
@@ -511,43 +589,63 @@ impl PoolState {
             });
     }
 
-    fn evict_one_clean_unpinned(&mut self) -> Result<()> {
-        let candidate_count = self.clock_order.len();
-        for _ in 0..candidate_count.saturating_mul(2) {
+    /// Clock-sweep for an eviction victim. A clean unpinned frame is removed
+    /// immediately (`FreedClean`). When stealing is enabled, a committed dirty
+    /// unpinned frame is pinned and returned (`ReservedDirty`) so the caller can
+    /// flush it outside the lock before evicting. `NoVictim` means every frame is
+    /// pinned or holds dirty data the flush policy refuses.
+    fn reclaim_victim(&mut self, stealing: bool, flush_policy: &dyn FlushPolicy) -> ReclaimOutcome {
+        let sweep_limit = self.clock_order.len().saturating_mul(2);
+        for _ in 0..sweep_limit {
             if self.clock_order.is_empty() {
                 break;
             }
-
             self.clock_hand %= self.clock_order.len();
             let key = self.clock_order[self.clock_hand];
-            let Some(frame) = self.frames.get(&key) else {
+            let Some(frame) = self.frames.get(&key).cloned() else {
                 self.clock_order.remove(self.clock_hand);
+                self.fix_clock_hand();
                 continue;
             };
 
-            if frame.is_evictable() {
-                if frame.reference_bit.swap(false, Ordering::AcqRel) {
-                    self.clock_hand = (self.clock_hand + 1) % self.clock_order.len();
-                    continue;
-                }
-
-                self.frames.remove(&key);
-                self.clock_order.remove(self.clock_hand);
-                if !self.clock_order.is_empty() {
-                    self.clock_hand %= self.clock_order.len();
-                } else {
-                    self.clock_hand = 0;
-                }
-                return Ok(());
+            if frame.pin_count.load(Ordering::Acquire) != 0 {
+                self.advance_clock_hand();
+                continue;
+            }
+            if frame.reference_bit.swap(false, Ordering::AcqRel) {
+                self.advance_clock_hand();
+                continue;
             }
 
-            self.clock_hand = (self.clock_hand + 1) % self.clock_order.len();
-        }
+            if !frame.is_dirty() {
+                self.remove_frame(key);
+                return ReclaimOutcome::FreedClean;
+            }
 
-        Err(MemoryBufferPool::storage_internal_error(
-            "no clean unpinned frame available for eviction",
-        ))
+            if stealing {
+                let info = PageFlushInfo {
+                    dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
+                    page_lsn: None,
+                };
+                if flush_policy.can_flush(&info) {
+                    frame.pin(); // reserve across the unlocked flush
+                    return ReclaimOutcome::ReservedDirty(frame);
+                }
+            }
+            self.advance_clock_hand();
+        }
+        ReclaimOutcome::NoVictim
     }
+}
+
+/// Outcome of a clock-sweep victim search (see `PoolState::reclaim_victim`).
+enum ReclaimOutcome {
+    /// A clean frame was removed under the lock; room is available.
+    FreedClean,
+    /// A committed dirty frame was pinned for an out-of-lock flush, then eviction.
+    ReservedDirty(Arc<Frame>),
+    /// No frame can be evicted (all pinned or unflushable dirty).
+    NoVictim,
 }
 
 #[derive(Default)]
@@ -625,10 +723,6 @@ impl Frame {
 
     fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Acquire)
-    }
-
-    fn is_evictable(&self) -> bool {
-        !self.is_dirty() && self.pin_count.load(Ordering::Acquire) == 0
     }
 }
 
@@ -812,15 +906,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_frame_rejects_resident_page_key() {
+    fn insert_fresh_frame_rejects_resident_page_key() {
         let mut state = PoolState::default();
-        state
-            .insert_frame(8, 1, 0, PageData::default(), false, true)
-            .unwrap();
-        let mut replacement = PageData::default();
-        replacement.0[0] = 9;
+        state.insert_fresh_frame(1, 0).unwrap();
 
-        let err = match state.insert_frame(8, 1, 0, replacement, true, false) {
+        let err = match state.insert_fresh_frame(1, 0) {
             Ok(_) => panic!("expected resident page rejection"),
             Err(err) => err,
         };
@@ -1059,6 +1149,120 @@ mod tests {
         let err = pool.flush_committed_pages().unwrap_err();
         assert_eq!(err.kind, ErrorKind::Storage);
         assert!(store.writes.lock().unwrap().is_empty());
+    }
+
+    /// A `PageStore` that both records writes and serves them back, so eviction
+    /// spills can be read back.
+    #[derive(Default)]
+    struct MemStore {
+        pages: Mutex<HashMap<(FileId, PageNum), PageData>>,
+    }
+
+    impl PageLoader for MemStore {
+        fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .get(&(file_id, page_num))
+                .cloned())
+        }
+    }
+
+    impl PageStore for MemStore {
+        fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()> {
+            self.pages
+                .lock()
+                .unwrap()
+                .insert((file_id, page_num), data.clone());
+            Ok(())
+        }
+
+        fn sync_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stealing_flushes_committed_dirty_page_on_eviction() {
+        let store = Arc::new(MemStore::default());
+        let pool = MemoryBufferPool::new(1, Box::new(FlushAll), store.clone());
+        pool.enable_stealing();
+
+        {
+            let mut page = pool.new_page(1, 7).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(7).unwrap();
+
+        // Allocating a second page in a one-frame pool must steal page (1, 0).
+        {
+            let mut page = pool.new_page(1, 8).unwrap();
+            page.data_mut()[0] = 99;
+        }
+        pool.commit(8).unwrap();
+
+        assert!(store.pages.lock().unwrap().contains_key(&(1, 0)));
+        let restored = pool.read_page(1, 0).unwrap();
+        assert_eq!(restored.data()[0], 42);
+    }
+
+    #[test]
+    fn stealing_cannot_evict_dirty_page_the_policy_refuses() {
+        let store = Arc::new(MemStore::default());
+        let pool = MemoryBufferPool::new(1, Box::new(NeverFlush), store.clone());
+        pool.enable_stealing();
+
+        {
+            let mut page = pool.new_page(1, 7).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(7).unwrap();
+
+        // The dirty page is uncommitted from the policy's view, so it cannot be
+        // stolen; eviction fails loudly instead of dropping it.
+        let err = pool.new_page(1, 8).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Storage);
+        assert!(store.pages.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dirty_page_is_not_stolen_when_stealing_disabled() {
+        let store = Arc::new(MemStore::default());
+        // FlushAll would admit the page, but stealing is never enabled.
+        let pool = MemoryBufferPool::new(1, Box::new(FlushAll), store.clone());
+
+        {
+            let mut page = pool.new_page(1, 7).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(7).unwrap();
+
+        let err = pool.new_page(1, 8).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Storage);
+        assert!(store.pages.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stealing_spills_working_set_larger_than_pool() {
+        let store = Arc::new(MemStore::default());
+        let pool = MemoryBufferPool::new(2, Box::new(FlushAll), store.clone());
+        pool.enable_stealing();
+
+        // Six committed pages through a two-frame pool: the rest must spill.
+        for i in 0..6u8 {
+            let txn = u64::from(i) + 1;
+            {
+                let mut page = pool.new_page(1, txn).unwrap();
+                page.data_mut()[0] = i;
+            }
+            pool.commit(txn).unwrap();
+        }
+
+        for i in 0..6u8 {
+            let page = pool.read_page(1, u32::from(i)).unwrap();
+            assert_eq!(page.data()[0], i);
+        }
     }
 
     #[test]
