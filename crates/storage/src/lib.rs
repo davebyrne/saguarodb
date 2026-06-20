@@ -14,7 +14,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use buffer::{BufferPool, MemoryBufferPool, PageData};
+    use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
         ColumnDef, DataType, Key, KeyRange, Lsn, Result, Row, SqlState, StatementContext,
         TableSchema, Value,
@@ -369,7 +369,7 @@ mod tests {
         let large_row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8159)),
+                Value::Text(single_page_capacity_text()),
                 Value::Null,
             ],
         };
@@ -410,7 +410,7 @@ mod tests {
         let row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8159)),
+                Value::Text(single_page_capacity_text()),
                 Value::Null,
             ],
         };
@@ -436,7 +436,7 @@ mod tests {
         let row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8160)),
+                Value::Text(single_page_capacity_text() + "x"),
                 Value::Null,
             ],
         };
@@ -457,7 +457,11 @@ mod tests {
     fn page_reports_no_space_when_only_existing_slot_boundary_remains() {
         let mut page = PageData::default();
         crate::page::init_page(&mut page.0, 0);
-        crate::page::insert_row(&mut page.0, &vec![0; 8172]).unwrap();
+        crate::page::insert_row(
+            &mut page.0,
+            &vec![0; PAGE_SIZE - crate::page::HEADER_LEN - crate::page::SLOT_LEN],
+        )
+        .unwrap();
 
         assert!(!crate::page::has_space_for(&page.0, 1).unwrap());
     }
@@ -471,7 +475,7 @@ mod tests {
         let large_row = Row {
             values: vec![
                 Value::Integer(1),
-                Value::Text("x".repeat(8159)),
+                Value::Text(single_page_capacity_text()),
                 Value::Null,
             ],
         };
@@ -653,5 +657,21 @@ mod tests {
                 Value::Null,
             ],
         }
+    }
+
+    /// Longest `big_text` payload whose encoded row exactly fills one data page,
+    /// derived from the page header/slot overhead so it tracks format changes.
+    fn single_page_capacity_text() -> String {
+        let schema = big_text_schema();
+        let base = encode_row(
+            &schema,
+            &Row {
+                values: vec![Value::Integer(1), Value::Text(String::new()), Value::Null],
+            },
+        )
+        .unwrap()
+        .len();
+        let capacity = PAGE_SIZE - crate::page::HEADER_LEN - crate::page::SLOT_LEN;
+        "x".repeat(capacity - base)
     }
 }

@@ -1,16 +1,17 @@
 use buffer::PAGE_SIZE;
-use common::{DbError, PageNum, Result, SqlState};
+use common::{DbError, Lsn, PageNum, Result, SqlState};
 
 pub const PAGE_TYPE_DATA: u8 = 1;
-const PAGE_VERSION: u8 = 1;
+const PAGE_VERSION: u8 = 2;
 
-pub(crate) const HEADER_LEN: usize = 14;
+pub(crate) const HEADER_LEN: usize = 22;
 const PAGE_ID_OFFSET: usize = 0;
 const PAGE_TYPE_OFFSET: usize = 4;
 const PAGE_VERSION_OFFSET: usize = 5;
 const NUM_SLOTS_OFFSET: usize = 6;
 const FREE_SPACE_OFFSET: usize = 8;
-const CHECKSUM_OFFSET: usize = 10;
+const PAGE_LSN_OFFSET: usize = 10;
+const CHECKSUM_OFFSET: usize = 18;
 pub(crate) const SLOT_LEN: usize = 6;
 const SLOT_DEAD: u16 = 1;
 const SLOT_LIVE: u16 = 2;
@@ -75,6 +76,13 @@ pub fn is_initialized(data: &[u8; PAGE_SIZE]) -> bool {
 
 pub fn page_id(data: &[u8; PAGE_SIZE]) -> Result<PageNum> {
     Ok(validate(data)?.page_id)
+}
+
+/// Stamp the page-LSN (the LSN of the WAL record that last modified this page)
+/// into the header and refresh the checksum.
+pub fn set_page_lsn(data: &mut [u8; PAGE_SIZE], lsn: Lsn) {
+    write_u64(data, PAGE_LSN_OFFSET, lsn);
+    write_checksum(data);
 }
 
 pub fn has_space_for(data: &[u8; PAGE_SIZE], row_len: usize) -> Result<bool> {
@@ -245,6 +253,10 @@ fn write_u32(data: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_u64(data: &mut [u8; PAGE_SIZE], offset: usize, value: u64) {
+    data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn corrupt_page(message: impl Into<String>) -> common::DbError {
     DbError::storage(SqlState::InternalError, message)
 }
@@ -252,8 +264,8 @@ fn corrupt_page(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, init_page, validate,
-        write_checksum,
+        PAGE_LSN_OFFSET, PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET,
+        init_page, set_page_lsn, validate, write_checksum,
     };
     use buffer::PageData;
 
@@ -284,5 +296,32 @@ mod tests {
 
         let err = validate(&data.0).unwrap_err();
         assert!(err.message.contains("unsupported page version"));
+    }
+
+    #[test]
+    fn validate_rejects_v1_page_format() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        data.0[PAGE_VERSION_OFFSET] = 1;
+        write_checksum(&mut data.0);
+
+        let err = validate(&data.0).unwrap_err();
+        assert!(err.message.contains("unsupported page version"));
+    }
+
+    #[test]
+    fn set_page_lsn_round_trips_and_revalidates() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 3);
+        set_page_lsn(&mut data.0, 0x0102_0304_0506_0708);
+
+        // Checksum was refreshed, so the page still validates.
+        validate(&data.0).unwrap();
+        let stored = u64::from_le_bytes(
+            data.0[PAGE_LSN_OFFSET..PAGE_LSN_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, 0x0102_0304_0506_0708);
     }
 }

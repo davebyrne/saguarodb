@@ -63,22 +63,23 @@ V1 only supports the primary-key index:
 
 ## Page Format
 
-V1 page header:
+Page header (22 bytes, version 2):
 
 ```text
-PageID: 4 bytes
-PageType: 1 byte
+PageID:      4 bytes
+PageType:    1 byte
 PageVersion: 1 byte
-NumSlots: 2 bytes
-FreeSpace: 2 bytes
-Checksum: 4 bytes
+NumSlots:    2 bytes
+FreeSpace:   2 bytes
+PageLSN:     8 bytes
+Checksum:    4 bytes
 ```
 
-`PageVersion` is `1` for the v1 page format; unknown versions are rejected as page corruption.
+`PageVersion` is `2`; unknown versions (including the legacy v1 value `1`) are rejected as page corruption. The whole header is covered by `Checksum` (the checksum field itself excepted), so `PageLSN` is checksummed.
 
-V1 development builds do not migrate unversioned page headers. Existing page files without `PageVersion = 1` are rejected as corrupt during snapshot load/recovery.
+`PageLSN` is the LSN of the WAL record that last modified the page. It is stamped on every mutation by `page::set_page_lsn`. It is the basis for PageLSN-gated redo replay and for deciding when a dirty page is safe to flush (see `wal.md` and `buffer.md`).
 
-No `PageLSN` in v1. The snapshot/WAL model avoids incremental page recovery.
+V1 development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
 
 Page body:
 
