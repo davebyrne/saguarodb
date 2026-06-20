@@ -178,7 +178,7 @@ pub trait FlushPolicy: Send + Sync {
 }
 ```
 
-V1 implementation always returns `false`. Dirty pages are not evicted or flushed incrementally. The `page_lsn` field exists for future physical WAL without changing the trait.
+V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; the checkpoint flushes them in place to the heap. The `page_lsn` field lets eviction-flush-on-steal check WAL durability without changing the trait.
 
 ## Concurrency Controller
 

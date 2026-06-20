@@ -66,9 +66,9 @@ Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snaps
 - `ColumnId`s are assigned in declared column order starting at zero.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 
-## Snapshot Persistence
+## Catalog Persistence
 
-The catalog serializes into `snap_<generation>/catalog.dat`.
+The catalog serializes into the control record (`manifest.dat`) at each checkpoint.
 
 On startup:
 

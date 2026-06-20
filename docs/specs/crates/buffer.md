@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`buffer` manages in-memory page frames, page latches, dirty tracking, statement rollback, and snapshot iteration. V1 never evicts dirty pages; dirty pages are made clean only after a successful snapshot checkpoint.
+`buffer` manages in-memory page frames, page latches, dirty tracking, statement rollback, and in-place dirty-page flushing to a `PageStore`. V1 does not yet evict dirty pages; they are made clean by the checkpoint that flushes them to the heap.
 
 ## Depends On
 
@@ -16,8 +16,8 @@
 
 - Page size: 8192 bytes.
 - Frames are addressed by `(FileId, PageNum)`.
-- The buffer pool may read clean pages from the current snapshot files through an injected page loader.
-- Dirty pages remain in memory until snapshot checkpoint or rollback.
+- The buffer pool reads pages from the heap files through an injected `PageStore`.
+- Dirty pages remain in memory until a checkpoint flushes them to the heap, or until rollback.
 
 ## Public API
 
@@ -58,7 +58,7 @@ pub trait BufferPool: Send + Sync {
 
 `MemoryBufferPool::new(frame_count, flush_policy, page_loader)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageLoader>`. `read_page` first checks resident frames; on a miss it calls `page_loader.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
 
-In production, the server supplies a `SnapshotPageLoader` that wraps `SnapshotManager::current_table_pages(file_id as TableId)` and returns the matching `page_num` when present. The `buffer` crate defines only the trait; it does not depend on `snapshot`.
+In production, the server supplies a `HeapPageStore` (a `PageStore`) backed by per-table heap files. The `buffer` crate defines only the traits and does not depend on `storage` or `snapshot`.
 
 `PageStore` extends `PageLoader` with `write_page` and `sync_all` for in-place dirty-page flushing. `storage::HeapPageStore` implements it over one file per table (`<data>/heap/<file_id>.heap`, page `n` at byte offset `n * PAGE_SIZE`, positioned I/O). `write_page` does not fsync; `sync_all` fsyncs all open heap files and the directory. It is the mutable page home for the redo-WAL/flushing model; the buffer pool and server adopt it as the backing store when that cutover lands.
 

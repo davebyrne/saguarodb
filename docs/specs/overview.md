@@ -256,19 +256,18 @@ pub struct StatementContext {
 #### Flush Policy
 
 ```rust
-/// Information about a dirty page, passed to FlushPolicy to decide
-/// whether it can be flushed. Extensible struct so future fields
-/// (e.g., page_lsn for physical WAL) don't change the trait signature.
+/// Information about a dirty page, passed to FlushPolicy to decide whether it
+/// can be flushed. The struct is extensible so new fields don't change the
+/// trait signature.
 pub struct PageFlushInfo {
     pub dirty_txn_id: u64,
-    pub page_lsn: Option<Lsn>,  // V1: always None. Future physical WAL populates this.
+    pub page_lsn: Option<Lsn>,  // checkpoint passes None (WAL already flushed); eviction-steal will pass the page-LSN.
 }
 
-/// Abstraction so the buffer pool can check whether a dirty page is safe to
-/// flush/evict, without depending on the wal crate.
-/// V1 implementation always returns false — dirty pages are never flushed
-/// except during snapshot checkpoint. Future physical WAL implementation
-/// checks WAL durability and commit status to enable incremental flushing.
+/// Abstraction so the buffer pool can decide whether a dirty page is safe to
+/// flush, without depending on the wal crate. V1's WalFlushPolicy admits
+/// committed (or recovery, txn 0), WAL-durable pages; checkpoint flushes them in
+/// place via flush_committed_pages. Eviction-flush-on-steal reuses the same policy.
 pub trait FlushPolicy: Send + Sync {
     fn can_flush(&self, info: &PageFlushInfo) -> bool;
 }
@@ -309,7 +308,7 @@ pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
 All layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves names to IDs and assigns physical slot positions via the catalog. The logical planner, physical planner, executor, and storage engine never do name lookups — they work exclusively with stable IDs and slot indices.
 
-`FlushPolicy` lives in `common` so the buffer pool can determine whether a dirty page is eligible for eviction without depending on the `wal` crate. V1's implementation always returns `false` (dirty pages are never evicted — only flushed during snapshot checkpoint). A future physical WAL implementation would return `true` for committed, WAL-durable pages, enabling incremental eviction.
+`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; checkpoint uses it via `flush_committed_pages` to flush dirty pages in place to the heap. Eviction-flush-on-steal (flushing during eviction to remove the in-RAM working-set ceiling) is a planned follow-up.
 
 ## 3. Wire Protocol
 
@@ -1113,7 +1112,7 @@ Slotted page design. Slot array at the top points to variable-length rows packed
 
 V1 development builds do not migrate unversioned page headers. Existing page files without `PageVersion = 1` are rejected as corrupt during snapshot load/recovery.
 
-**No PageLSN:** Because V1 uses a logical WAL with snapshot checkpoints, there is no per-page LSN. Dirty pages are never flushed individually — only as a complete snapshot. The `dirty_txn_id` is tracked in the buffer pool's page descriptor (in memory, not on disk) for future use by `FlushPolicy`. A future physical WAL would add a `PageLSN` field to the page header and enable incremental page flushing.
+**PageLSN:** The page header carries an 8-byte PageLSN — the LSN of the WAL record that last modified the page — stamped on every mutation. Redo replay is gated by it (a record is applied only if `page_lsn < record.lsn`), and it determines when a dirty page is safe to flush. See the Write-Ahead Log section.
 
 ### Page-Backed Primary-Key Structure
 
@@ -1139,23 +1138,18 @@ V1 development builds do not migrate unversioned page headers. Existing page fil
 
 Files are named by stable numeric ID, not by user-visible names. This avoids rename issues (future `ALTER TABLE RENAME`), filesystem-unsafe characters in table names, and name collisions.
 
-**Snapshot files (written only during checkpoint):**
-- `data/snap_<generation>/table_<TableId>.tbl` — table data snapshot
-- `data/snap_<generation>/catalog.dat` — catalog metadata snapshot
+**Heap files (the mutable page home):**
+- `data/heap/<TableId>.heap` — slotted data pages, page `n` at byte offset `n * PAGE_SIZE`. Written in place by checkpoint flush; files grow by appending pages.
 
-**Generation:** A monotonically increasing integer. Each completed checkpoint writes to a new generation directory.
+**Control record (the single source of truth for the current checkpoint):**
+- `data/manifest.dat` — a versioned binary envelope (magic `SGMF`, version, payload length, CRC32 over the payload) whose JSON payload holds the redo boundary `checkpoint_lsn`, sorted table IDs, and the catalog snapshot.
 
-**Manifest (the single source of truth for which snapshot is current):**
-- `data/manifest.dat` — contains a versioned binary envelope with magic `SGMF`, manifest version, payload length, CRC32 over the exact stored JSON payload bytes, and a payload containing current generation number, checkpoint LSN, and sorted table IDs
-
-The manifest is updated atomically via write-to-temp + rename (atomic on POSIX). Recovery reads the manifest to find the current snapshot. See Snapshot Checkpoint below for the full protocol.
+The control record is updated atomically via write-to-temp + fsync + rename (atomic on POSIX) + directory fsync. Recovery reads it to find the redo boundary and catalog. See Checkpoint below for the full protocol.
 
 **Other files:**
 - `data/wal.dat` — write-ahead log (append-only)
 
-The catalog maps `TableId` → file path via the manifest. Table names are purely a catalog-level concept — the storage engine only sees IDs and file paths.
-
-Each table file contains slotted data pages. Files grow by appending new pages.
+Table names are purely a catalog-level concept — the storage engine only sees table IDs, which map directly to heap file names.
 
 ## 8. Buffer Pool
 
@@ -1237,7 +1231,7 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
 ### Design
 
 - **Frame:** A slot holding one 8KB page. Pool size is configurable (default: 1024 frames = 8MB).
-- **Page descriptor:** Tracks `(file_id, page_number)`, pin count, dirty flag, reference bit, `dirty_txn_id` (the txn that last dirtied it), and `dirty_since_snapshot` flag (true if modified since the last snapshot — distinct from "currently being modified by an active txn").
+- **Page descriptor:** Tracks `(file_id, page_number)`, pin count, dirty flag, reference bit, `dirty_txn_id` (the txn that last dirtied it), and `needs_fpi` (whether the next modification must log a full-page image).
 - **Before-image store:** Per active `txn_id`, two tracking structures:
   - `before_images: HashMap<(FileId, PageNum), PageData>` — on the first `write_page` call for an existing page by a `txn_id`, the current page data is copied here.
   - `new_pages: Vec<(FileId, PageNum)>` — pages allocated via `new_page` by this `txn_id`.
@@ -1251,9 +1245,9 @@ pub trait PageLoader: Send + Sync {
 }
 ```
 
-On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` is inserted as a clean frame; `None` returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`; loader I/O failures propagate as `ErrorKind::Io`. In production, the server supplies a `SnapshotPageLoader` that wraps `SnapshotManager::current_table_pages(file_id as TableId)` and returns the matching page when present. `MemoryBufferPool::empty(frame_count)` is a test helper using a never-flush policy and a no-op loader that returns `Ok(None)`.
+On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` is inserted as a clean frame; `None` returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`; loader I/O failures propagate as `ErrorKind::Io`. In production, the server supplies a `HeapPageStore` (a `PageStore`) that reads page `n` of table `file_id` from `data/heap/<file_id>.heap`. `MemoryBufferPool::empty(frame_count)` is a test helper using a never-flush policy and a no-op store that returns `Ok(None)`.
 
-- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. Before evicting any dirty page, it calls `flush_policy.can_flush(&PageFlushInfo { dirty_txn_id, page_lsn: None })`. **V1's `FlushPolicy` always returns `false`** — dirty pages are never flushed except during snapshot checkpoint. The trait exists so a future physical WAL can enable incremental flushing (populating `page_lsn` and checking WAL durability).
+- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_committed_pages` (checkpoint) consults it per dirty page: V1's `WalFlushPolicy` admits committed (or txn 0) pages whose page-LSN is WAL-durable. The same policy will gate eviction-flush-on-steal when that lands.
 
 ### Eviction: Clock Algorithm (Single-Bit)
 
@@ -1261,7 +1255,7 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 - Each frame has a reference bit, set on access
 - On sweep: if bit is 1, clear to 0 and skip. If bit is 0 and unpinned, check dirty flag.
 - **If clean:** evict immediately. The page can be re-read from the table file (last snapshot) if needed later.
-- **If dirty:** skip. V1 never evicts dirty pages — they must stay in memory until the next snapshot checkpoint clears their dirty flag.
+- **If dirty:** skip. V1 does not yet evict dirty pages; they stay in memory until the checkpoint flushes them to the heap and clears their dirty flag. (Eviction-flush-on-steal is a planned follow-up.)
 - If all frames are dirty and pinned, the buffer pool returns an error (out of frames). This is the V1 memory limitation.
 
 ### V1 Limitation: Working Set Must Fit in Buffer Pool
@@ -1279,110 +1273,60 @@ Between snapshots, all dirty pages must remain in memory. With V1's single-write
 - Page table mapping `(file_id, page_num)` to frame protected by a separate latch
 - Multiple threads can read different pages concurrently
 
-## 9. Snapshot Manager
+## 9. Control Store
 
-The snapshot manager owns the on-disk snapshot lifecycle: writing new snapshots, loading existing ones, and managing the manifest. It lives in the dedicated `snapshot` crate and operates on page data supplied by the buffer pool and catalog through server checkpoint orchestration.
+The `snapshot` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable per-table heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
 
 ### Trait
 
 ```rust
-pub struct SnapshotMetadata {
-    pub generation: u64,
-    pub checkpoint_lsn: Lsn,
-    pub tables: Vec<TableId>,
+pub struct ControlData {
+    pub checkpoint_lsn: Lsn,   // redo boundary
+    pub tables: Vec<TableId>,  // sorted, no duplicates
+    pub catalog: Vec<u8>,      // serialized catalog snapshot
 }
 
-pub struct LoadedSnapshot {
-    pub metadata: SnapshotMetadata,
-    pub catalog_bytes: Vec<u8>,
-}
+pub trait ControlStore: Send + Sync {
+    /// Load the current control record, or None if none exists yet.
+    fn load(&self) -> Result<Option<ControlData>>;
 
-pub struct SnapshotPage {
-    pub page_num: PageNum,
-    pub data: PageData,
-}
-
-pub trait SnapshotManager: Send + Sync {
-    /// Load the current snapshot from the manifest.
-    /// Returns metadata and catalog bytes describing what was loaded, or None if no snapshot exists.
-    /// Populates the buffer pool with pages from the snapshot files.
-    fn load_current(&self, buffer_pool: &dyn BufferPool) -> Result<Option<LoadedSnapshot>>;
-
-    /// Read clean page-numbered data for one table from the current snapshot.
-    /// Returns an empty vector when no current snapshot/table file exists.
-    fn current_table_pages(&self, table: TableId) -> Result<Vec<SnapshotPage>>;
-
-    /// Begin writing a new snapshot. Returns a writer that accepts pages.
-    fn begin_snapshot(&self) -> Result<SnapshotWriter>;
-
-    /// Commit a completed snapshot: fsync files, atomically swap manifest.
-    /// After this returns, the new snapshot is the current one.
-    fn commit_snapshot(&self, writer: SnapshotWriter, checkpoint_lsn: Lsn) -> Result<SnapshotMetadata>;
-
-    /// Delete orphaned snapshot directories (generations other than current).
-    fn cleanup_old_snapshots(&self) -> Result<()>;
+    /// Atomically write a new control record (the checkpoint commit point).
+    fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
 }
 ```
 
-Table file names are deterministic (`table_<TableId>.tbl`) and are not separately exposed in `SnapshotMetadata`. The on-disk manifest may store only table IDs because the file name can be derived from the table ID.
+`store` writes `data/manifest.dat` via temp file + fsync + rename + directory fsync. The rename is the checkpoint commit point: the caller must fsync the heap (`PageStore::sync_all`) **before** `store`, and truncate the WAL only **after** it.
 
-Manifest decode validates the binary envelope magic, version, payload length, checksum over the exact stored payload bytes, JSON payload, and strictly ascending table IDs. Legacy JSON-object manifests are rejected rather than migrated in v1 development builds.
-
-### SnapshotWriter
-
-```rust
-/// Writes a complete snapshot to a new generation directory.
-/// The checkpoint protocol feeds it ALL pages for ALL tables (dirty from
-/// the buffer pool, clean from the current snapshot files).
-pub struct SnapshotWriter {
-    generation: u64,
-    // Writes to data/snap_<generation>/
-}
-
-impl SnapshotWriter {
-    /// Write all pages for a table file.
-    pub fn write_table(&mut self, table: TableId, pages: &[SnapshotPage]) -> Result<()>;
-
-    /// Write the catalog snapshot.
-    pub fn write_catalog(&mut self, catalog: &[u8]) -> Result<()>;
-}
-```
-
-The server composes each table file from two sources before calling `write_table`:
-- **Dirty pages** — read from the buffer pool (the current in-memory state)
-- **Clean pages** — copied from the current snapshot files with `current_table_pages`
-
-`write_table` preserves sparse page numbers. Table files store `u32 page_count`, followed by repeated `u32 page_num` and 8192 bytes of page data.
+The control record uses a versioned binary envelope: magic `SGMF`, a `u32` version, payload length, CRC32 over the payload, and a JSON payload of `checkpoint_lsn`, sorted `tables`, and `catalog`. Decode rejects magic/version/length/checksum mismatch, malformed JSON, and unsorted or duplicate table IDs. The legacy full-snapshot manifest (version `1`) is rejected, not migrated.
 
 ### checkpoint_lsn
 
-The manifest's `checkpoint_lsn` is the **authoritative WAL replay boundary**. It is the LSN of the last WAL record whose effects are included in this snapshot — i.e., the WAL's high-water mark at the time the snapshot was started.
-
-Recovery reads `checkpoint_lsn` from the manifest and replays all committed WAL records with `LSN > checkpoint_lsn`. The WAL `Checkpoint` record is optional metadata (useful for WAL truncation) but is NOT required for recovery correctness — the manifest is sufficient.
+`checkpoint_lsn` is the **authoritative redo boundary**: the WAL high-water mark whose effects are reflected in the heap. Recovery reads it from the control record and replays committed WAL records with `LSN > checkpoint_lsn`. The WAL `Checkpoint` record is optional metadata; the control record is authoritative.
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate ensures durability using a **logical WAL** — records describe operations (insert row, delete key) not page modifications (write bytes at offset). Recovery replays operations through the storage API.
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`) and the `Commit`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
 
-### V1 Durability Model: In-Memory Pages + WAL + Snapshot Checkpoint
+### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
-A logical WAL combined with in-place mutable table pages has a fundamental problem: a crash can leave on-disk pages half-updated if dirty pages are flushed independently. Logical replay assumes a consistent starting snapshot, so it cannot recover from arbitrary partial page writes.
+Table data lives in mutable per-table heap files; pages are mutated in the buffer pool and written back in place. In-place page writes with a logical-only WAL would be unrecoverable (a torn page has no consistent base), so v1 uses:
 
-**V1 solves this by never flushing individual dirty pages during normal operation.** All modified pages stay in the buffer pool (memory). The WAL is the sole source of durability between snapshots. Table files on disk are only ever written as a complete, consistent snapshot during checkpoint.
+- **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
+- **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
+- **Flush-based checkpoint**: dirty committed pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the WAL prefix is truncated.
 
-This gives three invariants:
-1. Table files on disk always reflect a complete, consistent page snapshot.
-2. The WAL captures all committed operations since that snapshot.
-3. Recovery loads the snapshot and replays the WAL — starting from known-good table pages and rebuilt primary-key directories.
+This gives the invariants:
+1. After a crash, recovery loads the heap as of the last control record and replays committed redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe.
+2. The WAL captures all committed operations since the redo boundary.
+3. Checkpoint cost is O(pages changed), not O(database size).
 
 **Trade-offs:**
-- Simplest correctness model: no partial-flush, no page-level recovery, no PageLSN.
-- Working set between snapshots must fit in the buffer pool. With V1's single-writer autocommit, each statement dirtys a modest number of pages, and snapshots clear them.
-- Startup replays WAL from last snapshot — bounded by checkpoint frequency.
+- v1 keeps dirty pages resident between checkpoints (eviction is clean-only), so the working set must fit in the buffer pool until eviction-flush-on-steal lands.
+- Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
 **Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
-- **Atomic snapshot checkpoint** (write to new files, swap manifest) — allows concurrent reads during checkpoint.
-- **Physical WAL** (page images/deltas, PageLSN) — enables incremental page flushing between checkpoints, removing the memory constraint.
+- **Eviction-flush-on-steal** — flush committed, WAL-durable dirty pages during eviction to remove the in-RAM working-set ceiling. The `FlushPolicy` + PageLSN machinery is already in place.
+- **MVCC** — the reserved row-format version byte carries future `xmin`/`xmax`; the redo WAL is the prerequisite.
 
 ### WAL Record Format
 
@@ -1450,7 +1394,7 @@ pub trait WalManager: Send + Sync {
 
 `append(record)` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. Replay preserves the stored LSN from disk.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the manifest `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already included in the snapshot. `replay_committed_from` returns committed logical operation records only (`Insert`, `Update`, `Delete`, `CreateTable`, `DropTable`); it never yields `Commit` or `Checkpoint` metadata records.
+`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — everything except the `Commit`/`Checkpoint` markers — applied as physiological redo and DDL replay.
 
 `truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
 
@@ -1460,14 +1404,14 @@ pub trait WalManager: Send + Sync {
 
 One rule ensures redo-only recovery is correct:
 
-**No incremental page flushing.** Dirty pages are never flushed to table files during normal operation — not by eviction, not by background threads, not for any reason. The `FlushPolicy` V1 implementation always returns `false`. Only the snapshot checkpoint writes pages to disk, and it writes ALL dirty pages as an atomic unit.
+**In-place page flushing.** Dirty committed pages are written back to their heap file by the checkpoint (and, in a future step, by eviction). Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo.
 
 The WAL is the sole source of durability between snapshots:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though no table pages have been written.
 - The buffer pool holds all modified pages in memory until the next snapshot.
 - Table files on disk reflect the last completed snapshot — always a consistent page set.
 
-This gives a clean invariant: **table files on disk only ever contain a complete, consistent snapshot.**
+This gives a clean invariant: **after a crash, PageLSN-gated redo (with full-page images) restores every heap page to its last committed state.**
 
 ### V1 Write Protocol
 
@@ -1515,57 +1459,47 @@ The buffer pool saves a before-image (copy of the page data) on the first write 
 
 If any rollback cleanup step fails before the commit record is durable, the server treats process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits instead of returning to service.
 
-**Why before-images, not snapshot reload:** A page may have been dirtied by a prior *committed* transaction that has not yet been snapshotted. Reloading from the snapshot file would lose that committed change. Before-images capture the page state *at the moment this txn_id first touched it*, which correctly preserves prior committed modifications.
+**Why before-images, not reload-from-heap:** A page may have been dirtied by a prior *committed* transaction that has not yet been flushed. Reloading from the heap file would lose that committed change. Before-images capture the page state *at the moment this txn_id first touched it*, which correctly preserves prior committed modifications.
 
 **Memory cost:** One 8KB copy per page touched by the active statement, held only for the statement duration. With V1's single-writer autocommit, this is bounded by the number of pages a single statement modifies.
 
-### Snapshot Checkpoint
+### Checkpoint
 
-The checkpoint writes a complete, consistent snapshot to **new files** via the `SnapshotManager`, then atomically swaps the manifest. The previous snapshot remains intact until the new one is committed. Crash-safe at every step.
+The checkpoint flushes dirty pages in place to the heap and advances the redo boundary. Cost is O(pages changed), not O(database size). The previous control record stays valid until the new one is committed.
 
 **Checkpoint protocol:**
 
-1. Acquire exclusive write guard (ensures no statement is in-flight, all commits are final)
-2. Record `checkpoint_lsn` = current WAL high-water mark (the last flushed LSN)
-3. `let writer = snapshot_manager.begin_snapshot()`
-4. For each live catalog table: compose pages (dirty from buffer pool overlaid on clean pages from `current_table_pages`) and write via `writer.write_table(table_id, pages)`
-5. Serialize catalog and write via `writer.write_catalog(bytes)`
-6. `let metadata = snapshot_manager.commit_snapshot(writer, checkpoint_lsn)` — this fsyncs all files, writes the manifest atomically, fsyncs the directory, and returns the durable manifest metadata
-7. `buffer_pool.mark_all_clean()` — all pages are now reflected in the snapshot
-8. Append `WalRecord { txn_id: 0, kind: Checkpoint { generation: metadata.generation, checkpoint_lsn } }` record to WAL (metadata is not required for recovery, but v1 writes it for observability and WAL tests)
-9. Flush WAL, then truncate WAL before `checkpoint_lsn`; WAL truncation fsyncs the replacement rename in the parent directory before reopening the WAL or replacing retained-record in-memory state
-10. `snapshot_manager.cleanup_old_snapshots()`
-11. Drop write guard
+1. Acquire exclusive write guard (no statement in-flight; every dirty page is committed).
+2. `wal.flush()` — a page's redo must be durable before the page is written.
+3. `buffer_pool.flush_committed_pages()` — write flushable dirty pages to the heap `PageStore`.
+4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
+5. `checkpoint_lsn = wal.flushed_lsn()`.
+6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point (atomic temp + fsync + rename + directory fsync).
+7. Append `WalRecord { txn_id: 0, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)`.
+8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
+9. Drop write guard.
 
-**Crash safety analysis:**
-- Crash during steps 3-5: `commit_snapshot` was never called. Manifest still points to the old snapshot. The partial new generation directory is an orphan — cleaned up on recovery by `cleanup_old_snapshots()`.
-- Crash during step 6 (inside `commit_snapshot`):
-  - Before manifest rename: old manifest intact, orphan directory cleaned up.
-  - During manifest rename: either old or new manifest survives — both are valid.
-  - After manifest rename, before fsync: new manifest may or may not be durable. If lost, old manifest is restored by filesystem recovery — still valid.
-- Crash during steps 7-10: new manifest is committed. Old snapshot may not be deleted yet — harmless, cleaned up on next startup.
+**Crash safety analysis:** the ordering is heap fsync (4) → control record (6) → WAL truncation (7).
+- Crash before step 6: the control record is unchanged; recovery falls back to the previous `checkpoint_lsn`, and this cycle's full-page images (logged since that boundary) repair any torn heap write.
+- Crash between steps 6 and 7: the new control record is durable and the heap is consistent; the un-truncated WAL tail replays idempotently under PageLSN gating.
+- Crash after step 7: consistent.
 
-**Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O and disk space (two snapshot generations coexist briefly).
+**Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O.
 
-### Crash Recovery (REDO Only for V1)
+### Crash Recovery (REDO)
 
-The manifest always points to a complete, consistent snapshot. Recovery loads it and replays committed WAL records.
+The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays committed redo records on top.
 
-**Recovery uses a separate API** so that replayed operations do not re-append to the WAL:
+**Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
 ```rust
-/// Applied during crash recovery. Replays a logical WAL record directly
-/// to storage without appending new WAL records.
 pub trait RecoveryOperations: Send + Sync {
-    fn apply_insert(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_update(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_delete(&self, table: TableId, key: Key) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
 }
 ```
 
-The `StorageEngine` implementor also implements `RecoveryOperations`. The normal `insert`/`update`/`delete` methods append WAL records; the `apply_*` methods modify pages directly without WAL interaction.
+Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN; DDL replays through `RecoveryOperations`. Both modify pages without appending WAL.
 
 Concrete storage is opened with:
 
@@ -1583,17 +1517,15 @@ impl PageBackedStorageEngine {
 
 **Recovery procedure** (driven by the server startup sequence):
 
-1. `snapshot_manager.load_current(buffer_pool)` — reads manifest, loads snapshot pages into the buffer pool, and returns catalog bytes plus `checkpoint_lsn` from the manifest (the authoritative replay boundary). If no manifest exists: fresh database.
-2. Initialize storage engine in recovery mode and catalog from snapshot
-3. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.rebuild_directories()`
-4. Scan the WAL forward, collecting all `txn_id`s with a `Commit` record where `LSN > checkpoint_lsn`
-5. Replay committed WAL records in LSN order with `WalManager::replay_committed_from`, calling `RecoveryOperations::apply_*`
-6. Discard records for uncommitted transactions — they have no `Commit` record
-7. Clean up orphaned snapshot directories
-8. If records were replayed: trigger checkpoint to persist as a new snapshot
-9. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`
+1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
+2. Initialize storage in recovery mode and the catalog; `install_schemas`.
+3. Pre-load every heap page of each live table into the buffer pool.
+4. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them), DDL via `RecoveryOperations`.
+5. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small for the working set), then `rebuild_directories`.
+6. If records were replayed: checkpoint to persist the redone state and advance the boundary.
+7. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
-**No idempotency concerns:** The snapshot reflects exactly the state at `checkpoint_lsn`. V1 does not flush pages between snapshots. WAL records after `checkpoint_lsn` have NOT been applied to the snapshot files. Each replays exactly once.
+**Idempotency:** PageLSN gating applies each record's effect at most once, so replay is safe even when the heap already reflects some post-boundary work (e.g. a partially completed prior checkpoint).
 
 ### File
 
@@ -1668,11 +1600,11 @@ Empty catalogs start with `next_table_id = 1`. `apply_create_table` and `apply_d
 
 ### Persistence
 
-The catalog is included in the snapshot checkpoint: `data/snap_<gen>/catalog.dat`. Loaded into memory on startup from the current snapshot. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE) are durable.
+The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Loaded into memory on startup. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE) are durable.
 
 ### WAL Integration
 
-`CREATE TABLE` and `DROP TABLE` are logged to the WAL. On crash recovery, the catalog is rebuilt by loading the snapshot version and replaying catalog-related WAL records.
+`CREATE TABLE` and `DROP TABLE` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable` records.
 
 ### Concurrency
 
@@ -1685,23 +1617,22 @@ The `server` crate is the binary entry point.
 ### Startup Sequence
 
 1. Load configuration (data directory, port, buffer pool size)
-2. Initialize snapshot manager
-3. Create server-owned `SnapshotPageLoader` from the snapshot manager
-4. Initialize buffer pool with configured frames, never-flush policy, and snapshot page loader
-5. Initialize WAL — open or create `data/wal.dat`
-6. Load snapshot: `snapshot_manager.load_current(buffer_pool)` — reads manifest, loads table files into the buffer pool, and returns `LoadedSnapshot` with catalog bytes and `checkpoint_lsn`.
-7. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
-8. Initialize catalog from loaded snapshot data
-9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.rebuild_directories()`
-10. Replay committed WAL records with `LSN > checkpoint_lsn` through `WalManager::replay_committed_from` and `RecoveryOperations` (uses storage engine in recovery mode — modifies pages and primary-key directories without appending WAL records)
-11. Build `ServerComponents` with catalog, storage, buffer pool, WAL, snapshot manager, concurrency controller, shutdown state, checkpoint state initialized from the loaded manifest checkpoint LSN, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
-12. `snapshot_manager.cleanup_old_snapshots()`
-13. If WAL records were replayed: trigger checkpoint with `run_checkpoint(&components)` to persist replayed changes as a new snapshot
-14. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
-15. Construct `QueryService` from `components`
-16. Start Tokio runtime, bind TCP listener (default port 5433)
+2. Initialize the control store (`FileControlStore`) and heap page store (`HeapPageStore` over `data/heap`)
+3. Initialize WAL — open or create `data/wal.dat`
+4. Initialize buffer pool with configured frames, the `WalFlushPolicy`, and the heap page store
+5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if absent)
+6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
+7. Initialize catalog from the control catalog bytes (or empty); `storage.install_schemas(catalog.list_tables()?)`
+8. Pre-load every heap page of each live table into the buffer pool
+9. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), DDL via `RecoveryOperations` — no WAL appended in recovery mode
+10. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small), then `storage.rebuild_directories()`
+11. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+12. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and advance the redo boundary
+13. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
+14. Construct `QueryService` from `components`
+15. Start Tokio runtime, bind TCP listener (default port 5433)
 
-Steps 6-10 use the storage engine's `RecoveryOperations` trait, which requires the buffer pool and page/directory logic but does not append to the WAL. Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` checkpoint metadata. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 14 transitions to normal operation where `StorageEngine` methods append WAL records.
+Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` records. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
 The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--shutdown-timeout-ms <MS>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, and `30000`. V1 parses these flags with `std::env::args`; `--port` accepts `1..=65535`, all other numeric flags must be positive nonzero integers, and invalid input prints usage to stderr and exits with code `2`.
 
@@ -1728,7 +1659,7 @@ All concurrency is managed through the `ConcurrencyController` trait (defined in
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Multiple readers proceed concurrently.
 - **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`): server query orchestration parses SQL to classify the statement, calls `begin_write()`, receives a write guard, binds and plans, allocates the statement `txn_id`, then invokes `QueryEngine`. Blocks until all other guards are released. Writes are fully serialized.
-- The guard is held for the entire statement lifetime. Dirty pages are never flushed between snapshots (V1's `FlushPolicy` always returns `false`), so there is no risk of partially-committed data reaching disk.
+- The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive write guard and `WalFlushPolicy` admits only committed pages, so uncommitted data never reaches the heap.
 
 **V1 implementation:** The concrete `ConcurrencyController` is an `RwLock`. `begin_read()` acquires a shared lock, `begin_write()` acquires an exclusive lock. This is the foundation for safe page mutation, DDL, concurrent scans, and redo-only recovery.
 
@@ -1772,6 +1703,5 @@ Loaded from command-line args only in V1. No environment-variable or config-file
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **INSERT ... SELECT:** `InsertSource::Query` variant exists in the AST. The logical/physical plans already model inserts as `source: Box<LogicalPlan>` / `source: Box<PhysicalPlan>`, so this can be enabled later by binding query sources.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.
-- **Physical WAL + Incremental Flushing:** V1 keeps all dirty pages in memory and flushes only during snapshot checkpoints (manifest-based, crash-safe). A future physical WAL logs page images/deltas, adds `PageLSN` to the page header, and enables incremental dirty-page flushing between checkpoints — removing the memory limitation. The `FlushPolicy` trait already has the right interface; the V1 implementation just needs to return `true` for committed pages instead of always `false`. The `WalManager` and `BufferPool` traits abstract this change.
-- **Incremental Checkpoints:** V1 writes ALL pages during every checkpoint (full snapshot). A future version could write only dirty pages, using the manifest to compose a logical snapshot from multiple generations. This reduces checkpoint I/O for large datasets.
+- **Eviction-flush-on-steal:** V1 flushes dirty pages only at checkpoint, so the working set must fit in the buffer pool between checkpoints. A follow-up flushes committed, WAL-durable dirty pages during eviction (using the existing `FlushPolicy` + PageLSN machinery), removing the memory limitation without changing the `WalManager` or `BufferPool` traits.
 - **Additional Data Types:** `DataType` and `Value` enums are extensible. Row serialization format supports new types via the null bitmap + column data pattern.
