@@ -203,6 +203,13 @@ fn build_schema(
         primary_key_ids.push(column_id);
     }
 
+    if primary_key_ids.len() != 1 {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            "v1 requires exactly one primary key column",
+        ));
+    }
+
     Ok(TableSchema {
         id: table_id,
         name,

@@ -59,6 +59,54 @@ async fn e2e_create_insert_select_update_delete_explain() {
 }
 
 #[tokio::test]
+async fn e2e_order_by_ordinal_sorts_by_output_column() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table nums (id integer primary key, label text)")
+        .await
+        .unwrap();
+    for (id, label) in [(3, "c"), (1, "a"), (2, "b")] {
+        server
+            .simple_query(&format!(
+                "insert into nums (id, label) values ({id}, '{label}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // ORDER BY 2 sorts by the second output column (id), ascending.
+    let rows = server
+        .simple_query("select label, id from nums order by 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("a".to_string()), Some("1".to_string())],
+            vec![Some("b".to_string()), Some("2".to_string())],
+            vec![Some("c".to_string()), Some("3".to_string())],
+        ]
+    );
+
+    // ORDER BY 1 DESC sorts by the first output column (id), descending.
+    let rows = server
+        .simple_query("select id from nums order by 1 desc")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("1".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

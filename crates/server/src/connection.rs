@@ -55,9 +55,9 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
                     };
 
                     let service = app.query_service.clone();
-                    let result = tokio::task::spawn_blocking(move || service.execute_sql(&sql))
-                        .await
-                        .map_err(|err| DbError::internal(format!("query task failed: {err}")))?;
+                    let result = query_task_result(
+                        tokio::task::spawn_blocking(move || service.execute_sql(&sql)).await,
+                    );
                     match result {
                         Ok(result) => write_execution_result(&mut socket, &codec, result).await?,
                         Err(err) => {
@@ -87,6 +87,17 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
             }
         }
     }
+}
+
+/// Map the outcome of the query `spawn_blocking` task into a query result. A
+/// panic in parse/bind/plan/execute (or a cancelled task) surfaces as a
+/// `JoinError`; converting it to an internal error lets the caller report it and
+/// keep the connection open instead of dropping the socket silently. The wire
+/// codec buffer is unaffected and statement guards/page pins release on unwind.
+fn query_task_result(
+    join: std::result::Result<Result<ExecutionResult>, tokio::task::JoinError>,
+) -> Result<ExecutionResult> {
+    join.unwrap_or_else(|join_err| Err(DbError::internal(format!("query task failed: {join_err}"))))
 }
 
 async fn write_execution_result(
@@ -208,8 +219,25 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::handle_connection;
+    use common::{ErrorKind, Result};
+    use executor::ExecutionResult;
+
+    use super::{handle_connection, query_task_result};
     use crate::app::AppState;
+
+    #[tokio::test]
+    async fn panicked_query_task_becomes_internal_error() {
+        // A panicked spawn_blocking task yields a real JoinError; the firewall
+        // must map it to an internal error (so the caller keeps the connection
+        // open) rather than letting it escape and drop the connection.
+        let join = tokio::task::spawn_blocking(|| -> Result<ExecutionResult> {
+            panic!("intentional test panic");
+        })
+        .await;
+
+        let err = query_task_result(join).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Internal);
+    }
 
     #[tokio::test]
     async fn loopback_startup_and_simple_query_return_protocol_rows() {

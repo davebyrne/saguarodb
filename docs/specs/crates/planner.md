@@ -38,6 +38,11 @@ Binder responsibilities:
 - Resolve columns to `BoundExpr::InputRef`.
 - Assign slot indices in operator input rows.
 - Expand wildcards.
+- Resolve `ORDER BY` items: a bare positive integer literal is a 1-based
+  reference to the nth output column (PostgreSQL ordinal `ORDER BY`); an
+  out-of-range position is rejected with `SqlState::SyntaxError`. A bare
+  unqualified name first matches an output column alias. All other `ORDER BY`
+  expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability.
 - Validate aggregate usage and `GROUP BY` rules.

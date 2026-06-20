@@ -246,6 +246,41 @@ mod tests {
     }
 
     #[test]
+    fn create_table_rejects_empty_primary_key() {
+        let catalog = MemoryCatalog::empty();
+
+        let err = catalog
+            .create_table("users".to_string(), vec![id_column(false)], vec![])
+            .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn create_table_rejects_composite_primary_key() {
+        let catalog = MemoryCatalog::empty();
+
+        let err = catalog
+            .create_table(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "tenant".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                    },
+                ],
+                vec!["id".to_string(), "tenant".to_string()],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn primary_key_on_missing_column_is_rejected() {
         let catalog = MemoryCatalog::empty();
 

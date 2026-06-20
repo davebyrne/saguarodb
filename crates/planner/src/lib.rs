@@ -110,6 +110,39 @@ mod tests {
     }
 
     #[test]
+    fn binder_resolves_order_by_ordinal_to_output_column() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select name, id from users order by 2").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+
+        assert_eq!(select.order_by.len(), 1);
+        // Output column 2 is `id`, which resolves to InputRef column 0, slot 0 —
+        // not the constant literal 2.
+        assert!(matches!(
+            select.order_by[0].expr,
+            BoundExpr::InputRef {
+                column: 0,
+                slot: 0,
+                ..
+            }
+        ));
+        assert!(select.order_by[0].ascending);
+    }
+
+    #[test]
+    fn binder_rejects_out_of_range_order_by_ordinal() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users order by 2").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_rejects_ambiguous_unqualified_column() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select id from users join accounts on users.id = accounts.id").unwrap();

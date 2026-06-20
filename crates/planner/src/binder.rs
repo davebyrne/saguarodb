@@ -425,6 +425,12 @@ fn bind_order_by(
         .iter()
         .map(|item| {
             let expr = match &item.expr {
+                // `ORDER BY <n>`: a bare positive integer literal selects the
+                // nth output column (1-based), matching PostgreSQL.
+                Expr::Literal(Value::Integer(position)) => {
+                    let index = order_by_position_index(*position, columns.len())?;
+                    columns[index].expr.clone()
+                }
                 Expr::ColumnRef {
                     table: None,
                     column,
@@ -443,6 +449,18 @@ fn bind_order_by(
             })
         })
         .collect()
+}
+
+/// Resolve a 1-based `ORDER BY` position into a zero-based output-column index.
+fn order_by_position_index(position: i64, column_count: usize) -> Result<usize> {
+    let in_range = position >= 1 && usize::try_from(position).is_ok_and(|p| p <= column_count);
+    if !in_range {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("ORDER BY position {position} is out of range (1..{column_count})"),
+        ));
+    }
+    Ok(position as usize - 1)
 }
 
 fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
