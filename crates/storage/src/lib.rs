@@ -1,6 +1,8 @@
+mod btree;
 mod codec;
 mod engine;
 mod heap;
+mod index_page;
 mod page;
 mod recovery;
 mod redo;

@@ -2,14 +2,15 @@ use buffer::PAGE_SIZE;
 use common::{DbError, Lsn, PageNum, Result, SqlState};
 
 pub const PAGE_TYPE_DATA: u8 = 1;
-const PAGE_VERSION: u8 = 2;
+pub(crate) const PAGE_TYPE_INDEX: u8 = 2;
+pub(crate) const PAGE_VERSION: u8 = 2;
 
 pub(crate) const HEADER_LEN: usize = 22;
-const PAGE_ID_OFFSET: usize = 0;
-const PAGE_TYPE_OFFSET: usize = 4;
-const PAGE_VERSION_OFFSET: usize = 5;
-const NUM_SLOTS_OFFSET: usize = 6;
-const FREE_SPACE_OFFSET: usize = 8;
+pub(crate) const PAGE_ID_OFFSET: usize = 0;
+pub(crate) const PAGE_TYPE_OFFSET: usize = 4;
+pub(crate) const PAGE_VERSION_OFFSET: usize = 5;
+pub(crate) const NUM_SLOTS_OFFSET: usize = 6;
+pub(crate) const FREE_SPACE_OFFSET: usize = 8;
 const PAGE_LSN_OFFSET: usize = 10;
 const CHECKSUM_OFFSET: usize = 18;
 pub(crate) const SLOT_LEN: usize = 6;
@@ -47,7 +48,8 @@ pub fn init_page(data: &mut [u8; PAGE_SIZE], page_id: PageNum) {
 }
 
 pub fn validate(data: &[u8; PAGE_SIZE]) -> Result<PageHeader> {
-    if data[PAGE_TYPE_OFFSET] != PAGE_TYPE_DATA {
+    let page_type = data[PAGE_TYPE_OFFSET];
+    if page_type != PAGE_TYPE_DATA && page_type != PAGE_TYPE_INDEX {
         return Err(corrupt_page("unexpected page type"));
     }
     if data[PAGE_VERSION_OFFSET] != PAGE_VERSION {
@@ -66,7 +68,11 @@ pub fn validate(data: &[u8; PAGE_SIZE]) -> Result<PageHeader> {
         num_slots: read_u16(data, NUM_SLOTS_OFFSET),
         free_start: read_u16(data, FREE_SPACE_OFFSET),
     };
-    validate_layout(data, header)?;
+    // Index nodes carry their own (sorted-slot) body layout validated by the
+    // btree; here the shared version + checksum are enough to trust the page.
+    if page_type == PAGE_TYPE_DATA {
+        validate_layout(data, header)?;
+    }
     Ok(header)
 }
 
@@ -245,19 +251,19 @@ fn checksum(data: &[u8; PAGE_SIZE]) -> u32 {
     hasher.finalize()
 }
 
-fn write_checksum(data: &mut [u8; PAGE_SIZE]) {
+pub(crate) fn write_checksum(data: &mut [u8; PAGE_SIZE]) {
     write_u32(data, CHECKSUM_OFFSET, checksum(data));
 }
 
-fn read_u16(data: &[u8; PAGE_SIZE], offset: usize) -> u16 {
+pub(crate) fn read_u16(data: &[u8; PAGE_SIZE], offset: usize) -> u16 {
     u16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
-fn write_u16(data: &mut [u8; PAGE_SIZE], offset: usize, value: u16) {
+pub(crate) fn write_u16(data: &mut [u8; PAGE_SIZE], offset: usize, value: u16) {
     data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-fn read_u32(data: &[u8; PAGE_SIZE], offset: usize) -> u32 {
+pub(crate) fn read_u32(data: &[u8; PAGE_SIZE], offset: usize) -> u32 {
     u32::from_le_bytes([
         data[offset],
         data[offset + 1],
@@ -272,7 +278,7 @@ fn read_u64(data: &[u8; PAGE_SIZE], offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn write_u32(data: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
+pub(crate) fn write_u32(data: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
     data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
@@ -280,7 +286,7 @@ fn write_u64(data: &mut [u8; PAGE_SIZE], offset: usize, value: u64) {
     data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn corrupt_page(message: impl Into<String>) -> common::DbError {
+pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 

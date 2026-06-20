@@ -1,9 +1,89 @@
-use common::{DataType, DbError, Result, Row, SqlState, TableSchema, Value};
+use common::{DataType, DbError, Key, Result, Row, SqlState, TableSchema, Value};
 
 /// On-page row encoding version. v1 layout is `[version][null_bitmap][columns]`.
 /// Reserved so MVCC row versions (e.g. `xmin`/`xmax`) can be added later without
 /// a second on-disk format break.
 const ROW_FORMAT_VERSION: u8 = 1;
+
+const KEY_TAG_NULL: u8 = 0;
+const KEY_TAG_INTEGER: u8 = 1;
+const KEY_TAG_TEXT: u8 = 2;
+const KEY_TAG_BOOLEAN: u8 = 3;
+
+/// Encode a primary key into the self-describing byte form stored in B-tree
+/// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
+/// btree can decode and order keys without a schema. Not order-preserving — the
+/// btree compares decoded `Key`s via `Ord`, matching the in-memory directory.
+pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
+    let count = u16::try_from(key.0.len())
+        .map_err(|_| DbError::storage(SqlState::InternalError, "key has too many columns"))?;
+    let mut bytes = count.to_le_bytes().to_vec();
+    for value in &key.0 {
+        match value {
+            Value::Null => bytes.push(KEY_TAG_NULL),
+            Value::Integer(value) => {
+                bytes.push(KEY_TAG_INTEGER);
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Text(value) => {
+                bytes.push(KEY_TAG_TEXT);
+                let len = u32::try_from(value.len()).map_err(|_| {
+                    DbError::storage(SqlState::InternalError, "key text is too large")
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            Value::Boolean(value) => {
+                bytes.push(KEY_TAG_BOOLEAN);
+                bytes.push(u8::from(*value));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
+    let mut offset = 0;
+    let count = u16::from_le_bytes(
+        read_exact(bytes, &mut offset, 2)?
+            .try_into()
+            .expect("read_exact returns 2 bytes"),
+    );
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let tag = read_exact(bytes, &mut offset, 1)?[0];
+        let value = match tag {
+            KEY_TAG_NULL => Value::Null,
+            KEY_TAG_INTEGER => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                Value::Integer(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+            }
+            KEY_TAG_TEXT => {
+                let len = u32::from_le_bytes(
+                    read_exact(bytes, &mut offset, 4)?
+                        .try_into()
+                        .expect("4 bytes"),
+                ) as usize;
+                let raw = read_exact(bytes, &mut offset, len)?;
+                Value::Text(
+                    String::from_utf8(raw.to_vec())
+                        .map_err(|_| corrupt_row("key text is not valid UTF-8"))?,
+                )
+            }
+            KEY_TAG_BOOLEAN => match read_exact(bytes, &mut offset, 1)?[0] {
+                0 => Value::Boolean(false),
+                1 => Value::Boolean(true),
+                _ => return Err(corrupt_row("key boolean is not 0 or 1")),
+            },
+            _ => return Err(corrupt_row("unknown key value tag")),
+        };
+        values.push(value);
+    }
+    if offset != bytes.len() {
+        return Err(corrupt_row("key has trailing bytes"));
+    }
+    Ok(Key(values))
+}
 
 pub fn encode_row(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
     if row.values.len() != schema.columns.len() {
@@ -145,9 +225,9 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnDef, DataType, Row, TableSchema, Value};
+    use common::{ColumnDef, DataType, Key, Row, TableSchema, Value};
 
-    use super::{ROW_FORMAT_VERSION, decode_row, encode_row};
+    use super::{ROW_FORMAT_VERSION, decode_key, decode_row, encode_key, encode_row};
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -178,6 +258,24 @@ mod tests {
         };
         let bytes = encode_row(&schema(), &row).unwrap();
         assert_eq!(bytes[0], ROW_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn key_codec_round_trips_mixed_value_types() {
+        let key = Key(vec![
+            Value::Integer(-9),
+            Value::Text("名前".to_string()),
+            Value::Boolean(true),
+        ]);
+        let bytes = encode_key(&key).unwrap();
+        assert_eq!(decode_key(&bytes).unwrap(), key);
+    }
+
+    #[test]
+    fn decode_key_rejects_trailing_bytes() {
+        let mut bytes = encode_key(&Key(vec![Value::Integer(1)])).unwrap();
+        bytes.push(0);
+        assert!(decode_key(&bytes).is_err());
     }
 
     #[test]
