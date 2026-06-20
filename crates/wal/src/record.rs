@@ -32,8 +32,7 @@ pub enum WalRecordKind {
     },
     Commit,
     Checkpoint {
-        generation: u64,
-        checkpoint_lsn: Lsn,
+        redo_lsn: Lsn,
     },
     /// Physiological redo: initialize a fresh heap page.
     HeapInit {

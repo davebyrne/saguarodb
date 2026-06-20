@@ -411,7 +411,6 @@ name = "saguarodb-snapshot"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
- "saguarodb-buffer",
  "saguarodb-common",
  "serde",
  "serde_json",

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use buffer::BufferPool;
+use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnInfo, DbError, FileId, Key, KeyRange, Lsn, PageNum, Result, Row, RowId, SqlState,
     StatementContext, StoredRow, TableId, TableSchema, Value,
@@ -131,64 +131,6 @@ impl PageBackedStorageEngine {
         Ok(())
     }
 
-    pub(crate) fn apply_insert_without_wal(
-        &self,
-        table: TableId,
-        key: Key,
-        row: Row,
-    ) -> Result<()> {
-        let mut state = self.lock_state()?;
-        let schema = live_table(&state, table)?.schema.clone();
-        let row_key = key_for_row(&schema, &row)?;
-        if row_key != key {
-            return Err(storage_internal("WAL insert key does not match row"));
-        }
-        if live_table(&state, table)?.directory.contains_key(&key) {
-            return Err(DbError::storage(
-                SqlState::UniqueViolation,
-                "duplicate primary key",
-            ));
-        }
-        let location = self.write_new_row(&schema, &row, 0, 0)?;
-        live_table_mut(&mut state, table)?
-            .directory
-            .insert(key, location);
-        Ok(())
-    }
-
-    pub(crate) fn apply_update_without_wal(
-        &self,
-        table: TableId,
-        key: Key,
-        row: Row,
-    ) -> Result<()> {
-        let mut state = self.lock_state()?;
-        let table_state = live_table(&state, table)?;
-        let schema = table_state.schema.clone();
-        let Some(previous_location) = table_state.directory.get(&key).copied() else {
-            return Ok(());
-        };
-        let replacement_key = key_for_row(&schema, &row)?;
-        if replacement_key != key {
-            return Err(storage_internal("WAL update key does not match row"));
-        }
-        self.mark_dead(previous_location, 0, 0)?;
-        let new_location = self.write_new_row(&schema, &row, 0, 0)?;
-        live_table_mut(&mut state, table)?
-            .directory
-            .insert(key, new_location);
-        Ok(())
-    }
-
-    pub(crate) fn apply_delete_without_wal(&self, table: TableId, key: Key) -> Result<()> {
-        let mut state = self.lock_state()?;
-        let Some(location) = live_table_mut(&mut state, table)?.directory.remove(&key) else {
-            return Ok(());
-        };
-        self.mark_dead(location, 0, 0)?;
-        Ok(())
-    }
-
     pub(crate) fn apply_create_table_without_wal(&self, schema: TableSchema) -> Result<()> {
         let mut state = self.lock_state()?;
         state.tables.insert(
@@ -237,13 +179,7 @@ impl PageBackedStorageEngine {
         }
     }
 
-    fn write_new_row(
-        &self,
-        schema: &TableSchema,
-        row: &Row,
-        txn_id: u64,
-        lsn: Lsn,
-    ) -> Result<RowLocation> {
+    fn write_new_row(&self, schema: &TableSchema, row: &Row, txn_id: u64) -> Result<RowLocation> {
         let row_bytes = encode_row(schema, row)?;
         if row_bytes.len() + page_overhead() > buffer::PAGE_SIZE {
             return Err(DbError::storage(
@@ -259,8 +195,8 @@ impl PageBackedStorageEngine {
             drop(readable);
             if has_space {
                 let mut writable = self.buffer_pool.write_page(file_id, page_num, txn_id)?;
-                let slot_num = page::insert_row(writable.data_mut(), &row_bytes)?;
-                page::set_page_lsn(writable.data_mut(), lsn);
+                let slot_num =
+                    self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;
                 return Ok(RowLocation {
                     file_id,
                     page_num,
@@ -269,11 +205,18 @@ impl PageBackedStorageEngine {
             }
         }
 
+        // Allocate a fresh page. HeapInit is the page's own redo base, so a new
+        // page never needs a separate full-page image.
         let mut writable = self.buffer_pool.new_page(file_id, txn_id)?;
         let page_num = writable.page_num();
+        let init_lsn = self.wal.append(WalRecord {
+            lsn: 0,
+            txn_id,
+            kind: WalRecordKind::HeapInit { file_id, page_num },
+        })?;
         page::init_page(writable.data_mut(), page_num);
-        let slot_num = page::insert_row(writable.data_mut(), &row_bytes)?;
-        page::set_page_lsn(writable.data_mut(), lsn);
+        page::set_page_lsn(writable.data_mut(), init_lsn);
+        let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;
         Ok(RowLocation {
             file_id,
             page_num,
@@ -281,13 +224,82 @@ impl PageBackedStorageEngine {
         })
     }
 
-    fn mark_dead(&self, location: RowLocation, txn_id: u64, lsn: Lsn) -> Result<bool> {
-        let mut writable =
-            self.buffer_pool
-                .write_page(location.file_id, location.page_num, txn_id)?;
-        let deleted = page::delete_row(writable.data_mut(), location.slot_num)?;
-        page::set_page_lsn(writable.data_mut(), lsn);
-        Ok(deleted)
+    /// Insert a row into a pinned page and log its redo record: a full-page image
+    /// on the first modification since the last checkpoint (torn-page protection),
+    /// otherwise a `HeapInsert` delta. Stamps the page-LSN with the record's LSN.
+    fn log_insert(
+        &self,
+        guard: &mut PageWriteGuard,
+        txn_id: u64,
+        file_id: FileId,
+        page_num: PageNum,
+        row_bytes: &[u8],
+    ) -> Result<u16> {
+        if guard.take_needs_fpi() {
+            let slot_num = page::insert_row(guard.data_mut(), row_bytes)?;
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::FullPageImage {
+                    file_id,
+                    page_num,
+                    image: guard.data().to_vec(),
+                },
+            })?;
+            page::set_page_lsn(guard.data_mut(), lsn);
+            Ok(slot_num)
+        } else {
+            let slot_num = page::next_slot(guard.data())?;
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::HeapInsert {
+                    file_id,
+                    page_num,
+                    slot: slot_num,
+                    row_bytes: row_bytes.to_vec(),
+                },
+            })?;
+            let produced = page::insert_row(guard.data_mut(), row_bytes)?;
+            debug_assert_eq!(produced, slot_num);
+            page::set_page_lsn(guard.data_mut(), lsn);
+            Ok(produced)
+        }
+    }
+
+    /// Mark a row dead and log its redo record (full-page image on first touch
+    /// since the last checkpoint, else a `HeapDelete` delta).
+    fn delete_row_logged(&self, location: RowLocation, txn_id: u64) -> Result<bool> {
+        let mut guard = self
+            .buffer_pool
+            .write_page(location.file_id, location.page_num, txn_id)?;
+        if guard.take_needs_fpi() {
+            let deleted = page::delete_row(guard.data_mut(), location.slot_num)?;
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::FullPageImage {
+                    file_id: location.file_id,
+                    page_num: location.page_num,
+                    image: guard.data().to_vec(),
+                },
+            })?;
+            page::set_page_lsn(guard.data_mut(), lsn);
+            Ok(deleted)
+        } else {
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::HeapDelete {
+                    file_id: location.file_id,
+                    page_num: location.page_num,
+                    slot: location.slot_num,
+                },
+            })?;
+            let deleted = page::delete_row(guard.data_mut(), location.slot_num)?;
+            page::set_page_lsn(guard.data_mut(), lsn);
+            Ok(deleted)
+        }
     }
 
     fn read_location(&self, schema: &TableSchema, location: RowLocation) -> Result<Option<Row>> {
@@ -324,17 +336,8 @@ impl StorageEngine for PageBackedStorageEngine {
             ));
         }
 
-        let lsn = self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::Insert {
-                table,
-                key: key.clone(),
-                row: row.clone(),
-            },
-        )?;
         record_directory_before(&mut state, ctx.txn_id, table, &key)?;
-        let location = self.write_new_row(&schema, &row, ctx.txn_id, lsn)?;
+        let location = self.write_new_row(&schema, &row, ctx.txn_id)?;
         live_table_mut(&mut state, table)?
             .directory
             .insert(key, location);
@@ -370,16 +373,8 @@ impl StorageEngine for PageBackedStorageEngine {
             return Ok(false);
         };
 
-        let lsn = self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::Delete {
-                table,
-                key: key.clone(),
-            },
-        )?;
         record_directory_before(&mut state, ctx.txn_id, table, key)?;
-        self.mark_dead(location, ctx.txn_id, lsn)?;
+        self.delete_row_logged(location, ctx.txn_id)?;
         live_table_mut(&mut state, table)?.directory.remove(key);
         Ok(true)
     }
@@ -399,18 +394,9 @@ impl StorageEngine for PageBackedStorageEngine {
             ));
         }
 
-        let lsn = self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::Update {
-                table,
-                key: key.clone(),
-                row: row.clone(),
-            },
-        )?;
         record_directory_before(&mut state, ctx.txn_id, table, key)?;
-        self.mark_dead(previous_location, ctx.txn_id, lsn)?;
-        let new_location = self.write_new_row(&schema, &row, ctx.txn_id, lsn)?;
+        self.delete_row_logged(previous_location, ctx.txn_id)?;
+        let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
         live_table_mut(&mut state, table)?
             .directory
             .insert(key.clone(), new_location);

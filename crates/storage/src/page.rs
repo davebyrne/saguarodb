@@ -91,6 +91,17 @@ pub fn page_lsn(data: &[u8; PAGE_SIZE]) -> Lsn {
     read_u64(data, PAGE_LSN_OFFSET)
 }
 
+/// The slot number a subsequent `insert_row` will assign (the current slot count).
+pub fn next_slot(data: &[u8; PAGE_SIZE]) -> Result<u16> {
+    Ok(validate(data)?.num_slots)
+}
+
+/// Whether a page buffer is a structurally valid, checksum-correct data page.
+/// Recovery uses this to detect torn/uninitialized pages before redo.
+pub fn is_valid(data: &[u8; PAGE_SIZE]) -> bool {
+    validate(data).is_ok()
+}
+
 pub fn has_space_for(data: &[u8; PAGE_SIZE], row_len: usize) -> Result<bool> {
     let header = validate(data)?;
     Ok(free_bytes(header) >= row_len)

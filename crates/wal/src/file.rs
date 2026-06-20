@@ -262,7 +262,7 @@ impl WalManager for FileWalManager {
             .iter()
             .filter(|stored| stored.record.lsn > lsn)
             .filter(|stored| committed_after.contains(&stored.record.txn_id))
-            .filter(|stored| is_logical_operation(&stored.record.kind))
+            .filter(|stored| is_redo_operation(&stored.record.kind))
             .map(|stored| Ok(stored.record.clone()))
             .collect();
         Ok(Box::new(records.into_iter()))
@@ -435,14 +435,12 @@ fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
         .collect()
 }
 
-fn is_logical_operation(kind: &WalRecordKind) -> bool {
-    matches!(
+/// A replayable operation record (anything that recovery applies), i.e. every
+/// record except the `Commit` / `Checkpoint` metadata markers.
+fn is_redo_operation(kind: &WalRecordKind) -> bool {
+    !matches!(
         kind,
-        WalRecordKind::Insert { .. }
-            | WalRecordKind::Update { .. }
-            | WalRecordKind::Delete { .. }
-            | WalRecordKind::CreateTable { .. }
-            | WalRecordKind::DropTable { .. }
+        WalRecordKind::Commit | WalRecordKind::Checkpoint { .. }
     )
 }
 

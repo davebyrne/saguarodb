@@ -2,33 +2,36 @@ use common::{DbError, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const MANIFEST_HEADER_LEN: usize = 16;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotMetadata {
-    pub generation: u64,
+/// The durable control record. It is the checkpoint commit point: the redo
+/// boundary (`checkpoint_lsn`), the live table ids, and the catalog snapshot,
+/// written atomically as a single CRC-checked envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlData {
     pub checkpoint_lsn: Lsn,
     pub tables: Vec<TableId>,
+    pub catalog: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct ManifestPayload {
-    generation: u64,
+struct ControlPayload {
     checkpoint_lsn: Lsn,
     tables: Vec<TableId>,
+    catalog: Vec<u8>,
 }
 
-pub(crate) fn encode_manifest(metadata: &SnapshotMetadata) -> Result<Vec<u8>> {
-    let payload = ManifestPayload {
-        generation: metadata.generation,
-        checkpoint_lsn: metadata.checkpoint_lsn,
-        tables: metadata.tables.clone(),
+pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
+    let payload = ControlPayload {
+        checkpoint_lsn: control.checkpoint_lsn,
+        tables: control.tables.clone(),
+        catalog: control.catalog.clone(),
     };
     let payload_bytes = serde_json::to_vec(&payload)
-        .map_err(|err| corrupt_manifest(format!("failed to encode manifest payload: {err}")))?;
+        .map_err(|err| corrupt_control(format!("failed to encode control payload: {err}")))?;
     let payload_len = u32::try_from(payload_bytes.len())
-        .map_err(|_| corrupt_manifest("snapshot manifest payload is too large"))?;
+        .map_err(|_| corrupt_control("control payload is too large"))?;
     let checksum = crc32fast::hash(&payload_bytes);
 
     let mut bytes = Vec::with_capacity(MANIFEST_HEADER_LEN + payload_bytes.len());
@@ -40,117 +43,123 @@ pub(crate) fn encode_manifest(metadata: &SnapshotMetadata) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<SnapshotMetadata> {
+pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
     if bytes.len() < MANIFEST_HEADER_LEN {
-        return Err(corrupt_manifest("snapshot manifest is too short"));
+        return Err(corrupt_control("control file is too short"));
     }
     if &bytes[0..4] != MANIFEST_MAGIC {
-        return Err(corrupt_manifest("snapshot manifest magic mismatch"));
+        return Err(corrupt_control("control file magic mismatch"));
     }
 
-    let version = read_u32(&bytes[4..8], "snapshot manifest version")?;
+    let version = read_u32(&bytes[4..8], "control file version")?;
     if version != MANIFEST_VERSION {
-        return Err(corrupt_manifest(format!(
-            "unsupported snapshot manifest version {version}",
+        return Err(corrupt_control(format!(
+            "unsupported control file version {version}",
         )));
     }
 
-    let payload_len = read_u32(&bytes[8..12], "snapshot manifest payload length")? as usize;
+    let payload_len = read_u32(&bytes[8..12], "control file payload length")? as usize;
     let expected_len = MANIFEST_HEADER_LEN
         .checked_add(payload_len)
-        .ok_or_else(|| corrupt_manifest("snapshot manifest length overflows"))?;
+        .ok_or_else(|| corrupt_control("control file length overflows"))?;
     if bytes.len() != expected_len {
-        return Err(corrupt_manifest("snapshot manifest length mismatch"));
+        return Err(corrupt_control("control file length mismatch"));
     }
 
-    let expected_checksum = read_u32(&bytes[12..16], "snapshot manifest checksum")?;
+    let expected_checksum = read_u32(&bytes[12..16], "control file checksum")?;
     let payload_bytes = &bytes[MANIFEST_HEADER_LEN..];
-    let actual_checksum = crc32fast::hash(payload_bytes);
-    if actual_checksum != expected_checksum {
-        return Err(corrupt_manifest("snapshot manifest checksum mismatch"));
+    if crc32fast::hash(payload_bytes) != expected_checksum {
+        return Err(corrupt_control("control file checksum mismatch"));
     }
 
-    let payload: ManifestPayload = serde_json::from_slice(payload_bytes)
-        .map_err(|err| corrupt_manifest(format!("failed to decode manifest payload: {err}")))?;
+    let payload: ControlPayload = serde_json::from_slice(payload_bytes)
+        .map_err(|err| corrupt_control(format!("failed to decode control payload: {err}")))?;
     validate_sorted_tables(&payload.tables)?;
-    Ok(SnapshotMetadata {
-        generation: payload.generation,
+    Ok(ControlData {
         checkpoint_lsn: payload.checkpoint_lsn,
         tables: payload.tables,
+        catalog: payload.catalog,
     })
 }
 
 fn read_u32(bytes: &[u8], field: &str) -> Result<u32> {
     let bytes: [u8; 4] = bytes
         .try_into()
-        .map_err(|_| corrupt_manifest(format!("{field} is incomplete")))?;
+        .map_err(|_| corrupt_control(format!("{field} is incomplete")))?;
     Ok(u32::from_le_bytes(bytes))
 }
 
 fn validate_sorted_tables(tables: &[TableId]) -> Result<()> {
     if tables.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(corrupt_manifest(
-            "snapshot manifest tables must contain sorted table ids without duplicates",
+        return Err(corrupt_control(
+            "control file tables must contain sorted table ids without duplicates",
         ));
     }
     Ok(())
 }
 
-fn corrupt_manifest(message: impl Into<String>) -> DbError {
+fn corrupt_control(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SnapshotMetadata, decode_manifest, encode_manifest};
+    use super::{ControlData, decode_control, encode_control};
 
-    fn metadata() -> SnapshotMetadata {
-        SnapshotMetadata {
-            generation: 3,
+    fn control() -> ControlData {
+        ControlData {
             checkpoint_lsn: 42,
             tables: vec![1, 2],
+            catalog: b"catalog-bytes".to_vec(),
         }
     }
 
     #[test]
-    fn manifest_rejects_payload_byte_tampering() {
-        let mut bytes = encode_manifest(&metadata()).unwrap();
+    fn round_trips_control_data() {
+        let bytes = encode_control(&control()).unwrap();
+        assert_eq!(decode_control(&bytes).unwrap(), control());
+    }
+
+    #[test]
+    fn rejects_payload_byte_tampering() {
+        let mut bytes = encode_control(&control()).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
 
-        let err = decode_manifest(&bytes).unwrap_err();
+        let err = decode_control(&bytes).unwrap_err();
         assert!(err.message.contains("checksum mismatch"));
     }
 
     #[test]
-    fn manifest_rejects_trailing_bytes_outside_envelope() {
-        let mut bytes = encode_manifest(&metadata()).unwrap();
+    fn rejects_trailing_bytes_outside_envelope() {
+        let mut bytes = encode_control(&control()).unwrap();
         bytes.push(0);
 
-        let err = decode_manifest(&bytes).unwrap_err();
+        let err = decode_control(&bytes).unwrap_err();
         assert!(err.message.contains("length mismatch"));
     }
 
     #[test]
-    fn manifest_rejects_legacy_json_manifest_without_binary_envelope() {
-        let bytes =
-            br#"{"version":1,"generation":3,"checkpoint_lsn":42,"tables":[1],"checksum":0}"#;
+    fn rejects_legacy_manifest_version() {
+        // A v1 (full-snapshot) manifest envelope must be rejected, not migrated.
+        let mut bytes = encode_control(&control()).unwrap();
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
 
-        let err = decode_manifest(bytes).unwrap_err();
-        assert!(err.message.contains("magic mismatch"));
+        let err = decode_control(&bytes).unwrap_err();
+        assert!(err.message.contains("unsupported control file version"));
     }
 
     #[test]
-    fn manifest_rejects_unsorted_or_duplicate_tables() {
+    fn rejects_unsorted_or_duplicate_tables() {
         for tables in [vec![2, 1], vec![1, 1]] {
-            let bytes = encode_manifest(&SnapshotMetadata {
-                generation: 3,
+            let bytes = encode_control(&ControlData {
                 checkpoint_lsn: 42,
                 tables,
+                catalog: Vec::new(),
             })
             .unwrap();
 
-            let err = decode_manifest(&bytes).unwrap_err();
+            let err = decode_control(&bytes).unwrap_err();
             assert!(err.message.contains("sorted table ids"));
         }
     }

@@ -40,15 +40,12 @@ pub trait SchemaOperations: Send + Sync {
 }
 
 pub trait RecoveryOperations: Send + Sync {
-    fn apply_insert(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_update(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_delete(&self, table: TableId, key: Key) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
 }
 ```
 
-Normal methods append WAL records. `rollback_txn` restores storage-owned in-memory state such as primary-key directory entries; page bytes are restored by `BufferPool::rollback`. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RecoveryOperations` carries only DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. `rollback_txn` restores storage-owned in-memory state such as primary-key directory entries; page bytes are restored by `BufferPool::rollback`. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
 ## Table Storage
 
@@ -121,13 +118,11 @@ the checkpoint LSN.
 
 ## WAL Interaction
 
-Normal storage and schema operations append logical WAL records before mutating pages or table metadata:
+Normal data operations append physiological redo records as they mutate pages, stamping the page-LSN with each record's LSN:
 
-- `Insert`: table, key, row.
-- `Update`: table, key, new row.
-- `Delete`: table, key.
-- `SchemaOperations::create_table`: `CreateTable` with the fully assigned table schema.
-- `SchemaOperations::drop_table`: `DropTable` with the table ID.
+- A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
+- A row delete logs `HeapDelete { file_id, page_num, slot }` (or a `FullPageImage` on first touch). An update is a delete followed by an insert.
+- `SchemaOperations::create_table` / `drop_table` log `CreateTable` / `DropTable`.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
 
@@ -135,10 +130,10 @@ Server query orchestration appends `Commit` and flushes WAL after the statement 
 
 The storage engine can be initialized in recovery mode. In recovery mode:
 
-- Normal `StorageEngine` methods should not be used by server queries.
-- `RecoveryOperations::apply_*` mutates pages and primary-key directories directly.
+- Normal `StorageEngine` methods are not used.
+- Row recovery is physiological page redo: the server drives `apply_physical_redo` over committed records, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations`.
 - No WAL append occurs.
-- Apply operations are idempotency-aware only where needed by recovery. With v1 snapshots, replay applies each post-snapshot record exactly once.
+- After redo, `rebuild_directories` rebuilds the in-memory primary-key directory from the pages.
 
 Concrete page-backed storage exports:
 

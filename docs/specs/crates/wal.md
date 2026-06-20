@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`wal` owns the append-only logical write-ahead log. It records committed statement intent so recovery can replay operations after the latest snapshot checkpoint.
+`wal` owns the append-only write-ahead log. It records committed operations — physiological page redo plus DDL — so recovery can replay them after the latest checkpoint.
 
 ## Depends On
 
@@ -77,7 +77,7 @@ pub trait WalManager: Send + Sync {
 
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the manifest `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already included in the snapshot. `replay_committed_from` returns committed logical operation records only (`Insert`, `Update`, `Delete`, `CreateTable`, `DropTable`); it never yields `Commit` or `Checkpoint` metadata records.
+`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit` and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`).
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
 
@@ -89,7 +89,7 @@ pub trait WalManager: Send + Sync {
 
 For a successful write statement:
 
-1. Storage appends logical operation records.
+1. Storage appends physiological redo records (`HeapInit`/`HeapInsert`/`HeapDelete`, or a `FullPageImage` on the first modification of a page since the last checkpoint); DDL appends `CreateTable`/`DropTable`.
 2. Server query orchestration appends `Commit`.
 3. Server query orchestration calls `wal.flush()`.
 4. The statement is durable and must not be rolled back.
@@ -108,21 +108,21 @@ If rollback cleanup fails before the commit record is durable, the server treats
 
 ## Checkpoint Interaction
 
-The snapshot manager manifest contains the authoritative `checkpoint_lsn`. WAL `Checkpoint` records are metadata only.
+The control record (`manifest.dat`) contains the authoritative `checkpoint_lsn` (redo boundary). WAL `Checkpoint` records are metadata only.
 
-After a snapshot is committed:
+After heap pages are flushed + fsynced and the control record is stored:
 
-1. Append `WalRecord { txn_id: 0, kind: Checkpoint { generation, checkpoint_lsn }, .. }`. Recovery does not depend on this metadata, but v1 writes it for observability and WAL tests.
+1. Append `WalRecord { txn_id: 0, kind: Checkpoint { redo_lsn }, .. }`. Recovery does not depend on this metadata; it is written for observability.
 2. Flush WAL.
 3. Call `truncate_before(checkpoint_lsn)`.
 
-`truncate_before` must not remove records needed by the current manifest. It must preserve the relative order and stored LSNs of retained records.
+`truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records.
 
 ## Replay
 
 Recovery:
 
-- Reads manifest checkpoint LSN.
+- Reads the control record checkpoint LSN.
 - Calls `replay_from(checkpoint_lsn)`.
 - Builds a set of txn IDs with commit records where `LSN > checkpoint_lsn`.
 - Replays only operation records whose txn ID committed. `replay_committed_from(checkpoint_lsn)` provides this filtered committed-record stream through the `WalManager` abstraction.

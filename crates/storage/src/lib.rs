@@ -9,6 +9,7 @@ mod traits;
 pub use codec::{decode_row, encode_row};
 pub use engine::{PageBackedStorageEngine, StorageMode};
 pub use heap::HeapPageStore;
+pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;
 pub use traits::{RecoveryOperations, RowIterator, SchemaOperations, StorageEngine};
 
@@ -112,59 +113,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_apply_does_not_append_wal() {
+    fn recovery_apply_ddl_does_not_append_wal() {
         let harness = StorageHarness::new();
         harness.storage.apply_create_table(users_schema()).unwrap();
-
-        harness
-            .storage
-            .apply_insert(1, Key(vec![Value::Integer(1)]), user_row(1, "Ada", true))
-            .unwrap();
-
-        assert_eq!(harness.wal.record_count(), 0);
-    }
-
-    #[test]
-    fn recovery_update_delete_and_drop_do_not_append_wal() {
-        let harness = StorageHarness::new();
-        let key = Key(vec![Value::Integer(1)]);
-        harness.storage.apply_create_table(users_schema()).unwrap();
-        harness
-            .storage
-            .apply_insert(1, key.clone(), user_row(1, "Ada", true))
-            .unwrap();
-
-        harness
-            .storage
-            .apply_update(1, key.clone(), user_row(1, "Lovelace", false))
-            .unwrap();
-        assert_eq!(
-            harness
-                .storage
-                .get(&StatementContext { txn_id: 0 }, 1, &key)
-                .unwrap(),
-            Some(user_row(1, "Lovelace", false))
-        );
-
-        harness.storage.apply_delete(1, key.clone()).unwrap();
-        assert_eq!(
-            harness
-                .storage
-                .get(&StatementContext { txn_id: 0 }, 1, &key)
-                .unwrap(),
-            None
-        );
-
-        harness
-            .storage
-            .apply_insert(1, key.clone(), user_row(1, "Ada", true))
-            .unwrap();
         harness.storage.apply_drop_table(1).unwrap();
-        let err = match harness.storage.scan(&StatementContext { txn_id: 0 }, 1) {
-            Ok(_) => panic!("expected dropped table to be unavailable"),
-            Err(err) => err,
-        };
-        assert_eq!(err.code, SqlState::UndefinedTable);
+
         assert_eq!(harness.wal.record_count(), 0);
     }
 

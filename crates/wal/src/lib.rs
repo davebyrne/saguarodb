@@ -287,8 +287,7 @@ mod tests {
             lsn: 0,
             txn_id: 0,
             kind: WalRecordKind::Checkpoint {
-                generation: 7,
-                checkpoint_lsn,
+                redo_lsn: checkpoint_lsn,
             },
         })
         .unwrap();

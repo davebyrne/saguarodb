@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use common::{DbError, FileId, FlushPolicy, PageFlushInfo, PageNum, Result, SqlState};
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, Mutex, RawRwLock, RwLock};
 
-use crate::{PAGE_SIZE, PageData, PageInfo, PageLoader};
+use crate::{PAGE_SIZE, PageData, PageInfo, PageLoader, PageStore};
 
 type PageKey = (FileId, PageNum);
 type PageReadLatch = ArcRwLockReadGuard<RawRwLock, PageData>;
@@ -71,6 +71,13 @@ impl PageWriteGuard {
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         &mut self.guard.0
     }
+
+    /// Atomically take the "needs full-page image" flag for this page, returning
+    /// whether this is the first modification since the last checkpoint. The
+    /// caller logs a `FullPageImage` when true, else a delta record.
+    pub fn take_needs_fpi(&self) -> bool {
+        self.frame.needs_fpi.swap(false, Ordering::AcqRel)
+    }
 }
 
 impl Drop for PageWriteGuard {
@@ -98,12 +105,23 @@ pub trait BufferPool: Send + Sync {
     fn mark_all_clean(&self) -> Result<()>;
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
+
+    /// Write every flushable dirty page (per the flush policy) to its home in the
+    /// `PageStore`. Does not fsync or mark frames clean; the caller fsyncs via the
+    /// store and then calls `mark_all_clean`. Used by checkpoint.
+    fn flush_committed_pages(&self) -> Result<()>;
+
+    /// Obtain a writable frame for recovery redo, creating a zeroed frame when the
+    /// page is absent from the store (a new page being re-established). The frame
+    /// is marked dirty under the recovery txn id (0) so it is flushed by the
+    /// post-recovery checkpoint.
+    fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
 }
 
 pub struct MemoryBufferPool {
     frame_count: usize,
-    _flush_policy: Box<dyn FlushPolicy>,
-    page_loader: Arc<dyn PageLoader>,
+    flush_policy: Box<dyn FlushPolicy>,
+    store: Arc<dyn PageStore>,
     state: Mutex<PoolState>,
 }
 
@@ -111,18 +129,18 @@ impl MemoryBufferPool {
     pub fn new(
         frame_count: usize,
         flush_policy: Box<dyn FlushPolicy>,
-        page_loader: Arc<dyn PageLoader>,
+        store: Arc<dyn PageStore>,
     ) -> Self {
         Self {
             frame_count,
-            _flush_policy: flush_policy,
-            page_loader,
+            flush_policy,
+            store,
             state: Mutex::new(PoolState::default()),
         }
     }
 
     pub fn empty(frame_count: usize) -> Self {
-        Self::new(frame_count, Box::new(NeverFlush), Arc::new(NoopPageLoader))
+        Self::new(frame_count, Box::new(NeverFlush), Arc::new(NoopPageStore))
     }
 
     fn read_resident_page(&self, file_id: FileId, page_num: PageNum) -> Option<PageReadGuard> {
@@ -204,7 +222,7 @@ impl BufferPool for MemoryBufferPool {
             return Ok(guard);
         }
 
-        match self.page_loader.load_page(file_id, page_num)? {
+        match self.store.load_page(file_id, page_num)? {
             Some(data) => self.insert_loaded_read_page(file_id, page_num, data),
             None => Err(Self::storage_internal_error(format!(
                 "page not found: file_id={file_id}, page_num={page_num}"
@@ -221,7 +239,7 @@ impl BufferPool for MemoryBufferPool {
         let frame = if let Some(frame) = self.prepare_write_frame(file_id, page_num, txn_id) {
             frame
         } else {
-            match self.page_loader.load_page(file_id, page_num)? {
+            match self.store.load_page(file_id, page_num)? {
                 Some(data) => self.insert_loaded_write_page(file_id, page_num, txn_id, data)?,
                 None => {
                     return Err(Self::storage_internal_error(format!(
@@ -243,6 +261,7 @@ impl BufferPool for MemoryBufferPool {
                 page_num,
                 PageData::default(),
                 true,
+                false,
             )?;
             frame.mark_dirty(txn_id);
             state.advance_next_page_num(file_id, page_num);
@@ -333,6 +352,48 @@ impl BufferPool for MemoryBufferPool {
         self.state.lock().txns.remove(&txn_id);
         Ok(())
     }
+
+    fn flush_committed_pages(&self) -> Result<()> {
+        // Collect dirty frames under the lock, then do I/O without holding it.
+        let dirty: Vec<Arc<Frame>> = {
+            let state = self.state.lock();
+            state
+                .frames
+                .values()
+                .filter(|frame| frame.is_dirty())
+                .cloned()
+                .collect()
+        };
+        for frame in dirty {
+            let info = PageFlushInfo {
+                dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
+                page_lsn: None,
+            };
+            // Checkpoint runs under the exclusive write guard, so every dirty
+            // page belongs to a committed (or recovery, txn 0) transaction and is
+            // flushable. An unflushable dirty page would be silently dropped by
+            // the subsequent `mark_all_clean`, so fail loudly instead.
+            if !self.flush_policy.can_flush(&info) {
+                return Err(Self::storage_internal_error(
+                    "checkpoint encountered an unflushable dirty page",
+                ));
+            }
+            let data = frame.data.read().clone();
+            self.store
+                .write_page(frame.file_id, frame.page_num, &data)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard> {
+        const RECOVERY_TXN: u64 = 0;
+        if let Some(frame) = self.prepare_write_frame(file_id, page_num, RECOVERY_TXN) {
+            return Ok(write_guard(file_id, page_num, frame));
+        }
+        let data = self.store.load_page(file_id, page_num)?.unwrap_or_default();
+        let frame = self.insert_loaded_write_page(file_id, page_num, RECOVERY_TXN, data)?;
+        Ok(write_guard(file_id, page_num, frame))
+    }
 }
 
 #[derive(Default)]
@@ -367,6 +428,7 @@ impl PoolState {
         page_num: PageNum,
         data: PageData,
         dirty: bool,
+        needs_fpi: bool,
     ) -> Result<Arc<Frame>> {
         let key = (file_id, page_num);
         if self.frames.contains_key(&key) {
@@ -385,7 +447,7 @@ impl PoolState {
             self.evict_one_clean_unpinned()?;
         }
 
-        let frame = Arc::new(Frame::new(file_id, page_num, data, dirty));
+        let frame = Arc::new(Frame::new(file_id, page_num, data, dirty, needs_fpi));
         self.frames.insert(key, frame.clone());
         self.clock_order.push(key);
         Ok(frame)
@@ -414,7 +476,7 @@ impl PoolState {
             self.evict_one_clean_unpinned()?;
         }
 
-        let frame = Arc::new(Frame::new(file_id, page_num, data, false));
+        let frame = Arc::new(Frame::new(file_id, page_num, data, false, true));
         self.frames.insert(key, frame.clone());
         self.clock_order.push(key);
         Ok(frame)
@@ -506,22 +568,28 @@ struct Frame {
     data: Arc<RwLock<PageData>>,
     pin_count: AtomicUsize,
     dirty: AtomicBool,
-    dirty_since_snapshot: AtomicBool,
     dirty_txn_id: AtomicU64,
     reference_bit: AtomicBool,
+    needs_fpi: AtomicBool,
 }
 
 impl Frame {
-    fn new(file_id: FileId, page_num: PageNum, data: PageData, dirty: bool) -> Self {
+    fn new(
+        file_id: FileId,
+        page_num: PageNum,
+        data: PageData,
+        dirty: bool,
+        needs_fpi: bool,
+    ) -> Self {
         Self {
             file_id,
             page_num,
             data: Arc::new(RwLock::new(data)),
             pin_count: AtomicUsize::new(0),
             dirty: AtomicBool::new(dirty),
-            dirty_since_snapshot: AtomicBool::new(dirty),
             dirty_txn_id: AtomicU64::new(0),
             reference_bit: AtomicBool::new(true),
+            needs_fpi: AtomicBool::new(needs_fpi),
         }
     }
 
@@ -536,21 +604,23 @@ impl Frame {
 
     fn mark_dirty(&self, txn_id: u64) {
         self.dirty.store(true, Ordering::Release);
-        self.dirty_since_snapshot.store(true, Ordering::Release);
         self.dirty_txn_id.store(txn_id, Ordering::Release);
     }
 
     fn mark_clean(&self) {
         self.dirty.store(false, Ordering::Release);
-        self.dirty_since_snapshot.store(false, Ordering::Release);
         self.dirty_txn_id.store(0, Ordering::Release);
+        // A clean page is on disk; its next modification must log a full-page
+        // image so a torn write can be repaired during redo.
+        self.needs_fpi.store(true, Ordering::Release);
     }
 
     fn restore_dirty_state(&self, was_dirty: bool, dirty_txn_id: u64) {
         self.dirty.store(was_dirty, Ordering::Release);
-        self.dirty_since_snapshot
-            .store(was_dirty, Ordering::Release);
         self.dirty_txn_id.store(dirty_txn_id, Ordering::Release);
+        // Conservatively require a full-page image on the next modification after
+        // a rollback, since the rolled-back statement's FPI (if any) is discarded.
+        self.needs_fpi.store(true, Ordering::Release);
     }
 
     fn is_dirty(&self) -> bool {
@@ -590,11 +660,21 @@ impl FlushPolicy for NeverFlush {
     }
 }
 
-struct NoopPageLoader;
+struct NoopPageStore;
 
-impl PageLoader for NoopPageLoader {
+impl PageLoader for NoopPageStore {
     fn load_page(&self, _file_id: FileId, _page_num: PageNum) -> Result<Option<PageData>> {
         Ok(None)
+    }
+}
+
+impl PageStore for NoopPageStore {
+    fn write_page(&self, _file_id: FileId, _page_num: PageNum, _data: &PageData) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -735,12 +815,12 @@ mod tests {
     fn insert_frame_rejects_resident_page_key() {
         let mut state = PoolState::default();
         state
-            .insert_frame(8, 1, 0, PageData::default(), false)
+            .insert_frame(8, 1, 0, PageData::default(), false, true)
             .unwrap();
         let mut replacement = PageData::default();
         replacement.0[0] = 9;
 
-        let err = match state.insert_frame(8, 1, 0, replacement, true) {
+        let err = match state.insert_frame(8, 1, 0, replacement, true, false) {
             Ok(_) => panic!("expected resident page rejection"),
             Err(err) => err,
         };
@@ -900,5 +980,108 @@ mod tests {
             }
             Ok(self.pages.get(&(file_id, page_num)).cloned())
         }
+    }
+
+    impl PageStore for TestPageLoader {
+        fn write_page(&self, _file_id: FileId, _page_num: PageNum, _data: &PageData) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushAll;
+
+    impl FlushPolicy for FlushAll {
+        fn can_flush(&self, _info: &common::PageFlushInfo) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingStore {
+        writes: Mutex<Vec<(FileId, PageNum, PageData)>>,
+    }
+
+    impl PageLoader for CapturingStore {
+        fn load_page(&self, _file_id: FileId, _page_num: PageNum) -> Result<Option<PageData>> {
+            Ok(None)
+        }
+    }
+
+    impl PageStore for CapturingStore {
+        fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((file_id, page_num, data.clone()));
+            Ok(())
+        }
+
+        fn sync_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_committed_pages_writes_dirty_pages_to_store() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
+        {
+            let mut page = pool.new_page(1, 5).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(5).unwrap();
+
+        pool.flush_committed_pages().unwrap();
+
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 1);
+        assert_eq!(writes[0].1, 0);
+        assert_eq!(writes[0].2.0[0], 42);
+    }
+
+    #[test]
+    fn flush_committed_pages_errors_on_unflushable_dirty_page() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(NeverFlush), store.clone());
+        {
+            let mut page = pool.new_page(1, 5).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(5).unwrap();
+
+        // A dirty page that the policy refuses must fail loudly, never be silently
+        // dropped (it would be lost by the subsequent mark_all_clean).
+        let err = pool.flush_committed_pages().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Storage);
+        assert!(store.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fetch_for_redo_creates_zeroed_frame_for_missing_page() {
+        let pool = MemoryBufferPool::empty(8);
+
+        {
+            let mut page = pool.fetch_for_redo(3, 0).unwrap();
+            assert_eq!(page.data()[0], 0);
+            page.data_mut()[0] = 7;
+        }
+
+        assert_eq!(pool.read_page(3, 0).unwrap().data()[0], 7);
+    }
+
+    #[test]
+    fn take_needs_fpi_is_true_first_then_false() {
+        let pool = MemoryBufferPool::empty(8);
+        pool.load_page(1, 0, PageData::default()).unwrap();
+
+        let page = pool.write_page(1, 0, 9).unwrap();
+        // A loaded (on-disk) page needs a full-page image on first modification.
+        assert!(page.take_needs_fpi());
+        assert!(!page.take_needs_fpi());
     }
 }

@@ -61,18 +61,18 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 ## Startup Sequence
 
 1. Load configuration.
-2. Initialize snapshot manager.
-3. Create the server-owned `SnapshotPageLoader` from the snapshot manager.
-4. Initialize buffer pool with the configured frame count, never-flush policy, and snapshot page loader.
-5. Initialize WAL manager.
-6. Load current snapshot with `snapshot_manager.load_current(buffer_pool)`, returning table pages in the buffer pool plus catalog bytes in `LoadedSnapshot`.
-7. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
-8. Initialize catalog from snapshot catalog bytes, or empty catalog if no snapshot exists.
-9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.rebuild_directories()` so page-backed storage has schemas and primary-key directories before WAL replay.
-10. Replay committed WAL records with `LSN > checkpoint_lsn` through `WalManager::replay_committed_from` and `RecoveryOperations`.
-11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, snapshot manager, concurrency controller, shutdown state, checkpoint state initialized from the loaded manifest checkpoint LSN, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
-12. Clean up orphaned snapshots.
-13. If WAL records were replayed, run checkpoint with `run_checkpoint(&components)` to persist recovered state.
+2. Initialize the control store (`FileControlStore`) and the heap page store (`HeapPageStore` over `<data>/heap`).
+3. Initialize the WAL manager.
+4. Initialize the buffer pool with the configured frame count, the `WalFlushPolicy`, and the heap page store as its `PageStore`.
+5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
+6. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
+7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
+8. Call `storage.install_schemas(catalog.list_tables()?)`.
+9. Pre-load every heap page of each live table into the buffer pool.
+10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them); DDL records replay through `RecoveryOperations`.
+11. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small for the working set), then `storage.rebuild_directories()` to rebuild primary-key directories from the pages.
+12. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+13. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and advance the redo boundary.
 14. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
 15. Construct query service from `components`.
 16. Start Tokio runtime and bind listener.
@@ -143,7 +143,8 @@ pub struct ServerComponents {
     pub storage: Arc<PageBackedStorageEngine>,
     pub buffer_pool: Arc<dyn BufferPool>,
     pub wal: Arc<dyn WalManager>,
-    pub snapshot_manager: Arc<dyn SnapshotManager>,
+    pub control: Arc<dyn ControlStore>,
+    pub store: Arc<dyn PageStore>,
     pub concurrency: Arc<dyn ConcurrencyController>,
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
@@ -156,23 +157,21 @@ pub struct AppState {
 }
 ```
 
-Checkpoint is driven by server or a checkpoint service:
+Checkpoint flushes dirty pages in place to the heap and advances the redo
+boundary; its cost is O(pages changed), not O(database size). Driven by the
+server under the exclusive write guard:
 
 1. Acquire write guard.
-2. Read `checkpoint_lsn = wal.flushed_lsn()`.
-3. Begin snapshot.
-4. Compose table pages from buffer dirty pages plus current snapshot clean pages.
-5. Serialize catalog into snapshot writer.
-6. Commit snapshot.
-7. Mark all buffer pages clean.
-8. Append WAL checkpoint metadata with `txn_id: 0`.
-9. Truncate WAL before `checkpoint_lsn`.
-10. Clean up old snapshots.
-11. Release write guard.
+2. `wal.flush()` (a page's redo must be durable before the page is written).
+3. `buffer_pool.flush_committed_pages()` — write flushable dirty pages to the heap `PageStore`.
+4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
+5. `checkpoint_lsn = wal.flushed_lsn()`.
+6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
+7. Append the `Checkpoint { redo_lsn }` WAL marker (`txn_id: 0`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`.
+8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
+9. Release write guard.
 
-Checkpoint must not delete the previous snapshot before manifest swap is durable.
-
-Page composition is server-owned. For each live catalog table, server loads clean pages with `snapshot_manager.current_table_pages(table_id)`, overlays matching pages from `buffer_pool.iter_pages()`, sorts by page number, and passes `Vec<SnapshotPage>` to `SnapshotWriter::write_table`. The snapshot manager writes page-numbered table files and does not decide which tables are live.
+The durability-critical ordering is: heap fsync (4) before the control record (6) before WAL truncation (7). A crash before the control record falls back to the previous redo boundary, where this cycle's full-page images repair any torn heap writes.
 
 `checkpoint.rs` exposes component-level APIs, not query-service APIs:
 
@@ -180,13 +179,14 @@ Page composition is server-owned. For each live catalog table, server loads clea
 pub struct CheckpointState {
     pub last_checkpoint_lsn: AtomicU64,
     pub commits_since_checkpoint: AtomicU64,
+    pub checkpoints: AtomicU64, // count of completed checkpoints (observability/tests)
 }
 
 pub fn run_checkpoint(components: &ServerComponents) -> Result<()>;
 pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Result<()>;
 ```
 
-`run_checkpoint` resets `last_checkpoint_lsn` to the checkpoint LSN and `commits_since_checkpoint` to `0` only after the snapshot manifest and WAL checkpoint metadata are durable. `record_commit_and_maybe_checkpoint` is called after each successful write statement, after the statement write guard has been dropped. It increments `commits_since_checkpoint` and triggers `run_checkpoint` when either `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. If checkpoint fails, leave the counters unchanged except for the recorded commit so a later write can retry.
+`run_checkpoint` resets `last_checkpoint_lsn` to the checkpoint LSN and `commits_since_checkpoint` to `0` after the control record and WAL checkpoint marker are durable. `record_commit_and_maybe_checkpoint` is called after each successful write statement, after the statement write guard has been dropped. It increments `commits_since_checkpoint` and triggers `run_checkpoint` when either `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. If checkpoint fails, leave the counters unchanged except for the recorded commit so a later write can retry.
 
 ## Connection Handling
 

@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use catalog::serialize_catalog;
 use common::{Result, TableId};
-use snapshot::SnapshotPage;
 use wal::{WalRecord, WalRecordKind};
 
 use crate::app::ServerComponents;
@@ -11,50 +9,51 @@ use crate::app::ServerComponents;
 pub struct CheckpointState {
     pub last_checkpoint_lsn: AtomicU64,
     pub commits_since_checkpoint: AtomicU64,
+    /// Count of completed checkpoints (observability / tests).
+    pub checkpoints: AtomicU64,
 }
 
+/// Checkpoint by flushing dirty pages in place to the heap and advancing the
+/// redo boundary. Cost is O(pages changed), not O(database size).
+///
+/// Ordering is durability-critical: heap pages are fsynced before the control
+/// record (the commit point) is written, which happens before the WAL prefix is
+/// truncated. A crash before the control record falls back to the previous redo
+/// boundary, where this cycle's full-page images repair any torn heap writes.
 pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     let _guard = components.concurrency.begin_write()?;
+
+    // The WAL must be durable before any page it describes is written to the heap.
+    components.wal.flush()?;
+    components.buffer_pool.flush_committed_pages()?;
+    components.store.sync_all()?;
+
     let checkpoint_lsn = components.wal.flushed_lsn();
-    let live_tables = components.catalog.list_tables()?;
-    let live_table_ids: BTreeSet<TableId> = live_tables.iter().map(|table| table.id).collect();
-    let dirty_by_table = dirty_pages_by_table(components, &live_table_ids)?;
-
-    let mut writer = components.snapshot_manager.begin_snapshot()?;
-    for table in live_tables {
-        let mut pages = BTreeMap::new();
-        for page in components.snapshot_manager.current_table_pages(table.id)? {
-            pages.insert(page.page_num, page.data);
-        }
-        if let Some(dirty_pages) = dirty_by_table.get(&table.id) {
-            for (page_num, data) in dirty_pages {
-                pages.insert(*page_num, data.clone());
-            }
-        }
-        let pages = pages
-            .into_iter()
-            .map(|(page_num, data)| SnapshotPage { page_num, data })
-            .collect::<Vec<_>>();
-        writer.write_table(table.id, &pages)?;
-    }
-
+    let mut tables: Vec<TableId> = components
+        .catalog
+        .list_tables()?
+        .iter()
+        .map(|table| table.id)
+        .collect();
+    tables.sort_unstable();
     let catalog_bytes = serialize_catalog(&components.catalog.snapshot()?)?;
-    writer.write_catalog(&catalog_bytes)?;
-    let metadata = components
-        .snapshot_manager
-        .commit_snapshot(writer, checkpoint_lsn)?;
-    components.buffer_pool.mark_all_clean()?;
+    components
+        .control
+        .store(checkpoint_lsn, &tables, &catalog_bytes)?;
+
+    // The Checkpoint marker is optional metadata; recovery uses the control
+    // record's LSN. Truncating below it reclaims the now-redundant WAL prefix.
     components.wal.append(WalRecord {
         lsn: 0,
         txn_id: 0,
         kind: WalRecordKind::Checkpoint {
-            generation: metadata.generation,
-            checkpoint_lsn,
+            redo_lsn: checkpoint_lsn,
         },
     })?;
     components.wal.flush()?;
     components.wal.truncate_before(checkpoint_lsn)?;
-    components.snapshot_manager.cleanup_old_snapshots()?;
+
+    components.buffer_pool.mark_all_clean()?;
 
     components
         .checkpoint
@@ -64,6 +63,10 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         .checkpoint
         .commits_since_checkpoint
         .store(0, Ordering::Release);
+    components
+        .checkpoint
+        .checkpoints
+        .fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -84,20 +87,4 @@ pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Resu
         run_checkpoint(components)?;
     }
     Ok(())
-}
-
-fn dirty_pages_by_table(
-    components: &ServerComponents,
-    live_table_ids: &BTreeSet<TableId>,
-) -> Result<BTreeMap<TableId, BTreeMap<u32, buffer::PageData>>> {
-    let mut dirty_by_table = BTreeMap::<TableId, BTreeMap<u32, buffer::PageData>>::new();
-    for page in components.buffer_pool.iter_pages()? {
-        if page.is_dirty && live_table_ids.contains(&page.file_id) {
-            dirty_by_table
-                .entry(page.file_id)
-                .or_default()
-                .insert(page.page_num, page.data);
-        }
-    }
-    Ok(dirty_by_table)
 }

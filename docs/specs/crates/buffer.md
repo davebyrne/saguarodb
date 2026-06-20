@@ -49,8 +49,12 @@ pub trait BufferPool: Send + Sync {
     fn mark_all_clean(&self) -> Result<()>;
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
+    fn flush_committed_pages(&self) -> Result<()>;
+    fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
 }
 ```
+
+`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`).
 
 `MemoryBufferPool::new(frame_count, flush_policy, page_loader)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageLoader>`. `read_page` first checks resident frames; on a miss it calls `page_loader.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
 
@@ -58,9 +62,9 @@ In production, the server supplies a `SnapshotPageLoader` that wraps `SnapshotMa
 
 `PageStore` extends `PageLoader` with `write_page` and `sync_all` for in-place dirty-page flushing. `storage::HeapPageStore` implements it over one file per table (`<data>/heap/<file_id>.heap`, page `n` at byte offset `n * PAGE_SIZE`, positioned I/O). `write_page` does not fsync; `sync_all` fsyncs all open heap files and the directory. It is the mutable page home for the redo-WAL/flushing model; the buffer pool and server adopt it as the backing store when that cutover lands.
 
-`MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageLoader` returning `Ok(None)`.
+`MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageStore` returning `Ok(None)` from `load_page` and discarding writes.
 
-`load_page(file_id, page_num, data)` is used during snapshot loading. If the page is not resident, it inserts `data` as a clean frame. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool. Snapshot writing combines dirty pages from `iter_pages` with clean pages copied from current snapshot files.
+`load_page(file_id, page_num, data)` inserts a clean frame; recovery uses it to pre-load checkpointed heap pages. If the page is not resident, it inserts `data` as a clean frame. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool (used by directory rebuild).
 
 `commit(txn_id)` is cleanup-only: it discards before-images and new-page tracking after WAL flush succeeds. It must not perform I/O and should not fail for a valid `txn_id`. If it fails after a durable WAL commit, server treats that as fatal and does not roll back.
 
@@ -98,9 +102,9 @@ Each frame tracks:
 - `page_num`
 - `pin_count`
 - `dirty`
-- `dirty_since_snapshot`
 - `dirty_txn_id`
 - `reference_bit`
+- `needs_fpi` (true when the next modification must log a full-page image: set on load and after `mark_clean`/rollback-restore, cleared by `PageWriteGuard::take_needs_fpi`; false for freshly allocated pages, whose `HeapInit` is their own redo base)
 - latch state
 
 `dirty_txn_id` is the last transaction that modified the page. It is not enough for rollback by itself; before-images and new-page tracking handle rollback.
@@ -122,30 +126,27 @@ Rules:
 - On repeated writes to the same page by the same `txn_id`, do not replace the original before-image.
 - On `new_page(file, txn_id)`, record the allocated page in `new_pages`.
 - On `rollback(txn_id)`, restore all before-images and invalidate/free all newly allocated pages for that transaction.
-- On `commit(txn_id)`, discard before-images and new-page tracking. Pages remain dirty until snapshot checkpoint.
+- On `commit(txn_id)`, discard before-images and new-page tracking. Pages remain dirty until a checkpoint flushes them in place to the heap.
 
-This preserves committed in-memory changes from earlier transactions that have not yet been snapshotted.
+This preserves committed in-memory changes from earlier transactions that have not yet been flushed.
 
 ## Eviction
 
 V1 uses clock eviction:
 
-- Clean, unpinned pages may be evicted.
-- Dirty pages are never evicted in V1 because `FlushPolicy::can_flush` always returns false.
+- Clean, unpinned pages may be evicted (re-read from the heap on demand).
+- Dirty pages are not evicted in v1: `flush_committed_pages` (checkpoint) is the only path that writes dirty pages to the heap. Eviction-flush-on-steal (using `FlushPolicy` during eviction to remove the in-RAM working-set ceiling) is deferred.
 - If all candidate frames are dirty or pinned, return a storage/buffer error.
 
-Future physical WAL may allow dirty eviction through `FlushPolicy`.
+## Checkpoint Interaction
 
-## Snapshot Interaction
-
-After `SnapshotManager::commit_snapshot` succeeds, checkpoint calls `mark_all_clean()`. This clears dirty flags and rollback metadata must already be empty because checkpoint holds the global write guard.
-
-`iter_pages` must provide stable page data for snapshot writing. Checkpoint holds the write guard, so no statement mutates pages concurrently.
+Checkpoint holds the global write guard, so no statement mutates pages concurrently. It calls `flush_committed_pages` (writes flushable dirty pages to the `PageStore`), then `PageStore::sync_all`, then `mark_all_clean` (clears dirty flags and re-arms `needs_fpi`). At quiesce every dirty page is committed, so `FlushPolicy` admits them all.
 
 ## Invariants
 
 - No dirty page is evicted in v1.
-- Rollback restores page state to exactly what it was before the failed transaction first touched each page.
+- A page is never written to the heap before its redo records are WAL-durable (`flush_committed_pages` runs after `wal.flush()` at checkpoint).
+- Rollback restores page state to exactly what it was before the failed transaction first touched each page, and re-arms `needs_fpi`.
 - New pages from failed transactions are not visible after rollback.
 - Commit does not flush pages; it only discards rollback metadata.
 - Checkpoint is the only operation that marks committed dirty pages clean.

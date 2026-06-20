@@ -30,9 +30,6 @@ pub trait SchemaOperations: Send + Sync {
 }
 
 pub trait RecoveryOperations: Send + Sync {
-    fn apply_insert(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_update(&self, table: TableId, key: Key, row: Row) -> Result<()>;
-    fn apply_delete(&self, table: TableId, key: Key) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
 }
