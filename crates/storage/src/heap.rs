@@ -94,11 +94,12 @@ impl PageStore for HeapPageStore {
         let file = self
             .handle(file_id, true)?
             .expect("handle with create=true is always Some");
-        file.write_all_at(&data.0, page_offset(page_num)).map_err(|err| {
-            DbError::io(format!(
-                "failed to write heap page {file_id}/{page_num}: {err}"
-            ))
-        })
+        file.write_all_at(&data.0, page_offset(page_num))
+            .map_err(|err| {
+                DbError::io(format!(
+                    "failed to write heap page {file_id}/{page_num}: {err}"
+                ))
+            })
     }
 
     fn sync_all(&self) -> Result<()> {

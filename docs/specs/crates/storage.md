@@ -112,6 +112,13 @@ tail); `write_page` writes in place without fsync; `sync_all` fsyncs all open he
 files and the directory. It is introduced for the redo-WAL/flushing model and
 becomes the buffer pool's backing store when recovery and checkpoint adopt it.
 
+`apply_physical_redo(page, lsn, kind)` replays one physiological redo record
+(`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) onto a page buffer, gated by
+the page-LSN: a record whose effect is already present (`page_lsn(page) >= lsn`) is
+skipped, making replay idempotent. `FullPageImage` is validated to be exactly
+`PAGE_SIZE` bytes before install. Recovery uses it to redo committed records after
+the checkpoint LSN.
+
 ## WAL Interaction
 
 Normal storage and schema operations append logical WAL records before mutating pages or table metadata:

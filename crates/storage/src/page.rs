@@ -85,6 +85,12 @@ pub fn set_page_lsn(data: &mut [u8; PAGE_SIZE], lsn: Lsn) {
     write_checksum(data);
 }
 
+/// Read the page-LSN without validating the page. Safe on freshly zeroed or
+/// not-yet-initialized buffers, which redo gating relies on.
+pub fn page_lsn(data: &[u8; PAGE_SIZE]) -> Lsn {
+    read_u64(data, PAGE_LSN_OFFSET)
+}
+
 pub fn has_space_for(data: &[u8; PAGE_SIZE], row_len: usize) -> Result<bool> {
     let header = validate(data)?;
     Ok(free_bytes(header) >= row_len)
@@ -247,6 +253,12 @@ fn read_u32(data: &[u8; PAGE_SIZE], offset: usize) -> u32 {
         data[offset + 2],
         data[offset + 3],
     ])
+}
+
+fn read_u64(data: &[u8; PAGE_SIZE], offset: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[offset..offset + 8]);
+    u64::from_le_bytes(bytes)
 }
 
 fn write_u32(data: &mut [u8; PAGE_SIZE], offset: usize, value: u32) {
