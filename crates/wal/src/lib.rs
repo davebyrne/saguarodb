@@ -27,7 +27,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    use common::{ErrorKind, Key, Result, Row, Value};
+    use common::{ErrorKind, Result};
 
     use super::{
         FileWalManager, WalManager, WalRecord, WalRecordKind, decode_record, encode_record,
@@ -38,13 +38,7 @@ mod tests {
         let record = WalRecord {
             lsn: 3,
             txn_id: 9,
-            kind: WalRecordKind::Insert {
-                table: 1,
-                key: Key(vec![Value::Integer(7)]),
-                row: Row {
-                    values: vec![Value::Integer(7), Value::Text("Ada".to_string())],
-                },
-            },
+            kind: WalRecordKind::DropTable { table: 7 },
         };
 
         let bytes = encode_record(&record).unwrap();

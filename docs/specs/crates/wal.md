@@ -22,13 +22,10 @@ pub struct WalRecord {
 
 pub enum WalRecordKind {
     // Logical (structured) records, JSON payloads.
-    Insert { table: TableId, key: Key, row: Row },
-    Update { table: TableId, key: Key, row: Row },
-    Delete { table: TableId, key: Key },
     CreateTable { schema: TableSchema },
     DropTable { table: TableId },
     Commit,
-    Checkpoint { generation: u64, checkpoint_lsn: Lsn },
+    Checkpoint { redo_lsn: Lsn },
     // Physiological redo records, compact binary payloads.
     HeapInit { file_id: FileId, page_num: PageNum },
     HeapInsert { file_id: FileId, page_num: PageNum, slot: u16, row_bytes: Vec<u8> },
@@ -39,7 +36,7 @@ pub enum WalRecordKind {
 
 `txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `WalRecordKind::Checkpoint`. User statement transaction IDs start at `1`.
 
-The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) describe page-level changes and carry the `PageLSN` semantics for PageLSN-gated redo replay and torn-page recovery (`FullPageImage`). They define the on-disk redo format; the storage mutation path and recovery that produce and replay them land with the redo-WAL/dirty-page-flushing work.
+The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) describe page-level changes. The storage mutation path produces them (stamping the page-LSN), and recovery replays them PageLSN-gated; `FullPageImage` provides torn-page recovery.
 
 On disk:
 

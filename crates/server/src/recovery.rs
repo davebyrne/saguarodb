@@ -213,11 +213,7 @@ fn apply_redo(
             storage::apply_physical_redo(guard.data_mut(), lsn, &kind)?;
             Ok(())
         }
-        WalRecordKind::Commit
-        | WalRecordKind::Checkpoint { .. }
-        | WalRecordKind::Insert { .. }
-        | WalRecordKind::Update { .. }
-        | WalRecordKind::Delete { .. } => Err(DbError::internal(
+        WalRecordKind::Commit | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
             "recovery replay received an unexpected WAL record",
         )),
     }

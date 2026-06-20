@@ -6,18 +6,15 @@ use crate::{WalRecord, WalRecordKind};
 const HEADER_LEN: usize = 8 + 8 + 1 + 4;
 const CRC_LEN: usize = 4;
 
-const TYPE_INSERT: u8 = 1;
-const TYPE_UPDATE: u8 = 2;
-const TYPE_DELETE: u8 = 3;
-const TYPE_CREATE_TABLE: u8 = 4;
-const TYPE_DROP_TABLE: u8 = 5;
-const TYPE_COMMIT: u8 = 6;
-const TYPE_CHECKPOINT: u8 = 7;
+const TYPE_CREATE_TABLE: u8 = 1;
+const TYPE_DROP_TABLE: u8 = 2;
+const TYPE_COMMIT: u8 = 3;
+const TYPE_CHECKPOINT: u8 = 4;
 // Physiological redo records use compact binary payloads instead of JSON.
-const TYPE_HEAP_INIT: u8 = 8;
-const TYPE_HEAP_INSERT: u8 = 9;
-const TYPE_HEAP_DELETE: u8 = 10;
-const TYPE_FULL_PAGE_IMAGE: u8 = 11;
+const TYPE_HEAP_INIT: u8 = 5;
+const TYPE_HEAP_INSERT: u8 = 6;
+const TYPE_HEAP_DELETE: u8 = 7;
+const TYPE_FULL_PAGE_IMAGE: u8 = 8;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -136,9 +133,6 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
 
 fn record_type(kind: &WalRecordKind) -> u8 {
     match kind {
-        WalRecordKind::Insert { .. } => TYPE_INSERT,
-        WalRecordKind::Update { .. } => TYPE_UPDATE,
-        WalRecordKind::Delete { .. } => TYPE_DELETE,
         WalRecordKind::CreateTable { .. } => TYPE_CREATE_TABLE,
         WalRecordKind::DropTable { .. } => TYPE_DROP_TABLE,
         WalRecordKind::Commit => TYPE_COMMIT,

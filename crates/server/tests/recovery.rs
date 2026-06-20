@@ -2,7 +2,7 @@ mod support;
 
 use std::path::Path;
 
-use support::{TestServer, write_uncommitted_insert_record_for_test};
+use support::{TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
 async fn committed_data_survives_restart_with_checkpoint_and_wal() {
@@ -44,7 +44,7 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
 #[tokio::test]
 async fn uncommitted_wal_record_is_ignored_on_restart() {
     let dir = tempfile::tempdir().unwrap();
-    write_uncommitted_insert_record_for_test(dir.path(), 1, "Ada").unwrap();
+    write_uncommitted_record_for_test(dir.path()).unwrap();
 
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
     server

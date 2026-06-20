@@ -1,4 +1,4 @@
-use common::{FileId, Key, Lsn, PageNum, Row, TableId, TableSchema, Value};
+use common::{FileId, Lsn, PageNum, TableId, TableSchema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,20 +10,7 @@ pub struct WalRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalRecordKind {
-    Insert {
-        table: TableId,
-        key: Key,
-        row: Row,
-    },
-    Update {
-        table: TableId,
-        key: Key,
-        row: Row,
-    },
-    Delete {
-        table: TableId,
-        key: Key,
-    },
+    // Logical (structured) records, JSON payloads.
     CreateTable {
         schema: TableSchema,
     },
@@ -62,16 +49,17 @@ pub enum WalRecordKind {
 }
 
 impl WalRecord {
+    /// A committed-operation record for WAL tests (LSN assignment, commit
+    /// tracking, replay, truncation). `value` only distinguishes records.
     pub fn insert_for_test(txn_id: u64, value: i64) -> Self {
         Self {
             lsn: 0,
             txn_id,
-            kind: WalRecordKind::Insert {
-                table: 1,
-                key: Key(vec![Value::Integer(value)]),
-                row: Row {
-                    values: vec![Value::Integer(value)],
-                },
+            kind: WalRecordKind::HeapInsert {
+                file_id: 1,
+                page_num: 0,
+                slot: 0,
+                row_bytes: value.to_le_bytes().to_vec(),
             },
         }
     }

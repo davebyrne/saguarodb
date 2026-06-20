@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Key, Result, Row, Value};
+use common::Result;
 use saguarodb_server::app::AppState;
 use saguarodb_server::checkpoint::run_checkpoint;
 use saguarodb_server::config::Config;
@@ -132,7 +132,7 @@ impl SimpleQueryResult {
     }
 }
 
-pub fn write_uncommitted_insert_record_for_test(path: &Path, id: i64, name: &str) -> Result<()> {
+pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|err| {
         common::DbError::io(format!(
             "failed to create test WAL directory {}: {err}",
@@ -143,12 +143,11 @@ pub fn write_uncommitted_insert_record_for_test(path: &Path, id: i64, name: &str
     wal.append(WalRecord {
         lsn: 0,
         txn_id: 1,
-        kind: WalRecordKind::Insert {
-            table: 1,
-            key: Key(vec![Value::Integer(id)]),
-            row: Row {
-                values: vec![Value::Integer(id), Value::Text(name.to_string())],
-            },
+        kind: WalRecordKind::HeapInsert {
+            file_id: 1,
+            page_num: 0,
+            slot: 0,
+            row_bytes: vec![1, 2, 3],
         },
     })?;
     wal.flush()?;
