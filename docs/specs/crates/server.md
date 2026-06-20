@@ -17,7 +17,7 @@
 - `storage`
 - `buffer`
 - `wal`
-- `snapshot`
+- `control`
 - `catalog`
 
 No library crate depends on `server`.
@@ -217,11 +217,11 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 
 ## Acceptance Tests
 
-- Startup with no manifest creates empty catalog and empty storage.
-- Startup with manifest loads snapshot metadata and catalog.
-- Recovery replays only committed records after manifest checkpoint LSN.
+- Startup with no control record creates empty catalog and empty storage.
+- Startup with a control record loads the redo boundary and catalog.
+- Recovery replays only committed records after the control record's checkpoint LSN.
 - Failed write rolls back buffer pages and does not append commit.
 - Successful write appends commit, flushes WAL, commits buffer before returning.
-- Checkpoint creates new snapshot and advances manifest checkpoint LSN.
+- Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.
 - Protocol startup and simple query work over a loopback TCP connection.
 - Graceful shutdown runs checkpoint after in-flight query completes.

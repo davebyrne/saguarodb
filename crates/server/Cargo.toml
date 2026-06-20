@@ -12,11 +12,11 @@ path = "src/main.rs"
 buffer = { package = "saguarodb-buffer", path = "../buffer" }
 catalog = { package = "saguarodb-catalog", path = "../catalog" }
 common = { package = "saguarodb-common", path = "../common" }
+control = { package = "saguarodb-control", path = "../control" }
 executor = { package = "saguarodb-executor", path = "../executor" }
 parser = { package = "saguarodb-parser", path = "../parser" }
 planner = { package = "saguarodb-planner", path = "../planner" }
 protocol = { package = "saguarodb-protocol", path = "../protocol" }
-snapshot = { package = "saguarodb-snapshot", path = "../snapshot" }
 storage = { package = "saguarodb-storage", path = "../storage" }
 wal = { package = "saguarodb-wal", path = "../wal" }
 tokio.workspace = true

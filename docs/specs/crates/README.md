@@ -21,7 +21,7 @@ This directory decomposes the overview spec into crate-level contracts for v1 im
 | `storage` | [storage.md](storage.md) | Page-backed table storage, row serialization, recovery operations |
 | `buffer` | [buffer.md](buffer.md) | Page cache, RAII guards, dirty tracking, rollback, in-place page flushing |
 | `wal` | [wal.md](wal.md) | Physiological redo WAL, commit/checkpoint records, replay iterator |
-| `snapshot` | [snapshot.md](snapshot.md) | Durable control record (checkpoint commit point): redo boundary, table ids, catalog |
+| `control` | [control.md](control.md) | Durable control record (checkpoint commit point): redo boundary, table ids, catalog |
 | `protocol` | [protocol.md](protocol.md) | PostgreSQL simple query codec and connection state |
 | `server` | [server.md](server.md) | Binary wiring, startup/recovery, Tokio listener, blocking query execution |
 
@@ -41,5 +41,5 @@ Each crate owns focused unit tests for its public contract. Cross-crate behavior
 
 - SQL pipeline: parse, bind, plan, explain.
 - Execution: SELECT, INSERT, UPDATE, DELETE against in-memory storage.
-- Durability: commit, rollback, snapshot, recovery replay.
+- Durability: commit, rollback, checkpoint, recovery replay.
 - Protocol: startup, SSL rejection, simple query response shape.

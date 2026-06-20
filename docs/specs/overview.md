@@ -46,7 +46,7 @@ saguarodb/
 │   ├── planner/            (rule-based query planner, produces execution plans)
 │   ├── executor/           (query execution engine, evaluates plans against storage)
 │   ├── storage/            (storage engine trait + page-backed table implementation)
-│   ├── snapshot/           (snapshot manager — manifest, snapshot read/write)
+│   ├── control/            (control record — checkpoint commit point)
 │   ├── buffer/             (buffer pool — in-memory page cache)
 │   ├── wal/                (write-ahead log)
 │   ├── catalog/            (table metadata, schema definitions)
@@ -56,13 +56,13 @@ saguarodb/
 ### Dependency Flow
 
 ```
-server → protocol, parser, planner, executor, snapshot, storage, buffer, wal, catalog, common
+server → protocol, parser, planner, executor, control, storage, buffer, wal, catalog, common
 protocol → common
 parser → common
 planner → parser, catalog, common
 executor → planner, storage, catalog, common
 storage → buffer, wal, common
-snapshot → buffer, common
+control → common
 buffer → common
 wal → common
 catalog → common
@@ -1108,9 +1108,9 @@ Slotted page design. Slot array at the top points to variable-length rows packed
 
 **Checksum:** CRC32 computed over entire page content (excluding the checksum field). Verified on every read from disk. Recomputed on every flush to disk.
 
-**PageVersion:** `1` for the v1 page format. Unknown versions are rejected as page corruption.
+**PageVersion:** `2` for the current page format. Unknown versions (including the legacy `1`) are rejected as page corruption.
 
-V1 development builds do not migrate unversioned page headers. Existing page files without `PageVersion = 1` are rejected as corrupt during snapshot load/recovery.
+V1 development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
 
 **PageLSN:** The page header carries an 8-byte PageLSN — the LSN of the WAL record that last modified the page — stamped on every mutation. Redo replay is gated by it (a record is applied only if `page_lsn < record.lsn`), and it determines when a dirty page is safe to flush. See the Write-Ahead Log section.
 
@@ -1119,7 +1119,7 @@ V1 development builds do not migrate unversioned page headers. Existing page fil
 - Table pages store full serialized rows.
 - An in-memory `BTreeMap<Key, RowLocation>` maps primary keys to physical page slots.
 - `RowLocation` stores `file_id`, `page_num`, and `slot_num`.
-- On startup or after snapshot load, storage rebuilds the directory by scanning known table pages.
+- On startup, after recovery, storage rebuilds the directory by scanning the table pages.
 - A future on-disk clustered B-tree can replace this internal access path without changing the public storage traits.
 
 ### Row Serialization
@@ -1173,7 +1173,7 @@ pub trait BufferPool: Send + Sync {
     /// The returned PageWriteGuard exposes page_num() for row-location tracking.
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard>;
 
-    /// Load an exact clean page during snapshot loading.
+    /// Load an exact clean page (used by recovery to preload heap pages).
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
 
     /// Rollback: restore all pages modified by this txn_id to their before-images,
@@ -1182,15 +1182,15 @@ pub trait BufferPool: Send + Sync {
     fn rollback(&self, txn_id: u64) -> Result<()>;
 
     /// Commit: discard before-images and new-page tracking for this txn_id.
-    /// Changes are now permanent and eligible for future snapshots.
+    /// Changes are now permanent and eligible to be flushed at the next checkpoint.
     fn commit(&self, txn_id: u64) -> Result<()>;
 
-    /// Iterate all frames (for snapshot writing). Returns (file_id, page_num, data, is_dirty).
-    /// Server checkpoint composition overlays these pages on clean snapshot pages.
+    /// Iterate all frames (used by the directory rebuild). Returns (file_id, page_num, data, is_dirty).
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
 
-    /// Mark all dirty pages as clean (called after a successful snapshot commit).
+    /// Mark all dirty pages as clean (called by checkpoint after flushing them to the heap).
     fn mark_all_clean(&self) -> Result<()>;
+    // (Checkpoint flush and recovery redo add flush_committed_pages / fetch_for_redo; see buffer.md.)
 }
 ```
 
@@ -1236,7 +1236,7 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
   - `before_images: HashMap<(FileId, PageNum), PageData>` — on the first `write_page` call for an existing page by a `txn_id`, the current page data is copied here.
   - `new_pages: Vec<(FileId, PageNum)>` — pages allocated via `new_page` by this `txn_id`.
   
-  On `rollback(txn_id)`: before-images are restored (existing pages return to pre-statement state) and newly allocated pages are invalidated/freed. On `commit(txn_id)`: both tracking structures are discarded. This correctly handles the case where a page was already dirtied by a prior committed txn (rollback restores to the post-prior-commit state, not the snapshot state) and also handles failed inserts that allocated new pages before the error.
+  On `rollback(txn_id)`: before-images are restored (existing pages return to pre-statement state) and newly allocated pages are invalidated/freed. On `commit(txn_id)`: both tracking structures are discarded. This correctly handles the case where a page was already dirtied by a prior committed txn (rollback restores to the post-prior-commit state, not the on-disk state) and also handles failed inserts that allocated new pages before the error.
 - **PageLoader:** The buffer pool is constructed with an `Arc<dyn PageLoader>`:
 
 ```rust
@@ -1254,18 +1254,18 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 - Clock hand sweeps through frames
 - Each frame has a reference bit, set on access
 - On sweep: if bit is 1, clear to 0 and skip. If bit is 0 and unpinned, check dirty flag.
-- **If clean:** evict immediately. The page can be re-read from the table file (last snapshot) if needed later.
+- **If clean:** evict immediately. The page can be re-read from its heap file if needed later.
 - **If dirty:** skip. V1 does not yet evict dirty pages; they stay in memory until the checkpoint flushes them to the heap and clears their dirty flag. (Eviction-flush-on-steal is a planned follow-up.)
 - If all frames are dirty and pinned, the buffer pool returns an error (out of frames). This is the V1 memory limitation.
 
 ### V1 Limitation: Working Set Must Fit in Buffer Pool
 
-Between snapshots, all dirty pages must remain in memory. With V1's single-writer autocommit:
+Between checkpoints, all dirty pages must remain in memory. With V1's single-writer autocommit:
 - Each statement dirtys a modest number of pages
-- After commit, pages are dirty but committed — they stay in memory until the next snapshot
-- Snapshots clear all dirty flags, making those frames eligible for eviction again
+- After commit, pages are dirty but committed — they stay in memory until the next checkpoint
+- Checkpoints flush dirty pages to the heap and clear their dirty flags, making those frames eligible for eviction again
 - The buffer pool default (1024 frames = 8MB) is adequate for small-to-medium datasets
-- For larger datasets, increase the buffer pool size or snapshot more frequently
+- For larger datasets, increase the buffer pool size or checkpoint more frequently
 
 ### Concurrency
 
@@ -1275,7 +1275,7 @@ Between snapshots, all dirty pages must remain in memory. With V1's single-write
 
 ## 9. Control Store
 
-The `snapshot` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable per-table heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
+The `control` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable per-table heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
 
 ### Trait
 
@@ -1350,13 +1350,14 @@ This gives the invariants:
 
 | Type | Payload |
 |---|---|
-| `Insert` | `TableId`, serialized `Key`, serialized `Row` |
-| `Update` | `TableId`, serialized `Key`, serialized new `Row` |
-| `Delete` | `TableId`, serialized `Key` |
 | `CreateTable` | serialized `TableSchema` (name, columns, primary key) |
 | `DropTable` | `TableId` |
 | `Commit` | (empty — marks the transaction as committed) |
-| `Checkpoint` | generation number and `checkpoint_lsn` — marks a completed snapshot. WAL records before `checkpoint_lsn` can be truncated. |
+| `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
+| `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
+| `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
+| `HeapDelete` | `FileId`, `PageNum`, `slot` |
+| `FullPageImage` | `FileId`, `PageNum`, full page image (torn-page protection) |
 
 `txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `Checkpoint`. User statement transaction IDs start at `1`.
 
@@ -1406,10 +1407,10 @@ One rule ensures redo-only recovery is correct:
 
 **In-place page flushing.** Dirty committed pages are written back to their heap file by the checkpoint (and, in a future step, by eviction). Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo.
 
-The WAL is the sole source of durability between snapshots:
-- On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though no table pages have been written.
-- The buffer pool holds all modified pages in memory until the next snapshot.
-- Table files on disk reflect the last completed snapshot — always a consistent page set.
+The WAL is the source of durability between checkpoints:
+- On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
+- The buffer pool holds modified pages in memory until the next checkpoint flushes them to the heap.
+- Each heap page is recoverable from the last checkpoint plus the committed redo records after it.
 
 This gives a clean invariant: **after a crash, PageLSN-gated redo (with full-page images) restores every heap page to its last committed state.**
 
@@ -1435,7 +1436,7 @@ Reads acquire a shared read guard via `controller.begin_read()` and proceed conc
 
 ### Failed Statement Rollback
 
-If a write statement errors after mutating pages but before commit (e.g., a constraint violation mid-batch INSERT, or an internal error after allocating a page), dirty pages from that `txn_id` must be rolled back — they must not be visible to subsequent reads or included in the next snapshot.
+If a write statement errors after mutating pages but before commit (e.g., a constraint violation mid-batch INSERT, or an internal error after allocating a page), dirty pages from that `txn_id` must be rolled back — they must not be visible to subsequent reads or included in the next checkpoint.
 
 **V1 policy: before-image rollback.**
 
@@ -1453,7 +1454,7 @@ The buffer pool saves a before-image (copy of the page data) on the first write 
 2. ... (statement fails mid-execution) ...
 3. `storage.rollback_txn(txn_id)` — restores primary-key directories and table metadata
 4. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
-5. Catalog restore returns DDL metadata to the pre-statement snapshot when catalog state changed
+5. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
 6. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery
 7. Error returned to client
 

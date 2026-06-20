@@ -77,7 +77,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 ## Concurrency and Async Boundaries
 
-- Parser, planner, executor, storage, buffer, WAL, snapshot, and catalog crates are synchronous.
+- Parser, planner, executor, storage, buffer, WAL, control, and catalog crates are synchronous.
 - Tokio belongs at the server and connection boundary.
 - Use `std::sync::{Arc, Mutex, RwLock}` in core crates by default.
 - Use `parking_lot` where SaguaroDB needs owned lock guards, such as `ReadGuard`, `WriteGuard`, `PageReadGuard`, and `PageWriteGuard`. `std::sync` guard lifetimes are not suitable for these object-safe owned guard types.
@@ -89,11 +89,11 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 ## Serialization and Durable Formats
 
-- Derive `Serialize` and `Deserialize` only for data that intentionally crosses WAL, snapshot, or test fixture boundaries.
+- Derive `Serialize` and `Deserialize` only for data that intentionally crosses WAL, control-file, or test fixture boundaries.
 - Durable files must use explicit versioned envelopes where compatibility matters.
 - WAL and manifest data must be checksummed according to their specs.
 - Do not serialize arbitrary public structs directly as a durable format unless the codec wraps them in a versioned record.
-- Be conservative when changing serialized structs. Add fields in a way that existing snapshots or WAL records can be rejected clearly or migrated deliberately.
+- Be conservative when changing serialized structs. Add fields in a way that existing control or WAL records can be rejected clearly or migrated deliberately.
 - Keep WAL payload encoding behind the WAL codec and storage row encoding behind the storage codec.
 
 ## SQL Semantics in Rust Code

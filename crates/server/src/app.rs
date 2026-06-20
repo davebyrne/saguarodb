@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicU64;
 use buffer::{BufferPool, PageStore};
 use catalog::CatalogManager;
 use common::ConcurrencyController;
-use snapshot::ControlStore;
+use control::ControlStore;
 use storage::PageBackedStorageEngine;
 use wal::WalManager;
 

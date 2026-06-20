@@ -1,11 +1,11 @@
-# `snapshot` Crate Specification
+# `control` Crate Specification
 
 **Date:** 2026-05-03
 **Status:** Draft
 
 ## Purpose
 
-`snapshot` owns the durable **control record** — the checkpoint commit point. It
+`control` owns the durable **control record** — the checkpoint commit point. It
 persists, atomically, the redo boundary (`checkpoint_lsn`), the live table ids,
 and the catalog snapshot. Table data itself lives in mutable heap files
 (`storage::HeapPageStore`) and is flushed in place; this crate no longer writes

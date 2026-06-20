@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`catalog` owns schema metadata, stable table/column IDs, and name-to-ID resolution for binder. Its persisted form is included in snapshots and replayed through WAL for changes after the snapshot.
+`catalog` owns schema metadata, stable table/column IDs, and name-to-ID resolution for binder. Its persisted form is included in the control record and updated by replaying WAL DDL records for changes after the checkpoint.
 
 ## Depends On
 
@@ -72,11 +72,11 @@ The catalog serializes into the control record (`manifest.dat`) at each checkpoi
 
 On startup:
 
-1. Snapshot manager loads current catalog bytes.
+1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
-3. Recovery replays post-snapshot `CreateTable` and `DropTable` records into both catalog and storage using `apply_create_table` and `apply_drop_table`.
+3. Recovery replays post-checkpoint `CreateTable` and `DropTable` records into both catalog and storage using `apply_create_table` and `apply_drop_table`.
 
-Catalog mutations update memory immediately. Durability before snapshot is provided by WAL records.
+Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
 `restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
 

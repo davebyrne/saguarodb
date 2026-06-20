@@ -9,7 +9,7 @@ use common::{
     DbError, FileId, FlushPolicy, PageFlushInfo, PageNum, Result, RwLockConcurrencyController,
     SqlState, TableId,
 };
-use snapshot::{ControlStore, FileControlStore};
+use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
 use wal::{FileWalManager, WalManager, WalRecordKind};
 

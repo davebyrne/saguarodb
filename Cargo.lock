@@ -353,6 +353,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "saguarodb-control"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "saguarodb-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "saguarodb-executor"
 version = "0.1.0"
 dependencies = [
@@ -395,26 +406,15 @@ dependencies = [
  "saguarodb-buffer",
  "saguarodb-catalog",
  "saguarodb-common",
+ "saguarodb-control",
  "saguarodb-executor",
  "saguarodb-parser",
  "saguarodb-planner",
  "saguarodb-protocol",
- "saguarodb-snapshot",
  "saguarodb-storage",
  "saguarodb-wal",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "saguarodb-snapshot"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "saguarodb-common",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@ members = [
   "crates/protocol",
   "crates/storage",
   "crates/wal",
-  "crates/snapshot",
+  "crates/control",
   "crates/server",
 ]
 

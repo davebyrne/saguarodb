@@ -165,12 +165,12 @@ impl PageBackedStorageEngine {
 ## Page-Backed V1 Simplifications
 
 - Single writer means page and primary-key-directory modifications do not need fine-grained locks.
-- A table directory can be rebuilt by scanning known table pages after snapshot load.
+- A table directory can be rebuilt by scanning known table pages after recovery.
 - Compaction may be skipped unless a page runs out of free space.
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
 - New pages allocated during a statement must be tracked by buffer rollback through `new_page(file, txn_id)`.
 - In-memory primary-key directory mutations must be tracked per `txn_id` so `rollback_txn(txn_id)` can restore them if the statement fails after page mutation.
-- `drop_table` must record table schema, primary-key directory, and table metadata in storage rollback metadata before mutation. V1 does not physically delete table pages during the statement; committed drops are reflected by omitting the table from later snapshots.
+- `drop_table` must record table schema, primary-key directory, and table metadata in storage rollback metadata before mutation. V1 does not physically delete table pages during the statement; committed drops are reflected by omitting the table from later checkpoints.
 
 ## Error Handling
 
