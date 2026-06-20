@@ -133,7 +133,12 @@ fn apply_record(
             catalog.apply_drop_table(table)?;
             storage.apply_drop_table(table)
         }
-        WalRecordKind::Commit | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
+        WalRecordKind::Commit
+        | WalRecordKind::Checkpoint { .. }
+        | WalRecordKind::HeapInit { .. }
+        | WalRecordKind::HeapInsert { .. }
+        | WalRecordKind::HeapDelete { .. }
+        | WalRecordKind::FullPageImage { .. } => Err(DbError::internal(
             "recovery replay received non-logical WAL record",
         )),
     }

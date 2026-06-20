@@ -21,6 +21,7 @@ pub struct WalRecord {
 }
 
 pub enum WalRecordKind {
+    // Logical (structured) records, JSON payloads.
     Insert { table: TableId, key: Key, row: Row },
     Update { table: TableId, key: Key, row: Row },
     Delete { table: TableId, key: Key },
@@ -28,10 +29,17 @@ pub enum WalRecordKind {
     DropTable { table: TableId },
     Commit,
     Checkpoint { generation: u64, checkpoint_lsn: Lsn },
+    // Physiological redo records, compact binary payloads.
+    HeapInit { file_id: FileId, page_num: PageNum },
+    HeapInsert { file_id: FileId, page_num: PageNum, slot: u16, row_bytes: Vec<u8> },
+    HeapDelete { file_id: FileId, page_num: PageNum, slot: u16 },
+    FullPageImage { file_id: FileId, page_num: PageNum, image: Vec<u8> },
 }
 ```
 
 `txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `WalRecordKind::Checkpoint`. User statement transaction IDs start at `1`.
+
+The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) describe page-level changes and carry the `PageLSN` semantics for PageLSN-gated redo replay and torn-page recovery (`FullPageImage`). They define the on-disk redo format; the storage mutation path and recovery that produce and replay them land with the redo-WAL/dirty-page-flushing work.
 
 On disk:
 
@@ -44,7 +52,7 @@ Payload: variable
 CRC32: 4 bytes
 ```
 
-CRC covers header and payload except the CRC field.
+CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). The `Type` byte is authoritative for binary records.
 
 ## Public API
 
