@@ -5,8 +5,6 @@ precedence.
 
 ## Project Context
 
-- The project is SaguaroDB, even when the checkout directory is named
-  `clementedb`.
 - SaguaroDB v1 is implemented as a Rust workspace with a PostgreSQL simple-query
   server, SQL parse/bind/plan/execute pipeline, page-backed storage, logical
   WAL, manifest snapshots, and crash recovery.
