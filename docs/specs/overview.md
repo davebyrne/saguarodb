@@ -1126,9 +1126,10 @@ V1 development builds do not migrate unversioned page headers. Existing page fil
 ### Row Serialization
 
 ```
-[null_bitmap][col1_data][col2_data]...
+[row_format_version: 1 byte][null_bitmap][col1_data][col2_data]...
 ```
 
+- `row_format_version`: `1`; unknown versions are rejected as corrupt. Reserved so future MVCC row versions can be added without a second on-disk format break.
 - `INTEGER`: 8 bytes, little-endian i64
 - `TEXT`: 4-byte length prefix + UTF-8 bytes
 - `BOOLEAN`: 1 byte

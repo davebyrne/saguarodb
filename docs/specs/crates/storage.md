@@ -91,9 +91,10 @@ Page body:
 ## Row Serialization
 
 ```text
-[null_bitmap][col1_data][col2_data]...
+[row_format_version: 1 byte][null_bitmap][col1_data][col2_data]...
 ```
 
+- `row_format_version`: `1`; unknown versions are rejected as corrupt. Reserved so MVCC row versions can be added later without a second on-disk format break.
 - `Integer`: 8-byte little-endian i64.
 - `Text`: 4-byte length prefix plus UTF-8 bytes.
 - `Boolean`: 1 byte.
