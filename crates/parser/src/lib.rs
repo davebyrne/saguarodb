@@ -203,6 +203,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_schema_qualified_table_name() {
+        let err = parse("select id from schema.users").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn parses_select_wildcards_distinctly() {
         let stmt = parse("select *, users.* from users").unwrap();
         let Statement::Select(select) = stmt else {

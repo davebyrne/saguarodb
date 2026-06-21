@@ -959,16 +959,16 @@ fn table_alias_name(alias: &sql::TableAlias) -> Result<String> {
 }
 
 fn object_name(name: &sql::ObjectName) -> Result<String> {
-    name.0
-        .iter()
-        .map(|part| {
-            let ident = part
-                .as_ident()
-                .ok_or_else(|| parse_error("unsupported object name part"))?;
-            ident_name(ident)
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(|parts| parts.join("."))
+    // V1 has no schemas, so table, function, and column names are a single
+    // identifier. Reject `schema.table` (and longer) here with a clear error
+    // rather than letting a dotted name fail later as an unknown table.
+    let [part] = name.0.as_slice() else {
+        return unsupported("qualified names are not supported in v1");
+    };
+    let ident = part
+        .as_ident()
+        .ok_or_else(|| parse_error("unsupported object name part"))?;
+    ident_name(ident)
 }
 
 fn ident_name(ident: &sql::Ident) -> Result<String> {
