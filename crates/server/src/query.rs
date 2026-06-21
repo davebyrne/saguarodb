@@ -2,7 +2,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{ColumnInfo, DataType, DbError, Result, StatementContext, Value};
+use common::{ColumnInfo, DataType, DbError, Result, Snapshot, StatementContext, Value};
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
 use planner::{
@@ -137,7 +137,13 @@ impl QueryService {
             other => {
                 let logical = logical_plan(&other)?;
                 let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-                let ctx = self.execution_context(0, cancel);
+                // A read is not its own transaction (txn_id 0 / INVALID_XID), so no
+                // own txn is excluded from the snapshot. Under single-writer
+                // autocommit, reads and writes are mutually exclusive (shared vs.
+                // exclusive concurrency guard), so no write txn is active and `xip`
+                // is empty — the snapshot sees all committed rows.
+                let snapshot = self.capture_autocommit_snapshot(0);
+                let ctx = self.execution_context(0, snapshot, cancel);
                 self.engine.execute(&ctx, &physical)
             }
         }
@@ -157,7 +163,12 @@ impl QueryService {
         // id) until a `Commit`/`Abort` record settles it.
         self.components.active_txns.register(txn_id);
         let catalog_before = self.components.catalog.snapshot()?;
-        let ctx = self.execution_context(txn_id, cancel);
+        // Capture the snapshot after registering this txn, excluding its own id so
+        // own writes are seen via the predicate's `current_txn` path rather than
+        // hidden as "in-progress". Under single-writer autocommit this txn is the
+        // only active one, so `xip` is empty and the snapshot sees all committed.
+        let snapshot = self.capture_autocommit_snapshot(txn_id);
+        let ctx = self.execution_context(txn_id, snapshot, cancel);
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {
@@ -201,15 +212,42 @@ impl QueryService {
     fn execution_context<'a>(
         &'a self,
         txn_id: u64,
+        snapshot: Snapshot,
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
-            statement: StatementContext::new(txn_id),
+            statement: StatementContext::with_snapshot(txn_id, snapshot),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             cancel,
         }
+    }
+
+    /// Capture the autocommit snapshot for a statement (`docs/specs/mvcc.md`
+    /// §5.5). It sees every already-committed transaction:
+    ///
+    /// - `xmax` is the next txn id to be assigned, so every allocated (hence
+    ///   committed under single-writer autocommit) id is `< xmax`.
+    /// - `xip` is the currently-active set minus `own_txn` (the statement's own
+    ///   txn is seen via the predicate's own-write path, not as in-progress). A
+    ///   read passes `own_txn = 0` (it has no txn); nothing is excluded.
+    /// - `xmin` is the oldest active id, or `xmax` if none are active.
+    ///
+    /// In single-writer mode `xip` is empty (the only active id, if any, is
+    /// `own_txn`), making this the degenerate "sees all committed" snapshot — so
+    /// read results are unchanged until Milestone C captures real snapshots.
+    fn capture_autocommit_snapshot(&self, own_txn: u64) -> Snapshot {
+        let xmax = self.components.next_txn_id.load(Ordering::Acquire);
+        let xip: Vec<u64> = self
+            .components
+            .active_txns
+            .active_ids()
+            .into_iter()
+            .filter(|&id| id != own_txn)
+            .collect();
+        let xmin = self.components.active_txns.oldest().unwrap_or(xmax);
+        Snapshot { xmin, xmax, xip }
     }
 
     fn append_and_flush_commit(&self, txn_id: u64) -> Result<()> {

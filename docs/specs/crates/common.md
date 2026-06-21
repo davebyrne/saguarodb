@@ -183,13 +183,18 @@ pub struct StatementContext {
 }
 ```
 
-V1 uses one `txn_id` per autocommit statement. The `snapshot` and `isolation`
-fields are MVCC scaffolding (see `docs/specs/mvcc.md` §5.5): they are carried
-but not yet consulted, so behavior is unchanged. `StatementContext::new(txn_id)`
-fills `snapshot` with the degenerate placeholder `Snapshot::empty()` and
-`isolation` with the default (`IsolationLevel::ReadCommitted`); real snapshot
-capture per isolation level is wired in by later milestones. `StatementContext`
-is no longer `Copy` (it holds a `Snapshot`, which owns a `Vec`).
+V1 uses one `txn_id` per autocommit statement. The `snapshot` is the visibility
+snapshot threaded into the storage engine's read paths (see `docs/specs/mvcc.md`
+§5.5, §6) and is **consulted by scans and point lookups** (Appendix A commit 6):
+invisible versions are skipped. The server's autocommit read/write paths capture
+a real (degenerate, single-writer) snapshot with
+`StatementContext::with_snapshot(txn_id, snapshot)`. `StatementContext::new(txn_id)`
+fills `snapshot` with the equivalent `Snapshot::sees_all_committed()` placeholder
+(every committed row and own write is visible, so pre-capture call sites — tests,
+recovery scaffolding — filter nothing) and `isolation` with the default
+(`IsolationLevel::ReadCommitted`). `isolation` is carried but not yet honored
+(Milestone G). `StatementContext` is not `Copy` (it holds a `Snapshot`, which owns
+a `Vec`).
 
 ## MVCC Types
 
@@ -209,9 +214,16 @@ pub enum IsolationLevel { ReadCommitted, RepeatableRead /* = snapshot isolation 
 ```
 
 `Snapshot::empty()` (also `Default`) is the degenerate `{ xmin: 0, xmax: 0, xip:
-[] }` placeholder; it is not a captured snapshot. `IsolationLevel::default()` is
-`ReadCommitted` (Postgres' default). `Snapshot`/`IsolationLevel` are carried in
-`StatementContext` but not yet consulted by scans (B3.6 wires them in).
+[] }` placeholder; because `xmax = 0` every transaction is "in the future", so it
+sees **nothing** under `is_visible`. `Snapshot::sees_all_committed()` is the
+single-writer autocommit placeholder (`{ xmin: u64::MAX, xmax: u64::MAX, xip: []
+}`): no transaction is in the future and there are no in-progress ids, so every
+committed transaction — and the reader's own writes via the predicate's
+`current_txn` path — is visible. `StatementContext::new` uses
+`sees_all_committed()`, not `empty()`. `IsolationLevel::default()` is
+`ReadCommitted` (Postgres' default). The `snapshot` is consulted by the storage
+engine's scans/point lookups (Appendix A commit 6); `isolation` is honored from
+Milestone G.
 
 ## Visibility
 

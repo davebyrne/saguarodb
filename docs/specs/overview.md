@@ -1423,7 +1423,7 @@ This gives the invariants:
 | `HeapUpdateHeader` | `FileId`, `PageNum`, `slot`, `xmax`, `t_ctid` (`PageNum`, `u16`), `infomask` — in-place mutation of a v2 tuple header (MVCC version stamping; redo via `page::set_tuple_header`, not yet emitted by the engine) |
 | `FullPageImage` | `FileId`, `PageNum`, full page image (torn-page protection) |
 
-`txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `Checkpoint`. User statement transaction IDs start at `1`.
+Transaction ids `0..FIRST_NORMAL_XID` (3) are reserved: `INVALID_XID = 0` (no/non-transactional record), `1`, and `FROZEN_XID = 2` (always-committed/visible). Real statement transaction ids are allocated at or above `FIRST_NORMAL_XID = 3`. The `Checkpoint` marker reuses the per-record `txn_id` header field to carry the transaction-id high-water mark at checkpoint time, so the allocator boundary survives WAL truncation (preventing id reuse after a truncating checkpoint + restart); the CLOG additionally treats unrecorded normal ids below the truncation floor as committed (see §5.4 of `docs/specs/mvcc.md`).
 
 ### WAL Trait
 

@@ -989,11 +989,20 @@ mod tests {
         fn bytes_after(&self, _lsn: Lsn) -> Result<u64> {
             Ok(0)
         }
+
+        fn set_committed_floor(&self, _floor: u64) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl TxnStatusView for CountingWal {
+        // The harness models committed autocommit units: every statement here
+        // commits (via `commit_txn`/`buffer.commit`) and is read back as committed.
+        // Rolled-back rows are removed physically by the buffer before-image, so
+        // their invisibility does not depend on this status. Reporting `Committed`
+        // lets cross-transaction reads observe committed rows under the snapshot.
         fn status(&self, _txn_id: TxnId) -> TxnStatus {
-            TxnStatus::InProgress
+            TxnStatus::Committed
         }
     }
 

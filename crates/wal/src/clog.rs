@@ -25,28 +25,67 @@ use common::{FIRST_NORMAL_XID, TxnId, TxnStatus, TxnStatusView};
 /// `xmin = FROZEN_XID`. Any other unrecorded id reads as
 /// [`TxnStatus::InProgress`] (it is in flight, or aborted-but-never-recorded —
 /// indistinguishable, and treated as not-yet-committed either way).
-#[derive(Debug, Default)]
+///
+/// **Implicit-committed floor (recovery).** Transactions whose `Commit`/`Abort`
+/// records were truncated by a checkpoint are no longer in the rebuilt map, yet
+/// their flushed tuples survive in the heap. Per `docs/specs/mvcc.md` §5.4
+/// ("transactions older than the horizon are implicitly committed") and the
+/// Milestone B flush-gate invariant (uncommitted pages are never flushed, so a
+/// surviving tuple is committed), any unrecorded normal id **below**
+/// `committed_floor` reads as [`TxnStatus::Committed`]. The floor is set at
+/// recovery to the oldest transaction id still present in the (un-truncated) WAL;
+/// at runtime it stays `FIRST_NORMAL_XID` (no truncation gap), so live behavior is
+/// unchanged.
+#[derive(Debug)]
 pub struct Clog {
     statuses: HashMap<TxnId, TxnStatus>,
+    committed_floor: TxnId,
+}
+
+impl Default for Clog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Clog {
     pub fn new() -> Self {
         Self {
             statuses: HashMap::new(),
+            committed_floor: FIRST_NORMAL_XID,
         }
     }
 
+    /// Raise the implicit-committed floor: unrecorded normal ids strictly below
+    /// the floor read as committed (see the type docs). Monotonic — the floor only
+    /// ever advances, so a later checkpoint truncation cannot un-settle a
+    /// transaction an earlier one already covered. Set at recovery to the
+    /// transaction-id allocation boundary, and advanced past each checkpoint's
+    /// truncated transactions at runtime.
+    pub fn set_committed_floor(&mut self, floor: TxnId) {
+        self.committed_floor = self.committed_floor.max(floor).max(FIRST_NORMAL_XID);
+    }
+
+    /// The current implicit-committed floor.
+    pub fn committed_floor(&self) -> TxnId {
+        self.committed_floor
+    }
+
     /// The status of `txn_id`. Reserved ids (`< FIRST_NORMAL_XID`) are always
-    /// committed; an unrecorded normal id is `InProgress`.
+    /// committed; an unrecorded normal id below the implicit-committed floor is
+    /// committed (its `Commit` record was truncated by a checkpoint); any other
+    /// unrecorded normal id is `InProgress`.
     pub fn status(&self, txn_id: TxnId) -> TxnStatus {
         if txn_id < FIRST_NORMAL_XID {
             return TxnStatus::Committed;
         }
-        self.statuses
-            .get(&txn_id)
-            .copied()
-            .unwrap_or(TxnStatus::InProgress)
+        if let Some(status) = self.statuses.get(&txn_id) {
+            return *status;
+        }
+        if txn_id < self.committed_floor {
+            return TxnStatus::Committed;
+        }
+        TxnStatus::InProgress
     }
 
     /// Whether `txn_id` is committed. Equivalent to
@@ -103,6 +142,38 @@ mod tests {
         let clog = Clog::new();
         assert_eq!(clog.status(FIRST_NORMAL_XID), TxnStatus::InProgress);
         assert!(!clog.is_committed(FIRST_NORMAL_XID));
+    }
+
+    #[test]
+    fn committed_floor_treats_truncated_ids_as_committed() {
+        let mut clog = Clog::new();
+        // No floor yet: an unrecorded normal id is in-progress.
+        assert_eq!(clog.status(10), TxnStatus::InProgress);
+
+        // Raise the floor to 10: ids below it (whose Commit records were truncated)
+        // read as committed; ids at/above stay in-progress.
+        clog.set_committed_floor(10);
+        assert_eq!(clog.status(9), TxnStatus::Committed);
+        assert_eq!(clog.status(10), TxnStatus::InProgress);
+
+        // An explicit Abort below the floor still wins (recorded status is checked
+        // before the floor), so a recorded aborted txn is never falsely committed.
+        clog.set_aborted(8);
+        assert_eq!(clog.status(8), TxnStatus::Aborted);
+    }
+
+    #[test]
+    fn committed_floor_is_monotonic() {
+        let mut clog = Clog::new();
+        clog.set_committed_floor(20);
+        // A lower floor never lowers the boundary.
+        clog.set_committed_floor(5);
+        assert_eq!(clog.committed_floor(), 20);
+        assert_eq!(clog.status(15), TxnStatus::Committed);
+        // Never drops below FIRST_NORMAL_XID.
+        let mut fresh = Clog::new();
+        fresh.set_committed_floor(0);
+        assert_eq!(fresh.committed_floor(), FIRST_NORMAL_XID);
     }
 
     #[test]

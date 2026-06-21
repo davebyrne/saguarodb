@@ -26,6 +26,14 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
+
+    /// Raise the CLOG implicit-committed floor to the transaction-id allocation
+    /// boundary established at recovery: any unrecorded normal id below it is
+    /// treated as committed because its `Commit` record was truncated by a prior
+    /// checkpoint while its tuples survive (`docs/specs/mvcc.md` §5.4). Called once
+    /// after recovery seeds the allocator; monotonic, so it never un-settles a
+    /// transaction.
+    fn set_committed_floor(&self, floor: u64) -> Result<()>;
 }
 
 #[cfg(test)]

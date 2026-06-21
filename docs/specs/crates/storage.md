@@ -62,6 +62,33 @@ Each table is page-backed. Full rows live in heap pages; a durable, non-clustere
 - `index_scan` walks a secondary index, which points directly at heap TIDs, and reads each row from its heap location (no primary-key indirection; see Secondary Indexes).
 - `delete` / `update` keep every secondary index in sync with the heap.
 
+### Snapshot visibility on reads
+
+Every heap row materialized for a user-facing read — `get` (point lookup),
+`scan_range` (sequential scan), and `index_scan` (index → heap) — is filtered
+through the MVCC visibility predicate (`common::is_visible`, `docs/specs/mvcc.md`
+§6) before it is returned. The engine decodes each candidate tuple's
+`xmin`/`xmax`/`infomask`, evaluates it against the statement's `Snapshot`
+(`ctx.snapshot`), the current transaction (`ctx.txn_id`), and the CLOG-backed
+`TxnStatusView` (`PageBackedStorageEngine::txn_status_view`); an **invisible
+version is skipped, not returned**. Under single-writer autocommit the captured
+snapshot is degenerate ("sees all committed" — empty `xip`, `xmax` past every
+allocated id), so every committed row and own write stays visible and read
+results are unchanged from the pre-MVCC engine.
+
+- **Index → heap is skip, not error.** An index entry that resolves to a tuple
+  invisible to the snapshot (or whose line pointer is `DEAD`/absent) is skipped
+  rather than raising an internal error. This is the forward-looking contract for
+  per-version index entries that VACUUM has not yet reclaimed (Milestone B4/F).
+- **No `t_ctid` walk on reads.** With one index entry per version, a scan collects
+  every candidate TID from the index and visibility-checks each at the heap; the
+  forward `t_ctid` chain is not followed for `SELECT` (it serves update-locating
+  and conflict detection in later milestones).
+- **Internal index maintenance is unfiltered.** `delete`/`update` and index
+  backfill read the *current physical* tuple (not the snapshot-visible version) to
+  recompute index keys, so they use the unfiltered heap read, not the
+  visibility-aware one.
+
 ## Page Format
 
 Page header (22 bytes, version 2):

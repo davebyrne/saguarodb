@@ -38,7 +38,7 @@ pub enum WalRecordKind {
 }
 ```
 
-`txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `WalRecordKind::Checkpoint`. User statement transaction IDs start at `FIRST_NORMAL_XID` (the allocator floors there so real transactions never stamp tuple headers with a reserved xid).
+`txn_id = 0` is reserved for non-transactional system metadata records. The `Checkpoint` marker is the exception that carries a non-zero `txn_id`: it stamps the transaction-id allocation high-water mark so the allocator boundary survives WAL truncation (see Checkpoint Interaction). No consumer treats the marker's `txn_id` as a real transaction (CLOG rebuild and redo key off the record *kind*); only the allocator seed reads it. User statement transaction IDs start at `FIRST_NORMAL_XID` (the allocator floors there so real transactions never stamp tuple headers with a reserved xid).
 
 `Commit` and `Abort` carry no payload; the `txn_id` is in the header. `Commit` marks a transaction durably committed; `Abort` marks it aborted. Together they are the durable source of truth for transaction outcome and the input to CLOG reconstruction during recovery (see the MVCC plan, `docs/specs/mvcc.md` §5.4, §8). Under MVCC the CLOG is kept in memory and rebuilt from these records; a durable CLOG file is deferred to Milestone F.
 
@@ -78,6 +78,8 @@ pub trait WalManager: Send + Sync + common::TxnStatusView {
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
+    // Raise the CLOG implicit-committed floor (recovery seed). See Invariants.
+    fn set_committed_floor(&self, floor: u64) -> Result<()>;
 }
 ```
 
@@ -120,11 +122,11 @@ The control record (`manifest.dat`) contains the authoritative `checkpoint_lsn` 
 
 After heap pages are flushed + fsynced and the control record is stored:
 
-1. Append `WalRecord { txn_id: 0, kind: Checkpoint { redo_lsn }, .. }`. Recovery does not depend on this metadata; it is written for observability.
+1. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn }, .. }`. The marker's `txn_id` carries the transaction-id allocation high-water mark (highest id allocated so far) rather than the usual `0`. The marker survives `truncate_before` (its LSN is the retained boundary), so recovery's allocator seed recovers the boundary even when every data record below the checkpoint was truncated — without it the allocator would restart low and reissue ids that already stamped committed tuples, corrupting MVCC visibility. Recovery still does not *replay* this metadata.
 2. Flush WAL.
 3. Call `truncate_before(checkpoint_lsn)`.
 
-`truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records.
+`truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records. It also advances the CLOG implicit-committed floor (see Invariants) past the transactions it removes, since their `Commit` records are now gone but their flushed tuples survive.
 
 ## Replay
 
@@ -162,6 +164,19 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
   normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and
   rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F
   (see `docs/specs/mvcc.md` §5.4).
+- **Implicit-committed floor.** The CLOG carries a monotonic `committed_floor`:
+  an unrecorded normal id strictly below it reads as `Committed` instead of
+  `InProgress`. This covers transactions whose `Commit` records were truncated by
+  a checkpoint while their flushed tuples survive in the heap — per
+  `docs/specs/mvcc.md` §5.4 ("transactions older than the horizon are implicitly
+  committed") and the Milestone B flush-gate invariant (uncommitted pages are
+  never flushed, so a surviving tuple is committed). An explicitly recorded status
+  (`Committed`/`Aborted`) always takes precedence over the floor, so a recorded
+  abort below the floor is never falsely shown. The floor is set at recovery to the
+  transaction-id allocation boundary (`set_committed_floor(next_txn_id)`) and
+  advanced past each checkpoint's truncated transactions inside `truncate_before`.
+  At runtime, before any truncation, it stays at `FIRST_NORMAL_XID`, so live
+  behavior is unchanged.
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests

@@ -291,6 +291,19 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn >= lsn)
             .cloned()
             .collect();
+        // Transactions whose records are being truncated are settled and durable
+        // (the checkpoint flushed their committed pages; aborted transactions left
+        // no flushed tuples). Advance the implicit-committed floor past them so a
+        // post-truncation read still treats their surviving tuples as committed,
+        // even though their `Commit` records are gone (`docs/specs/mvcc.md` §5.4).
+        let truncated_floor = state
+            .records
+            .iter()
+            .filter(|stored| stored.record.lsn < lsn)
+            .map(|stored| stored.record.txn_id)
+            .filter(|&txn_id| txn_id != 0)
+            .max()
+            .map(|max_truncated| max_truncated + 1);
         let temp_path = self.path.with_extension("tmp");
         {
             let mut temp_file = OpenOptions::new()
@@ -365,7 +378,14 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn <= state.flushed_lsn)
             .map(|stored| stored.encoded_len)
             .sum();
+        let previous_floor = state.clog.committed_floor();
         state.clog = rebuild_clog(&state.records, state.flushed_lsn);
+        // Preserve the monotonic floor across the rebuild, then advance it past the
+        // transactions this truncation removed.
+        state.clog.set_committed_floor(previous_floor);
+        if let Some(floor) = truncated_floor {
+            state.clog.set_committed_floor(floor);
+        }
         state.pending_commits = pending_commits(&state.records, state.flushed_lsn);
 
         Ok(())
@@ -386,6 +406,11 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn > lsn)
             .map(|stored| stored.encoded_len)
             .sum())
+    }
+
+    fn set_committed_floor(&self, floor: u64) -> Result<()> {
+        self.lock_state()?.clog.set_committed_floor(floor);
+        Ok(())
     }
 }
 

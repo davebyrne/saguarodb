@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
-    Result, Row, RowId, SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView,
-    Value,
+    Result, Row, RowId, Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema,
+    TxnStatusView, Value, is_visible,
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -118,13 +118,9 @@ impl PageBackedStorageEngine {
     /// (`common::is_visible`, `docs/specs/mvcc.md` §6). The engine already holds an
     /// `Arc<dyn WalManager>`, and the WAL manager *is* a `TxnStatusView` (backed by
     /// its in-memory CLOG), so this hands out `&dyn TxnStatusView` with no extra
-    /// handle — the "injection" of transaction status into the engine. Snapshot-
-    /// aware scans/point-lookups consume it in Milestone B3.6; nothing reads it yet,
-    /// so reads are unchanged this commit.
-    #[allow(
-        dead_code,
-        reason = "consumed by snapshot-aware scans in B3.6 (Appendix A commit 6)"
-    )]
+    /// handle — the "injection" of transaction status into the engine. The
+    /// snapshot-aware read paths (`read_visible_row`, consumed by `get`/`scan_range`/
+    /// `index_scan`) consult it to settle each candidate tuple's `xmin`/`xmax`.
     pub(crate) fn txn_status_view(&self) -> &dyn TxnStatusView {
         // Trait upcast: `dyn WalManager` has `TxnStatusView` as a supertrait.
         self.wal.as_ref()
@@ -410,6 +406,12 @@ impl PageBackedStorageEngine {
         }
     }
 
+    /// Read the *current physical* row at `location`, ignoring snapshot
+    /// visibility. Used by index-maintenance paths (delete/update/index backfill)
+    /// that must see the live tuple to recompute its index keys, not the version a
+    /// reader's snapshot would observe. User-facing reads use
+    /// [`Self::read_visible_row`] instead. Returns `None` if the line pointer is
+    /// absent (DEAD/UNUSED).
     fn read_location(&self, schema: &TableSchema, location: RowLocation) -> Result<Option<Row>> {
         let readable = self
             .buffer_pool
@@ -417,9 +419,43 @@ impl PageBackedStorageEngine {
         let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
             return Ok(None);
         };
-        // Milestone A stamps the MVCC header but does not yet apply visibility, so
-        // callers still consume only the column values (`DecodedRow::row`).
         Ok(Some(decode_row(schema, &bytes)?.row))
+    }
+
+    /// Read the row at `location` only if it is **visible** to `snapshot` from
+    /// `current_txn` (`docs/specs/mvcc.md` §6). Decodes the v2 tuple header
+    /// (`xmin`/`xmax`/`infomask`) and applies [`is_visible`] against the CLOG-backed
+    /// status view; an invisible version yields `None` and is skipped by the caller.
+    /// A missing line pointer (DEAD/UNUSED) likewise yields `None` — an index entry
+    /// landing on an absent or invisible tuple is skipped, never an error (the
+    /// forward-looking hook for B4's retained index entries). Under the degenerate
+    /// autocommit snapshot every committed row and own write is visible, so this
+    /// filters nothing.
+    fn read_visible_row(
+        &self,
+        schema: &TableSchema,
+        location: RowLocation,
+        snapshot: &Snapshot,
+        current_txn: u64,
+    ) -> Result<Option<Row>> {
+        let readable = self
+            .buffer_pool
+            .read_page(location.file_id, location.page_num)?;
+        let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
+            return Ok(None);
+        };
+        let decoded = decode_row(schema, &bytes)?;
+        if !is_visible(
+            decoded.xmin,
+            decoded.xmax,
+            decoded.infomask,
+            snapshot,
+            current_txn,
+            self.txn_status_view(),
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(decoded.row))
     }
 
     fn table_page_nums(&self, file_id: FileId) -> Result<Vec<PageNum>> {
@@ -464,12 +500,19 @@ impl StorageEngine for PageBackedStorageEngine {
         })
     }
 
-    fn get(&self, _ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>> {
+    fn get(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>> {
         let (schema, index_fid) = self.table_handle(table)?;
-        let Some(location) = self.btree(index_fid).search(key)? else {
-            return Ok(None);
-        };
-        self.read_location(&schema, location)
+        // The primary-key index may carry entries for several versions of this key
+        // once versioning lands (B4); collect every candidate TID and return the
+        // single one visible to this snapshot. Today there is one entry per key.
+        for location in self.btree(index_fid).scan_key(key)? {
+            if let Some(row) =
+                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+            {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
     }
 
     fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool> {
@@ -560,7 +603,7 @@ impl StorageEngine for PageBackedStorageEngine {
 
     fn scan_range(
         &self,
-        _ctx: &StatementContext,
+        ctx: &StatementContext,
         table: TableId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
@@ -569,9 +612,12 @@ impl StorageEngine for PageBackedStorageEngine {
 
         let mut rows = Vec::with_capacity(entries.len());
         for (key, location) in entries {
-            let row = self
-                .read_location(&schema, location)?
-                .ok_or_else(|| storage_internal("primary-key index points to dead row"))?;
+            // Visibility-check the candidate TID at the heap; an invisible version
+            // (or an absent line pointer) is skipped, not returned or errored.
+            let Some(row) = self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+            else {
+                continue;
+            };
             rows.push(StoredRow {
                 row_id: RowId {
                     page_num: location.page_num,
@@ -591,7 +637,7 @@ impl StorageEngine for PageBackedStorageEngine {
 
     fn index_scan(
         &self,
-        _ctx: &StatementContext,
+        ctx: &StatementContext,
         table: TableId,
         index: IndexId,
         range: &KeyRange,
@@ -600,14 +646,21 @@ impl StorageEngine for PageBackedStorageEngine {
         self.ensure_index_live(table, index)?;
 
         // The secondary index points directly at heap TIDs (uniform with the
-        // primary-key index), so a scan reads the heap at each TID with no
-        // primary-key indirection.
+        // primary-key index), so a scan collects candidate TIDs from the index and
+        // reads the heap at each — no primary-key indirection, and no walking the
+        // `t_ctid` chain (every version is independently indexed; `mvcc.md` §6,
+        // Appendix A "Reads do not walk t_ctid").
         let entries = self.secondary_btree(index).range(range)?;
         let mut rows = Vec::with_capacity(entries.len());
         for (_entry_key, location) in entries {
-            let row = self
-                .read_location(&schema, location)?
-                .ok_or_else(|| storage_internal("secondary index resolves to a dead row"))?;
+            // Visibility-check the candidate TID at the heap. An index entry whose
+            // tuple is invisible to this snapshot (or whose line pointer is
+            // DEAD/absent) is skipped, not an error — the forward-looking hook for
+            // B4's retained per-version index entries.
+            let Some(row) = self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+            else {
+                continue;
+            };
             // The row's primary key is recovered from the heap row, preserving the
             // `StoredRow.key` semantics callers relied on under secondary→PK.
             let key = key_for_row(&schema, &row)?;
@@ -936,4 +989,307 @@ fn duplicate_unique_index(name: &str) -> DbError {
 
 fn storage_internal(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use std::sync::Arc;
+
+    use buffer::{BufferPool, MemoryBufferPool, PageStore};
+    use common::{
+        ColumnDef, DataType, IndexSchema, Key, KeyRange, PageFlushInfo, Row, Snapshot,
+        StatementContext, TableSchema, Value,
+    };
+    use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    use super::PageBackedStorageEngine;
+    use crate::HeapPageStore;
+    use crate::traits::{SchemaOperations, StorageEngine};
+
+    struct AlwaysFlush;
+    impl common::FlushPolicy for AlwaysFlush {
+        fn can_flush(&self, _info: &PageFlushInfo) -> bool {
+            true
+        }
+    }
+
+    /// A storage engine over an in-memory buffer pool and a real (file-backed) WAL,
+    /// whose CLOG the tests drive via `Commit`/`Abort` records to control which
+    /// `xmin`/`xmax` are committed/aborted/in-progress.
+    struct Fixture {
+        engine: PageBackedStorageEngine,
+        wal: Arc<FileWalManager>,
+        _dir: tempfile::TempDir,
+    }
+
+    const TABLE_ID: u32 = 1;
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn PageStore> =
+                Arc::new(HeapPageStore::open(dir.path().join("data")).unwrap());
+            let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
+            buffer.enable_stealing();
+            let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+            let engine =
+                PageBackedStorageEngine::open(buffer, wal.clone(), super::StorageMode::Normal)
+                    .unwrap();
+            Self {
+                engine,
+                wal,
+                _dir: dir,
+            }
+        }
+
+        /// Append a `Commit` for `txn_id` and flush so the CLOG records it
+        /// `Committed` (flush is what settles a commit).
+        fn commit(&self, txn_id: u64) {
+            self.wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            self.wal.flush().unwrap();
+        }
+
+        /// Append an `Abort` for `txn_id` so the CLOG records it `Aborted`.
+        fn abort(&self, txn_id: u64) {
+            self.wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+        }
+    }
+
+    fn ctx(txn_id: u64, snapshot: Snapshot) -> StatementContext {
+        StatementContext::with_snapshot(txn_id, snapshot)
+    }
+
+    /// A snapshot that sees every settled (committed) id below `xmax` except the
+    /// listed in-progress ids, none of which are own writes.
+    fn snapshot(xmax: u64, xip: Vec<u64>) -> Snapshot {
+        Snapshot { xmin: 1, xmax, xip }
+    }
+
+    fn users_schema() -> TableSchema {
+        TableSchema {
+            id: TABLE_ID,
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn name_index() -> IndexSchema {
+        IndexSchema {
+            id: 1,
+            table: TABLE_ID,
+            name: "users_name".to_string(),
+            columns: vec![1],
+            unique: false,
+        }
+    }
+
+    fn row(id: i64, name: &str) -> Row {
+        Row {
+            values: vec![Value::Integer(id), Value::Text(name.to_string())],
+        }
+    }
+
+    fn key(id: i64) -> Key {
+        Key(vec![Value::Integer(id)])
+    }
+
+    /// Insert three rows whose creating transactions are, respectively, committed,
+    /// in-progress, and aborted; settle the CLOG accordingly. Returns the fixture
+    /// with the table created. The reader uses `READER`/its snapshot to scan.
+    fn fixture_with_mixed_visibility() -> Fixture {
+        let fixture = Fixture::new();
+        // DDL under a committed setup transaction.
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        // Committed creator (txn 10): visible.
+        fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                row(1, "committed"),
+            )
+            .unwrap();
+        fixture.commit(10);
+
+        // In-progress creator (txn 20): never settled ⇒ hidden.
+        fixture
+            .engine
+            .insert(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                row(2, "in_progress"),
+            )
+            .unwrap();
+
+        // Aborted creator (txn 30): hidden.
+        fixture
+            .engine
+            .insert(&ctx(30, snapshot(31, vec![])), TABLE_ID, row(3, "aborted"))
+            .unwrap();
+        fixture.abort(30);
+
+        fixture
+    }
+
+    /// The reader's snapshot: the future starts at 40 (so 10/20/30 are in the
+    /// past), txn 20 is in-progress (in `xip`), and the reader is not its own txn
+    /// (current_txn 0), so visibility is settled purely by the CLOG.
+    fn reader_snapshot() -> Snapshot {
+        snapshot(40, vec![20])
+    }
+
+    #[test]
+    fn seq_scan_skips_invisible_versions() {
+        let fixture = fixture_with_mixed_visibility();
+        let mut iter = fixture
+            .engine
+            .scan_range(&ctx(0, reader_snapshot()), TABLE_ID, &KeyRange::All)
+            .unwrap();
+
+        let mut names = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            names.push(stored.row.values[1].clone());
+        }
+        // Only the committed row survives; the in-progress and aborted creators are
+        // hidden by the visibility predicate.
+        assert_eq!(names, vec![Value::Text("committed".to_string())]);
+    }
+
+    #[test]
+    fn point_lookup_hides_invisible_and_shows_committed() {
+        let fixture = fixture_with_mixed_visibility();
+        let reader = ctx(0, reader_snapshot());
+
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "committed"))
+        );
+        // In-progress creator: hidden, not an error.
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(2)).unwrap(),
+            None
+        );
+        // Aborted creator: hidden, not an error.
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(3)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn index_scan_skips_invisible_versions_without_erroring() {
+        let fixture = fixture_with_mixed_visibility();
+        // Build the secondary index after the rows exist, under a committed txn.
+        // Backfill reads the live physical rows (not snapshot-filtered), so every
+        // row — including the aborted/in-progress ones — gets an index entry. The
+        // scan must then *skip* the invisible ones at the heap, not error.
+        let builder = ctx(101, snapshot(102, vec![]));
+        fixture
+            .engine
+            .create_index(&builder, &name_index())
+            .unwrap();
+        fixture.commit(101);
+
+        let mut iter = fixture
+            .engine
+            .index_scan(
+                &ctx(0, reader_snapshot()),
+                TABLE_ID,
+                name_index().id,
+                &KeyRange::All,
+            )
+            .unwrap();
+
+        let mut names = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            names.push(stored.row.values[1].clone());
+        }
+        // The index has entries for all three rows, but only the committed one is
+        // visible; the entries pointing at the aborted/in-progress tuples are
+        // skipped rather than returned or erroring.
+        assert_eq!(names, vec![Value::Text("committed".to_string())]);
+    }
+
+    #[test]
+    fn degenerate_snapshot_shows_all_committed_and_own_writes() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        // Insert a committed row (txn 10) and an own-write row under the reader's
+        // own txn (txn 50, never committed) — both must be visible to txn 50 under
+        // the degenerate snapshot (empty xip, sees all committed + own writes).
+        fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                row(1, "committed"),
+            )
+            .unwrap();
+        fixture.commit(10);
+        fixture
+            .engine
+            .insert(
+                &ctx(50, snapshot(51, vec![])),
+                TABLE_ID,
+                row(2, "own_write"),
+            )
+            .unwrap();
+
+        // The degenerate autocommit snapshot for txn 50: empty xip, xmax past every
+        // allocated id. Own write (txn 50) is seen via current_txn; committed rows
+        // are seen via the CLOG.
+        let mut iter = fixture
+            .engine
+            .scan_range(&ctx(50, snapshot(60, vec![])), TABLE_ID, &KeyRange::All)
+            .unwrap();
+        let mut names = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            names.push(stored.row.values[1].clone());
+        }
+        assert_eq!(
+            names,
+            vec![
+                Value::Text("committed".to_string()),
+                Value::Text("own_write".to_string()),
+            ]
+        );
+    }
 }

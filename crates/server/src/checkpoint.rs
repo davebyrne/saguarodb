@@ -43,9 +43,21 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
 
     // The Checkpoint marker is optional metadata; recovery uses the control
     // record's LSN. Truncating below it reclaims the now-redundant WAL prefix.
+    //
+    // Stamp the marker with the current transaction-id high-water mark (the
+    // highest id allocated so far). The marker survives truncation (its LSN is the
+    // retained boundary), so on recovery `next_txn_id`'s max-scan recovers the
+    // allocator boundary even when every data record below the checkpoint was
+    // truncated. Without this the allocator would restart low and reissue ids that
+    // already stamped committed tuples, corrupting visibility. A checkpoint holds
+    // the write guard, so no concurrent writer advances the allocator here.
+    let txn_high_water = components
+        .next_txn_id
+        .load(Ordering::Acquire)
+        .saturating_sub(1);
     components.wal.append(WalRecord {
         lsn: 0,
-        txn_id: 0,
+        txn_id: txn_high_water,
         kind: WalRecordKind::Checkpoint {
             redo_lsn: checkpoint_lsn,
         },

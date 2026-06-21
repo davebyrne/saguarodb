@@ -76,6 +76,14 @@ pub fn open_app(config: Config) -> Result<AppState> {
     }
 
     let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
+    // Establish the CLOG implicit-committed floor at the allocation boundary: every
+    // transaction id below `next_txn_id` was allocated in a prior run, and under
+    // Milestone B the flush gate never flushes uncommitted pages, so any surviving
+    // tuple from such a transaction is committed even if a checkpoint truncated its
+    // `Commit` record (`docs/specs/mvcc.md` §5.4). Without this, a checkpointed-then-
+    // recovered committed row would read as in-progress and be hidden by the
+    // visibility predicate.
+    wal.set_committed_floor(next_txn_id)?;
     let tls = match config.tls_files().map_err(DbError::io)? {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
         None => None,
@@ -192,6 +200,10 @@ fn apply_redo(
 
 fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
     let mut max_txn_id = 0;
+    // Records with `LSN > checkpoint_lsn` include the retained `Checkpoint` marker
+    // (appended after the boundary), which carries the transaction-id high-water
+    // mark — recovering the allocator boundary even when every data record below
+    // the checkpoint was truncated.
     for record in wal.replay_from(checkpoint_lsn)? {
         let txn_id = record?.txn_id;
         if txn_id != 0 {

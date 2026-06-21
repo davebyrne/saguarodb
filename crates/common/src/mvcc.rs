@@ -186,10 +186,31 @@ impl Snapshot {
     /// in-progress xids). It is not a real captured snapshot; it exists so that
     /// pre-MVCC call sites can construct a [`StatementContext`](crate::StatementContext)
     /// before snapshot capture is wired in (B3/C3).
+    ///
+    /// Because `xmax = 0`, every transaction id is "in the future" and therefore
+    /// invisible under [`is_visible`]; this snapshot sees nothing. Call sites that
+    /// must see committed rows (the server's autocommit paths, and the pre-capture
+    /// placeholder used by [`StatementContext::new`](crate::StatementContext::new))
+    /// use [`Snapshot::sees_all_committed`] instead.
     pub fn empty() -> Self {
         Self {
             xmin: 0,
             xmax: 0,
+            xip: Vec::new(),
+        }
+    }
+
+    /// The degenerate "sees all committed" snapshot used by single-writer
+    /// autocommit before real per-transaction snapshots arrive (Milestone C):
+    /// `xmax = u64::MAX` (no transaction is in the future), no in-progress xids,
+    /// so every committed transaction — and the reader's own writes via the
+    /// predicate's `current_txn` path — is visible. This is the placeholder that
+    /// [`StatementContext::new`](crate::StatementContext::new) carries so the
+    /// snapshot-aware read paths behave as if no version is filtered.
+    pub fn sees_all_committed() -> Self {
+        Self {
+            xmin: TxnId::MAX,
+            xmax: TxnId::MAX,
             xip: Vec::new(),
         }
     }

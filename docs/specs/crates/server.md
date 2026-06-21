@@ -88,7 +88,30 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 
 Recovery mode must not append WAL records.
 
-Recovery computes `next_txn_id` from all retained WAL records with stored `LSN > checkpoint_lsn` by calling `WalManager::replay_from(checkpoint_lsn)`, not from `replay_committed_from`. Include committed operations, uncommitted operations, and `Commit` records; ignore only records with `txn_id = 0`. `ServerComponents.next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. This prevents a new statement from reusing an old uncommitted `txn_id` and accidentally making pre-crash records look committed.
+Recovery computes `next_txn_id` from all retained WAL records with stored
+`LSN > checkpoint_lsn` by calling `WalManager::replay_from(checkpoint_lsn)`, not
+`replay_committed_from`. That retained set includes the `Checkpoint` marker
+(appended just after the boundary), which carries the transaction-id high-water
+mark, so the allocator boundary is recovered even when every data record below the
+checkpoint was truncated; without it the allocator would restart low and reissue
+ids that already stamped committed tuples. Include committed operations,
+uncommitted operations, `Commit` records, and the `Checkpoint` marker's high-water;
+ignore only records with `txn_id = 0`.
+`ServerComponents.next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID`
+when no user transaction records remain. If the maximum retained user transaction
+ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of
+wrapping or saturating the next transaction ID. This prevents a new statement from
+reusing an old uncommitted `txn_id` and accidentally making pre-crash records look
+committed.
+
+After computing `next_txn_id`, recovery calls
+`WalManager::set_committed_floor(next_txn_id)`: every transaction id below the
+allocation boundary was allocated in a prior run, and under Milestone B the flush
+gate never flushes uncommitted pages, so any surviving tuple from such a
+transaction is committed even if a checkpoint truncated its `Commit` record (see
+`wal.md` "Implicit-committed floor" and `mvcc.md` §5.4). Without this, a
+checkpointed-then-recovered committed row would read as in-progress and be hidden
+by the visibility predicate.
 
 ## Query Service Wiring
 
@@ -103,6 +126,8 @@ engine.execute(execution_context, physical)
 ```
 
 The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `QueryEngine` receives the server-allocated `StatementContext` and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
+
+Both the read path and the write path capture the statement's visibility snapshot (`StatementContext.snapshot`) via `capture_autocommit_snapshot(own_txn)` and build the context with `StatementContext::with_snapshot`. The snapshot is the degenerate single-writer "sees all committed" snapshot: `xmax = next_txn_id` (every already-allocated, hence committed, id is below it), `xip = active_txns.active_ids()` minus the statement's own `txn_id` (so own writes are seen via the predicate's `current_txn` path rather than hidden as in-progress), and `xmin = active_txns.oldest()` or `xmax` if none are active. A read uses `own_txn = 0` (it has no transaction). Under single-writer autocommit, reads and writes are mutually exclusive (shared vs. exclusive concurrency guard), so no other write transaction is ever active during a capture and `xip` is empty — every committed row and own write is visible, so read results are unchanged from the pre-MVCC engine. This is forward-compatible with Milestone C's real per-transaction snapshots.
 
 `QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_sql_cancelable`/`execute_prepared_cancelable`, passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
 
@@ -175,12 +200,13 @@ pub struct AppState {
 a `Mutex<BTreeSet<TxnId>>` of currently in-progress transaction ids, with an
 `O(log n)` minimum. The autocommit lifecycle registers a `txn_id` when it is
 allocated and deregisters it on commit or rollback, so it is empty between
-statements under v1's single-writer autocommit. It is bookkeeping in Milestone A
-(not yet consulted); snapshot capture (B3/C3) reads it for `xmin`/`xip`, and the
-GC horizon (Milestone F) reads its minimum. The CLOG that records settled
-transaction outcomes lives in the WAL manager (`Clog`, rebuilt from `Commit`/
-`Abort` records; see `docs/specs/crates/wal.md`), separate from this registry of
-still-running transactions.
+statements under v1's single-writer autocommit. Snapshot capture
+(`capture_autocommit_snapshot`) reads `active_ids()` for `xip` (excluding the
+statement's own txn) and `oldest()` for `xmin`; the GC horizon (Milestone F) reads
+its minimum. The CLOG that records settled transaction outcomes lives in the WAL
+manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
+`docs/specs/crates/wal.md`), separate from this registry of still-running
+transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the
@@ -192,7 +218,7 @@ server under the exclusive write guard:
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
-7. Append the `Checkpoint { redo_lsn }` WAL marker (`txn_id: 0`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`.
+7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`.
 8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
 9. Release write guard.
 
