@@ -2,10 +2,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use common::{DbError, Result, StatementContext};
+use common::{ColumnInfo, DataType, DbError, Result, StatementContext, Value};
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
-use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
+use planner::{
+    BoundStatement, bind, bind_parameterized, format_explain, logical_plan, physical_plan,
+    substitute_params,
+};
 use storage::StorageEngine;
 use wal::{WalRecord, WalRecordKind};
 
@@ -27,17 +30,70 @@ impl QueryService {
 
     pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
-        match statement_class(&statement)? {
-            StatementClass::Read => self.execute_read(&statement),
-            StatementClass::Write => self.execute_write(&statement),
+        let class = statement_class(&statement)?;
+        let bound = bind(&statement, self.components.catalog.as_ref())?;
+        self.execute_bound(class, bound)
+    }
+
+    /// Parse and bind a (possibly parameterized) statement for the extended
+    /// query protocol, resolving parameter types from the declared OIDs or by
+    /// inference. The result can be executed repeatedly with different values.
+    pub fn prepare_sql(
+        &self,
+        sql: &str,
+        declared_param_types: &[DataType],
+    ) -> Result<PreparedStatement> {
+        let statement = parser::parse(sql)?;
+        let class = statement_class(&statement)?;
+        let declared: Vec<Option<DataType>> =
+            declared_param_types.iter().cloned().map(Some).collect();
+        let (bound, param_types) =
+            bind_parameterized(&statement, self.components.catalog.as_ref(), &declared)?;
+        let result_columns = result_columns(&bound);
+        Ok(PreparedStatement {
+            class,
+            bound,
+            param_types,
+            result_columns,
+        })
+    }
+
+    /// Execute a prepared statement with one value per parameter, in order. Each
+    /// call is its own autocommit unit, like a simple query.
+    pub fn execute_prepared(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        if params.len() != prepared.param_types.len() {
+            return Err(DbError::protocol(
+                common::SqlState::SyntaxError,
+                format!(
+                    "prepared statement requires {} parameter(s), but {} were supplied",
+                    prepared.param_types.len(),
+                    params.len()
+                ),
+            ));
         }
+        let bound = substitute_params(&prepared.bound, params)?;
+        self.execute_bound(prepared.class, bound)
     }
 }
 
 impl QueryService {
-    fn execute_read(&self, statement: &Statement) -> Result<ExecutionResult> {
+    fn execute_bound(
+        &self,
+        class: StatementClass,
+        bound: BoundStatement,
+    ) -> Result<ExecutionResult> {
+        match class {
+            StatementClass::Read => self.execute_read_bound(bound),
+            StatementClass::Write => self.execute_write_bound(bound),
+        }
+    }
+
+    fn execute_read_bound(&self, bound: BoundStatement) -> Result<ExecutionResult> {
         let _guard = self.components.concurrency.begin_read()?;
-        let bound = bind(statement, self.components.catalog.as_ref())?;
         match bound {
             BoundStatement::Explain(inner) => {
                 if !matches!(inner.as_ref(), BoundStatement::Select(_)) {
@@ -61,9 +117,8 @@ impl QueryService {
         }
     }
 
-    fn execute_write(&self, statement: &Statement) -> Result<ExecutionResult> {
+    fn execute_write_bound(&self, bound: BoundStatement) -> Result<ExecutionResult> {
         let guard = self.components.concurrency.begin_write()?;
-        let bound = bind(statement, self.components.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         let txn_id = self.components.next_txn_id.fetch_add(1, Ordering::AcqRel);
@@ -167,9 +222,44 @@ impl QueryService {
     }
 }
 
+#[derive(Clone, Copy)]
 enum StatementClass {
     Read,
     Write,
+}
+
+/// A parsed and bound extended-protocol statement that can be executed
+/// repeatedly with different parameter values.
+pub struct PreparedStatement {
+    class: StatementClass,
+    bound: BoundStatement,
+    param_types: Vec<DataType>,
+    result_columns: Option<Vec<ColumnInfo>>,
+}
+
+impl PreparedStatement {
+    /// Resolved parameter types, by position.
+    pub fn param_types(&self) -> &[DataType] {
+        &self.param_types
+    }
+
+    /// Result column metadata, or `None` for a statement that returns no rows.
+    pub fn result_columns(&self) -> Option<&[ColumnInfo]> {
+        self.result_columns.as_deref()
+    }
+}
+
+fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
+    match bound {
+        BoundStatement::Select(select) => Some(select.output_schema.clone()),
+        BoundStatement::Explain(_) => Some(vec![ColumnInfo {
+            name: "QUERY PLAN".to_string(),
+            data_type: DataType::Text,
+            table_id: None,
+            column_id: None,
+        }]),
+        _ => None,
+    }
 }
 
 fn statement_class(statement: &Statement) -> Result<StatementClass> {
@@ -195,7 +285,7 @@ mod tests {
     use std::collections::HashMap;
 
     use catalog::CatalogSnapshot;
-    use common::{SqlState, Value};
+    use common::{DataType, SqlState, Value};
 
     use crate::app::AppState;
 
@@ -350,5 +440,86 @@ mod tests {
             rows[0].values,
             vec![Value::Text("Ada".to_string()), Value::Integer(1)]
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_select_executes_and_reuses_with_bound_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (2, 'Bo')")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql("select name from users where id = $1", &[])
+            .unwrap();
+        assert_eq!(prepared.param_types(), &[DataType::Integer]);
+        assert_eq!(prepared.result_columns().unwrap().len(), 1);
+
+        for (id, name) in [(2, "Bo"), (1, "Ada")] {
+            let executor::ExecutionResult::Query { rows, .. } = app
+                .query_service
+                .execute_prepared(&prepared, &[Value::Integer(id)])
+                .unwrap()
+            else {
+                panic!("expected query result");
+            };
+            assert_eq!(rows[0].values, vec![Value::Text(name.to_string())]);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_insert_with_parameters_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql("insert into users (id, name) values ($1, $2)", &[])
+            .unwrap();
+        assert_eq!(prepared.param_types(), &[DataType::Integer, DataType::Text]);
+        assert!(prepared.result_columns().is_none());
+
+        app.query_service
+            .execute_prepared(
+                &prepared,
+                &[Value::Integer(5), Value::Text("Cy".to_string())],
+            )
+            .unwrap();
+
+        let result = app
+            .query_service
+            .execute_sql("select name from users where id = 5")
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_prepared_rejects_wrong_parameter_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql("select name from users where id = $1", &[])
+            .unwrap();
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
     }
 }
