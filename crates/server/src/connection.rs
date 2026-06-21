@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::app::AppState;
+use crate::cancel::BackendKey;
 use crate::query::PreparedStatement;
 
 /// Accept a connection, run optional SSL/GSS negotiation, then serve the
@@ -77,6 +78,18 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
         }
 
         match initial.first() {
+            // A CancelRequest arrives on its own connection: signal the target
+            // backend (if the key matches a live query) and close without reply.
+            Some(ClientMessage::CancelRequest {
+                process_id,
+                secret_key,
+            }) => {
+                app.components.cancel_registry.request_cancel(BackendKey {
+                    process_id: *process_id,
+                    secret_key: *secret_key,
+                });
+                return Ok(());
+            }
             // GSSAPI transport encryption is unsupported: decline with the single
             // `N` byte (same as SSL rejection) and keep negotiating, since the
             // client typically follows with an SSLRequest or StartupMessage.
@@ -136,6 +149,17 @@ struct Session {
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
+    /// This connection's cancellation key, registered at startup and removed on
+    /// disconnect.
+    backend_key: Option<BackendKey>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.backend_key {
+            self.app.components.cancel_registry.deregister(key);
+        }
+    }
 }
 
 /// Drive the protocol over an established stream, starting with any messages
@@ -195,6 +219,7 @@ impl Session {
             portals: HashMap::new(),
             failed: false,
             cancel: Arc::new(AtomicBool::new(false)),
+            backend_key: None,
         }
     }
 
@@ -265,6 +290,27 @@ impl Session {
             | ClientMessage::Describe { .. }
             | ClientMessage::Close { .. }
             | ClientMessage::Execute { .. } => {}
+            msg @ ClientMessage::Startup { .. } => {
+                let mut replies = self.state.handle_message(msg)?;
+                // Register a cancellation key for this connection and announce it
+                // with BackendKeyData, placed after the ParameterStatus messages
+                // and before the trailing ReadyForQuery.
+                let key = self
+                    .app
+                    .components
+                    .cancel_registry
+                    .register(self.cancel.clone());
+                self.backend_key = Some(key);
+                let insert_at = replies.len().saturating_sub(1);
+                replies.insert(
+                    insert_at,
+                    ServerMessage::BackendKeyData {
+                        process_id: key.process_id,
+                        secret_key: key.secret_key,
+                    },
+                );
+                write_messages(stream, codec, &replies).await?;
+            }
             other => {
                 for response in self.state.handle_message(other)? {
                     write_messages(stream, codec, &[response]).await?;
@@ -717,6 +763,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -891,6 +938,62 @@ mod tests {
 
     fn sync_bytes() -> Vec<u8> {
         tagged(b'S', &[])
+    }
+
+    #[tokio::test]
+    async fn startup_sends_backend_key_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, app).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&startup_bytes("dave")).await.unwrap();
+        let response = read_until_ready(&mut client).await;
+
+        // BackendKeyData: tag 'K', length 12.
+        assert!(
+            response.windows(5).any(|w| w == [b'K', 0, 0, 0, 12]),
+            "startup reply includes BackendKeyData"
+        );
+
+        client.write_all(&terminate_bytes()).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_signals_the_target_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+        // Register a flag as if a connection were running a query.
+        let flag = Arc::new(AtomicBool::new(false));
+        let key = app.components.cancel_registry.register(flag.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, server_app).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&cancel_request_bytes(key.process_id, key.secret_key))
+            .await
+            .unwrap();
+
+        // The server signals the backend and closes without any reply.
+        let mut buf = [0u8; 8];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "CancelRequest gets no reply and the socket closes");
+        assert!(flag.load(Ordering::Relaxed), "target backend was signaled");
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1117,6 +1220,15 @@ mod tests {
 
     fn gssenc_request_bytes() -> Vec<u8> {
         negotiation_request_bytes(80_877_104)
+    }
+
+    fn cancel_request_bytes(process_id: i32, secret_key: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&16i32.to_be_bytes());
+        bytes.extend_from_slice(&80_877_102i32.to_be_bytes());
+        bytes.extend_from_slice(&process_id.to_be_bytes());
+        bytes.extend_from_slice(&secret_key.to_be_bytes());
+        bytes
     }
 
     fn negotiation_request_bytes(code: i32) -> Vec<u8> {

@@ -19,6 +19,7 @@ planner = { package = "saguarodb-planner", path = "../planner" }
 protocol = { package = "saguarodb-protocol", path = "../protocol" }
 storage = { package = "saguarodb-storage", path = "../storage" }
 wal = { package = "saguarodb-wal", path = "../wal" }
+getrandom = "0.2"
 rustls-pemfile.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

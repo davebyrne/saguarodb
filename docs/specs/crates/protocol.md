@@ -220,7 +220,6 @@ unsupported format codes.
 - Performing the TLS handshake itself. The protocol layer only encodes the
   `SslAccepted`/`SslRejected` negotiation byte; `server` owns the handshake.
 - GSSAPI transport encryption (the GSSENCRequest is declined with `N`).
-- CancelRequest.
 - COPY.
 
 ## Acceptance Tests

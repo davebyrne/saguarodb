@@ -229,6 +229,8 @@ aborted state.
 
 SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client may also lead with a `GSSENCRequest` (GSSAPI transport encryption), which is unsupported: the server declines it with a single `N` byte and keeps negotiating, since the client typically follows with an `SSLRequest` or `StartupMessage`. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest`/`GSSENCRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 
+Query cancellation uses a process-wide `CancelRegistry` on `ServerComponents` mapping a per-connection `BackendKey { process_id, secret_key }` to that connection's cancellation flag. At startup the server allocates a key (a counter-based `process_id` and a random `secret_key`), registers the connection's flag, and sends `BackendKeyData` after the `ParameterStatus` messages and before `ReadyForQuery`. A `CancelRequest` arrives on its own connection (handled during negotiation, before startup): the server looks up the `BackendKey`, sets the matching flag, and closes without any reply; an unknown or stale key is ignored. The connection deregisters its key on disconnect. See the cancellation flag plumbing under Connection Handling.
+
 ## Graceful Shutdown
 
 `ServerComponents` owns a `shutdown: Arc<ShutdownState>` used by the listener and connection tasks. `ShutdownState` tracks whether the server is still accepting new work and counts in-flight query executions. A query increments the count before entering `spawn_blocking` and decrements after its response is encoded or an error response is written. If shutdown has begun, `begin_query` returns `ErrorKind::Internal` / `SqlState::InternalError` with message `server is shutting down`.
@@ -253,6 +255,7 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 - Protocol startup and simple query work over a loopback TCP connection.
 - An extended-protocol Parse/Bind/Describe/Execute/Sync sequence runs a parameterized query over a loopback connection with both text and binary parameter and result encodings.
 - An error inside an extended sequence is reported and the following messages are skipped until Sync, after which the connection is reusable.
+- Startup sends `BackendKeyData`, and a `CancelRequest` carrying a registered backend key sets that backend's cancellation flag (and is ignored for an unknown key).
 - With TLS disabled, an `SSLRequest` is rejected with `N` and the same connection then completes a plaintext startup.
 - With TLS enabled, an `SSLRequest` is accepted with `S`, the TLS handshake completes, and a simple query runs over the encrypted stream.
 - Supplying exactly one of `--tls-cert-file`/`--tls-key-file` is rejected during config parsing.

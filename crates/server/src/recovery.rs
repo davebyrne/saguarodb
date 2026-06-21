@@ -97,6 +97,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
         tls,
+        cancel_registry: crate::cancel::CancelRegistry::new(),
     });
 
     // Persist the redone state to the heap/index and advance the redo boundary.

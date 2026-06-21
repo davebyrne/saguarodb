@@ -440,7 +440,6 @@ portals, and binary parameter/result encoding:
 - GSSAPI transport encryption (GSSENCRequest declined with `N`)
 - Authentication beyond accepting any connection
 - `COPY`, `NOTIFY/LISTEN`
-- `CancelRequest` flow
 
 ### PostgreSQL Wire Encoding Details
 
@@ -983,9 +982,9 @@ pub trait PlanExecutor {
     /// Open the operator, initialize state.
     fn open(&mut self) -> Result<()>;
 
-    /// Pull the next row. Returns None when exhausted.
-    /// Implementations should call cancellation.is_cancelled() periodically
-    /// and return an error if true (e.g., every N rows in a scan).
+    /// Pull the next row. Returns None when exhausted. Cancellation is polled by
+    /// the query engine between rows (via `ExecutionContext.cancel`), not inside
+    /// each operator's `next`.
     fn next(&mut self) -> Result<Option<ExecRow>>;
 
     /// Pull up to max_rows at once. V1 implementation: calls next() in a loop.

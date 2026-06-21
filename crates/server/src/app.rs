@@ -9,6 +9,7 @@ use storage::PageBackedStorageEngine;
 use tokio_rustls::TlsAcceptor;
 use wal::WalManager;
 
+use crate::cancel::CancelRegistry;
 use crate::checkpoint::CheckpointState;
 use crate::config::Config;
 use crate::query::QueryService;
@@ -28,6 +29,8 @@ pub struct ServerComponents {
     pub next_txn_id: AtomicU64,
     /// TLS acceptor when the server is configured for SSL, else `None`.
     pub tls: Option<TlsAcceptor>,
+    /// Per-connection cancellation keys, used to act on `CancelRequest`.
+    pub cancel_registry: CancelRegistry,
 }
 
 pub struct AppState {
