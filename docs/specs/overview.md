@@ -24,7 +24,6 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 
 - Multi-statement transactions / MVCC (designed for, not implemented)
 - Secondary indexes (designed for, not implemented)
-- Extended query protocol / prepared statements
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
 - Replication
@@ -410,9 +409,33 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 5. **Protocol decode error handling:** If decoding client bytes fails, server sends `ErrorResponse` then `ReadyForQuery` and closes the connection because the codec buffer state may be unrecoverable.
 6. **Termination:** Client sends `Terminate`. Server closes connection.
 
+### PostgreSQL Extended Query Flow (V1)
+
+The extended protocol supports parameterized statements, prepared statements,
+portals, and binary parameter/result encoding:
+
+1. **Parse:** Client sends `Parse` (statement name, SQL with `$n` placeholders,
+   optional parameter type OIDs). The server prepares the statement, resolving
+   each parameter's type from the declared OID or by inference from context, and
+   replies `ParseComplete`.
+2. **Bind:** Client sends `Bind` (portal name, statement name, parameter format
+   codes, parameter values, result format codes). The server decodes the values
+   (text or binary) into a portal and replies `BindComplete`.
+3. **Describe:** `Describe` of a statement returns `ParameterDescription` then
+   `RowDescription`/`NoData`; of a portal returns `RowDescription`/`NoData` in
+   the portal's result formats.
+4. **Execute:** The server runs the portal and streams `DataRow`s in the
+   requested result formats, then `CommandComplete`. No `RowDescription` (that
+   comes from Describe) and no `ReadyForQuery` (that comes from Sync). Each
+   Execute is its own autocommit unit; `max_rows` is treated as "all rows".
+5. **Sync:** The server sends `ReadyForQuery`. An error earlier in the sequence
+   sends `ErrorResponse` and then skips messages until `Sync`.
+6. **Close/Flush:** `Close` drops a statement or portal (`CloseComplete`);
+   `Flush` flushes pending output. Named and unnamed statements/portals are
+   supported.
+
 ### V1 Protocol Scope — What We Skip
 
-- Extended query protocol (Parse/Bind/Execute) — no prepared statements
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported; see SSLRequest handling above)
 - GSSAPI transport encryption (GSSENCRequest declined with `N`)
 - Authentication beyond accepting any connection

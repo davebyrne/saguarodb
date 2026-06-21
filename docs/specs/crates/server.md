@@ -202,11 +202,28 @@ For each accepted TCP connection:
 2. Read bytes from socket.
 3. Decode client messages.
 4. Handle startup/terminate through protocol state.
-5. For query messages, run `QueryService` using the blocking thread pool.
+5. For simple `Query` messages, run `QueryService::execute_sql` using the blocking thread pool.
 6. Encode and write server messages.
 7. On query execution errors, send `ErrorResponse` and `ReadyForQuery` and keep the connection open.
 8. On protocol decode errors, send `ErrorResponse` and `ReadyForQuery`, then close the connection because the codec buffer state may be unrecoverable.
 9. On Terminate or unrecoverable IO error, close connection.
+
+The connection also serves the extended query protocol, holding per-connection
+prepared-statement and portal maps (named and unnamed). `Parse` calls
+`QueryService::prepare_sql` (mapping the declared parameter type OIDs, `0` =
+unspecified) and replies `ParseComplete`. `Bind` decodes each parameter value
+(text or binary, per the Bind format codes, via `decode_value`) into a portal
+and replies `BindComplete`. `Describe` replies `ParameterDescription` +
+`RowDescription`/`NoData` for a statement, or `RowDescription`/`NoData` in the
+portal's result formats for a portal. `Execute` runs the portal via
+`QueryService::execute_prepared` on the blocking thread pool, streaming
+`DataRow`s in the requested result formats followed by `CommandComplete` (no
+`RowDescription`, no `ReadyForQuery`); each `Execute` is its own autocommit unit
+and `max_rows` is treated as all rows. `Sync` sends `ReadyForQuery`; `Flush`
+flushes; `Close` drops a statement or portal and replies `CloseComplete`. An
+error inside an extended sequence sends `ErrorResponse` and then skips the
+remaining extended messages until `Sync`; a simple `Query` also clears that
+aborted state.
 
 SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client may also lead with a `GSSENCRequest` (GSSAPI transport encryption), which is unsupported: the server declines it with a single `N` byte and keeps negotiating, since the client typically follows with an `SSLRequest` or `StartupMessage`. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest`/`GSSENCRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 
@@ -232,6 +249,8 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 - Successful write appends commit, flushes WAL, commits buffer before returning.
 - Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.
 - Protocol startup and simple query work over a loopback TCP connection.
+- An extended-protocol Parse/Bind/Describe/Execute/Sync sequence runs a parameterized query over a loopback connection with both text and binary parameter and result encodings.
+- An error inside an extended sequence is reported and the following messages are skipped until Sync, after which the connection is reusable.
 - With TLS disabled, an `SSLRequest` is rejected with `N` and the same connection then completes a plaintext startup.
 - With TLS enabled, an `SSLRequest` is accepted with `S`, the TLS handshake completes, and a simple query runs over the encrypted stream.
 - Supplying exactly one of `--tls-cert-file`/`--tls-key-file` is rejected during config parsing.

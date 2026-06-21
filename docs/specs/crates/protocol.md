@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`protocol` implements PostgreSQL simple query protocol encoding, decoding, and connection state. It does not own sockets, Tokio tasks, or storage/query execution.
+`protocol` implements PostgreSQL simple and extended query protocol encoding, decoding, and connection state. It does not own sockets, Tokio tasks, or storage/query execution.
 
 ## Depends On
 
@@ -212,9 +212,6 @@ unsupported format codes.
 
 ## Non-Goals
 
-- Extended query protocol.
-- Prepared statements.
-- Binary row format.
 - Authentication.
 - Performing the TLS handshake itself. The protocol layer only encodes the
   `SslAccepted`/`SslRejected` negotiation byte; `server` owns the handshake.

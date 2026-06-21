@@ -854,6 +854,13 @@ mod tests {
         tagged(b'D', &body)
     }
 
+    fn describe_statement_bytes(name: &str) -> Vec<u8> {
+        let mut body = vec![b'S'];
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        tagged(b'D', &body)
+    }
+
     fn execute_bytes(portal: &str) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(portal.as_bytes());
@@ -984,6 +991,52 @@ mod tests {
             response.windows(13).any(|w| w == b"CREATE TABLE\0"),
             "connection recovered"
         );
+
+        client.write_all(&terminate_bytes()).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extended_protocol_named_statement_and_describe() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, app).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&startup_bytes("dave")).await.unwrap();
+        read_until_ready(&mut client).await;
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "insert into users (id, name) values (7, 'Cy')",
+        ] {
+            client.write_all(&query_bytes(sql)).await.unwrap();
+            read_until_ready(&mut client).await;
+        }
+
+        // Named statement + named portal, with Describe of the statement.
+        let mut seq = parse_bytes("stmt1", "select name from users where id = $1", &[20]);
+        seq.extend(describe_statement_bytes("stmt1"));
+        seq.extend(bind_bytes("p1", "stmt1", &[0], &[Some(b"7")], &[0]));
+        seq.extend(execute_bytes("p1"));
+        seq.extend(sync_bytes());
+        client.write_all(&seq).await.unwrap();
+        let response = read_until_ready(&mut client).await;
+
+        // ParameterDescription (tag 't'): one parameter, int8 (OID 20).
+        assert!(
+            response
+                .windows(11)
+                .any(|w| w == [b't', 0, 0, 0, 10, 0, 1, 0, 0, 0, 20]),
+            "ParameterDescription with int8 parameter"
+        );
+        assert!(response.first() == Some(&b'1'), "ParseComplete first");
+        assert!(response.windows(1).any(|w| w == b"T"), "RowDescription");
+        assert!(response.windows(2).any(|w| w == b"Cy"), "row value");
 
         client.write_all(&terminate_bytes()).await.unwrap();
         server.await.unwrap();
