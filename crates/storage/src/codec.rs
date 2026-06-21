@@ -319,6 +319,45 @@ fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> 
     Ok((xmin, xmax, (page, slot), infomask))
 }
 
+/// Mutate the in-place MVCC header fields of an existing v2 tuple, overwriting
+/// `xmax`, `t_ctid`, and `infomask` in `tuple` (the full tuple byte buffer,
+/// version byte included). `xmin` is the immutable creator and is left untouched.
+///
+/// These three are fixed-width header fields, so the tuple length is unchanged —
+/// the heap page can rewrite them without relocating the tuple or compacting the
+/// page. This is the single codec chokepoint for header-field offsets, so
+/// `page.rs` mutates a tuple header through here rather than duplicating layout.
+///
+/// Returns `InternalError` if the buffer is not a v2 tuple or is shorter than the
+/// v2 header, so misuse surfaces as a structured `DbError` instead of a panic.
+#[allow(
+    dead_code,
+    reason = "called by page::set_tuple_header, wired into UPDATE/DELETE in Milestone B commits 8-9"
+)]
+pub(crate) fn set_mvcc_header_fields(
+    tuple: &mut [u8],
+    xmax: TxnId,
+    t_ctid: (PageNum, u16),
+    infomask: u16,
+) -> Result<()> {
+    if tuple.is_empty() || tuple[0] != ROW_FORMAT_VERSION {
+        return Err(corrupt_row(
+            "cannot mutate header of a non-v2 (or empty) tuple",
+        ));
+    }
+    let header = tuple
+        .get_mut(1..1 + V2_MVCC_HEADER_LEN)
+        .ok_or_else(|| corrupt_row("tuple is shorter than its v2 header"))?;
+    // Offsets are relative to the header slice: infomask[0..2], xmin[2..10]
+    // (untouched), xmax[10..18], t_ctid.page[18..22], t_ctid.slot[22..24].
+    header[0..2].copy_from_slice(&infomask.to_le_bytes());
+    header[10..18].copy_from_slice(&xmax.to_le_bytes());
+    let (page, slot) = t_ctid;
+    header[18..22].copy_from_slice(&page.to_le_bytes());
+    header[22..24].copy_from_slice(&slot.to_le_bytes());
+    Ok(())
+}
+
 fn null_bitmap_len(columns: usize) -> usize {
     columns.div_ceil(8)
 }
@@ -351,8 +390,9 @@ mod tests {
     use common::{ColumnDef, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema, Value};
 
     use super::{
-        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, XMIN_COMMITTED,
-        decode_key, decode_row, encode_key, encode_row, null_bitmap_len,
+        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, XMAX_COMMITTED,
+        XMIN_COMMITTED, decode_key, decode_row, encode_key, encode_row, null_bitmap_len,
+        set_mvcc_header_fields,
     };
 
     fn schema() -> TableSchema {
@@ -461,6 +501,35 @@ mod tests {
 
         assert_eq!(decoded.row, row);
         assert_eq!(decoded.xmin, FROZEN_XID);
+    }
+
+    #[test]
+    fn set_mvcc_header_fields_overwrites_only_xmax_t_ctid_infomask() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Text("keep".to_string())],
+        };
+        let mut bytes = encode_row(&schema(), &row, 7).unwrap();
+
+        set_mvcc_header_fields(&mut bytes, 99, (4, 5), XMAX_COMMITTED).unwrap();
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+
+        // The three mutated header fields took the new values.
+        assert_eq!(decoded.xmax, 99);
+        assert_eq!(decoded.t_ctid, (4, 5));
+        assert_eq!(decoded.infomask, XMAX_COMMITTED);
+        // xmin (creator) and the column payload/null bitmap are undisturbed.
+        assert_eq!(decoded.xmin, 7);
+        assert_eq!(decoded.row, row);
+    }
+
+    #[test]
+    fn set_mvcc_header_fields_rejects_non_v2_tuple() {
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Null],
+        };
+        let mut bytes = encode_row_v1(&schema(), &row);
+        assert!(set_mvcc_header_fields(&mut bytes, 5, INVALID_TID, 0).is_err());
+        assert!(set_mvcc_header_fields(&mut [], 5, INVALID_TID, 0).is_err());
     }
 
     #[test]

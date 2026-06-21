@@ -91,6 +91,48 @@ Page body (data page):
 - Delete marks slots dead.
 - Compaction may be implemented lazily.
 
+### Line Pointers (heap slot array)
+
+A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
+(ItemId)** whose `flags` field is one of four states (`mvcc.md` §5.2):
+
+- `NORMAL` (`2`) — `(offset, len)` address a live tuple on this page.
+- `DEAD` (`1`) — the tuple was removed but the line pointer is retained because
+  index entries may still reference it; reclaimed to `UNUSED` only after index
+  vacuum.
+- `UNUSED` (`0`) — free for reuse. *Defined; the `DEAD`/`REDIRECT → UNUSED`
+  reclaim is owned by VACUUM (Milestone F), so no path produces it yet.*
+- `REDIRECT` (`3`) — points at another slot on the same page. *Reserved for HOT
+  (Milestone H); no path produces it yet.*
+
+The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly today's
+"live" slot and `DEAD` is today's tombstoned slot; this milestone is a renaming
+with no behavior change (still one version per row, and `delete_row` still
+tombstones to `DEAD`). `validate` accepts only `NORMAL` and `DEAD` flags on a
+data page (the two states this milestone produces); any other value is corruption.
+
+**Stable `(page, slot)` contract.** An index entry references a
+`(page, line-pointer-slot)`. The tuple bytes a line pointer names may later be
+relocated *within the page* (intra-page compaction, Milestone F) by rewriting the
+line pointer's `(offset, len)` — the slot id is stable across that relocation and
+no index is touched. `RowId`/`RowLocation` already encode `(page_num, slot_num)`
+and are unchanged; they remain valid across intra-page compaction.
+
+### In-Place Tuple-Header Mutation
+
+`page::set_tuple_header(data, slot_num, xmax, t_ctid, infomask, lsn)` overwrites
+the `xmax`, `t_ctid`, and `infomask` fields of the v2 tuple at a `NORMAL` slot
+**in place**, stamps the page-LSN with `lsn`, and refreshes the checksum (exactly
+like `insert_row`/`delete_row`). These are fixed-width header fields, so the
+tuple keeps its exact offset and length — nothing is relocated and the page is
+not compacted. The header offsets live solely in
+`codec::set_mvcc_header_fields`, which `set_tuple_header` calls on the slot's
+byte range, so `page.rs` never duplicates the header layout. A non-live
+(`DEAD`/`UNUSED`/out-of-bounds) slot or a non-v2 tuple is a misuse and returns a
+structured `DbError` rather than panicking. This is the substrate for `UPDATE`
+/`DELETE` version stamping (Milestone B commits 8–9); it is not yet wired to the
+WAL (`HeapUpdateHeader`, a later commit) or emitted by the engine.
+
 ## Row Serialization
 
 ```text

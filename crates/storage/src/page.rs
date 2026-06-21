@@ -14,8 +14,37 @@ pub(crate) const FREE_SPACE_OFFSET: usize = 8;
 const PAGE_LSN_OFFSET: usize = 10;
 const CHECKSUM_OFFSET: usize = 18;
 pub(crate) const SLOT_LEN: usize = 6;
-const SLOT_DEAD: u16 = 1;
-const SLOT_LIVE: u16 = 2;
+
+/// Line-pointer (ItemId) states stored in a heap slot's `flags` field (§5.2 of
+/// `mvcc.md`). A heap slot is a *line pointer*: a stable `(page, slot)` address
+/// that an index entry references; the tuple bytes it names may later be
+/// relocated within the page (compaction, Milestone F) by rewriting the line
+/// pointer's `(offset, len)` without touching any index. The slot id is stable
+/// across that relocation, which is the contract `RowId`/`RowLocation` rely on.
+///
+/// The numeric values preserve the pre-MVCC `SLOT_DEAD = 1` / `SLOT_LIVE = 2`
+/// encoding, so this is a pure renaming: today's "live" slot is `NORMAL` and
+/// today's tombstoned slot is `DEAD`. `UNUSED` and `REDIRECT` are reserved for
+/// later milestones and not yet produced by any path.
+mod line_pointer {
+    /// `(offset, len)` address a live tuple on this page (today's "live" slot).
+    pub(super) const NORMAL: u16 = 2;
+    /// Tuple removed; the line pointer is retained because index entries may
+    /// still reference it (today's tombstoned slot). Reclaimed to `UNUSED` only
+    /// after index vacuum.
+    pub(super) const DEAD: u16 = 1;
+    /// Free for reuse. Defined now; reclaim (`DEAD`/`REDIRECT` -> `UNUSED`) is
+    /// owned by VACUUM (Milestone F), so nothing assigns it yet.
+    #[allow(dead_code, reason = "line-pointer reclaim owned by Milestone F")]
+    pub(super) const UNUSED: u16 = 0;
+    /// Points at another slot on the same page. Reserved for HOT (Milestone H);
+    /// no path produces it yet.
+    #[allow(
+        dead_code,
+        reason = "REDIRECT line pointers owned by HOT (Milestone H)"
+    )]
+    pub(super) const REDIRECT: u16 = 3;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageHeader {
@@ -31,8 +60,9 @@ struct Slot {
 }
 
 impl Slot {
+    /// True when this line pointer is `NORMAL` (addresses a live tuple).
     fn is_live(self) -> bool {
-        self.flags == SLOT_LIVE
+        self.flags == line_pointer::NORMAL
     }
 }
 
@@ -128,7 +158,7 @@ pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
         Slot {
             offset: row_offset,
             len: row_len,
-            flags: SLOT_LIVE,
+            flags: line_pointer::NORMAL,
         },
     );
     write_u16(data, NUM_SLOTS_OFFSET, slot_num + 1);
@@ -160,10 +190,55 @@ pub fn delete_row(data: &mut [u8; PAGE_SIZE], slot_num: u16) -> Result<bool> {
     if !slot.is_live() {
         return Ok(false);
     }
-    slot.flags = SLOT_DEAD;
+    slot.flags = line_pointer::DEAD;
     write_slot(data, slot_num, slot);
     write_checksum(data);
     Ok(true)
+}
+
+/// Mutate the MVCC header (`xmax`, `t_ctid`, `infomask`) of the live tuple at
+/// `slot_num` **in place**, stamp the page-LSN, and refresh the checksum — the
+/// substrate for `UPDATE`/`DELETE` version stamping (Milestone B commits 8–9).
+///
+/// These three are fixed-width header fields, so the tuple keeps its exact
+/// length and offset: nothing is relocated and the page is not compacted. The
+/// header offsets live in `codec::set_mvcc_header_fields`, called here on the
+/// slot's existing byte range, so layout stays DRY in `codec`. PageLSN/checksum
+/// are refreshed exactly like `insert_row`/`delete_row` (the `lsn` is the LSN of
+/// the WAL record that authorizes the change; the `HeapUpdateHeader` record and
+/// its emission are later commits, so a unit test may pass a synthetic LSN).
+///
+/// The line pointer must be `NORMAL` (live); a dead/unused/out-of-bounds slot is
+/// a misuse and returns a structured `DbError` rather than panicking, matching
+/// the sibling primitives.
+#[allow(
+    dead_code,
+    reason = "wired into UPDATE/DELETE version stamping in Milestone B commits 8-9"
+)]
+pub fn set_tuple_header(
+    data: &mut [u8; PAGE_SIZE],
+    slot_num: u16,
+    xmax: common::TxnId,
+    t_ctid: (PageNum, u16),
+    infomask: u16,
+    lsn: Lsn,
+) -> Result<()> {
+    let header = validate(data)?;
+    if slot_num >= header.num_slots {
+        return Err(corrupt_page("slot number is out of bounds"));
+    }
+    let slot = read_slot(data, slot_num);
+    if !slot.is_live() {
+        return Err(DbError::storage(
+            SqlState::InternalError,
+            "cannot mutate the header of a non-live slot",
+        ));
+    }
+    let start = slot.offset as usize;
+    let end = start + slot.len as usize;
+    crate::codec::set_mvcc_header_fields(&mut data[start..end], xmax, t_ctid, infomask)?;
+    set_page_lsn(data, lsn);
+    Ok(())
 }
 
 fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
@@ -185,7 +260,10 @@ fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
 
     for slot_num in 0..header.num_slots {
         let slot = read_slot(data, slot_num);
-        if slot.flags != SLOT_LIVE && slot.flags != SLOT_DEAD {
+        // Only NORMAL and DEAD line pointers are produced in this milestone;
+        // UNUSED/REDIRECT (reclaim/HOT) are reserved and not yet written, so a
+        // page carrying any other flag value is corrupt.
+        if slot.flags != line_pointer::NORMAL && slot.flags != line_pointer::DEAD {
             return Err(corrupt_page("slot has invalid flags"));
         }
         let start = slot.offset as usize;
@@ -277,9 +355,40 @@ pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
 mod tests {
     use super::{
         PAGE_LSN_OFFSET, PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET,
-        init_page, set_page_lsn, validate, write_checksum,
+        delete_row, init_page, insert_row, line_pointer, read_slot, set_page_lsn, set_tuple_header,
+        validate, write_checksum,
     };
+    use crate::codec::{XMAX_COMMITTED, decode_row, encode_row};
     use buffer::PageData;
+    use common::{ColumnDef, DataType, INVALID_XID, TableSchema, Value};
+
+    fn schema() -> TableSchema {
+        TableSchema {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "note".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn row() -> common::Row {
+        common::Row {
+            values: vec![Value::Integer(42), Value::Text("hi".to_string())],
+        }
+    }
 
     #[test]
     fn init_page_sets_page_format_version() {
@@ -335,5 +444,70 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(stored, 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn set_tuple_header_mutates_in_place_without_relocating() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
+
+        let before = read_slot(&data.0, slot);
+
+        set_tuple_header(&mut data.0, slot, 99, (4, 5), XMAX_COMMITTED, 0x42).unwrap();
+
+        // The tuple kept its exact offset and length: no relocation, no compaction.
+        let after = read_slot(&data.0, slot);
+        assert_eq!(after.offset, before.offset);
+        assert_eq!(after.len, before.len);
+        assert!(after.is_live());
+
+        // The page checksum still verifies and the PageLSN was stamped.
+        validate(&data.0).unwrap();
+        assert_eq!(super::page_lsn(&data.0), 0x42);
+
+        // The three header fields changed; xmin and the payload/null bitmap are intact.
+        let bytes = super::read_row(&data.0, slot).unwrap().unwrap();
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+        assert_eq!(decoded.xmax, 99);
+        assert_eq!(decoded.t_ctid, (4, 5));
+        assert_eq!(decoded.infomask, XMAX_COMMITTED);
+        assert_eq!(decoded.xmin, 7);
+        assert_eq!(decoded.row, row());
+    }
+
+    #[test]
+    fn set_tuple_header_rejects_a_dead_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
+        assert!(delete_row(&mut data.0, slot).unwrap());
+
+        // A tombstoned (DEAD) line pointer is not a valid mutation target.
+        assert!(set_tuple_header(&mut data.0, slot, 1, (0, 0), 0, 1).is_err());
+    }
+
+    #[test]
+    fn line_pointer_state_maps_live_to_normal_and_deleted_to_dead() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
+
+        // A freshly inserted slot is a NORMAL line pointer.
+        assert_eq!(read_slot(&data.0, slot).flags, line_pointer::NORMAL);
+
+        // Deleting through the existing path moves it to the DEAD state.
+        assert!(delete_row(&mut data.0, slot).unwrap());
+        assert_eq!(read_slot(&data.0, slot).flags, line_pointer::DEAD);
+    }
+
+    #[test]
+    fn inserted_tuple_decodes_with_a_live_xmax() {
+        // Sanity: the unmutated tuple is live (xmax invalid) before the primitive runs.
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
+        let bytes = super::read_row(&data.0, slot).unwrap().unwrap();
+        assert_eq!(decode_row(&schema(), &bytes).unwrap().xmax, INVALID_XID);
     }
 }
