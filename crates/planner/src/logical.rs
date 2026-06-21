@@ -79,6 +79,11 @@ pub enum LogicalPlan {
 }
 
 pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
+    let plan = build_logical_plan(bound)?;
+    Ok(crate::simplify::simplify_logical(plan))
+}
+
+fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
     match bound {
         BoundStatement::CreateTable {
             name,

@@ -5,6 +5,7 @@ mod expr;
 mod logical;
 mod params;
 mod physical;
+mod simplify;
 
 pub use binder::{bind, bind_parameterized};
 pub use bound::{BoundFrom, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement};
@@ -1025,6 +1026,91 @@ mod tests {
         assert!(
             matches!(source.as_ref(), LogicalPlan::Sort { .. }),
             "expected sort under projection, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn simplify_folds_constant_arithmetic_in_filter() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select name from users where id = 3 + 4").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        // The folded `id = 7` makes the primary-key index usable as an exact match.
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let text = format!("{physical:?}");
+        assert!(text.contains("IndexScan"), "expected IndexScan, got {text}");
+        assert!(text.contains("Exact"), "expected exact key, got {text}");
+    }
+
+    #[test]
+    fn simplify_does_not_fold_division_by_zero() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select name from users where id = 1 / 0").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        // `1 / 0` must survive so the executor raises the runtime error; the
+        // comparand is not a bare literal, so the plan stays a SeqScan.
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        assert!(format!("{physical:?}").contains("SeqScan"));
+    }
+
+    #[test]
+    fn simplify_drops_constant_true_filter_above_join() {
+        let catalog = catalog_with_users_and_accounts();
+        // `1 = 1` folds to TRUE; the residual Filter above the cross join is removed.
+        let stmt = parse("select users.id from users, accounts where 1 = 1").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        assert!(
+            !format!("{logical:?}").contains("Filter"),
+            "constant-true filter should be removed: {logical:?}"
+        );
+    }
+
+    #[test]
+    fn simplify_drops_redundant_and_true_in_filter() {
+        let catalog = catalog_with_users();
+        // `id = 7 AND true` simplifies to `id = 7` (dropping only the TRUE literal),
+        // which keeps the predicate usable as an index key.
+        let stmt = parse("select name from users where id = 7 and true").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let LogicalPlan::Projection { source, .. } = &logical else {
+            panic!("expected projection, got {logical:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                LogicalPlan::Scan {
+                    filter: Some(BoundExpr::BinaryOp { op: BinOp::Eq, .. }),
+                    ..
+                }
+            ),
+            "expected `id = 7` after dropping `AND true`, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn simplify_keeps_fallible_operand_in_false_conjunction() {
+        let catalog = catalog_with_users();
+        // The executor evaluates both AND operands eagerly, so folding `false AND x`
+        // must NOT discard `x` when `x` can raise at runtime (`id / 0` here). The
+        // conjunction is preserved so the division-by-zero error still surfaces.
+        let stmt = parse("select name from users where false and id / 0 = 1").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let LogicalPlan::Projection { source, .. } = &logical else {
+            panic!("expected projection, got {logical:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                LogicalPlan::Scan {
+                    filter: Some(BoundExpr::BinaryOp { op: BinOp::And, .. }),
+                    ..
+                }
+            ),
+            "fallible operand must be preserved (no collapse to constant), got {source:?}"
         );
     }
 }

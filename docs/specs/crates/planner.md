@@ -328,6 +328,32 @@ pub enum LogicalPlan {
 
 Logical plan contains no access method choices.
 
+## Plan-Time Simplification
+
+After logical planning, the planner runs a result-preserving simplification pass
+over the `LogicalPlan` (`logical_plan` returns the simplified plan):
+
+- **Constant folding.** Literal-only arithmetic, comparison, and `||` concat
+  sub-expressions, integer negation, `NOT`, `IS NULL`, and `IS NOT NULL` over a
+  literal are collapsed to a `Literal`. Folding is skipped for any operation that
+  could fail at runtime — integer overflow and divide/modulo by zero are left
+  intact so the executor raises the same error it would have without folding.
+- **Boolean simplification.** `AND`/`OR` over two boolean constants fold to a
+  constant, and a redundant constant operand is dropped while the other operand
+  is kept: `TRUE AND x → x`, `FALSE OR x → x` (and the symmetric forms). The
+  planner does **not** collapse `FALSE AND x → FALSE` or `TRUE OR x → TRUE` when
+  `x` is not constant: the executor evaluates both operands eagerly (no
+  short-circuit), so discarding `x` could suppress a runtime error (e.g. division
+  by zero) it would otherwise raise. A simplification therefore never drops a
+  non-constant operand.
+- **Constant-true predicate removal.** A `Scan.filter` or `Filter.predicate` that
+  folds to constant `TRUE` is dropped (`Scan.filter` becomes `None`; the `Filter`
+  node is replaced by its source).
+
+The pass never changes a query's result set or output schema; it only narrows
+expressions and removes no-op predicates, which can in turn make an index range
+usable (e.g. `id = 3 + 4` folds to `id = 7`).
+
 ## Physical Plan
 
 ```rust
