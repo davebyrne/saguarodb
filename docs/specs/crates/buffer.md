@@ -92,7 +92,7 @@ impl PageWriteGuard {
 
 Read guards hold a read latch and unpin on drop. Write guards hold a write latch, set dirty state for `txn_id`, and unpin on drop.
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a `PageWriteGuard` whose `page_num()` identifies the new page. The fresh-page insertion path must reject an already resident `(file_id, page_num)` with an internal error rather than overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, ...)` advances this counter to at least `page_num + 1`, and rollback of a new page removes the page but does not need to reuse its page number in v1.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a `PageWriteGuard` whose `page_num()` identifies the new page. The fresh-page insertion path must reject an already resident `(file_id, page_num)` with an internal error rather than overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, ...)` advances this counter to at least `page_num + 1`. Rollback removes a transaction's new pages and restores each affected file's allocation counter to its pre-transaction value, so the rolled-back page numbers are reusable — this is required because a rebuilt B-tree in a reused file (an index id freed by a rolled-back create) must place its metapage at page 0. Restoring the counter is safe under the v1 single-writer model, where no other transaction raised it; the rolled-back pages were never flushed, so they do not exist on disk.
 
 Guards are owned and object-safe. They may internally hold `Arc<Frame>`.
 
@@ -119,6 +119,7 @@ The buffer pool tracks active write transactions:
 pub struct TxnDirtyState {
     pub before_images: HashMap<(FileId, PageNum), PageData>,
     pub new_pages: Vec<(FileId, PageNum)>,
+    pub next_page_before: HashMap<FileId, PageNum>,
 }
 ```
 
@@ -126,8 +127,8 @@ Rules:
 
 - On first `write_page(file, page, txn_id)` for an existing page by that `txn_id`, copy the current in-memory page into `before_images`.
 - On repeated writes to the same page by the same `txn_id`, do not replace the original before-image.
-- On `new_page(file, txn_id)`, record the allocated page in `new_pages`.
-- On `rollback(txn_id)`, restore all before-images and invalidate/free all newly allocated pages for that transaction.
+- On `new_page(file, txn_id)`, record the allocated page in `new_pages`, and the first time the txn allocates into a file record that file's pre-allocation counter in `next_page_before`.
+- On `rollback(txn_id)`, restore all before-images, invalidate/free all newly allocated pages for that transaction, and restore each affected file's allocation counter from `next_page_before`.
 - On `commit(txn_id)`, discard before-images and new-page tracking. Pages remain dirty until a checkpoint flushes them in place to the heap.
 
 This preserves committed in-memory changes from earlier transactions that have not yet been flushed.
@@ -152,7 +153,7 @@ Checkpoint holds the global write guard, so no statement mutates pages concurren
 - Uncommitted dirty pages are never written to the heap; only committed (hence WAL-durable) dirty pages are stolen.
 - A page is never written to the heap before its redo records are WAL-durable: checkpoint flushes after `wal.flush()`, and eviction-steal only flushes committed pages.
 - Rollback restores page state to exactly what it was before the failed transaction first touched each page, and re-arms `needs_fpi`.
-- New pages from failed transactions are not visible after rollback.
+- New pages from failed transactions are not visible after rollback, and their page numbers become re-allocatable (the allocation counter is restored).
 - Commit does not flush pages; it only discards rollback metadata.
 - A committed dirty page is marked clean only when it is flushed to the heap — in place by checkpoint, or immediately before eviction by a steal.
 
@@ -160,7 +161,7 @@ Checkpoint holds the global write guard, so no statement mutates pages concurren
 
 - First write stores a before-image; second write by same txn does not replace it.
 - Rollback restores a page that was already dirty from a prior committed txn.
-- Rollback invalidates pages allocated by the failed txn.
+- Rollback invalidates pages allocated by the failed txn and resets the allocation counter so the next transaction reuses those page numbers.
 - Commit discards before-images but leaves pages dirty.
 - A committed dirty page is stolen (flushed then evicted) when stealing is enabled.
 - A dirty page the policy refuses, or any dirty page when stealing is disabled, is not evicted (error when no other victim).

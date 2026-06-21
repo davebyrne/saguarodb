@@ -365,12 +365,11 @@ impl BufferPool for MemoryBufferPool {
             let frame = state.insert_fresh_frame(file_id, page_num)?;
             frame.mark_dirty(txn_id);
             state.advance_next_page_num(file_id, page_num);
-            state
-                .txns
-                .entry(txn_id)
-                .or_default()
-                .new_pages
-                .push((file_id, page_num));
+            let txn = state.txns.entry(txn_id).or_default();
+            txn.new_pages.push((file_id, page_num));
+            // `page_num` of the txn's first allocation in this file is its
+            // pre-txn allocation counter; remember it once for rollback.
+            txn.next_page_before.entry(file_id).or_insert(page_num);
             frame.pin();
             Ok(Some((page_num, frame)))
         })?;
@@ -428,6 +427,11 @@ impl BufferPool for MemoryBufferPool {
             let mut state = self.state.lock();
             for key in &new_pages {
                 state.remove_frame(*key);
+            }
+            // Restore each file's allocation counter so the rolled-back pages are
+            // re-allocatable (single writer in v1, so no other txn raised it).
+            for (file_id, before) in dirty_state.next_page_before {
+                state.next_page_num_by_file.insert(file_id, before);
             }
         }
 
@@ -682,6 +686,11 @@ enum ReclaimOutcome {
 struct TxnDirtyState {
     before_images: HashMap<PageKey, BeforeImage>,
     new_pages: Vec<PageKey>,
+    /// Each file's allocation counter just before this txn first allocated into
+    /// it, so rollback can restore it and fully undo the allocation. Without this
+    /// a rolled-back B-tree build would leave the counter advanced, and a rebuild
+    /// in the same (reused) file would not place its metapage at page 0.
+    next_page_before: HashMap<FileId, PageNum>,
 }
 
 struct BeforeImage {
@@ -858,6 +867,23 @@ mod tests {
         pool.rollback(77).unwrap();
 
         assert!(pool.read_page(1, 0).is_err());
+    }
+
+    #[test]
+    fn rollback_resets_allocation_so_new_pages_reuse_numbers() {
+        let pool = MemoryBufferPool::empty(8);
+
+        // A transaction allocates two pages in a fresh file, then rolls back.
+        {
+            let _meta = pool.new_page(1, 7).unwrap();
+            let _root = pool.new_page(1, 7).unwrap();
+        }
+        pool.rollback(7).unwrap();
+
+        // The next transaction's first allocation reuses page 0, so a rebuilt
+        // B-tree in the same file places its metapage at page 0 again.
+        let page = pool.new_page(1, 8).unwrap();
+        assert_eq!(page.page_num(), 0);
     }
 
     #[test]
