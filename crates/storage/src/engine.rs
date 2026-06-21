@@ -5,7 +5,7 @@ use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
     Result, Row, RowId, Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema,
-    TxnStatusView, Value, is_visible,
+    TxnStatusView, Value, is_visible, version_conflicts,
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -243,22 +243,26 @@ impl PageBackedStorageEngine {
     /// Insert `(entry_key, location)` into a secondary index, enforcing uniqueness
     /// for a unique index. The secondary key is the indexed column(s) alone (no pk
     /// tiebreaker); duplicate indexed values are disambiguated by the heap TID in
-    /// `(key, tid)` order. A unique index presence-probes its key first so a
-    /// duplicate non-NULL indexed value is rejected. A NULL indexed value never
-    /// participates in a unique constraint (SQL treats NULLs as distinct), so the
-    /// probe is skipped when `has_null`; distinct NULL rows coexist because their
-    /// heap TIDs differ. This presence-probe is TEMPORARY: Milestone B commit 7
-    /// replaces it with a visibility-aware uniqueness check.
+    /// `(key, tid)` order. A unique index rejects a duplicate non-NULL indexed value
+    /// via the shared visibility-aware [`Self::unique_conflict_exists`] check (it
+    /// conflicts only with an alive-or-potentially-alive version; dead/aborted
+    /// versions are ignored). A NULL indexed value never participates in a unique
+    /// constraint (SQL treats NULLs as distinct), so the check is skipped when
+    /// `has_null`; distinct NULL rows coexist because their heap TIDs differ.
     fn insert_secondary_entry(
         &self,
         ctx: &StatementContext,
+        table_schema: &TableSchema,
         index: &IndexSchema,
         entry_key: &Key,
         has_null: bool,
         location: &RowLocation,
     ) -> Result<()> {
         let secondary = self.secondary_btree(index.id);
-        if index.unique && !has_null && !secondary.scan_key(entry_key)?.is_empty() {
+        if index.unique
+            && !has_null
+            && self.unique_conflict_exists(&secondary, entry_key, table_schema, ctx.txn_id)?
+        {
             return Err(duplicate_unique_index(&index.name));
         }
         secondary.insert(ctx.txn_id, entry_key, location)
@@ -458,6 +462,58 @@ impl PageBackedStorageEngine {
         Ok(Some(decoded.row))
     }
 
+    /// Whether any existing version indexed under `key` in `index_btree` **conflicts**
+    /// with a unique-constraint insert by `current_txn` — the shared,
+    /// visibility-aware uniqueness check for the primary-key index and unique
+    /// secondary indexes (`docs/specs/mvcc.md` §6/§7.3). It replaces the temporary
+    /// presence-probes (B2 commits 3–4): "any entry for the key" became "any
+    /// *alive-or-potentially-alive* version for the key".
+    ///
+    /// This is a **liveness ("dirty") check, not a snapshot read**: it consults the
+    /// CLOG (`TxnStatusView`) + the tuple's `infomask` hint bits — never a
+    /// [`Snapshot`] — so it sees concurrently in-flight and already-committed state,
+    /// not just what `current_txn`'s snapshot would observe. Each candidate TID from
+    /// `scan_key` is read at the *physical* tuple header (NOT via
+    /// [`Self::read_visible_row`], which would wrongly hide non-visible-but-alive
+    /// versions); a DEAD/UNUSED line pointer (`read_row` ⇒ `None`) is a reclaimed
+    /// slot and contributes no conflict. The per-candidate decision is
+    /// [`common::version_conflicts`]: a creator-aborted or committed-deleted (incl.
+    /// deleted-by-me) version is dead and ignored; anything else conflicts.
+    ///
+    /// While the engine is single-version every index entry is a committed,
+    /// non-deleted tuple, so this returns `true` exactly when the old presence-probe
+    /// did — existing uniqueness behavior is unchanged. It becomes load-bearing once
+    /// versioning (B4 commits 8–9) starts stamping `xmax`/writing aborted versions.
+    fn unique_conflict_exists(
+        &self,
+        index_btree: &BTree<'_, RowLocation>,
+        key: &Key,
+        schema: &TableSchema,
+        current_txn: u64,
+    ) -> Result<bool> {
+        let status = self.txn_status_view();
+        for location in index_btree.scan_key(key)? {
+            let readable = self
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)?;
+            let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
+                // DEAD/UNUSED line pointer: the slot was reclaimed; no conflict.
+                continue;
+            };
+            let decoded = decode_row(schema, &bytes)?;
+            if version_conflicts(
+                decoded.xmin,
+                decoded.xmax,
+                decoded.infomask,
+                current_txn,
+                status,
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn table_page_nums(&self, file_id: FileId) -> Result<Vec<PageNum>> {
         let mut pages: Vec<_> = self
             .buffer_pool
@@ -475,11 +531,12 @@ impl StorageEngine for PageBackedStorageEngine {
         let (schema, index_fid) = self.table_handle(table)?;
         let key = key_for_row(&schema, &row)?;
         let btree = self.btree(index_fid);
-        // TEMPORARY presence-probe for primary-key uniqueness: the multi-entry
-        // tree no longer rejects duplicate keys structurally, so the engine
-        // checks for an existing entry first. Milestone B commit 7 replaces this
-        // with a visibility-aware uniqueness check.
-        if !btree.scan_key(&key)?.is_empty() {
+        // Visibility-aware primary-key uniqueness: the multi-entry tree no longer
+        // rejects duplicate keys structurally, so reject only when an
+        // alive-or-potentially-alive version already holds the key (dead/aborted
+        // versions do not block a re-insert). Single-version today ⇒ behaves like a
+        // presence check; correct once versioning (B4) lands.
+        if self.unique_conflict_exists(&btree, &key, &schema, ctx.txn_id)? {
             return Err(DbError::storage(
                 SqlState::UniqueViolation,
                 "duplicate primary key",
@@ -491,7 +548,7 @@ impl StorageEngine for PageBackedStorageEngine {
 
         for index in self.table_indexes(table)? {
             let (entry_key, has_null) = secondary_index_key(&schema, &index, &row)?;
-            self.insert_secondary_entry(ctx, &index, &entry_key, has_null, &location)?;
+            self.insert_secondary_entry(ctx, &schema, &index, &entry_key, has_null, &location)?;
         }
 
         Ok(RowId {
@@ -590,7 +647,14 @@ impl StorageEngine for PageBackedStorageEngine {
             }
             for index in &indexes {
                 let (new_key, has_null) = secondary_index_key(&schema, index, &row)?;
-                self.insert_secondary_entry(ctx, index, &new_key, has_null, &new_location)?;
+                self.insert_secondary_entry(
+                    ctx,
+                    &schema,
+                    index,
+                    &new_key,
+                    has_null,
+                    &new_location,
+                )?;
             }
         }
 
@@ -798,7 +862,7 @@ impl SchemaOperations for PageBackedStorageEngine {
                     storage_internal("primary-key index points to a dead row during index backfill")
                 })?;
             let (key, has_null) = secondary_index_key(&table_schema, schema, &row)?;
-            self.insert_secondary_entry(ctx, schema, &key, has_null, &location)?;
+            self.insert_secondary_entry(ctx, &table_schema, schema, &key, has_null, &location)?;
         }
         Ok(())
     }
@@ -1065,6 +1129,43 @@ mod visibility_tests {
                 })
                 .unwrap();
         }
+
+        /// Stamp a deleter (`xmax`) on the heap tuple at `(page_num, slot)` of the
+        /// users table, simulating an in-place DELETE before versioning writes (B4)
+        /// are wired. Mirrors the eventual engine path: append a `HeapUpdateHeader`
+        /// record for a real LSN, then mutate the header in place. `t_ctid` stays
+        /// the no-successor sentinel; `infomask` is the caller's hint bits.
+        fn stamp_xmax(&self, page_num: u32, slot: u16, xmax: u64, infomask: u16) {
+            let lsn = self
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: xmax,
+                    kind: WalRecordKind::HeapUpdateHeader {
+                        file_id: TABLE_ID,
+                        page_num,
+                        slot,
+                        xmax,
+                        t_ctid: crate::codec::INVALID_TID,
+                        infomask,
+                    },
+                })
+                .unwrap();
+            let mut guard = self
+                .engine
+                .buffer_pool
+                .write_page(TABLE_ID, page_num, xmax)
+                .unwrap();
+            crate::page::set_tuple_header(
+                guard.data_mut(),
+                slot,
+                xmax,
+                crate::codec::INVALID_TID,
+                infomask,
+                lsn,
+            )
+            .unwrap();
+        }
     }
 
     fn ctx(txn_id: u64, snapshot: Snapshot) -> StatementContext {
@@ -1291,5 +1392,184 @@ mod visibility_tests {
                 Value::Text("own_write".to_string()),
             ]
         );
+    }
+
+    // --- MVCC-aware uniqueness (Milestone B commit 7) ---
+
+    /// A committed, live version holding a primary key blocks a re-insert of that
+    /// key with `UniqueViolation`. This is the single-version baseline preserved by
+    /// the visibility-aware check.
+    #[test]
+    fn unique_live_committed_pk_conflicts() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "alive"))
+            .unwrap();
+        fixture.commit(10);
+
+        let err = fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "dup"))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::UniqueViolation);
+    }
+
+    /// A primary key whose only existing version had an **aborted creator** is dead;
+    /// re-inserting that key succeeds (no conflict). The version is planted by
+    /// inserting under a creator txn and then aborting it.
+    #[test]
+    fn unique_aborted_creator_pk_does_not_conflict() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        // Creator txn 10 inserts key 1, then aborts ⇒ the version is dead.
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "aborted"))
+            .unwrap();
+        fixture.abort(10);
+
+        // A fresh committed txn re-inserts key 1: the dead version must not block it.
+        fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "reinsert"))
+            .unwrap();
+        fixture.commit(11);
+
+        // The live version is the one that survives.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(20, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "reinsert"))
+        );
+    }
+
+    /// A primary key whose only existing version is **committed-deleted** (its
+    /// `xmax` committed) is dead; re-inserting that key succeeds. The deletion is
+    /// planted by stamping `xmax` in place (versioning DELETE is not wired yet) and
+    /// committing the deleter.
+    #[test]
+    fn unique_committed_deleted_pk_does_not_conflict() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        // Creator txn 10 inserts key 1 (committed-live).
+        let rid = fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "deleted"))
+            .unwrap();
+        fixture.commit(10);
+
+        // Deleter txn 20 stamps xmax in place and commits ⇒ the version is gone.
+        fixture.stamp_xmax(rid.page_num, rid.slot_num, 20, common::XMAX_COMMITTED);
+        fixture.commit(20);
+
+        // Re-insert key 1: the committed-deleted version must not block it.
+        fixture
+            .engine
+            .insert(&ctx(21, snapshot(22, vec![])), TABLE_ID, row(1, "reinsert"))
+            .unwrap();
+        fixture.commit(21);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "reinsert"))
+        );
+    }
+
+    /// A **committed-but-aborted-delete** version is still alive and conflicts: a
+    /// version with a committed creator and an *aborted* `xmax` blocks a re-insert.
+    /// Guards against treating any non-INVALID `xmax` as "deleted".
+    #[test]
+    fn unique_aborted_delete_pk_still_conflicts() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.commit(100);
+
+        let rid = fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "alive"))
+            .unwrap();
+        fixture.commit(10);
+
+        // Deleter txn 20 stamps xmax but aborts ⇒ the delete never happened.
+        fixture.stamp_xmax(rid.page_num, rid.slot_num, 20, common::XMAX_ABORTED);
+        fixture.abort(20);
+
+        let err = fixture
+            .engine
+            .insert(&ctx(21, snapshot(22, vec![])), TABLE_ID, row(1, "dup"))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::UniqueViolation);
+    }
+
+    /// The same liveness rule governs unique **secondary** indexes: an aborted
+    /// creator's secondary entry does not block a duplicate non-NULL value.
+    #[test]
+    fn unique_secondary_aborted_creator_does_not_conflict() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        let unique_name = IndexSchema {
+            id: 1,
+            table: TABLE_ID,
+            name: "users_name_unique".to_string(),
+            columns: vec![1],
+            unique: true,
+        };
+        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture.commit(100);
+
+        // Creator txn 10 inserts (id 1, name "amy"), then aborts ⇒ dead version.
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+            .unwrap();
+        fixture.abort(10);
+
+        // A different row with the SAME unique name must be accepted: the dead
+        // version does not occupy the unique key.
+        fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "amy"))
+            .unwrap();
+        fixture.commit(11);
+
+        // A committed-live duplicate name is still rejected.
+        let err = fixture
+            .engine
+            .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(3, "amy"))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::UniqueViolation);
     }
 }

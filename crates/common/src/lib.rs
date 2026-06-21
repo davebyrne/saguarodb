@@ -18,7 +18,7 @@ pub use ids::{
 };
 pub use mvcc::{
     IsolationLevel, Snapshot, TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED,
-    XMIN_COMMITTED, is_visible,
+    XMIN_COMMITTED, is_visible, version_conflicts,
 };
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};

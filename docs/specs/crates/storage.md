@@ -269,11 +269,23 @@ one `RowLocation` per key (single version).
   to `Key` and comparing with `Ord`; equal keys are then ordered by their raw
   value bytes.
 
-**Primary-key uniqueness (temporary presence-probe).** Because the tree no longer
-rejects duplicate keys, the engine `insert` first `scan_key(pk)`s the primary-key
-index and returns `SqlState::UniqueViolation` if any entry already exists. This
-presence-probe is TEMPORARY: Milestone B commit 7 replaces it with a
-visibility-aware uniqueness check that ignores dead/aborted versions.
+**Primary-key uniqueness (visibility/CLOG-aware liveness check).** Because the tree
+no longer rejects duplicate keys, the engine `insert` enforces uniqueness with a
+shared visibility-aware check (`unique_conflict_exists`): it `scan_key(pk)`s the
+primary-key index and, for each candidate TID, reads the *physical* tuple header
+and asks whether that version is **alive or potentially-alive**
+(`common::version_conflicts`). It returns `SqlState::UniqueViolation` only when
+such a conflicting version exists. The decision is a **liveness ("dirty") check,
+not a snapshot read**: it consults the CLOG (`TxnStatusView`) plus the tuple's
+`infomask` hint bits — never a `Snapshot` — so it sees concurrently in-flight and
+already-committed state. A candidate is *definitively dead and ignored* iff its
+creator is aborted, or it is committed-deleted (`xmax` committed, or
+`xmax == current_txn` deleted-by-me); any other version (committed-live,
+in-progress creator, aborted/in-progress delete) conflicts. A DEAD/UNUSED line
+pointer contributes no conflict. This replaces the earlier temporary
+presence-probe; while the engine is single-version it rejects exactly the same
+inputs, and once versioning (Milestone B4) stamps `xmax`/writes aborted versions a
+dead version with the same key no longer blocks a re-insert.
 
 The B-tree is generic over its leaf value type, but every index — primary-key and
 secondary — now stores a fixed-width `RowLocation` (heap TID), so all indexes are
@@ -297,13 +309,17 @@ used for a secondary index.
   primary key is no longer embedded. Duplicate indexed values (including multiple
   rows whose indexed value is NULL) coexist as ordinary multi-entry rows,
   disambiguated by the trailing heap TID in the tree's `(key, tid)` ordering. A
-  unique secondary index enforces uniqueness with a temporary engine-level
-  presence-probe (`scan_key` before insert) returning `SqlState::UniqueViolation`
-  when the indexed value is non-NULL. The probe is **skipped for a NULL indexed
-  value**: SQL treats NULLs as distinct, so NULL never participates in a unique
-  constraint, and distinct NULL rows coexist naturally via their differing heap
-  TIDs. This presence-probe is temporary (Milestone B commit 7 replaces it with a
-  visibility-aware uniqueness check).
+  unique secondary index enforces uniqueness through the **same shared
+  visibility/CLOG-aware liveness check** the primary-key index uses
+  (`unique_conflict_exists` / `common::version_conflicts`): it conflicts only with
+  an alive-or-potentially-alive version of the key, ignoring dead (creator-aborted)
+  and committed-deleted versions, and returns `SqlState::UniqueViolation` when the
+  indexed value is non-NULL and such a version exists. The check is **skipped for a
+  NULL indexed value**: SQL treats NULLs as distinct, so NULL never participates in
+  a unique constraint, and distinct NULL rows coexist naturally via their differing
+  heap TIDs. This replaces the earlier temporary presence-probe; single-version
+  behavior is unchanged, and it becomes load-bearing once versioning (Milestone B4)
+  lands.
 - **Lookup / range.** `index_scan(table, index, range)` constrains the leading
   indexed columns; the range bounds hold exactly those columns, and comparison
   ignores each stored key's trailing TID tiebreaker (the leaf value). An equality

@@ -165,6 +165,54 @@ pub fn is_visible(
     !deleter_visible
 }
 
+/// The visibility-aware **uniqueness conflict** predicate of `docs/specs/mvcc.md`
+/// §6/§7.3: whether a candidate index version with creator `xmin` and deleter
+/// `xmax` is **alive or potentially-alive** and therefore conflicts with an
+/// inserting transaction `current_txn` trying to claim the same unique key.
+///
+/// This is a **liveness ("dirty") check, not a snapshot-relative read**. Unique
+/// enforcement must consider concurrently in-flight and already-committed state —
+/// not just what `current_txn`'s snapshot sees — so it takes **no [`Snapshot`]**
+/// and decides committed/aborted purely from the [`TxnStatusView`] (CLOG) and the
+/// `infomask` hint bits. Do not route it through [`is_visible`].
+///
+/// A candidate is **definitively dead ⇒ no conflict** iff either:
+/// - its creator is **aborted** (`status(xmin) == Aborted`, or `XMIN_ABORTED`) —
+///   the row never really existed; or
+/// - it is **committed-deleted**: `xmax` is set (`!= INVALID_XID`) and the delete
+///   is settled — either `xmax == current_txn` (deleted by me earlier in this
+///   txn; with no command ids yet this counts as deleted, mirroring `is_visible`'s
+///   own-delete handling, so I may re-insert the key within my own txn) or the
+///   deleter committed (`status(xmax) == Committed`, or `XMAX_COMMITTED`).
+///
+/// Otherwise the candidate is **alive or potentially-alive ⇒ conflict**: the
+/// creator is committed, in-progress, or `current_txn`, and the row is not
+/// committed-deleted (`xmax == INVALID_XID`, the deleter is aborted, or the
+/// deleter is another in-progress txn — an in-flight delete that may yet roll
+/// back, so it still blocks).
+pub fn version_conflicts(
+    xmin: TxnId,
+    xmax: TxnId,
+    infomask: u16,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> bool {
+    // Creator aborted ⇒ the version is definitively dead; never conflicts.
+    if infomask & XMIN_ABORTED != 0 || status.status(xmin) == TxnStatus::Aborted {
+        return false;
+    }
+    // Committed-deleted (including deleted-by-me) ⇒ the row is gone; no conflict.
+    if xmax != INVALID_XID
+        && (xmax == current_txn
+            || infomask & XMAX_COMMITTED != 0
+            || status.status(xmax) == TxnStatus::Committed)
+    {
+        return false;
+    }
+    // Otherwise alive or potentially-alive ⇒ conflict.
+    true
+}
+
 /// A point-in-time view of which transactions are visible, in the Postgres
 /// `{xmin, xmax, xip}` style (see `docs/specs/mvcc.md` §5.5, §6).
 ///
@@ -258,7 +306,7 @@ mod tests {
 
     use super::{
         IsolationLevel, Snapshot, TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED,
-        XMIN_ABORTED, XMIN_COMMITTED, is_visible,
+        XMIN_ABORTED, XMIN_COMMITTED, is_visible, version_conflicts,
     };
 
     #[test]
@@ -541,5 +589,115 @@ mod tests {
         );
         assert_eq!(by_clog, by_hint);
         assert!(!by_hint);
+    }
+
+    // --- version_conflicts (uniqueness liveness check) ---
+
+    const CURRENT_TXN: TxnId = 100;
+
+    #[test]
+    fn conflict_committed_live_version_conflicts() {
+        // Creator committed, no deleter ⇒ alive ⇒ conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+        assert!(version_conflicts(7, INVALID_XID, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_aborted_creator_does_not_conflict() {
+        // Creator aborted ⇒ the version never really existed ⇒ no conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Aborted)]);
+        assert!(!version_conflicts(7, INVALID_XID, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_committed_deleted_version_does_not_conflict() {
+        // Creator committed but a committed delete removed it ⇒ no conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::Committed)]);
+        assert!(!version_conflicts(7, 9, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_aborted_delete_still_conflicts() {
+        // Creator committed; the delete aborted (the row is still alive) ⇒ conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::Aborted)]);
+        assert!(version_conflicts(7, 9, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_in_progress_delete_still_conflicts() {
+        // Creator committed; another in-progress txn is deleting it but has not
+        // committed (it may yet roll back) ⇒ still potentially-alive ⇒ conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::InProgress)]);
+        assert!(version_conflicts(7, 9, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_in_progress_creator_conflicts() {
+        // A concurrent inserter's in-flight version (creator in-progress, not me)
+        // is potentially-alive ⇒ conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::InProgress)]);
+        assert!(version_conflicts(7, INVALID_XID, 0, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_own_live_write_conflicts() {
+        // A live version I created myself still occupies the key ⇒ conflict.
+        let view = MockStatus::new(&[]);
+        assert!(version_conflicts(
+            CURRENT_TXN,
+            INVALID_XID,
+            0,
+            CURRENT_TXN,
+            &view
+        ));
+    }
+
+    #[test]
+    fn conflict_deleted_by_me_does_not_conflict() {
+        // I created and then deleted this version earlier in my own txn; with no
+        // command ids, deleted-by-me counts as gone ⇒ I may re-insert the key.
+        let view = MockStatus::new(&[]);
+        assert!(!version_conflicts(
+            CURRENT_TXN,
+            CURRENT_TXN,
+            0,
+            CURRENT_TXN,
+            &view
+        ));
+    }
+
+    #[test]
+    fn conflict_honours_hint_bits_without_probing() {
+        // Aborted-creator hint ⇒ no conflict, no CLOG probe.
+        assert!(!version_conflicts(
+            7,
+            INVALID_XID,
+            XMIN_ABORTED,
+            CURRENT_TXN,
+            &PanicStatus
+        ));
+        // The aborted-delete hint must NOT short-circuit to "no conflict": an
+        // aborted delete leaves the row alive. The creator status is still probed,
+        // so use a live view rather than PanicStatus here.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+        assert!(version_conflicts(7, 9, XMAX_ABORTED, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_committed_delete_hint_short_circuits() {
+        // Committed-delete hint ⇒ no conflict without probing the deleter; the
+        // creator status is still consulted (committed here).
+        let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+        assert!(!version_conflicts(7, 9, XMAX_COMMITTED, CURRENT_TXN, &view));
+    }
+
+    #[test]
+    fn conflict_is_not_snapshot_relative() {
+        // A version whose creator is in the "future" relative to some snapshot
+        // (id >= a snapshot's xmax) still conflicts if it is committed/alive —
+        // proving the check is liveness-based, not snapshot-relative. (There is no
+        // snapshot argument to pass; this documents the contract.)
+        let view = MockStatus::new(&[(50, TxnStatus::Committed)]);
+        assert!(version_conflicts(50, INVALID_XID, 0, CURRENT_TXN, &view));
     }
 }
