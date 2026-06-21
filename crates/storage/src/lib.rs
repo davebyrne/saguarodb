@@ -23,14 +23,14 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, DataType, Key, KeyRange, Lsn, Result, Row, SqlState, StatementContext,
-        TableSchema, Value,
+        ColumnDef, DataType, IndexSchema, Key, KeyRange, Lsn, Result, Row, SqlState,
+        StatementContext, TableSchema, Value,
     };
     use wal::{WalManager, WalRecord};
 
     use crate::{
-        PageBackedStorageEngine, RecoveryOperations, SchemaOperations, StorageEngine, StorageMode,
-        decode_row, encode_row,
+        PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
+        StorageMode, decode_row, encode_row,
     };
 
     #[test]
@@ -463,6 +463,290 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_index_backfills_existing_rows() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Grace", true))
+            .unwrap();
+
+        // Build the index after the rows exist; backfill must pick them up.
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(&ctx, 1, 1, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![user_row(1, "Ada", true)]);
+    }
+
+    #[test]
+    fn dml_keeps_secondary_index_in_sync() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+
+        // Insert is reflected in the index.
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        assert_eq!(index_ids(&harness, "Ada"), vec![1]);
+
+        // Updating the indexed column moves the entry.
+        harness
+            .storage
+            .update(&ctx, 1, &pk(1), user_row(1, "Lovelace", true))
+            .unwrap();
+        assert!(index_ids(&harness, "Ada").is_empty());
+        assert_eq!(index_ids(&harness, "Lovelace"), vec![1]);
+
+        // Delete removes the entry.
+        harness.storage.delete(&ctx, 1, &pk(1)).unwrap();
+        assert!(index_ids(&harness, "Lovelace").is_empty());
+    }
+
+    #[test]
+    fn non_unique_index_returns_every_row_for_a_value() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Sam", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Sam", false))
+            .unwrap();
+
+        let mut ids = index_ids(&harness, "Sam");
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn index_scan_returns_a_range_in_index_order() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+        for (id, name) in [(1, "Ada"), (2, "Cleo"), (3, "Bob")] {
+            harness
+                .storage
+                .insert(&ctx, 1, user_row(id, name, true))
+                .unwrap();
+        }
+
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(
+                    &ctx,
+                    1,
+                    1,
+                    &KeyRange::Range {
+                        start: Bound::Included(Key(vec![Value::Text("Bob".to_string())])),
+                        end: Bound::Unbounded,
+                    },
+                )
+                .unwrap(),
+        );
+        let names: Vec<_> = rows.into_iter().map(row_name).collect();
+        assert_eq!(names, vec!["Bob".to_string(), "Cleo".to_string()]);
+    }
+
+    #[test]
+    fn unique_index_rejects_duplicate_value_on_insert() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Ada", false))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
+    fn unique_index_backfill_rejects_duplicate_existing_values() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Ada", false))
+            .unwrap();
+
+        let err = harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
+    fn unique_index_allows_multiple_nulls() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap();
+
+        // name is nullable; SQL treats NULLs as distinct, so two are allowed.
+        harness
+            .storage
+            .insert(&ctx, 1, user_row_null_name(1))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row_null_name(2))
+            .unwrap();
+
+        assert!(harness.storage.get(&ctx, 1, &pk(1)).unwrap().is_some());
+        assert!(harness.storage.get(&ctx, 1, &pk(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn dropped_index_is_not_maintained_or_scannable() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        harness.storage.drop_index(&ctx, 1).unwrap();
+
+        // The dropped unique index no longer rejects the duplicate value...
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Ada", false))
+            .unwrap();
+        // ...and can no longer be scanned.
+        let err = harness
+            .storage
+            .index_scan(&ctx, 1, 1, &name_eq("Ada"))
+            .err()
+            .expect("dropped index should not be scannable");
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn rollback_removes_a_created_index() {
+        let harness = StorageHarness::new();
+        harness
+            .create_users_table(&StatementContext { txn_id: 0 })
+            .unwrap();
+        let ctx = StatementContext { txn_id: 5 };
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+
+        harness.storage.rollback_txn(ctx.txn_id).unwrap();
+        harness.buffer.rollback(ctx.txn_id).unwrap();
+
+        let err = harness
+            .storage
+            .index_scan(&StatementContext { txn_id: 6 }, 1, 1, &KeyRange::All)
+            .err()
+            .expect("rolled-back index should not be scannable");
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    /// A secondary index on the `name` column (column id 1) of `users`.
+    fn name_index(unique: bool) -> IndexSchema {
+        IndexSchema {
+            id: 1,
+            table: 1,
+            name: "users_name".to_string(),
+            columns: vec![1],
+            unique,
+        }
+    }
+
+    fn pk(id: i64) -> Key {
+        Key(vec![Value::Integer(id)])
+    }
+
+    fn name_eq(name: &str) -> KeyRange {
+        KeyRange::Exact(Key(vec![Value::Text(name.to_string())]))
+    }
+
+    fn collect(mut iter: Box<dyn RowIterator>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            rows.push(stored.row);
+        }
+        rows
+    }
+
+    fn row_name(row: Row) -> String {
+        match &row.values[1] {
+            Value::Text(name) => name.clone(),
+            other => panic!("expected text name, got {other:?}"),
+        }
+    }
+
+    /// The primary-key ids of the rows the `name` index returns for `name`.
+    fn index_ids(harness: &StorageHarness, name: &str) -> Vec<i64> {
+        let iter = harness
+            .storage
+            .index_scan(&StatementContext { txn_id: 1 }, 1, 1, &name_eq(name))
+            .unwrap();
+        collect(iter)
+            .into_iter()
+            .map(|row| match row.values[0] {
+                Value::Integer(id) => id,
+                ref other => panic!("expected integer id, got {other:?}"),
+            })
+            .collect()
+    }
+
     struct StorageHarness {
         storage: PageBackedStorageEngine,
         buffer: Arc<MemoryBufferPool>,
@@ -576,6 +860,17 @@ mod tests {
                 Value::Integer(id),
                 Value::Text(name.to_string()),
                 Value::Boolean(active),
+                Value::Null,
+            ],
+        }
+    }
+
+    fn user_row_null_name(id: i64) -> Row {
+        Row {
+            values: vec![
+                Value::Integer(id),
+                Value::Null,
+                Value::Boolean(true),
                 Value::Null,
             ],
         }

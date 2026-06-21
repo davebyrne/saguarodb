@@ -9,6 +9,7 @@
 //! page-LSN, so the tree is crash-safe through the same redo path as the heap.
 
 use std::cmp::Ordering;
+use std::marker::PhantomData;
 use std::ops::Bound;
 
 use buffer::{BufferPool, PageWriteGuard};
@@ -23,12 +24,54 @@ const META_PAGE: PageNum = 0;
 const LOCATION_LEN: usize = 10;
 const CHILD_LEN: usize = 4;
 
-/// A primary-key B+-tree over one index file. Reads need only the buffer pool;
-/// mutations also log redo through the WAL under the statement's `txn_id`.
-pub(crate) struct BTree<'a> {
+/// A value stored in a B-tree leaf. The primary-key index stores a `RowLocation`
+/// (fixed width); a secondary index stores the row's primary `Key` (variable
+/// width). The tree itself treats values as opaque bytes; this trait is the only
+/// place a value's on-page encoding is defined.
+pub(crate) trait IndexValue: Sized {
+    fn encode(&self) -> Result<Vec<u8>>;
+    fn decode(bytes: &[u8]) -> Result<Self>;
+}
+
+impl IndexValue for RowLocation {
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(LOCATION_LEN);
+        bytes.extend_from_slice(&self.file_id.to_le_bytes());
+        bytes.extend_from_slice(&self.page_num.to_le_bytes());
+        bytes.extend_from_slice(&self.slot_num.to_le_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != LOCATION_LEN {
+            return Err(corrupt("index leaf value is not a row location"));
+        }
+        Ok(RowLocation {
+            file_id: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
+            page_num: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
+            slot_num: u16::from_le_bytes(bytes[8..10].try_into().expect("2 bytes")),
+        })
+    }
+}
+
+impl IndexValue for Key {
+    fn encode(&self) -> Result<Vec<u8>> {
+        encode_key(self)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        decode_key(bytes)
+    }
+}
+
+/// A B+-tree over one index file, generic over its leaf value type `V`. Reads
+/// need only the buffer pool; mutations also log redo through the WAL under the
+/// statement's `txn_id`.
+pub(crate) struct BTree<'a, V> {
     buffer: &'a dyn BufferPool,
     wal: &'a dyn WalManager,
     file_id: FileId,
+    _value: PhantomData<fn() -> V>,
 }
 
 enum InsertOutcome {
@@ -40,7 +83,7 @@ enum InsertOutcome {
     },
 }
 
-impl<'a> BTree<'a> {
+impl<'a, V: IndexValue> BTree<'a, V> {
     pub(crate) fn new(
         buffer: &'a dyn BufferPool,
         wal: &'a dyn WalManager,
@@ -50,6 +93,7 @@ impl<'a> BTree<'a> {
             buffer,
             wal,
             file_id,
+            _value: PhantomData,
         }
     }
 
@@ -69,14 +113,14 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    pub(crate) fn search(&self, key: &Key) -> Result<Option<RowLocation>> {
+    pub(crate) fn search(&self, key: &Key) -> Result<Option<V>> {
         let mut page_num = self.root()?;
         loop {
             let guard = self.buffer.read_page(self.file_id, page_num)?;
             let data = guard.data();
             if index_page::is_leaf(data) {
                 return match self.find_in_node(data, key)? {
-                    Some(pos) => Ok(Some(decode_location(index_page::entry_value(data, pos))?)),
+                    Some(pos) => Ok(Some(V::decode(index_page::entry_value(data, pos))?)),
                     None => Ok(None),
                 };
             }
@@ -84,11 +128,11 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Insert `key -> location`. Returns `false` (and changes nothing) if the key
+    /// Insert `key -> value`. Returns `false` (and changes nothing) if the key
     /// already exists.
-    pub(crate) fn insert(&self, txn_id: u64, key: &Key, location: RowLocation) -> Result<bool> {
+    pub(crate) fn insert(&self, txn_id: u64, key: &Key, value: &V) -> Result<bool> {
         let key_bytes = encode_key(key)?;
-        let value = encode_location(location);
+        let value = value.encode()?;
         let root = self.root()?;
         match self.insert_rec(txn_id, root, key, &key_bytes, &value)? {
             InsertOutcome::Inserted => Ok(true),
@@ -135,8 +179,10 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Update the location stored for `key` in place. Returns `false` if absent.
-    pub(crate) fn update(&self, txn_id: u64, key: &Key, location: RowLocation) -> Result<bool> {
+    /// Update the value stored for `key` in place. Returns `false` if absent. The
+    /// new value must encode to the same length as the old one (true for the
+    /// fixed-width `RowLocation` of the primary-key index).
+    pub(crate) fn update(&self, txn_id: u64, key: &Key, value: &V) -> Result<bool> {
         let mut page_num = self.root()?;
         loop {
             if self.node_is_leaf(page_num)? {
@@ -144,7 +190,7 @@ impl<'a> BTree<'a> {
                 let Some(pos) = self.find_in_node(guard.data(), key)? else {
                     return Ok(false);
                 };
-                index_page::set_value(guard.data_mut(), pos, &encode_location(location))?;
+                index_page::set_value(guard.data_mut(), pos, &value.encode()?)?;
                 self.log_full_page(txn_id, &mut guard)?;
                 return Ok(true);
             }
@@ -153,20 +199,30 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Collect `(key, location)` for every entry within `range`, in key order.
-    pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, RowLocation)>> {
+    /// Collect `(key, value)` for every entry within `range`, in key order.
+    ///
+    /// Comparison uses only the leading components of each key that the range's
+    /// bounds constrain (their length). For the primary-key index the bounds are
+    /// full keys, so this is an exact-key range. For a secondary index the bounds
+    /// constrain the indexed columns while each stored key is `[indexed.., pk]`,
+    /// so the trailing primary key is ignored — an equality bound matches every
+    /// row sharing the indexed value. Entries are returned with their full key.
+    pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, V)>> {
+        let prefix_len = comparison_prefix_len(range);
         let mut page_num = self.start_leaf(range)?;
         let mut out = Vec::new();
         loop {
             let guard = self.buffer.read_page(self.file_id, page_num)?;
             let data = guard.data();
             for pos in 0..index_page::entry_count(data) {
-                let key = decode_key(index_page::entry_key(data, pos))?;
-                if beyond_end(&key, range) {
+                let full = decode_key(index_page::entry_key(data, pos))?;
+                let probe = prefix_of(&full, prefix_len);
+                let compared = probe.as_ref().unwrap_or(&full);
+                if beyond_end(compared, range) {
                     return Ok(out);
                 }
-                if key_in_range(&key, range) {
-                    out.push((key, decode_location(index_page::entry_value(data, pos))?));
+                if key_in_range(compared, range) {
+                    out.push((full, V::decode(index_page::entry_value(data, pos))?));
                 }
             }
             let next = index_page::link(data);
@@ -419,25 +475,6 @@ fn split_point(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
     mid.clamp(1, entries.len() - 1)
 }
 
-fn encode_location(location: RowLocation) -> [u8; LOCATION_LEN] {
-    let mut bytes = [0u8; LOCATION_LEN];
-    bytes[0..4].copy_from_slice(&location.file_id.to_le_bytes());
-    bytes[4..8].copy_from_slice(&location.page_num.to_le_bytes());
-    bytes[8..10].copy_from_slice(&location.slot_num.to_le_bytes());
-    bytes
-}
-
-fn decode_location(bytes: &[u8]) -> Result<RowLocation> {
-    if bytes.len() != LOCATION_LEN {
-        return Err(corrupt("index leaf value is not a row location"));
-    }
-    Ok(RowLocation {
-        file_id: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
-        page_num: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
-        slot_num: u16::from_le_bytes(bytes[8..10].try_into().expect("2 bytes")),
-    })
-}
-
 fn encode_child(page: PageNum) -> [u8; CHILD_LEN] {
     page.to_le_bytes()
 }
@@ -458,6 +495,27 @@ fn range_start_key(range: &KeyRange) -> Option<Key> {
             Bound::Unbounded => None,
         },
     }
+}
+
+/// How many leading key components the range's bounds constrain. The bound keys
+/// hold exactly the constrained columns, so their length is the comparison
+/// prefix. An unbounded range constrains nothing.
+fn comparison_prefix_len(range: &KeyRange) -> usize {
+    let bound_len = |bound: &Bound<Key>| match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key.0.len()),
+        Bound::Unbounded => None,
+    };
+    match range {
+        KeyRange::All => 0,
+        KeyRange::Exact(key) => key.0.len(),
+        KeyRange::Range { start, end } => bound_len(start).or_else(|| bound_len(end)).unwrap_or(0),
+    }
+}
+
+/// The first `len` components of `key`, or `None` when `len` already covers the
+/// whole key so the caller can compare it directly without allocating.
+fn prefix_of(key: &Key, len: usize) -> Option<Key> {
+    (len < key.0.len()).then(|| Key(key.0[..len].to_vec()))
 }
 
 fn key_in_range(key: &Key, range: &KeyRange) -> bool {
@@ -510,6 +568,7 @@ mod tests {
     use crate::engine::RowLocation;
 
     const INDEX_FILE: FileId = 0x8000_0001;
+    const SECONDARY_FILE: FileId = 0xC000_0001;
 
     struct Fixture {
         buffer: Arc<MemoryBufferPool>,
@@ -532,8 +591,12 @@ mod tests {
             }
         }
 
-        fn tree(&self) -> BTree<'_> {
+        fn tree(&self) -> BTree<'_, RowLocation> {
             BTree::new(self.buffer.as_ref(), self.wal.as_ref(), INDEX_FILE)
+        }
+
+        fn secondary_tree(&self) -> BTree<'_, Key> {
+            BTree::new(self.buffer.as_ref(), self.wal.as_ref(), SECONDARY_FILE)
         }
     }
 
@@ -562,7 +625,7 @@ mod tests {
         let tree = fixture.tree();
         tree.create(1).unwrap();
 
-        assert!(tree.insert(1, &key(5), location(0, 2)).unwrap());
+        assert!(tree.insert(1, &key(5), &location(0, 2)).unwrap());
         assert_eq!(tree.search(&key(5)).unwrap(), Some(location(0, 2)));
         assert_eq!(tree.search(&key(6)).unwrap(), None);
     }
@@ -572,8 +635,8 @@ mod tests {
         let fixture = Fixture::new(64);
         let tree = fixture.tree();
         tree.create(1).unwrap();
-        assert!(tree.insert(1, &key(1), location(0, 0)).unwrap());
-        assert!(!tree.insert(1, &key(1), location(0, 9)).unwrap());
+        assert!(tree.insert(1, &key(1), &location(0, 0)).unwrap());
+        assert!(!tree.insert(1, &key(1), &location(0, 9)).unwrap());
         assert_eq!(tree.search(&key(1)).unwrap(), Some(location(0, 0)));
     }
 
@@ -582,11 +645,11 @@ mod tests {
         let fixture = Fixture::new(64);
         let tree = fixture.tree();
         tree.create(1).unwrap();
-        tree.insert(1, &key(1), location(0, 0)).unwrap();
+        tree.insert(1, &key(1), &location(0, 0)).unwrap();
 
-        assert!(tree.update(1, &key(1), location(3, 7)).unwrap());
+        assert!(tree.update(1, &key(1), &location(3, 7)).unwrap());
         assert_eq!(tree.search(&key(1)).unwrap(), Some(location(3, 7)));
-        assert!(!tree.update(1, &key(2), location(0, 0)).unwrap());
+        assert!(!tree.update(1, &key(2), &location(0, 0)).unwrap());
     }
 
     #[test]
@@ -594,7 +657,7 @@ mod tests {
         let fixture = Fixture::new(64);
         let tree = fixture.tree();
         tree.create(1).unwrap();
-        tree.insert(1, &key(1), location(0, 0)).unwrap();
+        tree.insert(1, &key(1), &location(0, 0)).unwrap();
 
         assert!(tree.remove(1, &key(1)).unwrap());
         assert_eq!(tree.search(&key(1)).unwrap(), None);
@@ -611,7 +674,7 @@ mod tests {
         let n = 500i64;
         for value in 0..n {
             assert!(
-                tree.insert(1, &key(value), location(value as u32, 0))
+                tree.insert(1, &key(value), &location(value as u32, 0))
                     .unwrap()
             );
         }
@@ -631,7 +694,7 @@ mod tests {
         let tree = fixture.tree();
         tree.create(1).unwrap();
         for value in (0..200i64).rev() {
-            tree.insert(1, &key(value), location(value as u32, 0))
+            tree.insert(1, &key(value), &location(value as u32, 0))
                 .unwrap();
         }
 
@@ -656,7 +719,7 @@ mod tests {
         let tree = fixture.tree();
         tree.create(1).unwrap();
         for value in 0..300i64 {
-            tree.insert(1, &key(value), location(value as u32, 0))
+            tree.insert(1, &key(value), &location(value as u32, 0))
                 .unwrap();
         }
         for value in (0..300i64).step_by(2) {
@@ -667,7 +730,7 @@ mod tests {
             assert_eq!(tree.search(&key(value)).unwrap(), expected);
         }
         // A removed key can be reinserted.
-        assert!(tree.insert(1, &key(0), location(99, 1)).unwrap());
+        assert!(tree.insert(1, &key(0), &location(99, 1)).unwrap());
         assert_eq!(tree.search(&key(0)).unwrap(), Some(location(99, 1)));
     }
 
@@ -684,7 +747,7 @@ mod tests {
             |value: i64| Key(vec![Value::Text(format!("{value:04}{}", "x".repeat(2600)))]);
         for value in 0..6i64 {
             assert!(
-                tree.insert(1, &text_key(value), location(value as u32, 0))
+                tree.insert(1, &text_key(value), &location(value as u32, 0))
                     .unwrap(),
                 "insert of large key {value} failed"
             );
@@ -702,5 +765,95 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert_eq!(ordered, (0..6i64).map(text_key).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn stores_primary_key_values_for_a_secondary_index() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.secondary_tree();
+        tree.create(1).unwrap();
+
+        // Secondary-index shape: key = [indexed_value, pk], value = pk. The same
+        // indexed value (10) appears twice, distinguished by the trailing pk.
+        let entry = |indexed: i64, pk: i64| {
+            (
+                Key(vec![Value::Integer(indexed), Value::Integer(pk)]),
+                Key(vec![Value::Integer(pk)]),
+            )
+        };
+        for (indexed, pk) in [(20, 3), (10, 1), (10, 2)] {
+            let (composite, primary) = entry(indexed, pk);
+            assert!(tree.insert(1, &composite, &primary).unwrap());
+        }
+
+        let (composite, primary) = entry(10, 1);
+        assert_eq!(tree.search(&composite).unwrap(), Some(primary));
+
+        // Range order follows the composite key, so pks come back 1, 2, 3.
+        let pks: Vec<_> = tree
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, pk)| pk)
+            .collect();
+        assert_eq!(
+            pks,
+            vec![
+                Key(vec![Value::Integer(1)]),
+                Key(vec![Value::Integer(2)]),
+                Key(vec![Value::Integer(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn range_matches_indexed_prefix_ignoring_trailing_primary_key() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.secondary_tree();
+        tree.create(1).unwrap();
+
+        for (indexed, pk) in [(10, 1), (10, 5), (20, 2), (30, 3)] {
+            tree.insert(
+                1,
+                &Key(vec![Value::Integer(indexed), Value::Integer(pk)]),
+                &Key(vec![Value::Integer(pk)]),
+            )
+            .unwrap();
+        }
+        let pks = |entries: Vec<(Key, Key)>| -> Vec<i64> {
+            entries
+                .into_iter()
+                .map(|(_, pk)| match pk.0[0] {
+                    Value::Integer(value) => value,
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+
+        // Equality on the indexed value returns every row sharing it (both pks),
+        // though the stored keys differ in their trailing pk.
+        let eq = tree
+            .range(&KeyRange::Exact(Key(vec![Value::Integer(10)])))
+            .unwrap();
+        assert_eq!(pks(eq), vec![1, 5]);
+
+        // An inclusive upper bound on the indexed value still includes its rows,
+        // which a naive full-key compare would wrongly drop (since [20, pk] > [20]).
+        let inclusive = tree
+            .range(&KeyRange::Range {
+                start: Bound::Included(Key(vec![Value::Integer(20)])),
+                end: Bound::Included(Key(vec![Value::Integer(20)])),
+            })
+            .unwrap();
+        assert_eq!(pks(inclusive), vec![2]);
+
+        // A half-open range over the indexed value.
+        let bounded = tree
+            .range(&KeyRange::Range {
+                start: Bound::Included(Key(vec![Value::Integer(10)])),
+                end: Bound::Excluded(Key(vec![Value::Integer(30)])),
+            })
+            .unwrap();
+        assert_eq!(pks(bounded), vec![1, 5, 2]);
     }
 }

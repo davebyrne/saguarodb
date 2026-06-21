@@ -6,16 +6,34 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use buffer::{PAGE_SIZE, PageData, PageLoader, PageStore};
-use common::{DbError, FileId, PageNum, Result, TableId};
+use common::{DbError, FileId, IndexId, PageNum, Result, TableId};
 
 /// File-id high bit marking a table's primary-key index file. A table's heap file
 /// id is its table id; its index file id is the table id with this bit set, so a
 /// single page store serves both without collision (v1 table ids are small).
 pub(crate) const INDEX_FILE_BIT: FileId = 0x8000_0000;
 
-/// The index file id for a table (distinct from its heap file id).
+/// File-id high *two* bits marking a secondary-index file. Distinct from the
+/// primary-key index tag (top bit only): a secondary file id is `index_id` with
+/// both bits set, so heaps (no high bit), primary-key indexes (top bit), and
+/// secondary indexes (top two bits) never collide while table and index ids stay
+/// under `0x4000_0000` (always true in v1).
+pub(crate) const SECONDARY_INDEX_BITS: FileId = 0xC000_0000;
+
+/// The primary-key index file id for a table (distinct from its heap file id).
 pub(crate) fn index_file_id(table: TableId) -> FileId {
     table | INDEX_FILE_BIT
+}
+
+/// The file id for a secondary index, tagged so it shares the page store with
+/// heaps and primary-key indexes without collision.
+pub(crate) fn secondary_index_file_id(index: IndexId) -> FileId {
+    debug_assert_eq!(
+        index & SECONDARY_INDEX_BITS,
+        0,
+        "secondary index id {index} does not fit in 30 bits"
+    );
+    index | SECONDARY_INDEX_BITS
 }
 
 /// Mutable page home backed by one file per table: the heap at `<dir>/<id>.heap`
@@ -43,7 +61,10 @@ impl HeapPageStore {
     }
 
     fn path(&self, file_id: FileId) -> PathBuf {
-        if file_id & INDEX_FILE_BIT != 0 {
+        if file_id & SECONDARY_INDEX_BITS == SECONDARY_INDEX_BITS {
+            self.dir
+                .join(format!("{}.sidx", file_id & !SECONDARY_INDEX_BITS))
+        } else if file_id & INDEX_FILE_BIT != 0 {
             self.dir.join(format!("{}.idx", file_id & !INDEX_FILE_BIT))
         } else {
             self.dir.join(format!("{file_id}.heap"))
@@ -227,5 +248,28 @@ mod tests {
         assert_eq!(store.load_page(index, 0).unwrap(), Some(page(0x22)));
         assert!(dir.path().join("5.heap").exists());
         assert!(dir.path().join("5.idx").exists());
+    }
+
+    #[test]
+    fn heap_primary_and_secondary_index_files_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HeapPageStore::open(dir.path()).unwrap();
+        // Same numeric id, three namespaces: heap 5, primary-key index 5,
+        // secondary index 5 must all be distinct files.
+        let primary = super::index_file_id(5);
+        let secondary = super::secondary_index_file_id(5);
+        assert_ne!(primary, secondary);
+
+        store.write_page(5, 0, &page(0x11)).unwrap();
+        store.write_page(primary, 0, &page(0x22)).unwrap();
+        store.write_page(secondary, 0, &page(0x33)).unwrap();
+        store.sync_all().unwrap();
+
+        assert_eq!(store.load_page(5, 0).unwrap(), Some(page(0x11)));
+        assert_eq!(store.load_page(primary, 0).unwrap(), Some(page(0x22)));
+        assert_eq!(store.load_page(secondary, 0).unwrap(), Some(page(0x33)));
+        assert!(dir.path().join("5.heap").exists());
+        assert!(dir.path().join("5.idx").exists());
+        assert!(dir.path().join("5.sidx").exists());
     }
 }

@@ -1,7 +1,7 @@
 use catalog::{CatalogManager, MemoryCatalog};
 use common::{
-    ColumnInfo, DataType, DbError, Key, KeyRange, ParsedColumnDef, Result, Row, RowId, SqlState,
-    StatementContext, StoredRow, TableId, TableSchema, Value,
+    ColumnInfo, DataType, DbError, IndexId, IndexSchema, Key, KeyRange, ParsedColumnDef, Result,
+    Row, RowId, SqlState, StatementContext, StoredRow, TableId, TableSchema, Value,
 };
 use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
 use std::collections::BTreeMap;
@@ -108,6 +108,7 @@ pub struct MemoryStorage {
 #[derive(Default)]
 struct MemoryStorageState {
     schemas: BTreeMap<TableId, TableSchema>,
+    indexes: BTreeMap<IndexId, IndexSchema>,
     rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
     savepoints: BTreeMap<u64, MemoryStorageSnapshot>,
 }
@@ -115,6 +116,7 @@ struct MemoryStorageState {
 #[derive(Clone)]
 struct MemoryStorageSnapshot {
     schemas: BTreeMap<TableId, TableSchema>,
+    indexes: BTreeMap<IndexId, IndexSchema>,
     rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
 }
 
@@ -253,6 +255,61 @@ impl StorageEngine for MemoryStorage {
         }))
     }
 
+    fn index_scan(
+        &self,
+        _ctx: &StatementContext,
+        table: TableId,
+        index: IndexId,
+        range: &KeyRange,
+    ) -> Result<Box<dyn RowIterator>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        let schema = state
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(table))?;
+        let index_schema = state
+            .indexes
+            .get(&index)
+            .filter(|index| index.table == table)
+            .cloned()
+            .ok_or_else(|| undefined_index(index))?;
+
+        // The mock holds rows directly, so it keys on the indexed columns alone
+        // (no trailing primary key) and orders by (indexed values, primary key).
+        let mut matched: Vec<(Key, Key, Row)> = Vec::new();
+        if let Some(rows) = state.rows.get(&table) {
+            for (pk, row) in rows {
+                let indexed = index_key(&schema, &index_schema, row)?;
+                if key_in_range(&indexed, range) {
+                    matched.push((indexed, pk.clone(), row.clone()));
+                }
+            }
+        }
+        matched.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let rows = matched
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, pk, row))| StoredRow {
+                row_id: row_id_for_len(index).unwrap_or(RowId {
+                    page_num: u32::MAX,
+                    slot_num: u16::MAX,
+                }),
+                key: pk,
+                row,
+            })
+            .collect();
+        Ok(Box::new(MemoryRowIterator {
+            schema: column_info(&schema),
+            rows,
+            index: 0,
+        }))
+    }
+
     fn rollback_txn(&self, txn_id: u64) -> Result<()> {
         let mut state = self
             .state
@@ -260,6 +317,7 @@ impl StorageEngine for MemoryStorage {
             .map_err(|_| DbError::internal("storage lock poisoned"))?;
         if let Some(snapshot) = state.savepoints.remove(&txn_id) {
             state.schemas = snapshot.schemas;
+            state.indexes = snapshot.indexes;
             state.rows = snapshot.rows;
         }
         Ok(())
@@ -294,7 +352,28 @@ impl SchemaOperations for MemoryStorage {
             .map_err(|_| DbError::internal("storage lock poisoned"))?;
         begin_txn(&mut state, ctx.txn_id);
         state.schemas.remove(&table);
+        state.indexes.retain(|_, index| index.table != table);
         state.rows.remove(&table);
+        Ok(())
+    }
+
+    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        state.indexes.insert(schema.id, schema.clone());
+        Ok(())
+    }
+
+    fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        state.indexes.remove(&index);
         Ok(())
     }
 }
@@ -307,6 +386,7 @@ fn begin_txn(state: &mut MemoryStorageState, txn_id: u64) {
         txn_id,
         MemoryStorageSnapshot {
             schemas: state.schemas.clone(),
+            indexes: state.indexes.clone(),
             rows: state.rows.clone(),
         },
     );
@@ -426,4 +506,29 @@ fn undefined_table(table: TableId) -> DbError {
         SqlState::UndefinedTable,
         format!("table id {table} does not exist"),
     )
+}
+
+fn undefined_index(index: IndexId) -> DbError {
+    DbError::storage(
+        SqlState::UndefinedTable,
+        format!("index id {index} does not exist"),
+    )
+}
+
+fn index_key(schema: &TableSchema, index: &IndexSchema, row: &Row) -> Result<Key> {
+    let mut values = Vec::with_capacity(index.columns.len());
+    for column_id in &index.columns {
+        let slot = schema
+            .columns
+            .iter()
+            .position(|column| column.id == *column_id)
+            .ok_or_else(|| DbError::internal("index column is missing from table"))?;
+        let value = row
+            .values
+            .get(slot)
+            .cloned()
+            .ok_or_else(|| DbError::internal("row is missing an index column"))?;
+        values.push(value);
+    }
+    Ok(Key(values))
 }

@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`storage` owns table files, row serialization, page-backed row storage, the durable on-disk primary-key B-tree index, normal data operations, schema file operations, and recovery apply operations.
+`storage` owns table files, row serialization, page-backed row storage, the durable on-disk primary-key and secondary B-tree indexes, normal data operations, schema file operations, and recovery apply operations.
 
 ## Depends On
 
@@ -30,6 +30,7 @@ pub trait StorageEngine: Send + Sync {
     fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool>;
     fn scan(&self, ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>>;
     fn scan_range(&self, ctx: &StatementContext, table: TableId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
+    fn index_scan(&self, ctx: &StatementContext, table: TableId, index: IndexId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
     fn rollback_txn(&self, txn_id: u64) -> Result<()>;
     fn commit_txn(&self, txn_id: u64) -> Result<()>;
 }
@@ -37,6 +38,8 @@ pub trait StorageEngine: Send + Sync {
 pub trait SchemaOperations: Send + Sync {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
+    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()>;
+    fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
@@ -51,12 +54,11 @@ pub trait RecoveryOperations: Send + Sync {
 
 Each table is page-backed. Full rows live in heap pages; a durable, non-clustered B-tree maps each primary key to its `RowLocation`, stored in a separate index file per table (see Primary-Key Index). The clustered on-disk B-tree (rows in the leaves, no separate heap) remains future work behind the existing storage traits.
 
-V1 only supports the primary-key index:
-
-- `insert` inserts by primary key (heap row plus B-tree entry).
+- `insert` inserts by primary key (heap row plus B-tree entry) and adds an entry to every secondary index on the table.
 - `get` does a primary-key lookup through the B-tree.
-- `scan` / `scan_range` walk the B-tree leaves in key order and read rows from their heap locations.
-- Secondary indexes are future work.
+- `scan` / `scan_range` walk the primary-key B-tree leaves in key order and read rows from their heap locations.
+- `index_scan` walks a secondary index for the matching primary keys, then resolves each through the primary-key index to its heap row (see Secondary Indexes).
+- `delete` / `update` keep every secondary index in sync with the heap.
 
 ## Page Format
 
@@ -130,13 +132,58 @@ in-memory directory.
 - **Keys.** Keys are stored in a self-describing byte form and ordered by decoding
   to `Key` and comparing with `Ord`, matching the previous in-memory ordering.
 
+The B-tree is generic over its leaf value type: the primary-key index stores a
+fixed-width `RowLocation`, and a secondary index stores the row's primary `Key`
+(see Secondary Indexes). Internally the tree treats values as opaque bytes.
+
+## Secondary Indexes
+
+A table may have any number of secondary indexes. Each is its own durable B-tree
+in its own file, tagged with the top two file-id bits (distinct from the heap and
+the primary-key index) and written to `<data>/heap/<index_id>.sidx`. Index ids
+are a separate id space from table ids; the reserved primary-key index id is never
+used for a secondary index.
+
+- **Entry layout.** A secondary index stores `indexed_columns -> primary_key`,
+  not `-> RowLocation`. Because the primary key is immutable and never moves, a
+  row relocation (every `update`) touches only the primary-key index; a secondary
+  index changes only when one of its indexed columns changes. Reads therefore go
+  secondary index → primary key → primary-key index → `RowLocation` → heap.
+- **Key shape.** A non-unique index keys on `[indexed.. , primary_key]`, so every
+  entry is distinct. A unique index keys on `[indexed..]` alone, so the tree
+  rejects a duplicate indexed value with `SqlState::UniqueViolation` — except when
+  an indexed value is NULL, where the primary key is appended too, so NULLs stay
+  distinct (SQL treats NULLs as unequal). The leaf value is the encoded primary
+  key in all cases.
+- **Lookup / range.** `index_scan(table, index, range)` constrains the leading
+  indexed columns; the range bounds hold exactly those columns, and comparison
+  ignores each stored key's trailing primary key. An equality bound thus matches
+  every row sharing the indexed value, and an inclusive upper bound includes all
+  of its rows. Results are returned in index order, resolved to current heap rows.
+- **Maintenance.** `insert` adds an entry to every index; `delete` removes the
+  entry computed from the row being deleted; `update` removes the old entries and
+  inserts the new ones (all removals before any insertion, so an unchanged unique
+  value is not seen as a duplicate). A unique-index conflict during `insert` or
+  `update` returns `SqlState::UniqueViolation`.
+- **Create / drop.** `create_index` registers the index, builds an empty tree,
+  and backfills it by scanning the live rows through the primary-key index
+  (a duplicate value for a unique index fails the build with `UniqueViolation`).
+  `drop_index` marks the index dropped and leaves its pages in place (accepted
+  bloat, like `drop_table`). The engine learns a table's live indexes from the
+  installed index schemas (`install_index_schemas`) plus in-session creates.
+- **Crash safety.** Like the primary-key index, every secondary node mutation
+  logs a `FullPageImage` and stamps the page-LSN, so index pages recover through
+  the same redo path as the heap. Index *metadata* durability (which indexes
+  exist) is the catalog's responsibility (see `catalog.md`).
+
 ## Heap Page Store
 
 `HeapPageStore` is the mutable page home for in-place dirty-page flushing. It
 implements `buffer::PageStore` over one file per table: the heap at
-`<data>/heap/<file_id>.heap` and the primary-key index at `<data>/heap/<table>.idx`
-(index file ids carry a high bit), storing page `n` at byte offset `n * PAGE_SIZE`
-with positioned reads/writes. `load_page` returns a complete page or `None`
+`<data>/heap/<file_id>.heap`, the primary-key index at `<data>/heap/<table>.idx`
+(index file ids carry the high bit), and each secondary index at
+`<data>/heap/<index_id>.sidx` (file ids carry the top two bits), storing page `n`
+at byte offset `n * PAGE_SIZE` with positioned reads/writes. `load_page` returns a complete page or `None`
 (missing file or beyond-EOF / short tail); `write_page` writes in place without
 fsync; `sync_all` fsyncs all open files and the directory; `page_count` returns a
 file's on-disk extent in pages, used to seed page allocation after recovery.
@@ -154,7 +201,7 @@ Normal data operations append physiological redo records as they mutate pages, s
 
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - A row delete logs `HeapDelete { file_id, page_num, slot }` (or a `FullPageImage` on first touch). An update is a delete followed by an insert.
-- Each primary-key index node mutated during the operation logs a `FullPageImage` of that node (the index uses full-page-image redo throughout). `create_table` also initializes the index (metapage plus an empty root leaf), logged the same way.
+- Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` log `CreateTable` / `DropTable`.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
@@ -166,7 +213,7 @@ The storage engine can be initialized in recovery mode. In recovery mode:
 - Normal `StorageEngine` methods are not used.
 - Row recovery is physiological page redo: the server drives `apply_physical_redo` over committed records, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations`.
 - No WAL append occurs.
-- The primary-key index is durable on disk, so its pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild.
+- The primary-key and secondary indexes are durable on disk, so their pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild. Which indexes exist is reinstalled from the catalog at startup (`install_index_schemas`).
 
 Concrete page-backed storage exports:
 
@@ -184,11 +231,12 @@ impl PageBackedStorageEngine {
     ) -> Result<Self>;
 
     pub fn install_schemas(&self, schemas: Vec<TableSchema>) -> Result<()>;
+    pub fn install_index_schemas(&self, schemas: Vec<IndexSchema>) -> Result<()>;
     pub fn set_mode(&self, mode: StorageMode) -> Result<()>;
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` after loading the catalog snapshot.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables) and `install_index_schemas` (secondary indexes) after loading the catalog snapshot, so DML maintains the indexes.
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` for v1 so startup can call concrete recovery-mode methods and query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`.
 
@@ -201,8 +249,8 @@ impl PageBackedStorageEngine {
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
 - New pages allocated during a statement must be tracked by buffer rollback through `new_page(file, txn_id)`.
-- Index and heap page changes (including B-tree splits) are rolled back by the buffer pool's before-images and new-page tracking, so `rollback_txn(txn_id)` only restores table metadata.
-- `drop_table` records table metadata in storage rollback metadata before marking the table dropped. V1 does not physically delete heap or index pages; committed drops are reflected by omitting the table from later checkpoints.
+- Index and heap page changes (including B-tree splits) are rolled back by the buffer pool's before-images and new-page tracking, so `rollback_txn(txn_id)` only restores storage-owned table and index metadata.
+- `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. V1 does not physically delete heap or index pages; committed drops are reflected by omitting the table or index from later checkpoints.
 
 ## Error Handling
 
@@ -224,3 +272,9 @@ impl PageBackedStorageEngine {
 - A B-tree splits correctly under variable-length keys (byte-balanced) and stays searchable.
 - After a restart, inserting a row or growing the index never reuses an on-disk page.
 - Failed insert that allocated a new page rolls back newly allocated pages through buffer rollback.
+- Heap, primary-key index, and secondary index files for the same numeric id stay distinct.
+- A secondary B-tree stores primary keys and a prefix range matches the indexed columns regardless of the trailing primary key.
+- `create_index` backfills existing rows; `index_scan` returns them, and a non-unique index returns every row for a value.
+- Insert, update, and delete keep a secondary index in sync.
+- A unique index rejects a duplicate value on insert and on backfill, but allows multiple NULLs.
+- A dropped index is no longer maintained or scannable; a rolled-back create removes it.

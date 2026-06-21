@@ -1,6 +1,6 @@
 use common::{
-    ColumnInfo, Key, KeyRange, Result, Row, RowId, StatementContext, StoredRow, TableId,
-    TableSchema,
+    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, StatementContext,
+    StoredRow, TableId, TableSchema,
 };
 
 pub trait RowIterator: Send {
@@ -20,6 +20,16 @@ pub trait StorageEngine: Send + Sync {
         table: TableId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>>;
+    /// Scan a table through one of its secondary indexes. `range` constrains the
+    /// indexed columns; rows are returned in index order, resolved to the heap
+    /// via each entry's primary key.
+    fn index_scan(
+        &self,
+        ctx: &StatementContext,
+        table: TableId,
+        index: IndexId,
+        range: &KeyRange,
+    ) -> Result<Box<dyn RowIterator>>;
     fn rollback_txn(&self, txn_id: u64) -> Result<()>;
     fn commit_txn(&self, txn_id: u64) -> Result<()>;
 }
@@ -27,6 +37,8 @@ pub trait StorageEngine: Send + Sync {
 pub trait SchemaOperations: Send + Sync {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
+    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()>;
+    fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
