@@ -170,6 +170,48 @@ mod tests {
             parse("explain select * from users").unwrap(),
             Statement::Explain(_)
         ));
+        assert!(matches!(
+            parse("drop index users_name").unwrap(),
+            Statement::DropIndex { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_create_index_forms() {
+        assert_eq!(
+            parse("create index users_name on users (name)").unwrap(),
+            Statement::CreateIndex {
+                name: "users_name".to_string(),
+                table: "users".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+            }
+        );
+        assert_eq!(
+            parse("create unique index uq on users (tenant, name)").unwrap(),
+            Statement::CreateIndex {
+                name: "uq".to_string(),
+                table: "users".to_string(),
+                columns: vec!["tenant".to_string(), "name".to_string()],
+                unique: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_create_index_forms() {
+        // Each form exercises a distinct v1 rejection guard.
+        for sql in [
+            "create index i on users (name) where id > 0", // partial predicate
+            "create index i on users (lower(name))",       // expression column
+            "create index i on users (name desc)",         // descending column
+            "create index i on users using btree (name)",  // index method
+            "create index concurrently i on users (name)", // concurrently
+            "create index if not exists i on users (name)", // if not exists
+            "create index on users (name)",                // missing index name
+        ] {
+            assert!(parse(sql).is_err(), "expected `{sql}` to be rejected");
+        }
     }
 
     #[test]

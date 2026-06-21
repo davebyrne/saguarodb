@@ -25,6 +25,8 @@ pub fn parse(sql: &str) -> Result<Statement>;
 pub enum Statement {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { name: String },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { name: String },
     Insert { table: String, columns: Vec<String>, source: InsertSource },
     Select(SelectStatement),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
@@ -153,6 +155,8 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 
 - `CREATE TABLE` with column definitions and primary key. V1 parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys in v1.
 - `DROP TABLE`.
+- `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (v1 does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
+- `DROP INDEX name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `SELECT` with projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - `UPDATE ... SET ... WHERE`.

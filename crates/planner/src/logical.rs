@@ -1,4 +1,4 @@
-use common::{ColumnId, ColumnInfo, DataType, DbError, ParsedColumnDef, Result, TableId};
+use common::{ColumnId, ColumnInfo, DataType, DbError, IndexId, ParsedColumnDef, Result, TableId};
 
 use crate::{
     AggregateExpr, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem, BoundSelect,
@@ -14,6 +14,15 @@ pub enum LogicalPlan {
     },
     DropTable {
         table: TableId,
+    },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
+    DropIndex {
+        index: IndexId,
     },
     Insert {
         table: TableId,
@@ -81,6 +90,18 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             primary_key: primary_key.clone(),
         }),
         BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
+        BoundStatement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => Ok(LogicalPlan::CreateIndex {
+            name: name.clone(),
+            table: table.clone(),
+            columns: columns.clone(),
+            unique: *unique,
+        }),
+        BoundStatement::DropIndex { index } => Ok(LogicalPlan::DropIndex { index: *index }),
         BoundStatement::Insert {
             table,
             columns,

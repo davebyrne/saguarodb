@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
 - Autocommit only (no multi-statement transactions)
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
+- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key access path only (full table scans otherwise)
 - WAL with crash recovery
@@ -456,7 +456,7 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Server `ReadyForQuery`: tag `Z`, length `5`, status byte `I`.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
-- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, or `EXPLAIN`.
+- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, or `EXPLAIN`.
 - Server `ErrorResponse`: tag `E`, fields `S` severity, `C` SQLSTATE, `M` message, then final `\0`.
 
 Type mapping uses PostgreSQL OIDs `INTEGER` as `INT8` (`20`, size `8`), `TEXT` (`25`, size `-1`), and `BOOLEAN` (`16`, size `1`). V1 rows are text format only: integers are decimal i64 strings, text is raw UTF-8, booleans are `t`/`f`, and null fields use length `-1`.
@@ -480,7 +480,7 @@ pub enum ExecutionResult {
         columns: Vec<ColumnInfo>,
         rows: Vec<Row>,
     },
-    /// DML or DDL result (INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
+    /// DML or DDL result (INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX)
     Modified { command: String, count: u64 },
     /// EXPLAIN result — the formatted plan without executing it
     Explanation { text: String },
@@ -508,6 +508,8 @@ The AST uses strings for identifiers — name resolution to IDs happens in the p
 pub enum Statement {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { name: String },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { name: String },
     Insert { table: String, columns: Vec<String>, source: InsertSource },
     Select(SelectStatement),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
@@ -652,6 +654,8 @@ The binder:
 pub enum BoundStatement {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource },
     Select(BoundSelect),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
@@ -820,6 +824,8 @@ pub enum LogicalPlan {
     // DDL — passes through to physical plan unchanged
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
 
     // DML
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan> },
@@ -878,6 +884,8 @@ pub enum PhysicalPlan {
     // DDL
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
 
     // DML
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan> },
@@ -1035,7 +1043,7 @@ V1 expression semantics:
 
 ### DDL and DML
 
-`INSERT`, `UPDATE`, and `DELETE` are handled directly by the executor (not through the iterator model), call into storage, and return the affected row count. `CREATE TABLE` and `DROP TABLE` also return `ExecutionResult::Modified`, using command names `CREATE TABLE` and `DROP TABLE` with `count = 0`.
+`INSERT`, `UPDATE`, and `DELETE` are handled directly by the executor (not through the iterator model), call into storage, and return the affected row count. `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` also return `ExecutionResult::Modified`, using command names `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` with `count = 0`.
 
 ## 7. Storage Engine
 
@@ -1332,7 +1340,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`) and the `Commit`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
 
 ### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1378,6 +1386,8 @@ This gives the invariants:
 |---|---|
 | `CreateTable` | serialized `TableSchema` (name, columns, primary key) |
 | `DropTable` | `TableId` |
+| `CreateIndex` | serialized `IndexSchema` (id, table, name, columns, unique) |
+| `DropIndex` | `IndexId` |
 | `Commit` | (empty — marks the transaction as committed) |
 | `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
@@ -1626,11 +1636,11 @@ Empty catalogs start with `next_table_id = 1`. `apply_create_table` and `apply_d
 
 ### Persistence
 
-The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Loaded into memory on startup. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE) are durable.
+The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Loaded into memory on startup. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE, CREATE/DROP INDEX) are durable.
 
 ### WAL Integration
 
-`CREATE TABLE` and `DROP TABLE` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable` records.
+`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex` records.
 
 ### Concurrency
 
@@ -1683,7 +1693,7 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 All concurrency is managed through the `ConcurrencyController` trait (defined in `common`):
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Multiple readers proceed concurrently.
-- **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`): server query orchestration parses SQL to classify the statement, calls `begin_write()`, receives a write guard, binds and plans, allocates the statement `txn_id`, then invokes `QueryEngine`. Blocks until all other guards are released. Writes are fully serialized.
+- **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): server query orchestration parses SQL to classify the statement, calls `begin_write()`, receives a write guard, binds and plans, allocates the statement `txn_id`, then invokes `QueryEngine`. Blocks until all other guards are released. Writes are fully serialized.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive write guard and `WalFlushPolicy` admits only committed pages, so uncommitted data never reaches the heap.
 
 **V1 implementation:** The concrete `ConcurrencyController` is an `RwLock`. `begin_read()` acquires a shared lock, `begin_write()` acquires an exclusive lock. This is the foundation for safe page mutation, DDL, concurrent scans, and redo-only recovery.

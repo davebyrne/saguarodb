@@ -18,6 +18,18 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
         PhysicalPlan::DropTable { table } => {
             output.push_str(&format!("{padding}DropTable table={table}\n"));
         }
+        PhysicalPlan::CreateIndex {
+            name,
+            table,
+            unique,
+            ..
+        } => {
+            let kind = if *unique { "Unique" } else { "" };
+            output.push_str(&format!("{padding}Create{kind}Index {name} on {table}\n"));
+        }
+        PhysicalPlan::DropIndex { index } => {
+            output.push_str(&format!("{padding}DropIndex index={index}\n"));
+        }
         PhysicalPlan::Insert { table, source, .. } => {
             output.push_str(&format!("{padding}Insert table={table}\n"));
             format_node(source, indent + 1, output);

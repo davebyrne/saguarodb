@@ -232,55 +232,32 @@ mod tests {
 
     #[test]
     fn recovery_replays_create_index_and_rebuilds_the_secondary_tree() {
-        use std::sync::atomic::Ordering;
-
         use common::{Key, KeyRange, StatementContext, Value};
-        use storage::{SchemaOperations, StorageEngine};
+        use storage::StorageEngine;
 
         let dir = tempfile::tempdir().unwrap();
         let table_id;
         let index_id;
         {
             let app = AppState::open_for_test(dir.path()).unwrap();
-            app.query_service
-                .execute_sql("create table users (id integer primary key, name text)")
-                .unwrap();
-            app.query_service
-                .execute_sql("insert into users (id, name) values (1, 'Ada')")
-                .unwrap();
-            app.query_service
-                .execute_sql("insert into users (id, name) values (2, 'Grace')")
-                .unwrap();
-
-            // CREATE INDEX has no SQL yet (next increment); drive it as a committed
-            // statement through the components, mirroring execute_write's durability
-            // sequence, and do NOT checkpoint so recovery must replay it.
-            let comps = &app.components;
-            let schema = comps
+            for sql in [
+                "create table users (id integer primary key, name text)",
+                "insert into users (id, name) values (1, 'Ada')",
+                "insert into users (id, name) values (2, 'Grace')",
+                "create index users_name on users (name)",
+            ] {
+                app.query_service.execute_sql(sql).unwrap();
+            }
+            // No checkpoint happened (few commits), so recovery must replay the
+            // CreateIndex record rather than load it from the snapshot.
+            let index = app
+                .components
                 .catalog
-                .create_index(
-                    "users_name".to_string(),
-                    "users",
-                    &["name".to_string()],
-                    false,
-                )
+                .get_index_by_name("users_name")
+                .unwrap()
                 .unwrap();
-            table_id = schema.table;
-            index_id = schema.id;
-            let txn_id = comps.next_txn_id.fetch_add(1, Ordering::AcqRel);
-            let ctx = StatementContext { txn_id };
-            comps.storage.create_index(&ctx, &schema).unwrap();
-            comps
-                .wal
-                .append(WalRecord {
-                    lsn: 0,
-                    txn_id,
-                    kind: WalRecordKind::Commit,
-                })
-                .unwrap();
-            comps.wal.flush().unwrap();
-            comps.storage.commit_txn(txn_id).unwrap();
-            comps.buffer_pool.commit(txn_id).unwrap();
+            table_id = index.table;
+            index_id = index.id;
         }
 
         // Reopen: recovery replays the CreateIndex record into both catalog and
@@ -295,6 +272,7 @@ mod tests {
                 .is_some()
         );
 
+        // Scan the rebuilt secondary tree directly to prove its pages recovered.
         let ctx = StatementContext { txn_id: 0 };
         let mut iter = comps
             .storage

@@ -59,6 +59,54 @@ async fn e2e_create_insert_select_update_delete_explain() {
 }
 
 #[tokio::test]
+async fn e2e_create_index_and_unique_constraint() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (2, 'Grace')")
+        .await
+        .unwrap();
+
+    // CREATE INDEX over the real wire protocol.
+    server
+        .simple_query("create index users_name on users (name)")
+        .await
+        .unwrap();
+
+    // Queries still return the right rows after the index is built.
+    let rows = server
+        .simple_query("select id from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // A unique index rejects a duplicate value through the protocol.
+    server
+        .simple_query("create unique index uq_name on users (name)")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("insert into users (id, name) values (3, 'Ada')")
+        .await
+        .err()
+        .expect("duplicate value should violate the unique index");
+    assert!(err.message.to_lowercase().contains("unique"));
+
+    // DROP INDEX over the protocol.
+    server.simple_query("drop index uq_name").await.unwrap();
+    server.simple_query("drop index users_name").await.unwrap();
+}
+
+#[tokio::test]
 async fn e2e_order_by_ordinal_sorts_by_output_column() {
     let server = TestServer::start().await.unwrap();
 

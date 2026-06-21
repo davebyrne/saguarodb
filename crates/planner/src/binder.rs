@@ -110,6 +110,21 @@ fn bind_inner(
             let table = require_table(catalog, name)?;
             Ok(BoundStatement::DropTable { table: table.id })
         }
+        Statement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => Ok(BoundStatement::CreateIndex {
+            name: name.clone(),
+            table: table.clone(),
+            columns: columns.clone(),
+            unique: *unique,
+        }),
+        Statement::DropIndex { name } => {
+            let index = require_index(catalog, name)?;
+            Ok(BoundStatement::DropIndex { index: index.id })
+        }
         Statement::Insert {
             table,
             columns,
@@ -1452,6 +1467,15 @@ fn require_table(catalog: &dyn CatalogManager, name: &str) -> Result<TableSchema
         plan_error(
             SqlState::UndefinedTable,
             format!("table {name} does not exist"),
+        )
+    })
+}
+
+fn require_index(catalog: &dyn CatalogManager, name: &str) -> Result<common::IndexSchema> {
+    catalog.get_index_by_name(name)?.ok_or_else(|| {
+        plan_error(
+            SqlState::UndefinedTable,
+            format!("index {name} does not exist"),
         )
     })
 }

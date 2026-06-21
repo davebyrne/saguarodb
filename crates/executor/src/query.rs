@@ -1,7 +1,7 @@
 use catalog::CatalogManager;
 use common::{
-    ColumnId, ColumnInfo, DataType, DbError, ExecRow, ParsedColumnDef, Result, Row, SqlState,
-    StatementContext, TableId, TableSchema, Value,
+    ColumnId, ColumnInfo, DataType, DbError, ExecRow, IndexId, ParsedColumnDef, Result, Row,
+    SqlState, StatementContext, TableId, TableSchema, Value,
 };
 use planner::PhysicalPlan;
 use storage::{SchemaOperations, StorageEngine};
@@ -52,6 +52,13 @@ impl QueryEngine {
                 primary_key,
             } => execute_create_table(ctx, name, columns, primary_key),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
+            PhysicalPlan::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            } => execute_create_index(ctx, name, table, columns, *unique),
+            PhysicalPlan::DropIndex { index } => execute_drop_index(ctx, *index),
             PhysicalPlan::Insert {
                 table,
                 columns,
@@ -166,6 +173,8 @@ pub(crate) fn build_executor<'a>(
         } => Ok(Box::new(ValuesOp::new(rows.clone(), output_schema.clone()))),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::CreateIndex { .. }
+        | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(DbError::internal(
@@ -319,6 +328,35 @@ fn execute_drop_table(ctx: &ExecutionContext<'_>, table: TableId) -> Result<Exec
     ctx.catalog.drop_table(table)?;
     Ok(ExecutionResult::Modified {
         command: "DROP TABLE".to_string(),
+        count: 0,
+    })
+}
+
+fn execute_create_index(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    table: &str,
+    columns: &[String],
+    unique: bool,
+) -> Result<ExecutionResult> {
+    let schema = ctx
+        .catalog
+        .create_index(name.to_string(), table, columns, unique)?;
+    if let Err(err) = ctx.schema_ops.create_index(&ctx.statement, &schema) {
+        let _ = ctx.catalog.drop_index(schema.id);
+        return Err(err);
+    }
+    Ok(ExecutionResult::Modified {
+        command: "CREATE INDEX".to_string(),
+        count: 0,
+    })
+}
+
+fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<ExecutionResult> {
+    ctx.schema_ops.drop_index(&ctx.statement, index)?;
+    ctx.catalog.drop_index(index)?;
+    Ok(ExecutionResult::Modified {
+        command: "DROP INDEX".to_string(),
         count: 0,
     })
 }

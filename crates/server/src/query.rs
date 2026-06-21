@@ -277,7 +277,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::Update { .. }
         | Statement::Delete { .. }
         | Statement::CreateTable { .. }
-        | Statement::DropTable { .. } => Ok(StatementClass::Write),
+        | Statement::DropTable { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::DropIndex { .. } => Ok(StatementClass::Write),
     }
 }
 
@@ -313,6 +315,132 @@ mod tests {
             .execute_sql("select id, name from users")
             .unwrap();
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_index_executes_and_query_still_returns_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "insert into users (id, name) values (1, 'Ada')",
+            "insert into users (id, name) values (2, 'Grace')",
+            "create index users_name on users (name)",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+
+        let result = app
+            .query_service
+            .execute_sql("select id from users where name = 'Ada'")
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn unique_index_rejects_duplicate_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create unique index users_name on users (name)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("insert into users (id, name) values (2, 'Ada')")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+
+        // The rejected insert left no trace.
+        let result = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_unique_index_on_duplicate_values_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "insert into users (id, name) values (1, 'Ada')",
+            "insert into users (id, name) values (2, 'Ada')",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+
+        let err = app
+            .query_service
+            .execute_sql("create unique index users_name on users (name)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+        // The rolled-back create left no index behind, so a non-unique one succeeds.
+        app.query_service
+            .execute_sql("create index users_name on users (name)")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_index_allows_recreate_and_rejects_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create index users_name on users (name)")
+            .unwrap();
+        app.query_service
+            .execute_sql("drop index users_name")
+            .unwrap();
+        // Recreating under the same name now succeeds.
+        app.query_service
+            .execute_sql("create index users_name on users (name)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("drop index missing")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[tokio::test]
+    async fn create_index_rejects_bad_table_column_and_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let missing_table = app
+            .query_service
+            .execute_sql("create index i on ghosts (name)")
+            .unwrap_err();
+        assert_eq!(missing_table.code, SqlState::UndefinedTable);
+
+        let missing_column = app
+            .query_service
+            .execute_sql("create index i on users (ghost)")
+            .unwrap_err();
+        assert_eq!(missing_column.code, SqlState::UndefinedColumn);
+
+        app.query_service
+            .execute_sql("create index dup on users (name)")
+            .unwrap();
+        let duplicate = app
+            .query_service
+            .execute_sql("create index dup on users (id)")
+            .unwrap_err();
+        assert_eq!(duplicate.code, SqlState::DuplicateTable);
     }
 
     #[tokio::test]

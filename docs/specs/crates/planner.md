@@ -70,6 +70,8 @@ Binder responsibilities:
 pub enum BoundStatement {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource },
     Select(BoundSelect),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
@@ -116,6 +118,8 @@ pub enum BoundFrom {
 ```
 
 `BoundSelect` is also used as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
+
+`CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
 `BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins and rejects `ON`/`USING`/`NATURAL` with `CROSS JOIN` in v1. The executor treats a cross join's `None` condition as `TRUE`.
 
@@ -299,6 +303,8 @@ Scalar functions remain `BoundExpr::Function`. Binder validates each call's arit
 pub enum LogicalPlan {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan> },
     Delete { table: TableId, source: Box<LogicalPlan> },
@@ -326,6 +332,8 @@ Logical plan contains no access method choices.
 pub enum PhysicalPlan {
     CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
     DropTable { table: TableId },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    DropIndex { index: IndexId },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan> },
     Delete { table: TableId, source: Box<PhysicalPlan> },

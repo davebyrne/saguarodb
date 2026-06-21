@@ -94,6 +94,8 @@ fn is_read_plan(plan: &PhysicalPlan) -> bool {
         plan,
         PhysicalPlan::CreateTable { .. }
             | PhysicalPlan::DropTable { .. }
+            | PhysicalPlan::CreateIndex { .. }
+            | PhysicalPlan::DropIndex { .. }
             | PhysicalPlan::Insert { .. }
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }

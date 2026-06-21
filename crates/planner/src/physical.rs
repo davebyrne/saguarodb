@@ -17,6 +17,15 @@ pub enum PhysicalPlan {
     DropTable {
         table: TableId,
     },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
+    DropIndex {
+        index: IndexId,
+    },
     Insert {
         table: TableId,
         columns: Vec<ColumnId>,
@@ -103,6 +112,18 @@ pub fn physical_plan(
             primary_key: primary_key.clone(),
         }),
         LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
+        LogicalPlan::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        } => Ok(PhysicalPlan::CreateIndex {
+            name: name.clone(),
+            table: table.clone(),
+            columns: columns.clone(),
+            unique: *unique,
+        }),
+        LogicalPlan::DropIndex { index } => Ok(PhysicalPlan::DropIndex { index: *index }),
         LogicalPlan::Insert {
             table,
             columns,

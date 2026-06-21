@@ -23,6 +23,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
 fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     match statement {
         sql::Statement::CreateTable(table) => convert_create_table(table),
+        sql::Statement::CreateIndex(index) => convert_create_index(index),
         sql::Statement::Drop {
             object_type,
             if_exists,
@@ -32,20 +33,15 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             purge,
             temporary,
         } => {
-            if object_type != sql::ObjectType::Table
-                || if_exists
-                || names.len() != 1
-                || cascade
-                || restrict
-                || purge
-                || temporary
-            {
-                return unsupported("unsupported DROP TABLE form");
+            if if_exists || names.len() != 1 || cascade || restrict || purge || temporary {
+                return unsupported("unsupported DROP form");
             }
-
-            Ok(Statement::DropTable {
-                name: object_name(&names.remove(0))?,
-            })
+            let name = object_name(&names.remove(0))?;
+            match object_type {
+                sql::ObjectType::Table => Ok(Statement::DropTable { name }),
+                sql::ObjectType::Index => Ok(Statement::DropIndex { name }),
+                _ => unsupported("unsupported DROP object type"),
+            }
         }
         sql::Statement::Insert(insert) => convert_insert(insert),
         sql::Statement::Query(query) => Ok(Statement::Select(convert_query_to_select(*query)?)),
@@ -103,6 +99,71 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             }
         }
         _ => unsupported("unsupported SQL statement"),
+    }
+}
+
+fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
+    let sql::CreateIndex {
+        name,
+        table_name,
+        using,
+        columns,
+        unique,
+        concurrently,
+        if_not_exists,
+        include,
+        nulls_distinct,
+        with,
+        predicate,
+    } = index;
+
+    if using.is_some()
+        || concurrently
+        || if_not_exists
+        || !include.is_empty()
+        || nulls_distinct.is_some()
+        || !with.is_empty()
+        || predicate.is_some()
+    {
+        return unsupported("unsupported CREATE INDEX form");
+    }
+
+    let name = match name {
+        Some(name) => object_name(&name)?,
+        None => return unsupported("CREATE INDEX requires an index name in v1"),
+    };
+    let table = object_name(&table_name)?;
+    let columns = columns
+        .iter()
+        .map(convert_index_column)
+        .collect::<Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return unsupported("CREATE INDEX requires at least one column");
+    }
+
+    Ok(Statement::CreateIndex {
+        name,
+        table,
+        columns,
+        unique,
+    })
+}
+
+fn convert_index_column(column: &sql::IndexColumn) -> Result<String> {
+    if column.operator_class.is_some() {
+        return unsupported("unsupported index column operator class");
+    }
+    let sql::OrderByExpr {
+        expr,
+        options,
+        with_fill,
+    } = &column.column;
+    if options.asc == Some(false) || options.nulls_first.is_some() || with_fill.is_some() {
+        return unsupported("v1 index columns must be plain ascending columns");
+    }
+    match expr {
+        sql::Expr::Identifier(ident) => ident_name(ident),
+        _ => unsupported("index columns must be simple column names in v1"),
     }
 }
 

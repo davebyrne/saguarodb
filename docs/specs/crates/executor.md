@@ -166,9 +166,25 @@ If a write errors after mutating pages or storage-owned metadata, executor/serve
 - `SchemaOperations::drop_table` appends the `DropTable` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "DROP TABLE", count: 0 }`.
 
+`CREATE INDEX`:
+
+- Server query orchestration acquires the write guard before execution.
+- Use `CatalogManager::create_index` to validate the table/columns/name and assign the `IndexId`.
+- Call `SchemaOperations::create_index` to build and backfill the secondary tree; on failure, roll back the catalog with `CatalogManager::drop_index` before returning the error (mirroring `CREATE TABLE`).
+- `SchemaOperations::create_index` appends the `CreateIndex` WAL operation record; server query orchestration appends the statement `Commit`.
+- Return `Modified { command: "CREATE INDEX", count: 0 }`.
+
+`DROP INDEX`:
+
+- Resolve the index to its `IndexId` in binder.
+- Call `SchemaOperations::drop_index`.
+- Call `CatalogManager::drop_index`.
+- `SchemaOperations::drop_index` appends the `DropIndex` WAL operation record; server query orchestration appends the statement `Commit`.
+- Return `Modified { command: "DROP INDEX", count: 0 }`.
+
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement, acquires `ConcurrencyController::begin_read` for SELECT and EXPLAIN or `begin_write` for INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, and checkpoint. SELECT runs bind, plan, and `QueryEngine::execute` while holding that guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. The guard lives for the full statement.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement, acquires `ConcurrencyController::begin_read` for SELECT and EXPLAIN or `begin_write` for INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, and checkpoint. SELECT runs bind, plan, and `QueryEngine::execute` while holding that guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. The guard lives for the full statement.
 
 ## Acceptance Tests
 

@@ -10,6 +10,15 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
+    DropIndex {
+        name: String,
+    },
     Insert {
         table: String,
         columns: Vec<String>,

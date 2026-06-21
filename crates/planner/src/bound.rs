@@ -1,4 +1,4 @@
-use common::{ColumnDef, ColumnId, ColumnInfo, ParsedColumnDef, TableId};
+use common::{ColumnDef, ColumnId, ColumnInfo, IndexId, ParsedColumnDef, TableId};
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
 
@@ -11,6 +11,15 @@ pub enum BoundStatement {
     },
     DropTable {
         table: TableId,
+    },
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
+    DropIndex {
+        index: IndexId,
     },
     Insert {
         table: TableId,
