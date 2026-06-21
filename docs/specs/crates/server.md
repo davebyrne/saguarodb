@@ -68,14 +68,13 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 6. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
 7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
 8. Call `storage.install_schemas(catalog.list_tables()?)`.
-9. Pre-load every heap page of each live table into the buffer pool.
-10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them); DDL records replay through `RecoveryOperations`.
-11. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small for the working set), then `storage.rebuild_directories()` to rebuild primary-key directories from the pages.
-12. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
-13. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and advance the redo boundary.
-14. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
-15. Construct query service from `components`.
-16. Start Tokio runtime and bind listener.
+9. Enable eviction-flush-on-steal (`buffer_pool.enable_stealing()`). The durable on-disk index means recovery rebuilds nothing in memory, so redo may spill and the recovery working set is not bounded by the pool size.
+10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them). Heap and primary-key-index pages replay the same way; DDL records replay through `RecoveryOperations`.
+11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+12. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
+13. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
+14. Construct query service from `components`.
+15. Start Tokio runtime and bind listener.
 
 Recovery mode must not append WAL records.
 
@@ -126,7 +125,7 @@ If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails be
 
 Checkpoint may run after successful writes according to configured thresholds. It is called after the statement write guard is released because `run_checkpoint` acquires its own write guard.
 
-`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>` in v1. Startup uses it for `install_schemas`, `rebuild_directories`, and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
+`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>` in v1. Startup uses it for `install_schemas` and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
 ## Query Results
 

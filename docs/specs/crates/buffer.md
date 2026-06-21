@@ -38,6 +38,7 @@ pub trait PageLoader: Send + Sync {
 pub trait PageStore: PageLoader {
     fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()>;
     fn sync_all(&self) -> Result<()>;
+    fn page_count(&self, file_id: FileId) -> Result<PageNum>;
 }
 
 pub trait BufferPool: Send + Sync {
@@ -55,17 +56,17 @@ pub trait BufferPool: Send + Sync {
 }
 ```
 
-`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it only after recovery completes.
+`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
 
-`MemoryBufferPool::new(frame_count, flush_policy, page_loader)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageLoader>`. `read_page` first checks resident frames; on a miss it calls `page_loader.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
+`MemoryBufferPool::new(frame_count, flush_policy, store)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageStore>`. `read_page` first checks resident frames; on a miss it calls `store.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
 
 In production, the server supplies a `HeapPageStore` (a `PageStore`) backed by per-table heap files. The `buffer` crate defines only the traits and does not depend on `storage` or `control`.
 
-`PageStore` extends `PageLoader` with `write_page` and `sync_all` for in-place dirty-page flushing. `storage::HeapPageStore` implements it over one file per table (`<data>/heap/<file_id>.heap`, page `n` at byte offset `n * PAGE_SIZE`, positioned I/O). `write_page` does not fsync; `sync_all` fsyncs all open heap files and the directory. It is the mutable page home for the redo-WAL/flushing model; the buffer pool and server adopt it as the backing store when that cutover lands.
+`PageStore` extends `PageLoader` with `write_page`, `sync_all`, and `page_count` for in-place dirty-page flushing. `storage::HeapPageStore` implements it over one file per table — the heap at `<data>/heap/<file_id>.heap` and the primary-key index at `<data>/heap/<table>.idx` (index file ids carry a high bit) — page `n` at byte offset `n * PAGE_SIZE`, positioned I/O. `write_page` does not fsync; `sync_all` fsyncs all open files and the directory; `page_count` returns a file's on-disk extent in pages. `new_page` seeds its allocator from `page_count` the first time it allocates into a file, so after recovery (which no longer preloads pages) a new page never reuses one that already exists on disk.
 
 `MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageStore` returning `Ok(None)` from `load_page` and discarding writes.
 
-`load_page(file_id, page_num, data)` inserts a clean frame; recovery uses it to pre-load checkpointed heap pages. If the page is not resident, it inserts `data` as a clean frame. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool (used by directory rebuild).
+`load_page(file_id, page_num, data)` inserts `data` as a clean frame if the page is not resident. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool (used by checkpoint flushing and the storage page scan).
 
 `commit(txn_id)` is cleanup-only: it discards before-images and new-page tracking after WAL flush succeeds. It must not perform I/O and should not fail for a valid `txn_id`. If it fails after a durable WAL commit, server treats that as fatal and does not roll back.
 
@@ -140,7 +141,7 @@ V1 uses clock eviction:
 - A dirty page the policy refuses (uncommitted), or any pinned page, is skipped.
 - If no frame can be freed (all pinned, or all dirty and unflushable), return a storage/buffer error.
 
-Stealing is off until `enable_stealing`. The server enables it only after recovery, so recovery's preload and directory rebuild see the full working set and a too-small buffer fails loudly instead of silently spilling.
+Stealing is off until `enable_stealing`. The server enables it during startup before redo; with the durable on-disk index there is no in-memory directory to rebuild, so recovery may spill and its working set is not bounded by the pool size.
 
 ## Checkpoint Interaction
 
@@ -165,4 +166,4 @@ Checkpoint holds the global write guard, so no statement mutates pages concurren
 - A dirty page the policy refuses, or any dirty page when stealing is disabled, is not evicted (error when no other victim).
 - A committed working set larger than the pool spills to the heap and reads back correctly.
 - `mark_all_clean` makes previously dirty pages evictable.
-- `iter_pages` returns in-memory page data for the directory rebuild.
+- `iter_pages` returns in-memory page data for checkpoint flushing and the storage page scan.

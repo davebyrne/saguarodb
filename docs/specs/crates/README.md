@@ -18,7 +18,7 @@ This directory decomposes the overview spec into crate-level contracts for v1 im
 | `catalog` | [catalog.md](catalog.md) | Table metadata, stable IDs, schema snapshots |
 | `planner` | [planner.md](planner.md) | Bind, logical plan, physical plan |
 | `executor` | [executor.md](executor.md) | Volcano operators, expression evaluation, DML/DDL execution |
-| `storage` | [storage.md](storage.md) | Page-backed table storage, row serialization, recovery operations |
+| `storage` | [storage.md](storage.md) | Page-backed table storage, primary-key B-tree index, row serialization, recovery operations |
 | `buffer` | [buffer.md](buffer.md) | Page cache, RAII guards, dirty tracking, rollback, in-place page flushing |
 | `wal` | [wal.md](wal.md) | Physiological redo WAL, commit/checkpoint records, replay iterator |
 | `control` | [control.md](control.md) | Durable control record (checkpoint commit point): redo boundary, table ids, catalog |
@@ -32,7 +32,7 @@ This directory decomposes the overview spec into crate-level contracts for v1 im
 - Cargo package names use the `saguarodb-*` prefix, but internal `Cargo.toml` dependencies use short aliases such as `common`, `storage`, and `wal`.
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.
-- Eviction can steal committed dirty pages (flush, then evict) once stealing is enabled after recovery; checkpoint also flushes dirty pages in place to the heap.
+- Eviction can steal committed dirty pages (flush, then evict) once stealing is enabled (the server enables it at startup, before redo); checkpoint also flushes dirty pages in place to the heap.
 - V1 uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal. MVCC is future work behind existing traits.
 
 ## V1 Test Strategy

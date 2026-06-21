@@ -117,9 +117,8 @@ pub trait BufferPool: Send + Sync {
     /// post-recovery checkpoint.
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
 
-    /// Allow eviction to flush+evict committed dirty pages (steal). The server
-    /// enables this only after recovery, so recovery's directory rebuild sees the
-    /// full working set and a too-small buffer still fails loudly.
+    /// Allow eviction to flush+evict committed dirty pages (steal). Disabled until
+    /// the server enables it during startup (before redo).
     fn enable_stealing(&self);
 }
 
@@ -129,7 +128,7 @@ pub struct MemoryBufferPool {
     store: Arc<dyn PageStore>,
     state: Mutex<PoolState>,
     /// When true, eviction may flush a committed dirty page to its home and evict
-    /// it (steal). Off during recovery so the directory rebuild sees all pages.
+    /// it (steal). Off until the server enables it during startup.
     stealing: AtomicBool,
 }
 

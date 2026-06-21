@@ -11,7 +11,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 
 - Standalone multi-client server
 - PostgreSQL simple query wire protocol (abstracted for future custom protocol)
-- Page-oriented storage engine with a v1 in-memory primary-key directory (abstracted for future MVCC and on-disk B-tree work)
+- Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
 - Autocommit only (no multi-statement transactions)
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
 - V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
@@ -1012,7 +1012,7 @@ V1 expression semantics:
 
 ## 7. Storage Engine
 
-The `storage` crate owns the on-disk data format, page-backed row storage, and the v1 in-memory primary-key directory.
+The `storage` crate owns the on-disk data format, page-backed row storage, and the durable on-disk primary-key B-tree index.
 
 ### Row Iterator
 
@@ -1087,7 +1087,7 @@ pub trait SchemaOperations: Send + Sync {
 
 Every operation takes a `StatementContext`. In V1 this carries only the autocommit `txn_id`. When MVCC is added, the context gains snapshot visibility, isolation level, and write-set tracking — without changing any call sites.
 
-`scan_range` serves `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the in-memory primary-key directory from start to end. For `KeyRange::All`, it is equivalent to `scan`. V1 uses this for primary key scans; a future on-disk B-tree or secondary indexes can replace the internal access path without changing the trait.
+`scan_range` serves `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. V1 uses this for primary key scans; secondary indexes can be added without changing the trait.
 
 ### Page Format (8KB Pages)
 
@@ -1116,11 +1116,11 @@ V1 development builds do not migrate older page formats. Existing page files wit
 
 ### Page-Backed Primary-Key Structure
 
-- Table pages store full serialized rows.
-- An in-memory `BTreeMap<Key, RowLocation>` maps primary keys to physical page slots.
+- Heap pages store full serialized rows.
+- A durable, non-clustered on-disk B-tree (`Key -> RowLocation`) in a separate file per table maps primary keys to physical heap slots.
 - `RowLocation` stores `file_id`, `page_num`, and `slot_num`.
-- On startup, after recovery, storage rebuilds the directory by scanning the table pages.
-- A future on-disk clustered B-tree can replace this internal access path without changing the public storage traits.
+- The B-tree is durable, so nothing is rebuilt on startup; its pages are recovered by redo like any other page.
+- A future clustered B-tree (rows in the leaves) can replace this internal access path without changing the public storage traits.
 
 ### Row Serialization
 
@@ -1138,8 +1138,9 @@ V1 development builds do not migrate older page formats. Existing page files wit
 
 Files are named by stable numeric ID, not by user-visible names. This avoids rename issues (future `ALTER TABLE RENAME`), filesystem-unsafe characters in table names, and name collisions.
 
-**Heap files (the mutable page home):**
-- `data/heap/<TableId>.heap` — slotted data pages, page `n` at byte offset `n * PAGE_SIZE`. Written in place by checkpoint flush; files grow by appending pages.
+**Heap and index files (the mutable page home):**
+- `data/heap/<TableId>.heap` — slotted data pages, page `n` at byte offset `n * PAGE_SIZE`. Written in place by checkpoint flush or eviction; files grow by appending pages.
+- `data/heap/<TableId>.idx` — the table's primary-key B-tree (metapage at page 0, then leaf/internal nodes), same page layout and offsets.
 
 **Control record (the single source of truth for the current checkpoint):**
 - `data/manifest.dat` — a versioned binary envelope (magic `SGMF`, version, payload length, CRC32 over the payload) whose JSON payload holds the redo boundary `checkpoint_lsn`, sorted table IDs, and the catalog snapshot.
@@ -1173,7 +1174,7 @@ pub trait BufferPool: Send + Sync {
     /// The returned PageWriteGuard exposes page_num() for row-location tracking.
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard>;
 
-    /// Load an exact clean page (used by recovery to preload heap pages).
+    /// Insert an exact clean page into the pool (does not mark it dirty).
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
 
     /// Rollback: restore all pages modified by this txn_id to their before-images,
@@ -1185,7 +1186,7 @@ pub trait BufferPool: Send + Sync {
     /// Changes are now permanent and eligible to be flushed at the next checkpoint.
     fn commit(&self, txn_id: u64) -> Result<()>;
 
-    /// Iterate all frames (used by the directory rebuild). Returns (file_id, page_num, data, is_dirty).
+    /// Iterate all frames (used by checkpoint flushing and the storage page scan). Returns (file_id, page_num, data, is_dirty).
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
 
     /// Mark all dirty pages as clean (called by checkpoint after flushing them to the heap).
@@ -1237,7 +1238,7 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
   - `new_pages: Vec<(FileId, PageNum)>` — pages allocated via `new_page` by this `txn_id`.
   
   On `rollback(txn_id)`: before-images are restored (existing pages return to pre-statement state) and newly allocated pages are invalidated/freed. On `commit(txn_id)`: both tracking structures are discarded. This correctly handles the case where a page was already dirtied by a prior committed txn (rollback restores to the post-prior-commit state, not the on-disk state) and also handles failed inserts that allocated new pages before the error.
-- **PageLoader:** The buffer pool is constructed with an `Arc<dyn PageLoader>`:
+- **PageStore / PageLoader:** The buffer pool is constructed with an `Arc<dyn PageStore>`, which extends the read-only `PageLoader`:
 
 ```rust
 pub trait PageLoader: Send + Sync {
@@ -1255,8 +1256,8 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 - Each frame has a reference bit, set on access
 - On sweep: if bit is 1, clear to 0 and skip. If bit is 0 and unpinned, check dirty flag.
 - **If clean:** evict immediately. The page can be re-read from its heap file if needed later.
-- **If dirty:** when stealing is enabled, steal it if the `FlushPolicy` admits it (committed): flush the page to its heap home outside the pool lock, then evict. A page the policy refuses (uncommitted), or any dirty page when stealing is off, is skipped. The server enables stealing only after recovery.
-- If no frame can be freed — every frame is pinned, or every unpinned frame is dirty and unflushable (uncommitted, or stealing disabled during recovery) — the buffer pool returns an out-of-frames error.
+- **If dirty:** when stealing is enabled, steal it if the `FlushPolicy` admits it (committed): flush the page to its heap home outside the pool lock, then evict. A page the policy refuses (uncommitted), or any dirty page when stealing is off, is skipped. The server enables stealing at startup, before redo.
+- If no frame can be freed — every frame is pinned, or every unpinned frame is dirty and unflushable (uncommitted) — the buffer pool returns an out-of-frames error.
 
 ### Working Set and the Buffer Pool
 
@@ -1264,7 +1265,7 @@ During normal operation the working set is not bound by the pool size: eviction-
 - Each statement dirtys a modest number of pages
 - After commit, pages are dirty but committed — they stay in memory until a checkpoint flushes them in place or an eviction steals them
 - The buffer pool default (1024 frames = 8MB) keeps a small-to-medium working set resident; larger sets spill to the heap
-- **Recovery** still requires its redo working set to fit (stealing is off until recovery completes); too small a buffer fails loudly
+- **Recovery** spills too: stealing is enabled before redo, so the redo working set is not bounded by the buffer pool either (the durable on-disk index means nothing is rebuilt in memory)
 
 ### Concurrency
 
@@ -1320,7 +1321,7 @@ This gives the invariants:
 3. Checkpoint cost is O(pages changed), not O(database size).
 
 **Trade-offs:**
-- Normal operation spills committed dirty pages to the heap via eviction-flush-on-steal; recovery still requires its redo working set to fit in the buffer pool.
+- Normal operation and recovery both spill committed dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory).
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
 **Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
@@ -1450,7 +1451,7 @@ The buffer pool saves a before-image (copy of the page data) on the first write 
 **Failure path:**
 1. `write_page(file, page, txn_id)` — saves before-image on first touch
 2. ... (statement fails mid-execution) ...
-3. `storage.rollback_txn(txn_id)` — restores primary-key directories and table metadata
+3. `storage.rollback_txn(txn_id)` — restores table metadata (index and heap pages roll back via the buffer pool's before-images)
 4. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
 5. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
 6. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery
@@ -1512,17 +1513,16 @@ impl PageBackedStorageEngine {
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata plus empty in-memory primary-key directories. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` after loading the catalog snapshot.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` after loading the catalog snapshot.
 
 **Recovery procedure** (driven by the server startup sequence):
 
 1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
 2. Initialize storage in recovery mode and the catalog; `install_schemas`.
-3. Pre-load every heap page of each live table into the buffer pool.
-4. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them), DDL via `RecoveryOperations`.
-5. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small for the working set), then `rebuild_directories`.
-6. If records were replayed: checkpoint to persist the redone state and advance the boundary.
-7. Enable eviction-flush-on-steal (`buffer.enable_stealing()`), then switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
+3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
+4. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike — DDL via `RecoveryOperations`.
+5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
+6. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
 **Idempotency:** PageLSN gating applies each record's effect at most once, so replay is safe even when the heap already reflects some post-boundary work (e.g. a partially completed prior checkpoint).
 
@@ -1622,14 +1622,13 @@ The `server` crate is the binary entry point.
 5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if absent)
 6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
 7. Initialize catalog from the control catalog bytes (or empty); `storage.install_schemas(catalog.list_tables()?)`
-8. Pre-load every heap page of each live table into the buffer pool
-9. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), DDL via `RecoveryOperations` — no WAL appended in recovery mode
-10. Verify all pre-loaded pages are still resident (fail if the buffer pool is too small), then `storage.rebuild_directories()`
-11. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
-12. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and advance the redo boundary
-13. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
-14. Construct `QueryService` from `components`
-15. Start Tokio runtime, bind TCP listener (default port 5433)
+8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
+9. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike, DDL via `RecoveryOperations` — no WAL appended in recovery mode
+10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
+12. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
+13. Construct `QueryService` from `components`
+14. Start Tokio runtime, bind TCP listener (default port 5433)
 
 Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` records. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
@@ -1667,7 +1666,7 @@ All concurrency is managed through the `ConcurrencyController` trait (defined in
 - **Catalog:** Internal `RwLock` (reads concurrent, DDL exclusive). The catalog's own lock is separate from the `ConcurrencyController` — the catalog lock protects metadata consistency, while the `ConcurrencyController` protects statement-level isolation.
 - **WAL appends:** Serialized by the write guard (no separate WAL mutex needed).
 
-This is intentionally simple. The exclusive write guard limits write throughput to one statement at a time, but it makes the durability and recovery model correct and safe for page and primary-key-directory modifications. Future MVCC replaces the `ConcurrencyController` implementation with row-level concurrency control while preserving the server-facing orchestration API.
+This is intentionally simple. The exclusive write guard limits write throughput to one statement at a time, but it makes the durability and recovery model correct and safe for heap and index page modifications. Future MVCC replaces the `ConcurrencyController` implementation with row-level concurrency control while preserving the server-facing orchestration API.
 
 ### Graceful Shutdown
 
@@ -1697,7 +1696,7 @@ Loaded from command-line args only in V1. No environment-variable or config-file
 ## 12. Future Work (Designed For, Not Implemented)
 
 - **MVCC / Transactions:** `StatementContext` carries `txn_id` and is extensible for snapshot visibility. The `ConcurrencyController` trait returns owned guards so a simple `RwLock` implementation can later be swapped for a transaction manager. WAL record format includes `TxnID`.
-- **Secondary Indexes:** `IndexId` type defined, `KeyRange` supports range scans, `.idx` file extension reserved. Storage engine can add `index_scan` method. Catalog can add `IndexSchema`.
+- **Secondary Indexes:** `IndexId` type defined, `KeyRange` supports range scans, and the on-disk B-tree (used by the primary key, in `<table>.idx`) is the access-method template. Storage engine can add `index_scan` method. Catalog can add `IndexSchema`.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **INSERT ... SELECT:** `InsertSource::Query` variant exists in the AST. The logical/physical plans already model inserts as `source: Box<LogicalPlan>` / `source: Box<PhysicalPlan>`, so this can be enabled later by binding query sources.
