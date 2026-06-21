@@ -389,6 +389,9 @@ mod tests {
             tables_by_name: HashMap::from([("ghost".to_string(), 7)]),
             tables_by_id: HashMap::new(),
             next_table_id: 1,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = service

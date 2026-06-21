@@ -18,18 +18,29 @@ pub struct Catalog {
     tables_by_name: HashMap<String, TableId>,
     tables_by_id: HashMap<TableId, TableSchema>,
     next_table_id: TableId,
+    indexes_by_name: HashMap<String, IndexId>,
+    indexes_by_id: HashMap<IndexId, IndexSchema>,
+    next_index_id: IndexId,
 }
 
 pub struct CatalogSnapshot {
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
+    pub indexes_by_name: HashMap<String, IndexId>,
+    pub indexes_by_id: HashMap<IndexId, IndexSchema>,
+    pub next_index_id: IndexId,
 }
 ```
 
-`TableSchema`, `ColumnDef`, and `DataType` live in `common`.
+`TableSchema`, `ColumnDef`, `DataType`, and `IndexSchema` live in `common`.
 
-IDs are monotonically increasing and never reused.
+Table IDs and index IDs are independent namespaces; both are monotonically
+increasing and never reused. `next_index_id` starts at
+`PRIMARY_KEY_INDEX_ID + 1`, because index id `0` is reserved for a table's
+primary-key index and is never assigned to a secondary index. The three index
+fields deserialize with defaults (empty maps, `next_index_id = 1`) so catalogs
+persisted before secondary indexes existed still load.
 
 ## Public API
 
@@ -49,12 +60,27 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+
+    fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
+    fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_drop_index(&self, id: IndexId) -> Result<()>;
+    fn create_index(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexSchema>;
+    fn drop_index(&self, id: IndexId) -> Result<()>;
 }
 ```
 
 Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success.
 
 `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting names or IDs, and advances `next_table_id` to at least `schema.id + 1`. It must not reassign table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs.
+
+`create_index` resolves the table and column names, assigns an `IndexId`, and returns the stored `IndexSchema`; `drop_index` removes an index by ID. `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs: `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects conflicting names or IDs, and advances `next_index_id` to at least `schema.id + 1`; `apply_drop_index` removes an existing index by ID. `list_indexes_for_table` returns a table's indexes ordered by ID and is how storage learns which indexes to maintain on DML.
 
 ## Create Table Rules
 
@@ -65,6 +91,17 @@ Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snaps
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
+
+## Create Index Rules
+
+- Index name must be unique among indexes (indexes have their own name space, separate from tables).
+- The target table must exist; otherwise `SqlState::UndefinedTable`.
+- Index column names must exist on the target table; otherwise `SqlState::UndefinedColumn`.
+- Duplicate index column names and an empty column list return `SqlState::SyntaxError`.
+- Index columns keep the order written.
+- `IndexId` is assigned from `next_index_id`, starting at `PRIMARY_KEY_INDEX_ID + 1`.
+- The `unique` flag is recorded here; duplicate-value rejection for unique indexes happens at the storage layer, not in the catalog.
+- Dropping a table cascades in the catalog to remove every index on that table. The same cascade runs on the recovery `apply_drop_table` path, so the durable `DropTable` record alone restores the post-drop state.
 
 ## Catalog Persistence
 
@@ -78,7 +115,7 @@ On startup:
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column for v1, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
 
 ## WAL Interaction
 
@@ -90,10 +127,12 @@ Recovery apply methods must update catalog state consistently with storage state
 
 ## Invariants
 
-- Name map and ID map are consistent.
+- Name map and ID map are consistent, for both tables and indexes.
 - IDs are never reused after drop.
+- Index id `PRIMARY_KEY_INDEX_ID` is reserved and never assigned to a secondary index.
+- Every secondary index references an existing table and existing columns on it; dropping a table removes its indexes.
 - Binder is the only consumer that resolves names for query planning.
-- Executor/storage should use `TableId` and `ColumnId` after binding.
+- Executor/storage should use `TableId`, `ColumnId`, and `IndexId` after binding.
 
 ## Acceptance Tests
 
@@ -104,3 +143,8 @@ Recovery apply methods must update catalog state consistently with storage state
 - Drop removes name and ID lookup.
 - Serialization round-trip preserves `next_table_id`.
 - Recovery create/drop updates catalog without name leaks into executor.
+- Create index resolves columns and assigns monotonically increasing index IDs.
+- Duplicate index name, missing table, missing column, and duplicate/empty columns are rejected with the documented SQLSTATEs.
+- Dropping a table cascades to its indexes.
+- Serialization round-trip preserves indexes and `next_index_id`; a snapshot without index fields loads as an empty index set.
+- Snapshot validation rejects an index that references a missing table, uses the reserved primary-key index ID, or carries a stale `next_index_id`.

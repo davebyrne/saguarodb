@@ -4,7 +4,7 @@ mod serialize;
 pub use memory::{CatalogSnapshot, MemoryCatalog};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 
-use common::{ParsedColumnDef, Result, TableId, TableSchema};
+use common::{IndexId, IndexSchema, ParsedColumnDef, Result, TableId, TableSchema};
 
 pub trait CatalogManager: Send + Sync {
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
@@ -21,13 +21,28 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+
+    fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
+    fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_drop_index(&self, id: IndexId) -> Result<()>;
+    fn create_index(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexSchema>;
+    fn drop_index(&self, id: IndexId) -> Result<()>;
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use common::{ColumnDef, DataType, ErrorKind, ParsedColumnDef, SqlState, TableSchema};
+    use common::{
+        ColumnDef, DataType, ErrorKind, IndexSchema, ParsedColumnDef, SqlState, TableSchema,
+    };
 
     use crate::{
         CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
@@ -39,6 +54,26 @@ mod tests {
             data_type: DataType::Integer,
             nullable,
         }
+    }
+
+    /// A `users(id INTEGER PRIMARY KEY, name TEXT)` table for index tests.
+    fn catalog_with_users() -> MemoryCatalog {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        catalog
     }
 
     #[test]
@@ -121,6 +156,9 @@ mod tests {
             tables_by_name: HashMap::from([("ghost".to_string(), 7)]),
             tables_by_id: HashMap::new(),
             next_table_id: 1,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = catalog.restore(snapshot).unwrap_err();
@@ -145,6 +183,9 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 3,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -177,6 +218,9 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 4,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -200,6 +244,9 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 4,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -223,6 +270,9 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 4,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -382,5 +432,387 @@ mod tests {
             )
             .unwrap();
         assert_eq!(next.id, 8);
+    }
+
+    #[test]
+    fn create_index_resolves_columns_and_assigns_ids() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(index.id, 1);
+        assert_eq!(index.table, table.id);
+        assert_eq!(index.columns, vec![1]);
+        assert!(!index.unique);
+
+        let second = catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], true)
+            .unwrap();
+        assert_eq!(second.id, 2);
+        assert!(second.unique);
+        assert_eq!(second.columns, vec![0]);
+    }
+
+    #[test]
+    fn duplicate_index_name_is_rejected() {
+        let catalog = catalog_with_users();
+        catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        let err = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn create_index_on_missing_table_is_rejected() {
+        let catalog = catalog_with_users();
+        let err = catalog
+            .create_index("ghost".to_string(), "ghost", &["id".to_string()], false)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn create_index_on_missing_column_is_rejected() {
+        let catalog = catalog_with_users();
+        let err = catalog
+            .create_index(
+                "users_missing".to_string(),
+                "users",
+                &["missing".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn create_index_rejects_duplicate_and_empty_columns() {
+        let catalog = catalog_with_users();
+
+        let duplicate = catalog
+            .create_index(
+                "dup".to_string(),
+                "users",
+                &["id".to_string(), "id".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(duplicate.code, SqlState::SyntaxError);
+
+        let empty = catalog
+            .create_index("empty".to_string(), "users", &[], false)
+            .unwrap_err();
+        assert_eq!(empty.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn get_index_by_name_returns_schema_or_none() {
+        let catalog = catalog_with_users();
+        let created = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            catalog.get_index_by_name("users_name").unwrap(),
+            Some(created)
+        );
+        assert_eq!(catalog.get_index_by_name("absent").unwrap(), None);
+    }
+
+    #[test]
+    fn list_indexes_for_table_filters_and_sorts_by_id() {
+        let catalog = catalog_with_users();
+        let accounts = catalog
+            .create_table(
+                "accounts".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+        catalog
+            .create_index(
+                "accounts_id".to_string(),
+                "accounts",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap();
+        catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let listed = catalog.list_indexes_for_table(users.id).unwrap();
+        let ids: Vec<_> = listed.iter().map(|index| index.id).collect();
+        let names: Vec<_> = listed.iter().map(|index| index.name.as_str()).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(names, vec!["users_name", "users_id"]);
+
+        assert_eq!(
+            catalog.list_indexes_for_table(accounts.id).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn drop_index_removes_lookups_without_reusing_id() {
+        let catalog = catalog_with_users();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        catalog.drop_index(index.id).unwrap();
+        assert_eq!(catalog.get_index_by_name("users_name").unwrap(), None);
+
+        let next = catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+        assert_eq!(next.id, index.id + 1);
+    }
+
+    #[test]
+    fn drop_index_on_missing_id_is_rejected() {
+        let catalog = catalog_with_users();
+        let err = catalog.drop_index(42).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn drop_table_cascades_to_its_indexes() {
+        let catalog = catalog_with_users();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+        catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+
+        catalog.drop_table(users.id).unwrap();
+
+        assert_eq!(catalog.get_index_by_name("users_name").unwrap(), None);
+        assert_eq!(catalog.get_index_by_name("users_id").unwrap(), None);
+        assert!(catalog.list_indexes_for_table(users.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_create_and_drop_index_drive_recovery_by_id() {
+        let catalog = catalog_with_users();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let schema = IndexSchema {
+            id: 5,
+            table: users.id,
+            name: "users_name".to_string(),
+            columns: vec![1],
+            unique: false,
+        };
+
+        catalog.apply_create_index(schema.clone()).unwrap();
+        assert_eq!(
+            catalog.get_index_by_name("users_name").unwrap(),
+            Some(schema.clone())
+        );
+
+        let duplicate = catalog.apply_create_index(schema).unwrap_err();
+        assert_eq!(duplicate.code, SqlState::DuplicateTable);
+
+        // next_index_id advanced past the replayed id, so a fresh create skips it.
+        let next = catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+        assert_eq!(next.id, 6);
+
+        catalog.apply_drop_index(5).unwrap();
+        assert_eq!(catalog.get_index_by_name("users_name").unwrap(), None);
+    }
+
+    #[test]
+    fn serialize_round_trip_preserves_indexes() {
+        let catalog = catalog_with_users();
+        catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                true,
+            )
+            .unwrap();
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+
+        let index = restored.get_index_by_name("users_name").unwrap().unwrap();
+        assert!(index.unique);
+        assert_eq!(index.columns, vec![1]);
+
+        // next_index_id survives the round trip, so ids keep climbing.
+        let next = restored
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+        assert_eq!(next.id, 2);
+    }
+
+    #[test]
+    fn validate_rejects_index_referencing_missing_table() {
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::new(),
+            tables_by_id: HashMap::new(),
+            next_table_id: 1,
+            indexes_by_name: HashMap::from([("orphan".to_string(), 1)]),
+            indexes_by_id: HashMap::from([(
+                1,
+                IndexSchema {
+                    id: 1,
+                    table: 7,
+                    name: "orphan".to_string(),
+                    columns: vec![0],
+                    unique: false,
+                },
+            )]),
+            next_index_id: 2,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("missing table"));
+    }
+
+    #[test]
+    fn validate_rejects_reserved_primary_key_index_id() {
+        let table = TableSchema {
+            id: 1,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, table)]),
+            next_table_id: 2,
+            indexes_by_name: HashMap::from([("bad".to_string(), 0)]),
+            indexes_by_id: HashMap::from([(
+                0,
+                IndexSchema {
+                    id: 0,
+                    table: 1,
+                    name: "bad".to_string(),
+                    columns: vec![0],
+                    unique: false,
+                },
+            )]),
+            next_index_id: 1,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("reserved primary-key index id"));
+    }
+
+    #[test]
+    fn validate_rejects_next_index_id_that_reuses_existing_id() {
+        let table = TableSchema {
+            id: 1,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+            }],
+            primary_key: vec![0],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, table)]),
+            next_table_id: 2,
+            indexes_by_name: HashMap::from([("users_id".to_string(), 1)]),
+            indexes_by_id: HashMap::from([(
+                1,
+                IndexSchema {
+                    id: 1,
+                    table: 1,
+                    name: "users_id".to_string(),
+                    columns: vec![0],
+                    unique: false,
+                },
+            )]),
+            next_index_id: 1,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("next_index_id"));
+    }
+
+    #[test]
+    fn snapshot_without_index_fields_deserializes_to_empty_indexes() {
+        // A catalog persisted before secondary indexes existed.
+        let json = r#"{
+            "tables_by_name": {"users": 1},
+            "tables_by_id": {"1": {
+                "id": 1,
+                "name": "users",
+                "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
+                "primary_key": [0]
+            }},
+            "next_table_id": 2
+        }"#;
+
+        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
+        assert!(snapshot.indexes_by_id.is_empty());
+        assert!(snapshot.indexes_by_name.is_empty());
+        assert_eq!(snapshot.next_index_id, 1);
+
+        // The validated load path accepts it.
+        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
     }
 }

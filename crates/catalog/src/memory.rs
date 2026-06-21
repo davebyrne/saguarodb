@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnId, DbError, ParsedColumnDef, Result, SqlState, TableId, TableSchema,
+    ColumnDef, ColumnId, DbError, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
+    Result, SqlState, TableId, TableSchema,
 };
 
 use crate::CatalogManager;
@@ -12,6 +13,19 @@ pub struct CatalogSnapshot {
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
+    // Secondary-index fields default so catalogs written before secondary
+    // indexes existed still deserialize (no indexes, ids start after the
+    // reserved primary-key id).
+    #[serde(default)]
+    pub indexes_by_name: HashMap<String, IndexId>,
+    #[serde(default)]
+    pub indexes_by_id: HashMap<IndexId, IndexSchema>,
+    #[serde(default = "default_next_index_id")]
+    pub next_index_id: IndexId,
+}
+
+fn default_next_index_id() -> IndexId {
+    PRIMARY_KEY_INDEX_ID + 1
 }
 
 #[derive(Debug)]
@@ -25,6 +39,9 @@ impl MemoryCatalog {
             tables_by_name: HashMap::new(),
             tables_by_id: HashMap::new(),
             next_table_id: 1,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: default_next_index_id(),
         })
     }
 
@@ -117,6 +134,7 @@ impl CatalogManager for MemoryCatalog {
             .remove(&id)
             .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
         snapshot.tables_by_name.remove(&schema.name);
+        drop_indexes_for_table(&mut snapshot, id);
         Ok(())
     }
 
@@ -145,6 +163,90 @@ impl CatalogManager for MemoryCatalog {
 
     fn drop_table(&self, id: TableId) -> Result<()> {
         self.apply_drop_table(id)
+    }
+
+    fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
+        let snapshot = self.read_snapshot()?;
+        Ok(snapshot
+            .indexes_by_name
+            .get(name)
+            .and_then(|id| snapshot.indexes_by_id.get(id))
+            .cloned())
+    }
+
+    fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>> {
+        let mut indexes: Vec<_> = self
+            .read_snapshot()?
+            .indexes_by_id
+            .values()
+            .filter(|index| index.table == table)
+            .cloned()
+            .collect();
+        indexes.sort_by_key(|index| index.id);
+        Ok(indexes)
+    }
+
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        reject_duplicate_index_name(&snapshot, &schema.name)?;
+        reject_duplicate_index_id(&snapshot, schema.id)?;
+
+        let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
+            DbError::internal("catalog index id overflow while applying create index")
+        })?;
+
+        snapshot
+            .indexes_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.next_index_id = snapshot.next_index_id.max(next_after_schema);
+        snapshot.indexes_by_id.insert(schema.id, schema);
+        Ok(())
+    }
+
+    fn apply_drop_index(&self, id: IndexId) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot
+            .indexes_by_id
+            .remove(&id)
+            .ok_or_else(|| undefined_index(format!("index id {id} does not exist")))?;
+        snapshot.indexes_by_name.remove(&schema.name);
+        Ok(())
+    }
+
+    fn create_index(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        reject_duplicate_index_name(&snapshot, &name)?;
+
+        let index_id = snapshot.next_index_id;
+        let next_index_id = index_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog index id overflow"))?;
+
+        let schema = {
+            let table_schema = snapshot
+                .tables_by_name
+                .get(table)
+                .and_then(|id| snapshot.tables_by_id.get(id))
+                .ok_or_else(|| undefined_table(format!("table {table} does not exist")))?;
+            build_index_schema(index_id, name, table_schema, columns, unique)?
+        };
+
+        snapshot
+            .indexes_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.indexes_by_id.insert(schema.id, schema.clone());
+        snapshot.next_index_id = next_index_id;
+        Ok(schema)
+    }
+
+    fn drop_index(&self, id: IndexId) -> Result<()> {
+        self.apply_drop_index(id)
     }
 }
 
@@ -261,6 +363,96 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
         )));
     }
 
+    validate_indexes(snapshot)?;
+
+    Ok(())
+}
+
+fn validate_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut max_index_id = 0;
+
+    for (name, id) in &snapshot.indexes_by_name {
+        let schema = snapshot.indexes_by_id.get(id).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog snapshot index name {name} points to missing index id {id}",
+            ))
+        })?;
+        if &schema.name != name || schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot index name/id mismatch for index {name}",
+            )));
+        }
+    }
+
+    for (id, schema) in &snapshot.indexes_by_id {
+        if schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot index id key {id} does not match schema id {}",
+                schema.id
+            )));
+        }
+        if *id == PRIMARY_KEY_INDEX_ID {
+            return Err(DbError::internal(
+                "catalog snapshot uses the reserved primary-key index id for a secondary index",
+            ));
+        }
+        if snapshot.indexes_by_name.get(&schema.name) != Some(id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot index {} is missing from name index",
+                schema.name
+            )));
+        }
+        validate_index_schema(schema, &snapshot.tables_by_id)?;
+        max_index_id = max_index_id.max(*id);
+    }
+
+    let required_next = max_index_id
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog snapshot index id overflow"))?;
+    if snapshot.next_index_id < required_next {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_index_id {} is less than required {required_next}",
+            snapshot.next_index_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_index_schema(
+    schema: &IndexSchema,
+    tables_by_id: &HashMap<TableId, TableSchema>,
+) -> Result<()> {
+    let table = tables_by_id.get(&schema.table).ok_or_else(|| {
+        DbError::internal(format!(
+            "catalog snapshot index {} references missing table {}",
+            schema.name, schema.table
+        ))
+    })?;
+
+    if schema.columns.is_empty() {
+        return Err(DbError::internal(format!(
+            "catalog snapshot index {} has no columns",
+            schema.name
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    for column_id in &schema.columns {
+        if !table.columns.iter().any(|column| column.id == *column_id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot index {} references missing column {} on table {}",
+                schema.name, column_id, schema.table
+            )));
+        }
+        if !seen.insert(*column_id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot index {} has duplicate column {}",
+                schema.name, column_id
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -347,4 +539,89 @@ fn reject_duplicate_table_id(snapshot: &CatalogSnapshot, id: TableId) -> Result<
 
 fn undefined_table(message: String) -> DbError {
     DbError::plan(SqlState::UndefinedTable, message)
+}
+
+fn undefined_index(message: String) -> DbError {
+    // Indexes share the relation namespace; v1 has no dedicated SQLSTATE.
+    DbError::plan(SqlState::UndefinedTable, message)
+}
+
+fn build_index_schema(
+    index_id: IndexId,
+    name: String,
+    table: &TableSchema,
+    columns: &[String],
+    unique: bool,
+) -> Result<IndexSchema> {
+    if columns.is_empty() {
+        return Err(DbError::plan(
+            SqlState::SyntaxError,
+            "index requires at least one column",
+        ));
+    }
+
+    let mut column_ids = Vec::with_capacity(columns.len());
+    let mut seen_names = HashSet::new();
+    for column_name in columns {
+        if !seen_names.insert(column_name.clone()) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!("duplicate index column {column_name}"),
+            ));
+        }
+
+        let column = table
+            .columns
+            .iter()
+            .find(|column| &column.name == column_name)
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!("index column {column_name} does not exist"),
+                )
+            })?;
+        column_ids.push(column.id);
+    }
+
+    Ok(IndexSchema {
+        id: index_id,
+        table: table.id,
+        name,
+        columns: column_ids,
+        unique,
+    })
+}
+
+fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {
+    let dropped: Vec<IndexId> = snapshot
+        .indexes_by_id
+        .iter()
+        .filter(|(_, schema)| schema.table == table)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in dropped {
+        if let Some(schema) = snapshot.indexes_by_id.remove(&id) {
+            snapshot.indexes_by_name.remove(&schema.name);
+        }
+    }
+}
+
+fn reject_duplicate_index_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
+    if snapshot.indexes_by_name.contains_key(name) {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("index {name} already exists"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_index_id(snapshot: &CatalogSnapshot, id: IndexId) -> Result<()> {
+    if snapshot.indexes_by_id.contains_key(&id) {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("index id {id} already exists"),
+        ));
+    }
+    Ok(())
 }
