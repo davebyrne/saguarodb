@@ -14,6 +14,8 @@ whole-table snapshots.
 ## Depends On
 
 - `common`
+- `crc32fast` — payload CRC32 checksum
+- `serde`, `serde_json` — JSON payload (de)serialization
 
 ## File Layout
 
@@ -45,11 +47,16 @@ The control record uses a versioned binary envelope:
 - payload checksum: little-endian CRC32 over the exact payload bytes
 - payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, and `catalog`
 
-Decode must reject magic mismatch, unsupported versions (including the legacy
-full-snapshot manifest, version `1`), length mismatch, checksum mismatch,
-malformed payload JSON, unsorted table IDs, and duplicate table IDs. V1
-development builds do not migrate older formats; an incompatible control file is
-rejected as corrupt and the data directory must be rebuilt.
+The four header fields form a fixed 16-byte header (`MANIFEST_HEADER_LEN = 16`)
+that precedes the payload.
+
+Decode must reject a file shorter than the 16-byte header, magic mismatch,
+unsupported versions (including the legacy full-snapshot manifest, version `1`),
+length mismatch, checksum mismatch, malformed payload JSON, unsorted table IDs,
+and duplicate table IDs. V1 development builds do not migrate older formats; an
+incompatible or corrupt control file surfaces as `SqlState::InternalError`
+(there is no dedicated corruption SQLSTATE) and the data directory must be
+rebuilt.
 
 `checkpoint_lsn` is the WAL high-water mark whose effects are reflected in the
 heap. Recovery replays committed WAL records with `LSN > checkpoint_lsn`.

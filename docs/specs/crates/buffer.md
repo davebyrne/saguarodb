@@ -54,11 +54,13 @@ pub trait BufferPool: Send + Sync {
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
     fn enable_stealing(&self);
 }
+
+pub struct MemoryBufferPool { /* the concrete BufferPool implementation */ }
 ```
 
 `flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
 
-`MemoryBufferPool::new(frame_count, flush_policy, store)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageStore>`. `read_page` first checks resident frames; on a miss it calls `store.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`. Loader I/O errors propagate as `ErrorKind::Io`.
+`MemoryBufferPool::new(frame_count, flush_policy, store)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageStore>`. `read_page` first checks resident frames; on a miss it calls `store.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with a message of the form `page not found: file_id=…, page_num=…`. A loader error from `store.load_page` is propagated unchanged, so its `ErrorKind` is whatever the injected `PageStore` returns (a file-backed store yields `ErrorKind::Io`).
 
 In production, the server supplies a `HeapPageStore` (a `PageStore`) backed by per-table heap files. The `buffer` crate defines only the traits and does not depend on `storage` or `control`.
 
@@ -87,6 +89,7 @@ impl PageWriteGuard {
     pub fn page_num(&self) -> PageNum;
     pub fn data(&self) -> &[u8; PAGE_SIZE];
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE];
+    pub fn take_needs_fpi(&self) -> bool;  // true once if this write must log a full-page image
 }
 ```
 

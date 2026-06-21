@@ -74,13 +74,15 @@ pub trait WalManager: Send + Sync {
 }
 ```
 
-`append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `flush` fsyncs all buffered records and returns the durable high-water mark.
+`append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `decode_record` decodes exactly one record from a buffer: it returns an error on a partial buffer (`"incomplete WAL record"`) and on a buffer with bytes left over after the record (`"WAL buffer contains trailing bytes"`). `flush` fsyncs all buffered records and returns the durable high-water mark.
 
 `replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit` and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`).
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
 
-`truncate_before` writes retained records to a temporary WAL file, fsyncs the temporary file, renames it over the live WAL, and immediately fsyncs the parent directory. If the parent directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL file or mutating retained-record in-memory state. Only after the rename is directory-durable may the manager reopen, seek, and replace in-memory WAL state.
+`truncate_before` writes retained records to a temporary WAL file, fsyncs the temporary file, renames it over the live WAL, and immediately fsyncs the parent directory. If the parent-directory fsync — or the subsequent WAL reopen or seek — fails, the WAL manager is poisoned and returns the error before mutating retained-record in-memory state. Only after the rename is directory-durable may the manager reopen, seek, and replace in-memory WAL state.
+
+Poisoning is not limited to truncation: the WAL manager is poisoned whenever it cannot undo a partial mutation — if `append` fails to roll back a partially written record, or if `flush` fails to roll back unflushed bytes. Once poisoned, every subsequent operation returns the poison error.
 
 `bytes_after(lsn)` returns the total encoded byte length of retained WAL records whose stored `record.lsn > lsn`. It is used only for server checkpoint threshold accounting. If `lsn` is older than the first retained record after truncation, it returns the total encoded byte length of all retained records.
 
@@ -127,13 +129,13 @@ Recovery:
 - Replays only operation records whose txn ID committed. `replay_committed_from(checkpoint_lsn)` provides this filtered committed-record stream through the `WalManager` abstraction.
 - Ignores uncommitted records.
 
-The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`.
+The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`. On `open`, an incomplete trailing record is not merely ignored in memory — the WAL file is physically truncated to the last complete record's end and fsynced, so the torn tail is removed on disk. After such a truncation (and after `truncate_before`), `next_lsn` is derived from the maximum LSN among the retained records, so newly appended records continue monotonically past the highest retained LSN.
 
 ## Invariants
 
 - LSNs are strictly increasing.
 - `flush()` only returns after fsync.
-- `is_committed(txn_id)` is true only if a commit record exists and is durable or has been read during recovery.
+- `is_committed(txn_id)` consults only durable commits: it is true once the txn's `Commit` record is flushed (recorded in `committed_txns`, populated at open from records with `lsn <= flushed_lsn` and extended on `flush`). A commit that has been appended but not yet flushed is tracked separately as pending and `is_committed` returns false for it until the flush makes it durable.
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests

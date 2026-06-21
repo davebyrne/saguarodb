@@ -39,8 +39,9 @@ Table IDs and index IDs are independent namespaces; both are monotonically
 increasing and never reused. `next_index_id` starts at
 `PRIMARY_KEY_INDEX_ID + 1`, because index id `0` is reserved for a table's
 primary-key index and is never assigned to a secondary index. The three index
-fields deserialize with defaults (empty maps, `next_index_id = 1`) so catalogs
-persisted before secondary indexes existed still load.
+fields deserialize with defaults (empty maps, `next_index_id =
+PRIMARY_KEY_INDEX_ID + 1`) so catalogs persisted before secondary indexes
+existed still load.
 
 ## Public API
 
@@ -78,23 +79,26 @@ pub trait CatalogManager: Send + Sync {
 
 Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success.
 
-`apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting names or IDs, and advances `next_table_id` to at least `schema.id + 1`. It must not reassign table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs.
+The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
 
-`create_index` resolves the table and column names, assigns an `IndexId`, and returns the stored `IndexSchema`; `drop_index` removes an index by ID. `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs: `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects conflicting names or IDs, and advances `next_index_id` to at least `schema.id + 1`; `apply_drop_index` removes an existing index by ID. `list_indexes_for_table` returns a table's indexes ordered by ID and is how storage learns which indexes to maintain on DML.
+`apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting names or IDs, and advances `next_table_id` to at least `schema.id + 1`. It must not reassign table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs; a missing ID returns `SqlState::UndefinedTable`.
+
+`create_index` resolves the table and column names, assigns an `IndexId`, and returns the stored `IndexSchema`; `drop_index` removes an index by ID, returning `SqlState::UndefinedTable` for a missing ID (indexes share the relation namespace, so v1 has no dedicated SQLSTATE). `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs: `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects conflicting names or IDs, and advances `next_index_id` to at least `schema.id + 1`; `apply_drop_index` removes an existing index by ID. `list_indexes_for_table` returns a table's indexes ordered by ID and is how storage learns which indexes to maintain on DML.
 
 ## Create Table Rules
 
-- Table name must be unique.
+- Table name must be unique; a duplicate name returns `SqlState::DuplicateTable`.
 - Column names must be unique within table; duplicate column definitions return `SqlState::SyntaxError`.
 - Primary key column names must exist.
 - Duplicate primary-key column names return `SqlState::SyntaxError`.
+- Exactly one primary-key column is required; an empty or composite primary key returns `SqlState::DatatypeMismatch`.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 
 ## Create Index Rules
 
-- Index name must be unique among indexes (indexes have their own name space, separate from tables).
+- Index name must be unique among indexes (indexes have their own name space, separate from tables); a duplicate index name returns `SqlState::DuplicateTable`, the same code reused for the shared relation namespace.
 - The target table must exist; otherwise `SqlState::UndefinedTable`.
 - Index column names must exist on the target table; otherwise `SqlState::UndefinedColumn`.
 - Duplicate index column names and an empty column list return `SqlState::SyntaxError`.
@@ -105,7 +109,7 @@ Methods return owned schema copies. V1 stores catalog behind an `RwLock`. `snaps
 
 ## Catalog Persistence
 
-The catalog serializes into the control record (`manifest.dat`) at each checkpoint.
+The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes existed still deserializes (empty index maps, `next_index_id = PRIMARY_KEY_INDEX_ID + 1`).
 
 On startup:
 
@@ -129,6 +133,7 @@ Recovery apply methods must update catalog state consistently with storage state
 
 - Name map and ID map are consistent, for both tables and indexes.
 - IDs are never reused after drop.
+- Table, index, and column ID assignment is overflow-guarded: rather than wrap or reuse, an exhausted ID space returns `SqlState::InternalError`.
 - Index id `PRIMARY_KEY_INDEX_ID` is reserved and never assigned to a secondary index.
 - Every secondary index references an existing table and existing columns on it; dropping a table removes its indexes.
 - Binder is the only consumer that resolves names for query planning.

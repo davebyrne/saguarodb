@@ -119,14 +119,16 @@ in-memory directory.
   carries a leaf flag and a link (right-sibling for a leaf, leftmost child for an
   internal node); entries are a sorted slotted array of `[key_len][key][value]`,
   where a leaf value is an encoded `RowLocation` and an internal value is a child
-  page number.
+  page number. Index-node slots are a narrower 4-byte `[offset: u16][len: u16]`
+  pair (no dead flag, since a delete removes the slot outright), distinct from the
+  6-byte `[offset][len][flags]` slot used by heap data pages.
 - **Lookup / scan.** `get` descends from the root to a leaf; `scan`/`scan_range`
   find the start leaf and walk the right-sibling chain in key order.
 - **Insert.** Places the entry in sorted position; a full node splits at a
   byte-balanced point (so variable-length keys do not overflow a half) and
   propagates a separator upward, growing the tree by a level on a root split.
 - **Delete.** Removes the entry; underfull nodes are not merged (accepted bloat).
-- **Update.** Overwrites the leaf entry's `RowLocation` in place.
+- **Update.** Overwrites the leaf entry's `RowLocation` in place. A row update that would change the primary key itself is rejected by the engine with `SqlState::DatatypeMismatch` (primary-key updates are not supported).
 - **Crash safety.** Every node mutation logs a `FullPageImage` and stamps the
   page-LSN, so the index is recovered by the same redo path as the heap and needs
   no rebuild. Page allocation is seeded from each file's on-disk extent so a new
@@ -261,6 +263,9 @@ impl PageBackedStorageEngine {
 ## Error Handling
 
 - Duplicate primary key: `SqlState::UniqueViolation`.
+- Duplicate value in a unique secondary index (insert, update, or backfill): `SqlState::UniqueViolation`.
+- Update that changes the primary key: `SqlState::DatatypeMismatch` (primary-key updates are not supported).
+- `index_scan` on a dropped or unknown index: `SqlState::UndefinedTable`.
 - Missing update/delete key: return `Ok(false)`.
 - Corrupt page checksum: `ErrorKind::Storage`.
 - Page layout or index invariant violation: `ErrorKind::Storage` or `Internal` depending on source.
