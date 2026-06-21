@@ -59,7 +59,7 @@ Each table is page-backed. Full rows live in heap pages; a durable, non-clustere
 - `insert` inserts by primary key (heap row plus B-tree entry) and adds an entry to every secondary index on the table.
 - `get` does a primary-key lookup through the B-tree.
 - `scan` / `scan_range` walk the primary-key B-tree leaves in key order and read rows from their heap locations.
-- `index_scan` walks a secondary index for the matching primary keys, then resolves each through the primary-key index to its heap row (see Secondary Indexes).
+- `index_scan` walks a secondary index, which points directly at heap TIDs, and reads each row from its heap location (no primary-key indirection; see Secondary Indexes).
 - `delete` / `update` keep every secondary index in sync with the heap.
 
 ## Page Format
@@ -245,10 +245,10 @@ index and returns `SqlState::UniqueViolation` if any entry already exists. This
 presence-probe is TEMPORARY: Milestone B commit 7 replaces it with a
 visibility-aware uniqueness check that ignores dead/aborted versions.
 
-The B-tree is generic over its leaf value type: the primary-key index stores a
-fixed-width `RowLocation`, and a secondary index stores the row's primary `Key`
-(see Secondary Indexes). Internally the tree treats values as opaque bytes and
-uses them as the equal-key tiebreaker.
+The B-tree is generic over its leaf value type, but every index — primary-key and
+secondary — now stores a fixed-width `RowLocation` (heap TID), so all indexes are
+uniform (see Secondary Indexes). Internally the tree treats values as opaque bytes
+and uses them as the equal-key tiebreaker.
 
 ## Secondary Indexes
 
@@ -258,29 +258,29 @@ the primary-key index) and written to `<data>/heap/<index_id>.sidx`. Index ids
 are a separate id space from table ids; the reserved primary-key index id is never
 used for a secondary index.
 
-- **Entry layout.** A secondary index stores `indexed_columns -> primary_key`,
-  not `-> RowLocation`. Because the primary key is immutable and never moves, a
-  row relocation (every `update`) touches only the primary-key index; a secondary
-  index changes only when one of its indexed columns changes. Reads therefore go
-  secondary index → primary key → primary-key index → `RowLocation` → heap.
-- **Key shape.** A non-unique index keys on `[indexed.. , primary_key]`, so every
-  entry is distinct. A unique index keys on `[indexed..]` alone, so a duplicate
-  indexed value collides on the key — except when an indexed value is NULL, where
-  the primary key is appended too, so NULLs stay distinct (SQL treats NULLs as
-  unequal). The leaf value is the encoded primary key in all cases. Since the
-  underlying B-tree is now multi-entry (it no longer rejects duplicate keys
-  structurally), a unique secondary index enforces uniqueness with an engine-level
-  presence-probe (`scan_key` before insert) returning `SqlState::UniqueViolation`;
-  a non-unique index needs no probe because its embedded primary key already makes
-  every key distinct. This presence-probe is temporary and parallels the
-  primary-key one; converting secondary indexes from `secondary→PK` to
-  `secondary→heap-TID` (and dropping the embedded-PK tiebreaker) is the next
-  commit (Milestone B commit 4).
+- **Entry layout.** A secondary index stores `indexed_columns -> RowLocation`
+  (heap TID), uniform with the primary-key index — every index is now
+  `(key → heap TID)`. Reads go secondary index → `RowLocation` → heap, with no
+  primary-key indirection. (Previously secondary indexes stored the primary key
+  and reads chained through the primary-key index; that indirection is removed.)
+- **Key shape.** The secondary key is the encoded indexed column(s) alone; the
+  primary key is no longer embedded. Duplicate indexed values (including multiple
+  rows whose indexed value is NULL) coexist as ordinary multi-entry rows,
+  disambiguated by the trailing heap TID in the tree's `(key, tid)` ordering. A
+  unique secondary index enforces uniqueness with a temporary engine-level
+  presence-probe (`scan_key` before insert) returning `SqlState::UniqueViolation`
+  when the indexed value is non-NULL. The probe is **skipped for a NULL indexed
+  value**: SQL treats NULLs as distinct, so NULL never participates in a unique
+  constraint, and distinct NULL rows coexist naturally via their differing heap
+  TIDs. This presence-probe is temporary (Milestone B commit 7 replaces it with a
+  visibility-aware uniqueness check).
 - **Lookup / range.** `index_scan(table, index, range)` constrains the leading
   indexed columns; the range bounds hold exactly those columns, and comparison
-  ignores each stored key's trailing primary key. An equality bound thus matches
-  every row sharing the indexed value, and an inclusive upper bound includes all
-  of its rows. Results are returned in index order, resolved to current heap rows.
+  ignores each stored key's trailing TID tiebreaker (the leaf value). An equality
+  bound thus matches every row sharing the indexed value, and an inclusive upper
+  bound includes all of its rows. Results are returned in index order, each read
+  directly from the heap at its TID. The `StoredRow.key` is recovered from the heap
+  row's primary key.
 - **Maintenance.** `insert` adds an entry to every index; `delete` removes the
   entry computed from the row being deleted; `update` removes the old entries and
   inserts the new ones (all removals before any insertion, so an unchanged unique
@@ -401,7 +401,7 @@ impl PageBackedStorageEngine {
 - After a restart, inserting a row or growing the index never reuses an on-disk page.
 - Failed insert that allocated a new page rolls back newly allocated pages through buffer rollback.
 - Heap, primary-key index, and secondary index files for the same numeric id stay distinct.
-- A secondary B-tree stores primary keys and a prefix range matches the indexed columns regardless of the trailing primary key.
+- A secondary B-tree stores heap TIDs and a prefix range matches the indexed columns regardless of the trailing TID tiebreaker; an index scan resolves to heap TIDs directly.
 - `create_index` backfills existing rows; `index_scan` returns them, and a non-unique index returns every row for a value.
 - Insert, update, and delete keep a secondary index in sync.
 - A unique index rejects a duplicate value on insert and on backfill, but allows multiple NULLs.

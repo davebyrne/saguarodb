@@ -216,9 +216,10 @@ impl PageBackedStorageEngine {
         BTree::new(self.buffer_pool.as_ref(), self.wal.as_ref(), index_file_id)
     }
 
-    /// The B-tree for a secondary index, keyed by the indexed columns and storing
-    /// the row's primary key as its value.
-    fn secondary_btree(&self, index: IndexId) -> BTree<'_, Key> {
+    /// The B-tree for a secondary index. Uniform with the primary-key index: keyed
+    /// by the indexed columns and storing the heap `RowLocation` (TID) as its value,
+    /// so duplicate indexed values are disambiguated by the `(key, tid)` ordering.
+    fn secondary_btree(&self, index: IndexId) -> BTree<'_, RowLocation> {
         BTree::new(
             self.buffer_pool.as_ref(),
             self.wal.as_ref(),
@@ -226,26 +227,28 @@ impl PageBackedStorageEngine {
         )
     }
 
-    /// Insert `(entry_key, pk)` into a secondary index, enforcing uniqueness for a
-    /// unique index. The multi-entry tree no longer rejects duplicate keys
-    /// structurally, so a unique index presence-probes its key first; its
-    /// `secondary_index_key` is `[indexed..]` alone (no pk tiebreaker), so a
-    /// duplicate indexed value collides and is rejected. A non-unique index (and a
-    /// unique index over a NULL value) embeds the pk in the key, so its keys are
-    /// distinct and no probe is needed. This presence-probe is TEMPORARY: Milestone
-    /// B commit 7 replaces it with a visibility-aware uniqueness check.
+    /// Insert `(entry_key, location)` into a secondary index, enforcing uniqueness
+    /// for a unique index. The secondary key is the indexed column(s) alone (no pk
+    /// tiebreaker); duplicate indexed values are disambiguated by the heap TID in
+    /// `(key, tid)` order. A unique index presence-probes its key first so a
+    /// duplicate non-NULL indexed value is rejected. A NULL indexed value never
+    /// participates in a unique constraint (SQL treats NULLs as distinct), so the
+    /// probe is skipped when `has_null`; distinct NULL rows coexist because their
+    /// heap TIDs differ. This presence-probe is TEMPORARY: Milestone B commit 7
+    /// replaces it with a visibility-aware uniqueness check.
     fn insert_secondary_entry(
         &self,
         ctx: &StatementContext,
         index: &IndexSchema,
         entry_key: &Key,
-        pk: &Key,
+        has_null: bool,
+        location: &RowLocation,
     ) -> Result<()> {
         let secondary = self.secondary_btree(index.id);
-        if index.unique && !secondary.scan_key(entry_key)?.is_empty() {
+        if index.unique && !has_null && !secondary.scan_key(entry_key)?.is_empty() {
             return Err(duplicate_unique_index(&index.name));
         }
-        secondary.insert(ctx.txn_id, entry_key, pk)
+        secondary.insert(ctx.txn_id, entry_key, location)
     }
 
     /// Append a WAL record (in `Normal` mode only) and return its assigned LSN.
@@ -434,8 +437,8 @@ impl StorageEngine for PageBackedStorageEngine {
         btree.insert(ctx.txn_id, &key, &location)?;
 
         for index in self.table_indexes(table)? {
-            let entry_key = secondary_index_key(&schema, &index, &row, &key)?;
-            self.insert_secondary_entry(ctx, &index, &entry_key, &key)?;
+            let (entry_key, has_null) = secondary_index_key(&schema, &index, &row)?;
+            self.insert_secondary_entry(ctx, &index, &entry_key, has_null, &location)?;
         }
 
         Ok(RowId {
@@ -467,11 +470,11 @@ impl StorageEngine for PageBackedStorageEngine {
                 storage_internal("primary-key index points to a dead row during delete")
             })?;
             for index in &indexes {
-                let entry_key = secondary_index_key(&schema, index, &row, key)?;
-                // Secondary value is the row's primary key (unchanged this
-                // milestone); remove the specific (entry_key, pk) entry.
+                let (entry_key, _has_null) = secondary_index_key(&schema, index, &row)?;
+                // The secondary value is the heap TID; remove the specific
+                // (entry_key, location) entry.
                 self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &entry_key, key)?;
+                    .remove(ctx.txn_id, &entry_key, &location)?;
             }
         }
 
@@ -517,15 +520,17 @@ impl StorageEngine for PageBackedStorageEngine {
 
         if let Some(previous_row) = previous_row {
             // Remove every old entry before inserting the new ones, so a unique
-            // index whose value is unchanged does not see a false duplicate.
+            // index whose value is unchanged does not see a false duplicate. The
+            // old entries point at `previous_location`; the new ones at
+            // `new_location` (the row relocated within the heap).
             for index in &indexes {
-                let old_key = secondary_index_key(&schema, index, &previous_row, key)?;
+                let (old_key, _has_null) = secondary_index_key(&schema, index, &previous_row)?;
                 self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &old_key, key)?;
+                    .remove(ctx.txn_id, &old_key, &previous_location)?;
             }
             for index in &indexes {
-                let new_key = secondary_index_key(&schema, index, &row, key)?;
-                self.insert_secondary_entry(ctx, index, &new_key, key)?;
+                let (new_key, has_null) = secondary_index_key(&schema, index, &row)?;
+                self.insert_secondary_entry(ctx, index, &new_key, has_null, &new_location)?;
             }
         }
 
@@ -574,27 +579,27 @@ impl StorageEngine for PageBackedStorageEngine {
         index: IndexId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
-        let (schema, pk_file_id) = self.table_handle(table)?;
+        let (schema, _pk_file_id) = self.table_handle(table)?;
         self.ensure_index_live(table, index)?;
 
-        // Walk the secondary index for the matching primary keys, then resolve
-        // each through the primary-key index to its current heap row.
-        let pk_btree = self.btree(pk_file_id);
+        // The secondary index points directly at heap TIDs (uniform with the
+        // primary-key index), so a scan reads the heap at each TID with no
+        // primary-key indirection.
         let entries = self.secondary_btree(index).range(range)?;
         let mut rows = Vec::with_capacity(entries.len());
-        for (_entry_key, pk) in entries {
-            let location = pk_btree.search(&pk)?.ok_or_else(|| {
-                storage_internal("secondary index points to a missing primary key")
-            })?;
+        for (_entry_key, location) in entries {
             let row = self
                 .read_location(&schema, location)?
                 .ok_or_else(|| storage_internal("secondary index resolves to a dead row"))?;
+            // The row's primary key is recovered from the heap row, preserving the
+            // `StoredRow.key` semantics callers relied on under secondary→PK.
+            let key = key_for_row(&schema, &row)?;
             rows.push(StoredRow {
                 row_id: RowId {
                     page_num: location.page_num,
                     slot_num: location.slot_num,
                 },
-                key: pk,
+                key,
                 row,
             });
         }
@@ -712,17 +717,18 @@ impl SchemaOperations for PageBackedStorageEngine {
             );
         }
         // Build the empty secondary tree (its pages are full-page-image redo), then
-        // backfill it from the live rows via the primary-key index.
+        // backfill it from the live rows via the primary-key index. Each secondary
+        // entry points directly at the heap TID (uniform with the primary key).
         let secondary = self.secondary_btree(schema.id);
         secondary.create(ctx.txn_id)?;
-        for (pk, location) in self.btree(pk_file_id).range(&KeyRange::All)? {
+        for (_pk, location) in self.btree(pk_file_id).range(&KeyRange::All)? {
             let row = self
                 .read_location(&table_schema, location)?
                 .ok_or_else(|| {
                     storage_internal("primary-key index points to a dead row during index backfill")
                 })?;
-            let key = secondary_index_key(&table_schema, schema, &row, &pk)?;
-            self.insert_secondary_entry(ctx, schema, &key, &pk)?;
+            let (key, has_null) = secondary_index_key(&table_schema, schema, &row)?;
+            self.insert_secondary_entry(ctx, schema, &key, has_null, &location)?;
         }
         Ok(())
     }
@@ -798,28 +804,22 @@ fn column_value(schema: &TableSchema, row: &Row, column_id: ColumnId) -> Result<
         .ok_or_else(|| storage_internal("row is missing a column value"))
 }
 
-/// The secondary-index B-tree key for `row`. Non-unique indexes append the
-/// primary key so every entry is distinct; a unique index keys on the indexed
-/// values alone so the tree rejects duplicates — except when an indexed value is
-/// NULL, where the primary key is appended too, because SQL treats NULLs as
-/// distinct.
-fn secondary_index_key(
-    table: &TableSchema,
-    index: &IndexSchema,
-    row: &Row,
-    pk: &Key,
-) -> Result<Key> {
-    let mut values = Vec::with_capacity(index.columns.len() + pk.0.len());
+/// The secondary-index B-tree key for `row`: just the encoded indexed column(s).
+/// The primary key is no longer embedded — duplicate secondary keys are
+/// disambiguated by the heap TID in the tree's `(key, tid)` ordering. Returns the
+/// key together with whether any indexed value is NULL, so the unique-constraint
+/// probe can skip NULL keys (SQL treats NULLs as distinct, so NULL never
+/// participates in a unique constraint; distinct NULL rows coexist via their
+/// differing TIDs).
+fn secondary_index_key(table: &TableSchema, index: &IndexSchema, row: &Row) -> Result<(Key, bool)> {
+    let mut values = Vec::with_capacity(index.columns.len());
     let mut has_null = false;
     for column_id in &index.columns {
         let value = column_value(table, row, *column_id)?;
         has_null |= matches!(value, Value::Null);
         values.push(value);
     }
-    if !index.unique || has_null {
-        values.extend(pk.0.iter().cloned());
-    }
-    Ok(Key(values))
+    Ok((Key(values), has_null))
 }
 
 fn live_table(state: &StorageState, table: TableId) -> Result<&TableState> {

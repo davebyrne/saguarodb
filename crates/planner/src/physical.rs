@@ -415,10 +415,10 @@ fn plan_scan(
 }
 
 /// Pick the index whose leading column the filter constrains best: an equality
-/// match beats a range, the primary key beats a secondary index (it avoids the
-/// secondary → primary-key → heap indirection), and a lower index id breaks
-/// remaining ties. Returns the chosen index id and its key candidate, or `None`
-/// to fall back to a sequential scan.
+/// match beats a range, the primary key beats a secondary index (it is the
+/// canonical access path and reads no separate secondary file), and a lower index
+/// id breaks remaining ties. Returns the chosen index id and its key candidate, or
+/// `None` to fall back to a sequential scan.
 fn best_index_scan(
     schema: &common::TableSchema,
     table: TableId,

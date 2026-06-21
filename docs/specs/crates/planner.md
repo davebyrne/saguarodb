@@ -396,7 +396,7 @@ pub enum PhysicalPlan {
 ## V1 Physical Rules
 
 - A scan with an equality or range predicate on the leading column of an index — the primary-key index or a secondary index — becomes an `IndexScan` over that index (`index = PRIMARY_KEY_INDEX_ID` for the primary key, else the secondary index id), with `range` an exact or bounded `KeyRange` over that column.
-- When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it avoids the secondary → primary-key → heap indirection), and a lower index id breaks remaining ties.
+- When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it is the canonical access path and reads no separate secondary file), and a lower index id breaks remaining ties.
 - `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
 - A lower-bound and an upper-bound comparison on the *same* index column fuse into one two-sided `KeyRange::Range`, consuming both conjuncts. For `WHERE id > 5 AND id < 10`, the range is `(5, 10)` (both bounds excluded) and the residual filter is `None`. This remains a single-column range; multi-column composite-index ranges are not produced in v1.
 - Otherwise scans are `SeqScan`.

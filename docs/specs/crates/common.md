@@ -120,7 +120,7 @@ pub struct IndexSchema {
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
 
-`IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate indexed values; a non-unique index appends the primary key to make each entry distinct on disk.
+`IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate non-NULL indexed values (NULLs are distinct); a non-unique index admits duplicates. On disk every index entry is disambiguated by the heap TID it points at (see `storage` Secondary Indexes), so no metadata distinguishes the two beyond the `unique` flag.
 
 ## Error Model
 

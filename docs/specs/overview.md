@@ -1146,7 +1146,7 @@ pub trait SchemaOperations: Send + Sync {
 
 Every operation takes a `StatementContext`. In V1 this carries only the autocommit `txn_id`. When MVCC is added, the context gains snapshot visibility, isolation level, and write-set tracking — without changing any call sites.
 
-`scan_range` serves primary-key `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. Secondary-index `IndexScan` nodes use `index_scan(table, index, range)`, which walks the secondary B-tree and resolves each entry's primary key through the primary-key index.
+`scan_range` serves primary-key `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. Secondary-index `IndexScan` nodes use `index_scan(table, index, range)`, which walks the secondary B-tree and reads each entry's heap row directly at the stored TID (secondary indexes point at heap TIDs, uniform with the primary-key index — no primary-key indirection).
 
 ### Page Format (8KB Pages)
 

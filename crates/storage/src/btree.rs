@@ -3,14 +3,14 @@
 //! in the heap; this tree replaces the in-memory primary-key directory.
 //!
 //! Duplicate user-keys are allowed; entries sharing a key are ordered and
-//! disambiguated by their `value` (the heap `RowLocation` for the primary-key
-//! index). The primary-key index stores exactly one entry per key in this
-//! milestone (single version); engine-level uniqueness is enforced by a presence
-//! probe before insert, replacing the structural duplicate-key rejection the tree
-//! used to do (see `engine.rs`). A secondary index already embeds the primary key
-//! into its user-key (`secondary_index_key`), so its keys remain distinct and no
-//! duplicates arise for it yet (converting secondary values to heap TIDs is a
-//! later commit, B2.4).
+//! disambiguated by their `value` (the heap `RowLocation`). The primary-key index
+//! stores exactly one entry per key in this milestone (single version);
+//! engine-level uniqueness is enforced by a presence probe before insert,
+//! replacing the structural duplicate-key rejection the tree used to do (see
+//! `engine.rs`). Secondary indexes are now uniform with the primary-key index:
+//! they store the heap `RowLocation` directly (keyed by the indexed column(s)
+//! alone, no embedded primary key), so duplicate indexed values coexist as
+//! `(key, tid)` entries.
 //!
 //! Page 0 is the metapage (holds the root page number); other pages are leaf or
 //! internal nodes (`index_page`). Leaves are singly linked left-to-right for
@@ -43,9 +43,9 @@ const META_PAGE: PageNum = 0;
 const LOCATION_LEN: usize = 10;
 const CHILD_LEN: usize = 4;
 
-/// A value stored in a B-tree leaf. The primary-key index stores a `RowLocation`
-/// (fixed width); a secondary index stores the row's primary `Key` (variable
-/// width). The tree itself treats values as opaque bytes; this trait is the only
+/// A value stored in a B-tree leaf. Every index (primary-key and secondary) stores
+/// a fixed-width `RowLocation` (heap TID); the trait keeps the value encoding
+/// pluggable. The tree itself treats values as opaque bytes; this trait is the only
 /// place a value's on-page encoding is defined. Entries with equal user-keys are
 /// ordered by the raw value bytes, so `encode` doubles as the value's sort key.
 pub(crate) trait IndexValue: Sized {
@@ -71,16 +71,6 @@ impl IndexValue for RowLocation {
             page_num: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
             slot_num: u16::from_le_bytes(bytes[8..10].try_into().expect("2 bytes")),
         })
-    }
-}
-
-impl IndexValue for Key {
-    fn encode(&self) -> Result<Vec<u8>> {
-        encode_key(self)
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        decode_key(bytes)
     }
 }
 
@@ -268,10 +258,11 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     ///
     /// Comparison uses only the leading components of each key that the range's
     /// bounds constrain (their length). For the primary-key index the bounds are
-    /// full keys, so this is an exact-key range. For a secondary index the bounds
-    /// constrain the indexed columns while each stored key is `[indexed.., pk]`,
-    /// so the trailing primary key is ignored — an equality bound matches every
-    /// row sharing the indexed value. Entries are returned with their full key.
+    /// full keys, so this is an exact-key range. For a secondary index each stored
+    /// key is just `[indexed..]` (no embedded primary key) and equal indexed values
+    /// are disambiguated by the leaf `value` (heap TID), so an equality bound
+    /// matches every row sharing the indexed value. Entries are returned with their
+    /// full key.
     pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, V)>> {
         let prefix_len = comparison_prefix_len(range);
         let mut page_num = self.start_leaf(range)?;
@@ -778,7 +769,7 @@ mod tests {
             BTree::new(self.buffer.as_ref(), self.wal.as_ref(), INDEX_FILE)
         }
 
-        fn secondary_tree(&self) -> BTree<'_, Key> {
+        fn secondary_tree(&self) -> BTree<'_, RowLocation> {
             BTree::new(self.buffer.as_ref(), self.wal.as_ref(), SECONDARY_FILE)
         }
     }
@@ -969,9 +960,8 @@ mod tests {
             let buffer = fixture.buffer.as_ref();
             // Descend the leftmost spine to the first leaf, then follow links.
             let mut page_num = {
-                let mut current = index_page::meta_root(
-                    buffer.read_page(INDEX_FILE, META_PAGE).unwrap().data(),
-                );
+                let mut current =
+                    index_page::meta_root(buffer.read_page(INDEX_FILE, META_PAGE).unwrap().data());
                 loop {
                     let guard = buffer.read_page(INDEX_FILE, current).unwrap();
                     if index_page::is_leaf(guard.data()) {
@@ -1055,35 +1045,58 @@ mod tests {
         // Remove the 2nd-leaf entry. Exactly that entry must disappear; every
         // other value must remain exactly once, in order; the count drops by 1.
         let before = scanned.len();
-        assert!(tree.remove(1, &dup_key, &value_of(target_second_mid)).unwrap());
+        assert!(
+            tree.remove(1, &dup_key, &value_of(target_second_mid))
+                .unwrap()
+        );
         present.remove(&target_second_mid);
         let after = tree.scan_key(&dup_key).unwrap();
-        assert_eq!(after, expected_order(&present), "after removing 2nd-leaf entry");
+        assert_eq!(
+            after,
+            expected_order(&present),
+            "after removing 2nd-leaf entry"
+        );
         assert_eq!(after.len(), before - 1, "exactly one entry removed");
         assert!(!after.contains(&value_of(target_second_mid)));
 
         // Re-removing the same (now-absent) entry is a no-op returning false and
         // must not perturb the multiset — catches a stray double-remove.
-        assert!(!tree.remove(1, &dup_key, &value_of(target_second_mid)).unwrap());
+        assert!(
+            !tree
+                .remove(1, &dup_key, &value_of(target_second_mid))
+                .unwrap()
+        );
         assert_eq!(tree.scan_key(&dup_key).unwrap(), expected_order(&present));
 
         // Remove the 3rd-leaf boundary entry (a leaf/internal-separator boundary).
         let before = present.len();
         assert!(
-            tree.remove(1, &dup_key, &value_of(target_third_boundary)).unwrap()
+            tree.remove(1, &dup_key, &value_of(target_third_boundary))
+                .unwrap()
         );
         present.remove(&target_third_boundary);
         let after = tree.scan_key(&dup_key).unwrap();
-        assert_eq!(after, expected_order(&present), "after removing 3rd-leaf boundary");
+        assert_eq!(
+            after,
+            expected_order(&present),
+            "after removing 3rd-leaf boundary"
+        );
         assert_eq!(after.len(), before - 1, "exactly one entry removed");
         assert!(!after.contains(&value_of(target_third_boundary)));
 
         // Remove a 3rd-leaf middle entry for good measure.
         let before = present.len();
-        assert!(tree.remove(1, &dup_key, &value_of(target_third_mid)).unwrap());
+        assert!(
+            tree.remove(1, &dup_key, &value_of(target_third_mid))
+                .unwrap()
+        );
         present.remove(&target_third_mid);
         let after = tree.scan_key(&dup_key).unwrap();
-        assert_eq!(after, expected_order(&present), "after removing 3rd-leaf middle");
+        assert_eq!(
+            after,
+            expected_order(&present),
+            "after removing 3rd-leaf middle"
+        );
         assert_eq!(after.len(), before - 1, "exactly one entry removed");
         assert!(!after.contains(&value_of(target_third_mid)));
 
@@ -1281,84 +1294,65 @@ mod tests {
     }
 
     #[test]
-    fn stores_primary_key_values_for_a_secondary_index() {
+    fn stores_heap_tids_for_a_secondary_index() {
         let fixture = Fixture::new(64);
         let tree = fixture.secondary_tree();
         tree.create(1).unwrap();
 
-        // Secondary-index shape: key = [indexed_value, pk], value = pk. The same
-        // indexed value (10) appears twice, distinguished by the trailing pk.
-        let entry = |indexed: i64, pk: i64| {
-            (
-                Key(vec![Value::Integer(indexed), Value::Integer(pk)]),
-                Key(vec![Value::Integer(pk)]),
-            )
-        };
-        for (indexed, pk) in [(20, 3), (10, 1), (10, 2)] {
-            let (composite, primary) = entry(indexed, pk);
-            tree.insert(1, &composite, &primary).unwrap();
+        // Secondary-index shape (uniform with the primary key): key = [indexed_value]
+        // alone, value = heap TID. The same indexed value (10) appears twice,
+        // disambiguated by the trailing TID in `(key, tid)` order.
+        let indexed = |value: i64| Key(vec![Value::Integer(value)]);
+        for (value, slot) in [(20, 3u16), (10, 1), (10, 2)] {
+            tree.insert(1, &indexed(value), &location(0, slot)).unwrap();
         }
 
-        let (composite, primary) = entry(10, 1);
-        assert_eq!(tree.search(&composite).unwrap(), Some(primary));
+        // A point scan of indexed value 10 returns both TIDs in `(key, tid)` order.
+        assert_eq!(
+            tree.scan_key(&indexed(10)).unwrap(),
+            vec![location(0, 1), location(0, 2)]
+        );
 
-        // Range order follows the composite key, so pks come back 1, 2, 3.
-        let pks: Vec<_> = tree
+        // Range order follows (indexed value, tid), so TIDs come back 1, 2, 3.
+        let tids: Vec<_> = tree
             .range(&KeyRange::All)
             .unwrap()
             .into_iter()
-            .map(|(_, pk)| pk)
+            .map(|(_, tid)| tid)
             .collect();
-        assert_eq!(
-            pks,
-            vec![
-                Key(vec![Value::Integer(1)]),
-                Key(vec![Value::Integer(2)]),
-                Key(vec![Value::Integer(3)]),
-            ]
-        );
+        assert_eq!(tids, vec![location(0, 1), location(0, 2), location(0, 3)]);
     }
 
     #[test]
-    fn range_matches_indexed_prefix_ignoring_trailing_primary_key() {
+    fn range_matches_indexed_prefix_disambiguated_by_tid() {
         let fixture = Fixture::new(64);
         let tree = fixture.secondary_tree();
         tree.create(1).unwrap();
 
-        for (indexed, pk) in [(10, 1), (10, 5), (20, 2), (30, 3)] {
-            tree.insert(
-                1,
-                &Key(vec![Value::Integer(indexed), Value::Integer(pk)]),
-                &Key(vec![Value::Integer(pk)]),
-            )
-            .unwrap();
+        // key = [indexed value] alone; equal indexed values share a key and are
+        // disambiguated by the heap TID (the leaf value), not an embedded pk.
+        for (indexed, slot) in [(10, 1u16), (10, 5), (20, 2), (30, 3)] {
+            tree.insert(1, &Key(vec![Value::Integer(indexed)]), &location(0, slot))
+                .unwrap();
         }
-        let pks = |entries: Vec<(Key, Key)>| -> Vec<i64> {
-            entries
-                .into_iter()
-                .map(|(_, pk)| match pk.0[0] {
-                    Value::Integer(value) => value,
-                    _ => unreachable!(),
-                })
-                .collect()
+        let slots = |entries: Vec<(Key, RowLocation)>| -> Vec<u16> {
+            entries.into_iter().map(|(_, tid)| tid.slot_num).collect()
         };
 
-        // Equality on the indexed value returns every row sharing it (both pks),
-        // though the stored keys differ in their trailing pk.
+        // Equality on the indexed value returns every row sharing it (both TIDs).
         let eq = tree
             .range(&KeyRange::Exact(Key(vec![Value::Integer(10)])))
             .unwrap();
-        assert_eq!(pks(eq), vec![1, 5]);
+        assert_eq!(slots(eq), vec![1, 5]);
 
-        // An inclusive upper bound on the indexed value still includes its rows,
-        // which a naive full-key compare would wrongly drop (since [20, pk] > [20]).
+        // An inclusive bound on the indexed value still includes its rows.
         let inclusive = tree
             .range(&KeyRange::Range {
                 start: Bound::Included(Key(vec![Value::Integer(20)])),
                 end: Bound::Included(Key(vec![Value::Integer(20)])),
             })
             .unwrap();
-        assert_eq!(pks(inclusive), vec![2]);
+        assert_eq!(slots(inclusive), vec![2]);
 
         // A half-open range over the indexed value.
         let bounded = tree
@@ -1367,6 +1361,6 @@ mod tests {
                 end: Bound::Excluded(Key(vec![Value::Integer(30)])),
             })
             .unwrap();
-        assert_eq!(pks(bounded), vec![1, 5, 2]);
+        assert_eq!(slots(bounded), vec![1, 5, 2]);
     }
 }

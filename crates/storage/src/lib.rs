@@ -671,6 +671,130 @@ mod tests {
     }
 
     #[test]
+    fn secondary_scan_resolves_heap_tids_directly() {
+        // Secondary entries now store the heap TID directly (not the primary key),
+        // so a scan reads the heap at that TID with no primary-key indirection.
+        // Updating a row keeps its indexed value but relocates the heap tuple to a
+        // new TID; the secondary entry must follow to the new TID, and a point scan
+        // must return the row's current contents — which only holds if the entry's
+        // value is the heap TID, not the (unchanged) primary key.
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        // Update a non-indexed column (active true -> false); the name is unchanged
+        // but the heap row relocates to a fresh slot.
+        harness
+            .storage
+            .update(&ctx, 1, &pk(1), user_row(1, "Ada", false))
+            .unwrap();
+
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(&ctx, 1, 1, &name_eq("Ada"))
+                .unwrap(),
+        );
+        // The scan resolves to the relocated tuple's current contents.
+        assert_eq!(rows, vec![user_row(1, "Ada", false)]);
+    }
+
+    #[test]
+    fn secondary_point_scan_returns_all_rows_for_a_value() {
+        // A non-unique secondary point scan returns every row sharing the indexed
+        // value, each resolved straight to its heap TID.
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+        for id in [1, 2, 3] {
+            harness
+                .storage
+                .insert(&ctx, 1, user_row(id, "Sam", id % 2 == 0))
+                .unwrap();
+        }
+
+        let mut ids = index_ids(&harness, "Sam");
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn unique_index_keeps_and_scans_multiple_null_rows() {
+        // Multiple rows whose indexed value is NULL coexist under a UNIQUE
+        // secondary index (SQL NULLs are distinct), now disambiguated by their
+        // differing heap TIDs rather than an embedded primary key. A scan of the
+        // NULL key returns every such row.
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap();
+
+        for id in [1, 2, 3] {
+            harness
+                .storage
+                .insert(&ctx, 1, user_row_null_name(id))
+                .unwrap();
+        }
+
+        // All three NULL-name rows are present and the unique index did not reject
+        // them; scanning the NULL key returns all three.
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(&ctx, 1, 1, &KeyRange::Exact(Key(vec![Value::Null])))
+                .unwrap(),
+        );
+        let mut ids: Vec<i64> = rows
+            .into_iter()
+            .map(|row| match row.values[0] {
+                Value::Integer(id) => id,
+                ref other => panic!("expected integer id, got {other:?}"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn unique_index_rejects_duplicate_non_null_value() {
+        // A duplicate non-NULL value under a UNIQUE secondary index is rejected by
+        // the temporary presence-probe, even though the key no longer embeds the
+        // primary key as a tiebreaker.
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Ada", false))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
     fn dropped_index_is_not_maintained_or_scannable() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
