@@ -329,7 +329,7 @@ The protocol layer is generic over IO — it works with byte buffers, not socket
 ```rust
 /// Incoming message from a client (decoded by the protocol layer)
 pub enum ClientMessage {
-    Startup { user: String, database: Option<String> },
+    Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
     Query(String),
     Terminate,
@@ -422,11 +422,11 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 All integer fields are big-endian. All server messages except the SSL negotiation reply are one-byte tag plus a four-byte length that includes the length field but not the tag. The SSL negotiation reply is exactly a single byte: `S` for acceptance, `N` for rejection.
 
 - Client `SSLRequest`: startup-style packet with length `8` and code `80877103`.
-- Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; V1 reads `user` and optional `database`.
+- Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; V1 reads `user`, optional `database`, and optional `application_name`.
 - Client `Query`: tag `Q`, length, nul-terminated SQL string.
 - Client `Terminate`: tag `X`, length `4`.
 - Server `AuthenticationOk`: tag `R`, length `8`, auth code `0`.
-- Server `ParameterStatus`: tag `S`, `key\0value\0`; startup emits at least `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, and `integer_datetimes=on`.
+- Server `ParameterStatus`: tag `S`, `key\0value\0`; startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
 - Server `ReadyForQuery`: tag `Z`, length `5`, status byte `I`.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.

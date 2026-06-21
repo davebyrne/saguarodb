@@ -5,6 +5,7 @@ pub enum ClientMessage {
     Startup {
         user: String,
         database: Option<String>,
+        application_name: Option<String>,
     },
     SslRequest,
     Query(String),

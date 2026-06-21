@@ -53,8 +53,12 @@ impl PostgresCodec {
             return Err(protocol_error("unsupported PostgreSQL startup protocol"));
         }
 
-        let (user, database) = decode_startup_params(&packet[8..])?;
-        messages.push(ClientMessage::Startup { user, database });
+        let (user, database, application_name) = decode_startup_params(&packet[8..])?;
+        messages.push(ClientMessage::Startup {
+            user,
+            database,
+            application_name,
+        });
         Ok(true)
     }
 
@@ -200,10 +204,11 @@ impl ProtocolCodec for PostgresCodec {
     }
 }
 
-fn decode_startup_params(bytes: &[u8]) -> Result<(String, Option<String>)> {
+fn decode_startup_params(bytes: &[u8]) -> Result<(String, Option<String>, Option<String>)> {
     let mut offset = 0;
     let mut user = None;
     let mut database = None;
+    let mut application_name = None;
 
     loop {
         let key = read_cstr(bytes, &mut offset)?;
@@ -214,12 +219,13 @@ fn decode_startup_params(bytes: &[u8]) -> Result<(String, Option<String>)> {
         match key {
             "user" => user = Some(value.to_string()),
             "database" => database = Some(value.to_string()),
+            "application_name" => application_name = Some(value.to_string()),
             _ => {}
         }
     }
 
     let user = user.ok_or_else(|| protocol_error("startup message is missing user"))?;
-    Ok((user, database))
+    Ok((user, database, application_name))
 }
 
 fn read_cstr<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a str> {

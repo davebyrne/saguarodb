@@ -116,6 +116,7 @@ mod tests {
             .handle_message(ClientMessage::Startup {
                 user: "dave".to_string(),
                 database: Some("saguaro".to_string()),
+                application_name: Some("psql".to_string()),
             })
             .unwrap();
 
@@ -130,12 +131,32 @@ mod tests {
             ("client_encoding", "UTF8"),
             ("DateStyle", "ISO"),
             ("integer_datetimes", "on"),
+            ("standard_conforming_strings", "on"),
+            ("TimeZone", "UTC"),
+            ("application_name", "psql"),
         ] {
             assert!(messages.contains(&ServerMessage::ParameterStatus {
                 key: key.to_string(),
                 value: value.to_string(),
             }));
         }
+    }
+
+    #[test]
+    fn startup_without_application_name_reports_it_empty() {
+        let mut state = PostgresConnectionState::new();
+        let messages = state
+            .handle_message(ClientMessage::Startup {
+                user: "dave".to_string(),
+                database: None,
+                application_name: None,
+            })
+            .unwrap();
+
+        assert!(messages.contains(&ServerMessage::ParameterStatus {
+            key: "application_name".to_string(),
+            value: String::new(),
+        }));
     }
 
     #[test]
@@ -159,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_startup_message_reads_user_database_and_buffers_incomplete_input() {
+    fn decodes_startup_message_reads_user_database_application_name_and_buffers_incomplete_input() {
         let mut codec = PostgresCodec::new();
         let packet = startup_bytes("dave", Some("saguaro"));
         let split = packet.len() - 2;
@@ -170,6 +191,7 @@ mod tests {
             vec![ClientMessage::Startup {
                 user: "dave".to_string(),
                 database: Some("saguaro".to_string()),
+                application_name: Some("psql".to_string()),
             }]
         );
     }
