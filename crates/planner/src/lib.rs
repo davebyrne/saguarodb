@@ -1148,4 +1148,30 @@ mod tests {
             "expected residual filter, got: {text}"
         );
     }
+
+    #[test]
+    fn physical_planner_fuses_two_sided_range_on_primary_key() {
+        use common::{Key, KeyRange};
+        use std::ops::Bound;
+        let catalog = catalog_with_users();
+        let physical = plan_of(&catalog, "select name from users where id > 5 and id < 10");
+        assert_eq!(
+            first_index_scan_range(&physical),
+            Some(&KeyRange::Range {
+                start: Bound::Excluded(Key(vec![Value::Integer(5)])),
+                end: Bound::Excluded(Key(vec![Value::Integer(10)])),
+            })
+        );
+        // Both conjuncts are consumed by the range, so no residual filter remains.
+        let PhysicalPlan::Projection { source, .. } = &physical else {
+            panic!("expected projection, got {physical:?}");
+        };
+        assert!(
+            matches!(
+                source.as_ref(),
+                PhysicalPlan::IndexScan { filter: None, .. }
+            ),
+            "expected no residual filter, got {source:?}"
+        );
+    }
 }

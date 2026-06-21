@@ -452,11 +452,11 @@ fn best_index_scan(
 #[derive(Clone)]
 struct KeyCandidate {
     range: KeyRange,
-    consumed: BoundExpr,
+    consumed: Vec<BoundExpr>,
     exact: bool,
 }
 
-fn best_key_candidate(expr: &BoundExpr, primary_key: ColumnId) -> Option<KeyCandidate> {
+fn best_key_candidate(expr: &BoundExpr, key_column: ColumnId) -> Option<KeyCandidate> {
     match expr {
         BoundExpr::BinaryOp {
             left,
@@ -464,15 +464,67 @@ fn best_key_candidate(expr: &BoundExpr, primary_key: ColumnId) -> Option<KeyCand
             right,
             ..
         } => match (
-            best_key_candidate(left, primary_key),
-            best_key_candidate(right, primary_key),
+            best_key_candidate(left, key_column),
+            best_key_candidate(right, key_column),
         ) {
-            (Some(left), Some(right)) if right.exact && !left.exact => Some(right),
-            (Some(left), _) => Some(left),
+            (Some(left), Some(right)) => Some(fuse_candidates(left, right)),
+            (Some(left), None) => Some(left),
             (None, right) => right,
         },
-        _ => key_candidate_from_comparison(expr, primary_key),
+        _ => key_candidate_from_comparison(expr, key_column),
     }
+}
+
+/// Combine two candidates over the same index column: an exact match wins; a
+/// lower bound and an upper bound fuse into a two-sided range consuming both;
+/// otherwise keep the left candidate.
+fn fuse_candidates(left: KeyCandidate, right: KeyCandidate) -> KeyCandidate {
+    if left.exact {
+        return left;
+    }
+    if right.exact {
+        return right;
+    }
+    combine_ranges(&left, &right).unwrap_or(left)
+}
+
+fn combine_ranges(left: &KeyCandidate, right: &KeyCandidate) -> Option<KeyCandidate> {
+    let (
+        KeyRange::Range {
+            start: left_start,
+            end: left_end,
+        },
+        KeyRange::Range {
+            start: right_start,
+            end: right_end,
+        },
+    ) = (&left.range, &right.range)
+    else {
+        return None;
+    };
+
+    // One candidate must be a pure lower bound (end unbounded) and the other a
+    // pure upper bound (start unbounded).
+    let (start, end) =
+        if matches!(left_end, Bound::Unbounded) && matches!(right_start, Bound::Unbounded) {
+            (left_start.clone(), right_end.clone())
+        } else if matches!(left_start, Bound::Unbounded) && matches!(right_end, Bound::Unbounded) {
+            (right_start.clone(), left_end.clone())
+        } else {
+            return None;
+        };
+
+    if matches!(start, Bound::Unbounded) || matches!(end, Bound::Unbounded) {
+        return None;
+    }
+
+    let mut consumed = left.consumed.clone();
+    consumed.extend(right.consumed.clone());
+    Some(KeyCandidate {
+        range: KeyRange::Range { start, end },
+        consumed,
+        exact: false,
+    })
 }
 
 fn key_candidate_from_comparison(expr: &BoundExpr, primary_key: ColumnId) -> Option<KeyCandidate> {
@@ -516,14 +568,11 @@ fn key_candidate_from_comparison(expr: &BoundExpr, primary_key: ColumnId) -> Opt
     Some(KeyCandidate {
         exact: matches!(range, KeyRange::Exact(_)),
         range,
-        consumed: expr.clone(),
+        consumed: vec![expr.clone()],
     })
 }
 
-fn residual_filter(expr: BoundExpr, consumed: &BoundExpr) -> Option<BoundExpr> {
-    if &expr == consumed {
-        return None;
-    }
+fn residual_filter(expr: BoundExpr, consumed: &[BoundExpr]) -> Option<BoundExpr> {
     match expr {
         BoundExpr::BinaryOp {
             left,
@@ -546,7 +595,13 @@ fn residual_filter(expr: BoundExpr, consumed: &BoundExpr) -> Option<BoundExpr> {
             (None, Some(right)) => Some(right),
             (None, None) => None,
         },
-        other => Some(other),
+        other => {
+            if consumed.contains(&other) {
+                None
+            } else {
+                Some(other)
+            }
+        }
     }
 }
 
