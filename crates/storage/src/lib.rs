@@ -723,6 +723,32 @@ mod tests {
         assert_eq!(err.code, SqlState::UndefinedTable);
     }
 
+    #[test]
+    fn drop_table_cascades_to_its_secondary_indexes() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext { txn_id: 1 };
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        // Dropping the table cascades to its index state; the table and its
+        // index are both gone.
+        harness.storage.drop_table(&ctx, 1).unwrap();
+
+        let err = harness
+            .storage
+            .index_scan(&ctx, 1, 1, &name_eq("Ada"))
+            .err()
+            .expect("a dropped table's index should not be scannable");
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {

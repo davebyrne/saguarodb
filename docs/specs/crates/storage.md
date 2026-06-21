@@ -171,8 +171,11 @@ used for a secondary index.
   and backfills it by scanning the live rows through the primary-key index
   (a duplicate value for a unique index fails the build with `UniqueViolation`).
   `drop_index` marks the index dropped and leaves its pages in place (accepted
-  bloat, like `drop_table`). The engine learns a table's live indexes from the
-  installed index schemas (`install_index_schemas`) plus in-session creates.
+  bloat, like `drop_table`). `drop_table` (and its recovery replay) cascades to
+  mark the table's secondary indexes dropped too, keeping storage's index set
+  consistent with the catalog's drop-table cascade. The engine learns a table's
+  live indexes from the installed index schemas (`install_index_schemas`) plus
+  in-session creates.
 - **Crash safety.** Like the primary-key index, every secondary node mutation
   logs a `FullPageImage` and stamps the page-LSN, so index pages recover through
   the same redo path as the heap. Index *metadata* (which indexes exist) is made

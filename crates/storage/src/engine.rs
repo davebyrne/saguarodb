@@ -132,6 +132,10 @@ impl PageBackedStorageEngine {
         if let Some(table_state) = state.tables.get_mut(&table) {
             table_state.dropped = true;
         }
+        // Recovery replays a single DropTable record; cascade to the table's
+        // indexes here, matching the catalog's apply_drop_table cascade. txn 0
+        // means no rollback tracking.
+        mark_table_indexes_dropped(&mut state, 0, table);
         Ok(())
     }
 
@@ -657,6 +661,9 @@ impl SchemaOperations for PageBackedStorageEngine {
             .ok_or_else(|| undefined_table(table))?;
         // V1 leaves the heap and index pages in place (no physical reclaim).
         table_state.dropped = true;
+        // Cascade to the table's secondary indexes, mirroring the catalog's
+        // drop-table cascade so the two stay consistent.
+        mark_table_indexes_dropped(&mut state, ctx.txn_id, table);
         Ok(())
     }
 
@@ -830,6 +837,24 @@ fn record_index_before(state: &mut StorageState, txn_id: u64, index: IndexId) {
         .indexes
         .entry(index)
         .or_insert(previous);
+}
+
+/// Mark every live secondary index on `table` dropped (with rollback tracking
+/// under `txn_id`; `0` skips it for recovery). Dropping a table cascades to its
+/// indexes, keeping storage's index set consistent with the catalog's.
+fn mark_table_indexes_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {
+    let index_ids: Vec<IndexId> = state
+        .indexes
+        .iter()
+        .filter(|(_, index)| !index.dropped && index.schema.table == table)
+        .map(|(id, _)| *id)
+        .collect();
+    for index_id in index_ids {
+        record_index_before(state, txn_id, index_id);
+        if let Some(index) = state.indexes.get_mut(&index_id) {
+            index.dropped = true;
+        }
+    }
 }
 
 fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {
