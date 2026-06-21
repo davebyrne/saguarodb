@@ -5,3 +5,4 @@ pub mod connection;
 pub mod query;
 pub mod recovery;
 pub mod shutdown;
+pub mod tls;

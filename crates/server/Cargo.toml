@@ -19,7 +19,10 @@ planner = { package = "saguarodb-planner", path = "../planner" }
 protocol = { package = "saguarodb-protocol", path = "../protocol" }
 storage = { package = "saguarodb-storage", path = "../storage" }
 wal = { package = "saguarodb-wal", path = "../wal" }
+rustls-pemfile.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true

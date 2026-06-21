@@ -42,4 +42,4 @@ Each crate owns focused unit tests for its public contract. Cross-crate behavior
 - SQL pipeline: parse, bind, plan, explain.
 - Execution: SELECT, INSERT, UPDATE, DELETE against in-memory storage.
 - Durability: commit, rollback, checkpoint, recovery replay.
-- Protocol: startup, SSL rejection, simple query response shape.
+- Protocol: startup, SSL negotiation (accept/reject), simple query response shape.

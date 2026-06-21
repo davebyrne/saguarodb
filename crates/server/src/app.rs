@@ -6,6 +6,7 @@ use catalog::CatalogManager;
 use common::ConcurrencyController;
 use control::ControlStore;
 use storage::PageBackedStorageEngine;
+use tokio_rustls::TlsAcceptor;
 use wal::WalManager;
 
 use crate::checkpoint::CheckpointState;
@@ -25,6 +26,8 @@ pub struct ServerComponents {
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
+    /// TLS acceptor when the server is configured for SSL, else `None`.
+    pub tls: Option<TlsAcceptor>,
 }
 
 pub struct AppState {

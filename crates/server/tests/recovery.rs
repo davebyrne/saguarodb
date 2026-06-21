@@ -211,6 +211,7 @@ async fn recovery_succeeds_with_buffer_smaller_than_working_set() {
         checkpoint_every_n_commits: 1_000,
         checkpoint_wal_bytes: 64 * 1024 * 1024,
         shutdown_timeout_ms: 1_000,
+        ..Default::default()
     };
     let app = saguarodb_server::recovery::open_app(config).unwrap();
     let result = app
@@ -233,6 +234,7 @@ async fn committed_pages_spill_to_heap_under_buffer_pressure() {
         checkpoint_every_n_commits: 1_000_000,
         checkpoint_wal_bytes: 1 << 30,
         shutdown_timeout_ms: 1_000,
+        ..Default::default()
     };
     let app = saguarodb_server::recovery::open_app(config).unwrap();
     app.query_service
@@ -319,6 +321,7 @@ async fn split_index_survives_restart_and_post_restart_growth() {
         checkpoint_every_n_commits: 100,
         checkpoint_wal_bytes: 64 * 1024 * 1024,
         shutdown_timeout_ms: 1_000,
+        ..Default::default()
     };
 
     // Build an index that splits into a root plus several leaves.

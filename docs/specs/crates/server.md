@@ -45,6 +45,8 @@ Defaults:
 - `checkpoint_every_n_commits = 100`
 - `checkpoint_wal_bytes = 64 * 1024 * 1024`
 - `shutdown_timeout_ms = 30000`
+- `tls_cert_file = None`
+- `tls_key_file = None`
 
 Binary CLI flags:
 
@@ -54,9 +56,11 @@ Binary CLI flags:
 - `--checkpoint-every-n-commits <N>` sets `Config.checkpoint_every_n_commits`; default `100`.
 - `--checkpoint-wal-bytes <BYTES>` sets `Config.checkpoint_wal_bytes`; default `67108864`.
 - `--shutdown-timeout-ms <MS>` sets `Config.shutdown_timeout_ms`; default `30000`.
+- `--tls-cert-file <PATH>` sets `Config.tls_cert_file`; PEM certificate chain. Optional; defaults to disabled.
+- `--tls-key-file <PATH>` sets `Config.tls_key_file`; PEM private key. Optional; defaults to disabled.
 - `--help` prints usage and exits with code `0`.
 
-V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; all other numeric flags must be positive nonzero integers. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`.
+V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; all other numeric flags must be positive nonzero integers. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`. TLS is enabled only when both `--tls-cert-file` and `--tls-key-file` are supplied; supplying exactly one is an error that prints usage to stderr and exits with code `2`.
 
 ## Startup Sequence
 
@@ -194,12 +198,14 @@ For each accepted TCP connection:
 1. Create protocol codec and connection state.
 2. Read bytes from socket.
 3. Decode client messages.
-4. Handle startup/SSL/terminate through protocol state.
+4. Handle startup/terminate through protocol state.
 5. For query messages, run `QueryService` using the blocking thread pool.
 6. Encode and write server messages.
 7. On query execution errors, send `ErrorResponse` and `ReadyForQuery` and keep the connection open.
 8. On protocol decode errors, send `ErrorResponse` and `ReadyForQuery`, then close the connection because the codec buffer state may be unrecoverable.
 9. On Terminate or unrecoverable IO error, close connection.
+
+SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 
 ## Graceful Shutdown
 
@@ -223,4 +229,7 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 - Successful write appends commit, flushes WAL, commits buffer before returning.
 - Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.
 - Protocol startup and simple query work over a loopback TCP connection.
+- With TLS disabled, an `SSLRequest` is rejected with `N` and the same connection then completes a plaintext startup.
+- With TLS enabled, an `SSLRequest` is accepted with `S`, the TLS handshake completes, and a simple query runs over the encrypted stream.
+- Supplying exactly one of `--tls-cert-file`/`--tls-key-file` is rejected during config parsing.
 - Graceful shutdown runs checkpoint after in-flight query completes.

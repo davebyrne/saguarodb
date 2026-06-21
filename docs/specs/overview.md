@@ -25,7 +25,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Multi-statement transactions / MVCC (designed for, not implemented)
 - Secondary indexes (designed for, not implemented)
 - Extended query protocol / prepared statements
-- SSL/TLS
+- Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
 - Replication
 - Custom wire protocol (designed for, not implemented)
@@ -398,7 +398,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 
 ### PostgreSQL Simple Query Flow (V1 Subset)
 
-1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The protocol detects this (8-byte message with code `80877103`) and responds with a single `N` byte (SSL not supported). The client then retries with a normal `StartupMessage`.
+1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The server detects this (8-byte message with code `80877103`). When TLS is configured (`--tls-cert-file`/`--tls-key-file`), it replies with a single `S` byte and performs the TLS handshake, after which the client sends its `StartupMessage` over the encrypted stream. When TLS is not configured, it replies with a single `N` byte and the client continues in plaintext (or retries with a plain `StartupMessage`). TLS is server-side only; no client certificate is requested.
 2. **Startup:** Client sends `StartupMessage` (version 3.0, user, database). Server responds `AuthenticationOk` → `ParameterStatus` (server_version, etc.) → `ReadyForQuery`.
 3. **Query cycle:** Client sends `Query` (SQL string). Server responds with:
    - `RowDescription` (column names and types) for SELECT
@@ -412,7 +412,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 ### V1 Protocol Scope — What We Skip
 
 - Extended query protocol (Parse/Bind/Execute) — no prepared statements
-- SSL/TLS (SSLRequest is explicitly rejected with `N`)
+- Mutual TLS / client-certificate authentication (optional server-side TLS is supported; see SSLRequest handling above)
 - Authentication beyond accepting any connection
 - `COPY`, `NOTIFY/LISTEN`
 - `CancelRequest` flow

@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -9,6 +9,8 @@ pub struct Config {
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
     pub shutdown_timeout_ms: u64,
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -20,6 +22,24 @@ impl Default for Config {
             checkpoint_every_n_commits: 100,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
             shutdown_timeout_ms: 30000,
+            tls_cert_file: None,
+            tls_key_file: None,
+        }
+    }
+}
+
+impl Config {
+    /// Resolve the configured TLS material. Returns `Ok(Some((cert, key)))` when
+    /// TLS is enabled, `Ok(None)` when it is disabled, and `Err` when exactly one
+    /// of the cert/key paths is set (TLS needs both or neither). This is the
+    /// single source of truth for the both-or-neither rule, used by both CLI
+    /// parsing and server startup.
+    pub fn tls_files(&self) -> std::result::Result<Option<(&Path, &Path)>, String> {
+        match (&self.tls_cert_file, &self.tls_key_file) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("--tls-cert-file requires --tls-key-file".to_string()),
+            (None, Some(_)) => Err("--tls-key-file requires --tls-cert-file".to_string()),
         }
     }
 }
@@ -70,9 +90,19 @@ where
                 let value = next_value(&mut args, "--shutdown-timeout-ms")?;
                 config.shutdown_timeout_ms = parse_positive_u64(&value, "--shutdown-timeout-ms")?;
             }
+            "--tls-cert-file" => {
+                let value = next_value(&mut args, "--tls-cert-file")?;
+                config.tls_cert_file = Some(PathBuf::from(value));
+            }
+            "--tls-key-file" => {
+                let value = next_value(&mut args, "--tls-key-file")?;
+                config.tls_key_file = Some(PathBuf::from(value));
+            }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
+
+    config.tls_files()?;
 
     Ok(ConfigAction::Run(config))
 }
@@ -88,6 +118,8 @@ pub fn usage(program: &str) -> String {
            --checkpoint-every-n-commits <N>   default 100\n\
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
+           --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)\n\
+           --tls-key-file <PATH>              PEM private key; enables TLS (needs --tls-cert-file)\n\
            --help                             print usage and exit 0\n"
     )
 }
@@ -145,6 +177,42 @@ mod tests {
         assert_eq!(config.checkpoint_every_n_commits, 100);
         assert_eq!(config.checkpoint_wal_bytes, 64 * 1024 * 1024);
         assert_eq!(config.shutdown_timeout_ms, 30000);
+        assert_eq!(config.tls_cert_file, None);
+        assert_eq!(config.tls_key_file, None);
+    }
+
+    #[test]
+    fn parses_tls_cert_and_key_flags() {
+        let parsed = parse_args([
+            "saguarodb",
+            "--tls-cert-file",
+            "/etc/saguaro/server.crt",
+            "--tls-key-file",
+            "/etc/saguaro/server.key",
+        ])
+        .unwrap();
+
+        let ConfigAction::Run(config) = parsed else {
+            panic!("expected runnable config");
+        };
+        assert_eq!(
+            config.tls_cert_file,
+            Some(PathBuf::from("/etc/saguaro/server.crt"))
+        );
+        assert_eq!(
+            config.tls_key_file,
+            Some(PathBuf::from("/etc/saguaro/server.key"))
+        );
+    }
+
+    #[test]
+    fn rejects_tls_cert_without_key() {
+        assert!(parse_args(["saguarodb", "--tls-cert-file", "server.crt"]).is_err());
+    }
+
+    #[test]
+    fn rejects_tls_key_without_cert() {
+        assert!(parse_args(["saguarodb", "--tls-key-file", "server.key"]).is_err());
     }
 
     #[test]

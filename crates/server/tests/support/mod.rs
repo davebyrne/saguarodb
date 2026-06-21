@@ -84,6 +84,7 @@ impl TestServer {
             checkpoint_every_n_commits: 1_000,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
             shutdown_timeout_ms: 1_000,
+            ..Config::default()
         };
         let app = Arc::new(open_app(config)?);
         let listener = TcpListener::bind("127.0.0.1:0")

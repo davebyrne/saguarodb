@@ -68,6 +68,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
     }
 
     let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
+    let tls = match config.tls_files().map_err(DbError::io)? {
+        Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
+        None => None,
+    };
     let components = Arc::new(ServerComponents {
         config,
         catalog,
@@ -84,6 +88,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         },
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
+        tls,
     });
 
     // Persist the redone state to the heap/index and advance the redo boundary.
