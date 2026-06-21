@@ -87,6 +87,12 @@ impl ConnectionState for PostgresConnectionState {
                 "extended query protocol messages must be handled by the server, \
                  not the connection state machine",
             )),
+            // CancelRequest opens its own connection and is handled by the server
+            // during startup (look up the backend key, signal, close). Reaching
+            // the state machine is a routing bug.
+            ClientMessage::CancelRequest { .. } => Err(DbError::internal(
+                "CancelRequest must be handled by the server during connection startup",
+            )),
             ClientMessage::Terminate => {
                 self.terminated = true;
                 Ok(Vec::new())

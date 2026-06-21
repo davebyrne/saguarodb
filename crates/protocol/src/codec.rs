@@ -5,6 +5,7 @@ use crate::{ClientMessage, ServerMessage, StatementKind};
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const GSSENC_REQUEST_CODE: i32 = 80_877_104;
+const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 const POSTGRES_PROTOCOL_V3: i32 = 196_608;
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -52,6 +53,15 @@ impl PostgresCodec {
         }
         if length == 8 && code == GSSENC_REQUEST_CODE {
             messages.push(ClientMessage::GssEncRequest);
+            return Ok(true);
+        }
+        if length == 16 && code == CANCEL_REQUEST_CODE {
+            let process_id = read_i32(&packet[8..12])?;
+            let secret_key = read_i32(&packet[12..16])?;
+            messages.push(ClientMessage::CancelRequest {
+                process_id,
+                secret_key,
+            });
             return Ok(true);
         }
         if code != POSTGRES_PROTOCOL_V3 {
@@ -167,6 +177,15 @@ impl ProtocolCodec for PostgresCodec {
                 let mut body = Vec::new();
                 put_i32(&mut body, 0);
                 encode_server_message(b'R', body)
+            }
+            ServerMessage::BackendKeyData {
+                process_id,
+                secret_key,
+            } => {
+                let mut body = Vec::new();
+                put_i32(&mut body, *process_id);
+                put_i32(&mut body, *secret_key);
+                encode_server_message(b'K', body)
             }
             ServerMessage::ParameterStatus { key, value } => {
                 let mut body = Vec::new();

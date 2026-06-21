@@ -17,6 +17,13 @@ pub enum ClientMessage {
     },
     SslRequest,
     GssEncRequest,
+    /// Cancel an in-flight query on another backend, identified by the
+    /// `BackendKeyData` it was given at startup. Sent on its own short-lived
+    /// connection; the server never replies.
+    CancelRequest {
+        process_id: i32,
+        secret_key: i32,
+    },
     Query(String),
     /// Extended protocol: prepare a (possibly parameterized) statement.
     Parse {
@@ -62,6 +69,12 @@ pub enum ServerMessage {
     SslAccepted,
     SslRejected,
     AuthenticationOk,
+    /// Backend identity for cancellation: the client may later open a separate
+    /// connection and send a `CancelRequest` carrying these values.
+    BackendKeyData {
+        process_id: i32,
+        secret_key: i32,
+    },
     ParameterStatus {
         key: String,
         value: String,

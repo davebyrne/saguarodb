@@ -23,6 +23,7 @@ pub enum ClientMessage {
     Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
     GssEncRequest,
+    CancelRequest { process_id: i32, secret_key: i32 },
     Query(String),
     // Extended query protocol.
     Parse { name: String, query: String, param_types: Vec<i32> },
@@ -45,6 +46,7 @@ pub enum ServerMessage {
     SslAccepted,
     SslRejected,
     AuthenticationOk,
+    BackendKeyData { process_id: i32, secret_key: i32 },
     ParameterStatus { key: String, value: String },
     ReadyForQuery,
     RowDescription(Vec<ColumnInfo>),
@@ -163,6 +165,7 @@ Client messages:
 
 - `SSLRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877103`.
 - `GSSENCRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877104`.
+- `CancelRequest`: startup-style packet with `int32 length = 16`, `int32 code = 80877102`, `int32 process_id`, `int32 secret_key`. Sent on its own connection; the server sends no reply.
 - `Startup`: startup-style packet with `int32 protocol = 196608` for protocol 3.0, followed by nul-terminated key/value strings and a final `\0`. V1 reads `user`, optional `database`, and optional `application_name`; other parameters are ignored.
 - `Query`: tag `b'Q'`, length, SQL string terminated by `\0`.
 - `Parse`: tag `b'P'`, length, `statement_name\0`, `query\0`, `int16 param_type_count`, then that many `int32` parameter type OIDs (`0` = unspecified).
@@ -177,6 +180,7 @@ Client messages:
 Server messages:
 
 - `AuthenticationOk`: tag `b'R'`, length `8`, `int32 auth_code = 0`.
+- `BackendKeyData`: tag `b'K'`, length `12`, `int32 process_id`, `int32 secret_key`. Sent at startup so the client can later cancel an in-flight query.
 - `ParameterStatus`: tag `b'S'`, length, `key\0value\0`. Startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
 - `ReadyForQuery`: tag `b'Z'`, length `5`, status byte `b'I'`.
 - `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
@@ -224,6 +228,7 @@ unsupported format codes.
 - Decodes SSLRequest and encodes single-byte `N` for `SslRejected`.
 - Encodes single-byte `S` for `SslAccepted`.
 - Decodes GSSENCRequest and declines it with single-byte `N`.
+- Decodes CancelRequest (process id + secret key) and encodes BackendKeyData.
 - Decodes StartupMessage (reading `user`, `database`, and `application_name`) and emits expected startup responses.
 - Startup echoes `application_name` in a `ParameterStatus`, reporting empty when the client omits it.
 - Decodes simple Query.

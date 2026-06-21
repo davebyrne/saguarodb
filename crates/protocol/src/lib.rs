@@ -29,6 +29,15 @@ mod tests {
         bytes
     }
 
+    fn cancel_request_bytes(process_id: i32, secret_key: i32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&16i32.to_be_bytes());
+        bytes.extend_from_slice(&80877102i32.to_be_bytes());
+        bytes.extend_from_slice(&process_id.to_be_bytes());
+        bytes.extend_from_slice(&secret_key.to_be_bytes());
+        bytes
+    }
+
     fn startup_bytes(user: &str, database: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
@@ -132,6 +141,32 @@ mod tests {
             state.handle_message(ClientMessage::GssEncRequest).unwrap(),
             vec![ServerMessage::SslRejected]
         );
+    }
+
+    #[test]
+    fn decodes_cancel_request() {
+        let mut codec = PostgresCodec::new();
+        assert_eq!(
+            codec.decode(&cancel_request_bytes(42, 1_234_567)).unwrap(),
+            vec![ClientMessage::CancelRequest {
+                process_id: 42,
+                secret_key: 1_234_567,
+            }]
+        );
+    }
+
+    #[test]
+    fn encodes_backend_key_data() {
+        let codec = PostgresCodec::new();
+        let bytes = codec.encode(&ServerMessage::BackendKeyData {
+            process_id: 7,
+            secret_key: 99,
+        });
+        assert_eq!(bytes[0], b'K');
+        assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()), 12);
+        let mut offset = 5;
+        assert_eq!(read_i32(&bytes, &mut offset), 7);
+        assert_eq!(read_i32(&bytes, &mut offset), 99);
     }
 
     fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
