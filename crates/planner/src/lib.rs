@@ -708,4 +708,126 @@ mod tests {
         let err = substitute_params(&bound, &[Value::Text("x".to_string())]).unwrap_err();
         assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
+
+    #[test]
+    fn binder_assigns_distinct_binding_ids_for_self_join() {
+        let catalog = catalog_with_users();
+        let stmt =
+            parse("select a.id from users as a join users as b on a.id = b.id").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        let BoundFrom::Join { left, right, .. } = select.from else {
+            panic!("expected join");
+        };
+        let BoundFrom::Table { binding: left_binding, .. } = *left else {
+            panic!("expected left table");
+        };
+        let BoundFrom::Table { binding: right_binding, .. } = *right else {
+            panic!("expected right table");
+        };
+        assert_ne!(
+            left_binding, right_binding,
+            "self-join occurrences must get distinct binding ids"
+        );
+    }
+
+    #[test]
+    fn binder_resolves_unqualified_identifiers_case_insensitively() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select ID from USERS where NAME = 'Ada'").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].name, "id");
+    }
+
+    #[test]
+    fn binder_binds_create_index_as_passthrough() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create index users_name on users (name)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        assert!(matches!(
+            bound,
+            BoundStatement::CreateIndex { ref name, ref table, ref columns, unique: false }
+                if name == "users_name" && table == "users" && columns == &["name".to_string()]
+        ));
+    }
+
+    #[test]
+    fn binder_rejects_drop_of_unknown_table() {
+        let catalog = catalog_with_users();
+        let stmt = parse("drop table missing").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn binder_rejects_drop_of_unknown_index() {
+        let catalog = catalog_with_users();
+        let stmt = parse("drop index missing").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn binder_rejects_table_without_primary_key() {
+        let catalog = MemoryCatalog::empty();
+        let stmt = parse("create table t (a integer not null)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_binds_between_predicate() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select name from users where id between 1 and 10").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(select.filter, Some(BoundExpr::Between { .. })));
+    }
+
+    #[test]
+    fn binder_binds_like_predicate() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where name like 'A%'").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(select.filter, Some(BoundExpr::Like { .. })));
+    }
+
+    #[test]
+    fn binder_desugars_comma_from_list_into_cross_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select users.id from users, accounts").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            select.from,
+            BoundFrom::Join { join_type: JoinType::Cross, condition: None, .. }
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_cross_join_with_on_predicate() {
+        // `CROSS JOIN ... ON` is rejected at parse time (not by the binder), with
+        // a SyntaxError; the statement is still rejected end-to-end.
+        let err = parse("select users.id from users cross join accounts on users.id = accounts.id")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
 }
