@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ColumnId, TableId};
+use crate::{ColumnId, IndexId, TableId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -38,6 +38,18 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
+}
+
+/// A secondary index over one or more columns of a table. `unique` rejects
+/// duplicate indexed values; a non-unique index appends the primary key to make
+/// each entry distinct on disk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexSchema {
+    pub id: IndexId,
+    pub table: TableId,
+    pub name: String,
+    pub columns: Vec<ColumnId>,
+    pub unique: bool,
 }
 
 #[cfg(test)]
