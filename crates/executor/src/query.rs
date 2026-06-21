@@ -9,8 +9,8 @@ use storage::{SchemaOperations, StorageEngine};
 use crate::ExecutionResult;
 use crate::eval_expr;
 use crate::ops::{
-    AggregateOp, FilterOp, IndexScanOp, LimitOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp, SortOp,
-    ValuesOp,
+    AggregateOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp, ProjectionOp,
+    SeqScanOp, SortOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -106,6 +106,21 @@ pub(crate) fn build_executor<'a>(
                 right,
                 condition.clone(),
                 *join_type,
+            )))
+        }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_keys,
+            right_keys,
+        } => {
+            let left = build_executor(ctx, left)?;
+            let right = build_executor(ctx, right)?;
+            Ok(Box::new(HashJoinOp::new(
+                left,
+                right,
+                left_keys.clone(),
+                right_keys.clone(),
             )))
         }
         PhysicalPlan::Filter { source, predicate } => Ok(Box::new(FilterOp::new(

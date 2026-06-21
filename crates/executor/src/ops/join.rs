@@ -1,4 +1,6 @@
-use common::{ColumnInfo, ExecRow, Result, Row, Value};
+use std::collections::HashMap;
+
+use common::{ColumnInfo, DbError, ExecRow, Result, Row, Value};
 use planner::{BoundExpr, JoinType};
 
 use crate::ops::predicate_matches;
@@ -139,4 +141,103 @@ fn join_with_null_left(left_width: usize, right: &ExecRow) -> ExecRow {
         row: Row { values },
         identity: None,
     }
+}
+
+/// Inner equi-join. Builds a probe table over the right input keyed by its join
+/// columns, then probes it with each left row. `left_keys`/`right_keys` are
+/// paired column slots into the left and right child rows.
+pub struct HashJoinOp<'a> {
+    left: Box<dyn PlanExecutor + 'a>,
+    right: Box<dyn PlanExecutor + 'a>,
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    output_schema: Vec<ColumnInfo>,
+    rows: Vec<ExecRow>,
+    index: usize,
+}
+
+impl<'a> HashJoinOp<'a> {
+    pub fn new(
+        left: Box<dyn PlanExecutor + 'a>,
+        right: Box<dyn PlanExecutor + 'a>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+    ) -> Self {
+        let mut output_schema = left.output_schema().to_vec();
+        output_schema.extend_from_slice(right.output_schema());
+        Self {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            output_schema,
+            rows: Vec::new(),
+            index: 0,
+        }
+    }
+}
+
+impl PlanExecutor for HashJoinOp<'_> {
+    fn output_schema(&self) -> &[ColumnInfo] {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.index = 0;
+
+        let left_rows = collect_all(self.left.as_mut())?;
+        let right_rows = collect_all(self.right.as_mut())?;
+
+        let mut table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+        for (right_index, right) in right_rows.iter().enumerate() {
+            if let Some(key) = join_key(&right.row.values, &self.right_keys)? {
+                table.entry(key).or_default().push(right_index);
+            }
+        }
+
+        for left in &left_rows {
+            let Some(key) = join_key(&left.row.values, &self.left_keys)? else {
+                continue;
+            };
+            if let Some(matches) = table.get(&key) {
+                for &right_index in matches {
+                    self.rows
+                        .push(join_row_refs(left, &right_rows[right_index]));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<ExecRow>> {
+        let Some(row) = self.rows.get(self.index).cloned() else {
+            return Ok(None);
+        };
+        self.index += 1;
+        Ok(Some(row))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.rows.clear();
+        self.index = 0;
+        Ok(())
+    }
+}
+
+/// Collects the key values at `key_slots`. Returns `None` when any key column is
+/// NULL, since SQL equality never matches NULL, so such rows cannot join.
+fn join_key(values: &[Value], key_slots: &[usize]) -> Result<Option<Vec<Value>>> {
+    let mut key = Vec::with_capacity(key_slots.len());
+    for &slot in key_slots {
+        let value = values
+            .get(slot)
+            .ok_or_else(|| DbError::internal(format!("join key slot {slot} is out of bounds")))?;
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        key.push(value.clone());
+    }
+    Ok(Some(key))
 }

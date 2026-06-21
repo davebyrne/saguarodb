@@ -10,6 +10,7 @@ mod values;
 
 pub use aggregate::AggregateOp;
 pub use filter::FilterOp;
+pub use join::HashJoinOp;
 pub use join::NestedLoopJoinOp;
 pub use join::join_rows;
 pub use limit::LimitOp;

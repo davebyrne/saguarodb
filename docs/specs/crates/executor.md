@@ -66,6 +66,7 @@ impl QueryEngine {
 | `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present |
 | `IndexScanOp` | Calls `StorageEngine::scan_range`, converts `StoredRow` to `ExecRow`, then applies `PhysicalPlan::IndexScan.filter` when present |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
+| `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
 | `FilterOp` | Evaluates predicate, preserves identity |
 | `ProjectionOp` | Rewrites row values, preserves identity |
 | `SortOp` | Materializes all input, sorts in memory, preserves identity |
@@ -172,6 +173,7 @@ Statement guards are owned by server query orchestration, not by the executor cr
 - `FilterOp` preserves identity.
 - `ProjectionOp` preserves identity while changing values.
 - `NestedLoopJoinOp` clears identity.
+- `HashJoinOp` joins inner equi-join rows on one or more key columns and excludes rows with a NULL join key.
 - `UPDATE WHERE` modifies only matched rows.
 - `DELETE WHERE` deletes only matched rows.
 - Failed write calls rollback and does not expose partial changes.

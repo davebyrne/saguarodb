@@ -365,6 +365,62 @@ mod tests {
     }
 
     #[test]
+    fn physical_planner_uses_hash_join_for_inner_equi_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select users.id from users join accounts on users.name = accounts.owner")
+            .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+
+        assert!(format_explain(&physical).contains("HashJoin keys=1"));
+    }
+
+    #[test]
+    fn physical_planner_extracts_all_equi_keys_from_conjunction() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select users.id from users join accounts \
+             on users.id = accounts.id and users.name = accounts.owner",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+
+        assert!(format_explain(&physical).contains("HashJoin keys=2"));
+    }
+
+    #[test]
+    fn physical_planner_uses_nested_loop_join_for_non_equi_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt =
+            parse("select users.id from users join accounts on users.id < accounts.id").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+
+        let text = format_explain(&physical);
+        assert!(text.contains("NestedLoopJoin"));
+        assert!(!text.contains("HashJoin"));
+    }
+
+    #[test]
+    fn physical_planner_uses_nested_loop_join_for_outer_equi_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt =
+            parse("select users.id from users left join accounts on users.name = accounts.owner")
+                .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+
+        let text = format_explain(&physical);
+        assert!(text.contains("NestedLoopJoin"));
+        assert!(!text.contains("HashJoin"));
+    }
+
+    #[test]
     fn binder_expands_wildcard_projection() {
         let catalog = catalog_with_users();
         let stmt = parse("select * from users").unwrap();

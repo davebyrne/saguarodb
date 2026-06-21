@@ -555,6 +555,72 @@ mod tests {
     }
 
     #[test]
+    fn inner_equi_join_does_not_match_null_keys() {
+        let harness = ExecutorHarness::with_users();
+        seed_users_and_accounts(&harness);
+        harness
+            .execute("insert into users (id, name) values (3, null)")
+            .unwrap();
+        harness
+            .execute("insert into accounts (id, owner) values (30, null)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select users.id, accounts.id from users join accounts \
+                 on users.name = accounts.owner order by users.id, accounts.id",
+            )
+            .unwrap();
+
+        // NULL = NULL is never true, so the NULL-keyed rows must not join.
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1), Value::Integer(10)]
+            }]
+        );
+    }
+
+    #[test]
+    fn inner_equi_join_matches_on_multiple_keys() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table l (id integer primary key, grp integer, tag text)")
+            .unwrap();
+        harness
+            .execute("create table r (id integer primary key, grp integer, tag text)")
+            .unwrap();
+        harness
+            .execute("insert into l (id, grp, tag) values (1, 100, 'x')")
+            .unwrap();
+        harness
+            .execute("insert into l (id, grp, tag) values (2, 100, 'y')")
+            .unwrap();
+        harness
+            .execute("insert into r (id, grp, tag) values (11, 100, 'x')")
+            .unwrap();
+        harness
+            .execute("insert into r (id, grp, tag) values (12, 200, 'x')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select l.id, r.id from l join r \
+                 on l.grp = r.grp and l.tag = r.tag order by l.id, r.id",
+            )
+            .unwrap();
+
+        // Only l(grp=100, tag='x') matches r(grp=100, tag='x'); the row that
+        // agrees on grp but not tag must not join.
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1), Value::Integer(11)]
+            }]
+        );
+    }
+
+    #[test]
     fn aggregate_computes_count_sum_avg_min_max() {
         let harness = ExecutorHarness::with_users();
         harness

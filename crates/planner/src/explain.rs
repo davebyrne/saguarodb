@@ -69,6 +69,16 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             format_node(left, indent + 1, output);
             format_node(right, indent + 1, output);
         }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            left_keys,
+            ..
+        } => {
+            output.push_str(&format!("{padding}HashJoin keys={}\n", left_keys.len()));
+            format_node(left, indent + 1, output);
+            format_node(right, indent + 1, output);
+        }
         PhysicalPlan::Filter { source, .. } => {
             output.push_str(&format!("{padding}Filter\n"));
             format_node(source, indent + 1, output);

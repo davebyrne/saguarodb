@@ -312,6 +312,12 @@ pub enum PhysicalPlan {
         condition: Option<BoundExpr>,
         join_type: JoinType,
     },
+    HashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+    },
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
     Projection { source: Box<PhysicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<PhysicalPlan>, order_by: Vec<BoundOrderByItem> },
@@ -334,6 +340,7 @@ pub enum PhysicalPlan {
 - Otherwise scans are `SeqScan`.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 - Joins are left-to-right nested loop joins. V1 supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
+- An `Inner` join whose `condition` is a conjunction of `left_column = right_column` equalities becomes a `HashJoin`. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). All other joins — outer, cross, non-equi, or predicates over expressions rather than bare columns — stay `NestedLoopJoin`.
 - Sort and aggregate are blocking operators.
 - Projection pushdown may be disabled in initial v1 implementation. If enabled, expressions must be slot-rebased against child output schemas.
 
@@ -358,4 +365,5 @@ The executor crate is not called for `EXPLAIN`.
 - Logical planner emits logical nodes without `SeqScan` or `IndexScan`.
 - Physical planner chooses `IndexScan` for primary-key equality and preserves residual non-key predicates in `IndexScan.filter`.
 - Physical planner falls back to `SeqScan` for non-key filters.
+- Physical planner chooses `HashJoin` for an inner join with a column-equality `ON` predicate and falls back to `NestedLoopJoin` for outer, cross, and non-equi joins.
 - `EXPLAIN` returns a readable physical plan tree.
