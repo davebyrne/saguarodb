@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
 - Autocommit only (no multi-statement transactions)
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
+- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -519,7 +519,7 @@ pub enum Statement {
 
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),       // INSERT INTO t VALUES (...)
-    Query(Box<SelectStatement>),  // INSERT INTO t SELECT ... (future, parsed but rejected in V1)
+    Query(Box<SelectStatement>),  // INSERT INTO t SELECT ...
 }
 
 pub struct Assignment {
@@ -645,7 +645,7 @@ The binder:
 - Assigns a unique `BindingId` to each table occurrence in FROM (critical for self-joins and aliases)
 - Resolves column references to `BoundExpr::InputRef` with physical slot positions
 - Validates types (e.g., `WHERE` clause is boolean, arithmetic operands are numeric)
-- Rejects unsupported features (e.g., `INSERT ... SELECT` in V1)
+- Rejects unsupported features (e.g., composite primary keys, unknown functions)
 - Expands `SELECT *` into explicit column lists
 
 ```rust
@@ -665,7 +665,7 @@ pub enum BoundStatement {
 
 pub enum BoundInsertSource {
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
-    // Future: Query(BoundSelect)
+    Query(Box<BoundSelect>),
 }
 
 /// A fully bound SELECT — all names resolved, types checked, slots assigned.
@@ -903,7 +903,13 @@ pub enum PhysicalPlan {
         condition: Option<BoundExpr>,
         join_type: JoinType,
     },
-    // Future: HashJoin, MergeSortJoin
+    HashJoin {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+    },
+    // Future: MergeSortJoin
 
     // Other operators
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
@@ -934,7 +940,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of an index — the primary-key index (`index = PRIMARY_KEY_INDEX_ID`) or a secondary index (its own id) — emit `IndexScan` with that index, a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, and any residual predicate in `filter`.
 2. **Index choice:** When several indexes' leading columns are constrained, prefer an equality over a range, the primary key over a secondary index, then the lower index id.
 3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
-4. **Join ordering:** Process joins left to right as written. All joins are `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
+4. **Join ordering:** Process joins left to right as written. An inner join whose `ON` predicate is a conjunction of `left_column = right_column` equalities becomes a `HashJoin` (its `left_keys`/`right_keys` are the paired key slots); every other join (outer, cross, non-equi) is a `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
 5. **Projection pushdown:** Optional for initial v1. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
 
 ### EXPLAIN
@@ -945,7 +951,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 
 - Cost-based optimization
 - Join reordering
-- Hash joins or merge joins
+- Merge joins
 - Query plan caching
 
 ## 6. Query Executor
@@ -1020,6 +1026,7 @@ V1 has no executor cancellation token in the public crate API. A future version 
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
 | `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the primary key, `index_scan` for a secondary index — and applies residual `IndexScan.filter` when present |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
+| `HashJoinOp` | Inner equi-join: builds a probe table over the right input keyed by `right_keys`, probes with `left_keys`; rows with a NULL key never match. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
 | `SortOp` | Materializes all input, sorts in memory, emits in order. Blocking operator. |
@@ -1028,7 +1035,7 @@ V1 has no executor cancellation token in the public crate API. A future version 
 
 ### Expression Evaluator
 
-A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, and `BETWEEN`. Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
+A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ABS`, and `SUBSTRING`. Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
 
 V1 expression semantics:
 
@@ -1036,6 +1043,7 @@ V1 expression semantics:
 - `LIKE` requires text operands, is case-sensitive, supports `%` and `_`, and uses backslash to escape `%`, `_`, or `\`. V1 does not support a SQL `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
 - `IN` returns `TRUE` on the first non-null equal item, `FALSE` when no item matches and no list item is `NULL`, and `NULL` when the left side is `NULL` or no item matches but some list item is `NULL`. `NOT IN` applies SQL `NOT`.
 - `BETWEEN` evaluates as `(expr >= low) AND (expr <= high)`; `NOT BETWEEN` applies SQL `NOT`.
+- String concatenation `||` requires text operands and returns `NULL` if either side is `NULL`. The scalar functions `UPPER`/`LOWER`/`LENGTH`/`TRIM` (text) and `ABS` (integer) and `SUBSTRING(text, start[, length])` are NULL-propagating; `LENGTH` and `SUBSTRING` count Unicode characters, and `SUBSTRING` uses 1-based positions clamped to the string and rejects a negative length.
 - Searched `CASE WHEN condition THEN value ...` chooses the first `WHEN` whose condition evaluates to `TRUE`; `FALSE` and `NULL` conditions do not match. Simple `CASE operand WHEN value THEN result ...` compares `operand = value` with SQL comparison semantics and chooses the first comparison that evaluates to `TRUE`. If no branch matches, both forms return `ELSE` or `NULL`.
 - `CASE` result typing: binder requires all non-`NULL` `THEN` and `ELSE` expressions to have the same `DataType`; `NULL` branches are allowed and make the output nullable. If every result branch is `NULL`, binder rejects the expression with `SqlState::DatatypeMismatch`.
 - Explicit `CAST` conversion matrix: same-type casts are identity; `NULL` casts to `NULL`; `INTEGER -> TEXT` uses decimal i64 formatting; `BOOLEAN -> TEXT` returns `true` or `false`; `TEXT -> INTEGER` parses a base-10 i64 with optional leading sign and no surrounding whitespace; `TEXT -> BOOLEAN` accepts case-insensitive `true`, `t`, `1`, `false`, `f`, and `0`. `INTEGER -> BOOLEAN`, `BOOLEAN -> INTEGER`, malformed text, and all other pairs return `SqlState::DatatypeMismatch`.
@@ -1735,6 +1743,5 @@ Loaded from command-line args only in V1. No environment-variable or config-file
 - **MVCC / Transactions:** `StatementContext` carries `txn_id` and is extensible for snapshot visibility. The `ConcurrencyController` trait returns owned guards so a simple `RwLock` implementation can later be swapped for a transaction manager. WAL record format includes `TxnID`.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among the primary-key and secondary indexes; a cost model would replace that heuristic.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
-- **INSERT ... SELECT:** `InsertSource::Query` variant exists in the AST. The logical/physical plans already model inserts as `source: Box<LogicalPlan>` / `source: Box<PhysicalPlan>`, so this can be enabled later by binding query sources.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.
 - **Additional Data Types:** `DataType` and `Value` enums are extensible. Row serialization format supports new types via the null bitmap + column data pattern.
