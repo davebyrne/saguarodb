@@ -107,6 +107,131 @@ async fn e2e_order_by_ordinal_sorts_by_output_column() {
 }
 
 #[tokio::test]
+async fn e2e_hash_join_returns_matching_rows() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text)")
+        .await
+        .unwrap();
+    for (id, name) in [(1, "Ada"), (2, "Grace")] {
+        server
+            .simple_query(&format!(
+                "insert into users (id, name) values ({id}, '{name}')"
+            ))
+            .await
+            .unwrap();
+    }
+    for (id, owner) in [(10, "Ada"), (20, "Linus")] {
+        server
+            .simple_query(&format!(
+                "insert into accounts (id, owner) values ({id}, '{owner}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Inner equi-join on name; only Ada matches.
+    let rows = server
+        .simple_query(
+            "select users.id, accounts.id from users join accounts \
+             on users.name = accounts.owner order by users.id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("10".to_string())]]
+    );
+
+    let explain = server
+        .simple_query(
+            "explain select users.id from users join accounts on users.name = accounts.owner",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(explain[0][0].as_ref().unwrap().contains("HashJoin"));
+}
+
+#[tokio::test]
+async fn e2e_insert_select_from_target_table_sees_only_preexisting_rows() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    for (id, name) in [(1, "Ada"), (2, "Grace")] {
+        server
+            .simple_query(&format!(
+                "insert into users (id, name) values ({id}, '{name}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Halloween problem: reading the target table must observe only the two
+    // pre-insert rows, so exactly two rows are appended (against the real
+    // on-disk B-tree scan).
+    server
+        .simple_query("insert into users select id + 10, name from users")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("11".to_string())],
+            vec![Some("12".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_scalar_functions_evaluate() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (-5, '  Ada  ')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select upper(name), length(trim(name)), abs(id), substring(name, 3, 3) from users",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("  ADA  ".to_string()),
+            Some("3".to_string()),
+            Some("5".to_string()),
+            Some("Ada".to_string()),
+        ]]
+    );
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();
