@@ -178,32 +178,77 @@ collides with the heap file id (the bare table id); `HeapPageStore` writes it to
 `<data>/heap/<table>.idx`. Rows stay in the heap; the tree replaces the former
 in-memory directory.
 
+### Multi-entry ordering
+
+The B-tree is a **multi-entry** structure ordered by the composite `(key, value)`
+where `value` is the leaf value (the `RowLocation` for the primary-key index).
+**Duplicate user-keys are allowed**, disambiguated and ordered by their value
+bytes (the `IndexValue::encode` form, compared as raw little-endian bytes — a
+stable total order, not necessarily numeric). The tree no longer rejects duplicate
+keys structurally; **primary-key uniqueness is now an engine-level check** (see
+Error Handling and the note below). This is the index-per-version substrate
+(`mvcc.md` §3.2 invariant 3): for now the primary-key index still stores exactly
+one `RowLocation` per key (single version).
+
+- **API.** `insert(txn_id, key, value)` inserts one `(key, value)` entry (duplicate
+  keys allowed). `remove(txn_id, key, value)` removes the single matching
+  `(key, value)` entry, leaving other entries that share the key intact.
+  `scan_key(key)` returns every value whose key equals `key`, in `(key, value)`
+  order. `search(key)` returns the first (lowest-value) entry for a key — the sole
+  entry for the single-version primary-key index. `range(range)` walks keys in
+  order and may now yield multiple values per key. `update` (in-place value
+  overwrite) is removed; an engine row relocation is a `remove(old)` +
+  `insert(new)`.
 - **Pages.** Page 0 is a metapage holding the current root page number. Other
   pages are leaf or internal nodes sharing the standard page header (so they get
   the same PageLSN, checksum, and torn-page protection). A 5-byte node sub-header
   carries a leaf flag and a link (right-sibling for a leaf, leftmost child for an
-  internal node); entries are a sorted slotted array of `[key_len][key][value]`,
-  where a leaf value is an encoded `RowLocation` and an internal value is a child
-  page number. Index-node slots are a narrower 4-byte `[offset: u16][len: u16]`
-  pair (no dead flag, since a delete removes the slot outright), distinct from the
-  6-byte `[offset][len][flags]` slot used by heap data pages.
-- **Lookup / scan.** `get` descends from the root to a leaf; `scan`/`scan_range`
-  find the start leaf and walk the right-sibling chain in key order.
-- **Insert.** Places the entry in sorted position; a full node splits at a
-  byte-balanced point (so variable-length keys do not overflow a half) and
-  propagates a separator upward, growing the tree by a level on a root split.
-- **Delete.** Removes the entry; underfull nodes are not merged (accepted bloat).
-- **Update.** Overwrites the leaf entry's `RowLocation` in place. A row update that would change the primary key itself is rejected by the engine with `SqlState::DatatypeMismatch` (primary-key updates are not supported).
+  internal node); entries are a sorted slotted array of `[key_len][key][value]`.
+  **The on-disk node layout is unchanged.** A leaf entry's value is an encoded
+  `RowLocation`; an internal entry's value is a child page number. An internal
+  **separator's `key` field holds the composite `encoded key ++ value`** of the
+  boundary leaf entry (the encoded key is self-delimiting, so the trailing value
+  tiebreaker needs no length prefix), so routing can disambiguate equal user-keys
+  that straddle a node split. Index-node slots are a narrower 4-byte
+  `[offset: u16][len: u16]` pair (no dead flag, since a delete removes the slot
+  outright), distinct from the 6-byte `[offset][len][flags]` slot used by heap
+  data pages.
+- **Lookup / scan.** `search`/`scan_key` descend from the root to the leaf at the
+  key's lower bound and walk the right-sibling chain; `scan`/`scan_range` find the
+  start leaf and walk the chain in `(key, value)` order. Equal keys that straddle
+  a leaf boundary are followed via the right-sibling link, so no entry is skipped
+  or duplicated.
+- **Insert.** Places the entry in `(key, value)` sorted position; a full node
+  splits at a byte-balanced point (so variable-length keys do not overflow a half)
+  and propagates a composite separator upward, growing the tree by a level on a
+  root split. Routing descends to the left of the first separator strictly greater
+  than the probe (a separator equal to the probe routes right, since a separator is
+  the right child's first `(key, value)`).
+- **Delete.** Removes the specific `(key, value)` entry; underfull nodes are not
+  merged (accepted bloat).
+- **Update.** A row update relocates its heap tuple, so the engine moves the
+  index entry by `remove(key, old_location)` then `insert(key, new_location)`. A
+  row update that would change the primary key itself is rejected by the engine
+  with `SqlState::DatatypeMismatch` (primary-key updates are not supported).
 - **Crash safety.** Every node mutation logs a `FullPageImage` and stamps the
   page-LSN, so the index is recovered by the same redo path as the heap and needs
-  no rebuild. Page allocation is seeded from each file's on-disk extent so a new
-  node never reuses an existing page after recovery.
+  no rebuild. The node layout is unchanged, so recovery replays these full-page
+  images exactly as before. Page allocation is seeded from each file's on-disk
+  extent so a new node never reuses an existing page after recovery.
 - **Keys.** Keys are stored in a self-describing byte form and ordered by decoding
-  to `Key` and comparing with `Ord`, matching the previous in-memory ordering.
+  to `Key` and comparing with `Ord`; equal keys are then ordered by their raw
+  value bytes.
+
+**Primary-key uniqueness (temporary presence-probe).** Because the tree no longer
+rejects duplicate keys, the engine `insert` first `scan_key(pk)`s the primary-key
+index and returns `SqlState::UniqueViolation` if any entry already exists. This
+presence-probe is TEMPORARY: Milestone B commit 7 replaces it with a
+visibility-aware uniqueness check that ignores dead/aborted versions.
 
 The B-tree is generic over its leaf value type: the primary-key index stores a
 fixed-width `RowLocation`, and a secondary index stores the row's primary `Key`
-(see Secondary Indexes). Internally the tree treats values as opaque bytes.
+(see Secondary Indexes). Internally the tree treats values as opaque bytes and
+uses them as the equal-key tiebreaker.
 
 ## Secondary Indexes
 
@@ -219,11 +264,18 @@ used for a secondary index.
   index changes only when one of its indexed columns changes. Reads therefore go
   secondary index → primary key → primary-key index → `RowLocation` → heap.
 - **Key shape.** A non-unique index keys on `[indexed.. , primary_key]`, so every
-  entry is distinct. A unique index keys on `[indexed..]` alone, so the tree
-  rejects a duplicate indexed value with `SqlState::UniqueViolation` — except when
-  an indexed value is NULL, where the primary key is appended too, so NULLs stay
-  distinct (SQL treats NULLs as unequal). The leaf value is the encoded primary
-  key in all cases.
+  entry is distinct. A unique index keys on `[indexed..]` alone, so a duplicate
+  indexed value collides on the key — except when an indexed value is NULL, where
+  the primary key is appended too, so NULLs stay distinct (SQL treats NULLs as
+  unequal). The leaf value is the encoded primary key in all cases. Since the
+  underlying B-tree is now multi-entry (it no longer rejects duplicate keys
+  structurally), a unique secondary index enforces uniqueness with an engine-level
+  presence-probe (`scan_key` before insert) returning `SqlState::UniqueViolation`;
+  a non-unique index needs no probe because its embedded primary key already makes
+  every key distinct. This presence-probe is temporary and parallels the
+  primary-key one; converting secondary indexes from `secondary→PK` to
+  `secondary→heap-TID` (and dropping the embedded-PK tiebreaker) is the next
+  commit (Milestone B commit 4).
 - **Lookup / range.** `index_scan(table, index, range)` constrains the leading
   indexed columns; the range bounds hold exactly those columns, and comparison
   ignores each stored key's trailing primary key. An equality bound thus matches

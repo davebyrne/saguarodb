@@ -226,6 +226,28 @@ impl PageBackedStorageEngine {
         )
     }
 
+    /// Insert `(entry_key, pk)` into a secondary index, enforcing uniqueness for a
+    /// unique index. The multi-entry tree no longer rejects duplicate keys
+    /// structurally, so a unique index presence-probes its key first; its
+    /// `secondary_index_key` is `[indexed..]` alone (no pk tiebreaker), so a
+    /// duplicate indexed value collides and is rejected. A non-unique index (and a
+    /// unique index over a NULL value) embeds the pk in the key, so its keys are
+    /// distinct and no probe is needed. This presence-probe is TEMPORARY: Milestone
+    /// B commit 7 replaces it with a visibility-aware uniqueness check.
+    fn insert_secondary_entry(
+        &self,
+        ctx: &StatementContext,
+        index: &IndexSchema,
+        entry_key: &Key,
+        pk: &Key,
+    ) -> Result<()> {
+        let secondary = self.secondary_btree(index.id);
+        if index.unique && !secondary.scan_key(entry_key)?.is_empty() {
+            return Err(duplicate_unique_index(&index.name));
+        }
+        secondary.insert(ctx.txn_id, entry_key, pk)
+    }
+
     /// Append a WAL record (in `Normal` mode only) and return its assigned LSN.
     /// Returns `0` in recovery mode, where the record is not produced.
     fn append_wal(
@@ -397,7 +419,11 @@ impl StorageEngine for PageBackedStorageEngine {
         let (schema, index_fid) = self.table_handle(table)?;
         let key = key_for_row(&schema, &row)?;
         let btree = self.btree(index_fid);
-        if btree.search(&key)?.is_some() {
+        // TEMPORARY presence-probe for primary-key uniqueness: the multi-entry
+        // tree no longer rejects duplicate keys structurally, so the engine
+        // checks for an existing entry first. Milestone B commit 7 replaces this
+        // with a visibility-aware uniqueness check.
+        if !btree.scan_key(&key)?.is_empty() {
             return Err(DbError::storage(
                 SqlState::UniqueViolation,
                 "duplicate primary key",
@@ -405,17 +431,11 @@ impl StorageEngine for PageBackedStorageEngine {
         }
 
         let location = self.write_new_row(&schema, &row, ctx.txn_id)?;
-        let inserted = btree.insert(ctx.txn_id, &key, &location)?;
-        debug_assert!(inserted, "uniqueness was checked above");
+        btree.insert(ctx.txn_id, &key, &location)?;
 
         for index in self.table_indexes(table)? {
             let entry_key = secondary_index_key(&schema, &index, &row, &key)?;
-            if !self
-                .secondary_btree(index.id)
-                .insert(ctx.txn_id, &entry_key, &key)?
-            {
-                return Err(duplicate_unique_index(&index.name));
-            }
+            self.insert_secondary_entry(ctx, &index, &entry_key, &key)?;
         }
 
         Ok(RowId {
@@ -448,13 +468,15 @@ impl StorageEngine for PageBackedStorageEngine {
             })?;
             for index in &indexes {
                 let entry_key = secondary_index_key(&schema, index, &row, key)?;
+                // Secondary value is the row's primary key (unchanged this
+                // milestone); remove the specific (entry_key, pk) entry.
                 self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &entry_key)?;
+                    .remove(ctx.txn_id, &entry_key, key)?;
             }
         }
 
         self.delete_row_logged(location, ctx.txn_id)?;
-        btree.remove(ctx.txn_id, key)?;
+        btree.remove(ctx.txn_id, key, &location)?;
         Ok(true)
     }
 
@@ -486,7 +508,12 @@ impl StorageEngine for PageBackedStorageEngine {
 
         self.delete_row_logged(previous_location, ctx.txn_id)?;
         let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
-        btree.update(ctx.txn_id, key, &new_location)?;
+        // The primary key is unchanged (rejected above otherwise), so move its
+        // single index entry to the new heap location: remove the old (key, loc)
+        // and insert (key, new_loc). Versioning UPDATE arrives in Milestone B
+        // commit 9; for now there is still one tid per key.
+        btree.remove(ctx.txn_id, key, &previous_location)?;
+        btree.insert(ctx.txn_id, key, &new_location)?;
 
         if let Some(previous_row) = previous_row {
             // Remove every old entry before inserting the new ones, so a unique
@@ -494,16 +521,11 @@ impl StorageEngine for PageBackedStorageEngine {
             for index in &indexes {
                 let old_key = secondary_index_key(&schema, index, &previous_row, key)?;
                 self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &old_key)?;
+                    .remove(ctx.txn_id, &old_key, key)?;
             }
             for index in &indexes {
                 let new_key = secondary_index_key(&schema, index, &row, key)?;
-                if !self
-                    .secondary_btree(index.id)
-                    .insert(ctx.txn_id, &new_key, key)?
-                {
-                    return Err(duplicate_unique_index(&index.name));
-                }
+                self.insert_secondary_entry(ctx, index, &new_key, key)?;
             }
         }
 
@@ -700,9 +722,7 @@ impl SchemaOperations for PageBackedStorageEngine {
                     storage_internal("primary-key index points to a dead row during index backfill")
                 })?;
             let key = secondary_index_key(&table_schema, schema, &row, &pk)?;
-            if !secondary.insert(ctx.txn_id, &key, &pk)? {
-                return Err(duplicate_unique_index(&schema.name));
-            }
+            self.insert_secondary_entry(ctx, schema, &key, &pk)?;
         }
         Ok(())
     }

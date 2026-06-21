@@ -172,24 +172,6 @@ pub(crate) fn remove_entry(data: &mut [u8; PAGE_SIZE], pos: u16) -> Result<()> {
     Ok(())
 }
 
-/// Overwrite the value of entry `pos` in place (the new value must be the same
-/// length as the old one, which holds for fixed-width leaf RowLocations).
-pub(crate) fn set_value(data: &mut [u8; PAGE_SIZE], pos: u16, value: &[u8]) -> Result<()> {
-    let count = entry_count(data);
-    if pos >= count {
-        return Err(corrupt_page("index set-value position out of range"));
-    }
-    let (offset, len) = read_slot(data, pos);
-    let key_len = read_u16(data, offset) as usize;
-    let value_offset = offset + 2 + key_len;
-    if value.len() != len - 2 - key_len {
-        return Err(corrupt_page("index value length mismatch"));
-    }
-    data[value_offset..value_offset + value.len()].copy_from_slice(value);
-    write_checksum(data);
-    Ok(())
-}
-
 // --- Metapage (page 0 of an index file): holds the current root page number ---
 
 const META_ROOT_OFFSET: usize = HEADER_LEN;
@@ -269,17 +251,6 @@ mod tests {
         assert_eq!(entry_count(&data.0), 2);
         assert_eq!(entry_key(&data.0, 0), b"a");
         assert_eq!(entry_key(&data.0, 1), b"c");
-    }
-
-    #[test]
-    fn set_value_overwrites_in_place() {
-        let mut data = leaf();
-        insert_entry(&mut data.0, 0, b"k", b"0123456789").unwrap();
-        set_value(&mut data.0, 0, b"9876543210").unwrap();
-        assert_eq!(entry_value(&data.0, 0), b"9876543210");
-
-        let err = set_value(&mut data.0, 0, b"short").unwrap_err();
-        assert!(err.message.contains("value length mismatch"));
     }
 
     #[test]

@@ -102,6 +102,18 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
+    let (key, consumed) = decode_key_prefix(bytes)?;
+    if consumed != bytes.len() {
+        return Err(corrupt_row("key has trailing bytes"));
+    }
+    Ok(key)
+}
+
+/// Decode the leading `Key` of `bytes` and report how many bytes it consumed,
+/// leaving any trailing bytes (a `(key, value)` separator's value tiebreaker in
+/// the multi-entry B-tree) for the caller. `decode_key` is this plus a
+/// no-trailing-bytes check.
+pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
     let mut offset = 0;
     let count = u16::from_le_bytes(
         read_exact(bytes, &mut offset, 2)?
@@ -138,10 +150,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
         };
         values.push(value);
     }
-    if offset != bytes.len() {
-        return Err(corrupt_row("key has trailing bytes"));
-    }
-    Ok(Key(values))
+    Ok((Key(values), offset))
 }
 
 /// Encode a freshly inserted row as a v2 tuple: `xmin = txn_id` (its creator),
