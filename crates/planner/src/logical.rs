@@ -1,4 +1,4 @@
-use common::{ColumnId, ColumnInfo, DataType, DbError, IndexId, ParsedColumnDef, Result, TableId};
+use common::{ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, TableId};
 
 use crate::{
     AggregateExpr, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem, BoundSelect,
@@ -562,7 +562,9 @@ fn rewrite_aggregate_expr(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. } => Ok(expr.clone()),
-        BoundExpr::AggregateCall { .. } => unreachable!(),
+        BoundExpr::AggregateCall { .. } => Err(DbError::internal(
+            "nested aggregate survived binder validation",
+        )),
     }
 }
 
@@ -604,6 +606,3 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::LocalRef { .. } => false,
     }
 }
-
-#[allow(dead_code)]
-fn _assert_datatype_is_used(_: DataType) {}
