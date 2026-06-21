@@ -375,53 +375,26 @@ impl PageBackedStorageEngine {
         }
     }
 
-    /// Mark a row dead and log its redo record (full-page image on first touch
-    /// since the last checkpoint, else a `HeapDelete` delta). Still used by
-    /// `UPDATE`'s relocate path (B4.9 will retire that); MVCC `DELETE` no longer
-    /// tombstones — it stamps `xmax` via [`Self::stamp_xmax_logged`].
-    fn delete_row_logged(&self, location: RowLocation, txn_id: u64) -> Result<bool> {
-        let mut guard = self
-            .buffer_pool
-            .write_page(location.file_id, location.page_num, txn_id)?;
-        if guard.take_needs_fpi() {
-            let deleted = page::delete_row(guard.data_mut(), location.slot_num)?;
-            let lsn = self.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::FullPageImage {
-                    file_id: location.file_id,
-                    page_num: location.page_num,
-                    image: guard.data().to_vec(),
-                },
-            })?;
-            page::set_page_lsn(guard.data_mut(), lsn);
-            Ok(deleted)
-        } else {
-            let lsn = self.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::HeapDelete {
-                    file_id: location.file_id,
-                    page_num: location.page_num,
-                    slot: location.slot_num,
-                },
-            })?;
-            let deleted = page::delete_row(guard.data_mut(), location.slot_num)?;
-            page::set_page_lsn(guard.data_mut(), lsn);
-            Ok(deleted)
-        }
-    }
-
-    /// Stamp `xmax = txn_id` on the version at `location` **in place** and log its
-    /// redo record (a full-page image on first touch since the last checkpoint,
-    /// else a `HeapUpdateHeader` delta). The line pointer stays `NORMAL`: the tuple
-    /// is physically present and is hidden purely by visibility once the deleter
-    /// commits (`docs/specs/mvcc.md` §3.2 invariant 1). `t_ctid` stays
-    /// `INVALID_TID` (a delete has no successor version) and `infomask` is carried
-    /// through unchanged (no hint bits set here — that is the optional commit 10).
-    /// This is the MVCC `DELETE` write; it never removes the tuple or its index
-    /// entries (VACUUM reclaims them, Milestone F).
-    fn stamp_xmax_logged(&self, location: RowLocation, infomask: u16, txn_id: u64) -> Result<()> {
+    /// Stamp `xmax = txn_id` and `t_ctid` on the version at `location` **in place**
+    /// and log its redo record (a full-page image on first touch since the last
+    /// checkpoint, else a `HeapUpdateHeader` delta). The line pointer stays
+    /// `NORMAL`: the tuple is physically present and is hidden purely by visibility
+    /// once the stamping transaction commits (`docs/specs/mvcc.md` §3.2 invariant
+    /// 1). `infomask` is carried through unchanged (no hint bits set here — that is
+    /// the optional commit 10).
+    ///
+    /// This is the shared "mark a version superseded" write for both MVCC writes:
+    /// `DELETE` passes `t_ctid = INVALID_TID` (a delete has no successor version);
+    /// `UPDATE` passes `t_ctid = new_tid`, the forward version-chain pointer to the
+    /// new tuple (invariant 5). It never removes the tuple or its index entries
+    /// (VACUUM reclaims them, Milestone F).
+    fn stamp_xmax_logged(
+        &self,
+        location: RowLocation,
+        t_ctid: (PageNum, u16),
+        infomask: u16,
+        txn_id: u64,
+    ) -> Result<()> {
         let mut guard = self
             .buffer_pool
             .write_page(location.file_id, location.page_num, txn_id)?;
@@ -434,7 +407,7 @@ impl PageBackedStorageEngine {
                 guard.data_mut(),
                 location.slot_num,
                 txn_id,
-                crate::codec::INVALID_TID,
+                t_ctid,
                 infomask,
                 current_lsn,
             )?;
@@ -457,7 +430,7 @@ impl PageBackedStorageEngine {
                     page_num: location.page_num,
                     slot: location.slot_num,
                     xmax: txn_id,
-                    t_ctid: crate::codec::INVALID_TID,
+                    t_ctid,
                     infomask,
                 },
             })?;
@@ -465,7 +438,7 @@ impl PageBackedStorageEngine {
                 guard.data_mut(),
                 location.slot_num,
                 txn_id,
-                crate::codec::INVALID_TID,
+                t_ctid,
                 infomask,
                 lsn,
             )?;
@@ -694,14 +667,23 @@ impl StorageEngine for PageBackedStorageEngine {
         // row is hidden by visibility (xmax committed ⇒ invisible to later
         // snapshots), and VACUUM (Milestone F) reclaims the dead version and its
         // entries. No tombstone, no index-entry removal.
-        self.stamp_xmax_logged(location, infomask, ctx.txn_id)?;
+        self.stamp_xmax_logged(location, crate::codec::INVALID_TID, infomask, ctx.txn_id)?;
         Ok(true)
     }
 
     fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool> {
         let (schema, index_fid) = self.table_handle(table)?;
         let btree = self.btree(index_fid);
-        let Some(previous_location) = btree.search(key)? else {
+        // Locate the version this statement's snapshot sees (the row the executor
+        // matched), NOT an arbitrary `search(key)` entry. The primary-key index may
+        // carry an entry per version once versioning lands (and after a
+        // delete-then-reinsert there are several entries for the key), so targeting
+        // the *visible* version is what makes the right row the one updated. If none
+        // is visible the key was already deleted or is absent, so the update affects
+        // no row — preserve the no-op semantics.
+        let Some((previous_location, infomask)) =
+            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, ctx.txn_id)?
+        else {
             return Ok(false);
         };
         let replacement_key = key_for_row(&schema, &row)?;
@@ -712,48 +694,47 @@ impl StorageEngine for PageBackedStorageEngine {
             ));
         }
 
-        let indexes = self.table_indexes(table)?;
-        let previous_row = if indexes.is_empty() {
-            None
-        } else {
-            Some(
-                self.read_location(&schema, previous_location)?
-                    .ok_or_else(|| {
-                        storage_internal("primary-key index points to a dead row during update")
-                    })?,
-            )
-        };
-
-        self.delete_row_logged(previous_location, ctx.txn_id)?;
+        // MVCC UPDATE (Postgres-style, non-HOT): write the new tuple as a fresh heap
+        // version (`xmin = txn`, `xmax = invalid`, `t_ctid = self`), then chain the
+        // old version forward to it and insert per-version index entries for the new
+        // version into *every* index. The old version and all old index entries are
+        // retained; VACUUM (Milestone F) reclaims them. Reads do not walk `t_ctid`
+        // (every version is independently indexed), so the new version needs its own
+        // entry in *all* indexes — including indexes whose columns did not change —
+        // or a scan on an unchanged secondary value would never find it (the
+        // changed-index-only skip is a HOT optimization, Milestone H; applying it
+        // here would be a correctness bug — `docs/specs/mvcc.md` Appendix A commit 9).
         let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
-        // The primary key is unchanged (rejected above otherwise), so move its
-        // single index entry to the new heap location: remove the old (key, loc)
-        // and insert (key, new_loc). Versioning UPDATE arrives in Milestone B
-        // commit 9; for now there is still one tid per key.
-        btree.remove(ctx.txn_id, key, &previous_location)?;
+
+        // Stamp the old version *before* the new version's uniqueness checks, so its
+        // `xmax = ctx.txn_id` makes `unique_conflict_exists` treat it as own-deleted
+        // (non-conflicting): the new version must not collide with the logical row it
+        // supersedes, but must still collide with any *other* live row. The forward
+        // `t_ctid` points at the new version (invariant 5).
+        let new_tid = (new_location.page_num, new_location.slot_num);
+        self.stamp_xmax_logged(previous_location, new_tid, infomask, ctx.txn_id)?;
+
+        // Primary-key entry for the new version. The key is unchanged (a PK change is
+        // rejected above), so this adds a second `(key, new_tid)` entry alongside the
+        // retained old one. The uniqueness check now sees the old version as
+        // own-deleted, so the unchanged PK does not falsely self-conflict.
+        if self.unique_conflict_exists(&btree, key, &schema, ctx.txn_id)? {
+            return Err(DbError::storage(
+                SqlState::UniqueViolation,
+                "duplicate primary key",
+            ));
+        }
         btree.insert(ctx.txn_id, key, &new_location)?;
 
-        if let Some(previous_row) = previous_row {
-            // Remove every old entry before inserting the new ones, so a unique
-            // index whose value is unchanged does not see a false duplicate. The
-            // old entries point at `previous_location`; the new ones at
-            // `new_location` (the row relocated within the heap).
-            for index in &indexes {
-                let (old_key, _has_null) = secondary_index_key(&schema, index, &previous_row)?;
-                self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &old_key, &previous_location)?;
-            }
-            for index in &indexes {
-                let (new_key, has_null) = secondary_index_key(&schema, index, &row)?;
-                self.insert_secondary_entry(
-                    ctx,
-                    &schema,
-                    index,
-                    &new_key,
-                    has_null,
-                    &new_location,
-                )?;
-            }
+        // A new per-version entry for the new tuple in *every* secondary index
+        // (changed-column or not), pointing at `new_location`. Old entries are
+        // retained. `insert_secondary_entry` enforces unique-secondary constraints
+        // visibility-aware: an unchanged unique value does not self-conflict (the old
+        // version is own-deleted), but a value colliding with a different live row
+        // raises `UniqueViolation`.
+        for index in self.table_indexes(table)? {
+            let (new_key, has_null) = secondary_index_key(&schema, &index, &row)?;
+            self.insert_secondary_entry(ctx, &schema, &index, &new_key, has_null, &new_location)?;
         }
 
         Ok(true)
@@ -1272,6 +1253,17 @@ mod visibility_tests {
             self.engine
                 .btree(crate::heap::index_file_id(TABLE_ID))
                 .scan_key(key)
+                .unwrap()
+        }
+
+        /// The heap TIDs secondary index `index_id` carries for a textual `name`
+        /// value, read straight from the B-tree (no visibility filtering), so an
+        /// UPDATE test can assert that *both* the old and new versions hold a
+        /// per-version entry (one entry per version) under the same value.
+        fn secondary_index_tids(&self, index_id: u32, name: &str) -> Vec<super::RowLocation> {
+            self.engine
+                .secondary_btree(index_id)
+                .scan_key(&Key(vec![Value::Text(name.to_string())]))
                 .unwrap()
         }
 
@@ -1879,5 +1871,387 @@ mod visibility_tests {
                 .unwrap(),
             Some(row(1, "alive"))
         );
+    }
+
+    // --- MVCC UPDATE: write a new version, chain the old, all-index entries
+    //     (Milestone B commit 9) ---
+
+    /// A committed UPDATE is seen by a *later* snapshot through a sequential scan, an
+    /// index scan on the **changed** column value, AND an index scan on an
+    /// **unchanged** secondary value — the last proves the new version got an entry
+    /// in the unchanged-column index too (the anti-HOT-bug check: every index gets a
+    /// per-version entry, not only changed-column indexes).
+    #[test]
+    fn committed_update_is_visible_via_seq_and_both_secondary_scans() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        // Two secondary indexes: one on `name` (changed by the update), one on `id`
+        // (an unchanged column). The unchanged-column index must still gain a new
+        // entry for the new version.
+        let name_idx = name_index();
+        let id_idx = IndexSchema {
+            id: 2,
+            table: TABLE_ID,
+            name: "users_id".to_string(),
+            columns: vec![0],
+            unique: false,
+        };
+        fixture.engine.create_index(&setup, &name_idx).unwrap();
+        fixture.engine.create_index(&setup, &id_idx).unwrap();
+        fixture.commit(100);
+
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "old"))
+            .unwrap();
+        fixture.commit(10);
+
+        // Update the name "old" -> "new" (id unchanged) under txn 20, then commit.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "new")
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        let reader = ctx(0, snapshot(30, vec![]));
+
+        // Sequential scan sees the new value.
+        let mut seq = fixture
+            .engine
+            .scan_range(&reader, TABLE_ID, &KeyRange::All)
+            .unwrap();
+        let stored = seq.next().unwrap().unwrap();
+        assert_eq!(stored.row, row(1, "new"));
+        assert!(seq.next().unwrap().is_none());
+
+        // Index scan on the CHANGED column (name = "new") returns the new version;
+        // the old value "old" returns nothing (the old version is superseded).
+        let by_new_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_idx.id, &name_eq("new"))
+                .unwrap(),
+        );
+        assert_eq!(by_new_name, vec![row(1, "new")]);
+        let by_old_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_idx.id, &name_eq("old"))
+                .unwrap(),
+        );
+        assert!(by_old_name.is_empty());
+
+        // Index scan on the UNCHANGED column (id = 1) ALSO returns the new version:
+        // the new tuple got its own entry in the unchanged-column index. Were the
+        // engine to skip unchanged-column indexes (the HOT optimization), the id
+        // index's only entry would point at the now-superseded old version and this
+        // scan would wrongly return the old row — or, with visibility filtering,
+        // nothing.
+        let by_id = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, id_idx.id, &KeyRange::Exact(key(1)))
+                .unwrap(),
+        );
+        assert_eq!(by_id, vec![row(1, "new")]);
+    }
+
+    /// Internally both versions coexist after an UPDATE: the old version is stamped
+    /// `xmax = txn` with `t_ctid` pointing at the new version (the forward chain),
+    /// and the new version is live (`xmax = INVALID`, `t_ctid = INVALID`). Asserted
+    /// via physical header decode. Both PK index entries linger (one per version).
+    #[test]
+    fn update_chains_old_to_new_and_keeps_both_versions() {
+        let (fixture, rid) = fixture_with_one_row_and_index();
+        let old_location = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "updated"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // Two PK entries now: the old (superseded) one and the new (live) one.
+        let tids = fixture.pk_index_tids(&key(1));
+        assert_eq!(tids.len(), 2);
+        let new_location = *tids.iter().find(|loc| **loc != old_location).unwrap();
+
+        // The old version is stamped xmax = 20 and chained forward to the new TID,
+        // and its slot stays NORMAL (decodes).
+        let old = fixture
+            .decode_physical(old_location)
+            .expect("old slot stays NORMAL");
+        assert_eq!(old.xmax, 20);
+        assert_eq!(old.t_ctid, (new_location.page_num, new_location.slot_num));
+        assert_eq!(old.row, row(1, "alive"));
+
+        // The new version is live: xmin = 20, no deleter, no successor.
+        let new = fixture
+            .decode_physical(new_location)
+            .expect("new slot is NORMAL");
+        assert_eq!(new.xmin, 20);
+        assert_eq!(new.xmax, common::INVALID_XID);
+        assert_eq!(new.t_ctid, crate::codec::INVALID_TID);
+        assert_eq!(new.row, row(1, "updated"));
+
+        // Both versions also hold a secondary `name` entry (one entry per version).
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "alive").len(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .secondary_index_tids(name_index().id, "updated")
+                .len(),
+            1
+        );
+    }
+
+    /// An older snapshot that predates the UPDATE still resolves the OLD version
+    /// through a secondary scan on the OLD value — the retained old entry + the old
+    /// version being visible to the old snapshot. This is the MVCC point: the
+    /// pre-update reader is unaffected by the update.
+    #[test]
+    fn old_snapshot_resolves_old_version_via_retained_secondary_entry() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        // Capture an OLD snapshot before the update: the future starts at 15, so the
+        // updater (txn 20) is in the future and invisible to this snapshot. The
+        // creator (txn 10) is committed and below xmax ⇒ visible.
+        let old_snapshot = ctx(0, snapshot(15, vec![]));
+
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "updated"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // The pre-update reader, scanning the OLD name value, still resolves the OLD
+        // version: its entry was retained and the old version is visible to a
+        // snapshot in which the deleter (txn 20) is in the future.
+        let by_old_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&old_snapshot, TABLE_ID, name_index().id, &name_eq("alive"))
+                .unwrap(),
+        );
+        assert_eq!(by_old_name, vec![row(1, "alive")]);
+
+        // A reader after the update sees the new value, and the old value is gone.
+        let after = ctx(0, snapshot(30, vec![]));
+        assert_eq!(
+            fixture.engine.get(&after, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "updated"))
+        );
+    }
+
+    /// Changing a UNIQUE secondary value to a *different live row's* value raises
+    /// `UniqueViolation`; changing it to a brand-new value succeeds; "updating" the
+    /// unique value to its own current value succeeds (no false self-conflict,
+    /// because the superseded old version is treated as own-deleted).
+    #[test]
+    fn update_unique_secondary_conflicts_only_with_other_live_rows() {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        let unique_name = IndexSchema {
+            id: 1,
+            table: TABLE_ID,
+            name: "users_name_unique".to_string(),
+            columns: vec![1],
+            unique: true,
+        };
+        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture.commit(100);
+
+        // Two committed-live rows with distinct unique names.
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+            .unwrap();
+        fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "bob"))
+            .unwrap();
+        fixture.commit(10);
+        fixture.commit(11);
+
+        // Updating row 1's name to "bob" (another live row's value) ⇒ UniqueViolation.
+        let err = fixture
+            .engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &key(1),
+                row(1, "bob"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::UniqueViolation);
+        // A statement error aborts the transaction (mvcc.md Decision 3): the partial
+        // new version txn 20 wrote (and its index entries) become CLOG-aborted ⇒
+        // invisible and non-conflicting, exactly as the server's abort path arranges.
+        fixture.abort(20);
+
+        // Updating row 1's name to a brand-new value ⇒ OK.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(21, snapshot(22, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "cleo")
+                )
+                .unwrap()
+        );
+        fixture.commit(21);
+
+        // "Updating" row 1 to its own current unique value ("cleo") ⇒ OK: the old
+        // version it supersedes is own-deleted, so it does not self-conflict.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(22, snapshot(23, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "cleo")
+                )
+                .unwrap()
+        );
+        fixture.commit(22);
+
+        // The live row reads back as "cleo".
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "cleo"))
+        );
+    }
+
+    /// Changing the primary key is rejected (existing behavior preserved); the row
+    /// is unchanged.
+    #[test]
+    fn update_rejects_primary_key_change() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        let err = fixture
+            .engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &key(1),
+                row(2, "alive"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::DatatypeMismatch);
+
+        // The original row is untouched.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "alive"))
+        );
+    }
+
+    /// After a delete-then-reinsert (two PK entries for the key — a committed-deleted
+    /// version and a live one), an UPDATE targets the VISIBLE version (the live
+    /// re-inserted one), not an arbitrary `search(key)` entry. This is the
+    /// multi-version landmine fix.
+    #[test]
+    fn update_targets_the_visible_version_after_delete_then_reinsert() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        // Delete the original (committed), then re-insert the same key (committed):
+        // now two PK entries exist for key 1 — the dead one and the live one.
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(20);
+        fixture
+            .engine
+            .insert(
+                &ctx(21, snapshot(22, vec![])),
+                TABLE_ID,
+                row(1, "reinserted"),
+            )
+            .unwrap();
+        fixture.commit(21);
+        assert_eq!(fixture.pk_index_tids(&key(1)).len(), 2);
+
+        // Update key 1: it must update the live (re-inserted) version, not the dead
+        // one — the visible-version targeting.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(22, snapshot(23, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "updated")
+                )
+                .unwrap()
+        );
+        fixture.commit(22);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "updated"))
+        );
+    }
+
+    fn name_eq(name: &str) -> KeyRange {
+        KeyRange::Exact(Key(vec![Value::Text(name.to_string())]))
+    }
+
+    /// Drain an index/sequential-scan iterator into the rows it yields.
+    fn collect_names(mut iter: Box<dyn crate::traits::RowIterator>) -> Vec<Row> {
+        let mut rows = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            rows.push(stored.row);
+        }
+        rows
     }
 }

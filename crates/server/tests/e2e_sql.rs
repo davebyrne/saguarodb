@@ -104,6 +104,81 @@ async fn e2e_delete_then_reinsert_same_key_succeeds() {
 }
 
 #[tokio::test]
+async fn e2e_update_new_version_is_visible_via_seq_and_index_scans() {
+    // MVCC UPDATE writes a new heap version and inserts a per-version entry into
+    // *every* index (the changed-column index and the unchanged-column index), so
+    // after a committed UPDATE a SELECT sees the new value via a sequential scan,
+    // an index scan on the changed column, AND a scan on an unchanged secondary
+    // value (the anti-HOT-bug check: the unchanged-column index got an entry too).
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text, city text)")
+        .await
+        .unwrap();
+    // city is changed by the update; name is the unchanged secondary value.
+    server
+        .simple_query("create index users_name on users (name)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create index users_city on users (city)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name, city) values (1, 'Ada', 'paris')")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("update users set city = 'london' where id = 1")
+        .await
+        .unwrap();
+
+    // Sequential scan sees the new value.
+    let rows = server
+        .simple_query("select id, name, city from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some("Ada".to_string()),
+            Some("london".to_string()),
+        ]]
+    );
+
+    // Index scan on the CHANGED column (city) returns the new version; the old
+    // value resolves nothing.
+    let rows = server
+        .simple_query("select id from users where city = 'london'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    let rows = server
+        .simple_query("select id from users where city = 'paris'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    // Index scan on the UNCHANGED column (name) STILL returns the row: the new
+    // version got an entry in the unchanged-column index too.
+    let rows = server
+        .simple_query("select id, city from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("london".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn e2e_create_index_and_unique_constraint() {
     let server = TestServer::start().await.unwrap();
 

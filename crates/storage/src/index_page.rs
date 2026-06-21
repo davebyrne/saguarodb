@@ -158,6 +158,11 @@ pub(crate) fn insert_entry(
 
 /// Remove the entry at `pos`, shifting later slots down. The entry bytes are not
 /// reclaimed (accepted bloat); a later `truncate` compacts them.
+///
+/// Reached only via `BTree::remove`, whose sole future caller is VACUUM (Milestone
+/// F); MVCC DML retains every index entry. Part of the index-page removal contract
+/// (exercised by this module's unit tests) until then.
+#[allow(dead_code, reason = "entry removal is VACUUM's job (Milestone F)")]
 pub(crate) fn remove_entry(data: &mut [u8; PAGE_SIZE], pos: u16) -> Result<()> {
     let count = entry_count(data);
     if pos >= count {

@@ -135,6 +135,14 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// The first value stored for `key`, or `None`. With duplicate keys allowed a
     /// key may have several values; this returns the lowest by value order, which
     /// is the single value for the (single-version) primary-key index.
+    ///
+    /// Visibility-unaware: with versioning (Milestone B4) a key may carry several
+    /// versions' entries, so the engine locates rows via
+    /// `locate_visible_version`/`scan_key` instead. `search` stays as part of the
+    /// B-tree's stable single-value lookup contract (exercised by the B-tree unit
+    /// tests) and remains available to callers that want exact `(key, value)`
+    /// presence.
+    #[allow(dead_code, reason = "single-value lookup; no engine caller after B4.9")]
     pub(crate) fn search(&self, key: &Key) -> Result<Option<V>> {
         let probe = Probe { key, value: None };
         let mut page_num = self.descend_to_leaf(&probe)?;
@@ -219,6 +227,13 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// Remove the single `(key, value)` entry. Returns `false` if no entry with
     /// that exact key *and* value exists. Other entries sharing the key are left
     /// intact. Underfull nodes are not merged (accepted bloat).
+    ///
+    /// MVCC DML never removes an index entry (DELETE/UPDATE retain every version's
+    /// entry; `docs/specs/mvcc.md` §3.2 invariant 3) — entry removal is VACUUM's job
+    /// (Milestone F), which is this method's next caller. It stays as part of the
+    /// B-tree's stable `(key, value)` removal contract (exercised by the B-tree unit
+    /// tests) until then.
+    #[allow(dead_code, reason = "entry removal is VACUUM's job (Milestone F)")]
     pub(crate) fn remove(&self, txn_id: u64, key: &Key, value: &V) -> Result<bool> {
         let value = value.encode()?;
         let probe = Probe {

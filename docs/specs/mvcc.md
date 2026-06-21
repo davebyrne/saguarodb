@@ -666,14 +666,34 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
      delete-then-reinsert now allowed.
 
 9. **`feat(storage): UPDATE writes a new version and chains it`**
-   - *Does:* stamp the old version's `xmax` + `t_ctid→new`, write the new version
-     (`xmin = txn`, `xmax = invalid`, `t_ctid = self`), insert per-version index
-     entries into all indexes, retain old entries; drop relocate-tombstone-repoint;
-     keep rejecting PK changes; only touch a secondary index whose columns changed
-     (but never *remove* the old entry — VACUUM's job).
+   - *Does:* locate the **visible** old version (`locate_visible_version`, snapshot +
+     `ctx.txn_id` — not `search(key)`, which after a delete-then-reinsert could
+     target a dead version), write the new version (`xmin = txn`, `xmax = invalid`,
+     `t_ctid = self`), stamp the old version's `xmax = txn` + `t_ctid→new` (the
+     forward chain, invariant 5), insert a per-version entry into **all** indexes
+     (PK and every secondary), and retain every old entry; drop
+     relocate-tombstone-repoint; keep rejecting PK changes.
+   - *All indexes, not only changed ones:* because reads do not walk `t_ctid` (every
+     version is independently indexed, §3.2 invariant 3 — one entry per version), the
+     new heap TID needs its own entry in **every** index, including secondaries whose
+     columns did not change; otherwise a scan on an unchanged secondary value would
+     find only the old version's entry (now superseded). Skipping unchanged-column
+     indexes is a **HOT optimization (Milestone H)** and would be a correctness bug
+     here. No old entry is ever *removed* (VACUUM's job, Milestone F).
+   - *Uniqueness:* the new version must not conflict with the old version it
+     supersedes but must conflict with other live rows. Stamping the old version's
+     `xmax = txn` *before* the new entries' uniqueness checks makes the MVCC
+     `unique_conflict_exists` treat it as own-deleted (non-conflicting); a changed
+     unique secondary value colliding with a different live row raises
+     `UniqueViolation` (the statement error → txn abort → before-image undo restores
+     everything).
    - *Touches:* `storage/src/engine.rs` (`update`).
-   - *Tests:* update+select sees the new value; both versions present internally; a
-     secondary scan by the *old* value resolves via a hand-built old snapshot.
+   - *Tests:* update+select sees the new value (seq scan, index scan on the changed
+     column, and a scan on an *unchanged* secondary column — the all-indexes check);
+     both versions present internally (old: `xmax=txn`, `t_ctid→new`); a secondary
+     scan by the *old* value resolves the old version via a hand-built old snapshot;
+     unique-secondary conflict vs. other live rows but not self; PK change rejected;
+     update after delete-then-reinsert targets the visible version.
 
 ### Optional / follow-on (land in B or defer to G)
 

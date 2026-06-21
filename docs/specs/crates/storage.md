@@ -61,8 +61,9 @@ Each table is page-backed. Full rows live in heap pages; a durable, non-clustere
 - `scan` / `scan_range` walk the primary-key B-tree leaves in key order and read rows from their heap locations.
 - `index_scan` walks a secondary index, which points directly at heap TIDs, and reads each row from its heap location (no primary-key indirection; see Secondary Indexes).
 - `delete` marks the visible version deleted in place (MVCC delete; see below) and
-  retains its index entries. `update` keeps every secondary index in sync with the
-  heap.
+  retains its index entries. `update` writes a new heap version, chains the old
+  version forward to it (`xmax` + `t_ctid`), and inserts a per-version entry into
+  every index (MVCC update; see below), retaining all old entries.
 
 ### Snapshot visibility on reads
 
@@ -86,12 +87,13 @@ results are unchanged from the pre-MVCC engine.
   every candidate TID from the index and visibility-checks each at the heap; the
   forward `t_ctid` chain is not followed for `SELECT` (it serves update-locating
   and conflict detection in later milestones).
-- **Internal index maintenance is unfiltered.** `update` and index backfill read
-  the *current physical* tuple (not the snapshot-visible version) to recompute
-  index keys, so they use the unfiltered heap read, not the visibility-aware one.
-  `delete` instead locates the *visible* version (the row the executor matched) via
-  the visibility predicate, then stamps its `xmax` in place; it removes no index
-  entry.
+- **Index backfill is unfiltered; DML locates the visible version.** `create_index`
+  backfill reads the *current physical* tuple (not the snapshot-visible version) to
+  recompute index keys, so it uses the unfiltered heap read. `delete` and `update`
+  instead locate the *visible* version (the row the executor matched) via the
+  visibility predicate (`locate_visible_version`); `delete` stamps its `xmax` in
+  place, `update` stamps it and chains it to the new version. Neither removes an
+  index entry.
 
 ## Page Format
 
@@ -137,12 +139,13 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
   (Milestone H); no path produces it yet.*
 
 The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly the
-former "live" slot and `DEAD` is the former tombstoned slot. MVCC `delete` no
-longer tombstones — it stamps `xmax` on a still-`NORMAL` line pointer (see MVCC
-Delete below), so the deleted tuple lingers physically until VACUUM. The `DEAD`
-state is now produced only by `update`'s relocate path (`delete_row`), retired in
-Milestone B4.9. `validate` accepts only `NORMAL` and `DEAD` flags on a data page
-(the two states produced today); any other value is corruption.
+former "live" slot and `DEAD` is the former tombstoned slot. Neither MVCC `delete`
+nor MVCC `update` tombstones any more — both keep the superseded version on a
+still-`NORMAL` line pointer and hide it by visibility (see MVCC Delete / MVCC
+Update below), so dead tuples linger physically until VACUUM (Milestone F), which
+is the only future producer of `DEAD`. No path produces `DEAD` today. `validate`
+still accepts `NORMAL` and `DEAD` flags on a data page (so a future VACUUM page is
+valid); any other value is corruption.
 
 **Stable `(page, slot)` contract.** An index entry references a
 `(page, line-pointer-slot)`. The tuple bytes a line pointer names may later be
@@ -163,9 +166,10 @@ not compacted. The header offsets live solely in
 byte range, so `page.rs` never duplicates the header layout. A non-live
 (`DEAD`/`UNUSED`/out-of-bounds) slot or a non-v2 tuple is a misuse and returns a
 structured `DbError` rather than panicking. This is the substrate for `UPDATE`
-/`DELETE` version stamping (Milestone B commits 8–9). MVCC `delete` already emits
-it under the WAL (`HeapUpdateHeader`; see MVCC Delete below); `update`'s version
-stamping arrives in B4.9.
+/`DELETE` version stamping (Milestone B commits 8–9). Both MVCC `delete` (with
+`t_ctid = INVALID_TID`) and MVCC `update` (with `t_ctid = new_tid`, the forward
+chain pointer) emit it under the WAL (`HeapUpdateHeader`; see MVCC Delete / MVCC
+Update below).
 
 ### MVCC Delete
 
@@ -201,6 +205,61 @@ before-image undo restores the page (un-stamping `xmax`); since no index entry w
 removed, no index repair is needed. Recovery replays the `HeapUpdateHeader` redo
 (PageLSN-gated), so a committed delete stays hidden and an aborted one (no durable
 `Commit`) leaves the row visible.
+
+### MVCC Update
+
+`update(ctx, table, key, row)` writes a **new heap version** and chains the old
+one to it (Postgres-style, non-HOT; `mvcc.md` §3.2 invariants 1, 3, 5). The
+primary key may not change (a changed PK is a `DatatypeMismatch` error), so the new
+version carries the same PK as the old. The flow is ordered for correct uniqueness:
+
+1. **Locate the visible old version.** Like `delete`, `update` locates the version
+   the statement's snapshot sees via `locate_visible_version(key)` (the candidate
+   TIDs from `scan_key(key)` filtered by `common::is_visible`), **not**
+   `search(key)`. This matters once a key carries several versions' entries — after
+   a delete-then-reinsert, `search` could return a dead version; targeting the
+   *visible* one is what makes the right row the one updated. No visible version ⇒
+   the update affects no row and returns `Ok(false)`.
+2. **Write the new version.** The replacement row is written as a fresh heap tuple
+   at a **new TID** through the normal insert/heap-write + WAL path, stamping
+   `xmin = ctx.txn_id`, `xmax = INVALID_XID`, `t_ctid = INVALID_TID` (it is the
+   latest version).
+3. **Chain the old version forward.** The old version's header is stamped
+   `xmax = ctx.txn_id` **and** `t_ctid = new_tid` in place via the WAL-logged
+   `HeapUpdateHeader` path (a `FullPageImage` on the page's first touch since the
+   last checkpoint). The line pointer stays `NORMAL`; `infomask` is carried through.
+   This stamping happens *before* the new version's uniqueness checks, so the old
+   version reads as own-deleted (`xmax == ctx.txn_id`) and does not falsely
+   self-conflict.
+4. **Insert per-version entries into all indexes.** A new `(key, new_tid)` entry is
+   inserted into the primary-key index and a new `(secondary_key, new_tid)` entry
+   into **every** secondary index — changed-column or not. Because reads do not walk
+   `t_ctid` (every version is independently indexed; one entry per version), the new
+   TID needs its own entry in every index, or a scan on an unchanged secondary value
+   would find only the superseded old version's entry. Skipping unchanged-column
+   indexes is a HOT optimization (Milestone H) and would be a correctness bug here.
+   Unique indexes (PK and unique secondary) run the visibility-aware
+   `unique_conflict_exists` check: a value unchanged from the old version does not
+   self-conflict (the old version is own-deleted), but a value colliding with a
+   *different* live row raises `UniqueViolation`.
+5. **Retain all old entries.** No old index entry — PK or secondary — is removed.
+
+After a committed `UPDATE`, both versions coexist in the heap: the old version
+(`xmax = txn`, `t_ctid → new`, invisible to later snapshots) and the new live
+version, with every old index entry lingering until VACUUM (Milestone F) reclaims
+the dead version and its entries. External SQL is unchanged: a later snapshot sees
+the new value via a sequential scan, an index scan on the changed column, and a
+scan on an unchanged secondary value (the new version's entry resolves all three).
+An older snapshot that predates the update still resolves the old version through
+its retained entries. On abort (statement error → autocommit rollback), the buffer
+pool's before-image undo restores every page the update touched — the new tuple's
+heap page and the index pages gain their new entries on a first `new_page`/
+`write_page` for the transaction, so the undo removes them, and the old version's
+header is un-stamped; combined with the `Abort` record (CLOG marks the txn
+aborted), no orphan new version is visible. Recovery replays the new tuple's
+`HeapInsert`/`FullPageImage`, the old version's `HeapUpdateHeader`, and the new
+index-entry page images (all PageLSN-gated), so a committed update's new value
+survives restart and an aborted one leaves the old value.
 
 ## Row Serialization
 

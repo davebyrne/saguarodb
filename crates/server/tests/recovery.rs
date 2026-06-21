@@ -120,6 +120,112 @@ async fn delete_then_reinsert_survives_restart() {
 }
 
 #[tokio::test]
+async fn committed_update_new_version_survives_restart() {
+    // A committed autocommit UPDATE writes a new heap version, stamps the old
+    // version's xmax + t_ctid->new via HeapUpdateHeader, and inserts new index
+    // entries. Recovery replays all of those records, so after restart a SELECT
+    // (seq scan and index scan) sees the NEW value and not the old one.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index users_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server
+            .simple_query("update users set name = 'Bea' where id = 1")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    // Sequential scan sees the new value after restart.
+    let rows = server
+        .simple_query("select id, name from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Bea".to_string())]]
+    );
+    // Index scan on the new value resolves the new version; the old value is gone.
+    let rows = server
+        .simple_query("select id from users where name = 'Bea'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    let rows = server
+        .simple_query("select id from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn aborted_update_leaves_old_value_after_restart() {
+    // A UPDATE that violates a unique secondary constraint errors; the autocommit
+    // transaction aborts (before-image undo restores the page, and the Abort
+    // record marks the txn aborted). After restart no orphan new version is
+    // visible and the old value survives.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create unique index uq_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (2, 'Bea')")
+            .await
+            .unwrap();
+
+        // Updating row 1's name to 'Bea' collides with the live row 2 ⇒ the
+        // statement errors and the autocommit transaction aborts.
+        let err = server
+            .simple_query("update users set name = 'Bea' where id = 1")
+            .await
+            .err()
+            .expect("unique violation aborts the update");
+        assert!(err.message.to_lowercase().contains("unique"));
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    // The aborted update left both original rows; no orphan new 'Bea'-named version
+    // of id 1 is visible.
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("2".to_string()), Some("Bea".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn uncommitted_wal_record_is_ignored_on_restart() {
     let dir = tempfile::tempdir().unwrap();
     write_uncommitted_record_for_test(dir.path()).unwrap();
