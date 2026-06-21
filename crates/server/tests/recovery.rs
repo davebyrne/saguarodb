@@ -181,7 +181,7 @@ async fn torn_heap_page_is_repaired_by_full_page_image() {
 }
 
 #[tokio::test]
-async fn recovery_fails_loudly_when_buffer_too_small() {
+async fn recovery_succeeds_with_buffer_smaller_than_working_set() {
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -189,25 +189,21 @@ async fn recovery_fails_loudly_when_buffer_too_small() {
             .simple_query("create table big (id integer primary key, payload text)")
             .await
             .unwrap();
-        // Two rows each large enough to occupy a separate page.
         let payload = "x".repeat(7000);
-        server
-            .simple_query(&format!(
-                "insert into big (id, payload) values (1, '{payload}')"
-            ))
-            .await
-            .unwrap();
-        server
-            .simple_query(&format!(
-                "insert into big (id, payload) values (2, '{payload}')"
-            ))
-            .await
-            .unwrap();
+        for id in 1..=4 {
+            server
+                .simple_query(&format!(
+                    "insert into big (id, payload) values ({id}, '{payload}')"
+                ))
+                .await
+                .unwrap();
+        }
         server.force_checkpoint().await.unwrap();
     }
 
-    // Reopen with a one-frame buffer pool: the recovery working set no longer
-    // fits, so the directory rebuild would be partial. Recovery must error.
+    // Reopen with a one-frame buffer pool. The durable on-disk index means
+    // recovery rebuilds nothing in memory, so it no longer needs the working set
+    // to fit — it spills, and queries still read every row.
     let config = saguarodb_server::config::Config {
         data_dir: dir.path().to_path_buf(),
         port: 0,
@@ -216,11 +212,12 @@ async fn recovery_fails_loudly_when_buffer_too_small() {
         checkpoint_wal_bytes: 64 * 1024 * 1024,
         shutdown_timeout_ms: 1_000,
     };
-    let err = match saguarodb_server::recovery::open_app(config) {
-        Ok(_) => panic!("expected recovery to fail with a one-frame buffer pool"),
-        Err(err) => err,
-    };
-    assert!(err.message.contains("buffer pool is too small"));
+    let app = saguarodb_server::recovery::open_app(config).unwrap();
+    let result = app
+        .query_service
+        .execute_sql("select id from big order by id")
+        .unwrap();
+    assert_eq!(result.row_count(), 4);
 }
 
 #[tokio::test]
@@ -260,13 +257,117 @@ async fn committed_pages_spill_to_heap_under_buffer_pressure() {
     assert_eq!(result.row_count(), 10);
 }
 
-/// Overwrite the first page of every heap file with garbage, simulating a torn
-/// write that leaves the on-disk page corrupt.
+#[tokio::test]
+async fn insert_after_checkpoint_and_restart_does_not_reuse_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(7000);
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key, payload text)")
+            .await
+            .unwrap();
+        // Four big rows occupy four heap pages, then a checkpoint makes them
+        // durable (and truncates their redo).
+        for id in 1..=4 {
+            server
+                .simple_query(&format!(
+                    "insert into t (id, payload) values ({id}, '{payload}')"
+                ))
+                .await
+                .unwrap();
+        }
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // Reopen (recovery replays nothing) and insert a fifth row needing a new heap
+    // page. The page allocator must be seeded from the on-disk extent so the new
+    // page does not reuse page 0 and overwrite id=1.
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(&format!(
+                "insert into t (id, payload) values (5, '{payload}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        (1..=5)
+            .map(|id| vec![Some(id.to_string())])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn split_index_survives_restart_and_post_restart_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    // In-process (no TCP) so the thousands of inserts that force index splits stay
+    // fast. A fresh config per phase reopens the same data dir.
+    let config = || saguarodb_server::config::Config {
+        data_dir: dir.path().to_path_buf(),
+        port: 0,
+        buffer_pool_frames: 64,
+        checkpoint_every_n_commits: 100,
+        checkpoint_wal_bytes: 64 * 1024 * 1024,
+        shutdown_timeout_ms: 1_000,
+    };
+
+    // Build an index that splits into a root plus several leaves.
+    {
+        let app = saguarodb_server::recovery::open_app(config()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+        for id in 0..400 {
+            app.query_service
+                .execute_sql(&format!("insert into t (id) values ({id})"))
+                .unwrap();
+        }
+    }
+
+    // Reopen and keep inserting ascending keys. These fill the rightmost leaf and
+    // split it, allocating fresh index pages *after* recovery — the allocator must
+    // be seeded from the .idx extent or a new node would reuse an existing index
+    // page and corrupt the tree.
+    {
+        let app = saguarodb_server::recovery::open_app(config()).unwrap();
+        for id in 400..800 {
+            app.query_service
+                .execute_sql(&format!("insert into t (id) values ({id})"))
+                .unwrap();
+        }
+    }
+
+    // Reopen once more and confirm every key is present and ordered.
+    let app = saguarodb_server::recovery::open_app(config()).unwrap();
+    let result = app
+        .query_service
+        .execute_sql("select id from t order by id")
+        .unwrap();
+    assert_eq!(result.row_count(), 800);
+}
+
+/// Overwrite the first page of every heap (`.heap`) file with garbage, simulating
+/// a torn heap write. Index (`.idx`) files are left intact: this exercises
+/// torn-page repair of a heap page, and the metapage of an index is not rewritten
+/// post-checkpoint, so it relies on the checkpoint's durable write rather than redo.
 fn corrupt_heap_pages(data_dir: &Path) {
     use std::io::Write;
     let heap_dir = data_dir.join("heap");
     for entry in std::fs::read_dir(&heap_dir).unwrap() {
         let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("heap") {
+            continue;
+        }
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.write_all(&[0xFF; 8192]).unwrap();
         file.sync_all().unwrap();

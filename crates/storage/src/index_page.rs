@@ -20,10 +20,6 @@
 //! a child `PageNum`. The btree (`btree.rs`) owns key comparison and the tree
 //! structure; this module only manipulates the on-page bytes.
 
-// Wired into the storage engine in the PK-cutover commit; until then only the
-// btree and unit tests exercise this module.
-#![allow(dead_code)]
-
 use buffer::PAGE_SIZE;
 use common::{PageNum, Result};
 

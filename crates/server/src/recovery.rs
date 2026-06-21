@@ -1,14 +1,10 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
-use common::{
-    DbError, FileId, FlushPolicy, PageFlushInfo, PageNum, Result, RwLockConcurrencyController,
-    SqlState, TableId,
-};
+use common::{DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController};
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
 use wal::{FileWalManager, WalManager, WalRecordKind};
@@ -28,6 +24,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
         Box::new(WalFlushPolicy { wal: wal.clone() }),
         store.clone(),
     ));
+    // The durable on-disk primary-key index means recovery never rebuilds an
+    // in-memory directory, so redo may flush+evict committed pages to the heap and
+    // index files. Allow stealing from the start: the recovery working set is no
+    // longer bounded by the buffer pool size.
+    buffer_pool.enable_stealing();
 
     // The control record is the redo boundary plus the catalog snapshot.
     let loaded = control.load()?;
@@ -49,18 +50,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
     )?);
     storage.install_schemas(catalog.list_tables()?)?;
 
-    // Load the checkpointed heap pages so redo and the directory rebuild see the
-    // full working set. (V1 requires the working set to fit in the buffer pool.)
-    let table_ids: Vec<TableId> = catalog
-        .list_tables()?
-        .iter()
-        .map(|table| table.id)
-        .collect();
-    let preloaded = preload_heap_pages(store.as_ref(), buffer_pool.as_ref(), &table_ids)?;
-
-    // Redo: replay committed records after the checkpoint LSN. PageLSN gating
-    // makes this idempotent; torn/missing pages are zeroed so a FullPageImage
-    // re-establishes them.
+    // Redo: replay committed records after the checkpoint LSN onto the heap and
+    // index pages. PageLSN gating makes this idempotent; torn/missing pages are
+    // zeroed so a FullPageImage/HeapInit re-establishes them. The durable B-tree
+    // is recovered the same way (its mutations are full-page-image records).
     let mut replay_applied = false;
     for record in wal.replay_committed_from(checkpoint_lsn)? {
         let record = record?;
@@ -73,12 +66,6 @@ pub fn open_app(config: Config) -> Result<AppState> {
         )?;
         replay_applied = true;
     }
-
-    // The directory rebuild scans resident pages only. If preload or redo evicted
-    // any checkpointed page (buffer pool too small for the working set), fail
-    // loudly rather than silently rebuild a partial directory.
-    verify_pages_resident(buffer_pool.as_ref(), &preloaded)?;
-    storage.rebuild_directories()?;
 
     let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
     let components = Arc::new(ServerComponents {
@@ -99,14 +86,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
         next_txn_id: AtomicU64::new(next_txn_id),
     });
 
-    // Persist the redone state to the heap and advance the redo boundary.
+    // Persist the redone state to the heap/index and advance the redo boundary.
     if replay_applied {
         run_checkpoint(&components)?;
     }
-    // Recovery (preload, redo, directory rebuild) ran with stealing disabled so a
-    // too-small buffer fails loudly instead of silently dropping pages. Normal
-    // operation may now flush+evict committed dirty pages to bound memory use.
-    components.buffer_pool.enable_stealing();
     components.storage.set_mode(StorageMode::Normal)?;
 
     Ok(AppState {
@@ -121,48 +104,6 @@ pub fn data_dir_for_test(path: &Path) -> Config {
         data_dir: path.to_path_buf(),
         ..Config::default()
     }
-}
-
-/// Load every heap page of each table into the buffer pool so that redo and the
-/// in-memory directory rebuild operate over the complete checkpointed state.
-/// Returns the loaded `(file_id, page_num)` keys for the post-redo residency check.
-fn preload_heap_pages(
-    store: &dyn PageStore,
-    buffer_pool: &dyn BufferPool,
-    tables: &[TableId],
-) -> Result<Vec<(FileId, PageNum)>> {
-    let mut loaded = Vec::new();
-    for &table in tables {
-        let mut page_num = 0;
-        while let Some(data) = store.load_page(table, page_num)? {
-            buffer_pool.load_page(table, page_num, data)?;
-            loaded.push((table, page_num));
-            page_num += 1;
-        }
-    }
-    Ok(loaded)
-}
-
-/// Verify every checkpointed page is still resident after preload + redo. A
-/// missing page means eviction occurred because the buffer pool cannot hold the
-/// working set, which would silently drop rows from the rebuilt directory.
-fn verify_pages_resident(
-    buffer_pool: &dyn BufferPool,
-    expected: &[(FileId, PageNum)],
-) -> Result<()> {
-    let resident: HashSet<(FileId, PageNum)> = buffer_pool
-        .iter_pages()?
-        .map(|page| (page.file_id, page.page_num))
-        .collect();
-    for key in expected {
-        if !resident.contains(key) {
-            return Err(DbError::storage(
-                SqlState::InternalError,
-                "buffer pool is too small to hold the recovery working set",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Flush policy for in-place dirty-page flushing: a page is flushable once its

@@ -225,6 +225,27 @@ impl MemoryBufferPool {
         }
     }
 
+    /// Seed the page allocator for `file_id` from its on-disk extent the first
+    /// time the file is allocated into, so a freshly allocated page never reuses
+    /// one that already exists on disk. Recovery no longer preloads pages, so
+    /// without this the counter would start at 0 for checkpointed-but-not-replayed
+    /// files and `new_page` would overwrite committed data.
+    ///
+    /// The extent read happens outside the pool lock; that is sound because the
+    /// single writer holds the server's exclusive statement guard, so no
+    /// concurrent flush can extend the file between the read and the seed.
+    fn ensure_extent_seeded(&self, file_id: FileId) -> Result<()> {
+        if self.state.lock().extent_seeded.contains(&file_id) {
+            return Ok(());
+        }
+        let extent = self.store.page_count(file_id)?;
+        let mut state = self.state.lock();
+        if state.extent_seeded.insert(file_id) {
+            state.ensure_next_page_at_least(file_id, extent);
+        }
+        Ok(())
+    }
+
     fn insert_loaded_read_page(
         &self,
         file_id: FileId,
@@ -336,6 +357,7 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard> {
+        self.ensure_extent_seeded(file_id)?;
         let (page_num, frame) = self.with_room(|state| {
             if state.frames.len() >= self.frame_count {
                 return Ok(None);
@@ -485,6 +507,8 @@ struct PoolState {
     clock_order: Vec<PageKey>,
     clock_hand: usize,
     next_page_num_by_file: HashMap<FileId, PageNum>,
+    /// Files whose allocation counter has been seeded from the on-disk extent.
+    extent_seeded: HashSet<FileId>,
     txns: HashMap<u64, TxnDirtyState>,
 }
 
@@ -498,6 +522,13 @@ impl PoolState {
 
     fn advance_next_page_num(&mut self, file_id: FileId, page_num: PageNum) {
         let next = page_num.saturating_add(1);
+        self.next_page_num_by_file
+            .entry(file_id)
+            .and_modify(|current| *current = (*current).max(next))
+            .or_insert(next);
+    }
+
+    fn ensure_next_page_at_least(&mut self, file_id: FileId, next: PageNum) {
         self.next_page_num_by_file
             .entry(file_id)
             .and_modify(|current| *current = (*current).max(next))
@@ -769,6 +800,10 @@ impl PageStore for NoopPageStore {
 
     fn sync_all(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
+        Ok(0)
     }
 }
 
@@ -1080,6 +1115,16 @@ mod tests {
         fn sync_all(&self) -> Result<()> {
             Ok(())
         }
+
+        fn page_count(&self, file_id: FileId) -> Result<PageNum> {
+            Ok(self
+                .pages
+                .keys()
+                .filter(|(file, _)| *file == file_id)
+                .map(|(_, page)| page + 1)
+                .max()
+                .unwrap_or(0))
+        }
     }
 
     struct FlushAll;
@@ -1112,6 +1157,10 @@ mod tests {
 
         fn sync_all(&self) -> Result<()> {
             Ok(())
+        }
+
+        fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
+            Ok(0)
         }
     }
 
@@ -1180,6 +1229,18 @@ mod tests {
 
         fn sync_all(&self) -> Result<()> {
             Ok(())
+        }
+
+        fn page_count(&self, file_id: FileId) -> Result<PageNum> {
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(file, _)| *file == file_id)
+                .map(|(_, page)| page + 1)
+                .max()
+                .unwrap_or(0))
         }
     }
 

@@ -19,7 +19,6 @@ const SLOT_LIVE: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageHeader {
-    page_id: PageNum,
     num_slots: u16,
     free_start: u16,
 }
@@ -64,7 +63,6 @@ pub fn validate(data: &[u8; PAGE_SIZE]) -> Result<PageHeader> {
     }
 
     let header = PageHeader {
-        page_id: read_u32(data, PAGE_ID_OFFSET),
         num_slots: read_u16(data, NUM_SLOTS_OFFSET),
         free_start: read_u16(data, FREE_SPACE_OFFSET),
     };
@@ -78,10 +76,6 @@ pub fn validate(data: &[u8; PAGE_SIZE]) -> Result<PageHeader> {
 
 pub fn is_initialized(data: &[u8; PAGE_SIZE]) -> bool {
     data[PAGE_TYPE_OFFSET] == PAGE_TYPE_DATA
-}
-
-pub fn page_id(data: &[u8; PAGE_SIZE]) -> Result<PageNum> {
-    Ok(validate(data)?.page_id)
 }
 
 /// Stamp the page-LSN (the LSN of the WAL record that last modified this page)
@@ -170,17 +164,6 @@ pub fn delete_row(data: &mut [u8; PAGE_SIZE], slot_num: u16) -> Result<bool> {
     write_slot(data, slot_num, slot);
     write_checksum(data);
     Ok(true)
-}
-
-pub fn live_rows(data: &[u8; PAGE_SIZE]) -> Result<Vec<(u16, Vec<u8>)>> {
-    let header = validate(data)?;
-    let mut rows = Vec::new();
-    for slot_num in 0..header.num_slots {
-        if let Some(row) = read_row(data, slot_num)? {
-            rows.push((slot_num, row));
-        }
-    }
-    Ok(rows)
 }
 
 fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {

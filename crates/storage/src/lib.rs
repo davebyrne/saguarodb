@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_directories_restores_lookup_from_table_pages() {
+    fn reopened_engine_reads_rows_through_durable_index() {
         let harness = StorageHarness::new();
         let ctx = StatementContext { txn_id: 1 };
         harness.create_users_table(&ctx).unwrap();
@@ -230,6 +230,8 @@ mod tests {
             .insert(&ctx, 1, user_row(1, "Ada", true))
             .unwrap();
 
+        // A second engine over the same buffer pool finds the row through the
+        // durable on-disk index — there is no in-memory directory to rebuild.
         let reopened = PageBackedStorageEngine::open(
             harness.buffer.clone(),
             harness.wal.clone(),
@@ -237,7 +239,6 @@ mod tests {
         )
         .unwrap();
         reopened.install_schemas(vec![users_schema()]).unwrap();
-        reopened.rebuild_directories().unwrap();
 
         assert_eq!(
             reopened

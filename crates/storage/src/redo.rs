@@ -69,6 +69,13 @@ mod tests {
     use super::apply_physical_redo;
     use crate::page;
 
+    fn live_row_count(data: &[u8; buffer::PAGE_SIZE]) -> usize {
+        let slots = page::next_slot(data).unwrap();
+        (0..slots)
+            .filter(|slot| page::read_row(data, *slot).unwrap().is_some())
+            .count()
+    }
+
     #[test]
     fn heap_init_initializes_and_stamps_lsn() {
         let mut data = PageData::default();
@@ -112,7 +119,7 @@ mod tests {
 
         // Re-applying the same record is skipped (page-LSN already >= record LSN).
         assert!(!apply_physical_redo(&mut data.0, 6, &insert).unwrap());
-        assert_eq!(page::live_rows(&data.0).unwrap().len(), 1);
+        assert_eq!(live_row_count(&data.0), 1);
     }
 
     #[test]
@@ -241,6 +248,6 @@ mod tests {
         )
         .unwrap();
         assert!(!applied);
-        assert_eq!(page::live_rows(&data.0).unwrap().len(), 0);
+        assert_eq!(live_row_count(&data.0), 0);
     }
 }

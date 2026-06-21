@@ -16,4 +16,9 @@ pub trait PageStore: PageLoader {
 
     /// Durably flush all previously written pages to stable storage.
     fn sync_all(&self) -> Result<()>;
+
+    /// The number of pages currently stored for `file_id` (its on-disk extent),
+    /// or `0` if the file does not exist. Used to seed page allocation so a freshly
+    /// allocated page never reuses one that already exists on disk after recovery.
+    fn page_count(&self, file_id: FileId) -> Result<PageNum>;
 }

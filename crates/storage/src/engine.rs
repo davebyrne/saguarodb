@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use buffer::{BufferPool, PageWriteGuard};
@@ -9,7 +8,9 @@ use common::{
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
+use crate::btree::BTree;
 use crate::codec::{decode_row, encode_row};
+use crate::heap::index_file_id;
 use crate::page;
 use crate::traits::{RowIterator, SchemaOperations, StorageEngine};
 
@@ -29,13 +30,11 @@ pub(crate) struct RowLocation {
 #[derive(Clone)]
 struct TableState {
     schema: TableSchema,
-    directory: BTreeMap<Key, RowLocation>,
     dropped: bool,
 }
 
 #[derive(Default)]
 struct TxnRollback {
-    directories: BTreeMap<TableId, BTreeMap<Key, Option<RowLocation>>>,
     tables: BTreeMap<TableId, Option<TableState>>,
 }
 
@@ -76,52 +75,9 @@ impl PageBackedStorageEngine {
                 schema.id,
                 TableState {
                     schema,
-                    directory: BTreeMap::new(),
                     dropped: false,
                 },
             );
-        }
-        Ok(())
-    }
-
-    pub fn rebuild_directories(&self) -> Result<()> {
-        let mut state = self.lock_state()?;
-        for table in state.tables.values_mut() {
-            table.directory.clear();
-        }
-
-        let pages: Vec<_> = self.buffer_pool.iter_pages()?.collect();
-        for info in pages {
-            let Some(table) = state.tables.get_mut(&info.file_id) else {
-                continue;
-            };
-            if table.dropped || !page::is_initialized(&info.data.0) {
-                continue;
-            }
-            let page_id = page::page_id(&info.data.0)?;
-            if page_id != info.page_num {
-                return Err(storage_internal(
-                    "page id does not match buffer page number",
-                ));
-            }
-            for (slot_num, bytes) in page::live_rows(&info.data.0)? {
-                let row = decode_row(&table.schema, &bytes)?;
-                let key = key_for_row(&table.schema, &row)?;
-                let previous = table.directory.insert(
-                    key,
-                    RowLocation {
-                        file_id: info.file_id,
-                        page_num: info.page_num,
-                        slot_num,
-                    },
-                );
-                if previous.is_some() {
-                    return Err(DbError::storage(
-                        SqlState::UniqueViolation,
-                        "duplicate primary key while rebuilding storage directory",
-                    ));
-                }
-            }
         }
         Ok(())
     }
@@ -132,12 +88,13 @@ impl PageBackedStorageEngine {
     }
 
     pub(crate) fn apply_create_table_without_wal(&self, schema: TableSchema) -> Result<()> {
+        // Recovery replays the index pages from their full-page-image redo
+        // records, so this installs metadata only; it must not create the tree.
         let mut state = self.lock_state()?;
         state.tables.insert(
             schema.id,
             TableState {
                 schema,
-                directory: BTreeMap::new(),
                 dropped: false,
             },
         );
@@ -148,7 +105,6 @@ impl PageBackedStorageEngine {
         let mut state = self.lock_state()?;
         if let Some(table_state) = state.tables.get_mut(&table) {
             table_state.dropped = true;
-            table_state.directory.clear();
         }
         Ok(())
     }
@@ -159,9 +115,32 @@ impl PageBackedStorageEngine {
             .map_err(|_| DbError::internal("storage lock poisoned"))
     }
 
-    /// Append a WAL record (in `Normal` mode only) and return its assigned LSN,
-    /// which the caller stamps into the modified page. Returns `0` in recovery
-    /// mode, where the page-LSN of replayed rows is irrelevant.
+    /// The schema and index file id of a live table, looked up under the lock so
+    /// the heap and B-tree work can run without holding it.
+    fn table_handle(&self, table: TableId) -> Result<(TableSchema, FileId)> {
+        let state = self.lock_state()?;
+        let table_state = live_table(&state, table)?;
+        Ok((table_state.schema.clone(), index_file_id(table)))
+    }
+
+    /// Like `table_handle`, but a missing or dropped table yields `None` (callers
+    /// that treat that as a no-op rather than an error).
+    fn table_handle_opt(&self, table: TableId) -> Result<Option<(TableSchema, FileId)>> {
+        let state = self.lock_state()?;
+        match state.tables.get(&table) {
+            Some(table_state) if !table_state.dropped => {
+                Ok(Some((table_state.schema.clone(), index_file_id(table))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn btree(&self, index_file_id: FileId) -> BTree<'_> {
+        BTree::new(self.buffer_pool.as_ref(), self.wal.as_ref(), index_file_id)
+    }
+
+    /// Append a WAL record (in `Normal` mode only) and return its assigned LSN.
+    /// Returns `0` in recovery mode, where the record is not produced.
     fn append_wal(
         &self,
         state: &StorageState,
@@ -326,21 +305,19 @@ impl PageBackedStorageEngine {
 
 impl StorageEngine for PageBackedStorageEngine {
     fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId> {
-        let mut state = self.lock_state()?;
-        let schema = live_table(&state, table)?.schema.clone();
+        let (schema, index_fid) = self.table_handle(table)?;
         let key = key_for_row(&schema, &row)?;
-        if live_table(&state, table)?.directory.contains_key(&key) {
+        let btree = self.btree(index_fid);
+        if btree.search(&key)?.is_some() {
             return Err(DbError::storage(
                 SqlState::UniqueViolation,
                 "duplicate primary key",
             ));
         }
 
-        record_directory_before(&mut state, ctx.txn_id, table, &key)?;
         let location = self.write_new_row(&schema, &row, ctx.txn_id)?;
-        live_table_mut(&mut state, table)?
-            .directory
-            .insert(key, location);
+        let inserted = btree.insert(ctx.txn_id, &key, location)?;
+        debug_assert!(inserted, "uniqueness was checked above");
         Ok(RowId {
             page_num: location.page_num,
             slot_num: location.slot_num,
@@ -348,42 +325,30 @@ impl StorageEngine for PageBackedStorageEngine {
     }
 
     fn get(&self, _ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>> {
-        let (schema, location) = {
-            let state = self.lock_state()?;
-            let table = live_table(&state, table)?;
-            let Some(location) = table.directory.get(key).copied() else {
-                return Ok(None);
-            };
-            (table.schema.clone(), location)
+        let (schema, index_fid) = self.table_handle(table)?;
+        let Some(location) = self.btree(index_fid).search(key)? else {
+            return Ok(None);
         };
         self.read_location(&schema, location)
     }
 
     fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool> {
-        let mut state = self.lock_state()?;
-        if !state
-            .tables
-            .get(&table)
-            .map(|table| !table.dropped)
-            .unwrap_or(false)
-        {
-            return Ok(false);
-        }
-        let Some(location) = live_table(&state, table)?.directory.get(key).copied() else {
+        let Some((_schema, index_fid)) = self.table_handle_opt(table)? else {
             return Ok(false);
         };
-
-        record_directory_before(&mut state, ctx.txn_id, table, key)?;
+        let btree = self.btree(index_fid);
+        let Some(location) = btree.search(key)? else {
+            return Ok(false);
+        };
         self.delete_row_logged(location, ctx.txn_id)?;
-        live_table_mut(&mut state, table)?.directory.remove(key);
+        btree.remove(ctx.txn_id, key)?;
         Ok(true)
     }
 
     fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool> {
-        let mut state = self.lock_state()?;
-        let table_state = live_table(&state, table)?;
-        let schema = table_state.schema.clone();
-        let Some(previous_location) = table_state.directory.get(key).copied() else {
+        let (schema, index_fid) = self.table_handle(table)?;
+        let btree = self.btree(index_fid);
+        let Some(previous_location) = btree.search(key)? else {
             return Ok(false);
         };
         let replacement_key = key_for_row(&schema, &row)?;
@@ -394,12 +359,9 @@ impl StorageEngine for PageBackedStorageEngine {
             ));
         }
 
-        record_directory_before(&mut state, ctx.txn_id, table, key)?;
         self.delete_row_logged(previous_location, ctx.txn_id)?;
         let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
-        live_table_mut(&mut state, table)?
-            .directory
-            .insert(key.clone(), new_location);
+        btree.update(ctx.txn_id, key, new_location)?;
         Ok(true)
     }
 
@@ -413,23 +375,14 @@ impl StorageEngine for PageBackedStorageEngine {
         table: TableId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
-        let (schema, entries) = {
-            let state = self.lock_state()?;
-            let table_state = live_table(&state, table)?;
-            let entries = table_state
-                .directory
-                .iter()
-                .filter(|(key, _)| key_in_range(key, range))
-                .map(|(key, location)| (key.clone(), *location))
-                .collect::<Vec<_>>();
-            (table_state.schema.clone(), entries)
-        };
+        let (schema, index_fid) = self.table_handle(table)?;
+        let entries = self.btree(index_fid).range(range)?;
 
         let mut rows = Vec::with_capacity(entries.len());
         for (key, location) in entries {
             let row = self
                 .read_location(&schema, location)?
-                .ok_or_else(|| storage_internal("primary-key directory points to dead row"))?;
+                .ok_or_else(|| storage_internal("primary-key index points to dead row"))?;
             rows.push(StoredRow {
                 row_id: RowId {
                     page_num: location.page_num,
@@ -448,11 +401,12 @@ impl StorageEngine for PageBackedStorageEngine {
     }
 
     fn rollback_txn(&self, txn_id: u64) -> Result<()> {
+        // Index and heap page changes are rolled back by the buffer pool's
+        // before-images; storage only restores its own table metadata.
         let mut state = self.lock_state()?;
         let Some(rollback) = state.rollback.remove(&txn_id) else {
             return Ok(());
         };
-
         for (table_id, previous) in rollback.tables.into_iter().rev() {
             match previous {
                 Some(table) => {
@@ -460,21 +414,6 @@ impl StorageEngine for PageBackedStorageEngine {
                 }
                 None => {
                     state.tables.remove(&table_id);
-                }
-            }
-        }
-
-        for (table_id, entries) in rollback.directories {
-            if let Some(table) = state.tables.get_mut(&table_id) {
-                for (key, previous) in entries {
-                    match previous {
-                        Some(location) => {
-                            table.directory.insert(key, location);
-                        }
-                        None => {
-                            table.directory.remove(&key);
-                        }
-                    }
                 }
             }
         }
@@ -489,24 +428,27 @@ impl StorageEngine for PageBackedStorageEngine {
 
 impl SchemaOperations for PageBackedStorageEngine {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()> {
-        let mut state = self.lock_state()?;
-        self.append_wal(
-            &state,
-            ctx,
-            WalRecordKind::CreateTable {
-                schema: schema.clone(),
-            },
-        )?;
-        record_table_before(&mut state, ctx.txn_id, schema.id);
-        state.tables.insert(
-            schema.id,
-            TableState {
-                schema: schema.clone(),
-                directory: BTreeMap::new(),
-                dropped: false,
-            },
-        );
-        Ok(())
+        {
+            let mut state = self.lock_state()?;
+            self.append_wal(
+                &state,
+                ctx,
+                WalRecordKind::CreateTable {
+                    schema: schema.clone(),
+                },
+            )?;
+            record_table_before(&mut state, ctx.txn_id, schema.id);
+            state.tables.insert(
+                schema.id,
+                TableState {
+                    schema: schema.clone(),
+                    dropped: false,
+                },
+            );
+        }
+        // Create the empty on-disk index (metapage + root leaf). Its redo is
+        // logged as full-page images, so recovery re-establishes it.
+        self.btree(index_file_id(schema.id)).create(ctx.txn_id)
     }
 
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()> {
@@ -525,8 +467,8 @@ impl SchemaOperations for PageBackedStorageEngine {
             .tables
             .get_mut(&table)
             .ok_or_else(|| undefined_table(table))?;
+        // V1 leaves the heap and index pages in place (no physical reclaim).
         table_state.dropped = true;
-        table_state.directory.clear();
         Ok(())
     }
 }
@@ -586,39 +528,6 @@ fn live_table(state: &StorageState, table: TableId) -> Result<&TableState> {
     Ok(table_state)
 }
 
-fn live_table_mut(state: &mut StorageState, table: TableId) -> Result<&mut TableState> {
-    let table_state = state
-        .tables
-        .get_mut(&table)
-        .ok_or_else(|| undefined_table(table))?;
-    if table_state.dropped {
-        return Err(undefined_table(table));
-    }
-    Ok(table_state)
-}
-
-fn record_directory_before(
-    state: &mut StorageState,
-    txn_id: u64,
-    table: TableId,
-    key: &Key,
-) -> Result<()> {
-    if txn_id == 0 {
-        return Ok(());
-    }
-    let previous = live_table(state, table)?.directory.get(key).copied();
-    state
-        .rollback
-        .entry(txn_id)
-        .or_default()
-        .directories
-        .entry(table)
-        .or_default()
-        .entry(key.clone())
-        .or_insert(previous);
-    Ok(())
-}
-
 fn record_table_before(state: &mut StorageState, txn_id: u64, table: TableId) {
     if txn_id == 0 {
         return;
@@ -631,32 +540,6 @@ fn record_table_before(state: &mut StorageState, txn_id: u64, table: TableId) {
         .tables
         .entry(table)
         .or_insert(previous);
-}
-
-fn key_in_range(key: &Key, range: &KeyRange) -> bool {
-    match range {
-        KeyRange::All => true,
-        KeyRange::Exact(exact) => key == exact,
-        KeyRange::Range { start, end } => {
-            bound_contains_start(start, key) && bound_contains_end(end, key)
-        }
-    }
-}
-
-fn bound_contains_start(bound: &Bound<Key>, key: &Key) -> bool {
-    match bound {
-        Bound::Included(start) => key >= start,
-        Bound::Excluded(start) => key > start,
-        Bound::Unbounded => true,
-    }
-}
-
-fn bound_contains_end(bound: &Bound<Key>, key: &Key) -> bool {
-    match bound {
-        Bound::Included(end) => key <= end,
-        Bound::Excluded(end) => key < end,
-        Bound::Unbounded => true,
-    }
 }
 
 fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {

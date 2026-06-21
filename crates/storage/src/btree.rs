@@ -8,9 +8,6 @@
 //! (accepted bloat). Every node mutation logs a `FullPageImage` and stamps the
 //! page-LSN, so the tree is crash-safe through the same redo path as the heap.
 
-// Wired into the storage engine in the PK-cutover commit.
-#![allow(dead_code)]
-
 use std::cmp::Ordering;
 use std::ops::Bound;
 
