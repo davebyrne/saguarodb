@@ -982,4 +982,49 @@ mod tests {
         assert_eq!(aggregates.len(), 1);
         assert!(matches!(aggregates[0].func, AggregateFunc::Sum));
     }
+
+    #[test]
+    fn logical_planner_builds_limit_with_offset_none() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users limit 5").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        assert!(matches!(
+            logical,
+            LogicalPlan::Limit { count: 5, offset: None, .. }
+        ));
+    }
+
+    #[test]
+    fn logical_planner_models_bare_offset_as_unbounded_limit() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users offset 3").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        assert!(matches!(
+            logical,
+            LogicalPlan::Limit { count: u64::MAX, offset: Some(3), .. }
+        ));
+    }
+
+    #[test]
+    fn logical_planner_orders_sort_under_projection_under_limit() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users order by id limit 2").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        let LogicalPlan::Limit { source, .. } = &logical else {
+            panic!("expected limit, got {logical:?}");
+        };
+        let LogicalPlan::Projection { source, .. } = source.as_ref() else {
+            panic!("expected projection under limit, got {source:?}");
+        };
+        assert!(
+            matches!(source.as_ref(), LogicalPlan::Sort { .. }),
+            "expected sort under projection, got {source:?}"
+        );
+    }
 }
