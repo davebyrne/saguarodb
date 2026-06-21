@@ -40,6 +40,8 @@ parse -> bind -> logical_plan -> physical_plan -> execute
 
 For SELECT, it materializes plain `Row` values into `ExecutionResult::Query` in v1. For DML/DDL, it executes immediately and returns command metadata. A future server streaming bridge may drive `PlanExecutor` directly without changing physical operator semantics.
 
+`ExecutionResult` has three variants: `Query` (SELECT rows and columns), `Modified { command, count }` (DML/DDL), and `Explanation { text }` (EXPLAIN). `QueryEngine::execute` produces only `Query` and `Modified`; `Explanation` is produced by the server's `QueryService` (EXPLAIN never calls the executor), but the variant lives in the executor crate's `ExecutionResult`.
+
 Production execution uses an explicit context:
 
 ```rust
@@ -74,7 +76,7 @@ impl QueryEngine {
 | `ProjectionOp` | Rewrites row values, preserves identity |
 | `SortOp` | Materializes all input, sorts in memory, preserves identity |
 | `LimitOp` | Skips offset, emits count rows, preserves identity |
-| `AggregateOp` | Materializes groups, emits aggregate rows, clears identity |
+| `AggregateOp` | Groups input by the `GROUP BY` expressions (a single group when there is none), emits one row per group, de-duplicates `DISTINCT` aggregate arguments, clears identity |
 | `ValuesOp` | Emits literal rows, identity is `None` |
 
 ## Identity Rules
@@ -104,6 +106,7 @@ V1 evaluator handles:
 - Scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), `ABS` (integer), and `SUBSTRING(text, start[, length])`. All are NULL-propagating (any NULL argument yields NULL). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
+- `Parameter` (`$n`) references must be substituted to literals before execution. One reaching the evaluator is an internal error (`"unbound parameter $N reached the executor"`).
 
 Division by zero returns `SqlState::DivisionByZero`. Integer overflow in scalar arithmetic or integer aggregate accumulation returns `SqlState::NumericValueOutOfRange`.
 
@@ -111,7 +114,7 @@ V1 expression semantics:
 
 - Comparisons with `NULL` return `Value::Null`; `WHERE` and `HAVING` keep only `Value::Boolean(true)`.
 - Boolean `AND`, `OR`, and `NOT` use SQL three-valued logic.
-- `LIKE` requires text operands, is case-sensitive, supports `%` for any sequence and `_` for one character, and uses backslash to escape `%`, `_`, or `\`. V1 does not support an `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
+- `LIKE` requires text operands, is case-sensitive, supports `%` for any sequence and `_` for one character, and uses backslash to escape `%`, `_`, or `\`. A backslash before any other character is treated as a literal backslash followed by that character, and a trailing lone backslash is a literal backslash. V1 does not support an `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
 - `IN` returns `TRUE` on the first non-null equal item, `FALSE` when no item matches and no list item is `NULL`, and `NULL` when the left side is `NULL` or no item matches but some list item is `NULL`. `NOT IN` applies SQL `NOT` to that result.
 - `BETWEEN` evaluates as `(expr >= low) AND (expr <= high)` using the same comparison and boolean null semantics. `NOT BETWEEN` applies SQL `NOT`.
 - Searched `CASE WHEN condition THEN value ...` chooses the first `WHEN` whose condition evaluates to `TRUE`; `FALSE` and `NULL` conditions do not match. Simple `CASE operand WHEN value THEN result ...` compares `operand = value` with SQL comparison semantics and chooses the first comparison that evaluates to `TRUE`. If no branch matches, both forms return `ELSE` or `NULL`.
@@ -120,7 +123,7 @@ V1 expression semantics:
 - `ORDER BY` defaults match PostgreSQL: ascending sorts `NULL` last, descending sorts `NULL` first, unless `NULLS FIRST` or `NULLS LAST` is specified. A bare positive integer literal in `ORDER BY` is a 1-based reference to the nth output column, resolved by the binder.
 - Type mismatches in expression evaluation return `SqlState::DatatypeMismatch`.
 
-Aggregate execution follows planner return-type rules: `COUNT` returns `0` for empty input and ignores nulls for `COUNT(expr)`; `SUM`, `AVG`, `MIN`, and `MAX` return `NULL` for empty input. `AVG(integer)` uses integer division truncated toward zero.
+Aggregate execution groups input rows by the `GROUP BY` expressions into ordered groups and emits one output row per group (group-key columns first, then the aggregates); with no `GROUP BY` the entire input is a single group. A `DISTINCT` aggregate argument (e.g. `COUNT(DISTINCT x)`) de-duplicates its argument values before aggregating. Return-type rules: `COUNT` returns `0` for empty input and ignores nulls for `COUNT(expr)`; `SUM`, `AVG`, `MIN`, and `MAX` return `NULL` for empty input. `SUM` and `AVG` require integer input and otherwise return `SqlState::DatatypeMismatch`; `AVG(integer)` uses integer division truncated toward zero. `MIN` and `MAX` order any `Value` type (including text and boolean) via the value ordering, ignoring nulls.
 
 ## DML Execution
 
@@ -138,7 +141,7 @@ Aggregate execution follows planner return-type rules: `COUNT` returns `0` for e
 - Build source executor.
 - For each source `ExecRow`, read identity key.
 - Evaluate assignments against the source row.
-- Build a full replacement row.
+- Build a full replacement row. The primary-key column cannot change; storage rejects an update whose replacement key differs with `SqlState::DatatypeMismatch` ("primary key updates are not supported").
 - Call `StorageEngine::update`.
 - Return count.
 
@@ -149,7 +152,7 @@ Aggregate execution follows planner return-type rules: `COUNT` returns `0` for e
 - Call `StorageEngine::delete`.
 - Return count.
 
-If a write errors after mutating pages or storage-owned metadata, executor/server orchestration must call `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` before returning the error.
+If a write errors after mutating pages or storage-owned metadata, the executor propagates the error without rolling back itself (consistent with `QueryEngine::execute` not calling storage/buffer commit or rollback). The server query orchestration — or the test harness — owns recovery and calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` before returning the error.
 
 ## DDL Execution
 
@@ -198,6 +201,6 @@ Statement guards are owned by server query orchestration, not by the executor cr
 - `HashJoinOp` joins inner equi-join rows on one or more key columns and excludes rows with a NULL join key.
 - `UPDATE WHERE` modifies only matched rows.
 - `DELETE WHERE` deletes only matched rows.
-- Failed write calls rollback and does not expose partial changes.
+- Failed write triggers rollback (driven by the server/harness, not the executor) and does not expose partial changes.
 - Scalar expression evaluator implements SQL NULL boolean cases.
 - Aggregate operator computes `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.

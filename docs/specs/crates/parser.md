@@ -161,7 +161,7 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 - `SELECT` with projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
-- `EXPLAIN <statement>`.
+- `EXPLAIN SELECT ...`. The AST node boxes any statement, but v1 only accepts a `SELECT` inner statement; any other inner statement is rejected as unsupported.
 
 Binder rejects parsed forms that exceed the v1 semantic subset, such as composite primary keys and unknown functions.
 

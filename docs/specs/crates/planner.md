@@ -37,12 +37,14 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan>;
 pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Result<PhysicalPlan>;
 ```
 
-`bind` is the simple-query entry point and rejects `$n` parameters. `bind_parameterized`
+`bind` is the simple-query entry point and rejects `$n` parameters with `SqlState::SyntaxError`. `bind_parameterized`
 binds an extended-protocol statement, resolving each parameter's type from the
 `Parse`-declared OID when given, otherwise inferring it from context (like a `NULL`
 literal); it returns the bound statement and the resolved parameter types by position.
 `substitute_params` replaces each `BoundExpr::Parameter` with a type-checked literal of
-the bound value before planning and execution.
+the bound value before planning and execution. `collect_param_types` and
+`substitute_params` live in the crate's `params` module and are re-exported from the
+crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
 
 ## Binder Contract
 
@@ -64,7 +66,7 @@ Binder responsibilities:
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
-- Reject unsupported v1 forms.
+- Reject unsupported v1 forms. Concretely, the binder rejects: a composite or empty primary key (`SqlState::DatatypeMismatch`) and duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE`; an `UPDATE` assigning the primary-key column (`SqlState::DatatypeMismatch`); and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
 
 ```rust
 pub enum BoundStatement {
@@ -121,7 +123,7 @@ pub enum BoundFrom {
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
-`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins and rejects `ON`/`USING`/`NATURAL` with `CROSS JOIN` in v1. The executor treats a cross join's `None` condition as `TRUE`.
+`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins and rejects `ON`/`USING`/`NATURAL` with `CROSS JOIN` in v1. The executor treats a cross join's `None` condition as `TRUE`. A comma-separated `FROM a, b, ...` list desugars into a left-deep chain of `JoinType::Cross` joins, each with `condition: None`.
 
 ## Bound Expressions
 
@@ -371,11 +373,13 @@ pub enum PhysicalPlan {
 - When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it avoids the secondary → primary-key → heap indirection), and a lower index id breaks remaining ties.
 - `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
 - Otherwise scans are `SeqScan`.
+- Only a literal comparand of type `Integer`, `Text`, or `Boolean` qualifies for an `IndexScan`; a parameter, expression, or other-typed comparand falls back to `SeqScan`.
+- The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one in v1.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 - Joins are left-to-right nested loop joins. V1 supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
 - An `Inner` join whose `condition` is a conjunction of `left_column = right_column` equalities becomes a `HashJoin`. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). All other joins — outer, cross, non-equi, or predicates over expressions rather than bare columns — stay `NestedLoopJoin`.
 - Sort and aggregate are blocking operators.
-- Projection pushdown may be disabled in initial v1 implementation. If enabled, expressions must be slot-rebased against child output schemas.
+- V1 performs no projection pushdown: `LogicalPlan::Projection` maps straight to `PhysicalPlan::Projection`, and logical planning always wraps a top-level `Projection`.
 
 ## EXPLAIN
 
@@ -388,6 +392,8 @@ pub enum PhysicalPlan {
 - The server `QueryService` handles the outer `EXPLAIN` statement by acquiring a read guard, binding the inner statement, building logical and physical plans for that inner statement, formatting the physical plan with `format_explain`, and returning `ExecutionResult::Explanation`.
 
 The executor crate is not called for `EXPLAIN`.
+
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 

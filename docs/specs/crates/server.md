@@ -22,6 +22,10 @@
 
 No library crate depends on `server`.
 
+## Modules
+
+`app` (component bundle + `AppState`), `cancel` (`BackendKey { process_id, secret_key }` and the process-wide `CancelRegistry`), `checkpoint`, `config`, `connection`, `query`, `recovery`, `shutdown`, and `tls` (`build_acceptor`).
+
 ## Configuration
 
 ```rust
@@ -70,12 +74,12 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 2. Initialize the control store (`FileControlStore`) and the heap page store (`HeapPageStore` over `<data>/heap`).
 3. Initialize the WAL manager.
 4. Initialize the buffer pool with the configured frame count, the `WalFlushPolicy`, and the heap page store as its `PageStore`.
-5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
-6. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
-7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
-8. Call `storage.install_schemas(catalog.list_tables()?)`.
-9. Enable eviction-flush-on-steal (`buffer_pool.enable_stealing()`). The durable on-disk index means recovery rebuilds nothing in memory, so redo may spill and the recovery working set is not bounded by the pool size.
-10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them). Heap and primary-key-index pages replay the same way; DDL records replay through `RecoveryOperations`.
+5. Enable eviction-flush-on-steal (`buffer_pool.enable_stealing()`), immediately after constructing the pool and before loading the control record. The durable on-disk index means recovery rebuilds nothing in memory, so redo may spill and the recovery working set is not bounded by the pool size.
+6. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
+7. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
+8. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
+9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.install_index_schemas(indexes)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain the secondary indexes.
+10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them). Heap, primary-key-index, and secondary-index pages replay the same way; DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) replay through `RecoveryOperations`.
 11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
 12. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
 13. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
@@ -107,7 +111,7 @@ The server constructs `ExecutionContext { statement, catalog, storage, schema_op
 Statement guard policy:
 
 - Read guard: SELECT and EXPLAIN.
-- Write guard: INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, checkpoint.
+- Write guard: INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, checkpoint.
 
 `QueryService::execute_sql` parses SQL first to classify the top-level statement, then acquires the read/write guard before bind or planning. Bind and plan run under the same statement guard as execution so catalog state cannot change between name resolution and execution.
 
@@ -157,6 +161,7 @@ pub struct ServerComponents {
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
     pub tls: Option<TlsAcceptor>,
+    pub cancel_registry: CancelRegistry,
 }
 
 pub struct AppState {
