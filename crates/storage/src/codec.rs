@@ -1,9 +1,68 @@
-use common::{DataType, DbError, Key, Result, Row, SqlState, TableSchema, Value};
+use common::{
+    DataType, DbError, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row, SqlState, TableSchema,
+    TxnId, Value,
+};
 
-/// On-page row encoding version. v1 layout is `[version][null_bitmap][columns]`.
-/// Reserved so MVCC row versions (e.g. `xmin`/`xmax`) can be added later without
-/// a second on-disk format break.
-const ROW_FORMAT_VERSION: u8 = 1;
+/// On-page row encoding version. The current MVCC layout (v2) is
+/// `[version=2][infomask:2][xmin:8][xmax:8][t_ctid:6][null_bitmap][columns]`;
+/// the legacy pre-MVCC layout (v1) is `[version=1][null_bitmap][columns]`.
+/// `decode_row` reads both so pre-MVCC heaps keep decoding.
+const ROW_FORMAT_VERSION: u8 = 2;
+
+/// Legacy pre-MVCC row layout: `[version=1][null_bitmap][columns]` with no
+/// per-version transaction header. Still decoded for backward compatibility.
+const ROW_FORMAT_VERSION_V1: u8 = 1;
+
+/// Byte width of the v2 MVCC header that precedes the v1-style null bitmap:
+/// `infomask(2) + xmin(8) + xmax(8) + t_ctid(6)`. The version byte and null
+/// bitmap are accounted for separately.
+const V2_MVCC_HEADER_LEN: usize = 2 + 8 + 8 + 6;
+
+/// Sentinel `t_ctid` meaning "no successor / this is the latest version". Used in
+/// place of a literal self-pointer because the encoder does not know the slot a
+/// tuple will land in; a real successor pointer is stamped later (Milestone B).
+pub(crate) const INVALID_TID: (PageNum, u16) = (u32::MAX, u16::MAX);
+
+/// `infomask` hint bits (bit positions in the v2 header's `u16`). The four
+/// `*_COMMITTED`/`*_ABORTED` bits cache settled CLOG status so visibility checks
+/// can skip a CLOG probe; the two HEAP bits are reserved for HOT (Milestone H).
+/// None are set on insert in this milestone — they are populated by later work.
+///
+/// ```text
+/// bit 0: XMIN_COMMITTED  bit 1: XMIN_ABORTED
+/// bit 2: XMAX_COMMITTED  bit 3: XMAX_ABORTED
+/// bit 4: HEAP_ONLY       bit 5: HOT_UPDATED   (reserved for HOT)
+/// bits 6-15: reserved (must be 0)
+/// ```
+// Reserved hint bits below are defined now (the v2 format owns the full layout)
+// but not yet read or set; visibility (Milestone B3) and HOT (Milestone H) wire
+// them in. The allow keeps the format definition complete without a placeholder.
+pub(crate) const XMIN_COMMITTED: u16 = 1 << 0;
+#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
+pub(crate) const XMIN_ABORTED: u16 = 1 << 1;
+#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
+pub(crate) const XMAX_COMMITTED: u16 = 1 << 2;
+#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
+pub(crate) const XMAX_ABORTED: u16 = 1 << 3;
+/// Reserved for HOT (Milestone H): tuple has no index entry of its own.
+#[allow(dead_code, reason = "reserved for HOT (Milestone H)")]
+pub(crate) const HEAP_ONLY: u16 = 1 << 4;
+/// Reserved for HOT (Milestone H): tuple was HOT-updated in place.
+#[allow(dead_code, reason = "reserved for HOT (Milestone H)")]
+pub(crate) const HOT_UPDATED: u16 = 1 << 5;
+
+/// A decoded row plus its MVCC tuple header. Later milestones (visibility,
+/// versioning) read `xmin`/`xmax`/`t_ctid`/`infomask`; current callers that only
+/// need the column values use `row`. v1 tuples synthesize a frozen, never-deleted
+/// header so they are visible to every snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedRow {
+    pub row: Row,
+    pub xmin: TxnId,
+    pub xmax: TxnId,
+    pub t_ctid: (PageNum, u16),
+    pub infomask: u16,
+}
 
 const KEY_TAG_NULL: u8 = 0;
 const KEY_TAG_INTEGER: u8 = 1;
@@ -85,7 +144,11 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<Key> {
     Ok(Key(values))
 }
 
-pub fn encode_row(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
+/// Encode a freshly inserted row as a v2 tuple: `xmin = txn_id` (its creator),
+/// `xmax = INVALID_XID` (live), `t_ctid = INVALID_TID` (no successor yet), and
+/// `infomask = 0` (no settled-status or HOT hints). `txn_id` flows from the
+/// inserting statement's `StatementContext.txn_id`.
+pub fn encode_row(schema: &TableSchema, row: &Row, txn_id: TxnId) -> Result<Vec<u8>> {
     if row.values.len() != schema.columns.len() {
         return Err(DbError::storage(
             SqlState::DatatypeMismatch,
@@ -99,9 +162,12 @@ pub fn encode_row(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
     }
 
     let bitmap_len = null_bitmap_len(schema.columns.len());
-    let mut bytes = vec![0; 1 + bitmap_len];
+    let mut bytes = vec![0; 1 + V2_MVCC_HEADER_LEN + bitmap_len];
     bytes[0] = ROW_FORMAT_VERSION;
+    write_v2_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], txn_id);
 
+    let bitmap_start = 1 + V2_MVCC_HEADER_LEN;
+    let bitmap_end = bitmap_start + bitmap_len;
     for (index, (column, value)) in schema.columns.iter().zip(&row.values).enumerate() {
         match value {
             Value::Null => {
@@ -111,7 +177,7 @@ pub fn encode_row(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
                         format!("column {} cannot be NULL", column.name),
                     ));
                 }
-                set_null(&mut bytes[1..1 + bitmap_len], index);
+                set_null(&mut bytes[bitmap_start..bitmap_end], index);
             }
             Value::Integer(value) if column.data_type == DataType::Integer => {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -137,20 +203,45 @@ pub fn encode_row(schema: &TableSchema, row: &Row) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
+pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
     let bitmap_len = null_bitmap_len(schema.columns.len());
-    let header_len = 1 + bitmap_len;
-    if bytes.len() < header_len {
+    if bytes.is_empty() {
         return Err(corrupt_row("row is shorter than its header"));
     }
-    if bytes[0] != ROW_FORMAT_VERSION {
-        return Err(corrupt_row(format!(
-            "unsupported row format version {}",
-            bytes[0]
-        )));
-    }
 
-    let null_bitmap = &bytes[1..header_len];
+    // Branch on the version byte: v2 carries the MVCC header before the null
+    // bitmap; v1 has only the bitmap and synthesizes a frozen, never-deleted
+    // header so pre-MVCC tuples are visible to every snapshot.
+    let (xmin, xmax, t_ctid, infomask, header_len) = match bytes[0] {
+        ROW_FORMAT_VERSION => {
+            let header_len = 1 + V2_MVCC_HEADER_LEN + bitmap_len;
+            if bytes.len() < header_len {
+                return Err(corrupt_row("row is shorter than its header"));
+            }
+            let (xmin, xmax, t_ctid, infomask) = read_v2_header(&bytes[1..1 + V2_MVCC_HEADER_LEN])?;
+            (xmin, xmax, t_ctid, infomask, header_len)
+        }
+        ROW_FORMAT_VERSION_V1 => {
+            let header_len = 1 + bitmap_len;
+            if bytes.len() < header_len {
+                return Err(corrupt_row("row is shorter than its header"));
+            }
+            (
+                FROZEN_XID,
+                INVALID_XID,
+                INVALID_TID,
+                XMIN_COMMITTED,
+                header_len,
+            )
+        }
+        other => {
+            return Err(corrupt_row(format!(
+                "unsupported row format version {other}"
+            )));
+        }
+    };
+
+    let null_bitmap = &bytes[header_len - bitmap_len..header_len];
     let mut offset = header_len;
     let mut values = Vec::with_capacity(schema.columns.len());
 
@@ -193,7 +284,39 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
         return Err(corrupt_row("row has trailing bytes"));
     }
 
-    Ok(Row { values })
+    Ok(DecodedRow {
+        row: Row { values },
+        xmin,
+        xmax,
+        t_ctid,
+        infomask,
+    })
+}
+
+/// Write the v2 MVCC header into `header` (exactly `V2_MVCC_HEADER_LEN` bytes):
+/// `[infomask:2][xmin:8][xmax:8][t_ctid:6]` for a freshly inserted tuple.
+fn write_v2_header(header: &mut [u8], txn_id: TxnId) {
+    debug_assert_eq!(header.len(), V2_MVCC_HEADER_LEN);
+    header[0..2].copy_from_slice(&0u16.to_le_bytes());
+    header[2..10].copy_from_slice(&txn_id.to_le_bytes());
+    header[10..18].copy_from_slice(&INVALID_XID.to_le_bytes());
+    let (page, slot) = INVALID_TID;
+    header[18..22].copy_from_slice(&page.to_le_bytes());
+    header[22..24].copy_from_slice(&slot.to_le_bytes());
+}
+
+/// Read the v2 MVCC header (`[infomask:2][xmin:8][xmax:8][t_ctid:6]`) from
+/// exactly `V2_MVCC_HEADER_LEN` bytes, returning `(xmin, xmax, t_ctid, infomask)`.
+fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> {
+    if header.len() != V2_MVCC_HEADER_LEN {
+        return Err(corrupt_row("row v2 header has the wrong length"));
+    }
+    let infomask = u16::from_le_bytes(header[0..2].try_into().expect("2 bytes"));
+    let xmin = u64::from_le_bytes(header[2..10].try_into().expect("8 bytes"));
+    let xmax = u64::from_le_bytes(header[10..18].try_into().expect("8 bytes"));
+    let page = u32::from_le_bytes(header[18..22].try_into().expect("4 bytes"));
+    let slot = u16::from_le_bytes(header[22..24].try_into().expect("2 bytes"));
+    Ok((xmin, xmax, (page, slot), infomask))
 }
 
 fn null_bitmap_len(columns: usize) -> usize {
@@ -225,9 +348,12 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnDef, DataType, Key, Row, TableSchema, Value};
+    use common::{ColumnDef, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema, Value};
 
-    use super::{ROW_FORMAT_VERSION, decode_key, decode_row, encode_key, encode_row};
+    use super::{
+        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, XMIN_COMMITTED,
+        decode_key, decode_row, encode_key, encode_row, null_bitmap_len,
+    };
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -251,13 +377,90 @@ mod tests {
         }
     }
 
+    /// Build a legacy v1 tuple buffer (`[version=1][null_bitmap][columns]`) by
+    /// hand so the v1 backward-compatibility path has a real input to decode.
+    fn encode_row_v1(schema: &TableSchema, row: &Row) -> Vec<u8> {
+        let bitmap_len = null_bitmap_len(schema.columns.len());
+        let mut bytes = vec![0u8; 1 + bitmap_len];
+        bytes[0] = ROW_FORMAT_VERSION_V1;
+        for (index, value) in row.values.iter().enumerate() {
+            match value {
+                Value::Null => bytes[1 + index / 8] |= 1 << (index % 8),
+                Value::Integer(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Value::Text(value) => {
+                    bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(value.as_bytes());
+                }
+                Value::Boolean(value) => bytes.push(u8::from(*value)),
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn row_format_version_is_two() {
+        assert_eq!(ROW_FORMAT_VERSION, 2);
+    }
+
     #[test]
     fn encode_prefixes_row_format_version() {
         let row = Row {
             values: vec![Value::Integer(7), Value::Null],
         };
-        let bytes = encode_row(&schema(), &row).unwrap();
+        let bytes = encode_row(&schema(), &row, 11).unwrap();
         assert_eq!(bytes[0], ROW_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v2_round_trip_preserves_header_and_values_including_nulls() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Null],
+        };
+        let bytes = encode_row(&schema(), &row, 7).unwrap();
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(decoded.row, row);
+        assert_eq!(decoded.xmin, 7);
+        assert_eq!(decoded.xmax, INVALID_XID);
+        assert_eq!(decoded.t_ctid, INVALID_TID);
+        assert_eq!(decoded.infomask, 0);
+    }
+
+    #[test]
+    fn v2_header_occupies_the_documented_byte_width() {
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Null],
+        };
+        let bytes = encode_row(&schema(), &row, 1).unwrap();
+        // version byte + MVCC header + null bitmap precede the first column.
+        assert!(bytes.len() >= 1 + V2_MVCC_HEADER_LEN + null_bitmap_len(schema().columns.len()));
+    }
+
+    #[test]
+    fn v1_buffer_decodes_as_frozen_visible_row() {
+        let row = Row {
+            values: vec![Value::Integer(9), Value::Text("legacy".to_string())],
+        };
+        let bytes = encode_row_v1(&schema(), &row);
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(decoded.row, row);
+        assert_eq!(decoded.xmin, FROZEN_XID);
+        assert_eq!(decoded.xmax, INVALID_XID);
+        assert_eq!(decoded.t_ctid, INVALID_TID);
+        assert_eq!(decoded.infomask, XMIN_COMMITTED);
+    }
+
+    #[test]
+    fn v1_buffer_with_null_decodes_correctly() {
+        let row = Row {
+            values: vec![Value::Integer(3), Value::Null],
+        };
+        let bytes = encode_row_v1(&schema(), &row);
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(decoded.row, row);
+        assert_eq!(decoded.xmin, FROZEN_XID);
     }
 
     #[test]
@@ -283,7 +486,7 @@ mod tests {
         let row = Row {
             values: vec![Value::Integer(7), Value::Null],
         };
-        let mut bytes = encode_row(&schema(), &row).unwrap();
+        let mut bytes = encode_row(&schema(), &row, 1).unwrap();
         bytes[0] = ROW_FORMAT_VERSION + 1;
 
         let err = decode_row(&schema(), &bytes).unwrap_err();

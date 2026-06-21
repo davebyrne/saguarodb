@@ -1184,10 +1184,12 @@ V1 development builds do not migrate older page formats. Existing page files wit
 ### Row Serialization
 
 ```
-[row_format_version: 1 byte][null_bitmap][col1_data][col2_data]...
+[row_format_version: 1 byte][infomask: 2][xmin: 8][xmax: 8][t_ctid: 6][null_bitmap][col1_data][col2_data]...
 ```
 
-- `row_format_version`: `1`; unknown versions are rejected as corrupt. Reserved so future MVCC row versions can be added without a second on-disk format break.
+- `row_format_version`: `2`, the MVCC tuple layout. `decode_row` still accepts legacy `1` tuples (`[version=1][null_bitmap][columns]`, no MVCC header); other versions are rejected as corrupt.
+- MVCC tuple header (v2 only, little-endian): `infomask` (2-byte hint bits — `XMIN_COMMITTED`/`XMIN_ABORTED`/`XMAX_COMMITTED`/`XMAX_ABORTED` cache settled CLOG status, `HEAP_ONLY`/`HOT_UPDATED` reserved for HOT, rest reserved-zero), `xmin` (8-byte creator txn id), `xmax` (8-byte deleter txn id; `0` = live), and `t_ctid` (forward successor pointer `(page: u32, slot: u16)`; sentinel `(u32::MAX, u16::MAX)` = latest version).
+- Insert stamps `xmin = txn_id` (from `StatementContext.txn_id`), `xmax = 0`, `t_ctid = sentinel`, `infomask = 0`. Legacy v1 tuples decode as frozen/always-visible (`xmin = FROZEN_XID`, `xmax = 0`).
 - `INTEGER`: 8 bytes, little-endian i64
 - `TEXT`: 4-byte length prefix + UTF-8 bytes
 - `BOOLEAN`: 1 byte
@@ -1384,7 +1386,7 @@ This gives the invariants:
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
 **Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
-- **MVCC** — the reserved row-format version byte carries future `xmin`/`xmax`; the redo WAL is the prerequisite.
+- **MVCC** — in progress on `feat/mvcc` (see `docs/specs/mvcc.md`). Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header; the redo WAL is the prerequisite. Visibility, version chains, and transactions land in later milestones.
 
 ### WAL Record Format
 

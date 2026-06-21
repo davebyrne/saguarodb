@@ -8,7 +8,7 @@ mod recovery;
 mod redo;
 mod traits;
 
-pub use codec::{decode_row, encode_row};
+pub use codec::{DecodedRow, decode_row, encode_row};
 pub use engine::{PageBackedStorageEngine, StorageMode};
 pub use heap::HeapPageStore;
 pub use page::is_valid as page_is_valid;
@@ -56,10 +56,10 @@ mod tests {
             ],
         };
 
-        let bytes = encode_row(&schema, &row).unwrap();
+        let bytes = encode_row(&schema, &row, 1).unwrap();
         let decoded = decode_row(&schema, &bytes).unwrap();
 
-        assert_eq!(decoded, row);
+        assert_eq!(decoded.row, row);
     }
 
     #[test]
@@ -974,6 +974,7 @@ mod tests {
             &Row {
                 values: vec![Value::Integer(1), Value::Text(String::new()), Value::Null],
             },
+            1,
         )
         .unwrap()
         .len();

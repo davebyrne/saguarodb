@@ -94,10 +94,33 @@ Page body (data page):
 ## Row Serialization
 
 ```text
-[row_format_version: 1 byte][null_bitmap][col1_data][col2_data]...
+[row_format_version: 1 byte][infomask: 2][xmin: 8][xmax: 8][t_ctid: 6][null_bitmap][col1_data][col2_data]...
 ```
 
-- `row_format_version`: `1`; unknown versions are rejected as corrupt. Reserved so MVCC row versions can be added later without a second on-disk format break.
+- `row_format_version`: `2`. `decode_row` also accepts legacy `1` tuples (which
+  omit the MVCC header — `[version=1][null_bitmap][columns]`); all other versions
+  are rejected as corrupt.
+- MVCC tuple header (v2 only), all little-endian:
+  - `infomask`: 2-byte hint bits. Bit 0 `XMIN_COMMITTED`, bit 1 `XMIN_ABORTED`,
+    bit 2 `XMAX_COMMITTED`, bit 3 `XMAX_ABORTED` cache settled transaction status
+    to skip a CLOG probe; bit 4 `HEAP_ONLY` and bit 5 `HOT_UPDATED` are reserved
+    for HOT; bits 6–15 reserved (zero). No bits are set on insert; later
+    milestones populate them.
+  - `xmin`: 8-byte `u64` creator transaction id.
+  - `xmax`: 8-byte `u64` deleter transaction id; `0` (`INVALID_XID`) means the
+    version is live/not-deleted.
+  - `t_ctid`: forward successor pointer `(page_num: u32, slot: u16)` = 6 bytes.
+    The sentinel `INVALID_TID = (u32::MAX, u16::MAX)` means "no successor / this
+    is the latest version" (the encoder does not know its own slot, so insert
+    stamps the sentinel).
+- Insert stamps `xmin = txn_id`, `xmax = INVALID_XID`, `t_ctid = INVALID_TID`,
+  `infomask = 0`; the creating `txn_id` flows from `StatementContext.txn_id`.
+- Legacy v1 tuples decode with synthesized `xmin = FROZEN_XID`,
+  `xmax = INVALID_XID`, `t_ctid = INVALID_TID`, `infomask = XMIN_COMMITTED`, so
+  pre-MVCC rows are always visible.
+- The reserved xid sentinels live in `common`: `INVALID_XID = 0`,
+  `FROZEN_XID = 2`; the transaction-id allocator must assign real ids strictly
+  above the reserved range (`FIRST_NORMAL_XID = 3`).
 - `Integer`: 8-byte little-endian i64.
 - `Text`: 4-byte length prefix plus UTF-8 bytes.
 - `Boolean`: 1 byte.

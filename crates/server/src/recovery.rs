@@ -194,9 +194,14 @@ fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
             max_txn_id = max_txn_id.max(txn_id);
         }
     }
-    max_txn_id
+    let next = max_txn_id
         .checked_add(1)
-        .ok_or_else(|| DbError::wal(common::SqlState::InternalError, "transaction id overflow"))
+        .ok_or_else(|| DbError::wal(common::SqlState::InternalError, "transaction id overflow"))?;
+    // Floor the allocator at FIRST_NORMAL_XID so real transactions never stamp
+    // tuple headers with a reserved xid. On a fresh database max_txn_id is 0, so
+    // an unfloored seed would hand out 1 and 2 (== FROZEN_XID), persisting rows
+    // that later visibility code would treat as frozen/always-visible.
+    Ok(next.max(common::FIRST_NORMAL_XID))
 }
 
 #[cfg(test)]

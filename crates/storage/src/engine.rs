@@ -246,7 +246,7 @@ impl PageBackedStorageEngine {
     }
 
     fn write_new_row(&self, schema: &TableSchema, row: &Row, txn_id: u64) -> Result<RowLocation> {
-        let row_bytes = encode_row(schema, row)?;
+        let row_bytes = encode_row(schema, row, txn_id)?;
         if row_bytes.len() + page_overhead() > buffer::PAGE_SIZE {
             return Err(DbError::storage(
                 SqlState::InternalError,
@@ -375,7 +375,9 @@ impl PageBackedStorageEngine {
         let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
             return Ok(None);
         };
-        Ok(Some(decode_row(schema, &bytes)?))
+        // Milestone A stamps the MVCC header but does not yet apply visibility, so
+        // callers still consume only the column values (`DecodedRow::row`).
+        Ok(Some(decode_row(schema, &bytes)?.row))
     }
 
     fn table_page_nums(&self, file_id: FileId) -> Result<Vec<PageNum>> {
