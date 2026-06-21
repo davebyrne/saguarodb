@@ -32,6 +32,8 @@ pub struct Config {
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
     pub shutdown_timeout_ms: u64,
+    pub tls_cert_file: Option<PathBuf>,
+    pub tls_key_file: Option<PathBuf>,
 }
 ```
 
@@ -152,6 +154,7 @@ pub struct ServerComponents {
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
+    pub tls: Option<TlsAcceptor>,
 }
 
 pub struct AppState {
