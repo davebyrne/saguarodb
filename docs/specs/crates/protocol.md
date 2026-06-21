@@ -48,7 +48,7 @@ pub enum ServerMessage {
     AuthenticationOk,
     BackendKeyData { process_id: i32, secret_key: i32 },
     ParameterStatus { key: String, value: String },
-    ReadyForQuery,
+    ReadyForQuery(u8),
     RowDescription { columns: Vec<ColumnInfo>, formats: Vec<i16> },
     DataRow(Vec<Option<Vec<u8>>>),
     CommandComplete(String),
@@ -188,7 +188,7 @@ Server messages:
 - `AuthenticationOk`: tag `b'R'`, length `8`, `int32 auth_code = 0`.
 - `BackendKeyData`: tag `b'K'`, length `12`, `int32 process_id`, `int32 secret_key`. Sent at startup so the client can later cancel an in-flight query.
 - `ParameterStatus`: tag `b'S'`, length, `key\0value\0`. Startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
-- `ReadyForQuery`: tag `b'Z'`, length `5`, status byte `b'I'`.
+- `ReadyForQuery(status)`: tag `b'Z'`, length `5`, transaction-status byte supplied by the caller. The protocol encodes whatever byte it is handed; the server sources it from the session's transaction state (`b'I'` idle, `b'T'` in a transaction block, `b'E'` failed transaction block). The session is always idle in v1's autocommit model, so the byte is `b'I'` in every interaction; the non-idle bytes are produced once transaction lifecycle transitions land.
 - `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
 - `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus its wire bytes (text or binary per the `RowDescription` format codes), or `int32 -1` for `NULL`.
 - `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. V1 tags are `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, and `EXPLAIN`.
@@ -240,6 +240,6 @@ unsupported format codes.
 - Encodes RowDescription for all v1 data types with PostgreSQL OIDs, the per-field format code, and `table_oid = 0`.
 - Round-trips int8/bool/text values through `encode_value`/`decode_value` in both text and binary formats, and rejects malformed binary input and unsupported format codes.
 - Encodes DataRow with `NULL` represented as null field.
-- Encodes ReadyForQuery as `b'Z'`, length `5`, status `b'I'`.
+- Encodes ReadyForQuery as `b'Z'`, length `5`, status byte equal to the supplied `status` (the server passes `b'I'`/`b'T'`/`b'E'` from the session's transaction state; always `b'I'` in v1).
 - Encodes ErrorResponse with SQLSTATE code.
 - Handles Terminate by marking connection terminated.

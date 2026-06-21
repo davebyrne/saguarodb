@@ -270,6 +270,18 @@ error inside an extended sequence sends `ErrorResponse` and then skips the
 remaining extended messages until `Sync`; a simple `Query` also clears that
 aborted state.
 
+The per-connection session tracks a `TransactionState` (`Idle` -> `b'I'`,
+`InTransaction` -> `b'T'`, `Failed` -> `b'E'`; defaulting to `Idle`) via its
+`status_byte()` mapping. Every `ReadyForQuery` the server sends sources its
+transaction-status byte from this session state rather than hardcoding `b'I'`:
+the startup `ReadyForQuery`, the trailing `ReadyForQuery` after each simple
+query (success, error, and shutdown-rejected), the `Sync` `ReadyForQuery`, and
+the decode-error `ReadyForQuery` once a session exists (the pre-startup
+negotiation-error `ReadyForQuery` predates the session and uses the idle byte
+directly). In v1's autocommit model the session is always `Idle`, so the byte is
+`b'I'` in every interaction; the lifecycle transitions that produce `b'T'`/`b'E'`
+arrive with transaction support.
+
 SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client may also lead with a `GSSENCRequest` (GSSAPI transport encryption), which is unsupported: the server declines it with a single `N` byte and keeps negotiating, since the client typically follows with an `SSLRequest` or `StartupMessage`. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest`/`GSSENCRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 
 Query cancellation uses a process-wide `CancelRegistry` on `ServerComponents` mapping a per-connection `BackendKey { process_id, secret_key }` to that connection's cancellation flag. At startup the server allocates a key (a counter-based `process_id` and a random `secret_key`), registers the connection's flag, and sends `BackendKeyData` after the `ParameterStatus` messages and before `ReadyForQuery`. A `CancelRequest` arrives on its own connection (handled during negotiation, before startup): the server looks up the `BackendKey`, sets the matching flag, and closes without any reply; an unknown or stale key is ignored. The connection deregisters its key on disconnect. See the cancellation flag plumbing under Connection Handling.

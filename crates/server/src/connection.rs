@@ -46,10 +46,15 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
                 Ok(messages) if !messages.is_empty() => break messages,
                 Ok(_) => continue,
                 Err(err) => {
+                    // Pre-startup: no session exists yet, and a fresh connection
+                    // is necessarily idle.
                     write_messages(
                         &mut socket,
                         &codec,
-                        &[error_response(&err), ServerMessage::ReadyForQuery],
+                        &[
+                            error_response(&err),
+                            ServerMessage::ReadyForQuery(TransactionState::Idle.status_byte()),
+                        ],
                     )
                     .await?;
                     return Ok(());
@@ -68,10 +73,14 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
                 SqlState::SyntaxError,
                 "client sent data before completing connection negotiation",
             );
+            // Pre-startup: no session exists yet, and a fresh connection is idle.
             write_messages(
                 &mut socket,
                 &codec,
-                &[error_response(&err), ServerMessage::ReadyForQuery],
+                &[
+                    error_response(&err),
+                    ServerMessage::ReadyForQuery(TransactionState::Idle.status_byte()),
+                ],
             )
             .await?;
             return Ok(());
@@ -137,6 +146,43 @@ struct Portal {
     result_formats: Vec<i16>,
 }
 
+/// The PostgreSQL transaction-block status reported in `ReadyForQuery`. Each
+/// variant maps to the wire status byte the protocol encodes.
+///
+/// In this milestone the session is always `Idle`: no statement transitions it
+/// yet (BEGIN is still rejected pending the transaction lifecycle), so the
+/// `InTransaction`/`Failed` variants exist only to fix the byte mapping. The
+/// lifecycle transitions arrive in a later milestone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionState {
+    /// Not in a transaction block (autocommit). Status byte `b'I'`.
+    Idle,
+    /// In a live transaction block. Status byte `b'T'`.
+    #[allow(
+        dead_code,
+        reason = "transitioned into by a later transaction-lifecycle milestone"
+    )]
+    InTransaction,
+    /// In a failed transaction block: rejects all but COMMIT/ROLLBACK. Status
+    /// byte `b'E'`.
+    #[allow(
+        dead_code,
+        reason = "transitioned into by a later transaction-lifecycle milestone"
+    )]
+    Failed,
+}
+
+impl TransactionState {
+    /// The PostgreSQL `ReadyForQuery` transaction-status byte for this state.
+    pub fn status_byte(self) -> u8 {
+        match self {
+            TransactionState::Idle => b'I',
+            TransactionState::InTransaction => b'T',
+            TransactionState::Failed => b'E',
+        }
+    }
+}
+
 /// Per-connection state for the simple and extended query protocols.
 struct Session {
     app: Arc<AppState>,
@@ -146,6 +192,9 @@ struct Session {
     /// Set after an error inside an extended-query sequence; subsequent extended
     /// messages are skipped until the client sends `Sync`.
     failed: bool,
+    /// Transaction-block status reported in `ReadyForQuery`. Always `Idle` in
+    /// this milestone (no lifecycle transitions yet).
+    tx: TransactionState,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -201,7 +250,10 @@ where
                 write_messages(
                     &mut stream,
                     &codec,
-                    &[error_response(&err), ServerMessage::ReadyForQuery],
+                    &[
+                        error_response(&err),
+                        ServerMessage::ReadyForQuery(session.status_byte()),
+                    ],
                 )
                 .await?;
                 return Ok(());
@@ -218,9 +270,16 @@ impl Session {
             prepared: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
+            tx: TransactionState::Idle,
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
         }
+    }
+
+    /// The `ReadyForQuery` transaction-status byte for the session's current
+    /// transaction state.
+    fn status_byte(&self) -> u8 {
+        self.tx.status_byte()
     }
 
     /// Clear the cancellation flag and hand a shared clone to the query about to
@@ -246,7 +305,8 @@ impl Session {
             ClientMessage::Query(sql) => return self.run_query(stream, codec, sql).await,
             ClientMessage::Sync => {
                 self.failed = false;
-                write_messages(stream, codec, &[ServerMessage::ReadyForQuery]).await?;
+                let status = self.status_byte();
+                write_messages(stream, codec, &[ServerMessage::ReadyForQuery(status)]).await?;
             }
             ClientMessage::Flush => {
                 stream
@@ -335,13 +395,14 @@ impl Session {
         // A simple query is a transaction boundary that clears any aborted
         // extended-query sequence, matching PostgreSQL.
         self.failed = false;
+        let status = self.status_byte();
         let guard = match self.app.components.shutdown.begin_query() {
             Ok(guard) => guard,
             Err(err) => {
                 write_messages(
                     stream,
                     codec,
-                    &[error_response(&err), ServerMessage::ReadyForQuery],
+                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
                 )
                 .await?;
                 return Ok(ControlFlow::Break(()));
@@ -355,12 +416,12 @@ impl Session {
         );
         drop(guard);
         match result {
-            Ok(result) => write_execution_result(stream, codec, result).await?,
+            Ok(result) => write_execution_result(stream, codec, result, status).await?,
             Err(err) => {
                 write_messages(
                     stream,
                     codec,
-                    &[error_response(&err), ServerMessage::ReadyForQuery],
+                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
                 )
                 .await?
             }
@@ -589,10 +650,13 @@ fn query_task_result(
     join.unwrap_or_else(|join_err| Err(DbError::internal(format!("query task failed: {join_err}"))))
 }
 
+/// Write the result of a simple query, terminated by a `ReadyForQuery` carrying
+/// the session's current transaction-status `status` byte.
 async fn write_execution_result<S>(
     socket: &mut S,
     codec: &PostgresCodec,
     result: ExecutionResult,
+    status: u8,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -609,7 +673,7 @@ where
             }
             let count = messages.len().saturating_sub(1);
             messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
-            messages.push(ServerMessage::ReadyForQuery);
+            messages.push(ServerMessage::ReadyForQuery(status));
             write_messages(socket, codec, &messages).await
         }
         ExecutionResult::Modified { command, count } => {
@@ -619,7 +683,7 @@ where
                 codec,
                 &[
                     ServerMessage::CommandComplete(tag),
-                    ServerMessage::ReadyForQuery,
+                    ServerMessage::ReadyForQuery(status),
                 ],
             )
             .await
@@ -640,7 +704,7 @@ where
                     },
                     ServerMessage::DataRow(vec![Some(text.into_bytes())]),
                     ServerMessage::CommandComplete("EXPLAIN".to_string()),
-                    ServerMessage::ReadyForQuery,
+                    ServerMessage::ReadyForQuery(status),
                 ],
             )
             .await
@@ -773,8 +837,15 @@ mod tests {
     use common::{ErrorKind, Result};
     use executor::ExecutionResult;
 
-    use super::{handle_connection, query_task_result};
+    use super::{TransactionState, handle_connection, query_task_result};
     use crate::app::AppState;
+
+    #[test]
+    fn transaction_state_maps_to_postgres_status_byte() {
+        assert_eq!(TransactionState::Idle.status_byte(), b'I');
+        assert_eq!(TransactionState::InTransaction.status_byte(), b'T');
+        assert_eq!(TransactionState::Failed.status_byte(), b'E');
+    }
 
     #[tokio::test]
     async fn panicked_query_task_becomes_internal_error() {

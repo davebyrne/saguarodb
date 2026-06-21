@@ -353,7 +353,7 @@ pub enum ServerMessage {
     AuthenticationOk,
     BackendKeyData { process_id: i32, secret_key: i32 },  // identity for CancelRequest
     ParameterStatus { key: String, value: String },
-    ReadyForQuery,
+    ReadyForQuery(u8),          // transaction-status byte: 'I' idle, 'T' in block, 'E' failed block
     RowDescription { columns: Vec<ColumnInfo>, formats: Vec<i16> },  // per-field 0=text,1=binary
     DataRow(Vec<Option<Vec<u8>>>),  // each column already encoded to its wire bytes
     CommandComplete(String),
@@ -470,7 +470,7 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Client `Terminate`: tag `X`, length `4`.
 - Server `AuthenticationOk`: tag `R`, length `8`, auth code `0`.
 - Server `ParameterStatus`: tag `S`, `key\0value\0`; startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
-- Server `ReadyForQuery`: tag `Z`, length `5`, status byte `I`.
+- Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). The session is always idle in v1's autocommit model, so the byte is `I` in every interaction; the non-idle bytes arrive with transaction lifecycle support.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
 - Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, or `EXPLAIN`.

@@ -71,7 +71,8 @@ impl ConnectionState for PostgresConnectionState {
                     key: "application_name".to_string(),
                     value: application_name.unwrap_or_default(),
                 },
-                ServerMessage::ReadyForQuery,
+                // A fresh connection is not in a transaction block: idle (`b'I'`).
+                ServerMessage::ReadyForQuery(b'I'),
             ]),
             ClientMessage::Query(_) => Ok(Vec::new()),
             // Extended-query-protocol messages need socket and query-service

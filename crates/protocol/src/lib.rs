@@ -456,7 +456,7 @@ mod tests {
         assert!(matches!(messages[0], ServerMessage::AuthenticationOk));
         assert!(matches!(
             messages.last(),
-            Some(ServerMessage::ReadyForQuery)
+            Some(ServerMessage::ReadyForQuery(b'I'))
         ));
         for (key, value) in [
             ("server_version", "16.0"),
@@ -505,11 +505,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_for_query_encodes_idle_status() {
+    fn ready_for_query_encodes_supplied_status_byte() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::ReadyForQuery);
-
-        assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, b'I']);
+        for status in [b'I', b'T', b'E'] {
+            let bytes = codec.encode(&ServerMessage::ReadyForQuery(status));
+            assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, status]);
+        }
     }
 
     #[test]

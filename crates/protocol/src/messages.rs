@@ -79,7 +79,12 @@ pub enum ServerMessage {
         key: String,
         value: String,
     },
-    ReadyForQuery,
+    /// Signals the backend is ready for a new query. The payload is the
+    /// transaction-status byte the server supplies from the session's current
+    /// transaction state: `b'I'` (idle), `b'T'` (in a transaction block), or
+    /// `b'E'` (failed transaction block). The protocol crate only encodes the
+    /// byte it is handed; the meaning lives in the server's `TransactionState`.
+    ReadyForQuery(u8),
     /// Column metadata plus the wire format code (`0` = text, `1` = binary) the
     /// values will be sent in. `formats` is parallel to `columns`; a shorter (or
     /// empty) `formats` defaults missing columns to text.

@@ -193,7 +193,7 @@ impl ProtocolCodec for PostgresCodec {
                 put_cstr(&mut body, value);
                 encode_server_message(b'S', body)
             }
-            ServerMessage::ReadyForQuery => encode_server_message(b'Z', vec![b'I']),
+            ServerMessage::ReadyForQuery(status) => encode_server_message(b'Z', vec![*status]),
             ServerMessage::RowDescription { columns, formats } => {
                 let mut body = Vec::new();
                 put_i16(
