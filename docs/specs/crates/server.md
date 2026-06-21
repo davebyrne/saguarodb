@@ -98,7 +98,9 @@ physical_plan(logical, catalog)
 engine.execute(execution_context, physical)
 ```
 
-The server constructs `ExecutionContext { statement, catalog, storage, schema_ops }` for each physical plan. The `QueryEngine` receives the server-allocated `StatementContext` and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
+The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `QueryEngine` receives the server-allocated `StatementContext` and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
+
+`QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_sql_cancelable`/`execute_prepared_cancelable`, passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
 
 `EXPLAIN` is the only query-service exception to the uniform execution path. For `BoundStatement::Explain(inner)`, `QueryService` acquires the read guard, plans `inner` to a `PhysicalPlan`, calls planner `format_explain(&physical)`, and returns `ExecutionResult::Explanation { text }` without calling `QueryEngine::execute`.
 

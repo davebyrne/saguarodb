@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use catalog::CatalogManager;
 use common::{
     ColumnId, ColumnInfo, DataType, DbError, ExecRow, IndexId, ParsedColumnDef, Result, Row,
@@ -18,6 +20,21 @@ pub struct ExecutionContext<'a> {
     pub catalog: &'a dyn CatalogManager,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
+    /// Set from another connection's `CancelRequest`; the engine polls it
+    /// between rows and aborts with `QueryCanceled` when it becomes true.
+    pub cancel: &'a AtomicBool,
+}
+
+/// Abort with `QueryCanceled` if a cancellation has been requested. Called
+/// between rows in the row-producing and write loops.
+fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {
+    if ctx.cancel.load(Ordering::Relaxed) {
+        return Err(DbError::execute(
+            SqlState::QueryCanceled,
+            "canceling statement due to user request",
+        ));
+    }
+    Ok(())
 }
 
 pub trait PlanExecutor {
@@ -192,6 +209,7 @@ fn execute_query(ctx: &ExecutionContext<'_>, plan: &PhysicalPlan) -> Result<Exec
         let columns = executor.output_schema().to_vec();
         let mut rows = Vec::new();
         while let Some(row) = executor.next()? {
+            check_canceled(ctx)?;
             rows.push(row.row);
         }
         Ok(ExecutionResult::Query { columns, rows })
@@ -215,6 +233,7 @@ fn execute_insert(
 
     let mut count = 0;
     for source_row in source_rows {
+        check_canceled(ctx)?;
         if source_row.row.values.len() != columns.len() {
             return Err(DbError::execute(
                 SqlState::DatatypeMismatch,
@@ -250,6 +269,7 @@ fn execute_update(
     let result = (|| {
         let mut count = 0;
         while let Some(source_row) = executor.next()? {
+            check_canceled(ctx)?;
             let identity = source_row.identity.clone().ok_or_else(|| {
                 DbError::internal("UPDATE source row did not include storage identity")
             })?;
@@ -290,6 +310,7 @@ fn execute_delete(
     let result = (|| {
         let mut count = 0;
         while let Some(source_row) = executor.next()? {
+            check_canceled(ctx)?;
             let identity = source_row.identity.ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
             })?;

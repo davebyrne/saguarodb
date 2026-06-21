@@ -365,11 +365,13 @@ mod tests {
         storage
             .create_table(&StatementContext { txn_id: 0 }, &schema)
             .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         let ctx = ExecutionContext {
             statement: StatementContext { txn_id: 1 },
             catalog: &catalog,
             storage: &storage,
             schema_ops: &storage,
+            cancel: &cancel,
         };
         let plan = PhysicalPlan::Insert {
             table: schema.id,
@@ -408,6 +410,22 @@ mod tests {
 
         assert_eq!(err.code, SqlState::DatatypeMismatch);
         assert!(err.message.contains("expected column id"));
+    }
+
+    #[test]
+    fn query_aborts_when_cancellation_requested() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let err = harness
+            .execute_with_cancel("select id from users", &cancel)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        assert!(err.message.contains("canceling statement"));
     }
 
     #[test]

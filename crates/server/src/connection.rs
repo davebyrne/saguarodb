@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{ColumnInfo, DataType, DbError, Result, Row, SqlState, Value};
 use executor::ExecutionResult;
@@ -132,6 +133,9 @@ struct Session {
     /// Set after an error inside an extended-query sequence; subsequent extended
     /// messages are skipped until the client sends `Sync`.
     failed: bool,
+    /// Shared with the running query's `ExecutionContext`; set from another
+    /// connection's `CancelRequest` to abort the in-flight query.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Drive the protocol over an established stream, starting with any messages
@@ -190,7 +194,16 @@ impl Session {
             prepared: HashMap::new(),
             portals: HashMap::new(),
             failed: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Clear the cancellation flag and hand a shared clone to the query about to
+    /// run, so a `CancelRequest` received during execution aborts it (and a
+    /// cancellation requested between queries is ignored).
+    fn begin_cancelable(&self) -> Arc<AtomicBool> {
+        self.cancel.store(false, Ordering::Relaxed);
+        self.cancel.clone()
     }
 
     /// Handle one decoded client message. Returns `Break` when the connection
@@ -289,8 +302,11 @@ impl Session {
             }
         };
         let service = self.app.query_service.clone();
-        let result =
-            query_task_result(tokio::task::spawn_blocking(move || service.execute_sql(&sql)).await);
+        let cancel = self.begin_cancelable();
+        let result = query_task_result(
+            tokio::task::spawn_blocking(move || service.execute_sql_cancelable(&sql, &cancel))
+                .await,
+        );
         drop(guard);
         match result {
             Ok(result) => write_execution_result(stream, codec, result).await?,
@@ -332,9 +348,12 @@ impl Session {
             }
         };
         let service = self.app.query_service.clone();
+        let cancel = self.begin_cancelable();
         let result = query_task_result(
-            tokio::task::spawn_blocking(move || service.execute_prepared(&statement, &params))
-                .await,
+            tokio::task::spawn_blocking(move || {
+                service.execute_prepared_cancelable(&statement, &params, &cancel)
+            })
+            .await,
         );
         drop(guard);
         match result {
@@ -689,6 +708,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::NumericValueOutOfRange => "22003",
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
+        SqlState::QueryCanceled => "57014",
         SqlState::IoError => "58030",
         SqlState::InternalError => "XX000",
     }

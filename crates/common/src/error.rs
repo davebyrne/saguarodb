@@ -34,6 +34,7 @@ pub enum SqlState {
     NumericValueOutOfRange,
     NotNullViolation,
     UniqueViolation,
+    QueryCanceled,
     IoError,
     InternalError,
 }

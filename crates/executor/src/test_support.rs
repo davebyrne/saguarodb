@@ -7,6 +7,7 @@ use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::{ExecutionContext, ExecutionResult, QueryEngine};
@@ -50,6 +51,10 @@ impl ExecutorHarness {
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
+        self.execute_with_cancel(sql, &AtomicBool::new(false))
+    }
+
+    pub fn execute_with_cancel(&self, sql: &str, cancel: &AtomicBool) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
         let bound = bind(&statement, &self.catalog)?;
         let logical = logical_plan(&bound)?;
@@ -63,6 +68,7 @@ impl ExecutorHarness {
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
+            cancel,
         };
         let result = self.engine.execute(&ctx, &physical);
         if is_read {

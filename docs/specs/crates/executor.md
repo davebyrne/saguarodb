@@ -48,6 +48,7 @@ pub struct ExecutionContext<'a> {
     pub catalog: &'a dyn CatalogManager,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
+    pub cancel: &'a AtomicBool,
 }
 
 pub struct QueryEngine;
@@ -58,6 +59,8 @@ impl QueryEngine {
 ```
 
 `QueryEngine::execute` passes `ctx.statement` to storage and schema operations. It does not allocate transaction IDs, append commit records, flush WAL, or call storage/buffer commit or rollback; server query orchestration owns those statement-level concerns.
+
+`ctx.cancel` is polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops; when it is set (from another connection's `CancelRequest`), execution aborts with `DbError::execute(SqlState::QueryCanceled, "canceling statement due to user request")`. Cancellation is observed at these row boundaries, not mid-operator (e.g. during a sort or join build phase).
 
 ## Operators
 

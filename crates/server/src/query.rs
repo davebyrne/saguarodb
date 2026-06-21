@@ -1,6 +1,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{ColumnInfo, DataType, DbError, Result, StatementContext, Value};
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
@@ -29,10 +29,20 @@ impl QueryService {
     }
 
     pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
+        self.execute_sql_cancelable(sql, &AtomicBool::new(false))
+    }
+
+    /// Like `execute_sql`, but aborts with `QueryCanceled` if `cancel` becomes
+    /// set (from another connection's `CancelRequest`) while the query runs.
+    pub fn execute_sql_cancelable(
+        &self,
+        sql: &str,
+        cancel: &AtomicBool,
+    ) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
         let class = statement_class(&statement)?;
         let bound = bind(&statement, self.components.catalog.as_ref())?;
-        self.execute_bound(class, bound)
+        self.execute_bound(class, bound, cancel)
     }
 
     /// Parse and bind a (possibly parameterized) statement for the extended
@@ -66,6 +76,16 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
+        self.execute_prepared_cancelable(prepared, params, &AtomicBool::new(false))
+    }
+
+    /// Like `execute_prepared`, but cancelable mid-flight via `cancel`.
+    pub fn execute_prepared_cancelable(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<ExecutionResult> {
         if params.len() != prepared.param_types.len() {
             return Err(DbError::protocol(
                 common::SqlState::SyntaxError,
@@ -77,7 +97,7 @@ impl QueryService {
             ));
         }
         let bound = substitute_params(&prepared.bound, params)?;
-        self.execute_bound(prepared.class, bound)
+        self.execute_bound(prepared.class, bound, cancel)
     }
 }
 
@@ -86,14 +106,19 @@ impl QueryService {
         &self,
         class: StatementClass,
         bound: BoundStatement,
+        cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
         match class {
-            StatementClass::Read => self.execute_read_bound(bound),
-            StatementClass::Write => self.execute_write_bound(bound),
+            StatementClass::Read => self.execute_read_bound(bound, cancel),
+            StatementClass::Write => self.execute_write_bound(bound, cancel),
         }
     }
 
-    fn execute_read_bound(&self, bound: BoundStatement) -> Result<ExecutionResult> {
+    fn execute_read_bound(
+        &self,
+        bound: BoundStatement,
+        cancel: &AtomicBool,
+    ) -> Result<ExecutionResult> {
         let _guard = self.components.concurrency.begin_read()?;
         match bound {
             BoundStatement::Explain(inner) => {
@@ -112,19 +137,23 @@ impl QueryService {
             other => {
                 let logical = logical_plan(&other)?;
                 let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-                let ctx = self.execution_context(0);
+                let ctx = self.execution_context(0, cancel);
                 self.engine.execute(&ctx, &physical)
             }
         }
     }
 
-    fn execute_write_bound(&self, bound: BoundStatement) -> Result<ExecutionResult> {
+    fn execute_write_bound(
+        &self,
+        bound: BoundStatement,
+        cancel: &AtomicBool,
+    ) -> Result<ExecutionResult> {
         let guard = self.components.concurrency.begin_write()?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         let txn_id = self.components.next_txn_id.fetch_add(1, Ordering::AcqRel);
         let catalog_before = self.components.catalog.snapshot()?;
-        let ctx = self.execution_context(txn_id);
+        let ctx = self.execution_context(txn_id, cancel);
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {
@@ -162,12 +191,17 @@ impl QueryService {
         Ok(result)
     }
 
-    fn execution_context(&self, txn_id: u64) -> ExecutionContext<'_> {
+    fn execution_context<'a>(
+        &'a self,
+        txn_id: u64,
+        cancel: &'a AtomicBool,
+    ) -> ExecutionContext<'a> {
         ExecutionContext {
             statement: StatementContext { txn_id },
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
+            cancel,
         }
     }
 
@@ -286,11 +320,57 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
 
     use catalog::CatalogSnapshot;
     use common::{DataType, SqlState, Value};
 
     use crate::app::AppState;
+
+    #[tokio::test]
+    async fn execute_sql_aborts_when_cancellation_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let err = app
+            .query_service
+            .execute_sql_cancelable("select id from users", &cancel)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
+    }
+
+    #[tokio::test]
+    async fn canceled_write_aborts_and_does_not_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let err = app
+            .query_service
+            .execute_sql_cancelable("insert into users (id) values (2)", &cancel)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
+
+        // The canceled write rolled back: the second row was never committed.
+        let result = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+    }
 
     #[tokio::test]
     async fn failed_write_rolls_back_buffer_and_does_not_commit() {
