@@ -16,7 +16,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
 - V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
-- Primary-key access path only (full table scans otherwise)
+- Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
 - Async networking (Tokio) with blocking thread pool for query execution
 
@@ -1733,8 +1733,7 @@ Loaded from command-line args only in V1. No environment-variable or config-file
 ## 12. Future Work (Designed For, Not Implemented)
 
 - **MVCC / Transactions:** `StatementContext` carries `txn_id` and is extensible for snapshot visibility. The `ConcurrencyController` trait returns owned guards so a simple `RwLock` implementation can later be swapped for a transaction manager. WAL record format includes `TxnID`.
-- **Secondary Indexes:** `IndexId` type defined, `KeyRange` supports range scans, and the on-disk B-tree (used by the primary key, in `<table>.idx`) is the access-method template. Storage engine can add `index_scan` method. Catalog can add `IndexSchema`.
-- **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor.
+- **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among the primary-key and secondary indexes; a cost model would replace that heuristic.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **INSERT ... SELECT:** `InsertSource::Query` variant exists in the AST. The logical/physical plans already model inserts as `source: Box<LogicalPlan>` / `source: Box<PhysicalPlan>`, so this can be enabled later by binding query sources.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.

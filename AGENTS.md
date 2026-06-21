@@ -61,8 +61,9 @@ precedence.
 ## SQL And Durability Rules
 
 - Preserve the v1 SQL subset unless the specs are intentionally updated:
-  `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `SELECT` with v1 clauses
-  and joins, `UPDATE`, `DELETE`, and `EXPLAIN`.
+  `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
+  `INSERT ... VALUES`, `SELECT` with v1 clauses and joins, `UPDATE`, `DELETE`,
+  and `EXPLAIN`.
 - Unsupported parsed forms should be rejected by the binder or server with
   structured `common::DbError` values and accurate SQLSTATE codes.
 - Do not introduce implicit casts. Type mismatches return
