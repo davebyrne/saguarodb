@@ -205,7 +205,7 @@ For each accepted TCP connection:
 8. On protocol decode errors, send `ErrorResponse` and `ReadyForQuery`, then close the connection because the codec buffer state may be unrecoverable.
 9. On Terminate or unrecoverable IO error, close connection.
 
-SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
+SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client may also lead with a `GSSENCRequest` (GSSAPI transport encryption), which is unsupported: the server declines it with a single `N` byte and keeps negotiating, since the client typically follows with an `SSLRequest` or `StartupMessage`. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest`/`GSSENCRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 
 ## Graceful Shutdown
 
@@ -232,4 +232,5 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 - With TLS disabled, an `SSLRequest` is rejected with `N` and the same connection then completes a plaintext startup.
 - With TLS enabled, an `SSLRequest` is accepted with `S`, the TLS handshake completes, and a simple query runs over the encrypted stream.
 - Supplying exactly one of `--tls-cert-file`/`--tls-key-file` is rejected during config parsing.
+- A `GSSENCRequest` is declined with `N`; the client may then negotiate SSL or start in plaintext on the same connection.
 - Graceful shutdown runs checkpoint after in-flight query completes.

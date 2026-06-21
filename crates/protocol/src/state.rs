@@ -26,7 +26,13 @@ impl Default for PostgresConnectionState {
 impl ConnectionState for PostgresConnectionState {
     fn handle_message(&mut self, msg: ClientMessage) -> Result<Vec<ServerMessage>> {
         match msg {
-            ClientMessage::SslRequest => Ok(vec![ServerMessage::SslRejected]),
+            // GSSAPI transport encryption is unsupported; decline with the same
+            // single `N` byte as SSL rejection. The leading-request case is
+            // handled by the server's negotiation loop; this covers a stray
+            // request seen mid-stream.
+            ClientMessage::SslRequest | ClientMessage::GssEncRequest => {
+                Ok(vec![ServerMessage::SslRejected])
+            }
             ClientMessage::Startup {
                 application_name, ..
             } => Ok(vec![

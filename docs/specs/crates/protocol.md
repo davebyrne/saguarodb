@@ -17,6 +17,7 @@
 pub enum ClientMessage {
     Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
+    GssEncRequest,
     Query(String),
     Terminate,
 }
@@ -69,7 +70,9 @@ pub trait ConnectionState: Send {
 1. Client may send SSLRequest. The protocol layer decodes it and encodes the
    negotiation reply the server selects: `SslAccepted` (`S` byte) when the
    server has TLS configured, otherwise `SslRejected` (`N` byte). The protocol
-   layer does not perform the TLS handshake; `server` owns it.
+   layer does not perform the TLS handshake; `server` owns it. A client may also
+   send a `GSSENCRequest` first; v1 does not support GSSAPI transport encryption
+   and declines it with the same `N` byte, after which the client continues.
 2. Client sends StartupMessage.
 3. Server sends:
    - `AuthenticationOk`
@@ -127,6 +130,7 @@ All integer fields are big-endian. All server messages except `SslAccepted` and 
 Client messages:
 
 - `SSLRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877103`.
+- `GSSENCRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877104`.
 - `Startup`: startup-style packet with `int32 protocol = 196608` for protocol 3.0, followed by nul-terminated key/value strings and a final `\0`. V1 reads `user`, optional `database`, and optional `application_name`; other parameters are ignored.
 - `Query`: tag `b'Q'`, length, SQL string terminated by `\0`.
 - `Terminate`: tag `b'X'`, length `4`.
@@ -156,6 +160,7 @@ Text value encoding:
 - Authentication.
 - Performing the TLS handshake itself. The protocol layer only encodes the
   `SslAccepted`/`SslRejected` negotiation byte; `server` owns the handshake.
+- GSSAPI transport encryption (the GSSENCRequest is declined with `N`).
 - CancelRequest.
 - COPY.
 
@@ -163,6 +168,7 @@ Text value encoding:
 
 - Decodes SSLRequest and encodes single-byte `N` for `SslRejected`.
 - Encodes single-byte `S` for `SslAccepted`.
+- Decodes GSSENCRequest and declines it with single-byte `N`.
 - Decodes StartupMessage (reading `user`, `database`, and `application_name`) and emits expected startup responses.
 - Startup echoes `application_name` in a `ParameterStatus`, reporting empty when the client omits it.
 - Decodes simple Query.

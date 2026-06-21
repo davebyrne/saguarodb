@@ -22,6 +22,13 @@ mod tests {
         bytes
     }
 
+    fn gssenc_request_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&8i32.to_be_bytes());
+        bytes.extend_from_slice(&80877104i32.to_be_bytes());
+        bytes
+    }
+
     fn startup_bytes(user: &str, database: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&196608i32.to_be_bytes());
@@ -107,6 +114,24 @@ mod tests {
     fn encodes_ssl_accepted_as_single_s_byte() {
         let codec = PostgresCodec::new();
         assert_eq!(codec.encode(&ServerMessage::SslAccepted), b"S".to_vec());
+    }
+
+    #[test]
+    fn decodes_gssenc_request() {
+        let mut codec = PostgresCodec::new();
+        assert_eq!(
+            codec.decode(&gssenc_request_bytes()).unwrap(),
+            vec![ClientMessage::GssEncRequest]
+        );
+    }
+
+    #[test]
+    fn gssenc_request_is_declined_with_rejection_byte() {
+        let mut state = PostgresConnectionState::new();
+        assert_eq!(
+            state.handle_message(ClientMessage::GssEncRequest).unwrap(),
+            vec![ServerMessage::SslRejected]
+        );
     }
 
     #[test]

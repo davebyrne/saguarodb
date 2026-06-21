@@ -8,6 +8,7 @@ pub enum ClientMessage {
         application_name: Option<String>,
     },
     SslRequest,
+    GssEncRequest,
     Query(String),
     Terminate,
 }

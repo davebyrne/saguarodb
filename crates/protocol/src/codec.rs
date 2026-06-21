@@ -4,6 +4,7 @@ use common::{ColumnInfo, DataType, DbError, Result, SqlState};
 use crate::{ClientMessage, ServerMessage};
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
+const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 const POSTGRES_PROTOCOL_V3: i32 = 196_608;
 const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -47,6 +48,10 @@ impl PostgresCodec {
         let code = read_i32(&packet[4..8])?;
         if length == 8 && code == SSL_REQUEST_CODE {
             messages.push(ClientMessage::SslRequest);
+            return Ok(true);
+        }
+        if length == 8 && code == GSSENC_REQUEST_CODE {
+            messages.push(ClientMessage::GssEncRequest);
             return Ok(true);
         }
         if code != POSTGRES_PROTOCOL_V3 {

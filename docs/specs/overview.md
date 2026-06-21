@@ -331,6 +331,7 @@ The protocol layer is generic over IO — it works with byte buffers, not socket
 pub enum ClientMessage {
     Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
+    GssEncRequest,
     Query(String),
     Terminate,
 }
@@ -358,7 +359,7 @@ pub trait ProtocolCodec: Send {
 }
 
 /// Connection state machine — tracks where we are in the protocol lifecycle.
-/// Handles non-query messages (startup, SSL, terminate) directly.
+/// Handles non-query messages (startup, SSL/GSS negotiation, terminate) directly.
 /// Query messages are handled by the server's streaming pipeline (see below).
 pub trait ConnectionState: Send {
     /// Handle a non-query client message, return response messages.
@@ -398,7 +399,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 
 ### PostgreSQL Simple Query Flow (V1 Subset)
 
-1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The server detects this (8-byte message with code `80877103`). When TLS is configured (`--tls-cert-file`/`--tls-key-file`), it replies with a single `S` byte and performs the TLS handshake, after which the client sends its `StartupMessage` over the encrypted stream. When TLS is not configured, it replies with a single `N` byte and the client continues in plaintext (or retries with a plain `StartupMessage`). TLS is server-side only; no client certificate is requested.
+1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The server detects this (8-byte message with code `80877103`). When TLS is configured (`--tls-cert-file`/`--tls-key-file`), it replies with a single `S` byte and performs the TLS handshake, after which the client sends its `StartupMessage` over the encrypted stream. When TLS is not configured, it replies with a single `N` byte and the client continues in plaintext (or retries with a plain `StartupMessage`). TLS is server-side only; no client certificate is requested. A `GSSENCRequest` (GSSAPI transport encryption) is likewise declined with a single `N` byte, after which the client continues with an `SSLRequest` or `StartupMessage`.
 2. **Startup:** Client sends `StartupMessage` (version 3.0, user, database). Server responds `AuthenticationOk` → `ParameterStatus` (server_version, etc.) → `ReadyForQuery`.
 3. **Query cycle:** Client sends `Query` (SQL string). Server responds with:
    - `RowDescription` (column names and types) for SELECT
@@ -413,6 +414,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 
 - Extended query protocol (Parse/Bind/Execute) — no prepared statements
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported; see SSLRequest handling above)
+- GSSAPI transport encryption (GSSENCRequest declined with `N`)
 - Authentication beyond accepting any connection
 - `COPY`, `NOTIFY/LISTEN`
 - `CancelRequest` flow
@@ -422,6 +424,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 All integer fields are big-endian. All server messages except the SSL negotiation reply are one-byte tag plus a four-byte length that includes the length field but not the tag. The SSL negotiation reply is exactly a single byte: `S` for acceptance, `N` for rejection.
 
 - Client `SSLRequest`: startup-style packet with length `8` and code `80877103`.
+- Client `GSSENCRequest`: startup-style packet with length `8` and code `80877104`; declined with a single `N` byte.
 - Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; V1 reads `user`, optional `database`, and optional `application_name`.
 - Client `Query`: tag `Q`, length, nul-terminated SQL string.
 - Client `Terminate`: tag `X`, length `4`.
