@@ -49,8 +49,8 @@ pub enum ServerMessage {
     BackendKeyData { process_id: i32, secret_key: i32 },
     ParameterStatus { key: String, value: String },
     ReadyForQuery,
-    RowDescription(Vec<ColumnInfo>),
-    DataRow(Vec<Option<String>>),
+    RowDescription { columns: Vec<ColumnInfo>, formats: Vec<i16> },
+    DataRow(Vec<Option<Vec<u8>>>),
     CommandComplete(String),
     // Extended query protocol.
     ParseComplete,
@@ -62,10 +62,13 @@ pub enum ServerMessage {
 }
 ```
 
-All row data is text-format in v1's simple query path. The extended-protocol
-`Bind` carries raw parameter bytes and the PostgreSQL format-code arrays (`0` =
-text, `1` = binary); the codec only frames these bytes, leaving their
-interpretation to the server. The connection-level choreography of the extended
+`RowDescription` carries the column metadata plus a per-field `formats` array
+(`0` = text, `1` = binary); a shorter or empty `formats` defaults the remaining
+columns to text. `DataRow` carries each value already encoded to its wire bytes
+for that format (or `None` for SQL NULL) — not decoded strings. The simple query
+path always uses text; the extended-protocol `Bind` carries raw parameter bytes
+and the PostgreSQL format-code arrays, and the codec only frames these bytes,
+leaving their interpretation to the server. The connection-level choreography of the extended
 messages (prepared statements, portals, Describe/Execute/Sync) is owned by
 `server`, not the codec; see the server spec.
 
@@ -84,7 +87,7 @@ impl PostgresCodec {
 }
 ```
 
-`decode` is stateful and may return zero, one, or many messages. It buffers incomplete input internally.
+`decode` is stateful and may return zero, one, or many messages. It buffers incomplete input internally. Any startup-style or tagged frame whose declared length exceeds `MAX_FRAME_LEN` (1 MiB) is rejected with a `SyntaxError` rather than buffered, bounding memory use. Per-message decoders enforce full consumption: extended messages reject trailing bytes, and `Query` rejects any payload after its nul terminator.
 
 ## Connection State API
 
@@ -152,6 +155,9 @@ The codec may return errors after buffering bytes. In v1 the server treats any d
 - `Integer` -> `INT8` (`type_oid = 20`, `type_size = 8`)
 - `Text` -> `TEXT` (`type_oid = 25`, `type_size = -1`)
 - `Boolean` -> `BOOL` (`type_oid = 16`, `type_size = 1`)
+
+The public helper `type_oid(data_type: &DataType) -> i32` returns the OID for a
+v1 data type (used when building `RowDescription` and `ParameterDescription`).
 
 The simple query path sends text format for all columns. The extended protocol
 lets a client request binary format (code `1`) per column via `Bind`;

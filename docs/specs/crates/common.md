@@ -11,7 +11,7 @@
 
 - Stable identifiers: `TableId`, `ColumnId`, `IndexId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
-- Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`, `ColumnInfo`, `TableSchema`.
+- Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`, `ColumnInfo`, `TableSchema`, `IndexSchema`.
 - Query access helpers: `KeyRange`.
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
 - Statement context and future transaction extension point.
@@ -107,9 +107,19 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
 }
+
+pub struct IndexSchema {
+    pub id: IndexId,
+    pub table: TableId,
+    pub name: String,
+    pub columns: Vec<ColumnId>,
+    pub unique: bool,
+}
 ```
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
+
+`IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate indexed values; a non-unique index appends the primary key to make each entry distinct on disk.
 
 ## Error Model
 
@@ -156,6 +166,8 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 
+`DbError` derives `thiserror::Error` with `#[error("{message}")]`, so it is a real `std::error::Error` whose `Display` renders the `message` field.
+
 ## Statement Context
 
 ```rust
@@ -189,17 +201,19 @@ pub trait ConcurrencyController: Send + Sync {
     fn begin_write(&self) -> Result<WriteGuard>;
 }
 
-pub struct RwLockConcurrencyController { /* parking_lot::RwLock<()> */ }
+pub struct RwLockConcurrencyController { /* lock: Arc<parking_lot::RwLock<()>> */ }
 
 impl RwLockConcurrencyController {
     pub fn new() -> Self;
 }
 
-pub struct ReadGuard { /* owned guard */ }
-pub struct WriteGuard { /* owned guard */ }
+impl Default for RwLockConcurrencyController { /* delegates to new() */ }
+
+pub struct ReadGuard { /* owned ArcRwLockReadGuard */ }
+pub struct WriteGuard { /* owned ArcRwLockWriteGuard */ }
 ```
 
-V1 implementation uses `parking_lot` owned `RwLock` guards internally. Reads run concurrently. Writes, DML, DDL, and checkpoints acquire the write guard. Guards are owned to keep the trait object-safe.
+V1 implementation holds the `RwLock` in an `Arc` and hands out `parking_lot` owned guards (`ArcRwLockReadGuard` / `ArcRwLockWriteGuard`) acquired via `read_arc()` / `write_arc()`. Reads run concurrently. Writes, DML, DDL, and checkpoints acquire the write guard. Guards are owned to keep the trait object-safe.
 
 ## Invariants
 
@@ -208,6 +222,7 @@ V1 implementation uses `parking_lot` owned `RwLock` guards internally. Reads run
 - `ExecRow.identity` is preserved through filters, sort, limit, and projection; joins and aggregates produce `None`.
 - `common` must not depend on any other SaguaroDB crate.
 - `FlushPolicy` must not reference `wal` types directly beyond `Lsn`.
+- Most public value, row, schema, error, id, flush, and context types derive serde `Serialize`/`Deserialize`; this serializability is part of the public/persistence contract.
 
 ## Acceptance Tests
 
