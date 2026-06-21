@@ -35,6 +35,15 @@ pub enum Statement {
         filter: Option<Expr>,
     },
     Explain(Box<Statement>),
+    /// `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION`. v1 supports only the
+    /// plain form; isolation-level and other transaction modes are rejected at
+    /// parse time. Execution is wired in MVCC Milestone C3.
+    Begin,
+    /// `COMMIT` / `END`. Execution is wired in MVCC Milestone C3.
+    Commit,
+    /// `ROLLBACK`. Savepoints are not supported in v1. Execution is wired in
+    /// MVCC Milestone C3.
+    Rollback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

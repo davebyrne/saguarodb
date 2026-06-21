@@ -177,6 +177,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_transaction_control_statements() {
+        // BEGIN and its synonyms parse to the same plain `Begin` variant.
+        for sql in ["begin", "begin transaction", "start transaction"] {
+            assert_eq!(parse(sql).unwrap(), Statement::Begin, "for `{sql}`");
+        }
+        // COMMIT and END both parse to `Commit`.
+        for sql in ["commit", "end"] {
+            assert_eq!(parse(sql).unwrap(), Statement::Commit, "for `{sql}`");
+        }
+        assert_eq!(parse("rollback").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn rejects_unsupported_transaction_control_forms() {
+        // sqlparser 0.56's PostgreSQL dialect does not recognize `ABORT`, so it
+        // is a syntax error rather than mapping to ROLLBACK; v1 does not add it.
+        // Isolation modes, chaining, and savepoints are deferred to later
+        // milestones and are rejected at parse time.
+        for sql in [
+            "abort",
+            "begin isolation level serializable",
+            "start transaction read only",
+            "commit and chain",
+            "rollback and chain",
+            "rollback to savepoint s1",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
     fn parses_create_index_forms() {
         assert_eq!(
             parse("create index users_name on users (name)").unwrap(),

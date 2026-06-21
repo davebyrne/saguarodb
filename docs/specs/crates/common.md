@@ -160,6 +160,7 @@ pub enum SqlState {
     NotNullViolation,
     UniqueViolation,
     QueryCanceled,
+    FeatureNotSupported,
     IoError,
     InternalError,
 }

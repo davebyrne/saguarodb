@@ -98,6 +98,49 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
                 _ => unsupported("EXPLAIN supports SELECT only in v1"),
             }
         }
+        sql::Statement::StartTransaction {
+            modes,
+            begin: _,
+            transaction: _,
+            modifier,
+            statements,
+            exception_statements,
+            has_end_keyword,
+        } => {
+            // Accept plain `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION`.
+            // `transaction`/`begin` are pure keyword spellings of the same plain
+            // form, so they are intentionally ignored. Everything else (isolation
+            // modes, MySQL-style modifiers, atomic-block bodies) is a later
+            // milestone and is rejected here.
+            if !modes.is_empty()
+                || modifier.is_some()
+                || !statements.is_empty()
+                || exception_statements.is_some()
+                || has_end_keyword
+            {
+                return unsupported("unsupported BEGIN/START TRANSACTION form");
+            }
+            Ok(Statement::Begin)
+        }
+        sql::Statement::Commit {
+            chain,
+            end: _,
+            modifier,
+        } => {
+            // Accept plain `COMMIT` and `END` (`end` is just the keyword
+            // spelling). `AND CHAIN` and MySQL-style modifiers are unsupported.
+            if chain || modifier.is_some() {
+                return unsupported("unsupported COMMIT form");
+            }
+            Ok(Statement::Commit)
+        }
+        sql::Statement::Rollback { chain, savepoint } => {
+            // Accept plain `ROLLBACK`. `AND CHAIN` and savepoints are unsupported.
+            if chain || savepoint.is_some() {
+                return unsupported("unsupported ROLLBACK form");
+            }
+            Ok(Statement::Rollback)
+        }
         _ => unsupported("unsupported SQL statement"),
     }
 }

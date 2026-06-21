@@ -755,6 +755,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
         SqlState::QueryCanceled => "57014",
+        SqlState::FeatureNotSupported => "0A000",
         SqlState::IoError => "58030",
         SqlState::InternalError => "XX000",
     }

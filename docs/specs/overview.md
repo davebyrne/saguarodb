@@ -232,6 +232,7 @@ pub enum SqlState {
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
     QueryCanceled,              // 57014
+    FeatureNotSupported,        // 0A000
     IoError,                    // 58030
     InternalError,              // XX000
     // ... extensible

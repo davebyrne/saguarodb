@@ -162,6 +162,7 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but v1 only accepts a `SELECT` inner statement; any other inner statement is rejected as unsupported.
+- Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. Only the plain forms are accepted: isolation-level and access modes, MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints are rejected at parse time. `ABORT` is not recognized by the dialect and is a syntax error (v1 does not add it). These statements parse to first-class variants for the MVCC effort; the multi-statement transaction lifecycle is wired in MVCC Milestone C3. Until then the server rejects them with `SqlState::FeatureNotSupported` rather than silently treating a `BEGIN` as a started transaction.
 
 Binder rejects parsed forms that exceed the v1 semantic subset, such as composite primary keys and unknown functions.
 

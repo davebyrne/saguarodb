@@ -374,6 +374,16 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::DropTable { .. }
         | Statement::CreateIndex { .. }
         | Statement::DropIndex { .. } => Ok(StatementClass::Write),
+        // TEMPORARY: replaced by real lifecycle in Milestone C3. BEGIN/COMMIT/
+        // ROLLBACK now parse to first-class statements (C1), but the
+        // multi-statement transaction lifecycle is not wired yet. Reject here
+        // rather than silently no-op a BEGIN (which would falsely tell a client
+        // a transaction had started). This is the dispatch seam C3 generalizes
+        // into transaction lifecycle handling.
+        Statement::Begin | Statement::Commit | Statement::Rollback => Err(DbError::plan(
+            common::SqlState::FeatureNotSupported,
+            "multi-statement transactions are not yet supported",
+        )),
     }
 }
 
@@ -404,6 +414,21 @@ mod tests {
             .execute_sql_cancelable("select id from users", &cancel)
             .unwrap_err();
         assert_eq!(err.code, SqlState::QueryCanceled);
+    }
+
+    #[tokio::test]
+    async fn transaction_control_statements_are_temporarily_unsupported() {
+        // C1 parses BEGIN/COMMIT/ROLLBACK to first-class statements, but the
+        // lifecycle is not wired until C3. Each must fail with a clear,
+        // structured feature-not-supported error rather than silently no-op a
+        // BEGIN (which would mislead a client into thinking a txn had started).
+        // This test marks the exact behavior C3 must replace.
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in ["begin", "commit", "rollback"] {
+            let err = app.query_service.execute_sql(sql).unwrap_err();
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
+        }
     }
 
     #[tokio::test]

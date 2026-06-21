@@ -144,6 +144,15 @@ fn bind_inner(
         Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
             inner, catalog, declared,
         )?))),
+        // TEMPORARY: replaced by real lifecycle in Milestone C3. Transaction
+        // control is dispatched before binding (see `statement_class` in the
+        // server), so the binder should not normally see these; this defensive
+        // arm keeps the public `bind` API honest if called directly, and never
+        // silently no-ops a BEGIN.
+        Statement::Begin | Statement::Commit | Statement::Rollback => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "multi-statement transactions are not yet supported",
+        )),
     }
 }
 
