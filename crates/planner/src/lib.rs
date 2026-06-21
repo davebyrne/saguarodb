@@ -200,10 +200,55 @@ mod tests {
     #[test]
     fn binder_rejects_unknown_functions_for_v1() {
         let catalog = catalog_with_users();
-        let stmt = parse("select lower(name) from users").unwrap();
+        let stmt = parse("select frobnicate(name) from users").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
 
         assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_types_scalar_functions() {
+        let catalog = catalog_with_users();
+        let stmt =
+            parse("select upper(name), length(name), abs(id), substring(name, 1, 2) from users")
+                .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        // upper(text)->text nullable (name is nullable); length(text)->int;
+        // abs(non-null int)->non-null int; substring(text,..)->text.
+        assert_eq!(select.output_schema[0].data_type, DataType::Text);
+        assert_eq!(select.output_schema[1].data_type, DataType::Integer);
+        assert_eq!(select.output_schema[2].data_type, DataType::Integer);
+        assert_eq!(select.output_schema[3].data_type, DataType::Text);
+        assert!(matches!(
+            select.columns[2].expr,
+            BoundExpr::Function {
+                nullable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binder_rejects_scalar_function_type_mismatch() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select upper(id) from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_rejects_scalar_function_wrong_arity() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select upper(name, name) from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::SyntaxError);
     }
 
     #[test]

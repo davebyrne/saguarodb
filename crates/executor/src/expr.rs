@@ -14,9 +14,7 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             left, op, right, ..
         } => eval_binary(left, *op, right, row),
         BoundExpr::UnaryOp { op, expr, .. } => eval_unary(*op, expr, row),
-        BoundExpr::Function { name, .. } => Err(DbError::internal(format!(
-            "function {name} reached executor scalar evaluation"
-        ))),
+        BoundExpr::Function { name, args, .. } => eval_function(name, args, row),
         BoundExpr::AggregateCall { func, .. } => Err(DbError::internal(format!(
             "aggregate {} reached executor scalar evaluation",
             aggregate_name(*func)
@@ -179,6 +177,82 @@ fn concat_values(left: Value, right: Value) -> Result<Value> {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(left), Value::Text(right)) => Ok(Value::Text(format!("{left}{right}"))),
         _ => datatype_mismatch("concatenation operands must be text"),
+    }
+}
+
+fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value> {
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_expr(arg, row)?);
+    }
+    // Every v1 scalar function is NULL-propagating.
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+
+    match name {
+        "upper" => Ok(Value::Text(function_text(&values[0])?.to_uppercase())),
+        "lower" => Ok(Value::Text(function_text(&values[0])?.to_lowercase())),
+        "trim" => Ok(Value::Text(function_text(&values[0])?.trim().to_string())),
+        "length" => {
+            let length = function_text(&values[0])?.chars().count();
+            i64::try_from(length)
+                .map(Value::Integer)
+                .map_err(|_| DbError::internal("string length exceeds i64 range"))
+        }
+        "abs" => function_integer(&values[0])?
+            .checked_abs()
+            .map(Value::Integer)
+            .ok_or_else(integer_overflow),
+        "substring" => eval_substring(&values),
+        _ => Err(DbError::internal(format!(
+            "unknown scalar function {name} reached the executor"
+        ))),
+    }
+}
+
+/// Evaluates `SUBSTRING(text, start[, length])` with 1-based start positions,
+/// clamped to the string bounds. A negative length is rejected.
+fn eval_substring(values: &[Value]) -> Result<Value> {
+    let chars: Vec<char> = function_text(&values[0])?.chars().collect();
+    let length = i64::try_from(chars.len())
+        .map_err(|_| DbError::internal("string length exceeds i64 range"))?;
+    let start = function_integer(&values[1])?;
+
+    // The result spans 1-based positions `lower..upper`, intersected with the
+    // string's valid range `[1, length]`.
+    let lower = start.max(1);
+    let upper = match values.get(2) {
+        Some(count) => {
+            let count = function_integer(count)?;
+            if count < 0 {
+                return datatype_mismatch("substring length must not be negative");
+            }
+            start.saturating_add(count).min(length + 1)
+        }
+        None => length + 1,
+    };
+    if upper <= lower {
+        return Ok(Value::Text(String::new()));
+    }
+
+    // `lower >= 1` and `upper <= length + 1`, so both indices are in range.
+    let begin = usize::try_from(lower - 1).map_err(|_| DbError::internal("substring index"))?;
+    let end = usize::try_from(upper - 1).map_err(|_| DbError::internal("substring index"))?;
+    Ok(Value::Text(chars[begin..end].iter().collect()))
+}
+
+fn function_text(value: &Value) -> Result<&str> {
+    match value {
+        Value::Text(text) => Ok(text),
+        _ => datatype_mismatch("function expected a text argument"),
+    }
+}
+
+fn function_integer(value: &Value) -> Result<i64> {
+    match value {
+        Value::Integer(value) => Ok(*value),
+        _ => datatype_mismatch("function expected an integer argument"),
     }
 }
 

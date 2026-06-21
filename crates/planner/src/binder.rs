@@ -707,13 +707,24 @@ fn bind_function(
     distinct: bool,
 ) -> Result<BoundExpr> {
     let name = name.to_ascii_lowercase();
-    let Some(func) = aggregate_func(&name) else {
+    if let Some(func) = aggregate_func(&name) {
+        return bind_aggregate(ctx, func, args, distinct);
+    }
+    if distinct {
         return Err(plan_error(
             SqlState::SyntaxError,
-            format!("function {name} is not supported in v1"),
+            format!("function {name} does not support DISTINCT"),
         ));
-    };
+    }
+    bind_scalar_function(ctx, &name, args)
+}
 
+fn bind_aggregate(
+    ctx: &mut BindContext,
+    func: AggregateFunc,
+    args: &[FunctionArg],
+    distinct: bool,
+) -> Result<BoundExpr> {
     if distinct {
         return Err(plan_error(
             SqlState::SyntaxError,
@@ -772,6 +783,85 @@ fn bind_function(
         data_type,
         nullable,
     })
+}
+
+fn bind_scalar_function(
+    ctx: &mut BindContext,
+    name: &str,
+    args: &[FunctionArg],
+) -> Result<BoundExpr> {
+    let mut bound_args = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            FunctionArg::Expr(expr) => bound_args.push(bind_expr(ctx, expr, None)?),
+            FunctionArg::Wildcard => {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    format!("function {name} does not accept a wildcard argument"),
+                ));
+            }
+        }
+    }
+
+    let (data_type, nullable) = scalar_signature(name, &bound_args)?;
+    Ok(BoundExpr::Function {
+        name: name.to_string(),
+        args: bound_args,
+        data_type,
+        nullable,
+    })
+}
+
+/// Validates a scalar function's arity and argument types, returning its result
+/// type and nullability. All v1 scalar functions are NULL-propagating, so the
+/// result is nullable when any argument is.
+fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> {
+    let nullable = args.iter().any(BoundExpr::nullable);
+    match name {
+        "upper" | "lower" | "trim" => {
+            expect_arity(name, args, 1)?;
+            require_type(&args[0], DataType::Text)?;
+            Ok((DataType::Text, nullable))
+        }
+        "length" => {
+            expect_arity(name, args, 1)?;
+            require_type(&args[0], DataType::Text)?;
+            Ok((DataType::Integer, nullable))
+        }
+        "abs" => {
+            expect_arity(name, args, 1)?;
+            require_type(&args[0], DataType::Integer)?;
+            Ok((DataType::Integer, nullable))
+        }
+        "substring" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "substring expects 2 or 3 arguments",
+                ));
+            }
+            require_type(&args[0], DataType::Text)?;
+            require_type(&args[1], DataType::Integer)?;
+            if let Some(length) = args.get(2) {
+                require_type(length, DataType::Integer)?;
+            }
+            Ok((DataType::Text, nullable))
+        }
+        _ => Err(plan_error(
+            SqlState::SyntaxError,
+            format!("function {name} is not supported in v1"),
+        )),
+    }
+}
+
+fn expect_arity(name: &str, args: &[BoundExpr], arity: usize) -> Result<()> {
+    if args.len() != arity {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("function {name} expects {arity} argument(s)"),
+        ));
+    }
+    Ok(())
 }
 
 fn bind_in_list(

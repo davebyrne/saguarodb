@@ -78,6 +78,53 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_trim_and_substring_into_function_calls() {
+        let stmt = parse("select trim(name), substring(name, 2, 3) from users").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, distinct: false },
+                ..
+            } if name == "trim" && args.len() == 1
+        ));
+        assert!(matches!(
+            select.columns[1],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, distinct: false },
+                ..
+            } if name == "substring" && args.len() == 3
+        ));
+    }
+
+    #[test]
+    fn normalizes_substring_from_for_syntax_to_function_args() {
+        let stmt =
+            parse("select substring(name from 2 for 3), substring(name, 2) from users").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, .. },
+                ..
+            } if name == "substring" && args.len() == 3
+        ));
+        assert!(matches!(
+            select.columns[1],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, .. },
+                ..
+            } if name == "substring" && args.len() == 2
+        ));
+    }
+
+    #[test]
     fn parses_insert_select_even_when_binder_rejects_it() {
         let stmt = parse("insert into users select id, name from old_users").unwrap();
 

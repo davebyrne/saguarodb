@@ -777,8 +777,54 @@ fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             })
         }
         sql::Expr::Function(function) => convert_function(function),
+        sql::Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => convert_substring(expr, substring_from.as_deref(), substring_for.as_deref()),
+        sql::Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                return unsupported("only TRIM(expr) is supported in v1");
+            }
+            Ok(Expr::Function {
+                name: "trim".to_string(),
+                args: vec![FunctionArg::Expr(convert_expr(expr)?)],
+                distinct: false,
+            })
+        }
         _ => unsupported("unsupported expression"),
     }
+}
+
+/// Normalizes `SUBSTRING(expr [FROM start] [FOR len])` and the comma form
+/// `SUBSTRING(expr, start[, len])` into a `substring` function call. A start
+/// position is required in v1.
+fn convert_substring(
+    expr: &sql::Expr,
+    substring_from: Option<&sql::Expr>,
+    substring_for: Option<&sql::Expr>,
+) -> Result<Expr> {
+    let Some(from) = substring_from else {
+        return unsupported("SUBSTRING requires a start position in v1");
+    };
+    let mut args = vec![
+        FunctionArg::Expr(convert_expr(expr)?),
+        FunctionArg::Expr(convert_expr(from)?),
+    ];
+    if let Some(for_expr) = substring_for {
+        args.push(FunctionArg::Expr(convert_expr(for_expr)?));
+    }
+    Ok(Expr::Function {
+        name: "substring".to_string(),
+        args,
+        distinct: false,
+    })
 }
 
 fn convert_value(value: &sql::Value) -> Result<Expr> {

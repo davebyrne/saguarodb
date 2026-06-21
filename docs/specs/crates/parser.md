@@ -144,6 +144,8 @@ Parser `BinOp` and `UnaryOp` variants use the same names as planner expression o
 
 Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`, and `COUNT(DISTINCT id)` is `Function { name: "count", args: vec![FunctionArg::Expr(...)] , distinct: true }`. Binder converts `COUNT(*)` to `BoundExpr::AggregateCall { arg: None, ... }`, rejects `distinct: true` aggregate calls in v1, and rejects `FunctionArg::Wildcard` for non-`COUNT` functions or mixed with other arguments.
 
+The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` grammar (and the comma form `SUBSTRING(expr, start[, length])`) is normalized into ordinary `Function { name: "trim" | "substring", ... }` calls so the binder treats them uniformly. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported in v1.
+
 ## V1 SQL Scope
 
 Parser may produce AST variants for syntax that binder rejects. V1 parser must parse:

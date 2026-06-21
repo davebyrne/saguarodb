@@ -747,6 +747,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scalar_string_and_numeric_functions_evaluate() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (-5, '  Ada  ')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select upper(name), lower(name), length(name), trim(name), abs(id) from users",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Text("  ADA  ".to_string()),
+                    Value::Text("  ada  ".to_string()),
+                    Value::Integer(7),
+                    Value::Text("Ada".to_string()),
+                    Value::Integer(5),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn scalar_functions_propagate_null() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, null)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select upper(name), length(name), substring(name, 1, 2) from users")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Null, Value::Null, Value::Null]
+            }]
+        );
+    }
+
+    #[test]
+    fn substring_handles_bounds_and_optional_length() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'hello')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select substring(name, 2, 3), substring(name, 3), substring(name, 0, 3), \
+                 substring(name, 10), substring(name, 2, 0) from users",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Text("ell".to_string()),
+                    Value::Text("llo".to_string()),
+                    Value::Text("he".to_string()),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn string_functions_count_characters_not_bytes() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'café')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select length(name), substring(name, 4, 1) from users")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(4), Value::Text("é".to_string())]
+            }]
+        );
+    }
+
+    #[test]
+    fn substring_rejects_negative_length() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'hello')")
+            .unwrap();
+
+        let err = harness
+            .execute("select substring(name, 2, -1) from users")
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn abs_of_min_integer_returns_out_of_range() {
+        // `i64::MIN` cannot be written as a SQL literal, so evaluate directly.
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let expr = BoundExpr::Function {
+            name: "abs".to_string(),
+            args: vec![BoundExpr::Literal {
+                value: Value::Integer(i64::MIN),
+                data_type: DataType::Integer,
+                nullable: false,
+            }],
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        let err = eval_expr(&expr, &row).unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+    }
+
     fn seed_users_and_accounts(harness: &ExecutorHarness) {
         harness
             .execute("create table accounts (id integer primary key, owner text)")

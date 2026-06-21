@@ -269,6 +269,8 @@ Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, 
 
 Aggregate `DISTINCT` is rejected in v1 with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
 
+Scalar functions remain `BoundExpr::Function`. Binder validates each call's arity and argument types and assigns its result type: `UPPER(text)`, `LOWER(text)`, `TRIM(text)` return `TEXT`; `LENGTH(text)` returns `INTEGER`; `ABS(integer)` returns `INTEGER`; `SUBSTRING(text, integer[, integer])` returns `TEXT`. All are NULL-propagating, so the result is nullable when any argument is. Unknown function names, wrong arity, and argument-type mismatches are rejected with `ErrorKind::Plan` (`SyntaxError` for unknown names and arity, `DatatypeMismatch` for argument types). Aggregates may appear as scalar-function arguments (e.g. `ABS(SUM(id))`); logical planning rewrites the nested aggregate as usual.
+
 ## Logical Plan
 
 ```rust

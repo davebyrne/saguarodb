@@ -97,6 +97,7 @@ V1 evaluator handles:
 - `IN`, `BETWEEN`, `LIKE`.
 - `CASE`.
 - `CAST`.
+- Scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), `ABS` (integer), and `SUBSTRING(text, start[, length])`. All are NULL-propagating (any NULL argument yields NULL). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
 
