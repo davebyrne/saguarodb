@@ -41,14 +41,15 @@ impl QueryService {
     pub fn prepare_sql(
         &self,
         sql: &str,
-        declared_param_types: &[DataType],
+        declared_param_types: &[Option<DataType>],
     ) -> Result<PreparedStatement> {
         let statement = parser::parse(sql)?;
         let class = statement_class(&statement)?;
-        let declared: Vec<Option<DataType>> =
-            declared_param_types.iter().cloned().map(Some).collect();
-        let (bound, param_types) =
-            bind_parameterized(&statement, self.components.catalog.as_ref(), &declared)?;
+        let (bound, param_types) = bind_parameterized(
+            &statement,
+            self.components.catalog.as_ref(),
+            declared_param_types,
+        )?;
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
             class,

@@ -544,6 +544,11 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
     }
 }
 
+/// PostgreSQL type OID for a v1 data type (e.g. for `ParameterDescription`).
+pub fn type_oid(data_type: &DataType) -> i32 {
+    postgres_type(data_type).0
+}
+
 fn put_error_field(body: &mut Vec<u8>, field: u8, value: &str) {
     body.push(field);
     put_cstr(body, value);
