@@ -876,6 +876,33 @@ mod tests {
         assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
+    #[test]
+    fn string_concatenation_operator_evaluates_and_propagates_null() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, null)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select name || '!' from users order by id")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Text("Ada!".to_string())]
+                },
+                Row {
+                    values: vec![Value::Null]
+                },
+            ]
+        );
+    }
+
     fn seed_users_and_accounts(harness: &ExecutorHarness) {
         harness
             .execute("create table accounts (id integer primary key, owner text)")

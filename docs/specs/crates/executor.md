@@ -92,6 +92,7 @@ V1 evaluator handles:
 - Literals and `InputRef`.
 - Arithmetic: `+`, `-`, `*`, `/`, `%`.
 - Comparison: `=`, `!=`, `<`, `<=`, `>`, `>=`.
+- String concatenation: `||` over text operands, NULL-propagating; non-text operands return `SqlState::DatatypeMismatch`.
 - Boolean: `AND`, `OR`, `NOT` with SQL three-valued logic.
 - `IS NULL`, `IS NOT NULL`.
 - `IN`, `BETWEEN`, `LIKE`.
