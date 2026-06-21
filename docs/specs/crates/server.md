@@ -127,28 +127,48 @@ engine.execute(execution_context, physical)
 
 The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `QueryEngine` receives the server-allocated `StatementContext` and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
 
-Both the read path and the write path capture the statement's visibility snapshot (`StatementContext.snapshot`) via `capture_autocommit_snapshot(own_txn)` and build the context with `StatementContext::with_snapshot`. The snapshot is the degenerate single-writer "sees all committed" snapshot: `xmax = next_txn_id` (every already-allocated, hence committed, id is below it), `xip = active_txns.active_ids()` minus the statement's own `txn_id` (so own writes are seen via the predicate's `current_txn` path rather than hidden as in-progress), and `xmin = active_txns.oldest()` or `xmax` if none are active. A read uses `own_txn = 0` (it has no transaction). Under single-writer autocommit, reads and writes are mutually exclusive (shared vs. exclusive concurrency guard), so no other write transaction is ever active during a capture and `xip` is empty — every committed row and own write is visible, so read results are unchanged from the pre-MVCC engine. This is forward-compatible with Milestone C's real per-transaction snapshots.
+### Transaction lifecycle (Milestone C)
 
-`QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_sql_cancelable`/`execute_prepared_cancelable`, passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
+The query path is a real transaction lifecycle; autocommit is an implicit single-statement transaction routed through the same machinery. A simple query carries the connection's transaction slot (`Option<Transaction>`, held on the `Session`) into `QueryService::execute_simple(sql, slot, cancel)`, which returns the (possibly mutated) slot. The connection derives its `ReadyForQuery` byte from the returned slot (`I`/`T`/`E`).
 
-`EXPLAIN` is the only query-service exception to the uniform execution path. For `BoundStatement::Explain(inner)`, `QueryService` acquires the read guard, plans `inner` to a `PhysicalPlan`, calls planner `format_explain(&physical)`, and returns `ExecutionResult::Explanation { text }` without calling `QueryEngine::execute`.
+- **BEGIN**: allocate a `txn_id` (and register it active) atomically under the registry latch, set the slot to an open `InTransaction` (`'T'`). `BEGIN` inside an open block is a no-op warning that stays `'T'` (Postgres-compatible). DDL inside a block is rejected (`FeatureNotSupported`); DDL is non-transactional.
+- **Statements inside the block** share the transaction's `txn_id`; writes are stamped with it; reads use the transaction's snapshot (per isolation, below).
+- **COMMIT**: append `Commit` → `flush` (fsync) → `CLOG=Committed` (set inside `flush`) → `storage.commit_txn`/`buffer_pool.commit` cleanup → deregister → release the write guard → `record_commit_and_maybe_checkpoint`. The slot returns to `Idle` (`'I'`). A read-only explicit transaction (no write guard, no writes) commits with no WAL record.
+- **ROLLBACK** (or any statement error): append `Abort` → `CLOG=Aborted` → `storage.rollback_txn`/`buffer_pool.rollback` before-image undo → deregister → release the write guard → `Idle`. Abort is not fsync-gated (a transaction with no durable `Commit` is recovered as aborted).
+- **Failed (`'E'`) state**: any statement error inside an explicit block poisons it to `'E'` and does **not** end it. While `'E'`, every statement except `COMMIT`/`ROLLBACK` is rejected with `SqlState::InFailedSqlTransaction` (SQLSTATE `25P02`). `COMMIT` of an `'E'` block issues `ROLLBACK` (returns `Idle`). `COMMIT`/`ROLLBACK` with no open block are no-op warnings that stay `Idle`.
+- **Autocommit**: a data/DDL statement with no open block runs as an implicit `BEGIN…COMMIT` around the one statement (allocate, snapshot, execute, commit-or-abort), preserving the prior external behavior exactly.
+- **Disconnect**: an open transaction held on a dropped `Session` is aborted (before-image undo + `Abort` record + write-guard release + deregister), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry.
+
+### Concurrency — Stage 1 (concurrent readers, serialized writers)
+
+- **Readers run lock-free.** A read-only statement/transaction takes **no** `ConcurrencyController` guard. It captures its snapshot under the active-transaction-registry latch and reads via the buffer pool's per-frame latches, so it runs concurrently with an in-flight writer and skips that writer's uncommitted versions by MVCC visibility.
+- **Writers serialize.** A write transaction acquires the exclusive write guard **lazily** on its first write statement and holds the owned guard on the `Session` for the whole write-transaction, releasing it at COMMIT/ROLLBACK/disconnect. Autocommit write = acquire for the one statement, release at the implicit commit. DDL takes the exclusive guard and commits immediately. This is Stage 1: many readers concurrent with at most one writer (concurrent writers + conflict detection are Milestone E).
+
+### Snapshot capture (per isolation)
+
+Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistently with the registry and the id allocator under one registry latch (`snapshot_with_boundary`): it reads the active set, then reads `next_txn_id` as `xmax`, so a concurrently-begun writer can never be both absent from `xip` and `< xmax`. `xip = active_ids` minus `own_txn` (own writes are seen via the predicate's `current_txn` path), and `xmin = oldest active id` or `xmax` if none are active. A read uses `own_txn = 0`. Id allocation and registration are done together under the latch (`register_allocated`) to close the same torn-snapshot window. The snapshot is shared via `Arc<Snapshot>` (`StatementContext.snapshot`), so the executor clones a `StatementContext` per scan operator by bumping a refcount rather than deep-cloning the now-possibly-non-empty `xip` vector. Isolation is the capture-timing knob: **Read Committed** (default) captures a fresh snapshot per statement; **Repeatable Read** captures one snapshot at the transaction's first statement and reuses it.
+
+`QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_simple` for simple queries and `execute_prepared_in_session`/`execute_prepared_cancelable` for extended `Execute` (in-transaction vs. autocommit, respectively), passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
+
+`EXPLAIN` is a query-service exception to the uniform execution path. For `BoundStatement::Explain(inner)`, `QueryService` plans `inner` to a `PhysicalPlan`, calls planner `format_explain(&physical)`, and returns `ExecutionResult::Explanation { text }` without calling `QueryEngine::execute`.
 
 Statement guard policy:
 
-- Read guard: SELECT and EXPLAIN.
-- Write guard: INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, checkpoint.
+- No guard: SELECT and EXPLAIN (lock-free readers), and a read-only explicit transaction.
+- Write guard (exclusive, held for the whole write-transaction): INSERT, UPDATE, DELETE, and an explicit transaction once its first write runs. Acquired lazily.
+- Write guard (exclusive, per statement): CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX (DDL is non-transactional and rejected inside a block), and checkpoint.
 
-`QueryService::execute_sql` parses SQL first to classify the top-level statement, then acquires the read/write guard before bind or planning. Bind and plan run under the same statement guard as execution so catalog state cannot change between name resolution and execution.
+Bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution.
 
-Write statement protocol:
+Write statement protocol (autocommit; an explicit write transaction is the same but the guard spans all its statements and the commit/abort happens at COMMIT/ROLLBACK):
 
-1. Acquire write guard.
-2. Allocate `txn_id`.
+1. Acquire the exclusive write guard (lazily, on the first write in an explicit transaction).
+2. Allocate `txn_id` and register it active (atomically under the registry latch).
 3. Execute storage/catalog operations.
-4. If execution fails, call `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog `restore` when needed, then return error.
+4. If execution fails, call `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog `restore` when needed, then return error. In an explicit transaction the statement error instead poisons the block to `'E'` and the undo runs at ROLLBACK.
 5. Append WAL `Commit`.
 6. Flush WAL.
-7. The statement is now durable and must not be rolled back or reported as a normal SQL failure.
+7. The statement/transaction is now durable and must not be rolled back or reported as a normal SQL failure.
 8. Call `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` to discard in-memory rollback metadata.
 9. Release write guard.
 10. Call `record_commit_and_maybe_checkpoint(&components)`.
@@ -198,15 +218,19 @@ pub struct AppState {
 
 `active_txns` is the active-transaction registry: an `ActiveTxnRegistry` wrapping
 a `Mutex<BTreeSet<TxnId>>` of currently in-progress transaction ids, with an
-`O(log n)` minimum. The autocommit lifecycle registers a `txn_id` when it is
-allocated and deregisters it on commit or rollback, so it is empty between
-statements under v1's single-writer autocommit. Snapshot capture
-(`capture_autocommit_snapshot`) reads `active_ids()` for `xip` (excluding the
-statement's own txn) and `oldest()` for `xmin`; the GC horizon (Milestone F) reads
-its minimum. The CLOG that records settled transaction outcomes lives in the WAL
-manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
-`docs/specs/crates/wal.md`), separate from this registry of still-running
-transactions.
+`O(log n)` minimum. The lifecycle registers a `txn_id` when it is allocated
+(`register_allocated`, which advances `next_txn_id` and inserts the id under the
+same latch) and deregisters it on commit or rollback. With concurrent readers and
+serialized writers (Stage 1), at most one write transaction is registered at a
+time, but a read's snapshot capture may observe it; the set is no longer always
+empty between statements. Snapshot capture (`capture_snapshot` via
+`snapshot_with_boundary`) reads `active_ids()` for `xip` (excluding the statement's
+own txn) and the minimum for `xmin`, taking the registry latch across the active-set
+read and the `next_txn_id` read so the snapshot is not torn relative to a
+concurrent `BEGIN`. The GC horizon (Milestone F) reads its minimum. The CLOG that
+records settled transaction outcomes lives in the WAL manager (`Clog`, rebuilt from
+`Commit`/`Abort` records; see `docs/specs/crates/wal.md`), separate from this
+registry of still-running transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the
@@ -260,15 +284,27 @@ unspecified) and replies `ParseComplete`. `Bind` decodes each parameter value
 (text or binary, per the Bind format codes, via `decode_value`) into a portal
 and replies `BindComplete`. `Describe` replies `ParameterDescription` +
 `RowDescription`/`NoData` for a statement, or `RowDescription`/`NoData` in the
-portal's result formats for a portal. `Execute` runs the portal via
-`QueryService::execute_prepared` on the blocking thread pool, streaming
-`DataRow`s in the requested result formats followed by `CommandComplete` (no
-`RowDescription`, no `ReadyForQuery`); each `Execute` is its own autocommit unit
-and `max_rows` is treated as all rows. `Sync` sends `ReadyForQuery`; `Flush`
-flushes; `Close` drops a statement or portal and replies `CloseComplete`. An
-error inside an extended sequence sends `ErrorResponse` and then skips the
-remaining extended messages until `Sync`; a simple `Query` also clears that
-aborted state.
+portal's result formats for a portal. `Execute` runs the portal on the blocking
+thread pool, streaming `DataRow`s in the requested result formats followed by
+`CommandComplete` (no `RowDescription`, no `ReadyForQuery`); `max_rows` is
+treated as all rows. `Execute` participates in the session's CURRENT transaction:
+when an explicit transaction is open on the session (`Session.txn` is `Some`), the
+portal runs *inside* that transaction via `QueryService::execute_prepared_in_session`,
+which routes through the same in-transaction machinery the simple-query path uses —
+the session's single write guard is reused (or lazily acquired once on the first
+write), the transaction's snapshot/isolation applies, the `'E'` failed-state gate
+rejects non-control statements with `25P02`, and a transaction-control portal
+(BEGIN/COMMIT/ROLLBACK) is dispatched through `handle_transaction_control` so it
+affects `Session.txn` exactly like a simple-query control statement. With no open
+transaction (`Session.txn` is `None`), `Execute` is its own autocommit unit via
+`QueryService::execute_prepared_cancelable`. Routing both protocols through the one
+transaction slot keeps the invariant that a connection acquires the exclusive write
+guard at most once, so an extended write on a connection already inside a write
+transaction never re-acquires the guard (which would self-deadlock). `Sync` sends
+`ReadyForQuery`; `Flush` flushes; `Close` drops a statement or portal and replies
+`CloseComplete`. An error inside an extended sequence sends `ErrorResponse` and then
+skips the remaining extended messages until `Sync`; a simple `Query` also clears
+that aborted state.
 
 The per-connection session tracks a `TransactionState` (`Idle` -> `b'I'`,
 `InTransaction` -> `b'T'`, `Failed` -> `b'E'`; defaulting to `Idle`) via its
@@ -278,9 +314,16 @@ the startup `ReadyForQuery`, the trailing `ReadyForQuery` after each simple
 query (success, error, and shutdown-rejected), the `Sync` `ReadyForQuery`, and
 the decode-error `ReadyForQuery` once a session exists (the pre-startup
 negotiation-error `ReadyForQuery` predates the session and uses the idle byte
-directly). In v1's autocommit model the session is always `Idle`, so the byte is
-`b'I'` in every interaction; the lifecycle transitions that produce `b'T'`/`b'E'`
-arrive with transaction support.
+directly). The session holds the open explicit transaction (`Option<Transaction>`)
+and updates `TransactionState` from it after each simple query, so `ReadyForQuery`
+reports `b'I'`/`b'T'`/`b'E'` per the lifecycle above. The transaction slot is moved
+into the per-statement `spawn_blocking` task and taken back with the result, so the
+whole statement (including any owned write guard) runs on one thread. The same slot
+is threaded through extended-protocol `Execute` (see above), which moves the slot
+into its blocking task and takes it back, so both protocols share one transaction
+context and the guard is acquired at most once per connection. On disconnect the
+session's `Drop` aborts any open transaction so the write guard and registry entry
+are not leaked.
 
 SSL negotiation happens before startup. A client may lead with an `SSLRequest`. When TLS is configured (`--tls-cert-file`/`--tls-key-file`), the server replies `SslAccepted` (`S`), performs the TLS handshake, and serves the rest of the session over the encrypted stream; otherwise it replies `SslRejected` (`N`) and the client continues in plaintext. TLS is server-side only; no client certificate is requested or verified. A client may also lead with a `GSSENCRequest` (GSSAPI transport encryption), which is unsupported: the server declines it with a single `N` byte and keeps negotiating, since the client typically follows with an `SSLRequest` or `StartupMessage`. A client that opens directly with a `StartupMessage` is served in plaintext. If a client bundles data after an `SSLRequest`/`GSSENCRequest` before receiving the negotiation reply, the server treats it as a protocol error, sends `ErrorResponse` and `ReadyForQuery`, and closes the connection.
 

@@ -76,6 +76,17 @@ impl TestServer {
             .map_err(|err| common::DbError::internal(format!("checkpoint task failed: {err}")))?
     }
 
+    /// The shared application state, for tests that inspect server internals such
+    /// as the active-transaction registry.
+    pub fn app(&self) -> &Arc<AppState> {
+        &self.app
+    }
+
+    /// The number of currently in-progress transactions in the registry.
+    pub fn active_txn_count(&self) -> usize {
+        self.app.components.active_txns.active_ids().len()
+    }
+
     async fn start_inner(path: &Path, temp_dir: Option<TempDir>) -> Result<Self> {
         let config = Config {
             data_dir: path.to_path_buf(),
@@ -131,6 +142,120 @@ impl SimpleQueryResult {
     pub fn unwrap_rows(self) -> Vec<Vec<Option<String>>> {
         self.rows
     }
+}
+
+/// A persistent client connection that keeps one TCP stream open across queries,
+/// so multi-statement transactions (`BEGIN ... COMMIT`) work as a single session.
+/// Each query returns the decoded rows and the `ReadyForQuery` transaction-status
+/// byte (`b'I'`/`b'T'`/`b'E'`).
+pub struct Connection {
+    stream: TcpStream,
+}
+
+impl Connection {
+    /// Open and complete the startup handshake.
+    pub async fn connect(server: &TestServer) -> Result<Self> {
+        let mut stream = TcpStream::connect(server.addr).await.map_err(|err| {
+            common::DbError::io(format!("failed to connect to test server: {err}"))
+        })?;
+        stream
+            .write_all(&startup_bytes())
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send startup message: {err}")))?;
+        read_until_ready(&mut stream).await?;
+        Ok(Self { stream })
+    }
+
+    /// Run one simple query on this connection, returning the decoded rows and the
+    /// trailing `ReadyForQuery` status byte. Errors decode as a `DbError` carrying
+    /// the server's error message.
+    pub async fn query(&mut self, sql: &str) -> Result<QueryOutcome> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send query message: {err}")))?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
+    /// Run a query expecting transport success; panics on protocol/transport
+    /// error (a server SQL error is still returned in the `QueryOutcome`).
+    pub async fn ok(&mut self, sql: &str) -> QueryOutcome {
+        self.query(sql).await.expect("query transport failed")
+    }
+
+    /// Run one parameterless statement over the EXTENDED query protocol on this
+    /// connection: send `Parse`/`Bind`/`Execute`/`Sync` (unnamed statement and
+    /// portal, no parameters), then read until the trailing `ReadyForQuery`.
+    /// Returns the decoded rows (or the server error) and the transaction-status
+    /// byte from `ReadyForQuery`.
+    pub async fn extended_execute(&mut self, sql: &str) -> Result<QueryOutcome> {
+        let mut seq = parse_bytes("", sql, &[]);
+        seq.extend(bind_bytes("", ""));
+        seq.extend(execute_bytes(""));
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to send extended-protocol sequence: {err}"))
+        })?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
+    /// Abruptly close the connection (drop the socket), simulating a client that
+    /// disconnects mid-transaction.
+    pub async fn close(self) {
+        drop(self.stream);
+    }
+}
+
+/// The result of one query on a persistent [`Connection`]: the decoded rows (or
+/// an error) and the session's transaction-status byte afterward.
+pub struct QueryOutcome {
+    pub result: Result<SimpleQueryResult>,
+    pub status: u8,
+}
+
+impl QueryOutcome {
+    pub fn rows(self) -> Vec<Vec<Option<String>>> {
+        self.result.expect("expected query success").rows
+    }
+
+    pub fn unwrap(self) -> SimpleQueryResult {
+        self.result.expect("expected query success")
+    }
+}
+
+/// Extract the transaction-status byte from the trailing `ReadyForQuery` (`Z`)
+/// message in a simple-query response.
+fn ready_for_query_status(bytes: &[u8]) -> Result<u8> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let tag = bytes[offset];
+        if tag == b'N' {
+            offset += 1;
+            continue;
+        }
+        if offset + 5 > bytes.len() {
+            break;
+        }
+        let len = read_i32(&bytes[offset + 1..offset + 5])? as usize;
+        let end = offset + 1 + len;
+        if end > bytes.len() {
+            break;
+        }
+        if tag == b'Z' && end == offset + 6 {
+            return Ok(bytes[offset + 5]);
+        }
+        offset = end;
+    }
+    Err(common::DbError::protocol(
+        common::SqlState::InternalError,
+        "no ReadyForQuery status byte in response",
+    ))
 }
 
 pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
@@ -300,7 +425,10 @@ fn decode_simple_query_response(bytes: &[u8]) -> Result<SimpleQueryResult> {
                     decode_error_message(body),
                 ));
             }
-            b'T' | b'C' | b'Z' => {}
+            // Simple-query framing tags plus the extended-protocol acknowledgements
+            // (`1` ParseComplete, `2` BindComplete, `n` NoData, `t`
+            // ParameterDescription) that carry no rows.
+            b'T' | b'C' | b'Z' | b'1' | b'2' | b'n' | b't' => {}
             _ => {
                 return Err(common::DbError::protocol(
                     common::SqlState::InternalError,
@@ -407,6 +535,56 @@ fn query_bytes(sql: &str) -> Vec<u8> {
 
 fn terminate_bytes() -> Vec<u8> {
     vec![b'X', 0, 0, 0, 4]
+}
+
+/// Frame a message body with its one-byte tag and four-byte length prefix.
+fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut packet = vec![tag];
+    packet.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+    packet.extend_from_slice(body);
+    packet
+}
+
+/// A `Parse` message: prepared-statement name, query text, and parameter type
+/// OIDs (`0` = unspecified).
+fn parse_bytes(name: &str, query: &str, param_oids: &[i32]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(query.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&i16::try_from(param_oids.len()).unwrap().to_be_bytes());
+    for oid in param_oids {
+        body.extend_from_slice(&oid.to_be_bytes());
+    }
+    tagged(b'P', &body)
+}
+
+/// A `Bind` message binding `statement` into `portal` with no parameter format
+/// codes, no parameters, and no result format codes (all text).
+fn bind_bytes(portal: &str, statement: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(statement.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i16.to_be_bytes()); // parameter format codes
+    body.extend_from_slice(&0i16.to_be_bytes()); // parameters
+    body.extend_from_slice(&0i16.to_be_bytes()); // result format codes
+    tagged(b'B', &body)
+}
+
+/// An `Execute` message for `portal` with no row limit (all rows).
+fn execute_bytes(portal: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i32.to_be_bytes());
+    tagged(b'E', &body)
+}
+
+fn sync_bytes() -> Vec<u8> {
+    tagged(b'S', &[])
 }
 
 fn read_i32(bytes: &[u8]) -> Result<i32> {

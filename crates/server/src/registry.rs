@@ -35,6 +35,28 @@ impl ActiveTxnRegistry {
         self.lock().insert(txn_id);
     }
 
+    /// Allocate a transaction id and register it as in-progress atomically under
+    /// the registry latch (`docs/specs/mvcc.md` §7.1).
+    ///
+    /// `allocate` is invoked while the latch is held; it must advance the id
+    /// allocator (e.g. `next_txn_id.fetch_add(1)`) and return the new id. Doing
+    /// the increment and the registration under one latch closes the torn-snapshot
+    /// window: a concurrent [`snapshot_with_boundary`](Self::snapshot_with_boundary),
+    /// which also takes the latch, can never observe the advanced allocator
+    /// boundary without also observing this transaction in the active set. Without
+    /// the shared latch a reader could read `xmax` after the increment but the
+    /// active set before the insert, wrongly treating the new writer as a settled
+    /// past transaction.
+    pub fn register_allocated<F>(&self, allocate: F) -> TxnId
+    where
+        F: FnOnce() -> TxnId,
+    {
+        let mut guard = self.lock();
+        let txn_id = allocate();
+        guard.insert(txn_id);
+        txn_id
+    }
+
     /// Deregister `txn_id`. Called on commit or rollback.
     pub fn deregister(&self, txn_id: TxnId) {
         self.lock().remove(&txn_id);
@@ -50,12 +72,30 @@ impl ActiveTxnRegistry {
     }
 
     /// A snapshot of the currently active ids, ascending.
-    ///
-    /// Snapshot capture (B3/C3) will read this to populate `xip`; unused until
-    /// then.
-    #[allow(dead_code, reason = "snapshot capture consumer arrives in B3/C3")]
     pub fn active_ids(&self) -> Vec<TxnId> {
         self.lock().iter().copied().collect()
+    }
+
+    /// Capture the active set together with an allocator boundary computed under
+    /// the registry latch, so snapshot capture is not torn relative to a
+    /// concurrent `register` (`docs/specs/mvcc.md` §7.1).
+    ///
+    /// `boundary` is invoked while the latch is held, *after* the active set is
+    /// read; the caller passes a closure that loads `next_txn_id`. Holding the
+    /// latch across both reads guarantees that any transaction registered before
+    /// the boundary is observed is also present in the returned active set — so a
+    /// concurrently-begun writer can never be both absent from `xip` and `< xmax`
+    /// (which would wrongly make its uncommitted writes visible). Reading the
+    /// active set first and the boundary second keeps every active id `< boundary`
+    /// (the allocator only grows).
+    pub fn snapshot_with_boundary<F>(&self, boundary: F) -> (Vec<TxnId>, TxnId)
+    where
+        F: FnOnce() -> TxnId,
+    {
+        let guard = self.lock();
+        let active: Vec<TxnId> = guard.iter().copied().collect();
+        let xmax = boundary();
+        (active, xmax)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<TxnId>> {

@@ -459,18 +459,60 @@ reference current files.
 - **C2 — Session state + protocol status byte.** Add `tx: TransactionState` to
   `Session` (`server/src/connection.rs`); make `ReadyForQuery` carry `'I'/'T'/'E'`
   (today hardcoded `'I'` at `protocol/src/codec.rs`), supplied from the session.
-- **C3 — Lifecycle + concurrency relaxation.** Generalize the write path
-  (`server/src/query.rs`): `txn_id` at `BEGIN`, shared across statements; snapshot
-  capture per isolation; `COMMIT` = `Commit`+flush; `ROLLBACK`/error = `Abort`.
-  Readers go lock-free; writers hold the existing owned write guard for the whole
-  write-transaction. **Retire the buffer-pool before-image undo** (abort =
-  invisible). Autocommit = implicit `BEGIN/COMMIT`.
+- **C3 — Lifecycle + concurrency relaxation** *(implemented)*. Generalize the
+  query path (`server/src/query.rs`) into a real transaction lifecycle, with
+  autocommit routed through the same machinery as an implicit single-statement
+  transaction:
+  - **Lifecycle.** `BEGIN` allocates a `txn_id`, registers it active, sets the
+    session to `'T'`, and (per isolation) sets up the snapshot policy. Statements
+    inside the block share that `txn_id`; writes are stamped with it and reads use
+    the transaction's snapshot. `COMMIT` = append `Commit` → `flush` (fsync) →
+    `CLOG=Committed` (set at flush) → post-durable cleanup → deregister → `'I'`.
+    `ROLLBACK` (or any statement error) = append `Abort` → `CLOG=Aborted` →
+    before-image undo → deregister. A statement error poisons the block to the
+    `'E'` failed state; while `'E'`, every statement except `COMMIT`/`ROLLBACK` is
+    rejected with `25P02` (`SqlState::InFailedSqlTransaction`). `COMMIT` of an
+    `'E'` block issues `ROLLBACK` (Postgres behavior). `BEGIN` inside a block is a
+    no-op warning that stays `'T'`; `COMMIT`/`ROLLBACK` with no open block are
+    no-op warnings that stay `'I'`. The open transaction is held on the connection
+    `Session`; a client disconnect aborts it (releasing the write guard and the
+    registry entry).
+  - **Stage-1 concurrency.** Readers run lock-free: a read-only statement/
+    transaction takes **no** `ConcurrencyController` guard. It captures its
+    snapshot under the active-transaction-registry latch (so the snapshot is not
+    torn relative to `next_txn_id`; id allocation and registration are done under
+    the same latch) and reads via the buffer pool's per-frame latches, skipping an
+    in-flight writer's uncommitted versions by MVCC visibility. Writers serialize:
+    a write transaction acquires the existing exclusive write guard **lazily** on
+    its first write statement and holds the owned guard on the `Session` for the
+    whole write-transaction, releasing it at `COMMIT`/`ROLLBACK`/disconnect. A
+    read-only explicit transaction never takes the write guard, so it stays
+    concurrent. Autocommit write = acquire for the one statement, release at the
+    implicit commit. DDL takes the exclusive guard and commits immediately
+    (non-transactional, §4 Decision 6) and is **rejected inside an explicit
+    transaction block**. This is Stage 1: many readers concurrent with at most one
+    writer; concurrent writers and write-write conflict detection are Milestone E.
+  - **Snapshot per isolation.** Default Read Committed captures a fresh snapshot at
+    the start of each statement; Repeatable Read captures one snapshot at the first
+    statement and reuses it. The snapshot is shared via `Arc` so the executor does
+    not deep-clone the (now-possibly-non-empty) `xip` vector per scan operator.
+  - **Before-image undo is retained through C3** (see §11 and D1 below): `ROLLBACK`
+    /abort still uses `buffer_pool.rollback(txn)` plus the `Abort` record +
+    `CLOG=Aborted`. Retiring it requires the relaxed flush gate, so it moves to D1.
 
 ### Milestone D — Recovery & durability rework
 
-- **D1 — Relax flush policy** (§8). **D2 — Redo-all recovery** + CLOG visibility;
-  in-flight-at-crash = aborted; build CLOG during replay. Crash tests across
-  checkpoint boundaries, torn pages, eviction of uncommitted pages.
+- **D1 — Relax flush policy** (§8), **and retire the buffer-pool before-image
+  undo** (abort becomes pure invisibility). These two belong together (§4 Decision
+  4): the flush gate is relaxed to WAL-durability only, which lets aborted dirty
+  pages be flushed/evicted; before-image undo can then be removed, because an
+  aborted version is hidden by the CLOG and reclaimed by VACUUM rather than undone.
+  Retiring before-image undo *before* relaxing the gate would leave aborted dirty
+  pages unflushable (the gate still requires `is_committed`) and pin the buffer
+  pool — a liveness bug — so C3 keeps before-image undo and D1 owns its removal.
+  **D2 — Redo-all recovery** + CLOG visibility; in-flight-at-crash = aborted; build
+  CLOG during replay. Crash tests across checkpoint boundaries, torn pages,
+  eviction of uncommitted pages.
 
 *A–D = MVCC MVP: snapshot reads + multi-statement transactions + serial writers +
 correct recovery. Correct, but bloats heap and indexes until F.*
@@ -525,11 +567,20 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
   secondary→heap-TID and re-specs the merged secondary-index feature.
 - **Executor identity.** `RowId` becomes `(page, line-pointer)`, stable across
   intra-page compaction; UPDATE/DELETE target by TID.
-- **Before-image retirement.** C3 removes the buffer-pool before-image rollback;
-  abort becomes status-based. This is a hard prerequisite for E (one before-image
-  per page cannot serve concurrent writers).
-- **Error codes.** Add `SqlState::SerializationFailure` (`40001`); the `'E'`
-  transaction state rejects all but `COMMIT`/`ROLLBACK`.
+- **Before-image retirement.** **D1** removes the buffer-pool before-image
+  rollback; abort becomes status-based. (Originally sequenced in C3, but retiring
+  it requires the relaxed flush gate — otherwise aborted dirty pages stay
+  unflushable under the `is_committed` gate and pin the buffer pool, a liveness
+  bug. §4 Decision 4 entails the flush-gate relaxation and abort-as-invisibility
+  together, so retirement belongs with D1. Through C3, abort keeps before-image
+  undo *and* records the `Abort`/`CLOG=Aborted`; this is correct for Stage-1
+  serialized writers, where one writer at a time means a single before-image per
+  page never has to serve two concurrent writers.) Before-image retirement is a
+  hard prerequisite for E (one before-image per page cannot serve concurrent
+  writers).
+- **Error codes.** C3 adds `SqlState::InFailedSqlTransaction` (`25P02`): the `'E'`
+  transaction state rejects all but `COMMIT`/`ROLLBACK` with it. Milestone E adds
+  `SqlState::SerializationFailure` (`40001`).
 - **WAL additions.** `Abort`, `HeapUpdateHeader` (§5.3); recovery handles both.
 
 ---

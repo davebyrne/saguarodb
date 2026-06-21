@@ -161,6 +161,7 @@ pub enum SqlState {
     UniqueViolation,
     QueryCanceled,
     FeatureNotSupported,
+    InFailedSqlTransaction,
     IoError,
     InternalError,
 }
@@ -169,6 +170,11 @@ pub type Result<T> = std::result::Result<T, DbError>;
 ```
 
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
+
+`SqlState::InFailedSqlTransaction` maps to SQLSTATE `25P02`: a statement other
+than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction block.
+The server raises it while gating an aborted transaction block (see
+`docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7.2).
 
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 
@@ -179,23 +185,28 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 ```rust
 pub struct StatementContext {
     pub txn_id: u64,
-    pub snapshot: Snapshot,
+    pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
 }
 ```
 
-V1 uses one `txn_id` per autocommit statement. The `snapshot` is the visibility
-snapshot threaded into the storage engine's read paths (see `docs/specs/mvcc.md`
-§5.5, §6) and is **consulted by scans and point lookups** (Appendix A commit 6):
-invisible versions are skipped. The server's autocommit read/write paths capture
-a real (degenerate, single-writer) snapshot with
-`StatementContext::with_snapshot(txn_id, snapshot)`. `StatementContext::new(txn_id)`
-fills `snapshot` with the equivalent `Snapshot::sees_all_committed()` placeholder
-(every committed row and own write is visible, so pre-capture call sites — tests,
-recovery scaffolding — filter nothing) and `isolation` with the default
-(`IsolationLevel::ReadCommitted`). `isolation` is carried but not yet honored
-(Milestone G). `StatementContext` is not `Copy` (it holds a `Snapshot`, which owns
-a `Vec`).
+A statement (autocommit or one statement of an explicit transaction) carries one
+`txn_id`. The `snapshot` is the visibility snapshot threaded into the storage
+engine's read paths (see `docs/specs/mvcc.md` §5.5, §6) and is **consulted by scans
+and point lookups** (Appendix A commit 6): invisible versions are skipped. It is
+held behind an `Arc` so the executor clones a `StatementContext` per scan operator
+by bumping a refcount rather than deep-cloning the `xip` vector — which matters
+once concurrent transactions make `xip` non-empty (Milestone C). The server's
+transaction read/write paths build it with
+`StatementContext::with_snapshot(txn_id, snapshot)` (default isolation) or
+`StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)`.
+`StatementContext::new(txn_id)` fills `snapshot` with the equivalent
+`Snapshot::sees_all_committed()` placeholder (every committed row and own write is
+visible, so pre-capture call sites — tests, recovery scaffolding — filter nothing)
+and `isolation` with the default (`IsolationLevel::ReadCommitted`). `isolation`
+selects the server's snapshot-capture timing (Read Committed = fresh per statement,
+Repeatable Read = captured once per transaction); the storage engine does not
+consult it. `StatementContext` is `Clone` but not `Copy`.
 
 ## MVCC Types
 

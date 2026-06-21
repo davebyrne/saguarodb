@@ -1286,7 +1286,7 @@ mod visibility_tests {
     }
 
     fn ctx(txn_id: u64, snapshot: Snapshot) -> StatementContext {
-        StatementContext::with_snapshot(txn_id, snapshot)
+        StatementContext::with_snapshot(txn_id, std::sync::Arc::new(snapshot))
     }
 
     /// A snapshot that sees every settled (committed) id below `xmax` except the

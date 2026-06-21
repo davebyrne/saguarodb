@@ -36,6 +36,10 @@ pub enum SqlState {
     UniqueViolation,
     QueryCanceled,
     FeatureNotSupported,
+    /// `25P02`: a statement other than `COMMIT`/`ROLLBACK` was issued inside a
+    /// transaction block that has already failed. The block must be ended before
+    /// any further command is accepted.
+    InFailedSqlTransaction,
     IoError,
     InternalError,
 }

@@ -2,7 +2,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{ColumnInfo, DataType, DbError, Result, Snapshot, StatementContext, Value};
+use common::{
+    ColumnInfo, DataType, DbError, IsolationLevel, Result, Snapshot, SqlState, StatementContext,
+    Value, WriteGuard,
+};
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
 use planner::{
@@ -20,6 +23,48 @@ pub struct QueryService {
     engine: QueryEngine,
 }
 
+/// The transaction-block status a session reports to the protocol layer after a
+/// statement runs. Mirrors PostgreSQL's `ReadyForQuery` status byte; the
+/// connection translates it to `b'I'`/`b'T'`/`b'E'`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionTxnStatus {
+    /// No transaction block is open (autocommit).
+    Idle,
+    /// A transaction block is open and healthy.
+    InTransaction,
+    /// A transaction block is open but failed; only COMMIT/ROLLBACK are accepted.
+    Failed,
+}
+
+/// An open explicit transaction's runtime state, held on the connection `Session`
+/// across statements (`docs/specs/mvcc.md` §7.2). It owns the exclusive write
+/// guard (acquired lazily on the first write) for the whole write-transaction so
+/// concurrent readers stay lock-free while at most one writer runs.
+pub struct Transaction {
+    txn_id: u64,
+    isolation: IsolationLevel,
+    /// `true` once any statement has entered the `Failed` ('E') state. While set,
+    /// every statement except COMMIT/ROLLBACK is rejected with `25P02`.
+    failed: bool,
+    /// The exclusive write guard, acquired lazily on the first write statement and
+    /// held until COMMIT/ROLLBACK. A read-only transaction never acquires it.
+    write_guard: Option<WriteGuard>,
+    /// The Repeatable Read snapshot: captured once at the first statement and
+    /// reused. `None` under Read Committed (a fresh snapshot is captured per
+    /// statement).
+    rr_snapshot: Option<Arc<Snapshot>>,
+}
+
+impl Transaction {
+    fn status(&self) -> SessionTxnStatus {
+        if self.failed {
+            SessionTxnStatus::Failed
+        } else {
+            SessionTxnStatus::InTransaction
+        }
+    }
+}
+
 impl QueryService {
     pub fn new(components: Arc<ServerComponents>) -> Self {
         Self {
@@ -28,21 +73,42 @@ impl QueryService {
         }
     }
 
+    /// Execute a simple-protocol SQL string against the session's transaction
+    /// `slot`, returning the (possibly mutated) slot alongside the result. The
+    /// slot carries the open explicit transaction across statements; autocommit
+    /// statements run with `slot == None`.
+    pub fn execute_simple(
+        &self,
+        sql: &str,
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        let parsed = match parser::parse(sql) {
+            Ok(parsed) => parsed,
+            // A syntax error inside an open transaction poisons the block to the
+            // failed state, matching PostgreSQL (the block must be ended before any
+            // further command is accepted). Autocommit (`None`) is unaffected.
+            Err(err) => return (mark_failed_on_error(slot), Err(err)),
+        };
+        self.dispatch(parsed, slot, cancel)
+    }
+
+    /// Backwards-compatible autocommit entry point: run one SQL string with no
+    /// surrounding transaction. Used by the prepared-statement path and by tests.
     pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
         self.execute_sql_cancelable(sql, &AtomicBool::new(false))
     }
 
     /// Like `execute_sql`, but aborts with `QueryCanceled` if `cancel` becomes
-    /// set (from another connection's `CancelRequest`) while the query runs.
+    /// set (from another connection's `CancelRequest`) while the query runs. This
+    /// is the autocommit path: no transaction is carried across the call.
     pub fn execute_sql_cancelable(
         &self,
         sql: &str,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
-        let statement = parser::parse(sql)?;
-        let class = statement_class(&statement)?;
-        let bound = bind(&statement, self.components.catalog.as_ref())?;
-        self.execute_bound(class, bound, cancel)
+        let (_slot, result) = self.execute_simple(sql, None, cancel);
+        result
     }
 
     /// Parse and bind a (possibly parameterized) statement for the extended
@@ -55,6 +121,19 @@ impl QueryService {
     ) -> Result<PreparedStatement> {
         let statement = parser::parse(sql)?;
         let class = statement_class(&statement)?;
+        if let StatementClass::TransactionControl(_) = class {
+            // BEGIN/COMMIT/ROLLBACK take no parameters and produce no rows; they do
+            // not bind. Carry the prepared statement with a no-op bound payload so
+            // an extended-protocol `Execute` can route it through the session's
+            // transaction lifecycle (`handle_transaction_control`) exactly like the
+            // simple-query path, rather than as an independent autocommit unit.
+            return Ok(PreparedStatement {
+                class,
+                bound: None,
+                param_types: Vec::new(),
+                result_columns: None,
+            });
+        }
         let (bound, param_types) = bind_parameterized(
             &statement,
             self.components.catalog.as_ref(),
@@ -63,7 +142,7 @@ impl QueryService {
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
             class,
-            bound,
+            bound: Some(bound),
             param_types,
             result_columns,
         })
@@ -79,16 +158,93 @@ impl QueryService {
         self.execute_prepared_cancelable(prepared, params, &AtomicBool::new(false))
     }
 
-    /// Like `execute_prepared`, but cancelable mid-flight via `cancel`.
+    /// Like `execute_prepared`, but cancelable mid-flight via `cancel`. Runs as an
+    /// autocommit unit: the caller has no open explicit transaction (the session's
+    /// transaction slot is `None`), so each `Execute` is its own implicit
+    /// `BEGIN…COMMIT`. When a transaction IS open, the connection routes through
+    /// `execute_prepared_in_session` instead, so the autocommit write path here is
+    /// never reached while the session already holds the write guard.
     pub fn execute_prepared_cancelable(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
+        let bound = self.substitute_prepared_params(prepared, params)?;
+        match prepared.class {
+            StatementClass::Read => self.autocommit_read(bound, cancel),
+            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            StatementClass::TransactionControl(_) => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "transaction control statements require the simple query protocol",
+            )),
+        }
+    }
+
+    /// Execute a prepared statement against the session's open explicit
+    /// transaction `slot`, returning the (possibly mutated) slot alongside the
+    /// result. This is the extended-protocol counterpart of `execute_simple`: it
+    /// routes a data statement through the SAME in-transaction machinery the simple
+    /// path uses (`run_bound_in_transaction`), so the open transaction's single
+    /// write guard is reused — never re-acquired — and the transaction's
+    /// snapshot/isolation and 'E' failed-state gating apply. Transaction-control
+    /// statements are dispatched through `handle_transaction_control`, exactly like
+    /// a simple `BEGIN`/`COMMIT`/`ROLLBACK`.
+    ///
+    /// Precondition: `slot` is `Some` (the connection only calls this with an open
+    /// transaction; with no open transaction it uses the autocommit
+    /// `execute_prepared_cancelable`).
+    pub fn execute_prepared_in_session(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        if let StatementClass::TransactionControl(kind) = prepared.class {
+            return self.handle_transaction_control(kind, slot, cancel);
+        }
+
+        let bound = match self.substitute_prepared_params(prepared, params) {
+            Ok(bound) => bound,
+            // A parameter-count/substitution error inside an open transaction
+            // poisons it to the failed state, matching the simple-query path.
+            Err(err) => return (mark_failed_on_error(slot), Err(err)),
+        };
+
+        match slot {
+            Some(txn) => {
+                self.run_bound_in_transaction(txn, prepared.class, BindSource::Bound(bound), cancel)
+            }
+            // No open transaction: fall back to an autocommit unit (the connection
+            // routes here only when a transaction is open, but keep this total so
+            // the contract holds regardless of caller).
+            None => {
+                let result = match prepared.class {
+                    StatementClass::Read => self.autocommit_read(bound, cancel),
+                    StatementClass::Write | StatementClass::Ddl => {
+                        self.autocommit_write(bound, cancel)
+                    }
+                    StatementClass::TransactionControl(_) => {
+                        unreachable!("transaction control is dispatched above before substitution")
+                    }
+                };
+                (None, result)
+            }
+        }
+    }
+
+    /// Validate the parameter count and substitute `params` into a prepared
+    /// statement's bound payload. Transaction-control statements carry no bound
+    /// payload, so substitution is only valid for data statements.
+    fn substitute_prepared_params(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<BoundStatement> {
         if params.len() != prepared.param_types.len() {
             return Err(DbError::protocol(
-                common::SqlState::SyntaxError,
+                SqlState::SyntaxError,
                 format!(
                     "prepared statement requires {} parameter(s), but {} were supplied",
                     prepared.param_types.len(),
@@ -96,60 +252,270 @@ impl QueryService {
                 ),
             ));
         }
-        let bound = substitute_params(&prepared.bound, params)?;
-        self.execute_bound(prepared.class, bound, cancel)
+        let bound = prepared.bound.as_ref().ok_or_else(|| {
+            DbError::internal("prepared transaction-control statement has no bound payload")
+        })?;
+        substitute_params(bound, params)
     }
 }
 
 impl QueryService {
-    fn execute_bound(
+    /// Route a parsed simple-query statement through the transaction lifecycle.
+    fn dispatch(
+        &self,
+        statement: Statement,
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        let class = match statement_class(&statement) {
+            Ok(class) => class,
+            Err(err) => {
+                // A parse/classification error inside an open transaction still
+                // poisons it to the failed state (matching Postgres).
+                let slot = mark_failed_on_error(slot);
+                return (slot, Err(err));
+            }
+        };
+
+        if let StatementClass::TransactionControl(kind) = class {
+            return self.handle_transaction_control(kind, slot, cancel);
+        }
+
+        match slot {
+            // A data statement with an open explicit transaction runs inside it.
+            Some(txn) => self.run_in_transaction(txn, class, statement, cancel),
+            // No open transaction: this is an autocommit unit.
+            None => {
+                let result = self.run_autocommit(class, statement, cancel);
+                (None, result)
+            }
+        }
+    }
+
+    /// Handle BEGIN/COMMIT/ROLLBACK against the session's transaction `slot`.
+    fn handle_transaction_control(
+        &self,
+        kind: TransactionControl,
+        slot: Option<Transaction>,
+        _cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        match kind {
+            TransactionControl::Begin => match slot {
+                // Postgres: BEGIN inside a transaction is a warning + no-op that
+                // stays 'T'. We keep the open transaction and report success.
+                Some(txn) => (Some(txn), Ok(begin_complete())),
+                None => match self.begin_transaction() {
+                    Ok(txn) => (Some(txn), Ok(begin_complete())),
+                    Err(err) => (None, Err(err)),
+                },
+            },
+            TransactionControl::Commit => match slot {
+                // COMMIT of a healthy transaction commits durably.
+                Some(txn) if !txn.failed => {
+                    let result = self.commit_transaction(txn).map(|()| commit_complete());
+                    (None, result)
+                }
+                // COMMIT of a failed transaction issues ROLLBACK (Postgres
+                // behavior), returning to Idle.
+                Some(txn) => {
+                    self.abort_transaction(txn);
+                    // Postgres tags this `ROLLBACK`, the actual action taken.
+                    (None, Ok(rollback_complete()))
+                }
+                // COMMIT with no open transaction is a no-op warning, stays Idle.
+                None => (None, Ok(commit_complete())),
+            },
+            TransactionControl::Rollback => match slot {
+                Some(txn) => {
+                    self.abort_transaction(txn);
+                    (None, Ok(rollback_complete()))
+                }
+                // ROLLBACK with no open transaction is a no-op warning, stays Idle.
+                None => (None, Ok(rollback_complete())),
+            },
+        }
+    }
+
+    /// Allocate a transaction id, register it active, and build the explicit
+    /// transaction. The write guard is acquired lazily on the first write.
+    fn begin_transaction(&self) -> Result<Transaction> {
+        let txn_id = self.register_active_txn();
+        Ok(Transaction {
+            txn_id,
+            isolation: IsolationLevel::default(),
+            failed: false,
+            write_guard: None,
+            rr_snapshot: None,
+        })
+    }
+
+    /// Run a simple-query data statement inside an open explicit transaction:
+    /// bind it against the catalog, then execute the bound form within `txn`.
+    fn run_in_transaction(
+        &self,
+        txn: Transaction,
+        class: StatementClass,
+        statement: Statement,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        self.run_bound_in_transaction(txn, class, BindSource::Unbound(statement), cancel)
+    }
+
+    /// Run a data statement inside an open explicit transaction. The statement is
+    /// supplied either unbound (simple query; bound here against the live catalog)
+    /// or already bound (extended-protocol `Execute`, with parameters
+    /// substituted). Both paths reuse the *same* in-transaction machinery: the 'E'
+    /// failed-state gate, the DDL rejection, and the single lazily-acquired write
+    /// guard — so the open transaction's one `WriteGuard` is acquired at most once.
+    fn run_bound_in_transaction(
+        &self,
+        mut txn: Transaction,
+        class: StatementClass,
+        source: BindSource,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
+        // `handle_transaction_control`, never reaching here).
+        if txn.failed {
+            return (
+                Some(txn),
+                Err(DbError::execute(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )),
+            );
+        }
+
+        // DDL is non-transactional (`docs/specs/mvcc.md` §4 Decision 6): reject it
+        // inside an explicit transaction block. The transaction stays healthy and
+        // open (this is a plain statement error, not a poisoning one in Postgres —
+        // but per our semantics any statement error poisons the block; do that for
+        // consistency with the 'E' gating contract).
+        if matches!(class, StatementClass::Ddl) {
+            txn.failed = true;
+            return (
+                Some(txn),
+                Err(DbError::plan(
+                    SqlState::FeatureNotSupported,
+                    "DDL is not allowed inside a transaction block",
+                )),
+            );
+        }
+
+        let bound = match source {
+            BindSource::Unbound(statement) => {
+                match bind(&statement, self.components.catalog.as_ref()) {
+                    Ok(bound) => bound,
+                    Err(err) => {
+                        txn.failed = true;
+                        return (Some(txn), Err(err));
+                    }
+                }
+            }
+            BindSource::Bound(bound) => bound,
+        };
+
+        let is_write = matches!(class, StatementClass::Write);
+        if is_write && txn.write_guard.is_none() {
+            // Lazily acquire the exclusive write guard on the first write of the
+            // transaction; hold it for the whole write-transaction.
+            if let Err(err) = self.acquire_write_guard(&mut txn) {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
+        }
+
+        let snapshot = self.snapshot_for_transaction(&mut txn);
+        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, cancel);
+
+        let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
+        match result {
+            Ok(result) => (Some(txn), Ok(result)),
+            Err(err) => {
+                // Any statement error poisons the transaction: it enters 'E' and
+                // must be ended with COMMIT/ROLLBACK. No partial-statement undo is
+                // needed (the failed version stays invisible via the CLOG, and a
+                // later ROLLBACK does the before-image undo).
+                txn.failed = true;
+                (Some(txn), Err(err))
+            }
+        }
+    }
+
+    /// Acquire the exclusive write guard for an explicit transaction's first
+    /// write, holding it on `txn` for the whole write-transaction.
+    ///
+    /// Reentrancy tripwire: a connection must acquire the write guard AT MOST ONCE.
+    /// `parking_lot::RwLock` is non-reentrant, so re-acquiring a held guard would
+    /// block this connection forever (and wedge every other writer, since the guard
+    /// is process-wide). The routing in this module guarantees a single acquire per
+    /// connection; this assertion converts a would-be self-deadlock from a future
+    /// regression into a clear error instead of a silent hang. It does NOT weaken
+    /// writer-vs-writer serialization: a *different* connection's writer (whose
+    /// `txn` has no guard) still blocks and waits inside `begin_write`.
+    fn acquire_write_guard(&self, txn: &mut Transaction) -> Result<()> {
+        if txn.write_guard.is_some() {
+            debug_assert!(
+                false,
+                "reentrant write-guard acquisition: this transaction already holds \
+                 the exclusive write guard"
+            );
+            return Err(DbError::internal(
+                "reentrant write-guard acquisition (transaction already holds the write guard)",
+            ));
+        }
+        // Only reached when this transaction holds no guard, so the blocking acquire
+        // can wait only on another connection's writer, never on ourselves.
+        let guard = self.components.concurrency.begin_write()?;
+        txn.write_guard = Some(guard);
+        Ok(())
+    }
+
+    /// Run a data/DDL statement as an implicit single-statement transaction
+    /// (autocommit): allocate, snapshot, execute, and commit-or-abort.
+    fn run_autocommit(
         &self,
         class: StatementClass,
-        bound: BoundStatement,
+        statement: Statement,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
+        let bound = bind(&statement, self.components.catalog.as_ref())?;
         match class {
-            StatementClass::Read => self.execute_read_bound(bound, cancel),
-            StatementClass::Write => self.execute_write_bound(bound, cancel),
+            StatementClass::Read => self.autocommit_read(bound, cancel),
+            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            // Transaction-control statements never reach here (dispatch routes
+            // them through `handle_transaction_control`).
+            StatementClass::TransactionControl(_) => Err(DbError::internal(
+                "transaction control reached the autocommit data path",
+            )),
         }
     }
 
-    fn execute_read_bound(
+    /// Execute a read-only statement (SELECT/EXPLAIN) lock-free: capture a
+    /// snapshot under the registry latch and read via the buffer pool's per-frame
+    /// latches. No `ConcurrencyController` guard is taken, so reads run
+    /// concurrently with an in-flight writer (`docs/specs/mvcc.md` §7.1).
+    fn autocommit_read(
         &self,
         bound: BoundStatement,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
-        let _guard = self.components.concurrency.begin_read()?;
-        match bound {
-            BoundStatement::Explain(inner) => {
-                if !matches!(inner.as_ref(), BoundStatement::Select(_)) {
-                    return Err(DbError::plan(
-                        common::SqlState::SyntaxError,
-                        "EXPLAIN supports SELECT only in v1",
-                    ));
-                }
-                let logical = logical_plan(inner.as_ref())?;
-                let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-                Ok(ExecutionResult::Explanation {
-                    text: format_explain(&physical),
-                })
-            }
-            other => {
-                let logical = logical_plan(&other)?;
-                let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-                // A read is not its own transaction (txn_id 0 / INVALID_XID), so no
-                // own txn is excluded from the snapshot. Under single-writer
-                // autocommit, reads and writes are mutually exclusive (shared vs.
-                // exclusive concurrency guard), so no write txn is active and `xip`
-                // is empty — the snapshot sees all committed rows.
-                let snapshot = self.capture_autocommit_snapshot(0);
-                let ctx = self.execution_context(0, snapshot, cancel);
-                self.engine.execute(&ctx, &physical)
-            }
+        if let BoundStatement::Explain(inner) = &bound {
+            return self.explain(inner.as_ref());
         }
+        // A read is not its own transaction (txn_id 0 / INVALID_XID), so no own
+        // txn is excluded; the snapshot sees all committed rows and skips any
+        // in-flight writer's uncommitted versions via MVCC visibility.
+        let snapshot = self.capture_snapshot(0);
+        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), cancel);
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
+        self.engine.execute(&ctx, &physical)
     }
 
-    fn execute_write_bound(
+    /// Execute a write/DDL statement as an autocommit unit under the exclusive
+    /// write guard, committing durably on success and aborting on error.
+    fn autocommit_write(
         &self,
         bound: BoundStatement,
         cancel: &AtomicBool,
@@ -157,40 +523,32 @@ impl QueryService {
         let guard = self.components.concurrency.begin_write()?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-        let txn_id = self.components.next_txn_id.fetch_add(1, Ordering::AcqRel);
-        // The autocommit unit begins: register the transaction active. Its CLOG
-        // status is `InProgress` implicitly (the default for any unsettled normal
-        // id) until a `Commit`/`Abort` record settles it.
-        self.components.active_txns.register(txn_id);
+        // The autocommit unit begins: allocate the transaction id and register it
+        // active atomically (so a concurrent reader's snapshot is not torn). Its
+        // CLOG status is `InProgress` implicitly until a `Commit`/`Abort` record
+        // settles it.
+        let txn_id = self.register_active_txn();
         let catalog_before = self.components.catalog.snapshot()?;
-        // Capture the snapshot after registering this txn, excluding its own id so
-        // own writes are seen via the predicate's `current_txn` path rather than
-        // hidden as "in-progress". Under single-writer autocommit this txn is the
-        // only active one, so `xip` is empty and the snapshot sees all committed.
-        let snapshot = self.capture_autocommit_snapshot(txn_id);
-        let ctx = self.execution_context(txn_id, snapshot, cancel);
+        // Capture the snapshot after registering, excluding the own id so own
+        // writes are seen via the predicate's `current_txn` path.
+        let snapshot = self.capture_snapshot(txn_id);
+        let ctx = self.execution_context(txn_id, snapshot, IsolationLevel::default(), cancel);
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
-                    self.fatal_pre_durable_rollback_failure(rollback_err);
-                }
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
                 return Err(err);
             }
             Err(_) => {
-                if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
-                    self.fatal_pre_durable_rollback_failure(rollback_err);
-                }
+                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
                 return Err(DbError::internal("statement execution panicked"));
             }
         };
 
         if let Err(err) = self.append_and_flush_commit(txn_id) {
-            if let Err(rollback_err) = self.rollback_pre_durable(txn_id, Some(catalog_before)) {
-                self.fatal_pre_durable_rollback_failure(rollback_err);
-            }
+            self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
             return Err(err);
         }
 
@@ -209,14 +567,112 @@ impl QueryService {
         Ok(result)
     }
 
+    /// Commit an explicit transaction: append a `Commit` record, flush (fsync),
+    /// set `CLOG=Committed` (done at flush), run post-durable-commit cleanup, and
+    /// deregister. Releasing the write guard happens when `txn` is dropped after
+    /// this returns.
+    fn commit_transaction(&self, txn: Transaction) -> Result<()> {
+        let txn_id = txn.txn_id;
+        // A read-only explicit transaction (no write guard, no writes) has nothing
+        // durable to commit: just deregister and return. Appending a `Commit` for
+        // it is harmless but unnecessary; skip it so a pure-reader transaction
+        // never touches the WAL.
+        if txn.write_guard.is_none() {
+            self.components.active_txns.deregister(txn_id);
+            return Ok(());
+        }
+
+        if let Err(err) = self.append_and_flush_commit(txn_id) {
+            // The commit is not durable: abort instead (before-image undo +
+            // CLOG=Aborted) so the transaction's effects are discarded cleanly.
+            self.rollback_pre_durable_or_die(txn_id, None);
+            // `txn` (and its write guard) drops here, releasing the guard.
+            return Err(err);
+        }
+
+        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+            self.fatal_after_durable_commit(err);
+        }
+        self.components.active_txns.deregister(txn_id);
+        // `txn` drops here, releasing the exclusive write guard.
+        drop(txn);
+
+        if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
+            eprintln!("checkpoint failed after committed transaction: {err}");
+        }
+        Ok(())
+    }
+
+    /// Abort an explicit transaction: append an `Abort` record, set
+    /// `CLOG=Aborted`, undo via the buffer-pool before-images, and deregister.
+    /// Dropping `txn` releases the write guard. A pre-durable rollback failure is
+    /// fatal (the engine cannot guarantee consistency), matching the autocommit
+    /// path.
+    fn abort_transaction(&self, txn: Transaction) {
+        let txn_id = txn.txn_id;
+        if txn.write_guard.is_none() {
+            // A read-only transaction wrote nothing: no Abort record, no undo,
+            // just deregister.
+            self.components.active_txns.deregister(txn_id);
+            return;
+        }
+        self.rollback_pre_durable_or_die(txn_id, None);
+        // `txn` drops here, releasing the exclusive write guard.
+        drop(txn);
+    }
+
+    fn explain(&self, inner: &BoundStatement) -> Result<ExecutionResult> {
+        if !matches!(inner, BoundStatement::Select(_)) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                "EXPLAIN supports SELECT only in v1",
+            ));
+        }
+        let logical = logical_plan(inner)?;
+        let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
+        Ok(ExecutionResult::Explanation {
+            text: format_explain(&physical),
+        })
+    }
+
+    /// Allocate the next transaction id and register it active atomically under
+    /// the registry latch (`docs/specs/mvcc.md` §7.1), so a concurrent reader's
+    /// snapshot capture never observes the advanced allocator boundary without
+    /// also observing this transaction in `xip`.
+    fn register_active_txn(&self) -> u64 {
+        self.components
+            .active_txns
+            .register_allocated(|| self.components.next_txn_id.fetch_add(1, Ordering::AcqRel))
+    }
+
+    /// The snapshot a statement of `txn` reads with, per isolation level
+    /// (`docs/specs/mvcc.md` §6): Read Committed captures a fresh snapshot each
+    /// statement (seeing other transactions' commits between statements);
+    /// Repeatable Read captures one snapshot at the first statement and reuses it.
+    fn snapshot_for_transaction(&self, txn: &mut Transaction) -> Arc<Snapshot> {
+        match txn.isolation {
+            IsolationLevel::ReadCommitted => self.capture_snapshot(txn.txn_id),
+            IsolationLevel::RepeatableRead => {
+                if let Some(snapshot) = &txn.rr_snapshot {
+                    snapshot.clone()
+                } else {
+                    let snapshot = self.capture_snapshot(txn.txn_id);
+                    txn.rr_snapshot = Some(snapshot.clone());
+                    snapshot
+                }
+            }
+        }
+    }
+
     fn execution_context<'a>(
         &'a self,
         txn_id: u64,
-        snapshot: Snapshot,
+        snapshot: Arc<Snapshot>,
+        isolation: IsolationLevel,
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
-            statement: StatementContext::with_snapshot(txn_id, snapshot),
+            statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
@@ -224,30 +680,36 @@ impl QueryService {
         }
     }
 
-    /// Capture the autocommit snapshot for a statement (`docs/specs/mvcc.md`
-    /// §5.5). It sees every already-committed transaction:
+    /// Capture a visibility snapshot consistently with the active-transaction
+    /// registry and the id allocator (`docs/specs/mvcc.md` §5.5, §7.1). Held under
+    /// the registry's brief latch (via `active_snapshot`) so the snapshot is not
+    /// torn relative to `next_txn_id`:
     ///
-    /// - `xmax` is the next txn id to be assigned, so every allocated (hence
-    ///   committed under single-writer autocommit) id is `< xmax`.
-    /// - `xip` is the currently-active set minus `own_txn` (the statement's own
-    ///   txn is seen via the predicate's own-write path, not as in-progress). A
-    ///   read passes `own_txn = 0` (it has no txn); nothing is excluded.
+    /// - `xmax` is the next id to be assigned; every already-allocated id is below
+    ///   it (read after the latched active set so no concurrently-begun writer is
+    ///   missed from `xip`).
+    /// - `xip` is the currently-active set minus `own_txn` (own writes are seen via
+    ///   the predicate's own-write path, not as in-progress). A read passes
+    ///   `own_txn = 0`; nothing is excluded.
     /// - `xmin` is the oldest active id, or `xmax` if none are active.
     ///
-    /// In single-writer mode `xip` is empty (the only active id, if any, is
-    /// `own_txn`), making this the degenerate "sees all committed" snapshot — so
-    /// read results are unchanged until Milestone C captures real snapshots.
-    fn capture_autocommit_snapshot(&self, own_txn: u64) -> Snapshot {
-        let xmax = self.components.next_txn_id.load(Ordering::Acquire);
-        let xip: Vec<u64> = self
+    /// Returned behind an `Arc` so the executor shares it across scan operators
+    /// rather than deep-cloning the `xip` vector per operator.
+    fn capture_snapshot(&self, own_txn: u64) -> Arc<Snapshot> {
+        // Snapshot the active set and the allocator boundary under one latch so a
+        // concurrent BEGIN cannot slip a new writer between reading `xmax` and
+        // reading `xip`. Reading `next_txn_id` first, then the active set, would
+        // risk a writer that registered after the `xmax` read being both `>= xmax`
+        // (so excluded as "future") and absent from `xip` — but visible. Reading
+        // the active set first guarantees any active id is reflected in `xip`, and
+        // `xmax` taken after only grows, so every active id stays `< xmax`.
+        let (active, xmax) = self
             .components
             .active_txns
-            .active_ids()
-            .into_iter()
-            .filter(|&id| id != own_txn)
-            .collect();
-        let xmin = self.components.active_txns.oldest().unwrap_or(xmax);
-        Snapshot { xmin, xmax, xip }
+            .snapshot_with_boundary(|| self.components.next_txn_id.load(Ordering::Acquire));
+        let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
+        let xmin = active.iter().copied().next().unwrap_or(xmax);
+        Arc::new(Snapshot { xmin, xmax, xip })
     }
 
     fn append_and_flush_commit(&self, txn_id: u64) -> Result<()> {
@@ -260,6 +722,16 @@ impl QueryService {
         Ok(())
     }
 
+    fn rollback_pre_durable_or_die(
+        &self,
+        txn_id: u64,
+        catalog_before: Option<catalog::CatalogSnapshot>,
+    ) {
+        if let Err(rollback_err) = self.rollback_pre_durable(txn_id, catalog_before) {
+            self.fatal_pre_durable_rollback_failure(rollback_err);
+        }
+    }
+
     fn rollback_pre_durable(
         &self,
         txn_id: u64,
@@ -270,7 +742,9 @@ impl QueryService {
         // not flushed — abort durability is not critical, since a transaction with
         // no durable `Commit` is recovered as aborted regardless. A failure to
         // append it is logged but not fatal: the in-memory rollback below (the
-        // mechanism A3 leaves in place until C3) still restores correctness.
+        // before-image undo retained through C3 — retirement is deferred to D1
+        // with the flush-gate relaxation, see `docs/specs/mvcc.md` §10 D1) still
+        // restores correctness.
         if let Err(err) = self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
@@ -317,17 +791,114 @@ impl QueryService {
     }
 }
 
+/// Abort and discard a transaction held on the session, e.g. when a client
+/// disconnects mid-transaction. Releases the write guard and clears the registry
+/// entry so neither is leaked. Standalone so the connection layer can call it on
+/// disconnect without holding a `&QueryService` borrow across the blocking task.
+pub fn abort_session_transaction(components: &Arc<ServerComponents>, txn: Transaction) {
+    let service = QueryService::new(components.clone());
+    service.abort_transaction(txn);
+}
+
+/// The session-facing status of a transaction slot after a statement.
+pub fn slot_status(slot: &Option<Transaction>) -> SessionTxnStatus {
+    match slot {
+        Some(txn) => txn.status(),
+        None => SessionTxnStatus::Idle,
+    }
+}
+
+/// Plan and execute a fully bound data statement under `ctx`.
+fn run_plan(
+    engine: &QueryEngine,
+    ctx: &ExecutionContext<'_>,
+    bound: BoundStatement,
+    catalog: &dyn catalog::CatalogManager,
+) -> Result<ExecutionResult> {
+    if let BoundStatement::Explain(inner) = &bound {
+        if !matches!(inner.as_ref(), BoundStatement::Select(_)) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                "EXPLAIN supports SELECT only in v1",
+            ));
+        }
+        let logical = logical_plan(inner.as_ref())?;
+        let physical = physical_plan(&logical, catalog)?;
+        return Ok(ExecutionResult::Explanation {
+            text: format_explain(&physical),
+        });
+    }
+    let logical = logical_plan(&bound)?;
+    let physical = physical_plan(&logical, catalog)?;
+    let result = catch_unwind(AssertUnwindSafe(|| engine.execute(ctx, &physical)));
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(DbError::internal("statement execution panicked")),
+    }
+}
+
+/// Poison an open transaction's slot to the failed state on a statement error
+/// (parse/classification before the lifecycle handler runs). Autocommit
+/// (`None`) is unaffected.
+fn mark_failed_on_error(slot: Option<Transaction>) -> Option<Transaction> {
+    slot.map(|mut txn| {
+        txn.failed = true;
+        txn
+    })
+}
+
+fn begin_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "BEGIN".to_string(),
+        count: 0,
+    }
+}
+
+fn commit_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "COMMIT".to_string(),
+        count: 0,
+    }
+}
+
+fn rollback_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "ROLLBACK".to_string(),
+        count: 0,
+    }
+}
+
+/// The statement supplied to the in-transaction execution path: either an
+/// unbound AST (simple query, bound here against the live catalog) or an
+/// already-bound statement (extended-protocol `Execute`, with its parameters
+/// already substituted).
+enum BindSource {
+    Unbound(Statement),
+    Bound(BoundStatement),
+}
+
+#[derive(Clone, Copy)]
+enum TransactionControl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
 #[derive(Clone, Copy)]
 enum StatementClass {
     Read,
     Write,
+    Ddl,
+    TransactionControl(TransactionControl),
 }
 
 /// A parsed and bound extended-protocol statement that can be executed
-/// repeatedly with different parameter values.
+/// repeatedly with different parameter values. `bound` is `None` only for
+/// transaction-control statements (BEGIN/COMMIT/ROLLBACK), which carry no bound
+/// payload and are dispatched through the session's transaction lifecycle.
 pub struct PreparedStatement {
     class: StatementClass,
-    bound: BoundStatement,
+    bound: Option<BoundStatement>,
     param_types: Vec<DataType>,
     result_columns: Option<Vec<ColumnInfo>>,
 }
@@ -336,6 +907,14 @@ impl PreparedStatement {
     /// Resolved parameter types, by position.
     pub fn param_types(&self) -> &[DataType] {
         &self.param_types
+    }
+
+    /// Whether this is a transaction-control statement (BEGIN/COMMIT/ROLLBACK).
+    /// The connection routes such an `Execute` through the session's transaction
+    /// lifecycle even with no transaction open, so it drives `Session.txn` rather
+    /// than running as an autocommit unit.
+    pub fn is_transaction_control(&self) -> bool {
+        matches!(self.class, StatementClass::TransactionControl(_))
     }
 
     /// Result column metadata, or `None` for a statement that returns no rows.
@@ -363,26 +942,25 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::Explain(inner) => match inner.as_ref() {
             Statement::Select(_) => Ok(StatementClass::Read),
             _ => Err(DbError::plan(
-                common::SqlState::SyntaxError,
+                SqlState::SyntaxError,
                 "EXPLAIN supports SELECT only in v1",
             )),
         },
-        Statement::Insert { .. }
-        | Statement::Update { .. }
-        | Statement::Delete { .. }
-        | Statement::CreateTable { .. }
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } => {
+            Ok(StatementClass::Write)
+        }
+        Statement::CreateTable { .. }
         | Statement::DropTable { .. }
         | Statement::CreateIndex { .. }
-        | Statement::DropIndex { .. } => Ok(StatementClass::Write),
-        // TEMPORARY: replaced by real lifecycle in Milestone C3. BEGIN/COMMIT/
-        // ROLLBACK now parse to first-class statements (C1), but the
-        // multi-statement transaction lifecycle is not wired yet. Reject here
-        // rather than silently no-op a BEGIN (which would falsely tell a client
-        // a transaction had started). This is the dispatch seam C3 generalizes
-        // into transaction lifecycle handling.
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(DbError::plan(
-            common::SqlState::FeatureNotSupported,
-            "multi-statement transactions are not yet supported",
+        | Statement::DropIndex { .. } => Ok(StatementClass::Ddl),
+        Statement::Begin => Ok(StatementClass::TransactionControl(
+            TransactionControl::Begin,
+        )),
+        Statement::Commit => Ok(StatementClass::TransactionControl(
+            TransactionControl::Commit,
+        )),
+        Statement::Rollback => Ok(StatementClass::TransactionControl(
+            TransactionControl::Rollback,
         )),
     }
 }
@@ -395,6 +973,7 @@ mod tests {
     use catalog::CatalogSnapshot;
     use common::{DataType, SqlState, Value};
 
+    use super::SessionTxnStatus;
     use crate::app::AppState;
 
     #[tokio::test]
@@ -417,18 +996,193 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_control_statements_are_temporarily_unsupported() {
-        // C1 parses BEGIN/COMMIT/ROLLBACK to first-class statements, but the
-        // lifecycle is not wired until C3. Each must fail with a clear,
-        // structured feature-not-supported error rather than silently no-op a
-        // BEGIN (which would mislead a client into thinking a txn had started).
-        // This test marks the exact behavior C3 must replace.
+    async fn begin_insert_select_commit_is_visible_to_a_later_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
-        for sql in ["begin", "commit", "rollback"] {
-            let err = app.query_service.execute_sql(sql).unwrap_err();
-            assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
-        }
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        // BEGIN; INSERT; SELECT (sees own insert); COMMIT;
+        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
+
+        let (slot, result) = app.query_service.execute_simple(
+            "insert into users (id, name) values (1, 'Ada')",
+            slot,
+            &cancel,
+        );
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
+
+        let (slot, result) =
+            app.query_service
+                .execute_simple("select id from users", slot, &cancel);
+        let rows = match result.unwrap() {
+            executor::ExecutionResult::Query { rows, .. } => rows,
+            other => panic!("expected query, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 1, "the open transaction sees its own insert");
+
+        let (slot, result) = app.query_service.execute_simple("commit", slot, &cancel);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Idle);
+        assert!(slot.is_none());
+
+        // A fresh autocommit SELECT now sees the committed row.
+        let result = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap();
+        assert_eq!(result.row_count(), 1);
+        assert!(app.components.active_txns.active_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_insert_rollback_is_not_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple(
+            "insert into users (id, name) values (1, 'Ada')",
+            slot,
+            &cancel,
+        );
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+
+        let result = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap();
+        assert_eq!(result.row_count(), 0, "rolled-back insert is invisible");
+        assert!(app.components.active_txns.active_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_statement_enters_e_state_and_rejects_until_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
+
+        // A statement against a missing table errors and poisons the txn to 'E'.
+        let (slot, result) =
+            app.query_service
+                .execute_simple("select id from ghosts", slot, &cancel);
+        assert!(result.is_err());
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+
+        // While 'E', every statement but COMMIT/ROLLBACK is rejected with 25P02.
+        let (slot, result) =
+            app.query_service
+                .execute_simple("select id from users", slot, &cancel);
+        let err = result.unwrap_err();
+        assert_eq!(err.code, SqlState::InFailedSqlTransaction);
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+
+        // ROLLBACK returns to Idle.
+        let (slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Idle);
+        assert!(app.components.active_txns.active_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_of_failed_transaction_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, _) =
+            app.query_service
+                .execute_simple("insert into users (id) values (1)", slot, &cancel);
+        let (slot, result) =
+            app.query_service
+                .execute_simple("select id from ghosts", slot, &cancel);
+        assert!(result.is_err());
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+
+        // COMMIT of an aborted transaction issues ROLLBACK (Postgres behavior).
+        let (slot, result) = app.query_service.execute_simple("commit", slot, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+
+        // The insert was rolled back: nothing committed.
+        let result = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap();
+        assert_eq!(result.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ddl_inside_transaction_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, result) = app.query_service.execute_simple(
+            "create table users (id integer primary key)",
+            slot,
+            &cancel,
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+        let (_slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn commit_and_rollback_with_no_open_transaction_are_no_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, result) = app.query_service.execute_simple("commit", None, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+        let (slot, result) = app.query_service.execute_simple("rollback", None, &cancel);
+        result.unwrap();
+        assert!(slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn begin_inside_transaction_is_a_noop_warning_staying_in_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
+        let txn_id_before = app.components.active_txns.active_ids();
+        let (slot, result) = app.query_service.execute_simple("begin", slot, &cancel);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
+        // The second BEGIN did not allocate a new transaction.
+        assert_eq!(app.components.active_txns.active_ids(), txn_id_before);
+        let (_slot, _) = app.query_service.execute_simple("rollback", slot, &cancel);
     }
 
     #[tokio::test]

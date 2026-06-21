@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use crate::app::AppState;
 use crate::cancel::BackendKey;
-use crate::query::PreparedStatement;
+use crate::query::{PreparedStatement, SessionTxnStatus, Transaction, abort_session_transaction};
 
 /// Accept a connection, run optional SSL/GSS negotiation, then serve the
 /// protocol over the resulting (plaintext or TLS) stream.
@@ -147,28 +147,19 @@ struct Portal {
 }
 
 /// The PostgreSQL transaction-block status reported in `ReadyForQuery`. Each
-/// variant maps to the wire status byte the protocol encodes.
-///
-/// In this milestone the session is always `Idle`: no statement transitions it
-/// yet (BEGIN is still rejected pending the transaction lifecycle), so the
-/// `InTransaction`/`Failed` variants exist only to fix the byte mapping. The
-/// lifecycle transitions arrive in a later milestone.
+/// variant maps to the wire status byte the protocol encodes. The session's
+/// transaction slot drives the transitions: `Idle` (`b'I'`) with no open
+/// transaction, `InTransaction` (`b'T'`) inside a healthy block, and `Failed`
+/// (`b'E'`) after a statement error until the block is ended
+/// (`docs/specs/mvcc.md` §7.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionState {
     /// Not in a transaction block (autocommit). Status byte `b'I'`.
     Idle,
     /// In a live transaction block. Status byte `b'T'`.
-    #[allow(
-        dead_code,
-        reason = "transitioned into by a later transaction-lifecycle milestone"
-    )]
     InTransaction,
     /// In a failed transaction block: rejects all but COMMIT/ROLLBACK. Status
     /// byte `b'E'`.
-    #[allow(
-        dead_code,
-        reason = "transitioned into by a later transaction-lifecycle milestone"
-    )]
     Failed,
 }
 
@@ -183,6 +174,16 @@ impl TransactionState {
     }
 }
 
+impl From<SessionTxnStatus> for TransactionState {
+    fn from(status: SessionTxnStatus) -> Self {
+        match status {
+            SessionTxnStatus::Idle => TransactionState::Idle,
+            SessionTxnStatus::InTransaction => TransactionState::InTransaction,
+            SessionTxnStatus::Failed => TransactionState::Failed,
+        }
+    }
+}
+
 /// Per-connection state for the simple and extended query protocols.
 struct Session {
     app: Arc<AppState>,
@@ -192,9 +193,14 @@ struct Session {
     /// Set after an error inside an extended-query sequence; subsequent extended
     /// messages are skipped until the client sends `Sync`.
     failed: bool,
-    /// Transaction-block status reported in `ReadyForQuery`. Always `Idle` in
-    /// this milestone (no lifecycle transitions yet).
+    /// Transaction-block status reported in `ReadyForQuery`, derived from `txn`
+    /// after each simple query and kept in sync so `ReadyForQuery` reports the
+    /// right `b'I'`/`b'T'`/`b'E'` byte.
     tx: TransactionState,
+    /// The open explicit transaction, threaded across simple queries. `None` in
+    /// autocommit. Aborted on disconnect (`Drop`) so a client that disconnects
+    /// mid-transaction does not leak the write guard or a registry entry.
+    txn: Option<Transaction>,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -207,6 +213,13 @@ impl Drop for Session {
     fn drop(&mut self) {
         if let Some(key) = self.backend_key {
             self.app.components.cancel_registry.deregister(key);
+        }
+        // A client that disconnected mid-transaction leaves an open transaction:
+        // abort it so the exclusive write guard and the registry entry are not
+        // leaked. The abort is in-memory before-image undo plus an (unflushed)
+        // Abort record — brief and bounded, safe to run during drop.
+        if let Some(txn) = self.txn.take() {
+            abort_session_transaction(&self.app.components, txn);
         }
     }
 }
@@ -271,6 +284,7 @@ impl Session {
             portals: HashMap::new(),
             failed: false,
             tx: TransactionState::Idle,
+            txn: None,
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
         }
@@ -392,17 +406,24 @@ impl Session {
     where
         S: AsyncWrite + Unpin,
     {
-        // A simple query is a transaction boundary that clears any aborted
-        // extended-query sequence, matching PostgreSQL.
+        // A simple query clears any aborted extended-query sequence, matching
+        // PostgreSQL. The transaction-block status (`self.tx`) is owned by the
+        // explicit transaction lifecycle and is updated from the slot returned
+        // below, not reset here.
         self.failed = false;
-        let status = self.status_byte();
         let guard = match self.app.components.shutdown.begin_query() {
             Ok(guard) => guard,
             Err(err) => {
+                // Reject due to shutdown: report the current (pre-statement)
+                // status and close. The open transaction (if any) is aborted when
+                // the session drops.
                 write_messages(
                     stream,
                     codec,
-                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
+                    &[
+                        error_response(&err),
+                        ServerMessage::ReadyForQuery(self.status_byte()),
+                    ],
                 )
                 .await?;
                 return Ok(ControlFlow::Break(()));
@@ -410,11 +431,32 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
-        let result = query_task_result(
-            tokio::task::spawn_blocking(move || service.execute_sql_cancelable(&sql, &cancel))
-                .await,
-        );
+        // Move the session's transaction slot into the blocking task so the whole
+        // statement (including any owned write guard) runs on one thread, then
+        // take it back along with the result.
+        let txn = self.txn.take();
+        let task = tokio::task::spawn_blocking(move || {
+            let (txn, result) = service.execute_simple(&sql, txn, &cancel);
+            (txn, result)
+        })
+        .await;
         drop(guard);
+        let result = match task {
+            Ok((txn, result)) => {
+                self.txn = txn;
+                result
+            }
+            Err(join_err) => {
+                // The blocking task panicked and lost the transaction slot. Treat
+                // the connection as having no open transaction (the panic firewall
+                // surfaces an internal error); the guard/registry entry for a lost
+                // txn cannot be recovered here, so this is best-effort.
+                self.txn = None;
+                Err(DbError::internal(format!("query task failed: {join_err}")))
+            }
+        };
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        let status = self.status_byte();
         match result {
             Ok(result) => write_execution_result(stream, codec, result, status).await?,
             Err(err) => {
@@ -456,13 +498,59 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
-        let result = query_task_result(
-            tokio::task::spawn_blocking(move || {
-                service.execute_prepared_cancelable(&statement, &params, &cancel)
+
+        // When an explicit transaction is open on this session, the extended-
+        // protocol `Execute` participates in THAT transaction rather than starting
+        // an independent autocommit unit. Routing both protocols through the one
+        // transaction slot guarantees the session acquires the exclusive write
+        // guard at most once: an open write transaction holds its single guard, and
+        // an in-transaction `Execute` reuses it (or lazily acquires it once on the
+        // first write) instead of re-acquiring it and self-deadlocking. A
+        // transaction-control `Execute` (BEGIN/COMMIT/ROLLBACK) is also routed
+        // through the session path even with no transaction open, so it drives
+        // `self.txn` like a simple-query control statement. Otherwise (a data
+        // statement with no open transaction), `Execute` stays a self-contained
+        // autocommit unit.
+        let route_through_session = self.txn.is_some() || statement.is_transaction_control();
+        let result = if route_through_session {
+            // Move the transaction slot into the blocking task (like the simple-
+            // query path) so the whole statement, including any owned write guard,
+            // runs on one thread; take it back with the result.
+            let txn = self.txn.take();
+            let task = tokio::task::spawn_blocking(move || {
+                service.execute_prepared_in_session(&statement, &params, txn, &cancel)
             })
-            .await,
-        );
-        drop(guard);
+            .await;
+            drop(guard);
+            match task {
+                Ok((txn, result)) => {
+                    self.txn = txn;
+                    result
+                }
+                Err(join_err) => {
+                    // The blocking task panicked and lost the transaction slot; the
+                    // guard/registry entry for the lost txn cannot be recovered
+                    // here. Treat the session as having no open transaction (the
+                    // simple-query path makes the same best-effort choice).
+                    self.txn = None;
+                    Err(DbError::internal(format!("query task failed: {join_err}")))
+                }
+            }
+        } else {
+            let result = query_task_result(
+                tokio::task::spawn_blocking(move || {
+                    service.execute_prepared_cancelable(&statement, &params, &cancel)
+                })
+                .await,
+            );
+            drop(guard);
+            result
+        };
+
+        // Keep the reported transaction-block status in sync with the slot, so the
+        // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+
         match result {
             Ok(result) => write_portal_result(stream, codec, result, &result_formats).await,
             Err(err) => {
@@ -820,6 +908,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::UniqueViolation => "23505",
         SqlState::QueryCanceled => "57014",
         SqlState::FeatureNotSupported => "0A000",
+        SqlState::InFailedSqlTransaction => "25P02",
         SqlState::IoError => "58030",
         SqlState::InternalError => "XX000",
     }

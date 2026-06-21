@@ -2,7 +2,7 @@ mod support;
 
 use std::path::Path;
 
-use support::{TestServer, write_uncommitted_record_for_test};
+use support::{Connection, TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
 async fn committed_data_survives_restart_with_checkpoint_and_wal() {
@@ -38,6 +38,80 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
             vec![Some("1".to_string()), Some("Ada".to_string())],
             vec![Some("2".to_string()), Some("Grace".to_string())],
         ]
+    );
+}
+
+#[tokio::test]
+async fn committed_multi_statement_transaction_survives_restart() {
+    // A committed explicit transaction's statements all share one txn_id with a
+    // single durable Commit, so redo-committed-only replays them together: every
+    // row of `BEGIN; INSERT; INSERT; COMMIT` is visible after restart.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table users (id integer primary key, name text)")
+            .await;
+        conn.ok("begin").await;
+        conn.ok("insert into users (id, name) values (1, 'Ada')")
+            .await;
+        conn.ok("insert into users (id, name) values (2, 'Grace')")
+            .await;
+        let commit = conn.ok("commit").await;
+        assert_eq!(commit.status, b'I');
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("2".to_string()), Some("Grace".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn in_flight_transaction_rows_are_not_visible_after_restart() {
+    // A transaction that never commits before the "crash" leaves uncommitted
+    // HeapInsert records with no durable Commit. Under redo-committed-only those
+    // records are not replayed and the flush gate never wrote their pages, so the
+    // rows are absent after restart. (Full redo-all is Milestone D2; this stays
+    // within what redo-committed-only supports.)
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        // Commit the table create so the table exists after restart.
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        // Open a transaction, insert rows, and never commit. Dropping the
+        // connection and server ends the in-flight transaction without a Commit.
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("insert into users (id, name) values (1, 'Ada')")
+            .await;
+        conn.ok("insert into users (id, name) values (2, 'Grace')")
+            .await;
+        // No COMMIT: the connection drops here, then the server drops.
+        conn.close().await;
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        rows.is_empty(),
+        "an uncommitted transaction's rows are not visible after restart"
     );
 }
 

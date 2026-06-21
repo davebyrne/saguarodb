@@ -204,11 +204,16 @@ impl MemoryBufferPool {
                 }
             };
 
-            // Flush the reserved victim to its home without holding the lock. No
-            // writer runs concurrently (the concurrency controller serializes the
-            // single writer against readers), so this committed page's bytes are
-            // stable during the write; a concurrent reader may pin it, detected
-            // below. The reservation pin keeps another eviction from racing it.
+            // Flush the reserved victim to its home without holding the pool lock.
+            // Safety rests on the per-frame latch and pin discipline, not on any
+            // global controller (lock-free readers take no controller guard): a
+            // victim is only reclaimed when unpinned, and any frame with an
+            // in-flight write is pinned by its live `PageWriteGuard`, so it is never
+            // chosen here. We snapshot the page bytes under the frame's read latch
+            // (`victim.data.read()`), so a concurrent reader or a writer on a
+            // *different* frame cannot tear this copy. The reservation pin keeps
+            // another eviction from racing this one; a reader that pins the victim
+            // during the flush is detected below.
             let data = victim.data.read().clone();
             self.store
                 .write_page(victim.file_id, victim.page_num, &data)?;
