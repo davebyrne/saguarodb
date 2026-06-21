@@ -363,11 +363,11 @@ mod tests {
             .unwrap();
         let storage = MemoryStorage::empty();
         storage
-            .create_table(&StatementContext { txn_id: 0 }, &schema)
+            .create_table(&StatementContext::new(0), &schema)
             .unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let ctx = ExecutionContext {
-            statement: StatementContext { txn_id: 1 },
+            statement: StatementContext::new(1),
             catalog: &catalog,
             storage: &storage,
             schema_ops: &storage,

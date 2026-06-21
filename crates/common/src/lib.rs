@@ -3,6 +3,7 @@ pub mod context;
 pub mod error;
 pub mod flush;
 pub mod ids;
+pub mod mvcc;
 pub mod row;
 pub mod schema;
 pub mod value;
@@ -15,6 +16,7 @@ pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, TableId, TxnId,
 };
+pub use mvcc::{IsolationLevel, Snapshot, TxnStatus};
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};
 pub use value::Value;

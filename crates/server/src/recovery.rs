@@ -279,7 +279,7 @@ mod tests {
         );
 
         // Scan the rebuilt secondary tree directly to prove its pages recovered.
-        let ctx = StatementContext { txn_id: 0 };
+        let ctx = StatementContext::new(0);
         let mut iter = comps
             .storage
             .index_scan(

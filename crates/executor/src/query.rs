@@ -98,7 +98,7 @@ pub(crate) fn build_executor<'a>(
 ) -> Result<Box<dyn PlanExecutor + 'a>> {
     match plan {
         PhysicalPlan::SeqScan { table, filter, .. } => Ok(Box::new(SeqScanOp::new(
-            ctx.statement,
+            ctx.statement.clone(),
             ctx.storage,
             *table,
             filter.clone(),
@@ -111,7 +111,7 @@ pub(crate) fn build_executor<'a>(
             filter,
             ..
         } => Ok(Box::new(IndexScanOp::new(
-            ctx.statement,
+            ctx.statement.clone(),
             ctx.storage,
             *table,
             *index,

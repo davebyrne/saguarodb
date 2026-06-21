@@ -197,7 +197,7 @@ impl QueryService {
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
-            statement: StatementContext { txn_id },
+            statement: StatementContext::new(txn_id),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),

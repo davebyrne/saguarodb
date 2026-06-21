@@ -14,7 +14,8 @@
 - Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`, `ColumnInfo`, `TableSchema`, `IndexSchema`.
 - Query access helpers: `KeyRange`.
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
-- Statement context and future transaction extension point.
+- Statement context and the transaction extension point.
+- Runtime MVCC types: `Snapshot`, `TxnStatus`, `IsolationLevel` (see `docs/specs/mvcc.md`).
 - Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`.
 
 ## Public Types
@@ -173,10 +174,40 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 ```rust
 pub struct StatementContext {
     pub txn_id: u64,
+    pub snapshot: Snapshot,
+    pub isolation: IsolationLevel,
 }
 ```
 
-V1 uses one `txn_id` per autocommit statement. Future MVCC may add snapshot and isolation fields without changing storage method signatures.
+V1 uses one `txn_id` per autocommit statement. The `snapshot` and `isolation`
+fields are MVCC scaffolding (see `docs/specs/mvcc.md` §5.5): they are carried
+but not yet consulted, so behavior is unchanged. `StatementContext::new(txn_id)`
+fills `snapshot` with the degenerate placeholder `Snapshot::empty()` and
+`isolation` with the default (`IsolationLevel::ReadCommitted`); real snapshot
+capture per isolation level is wired in by later milestones. `StatementContext`
+is no longer `Copy` (it holds a `Snapshot`, which owns a `Vec`).
+
+## MVCC Types
+
+Runtime-only MVCC types (no `serde`/durable derives; CLOG's on-disk status
+representation is a separate concern). See `docs/specs/mvcc.md` for the model.
+
+```rust
+pub struct Snapshot {
+    pub xmin: u64,     // lowest still-running xid; below this, status is settled via CLOG
+    pub xmax: u64,     // next xid to be assigned; >= xmax is invisible (the future)
+    pub xip: Vec<u64>, // in-progress xids in [xmin, xmax) at snapshot capture
+}
+
+pub enum TxnStatus { InProgress, Committed, Aborted }
+
+pub enum IsolationLevel { ReadCommitted, RepeatableRead /* = snapshot isolation */ }
+```
+
+`Snapshot::empty()` (also `Default`) is the degenerate `{ xmin: 0, xmax: 0, xip:
+[] }` placeholder; it is not a captured snapshot. `IsolationLevel::default()` is
+`ReadCommitted` (Postgres' default). These types are not yet consulted by any
+visibility or transaction logic; later milestones wire them in.
 
 ## Flush Policy
 

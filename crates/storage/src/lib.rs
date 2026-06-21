@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn insert_get_update_delete_round_trip_through_pages() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
 
         harness
@@ -135,7 +135,7 @@ mod tests {
         let wal = Arc::new(wal::FileWalManager::open(dir.path().join("wal.dat")).unwrap());
         let storage =
             PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         storage.create_table(&ctx, &users_schema()).unwrap();
         storage.create_index(&ctx, &name_index(false)).unwrap();
         wal.flush().unwrap();
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn duplicate_insert_returns_unique_violation_without_replacing_row() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn scan_range_walks_primary_key_directory_in_key_order() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn scan_returns_stored_row_identity_and_bounded_range() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn reopened_engine_reads_rows_through_durable_index() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -277,9 +277,9 @@ mod tests {
     fn rollback_txn_restores_storage_owned_directory_metadata() {
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext { txn_id: 0 })
+            .create_users_table(&StatementContext::new(0))
             .unwrap();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness
             .storage
             .insert(&ctx, 1, user_row(1, "Ada", true))
@@ -301,9 +301,9 @@ mod tests {
     fn rollback_txn_restores_update_and_drop_metadata() {
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext { txn_id: 0 })
+            .create_users_table(&StatementContext::new(0))
             .unwrap();
-        let insert_ctx = StatementContext { txn_id: 1 };
+        let insert_ctx = StatementContext::new(1);
         harness
             .storage
             .insert(&insert_ctx, 1, user_row(1, "Ada", true))
@@ -311,7 +311,7 @@ mod tests {
         harness.storage.commit_txn(insert_ctx.txn_id).unwrap();
         harness.buffer.commit(insert_ctx.txn_id).unwrap();
 
-        let update_ctx = StatementContext { txn_id: 2 };
+        let update_ctx = StatementContext::new(2);
         harness
             .storage
             .update(
@@ -332,7 +332,7 @@ mod tests {
             Some(user_row(1, "Ada", true))
         );
 
-        let drop_ctx = StatementContext { txn_id: 3 };
+        let drop_ctx = StatementContext::new(3);
         harness.storage.drop_table(&drop_ctx, 1).unwrap();
         harness.storage.rollback_txn(drop_ctx.txn_id).unwrap();
 
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn rollback_after_insert_on_new_page_removes_directory_and_buffer_page() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let large_row = Row {
@@ -362,7 +362,7 @@ mod tests {
         harness.storage.commit_txn(ctx.txn_id).unwrap();
         harness.buffer.commit(ctx.txn_id).unwrap();
 
-        let failed_ctx = StatementContext { txn_id: 2 };
+        let failed_ctx = StatementContext::new(2);
         harness
             .storage
             .insert(&failed_ctx, 2, small_big_text_row(2))
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn insert_accepts_row_that_fills_single_page_payload_capacity() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn insert_rejects_row_too_large_before_allocating_page() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn insert_allocates_new_page_when_first_page_has_no_next_slot_space() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         let schema = big_text_schema();
         harness.storage.create_table(&ctx, &schema).unwrap();
         let large_row = Row {
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn create_index_backfills_existing_rows() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn dml_keeps_secondary_index_in_sync() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn non_unique_index_returns_every_row_for_a_value() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn index_scan_returns_a_range_in_index_order() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn unique_index_rejects_duplicate_value_on_insert() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn unique_index_backfill_rejects_duplicate_existing_values() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn unique_index_allows_multiple_nulls() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn dropped_index_is_not_maintained_or_scannable() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -704,9 +704,9 @@ mod tests {
     fn rollback_removes_a_created_index() {
         let harness = StorageHarness::new();
         harness
-            .create_users_table(&StatementContext { txn_id: 0 })
+            .create_users_table(&StatementContext::new(0))
             .unwrap();
-        let ctx = StatementContext { txn_id: 5 };
+        let ctx = StatementContext::new(5);
         harness
             .storage
             .create_index(&ctx, &name_index(false))
@@ -717,7 +717,7 @@ mod tests {
 
         let err = harness
             .storage
-            .index_scan(&StatementContext { txn_id: 6 }, 1, 1, &KeyRange::All)
+            .index_scan(&StatementContext::new(6), 1, 1, &KeyRange::All)
             .err()
             .expect("rolled-back index should not be scannable");
         assert_eq!(err.code, SqlState::UndefinedTable);
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn drop_table_cascades_to_its_secondary_indexes() {
         let harness = StorageHarness::new();
-        let ctx = StatementContext { txn_id: 1 };
+        let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
@@ -787,7 +787,7 @@ mod tests {
     fn index_ids(harness: &StorageHarness, name: &str) -> Vec<i64> {
         let iter = harness
             .storage
-            .index_scan(&StatementContext { txn_id: 1 }, 1, 1, &name_eq(name))
+            .index_scan(&StatementContext::new(1), 1, 1, &name_eq(name))
             .unwrap();
         collect(iter)
             .into_iter()

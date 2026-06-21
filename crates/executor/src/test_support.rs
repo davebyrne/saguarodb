@@ -41,7 +41,7 @@ impl ExecutorHarness {
             .unwrap();
         let storage = MemoryStorage::empty();
         storage
-            .create_table(&StatementContext { txn_id: 0 }, &schema)
+            .create_table(&StatementContext::new(0), &schema)
             .unwrap();
         Self {
             catalog,
@@ -60,9 +60,8 @@ impl ExecutorHarness {
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, &self.catalog)?;
         let is_read = is_read_plan(&physical);
-        let statement = StatementContext {
-            txn_id: if is_read { 0 } else { 1 },
-        };
+        let statement = StatementContext::new(if is_read { 0 } else { 1 });
+        let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
             statement,
             catalog: &self.catalog,
@@ -77,11 +76,11 @@ impl ExecutorHarness {
 
         match result {
             Ok(result) => {
-                self.storage.commit_txn(statement.txn_id)?;
+                self.storage.commit_txn(txn_id)?;
                 Ok(result)
             }
             Err(err) => {
-                let _ = self.storage.rollback_txn(statement.txn_id);
+                let _ = self.storage.rollback_txn(txn_id);
                 Err(err)
             }
         }
