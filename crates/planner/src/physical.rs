@@ -323,6 +323,8 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::CreateIndex { .. }
+        | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(common::DbError::internal(
