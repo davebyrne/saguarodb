@@ -88,15 +88,25 @@ fn bind_insert(
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let columns = insert_columns(&table, column_names)?;
-
-    let InsertSource::Values(rows) = source else {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            "INSERT ... SELECT is not supported in v1",
-        ));
-    };
     validate_insert_omissions(&table, &columns)?;
 
+    let source = match source {
+        InsertSource::Values(rows) => bind_insert_values(&table, &columns, rows)?,
+        InsertSource::Query(select) => bind_insert_query(catalog, &table, &columns, select)?,
+    };
+
+    Ok(BoundStatement::Insert {
+        table: table.id,
+        columns,
+        source,
+    })
+}
+
+fn bind_insert_values(
+    table: &TableSchema,
+    columns: &[ColumnId],
+    rows: &[Vec<Expr>],
+) -> Result<BoundInsertSource> {
     let mut bound_rows = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() != columns.len() {
@@ -107,8 +117,8 @@ fn bind_insert(
         }
 
         let mut bound_row = Vec::with_capacity(row.len());
-        for (expr, column_id) in row.iter().zip(&columns) {
-            let column = column_by_id(&table, *column_id)?;
+        for (expr, column_id) in row.iter().zip(columns) {
+            let column = column_by_id(table, *column_id)?;
             let bound = bind_expr(
                 &mut BindContext::default(),
                 expr,
@@ -124,19 +134,35 @@ fn bind_insert(
     let output_schema = columns
         .iter()
         .map(|column_id| {
-            let column = column_by_id(&table, *column_id)?;
-            Ok(column_info_for_column(&table, column))
+            let column = column_by_id(table, *column_id)?;
+            Ok(column_info_for_column(table, column))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(BoundStatement::Insert {
-        table: table.id,
-        columns,
-        source: BoundInsertSource::Values {
-            rows: bound_rows,
-            output_schema,
-        },
+    Ok(BoundInsertSource::Values {
+        rows: bound_rows,
+        output_schema,
     })
+}
+
+fn bind_insert_query(
+    catalog: &dyn CatalogManager,
+    table: &TableSchema,
+    columns: &[ColumnId],
+    select: &SelectStatement,
+) -> Result<BoundInsertSource> {
+    let bound = bind_select(catalog, select)?;
+    if bound.columns.len() != columns.len() {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "INSERT ... SELECT query produces a different number of columns than the target",
+        ));
+    }
+    for (item, column_id) in bound.columns.iter().zip(columns) {
+        let column = column_by_id(table, *column_id)?;
+        validate_assignable(&item.expr, column)?;
+    }
+    Ok(BoundInsertSource::Query(Box::new(bound)))
 }
 
 fn bind_update(

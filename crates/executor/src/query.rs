@@ -196,33 +196,35 @@ fn execute_insert(
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
-    open_executor(executor.as_mut())?;
-    let result = (|| {
-        let mut count = 0;
-        while let Some(source_row) = executor.next()? {
-            if source_row.row.values.len() != columns.len() {
-                return Err(DbError::execute(
-                    SqlState::DatatypeMismatch,
-                    "INSERT source produced the wrong number of values",
-                ));
-            }
-            let mut values = vec![Value::Null; schema.columns.len()];
-            for (column, value) in columns.iter().zip(source_row.row.values) {
-                let slot = column_slot(&schema, *column)?;
-                validate_value_type(&schema.columns[slot], &value)?;
-                values[slot] = value;
-            }
-            validate_not_null(&schema, &values)?;
-            ctx.storage.insert(&ctx.statement, table, Row { values })?;
-            count += 1;
-        }
+    // Materialize the source fully before inserting. For `INSERT ... SELECT`
+    // that reads the target table, this makes the query observe only the
+    // pre-insert rows (the Halloween problem) regardless of how the storage
+    // engine iterates.
+    let source_rows = collect_all(executor.as_mut())?;
 
-        Ok(ExecutionResult::Modified {
-            command: "INSERT".to_string(),
-            count,
-        })
-    })();
-    close_after(executor.as_mut(), result)
+    let mut count = 0;
+    for source_row in source_rows {
+        if source_row.row.values.len() != columns.len() {
+            return Err(DbError::execute(
+                SqlState::DatatypeMismatch,
+                "INSERT source produced the wrong number of values",
+            ));
+        }
+        let mut values = vec![Value::Null; schema.columns.len()];
+        for (column, value) in columns.iter().zip(source_row.row.values) {
+            let slot = column_slot(&schema, *column)?;
+            validate_value_type(&schema.columns[slot], &value)?;
+            values[slot] = value;
+        }
+        validate_not_null(&schema, &values)?;
+        ctx.storage.insert(&ctx.statement, table, Row { values })?;
+        count += 1;
+    }
+
+    Ok(ExecutionResult::Modified {
+        command: "INSERT".to_string(),
+        count,
+    })
 }
 
 fn execute_update(

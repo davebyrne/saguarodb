@@ -36,6 +36,7 @@ pub enum BoundInsertSource {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
     },
+    Query(Box<BoundSelect>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

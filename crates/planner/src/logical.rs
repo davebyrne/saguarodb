@@ -86,17 +86,20 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns,
             source,
         } => {
-            let BoundInsertSource::Values {
-                rows,
-                output_schema,
-            } = source;
+            let source = match source {
+                BoundInsertSource::Values {
+                    rows,
+                    output_schema,
+                } => LogicalPlan::Values {
+                    rows: rows.clone(),
+                    output_schema: output_schema.clone(),
+                },
+                BoundInsertSource::Query(select) => plan_select(select)?,
+            };
             Ok(LogicalPlan::Insert {
                 table: *table,
                 columns: columns.clone(),
-                source: Box::new(LogicalPlan::Values {
-                    rows: rows.clone(),
-                    output_schema: output_schema.clone(),
-                }),
+                source: Box::new(source),
             })
         }
         BoundStatement::Select(select) => plan_select(select),

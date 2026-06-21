@@ -119,9 +119,10 @@ Aggregate execution follows planner return-type rules: `COUNT` returns `0` for e
 
 ## DML Execution
 
-`INSERT`:
+`INSERT` (from `VALUES` or `SELECT`):
 
-- Build row values in table column order.
+- Materialize the source plan fully before inserting any row, so that `INSERT ... SELECT` reading the target table observes only pre-insert rows.
+- For each source row, build row values in table column order.
 - Validate runtime values match destination column types. `NULL` is accepted at this step and checked by nullability validation.
 - Validate non-null constraints.
 - Call `StorageEngine::insert`.

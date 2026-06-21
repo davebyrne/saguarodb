@@ -648,6 +648,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn insert_select_copies_rows_from_another_table() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table archived_users (id integer primary key, name text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'Grace')")
+            .unwrap();
+
+        let result = harness
+            .execute("insert into archived_users select id, name from users")
+            .unwrap();
+        assert!(matches!(result, ExecutionResult::Modified { count: 2, .. }));
+
+        let rows = harness
+            .select_rows("select id, name from archived_users order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1), Value::Text("Ada".to_string())]
+                },
+                Row {
+                    values: vec![Value::Integer(2), Value::Text("Grace".to_string())]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_applies_where_filter() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table flagged (id integer primary key, name text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'Grace')")
+            .unwrap();
+
+        harness
+            .execute("insert into flagged select id, name from users where id = 2")
+            .unwrap();
+
+        let rows = harness.select_rows("select id from flagged").unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(2)]
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_select_from_target_table_sees_only_preexisting_rows() {
+        // The Halloween problem: an INSERT ... SELECT that reads its own target
+        // must duplicate only the rows that existed before the statement ran.
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'Grace')")
+            .unwrap();
+
+        let result = harness
+            .execute("insert into users select id + 10, name from users")
+            .unwrap();
+        assert!(matches!(result, ExecutionResult::Modified { count: 2, .. }));
+
+        let rows = harness
+            .select_rows("select id from users order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1)]
+                },
+                Row {
+                    values: vec![Value::Integer(2)]
+                },
+                Row {
+                    values: vec![Value::Integer(11)]
+                },
+                Row {
+                    values: vec![Value::Integer(12)]
+                },
+            ]
+        );
+    }
+
     fn seed_users_and_accounts(harness: &ExecutorHarness) {
         harness
             .execute("create table accounts (id integer primary key, owner text)")

@@ -44,7 +44,7 @@ Binder responsibilities:
   unqualified name first matches an output column alias. All other `ORDER BY`
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
-- Validate insert/update value types and nullability.
+- Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
 - Reject unsupported v1 forms.
@@ -62,6 +62,7 @@ pub enum BoundStatement {
 
 pub enum BoundInsertSource {
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
+    Query(Box<BoundSelect>),
 }
 
 pub struct BoundSelect {
@@ -361,7 +362,7 @@ The executor crate is not called for `EXPLAIN`.
 - Binder resolves aliases and self-joins with distinct `BindingId`s.
 - Binder rejects ambiguous unqualified columns.
 - Binder expands wildcard projection into explicit bound expressions.
-- Binder rejects `INSERT ... SELECT` in v1.
+- Binder binds `INSERT ... SELECT` into `BoundInsertSource::Query`, rejecting column-count, type, and nullability mismatches against the target.
 - Logical planner emits logical nodes without `SeqScan` or `IndexScan`.
 - Physical planner chooses `IndexScan` for primary-key equality and preserves residual non-key predicates in `IndexScan.filter`.
 - Physical planner falls back to `SeqScan` for non-key filters.

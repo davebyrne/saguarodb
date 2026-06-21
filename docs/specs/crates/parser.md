@@ -150,13 +150,13 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 
 - `CREATE TABLE` with column definitions and primary key. V1 parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys in v1.
 - `DROP TABLE`.
-- `INSERT INTO ... VALUES`.
+- `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `SELECT` with projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN <statement>`.
 
-Binder rejects unsupported V1 forms such as `INSERT ... SELECT` until implementation support exists.
+Binder rejects parsed forms that exceed the v1 semantic subset, such as composite primary keys and unknown functions.
 
 Unquoted identifiers are normalized to lowercase before AST construction. Quoted identifiers are rejected in v1 with `ErrorKind::Parse` and `SqlState::SyntaxError`.
 
@@ -182,4 +182,4 @@ Unquoted identifiers are normalized to lowercase before AST construction. Quoted
 - Preserves aliases and qualified names without resolving them.
 - Parses `SELECT *` and `table.*` distinctly.
 - Parses `EXPLAIN SELECT ...` into `Statement::Explain`.
-- Parses `INSERT ... SELECT` into `InsertSource::Query` even though binder rejects it in v1.
+- Parses `INSERT ... SELECT` into `InsertSource::Query`, which the binder binds in v1.

@@ -152,23 +152,49 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_insert_select_for_v1() {
+    fn binder_binds_insert_select_to_query_source() {
         let catalog = catalog_with_users();
         let stmt = parse("insert into users select id, name from users").unwrap();
-        let err = bind(&stmt, &catalog).unwrap_err();
+        let bound = bind(&stmt, &catalog).unwrap();
 
-        assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::SyntaxError);
+        assert!(matches!(
+            bound,
+            BoundStatement::Insert {
+                source: BoundInsertSource::Query(_),
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn binder_rejects_explicit_column_insert_select_before_nullability_checks() {
+    fn binder_rejects_insert_select_that_omits_non_null_column() {
         let catalog = catalog_with_users();
+        // `id` is NOT NULL and absent from the column list, so the insert is
+        // rejected before the query source is considered.
         let stmt = parse("insert into users (name) select name from users").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
 
-        assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::SyntaxError);
+        assert_eq!(err.code, SqlState::NotNullViolation);
+    }
+
+    #[test]
+    fn binder_rejects_insert_select_with_mismatched_column_count() {
+        let catalog = catalog_with_users();
+        let stmt = parse("insert into users select id from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_rejects_insert_select_with_mismatched_types() {
+        let catalog = catalog_with_users();
+        // The query yields (name: text, id: integer) but the table expects
+        // (id: integer, name: text), so the first column type mismatches.
+        let stmt = parse("insert into users select name, id from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 
     #[test]
