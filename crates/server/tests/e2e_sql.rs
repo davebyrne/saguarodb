@@ -59,6 +59,51 @@ async fn e2e_create_insert_select_update_delete_explain() {
 }
 
 #[tokio::test]
+async fn e2e_delete_then_reinsert_same_key_succeeds() {
+    // MVCC DELETE stamps xmax in place (no tombstone) and retains index entries, so
+    // re-inserting the deleted primary key now succeeds: the committed-deleted
+    // version no longer blocks it.
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada')")
+        .await
+        .unwrap();
+    server
+        .simple_query("delete from users where id = 1")
+        .await
+        .unwrap();
+
+    // The deleted row is hidden.
+    let rows = server
+        .simple_query("select id, name from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    // Re-inserting the same key now succeeds (previously a tombstone-then-reinsert;
+    // now a committed-delete + insert).
+    server
+        .simple_query("insert into users (id, name) values (1, 'Bea')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, name from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Bea".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn e2e_create_index_and_unique_constraint() {
     let server = TestServer::start().await.unwrap();
 

@@ -42,6 +42,84 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
 }
 
 #[tokio::test]
+async fn committed_delete_stays_hidden_after_restart() {
+    // A committed autocommit DELETE stamps xmax via HeapUpdateHeader; recovery must
+    // replay that redo so the deleted row stays hidden by visibility after restart.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (2, 'Grace')")
+            .await
+            .unwrap();
+        server
+            .simple_query("delete from users where id = 1")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+
+    // Only Grace survives the restart; the committed delete of Ada is replayed.
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string()), Some("Grace".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn delete_then_reinsert_survives_restart() {
+    // delete-then-reinsert of the same primary key now succeeds (the committed
+    // deleted version no longer blocks it); recovery replays the delete and the
+    // re-insert, leaving the re-inserted row visible.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server
+            .simple_query("delete from users where id = 1")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Bea')")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Bea".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn uncommitted_wal_record_is_ignored_on_restart() {
     let dir = tempfile::tempdir().unwrap();
     write_uncommitted_record_for_test(dir.path()).unwrap();

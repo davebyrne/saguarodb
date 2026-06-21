@@ -376,7 +376,9 @@ impl PageBackedStorageEngine {
     }
 
     /// Mark a row dead and log its redo record (full-page image on first touch
-    /// since the last checkpoint, else a `HeapDelete` delta).
+    /// since the last checkpoint, else a `HeapDelete` delta). Still used by
+    /// `UPDATE`'s relocate path (B4.9 will retire that); MVCC `DELETE` no longer
+    /// tombstones — it stamps `xmax` via [`Self::stamp_xmax_logged`].
     fn delete_row_logged(&self, location: RowLocation, txn_id: u64) -> Result<bool> {
         let mut guard = self
             .buffer_pool
@@ -408,6 +410,67 @@ impl PageBackedStorageEngine {
             page::set_page_lsn(guard.data_mut(), lsn);
             Ok(deleted)
         }
+    }
+
+    /// Stamp `xmax = txn_id` on the version at `location` **in place** and log its
+    /// redo record (a full-page image on first touch since the last checkpoint,
+    /// else a `HeapUpdateHeader` delta). The line pointer stays `NORMAL`: the tuple
+    /// is physically present and is hidden purely by visibility once the deleter
+    /// commits (`docs/specs/mvcc.md` §3.2 invariant 1). `t_ctid` stays
+    /// `INVALID_TID` (a delete has no successor version) and `infomask` is carried
+    /// through unchanged (no hint bits set here — that is the optional commit 10).
+    /// This is the MVCC `DELETE` write; it never removes the tuple or its index
+    /// entries (VACUUM reclaims them, Milestone F).
+    fn stamp_xmax_logged(&self, location: RowLocation, infomask: u16, txn_id: u64) -> Result<()> {
+        let mut guard = self
+            .buffer_pool
+            .write_page(location.file_id, location.page_num, txn_id)?;
+        if guard.take_needs_fpi() {
+            // Mutate the header first, then capture the page in a full-page image.
+            // Keep the existing page-LSN on this in-place stamp; the FPI append
+            // below assigns the record's LSN as the new page-LSN.
+            let current_lsn = page::page_lsn(guard.data());
+            page::set_tuple_header(
+                guard.data_mut(),
+                location.slot_num,
+                txn_id,
+                crate::codec::INVALID_TID,
+                infomask,
+                current_lsn,
+            )?;
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::FullPageImage {
+                    file_id: location.file_id,
+                    page_num: location.page_num,
+                    image: guard.data().to_vec(),
+                },
+            })?;
+            page::set_page_lsn(guard.data_mut(), lsn);
+        } else {
+            let lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::HeapUpdateHeader {
+                    file_id: location.file_id,
+                    page_num: location.page_num,
+                    slot: location.slot_num,
+                    xmax: txn_id,
+                    t_ctid: crate::codec::INVALID_TID,
+                    infomask,
+                },
+            })?;
+            page::set_tuple_header(
+                guard.data_mut(),
+                location.slot_num,
+                txn_id,
+                crate::codec::INVALID_TID,
+                infomask,
+                lsn,
+            )?;
+        }
+        Ok(())
     }
 
     /// Read the *current physical* row at `location`, ignoring snapshot
@@ -460,6 +523,46 @@ impl PageBackedStorageEngine {
             return Ok(None);
         }
         Ok(Some(decoded.row))
+    }
+
+    /// Locate the single version of `key` visible to `snapshot` from `current_txn`
+    /// and return its heap location together with the version's current `infomask`
+    /// (`docs/specs/mvcc.md` §6). The primary-key index may carry an entry per
+    /// version (B4); each candidate TID is decoded at its *physical* header and the
+    /// visibility predicate ([`is_visible`]) settles which one this snapshot sees.
+    /// Under snapshot isolation at most one version of a key is visible, so the
+    /// first visible candidate is the row the executor matched. Returns `None` when
+    /// no version is visible (already deleted, aborted, or never present) — the
+    /// caller treats that as "no row" (a no-op delete). A DEAD/UNUSED line pointer
+    /// (`read_row` ⇒ `None`) is a reclaimed slot and is skipped.
+    fn locate_visible_version(
+        &self,
+        schema: &TableSchema,
+        index_btree: &BTree<'_, RowLocation>,
+        key: &Key,
+        snapshot: &Snapshot,
+        current_txn: u64,
+    ) -> Result<Option<(RowLocation, u16)>> {
+        for location in index_btree.scan_key(key)? {
+            let readable = self
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)?;
+            let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
+                continue;
+            };
+            let decoded = decode_row(schema, &bytes)?;
+            if is_visible(
+                decoded.xmin,
+                decoded.xmax,
+                decoded.infomask,
+                snapshot,
+                current_txn,
+                self.txn_status_view(),
+            ) {
+                return Ok(Some((location, decoded.infomask)));
+            }
+        }
+        Ok(None)
     }
 
     /// Whether any existing version indexed under `key` in `index_btree` **conflicts**
@@ -577,26 +680,21 @@ impl StorageEngine for PageBackedStorageEngine {
             return Ok(false);
         };
         let btree = self.btree(index_fid);
-        let Some(location) = btree.search(key)? else {
+        // Locate the single version this statement's snapshot sees (the row the
+        // executor matched). If none is visible the key was already deleted or is
+        // absent, so the delete affects no row — preserve the no-op semantics.
+        let Some((location, infomask)) =
+            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, ctx.txn_id)?
+        else {
             return Ok(false);
         };
 
-        let indexes = self.table_indexes(table)?;
-        if !indexes.is_empty() {
-            let row = self.read_location(&schema, location)?.ok_or_else(|| {
-                storage_internal("primary-key index points to a dead row during delete")
-            })?;
-            for index in &indexes {
-                let (entry_key, _has_null) = secondary_index_key(&schema, index, &row)?;
-                // The secondary value is the heap TID; remove the specific
-                // (entry_key, location) entry.
-                self.secondary_btree(index.id)
-                    .remove(ctx.txn_id, &entry_key, &location)?;
-            }
-        }
-
-        self.delete_row_logged(location, ctx.txn_id)?;
-        btree.remove(ctx.txn_id, key, &location)?;
+        // MVCC delete: stamp xmax on the still-NORMAL line pointer in place. The
+        // tuple and *all* its index entries (PK and secondary) are retained — the
+        // row is hidden by visibility (xmax committed ⇒ invisible to later
+        // snapshots), and VACUUM (Milestone F) reclaims the dead version and its
+        // entries. No tombstone, no index-entry removal.
+        self.stamp_xmax_logged(location, infomask, ctx.txn_id)?;
         Ok(true)
     }
 
@@ -1061,7 +1159,7 @@ mod visibility_tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use common::{
-        ColumnDef, DataType, IndexSchema, Key, KeyRange, PageFlushInfo, Row, Snapshot,
+        ColumnDef, DataType, IndexSchema, Key, KeyRange, PageFlushInfo, Row, RowId, Snapshot,
         StatementContext, TableSchema, Value,
     };
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
@@ -1165,6 +1263,33 @@ mod visibility_tests {
                 lsn,
             )
             .unwrap();
+        }
+
+        /// The heap TIDs the primary-key index carries for `key`, read straight
+        /// from the B-tree (no visibility filtering), so a test can assert that a
+        /// deleted version's index entry is *retained* rather than removed.
+        fn pk_index_tids(&self, key: &Key) -> Vec<super::RowLocation> {
+            self.engine
+                .btree(crate::heap::index_file_id(TABLE_ID))
+                .scan_key(key)
+                .unwrap()
+        }
+
+        /// Decode the *physical* tuple header at `location` (ignoring snapshot
+        /// visibility). Returns `None` when the line pointer is not NORMAL/live
+        /// (DEAD/UNUSED), so a caller can assert both "the slot is still NORMAL"
+        /// and "xmax was stamped".
+        fn decode_physical(
+            &self,
+            location: super::RowLocation,
+        ) -> Option<crate::codec::DecodedRow> {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)
+                .unwrap();
+            let bytes = crate::page::read_row(readable.data(), location.slot_num).unwrap()?;
+            Some(crate::codec::decode_row(&users_schema(), &bytes).unwrap())
         }
     }
 
@@ -1571,5 +1696,188 @@ mod visibility_tests {
             .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(3, "amy"))
             .unwrap_err();
         assert_eq!(err.code, common::SqlState::UniqueViolation);
+    }
+
+    // --- MVCC DELETE: stamp xmax in place, retain entries (Milestone B commit 8) ---
+
+    /// A committed table with one committed-live row and a `users_name` secondary
+    /// index, ready for the DELETE tests below.
+    fn fixture_with_one_row_and_index() -> (Fixture, RowId) {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.engine.create_index(&setup, &name_index()).unwrap();
+        fixture.commit(100);
+
+        let rid = fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "alive"))
+            .unwrap();
+        fixture.commit(10);
+        (fixture, rid)
+    }
+
+    /// A committed DELETE hides the row from a *later* snapshot through both a
+    /// sequential scan and a secondary index scan — external behavior is unchanged.
+    #[test]
+    fn committed_delete_hides_row_from_seq_and_index_scans() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        // Deleter txn 20 (degenerate own snapshot) removes the row, then commits.
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // A reader whose snapshot is after the deleter sees no row, via either scan.
+        let reader = ctx(0, snapshot(30, vec![]));
+
+        let mut seq = fixture
+            .engine
+            .scan_range(&reader, TABLE_ID, &KeyRange::All)
+            .unwrap();
+        assert!(seq.next().unwrap().is_none());
+
+        let mut idx = fixture
+            .engine
+            .index_scan(&reader, TABLE_ID, name_index().id, &KeyRange::All)
+            .unwrap();
+        assert!(idx.next().unwrap().is_none());
+
+        // And a point get is hidden too.
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            None
+        );
+    }
+
+    /// MVCC DELETE stamps `xmax` on a *NORMAL* line pointer in place and **retains**
+    /// the index entries: the tuple lingers physically (no tombstone) and the
+    /// primary-key index still points at it (VACUUM reclaims both later).
+    #[test]
+    fn delete_keeps_slot_normal_stamps_xmax_and_retains_index_entry() {
+        let (fixture, rid) = fixture_with_one_row_and_index();
+        let location = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+
+        // Before: the PK index has one entry and the slot is NORMAL (decodes, no xmax).
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![location]);
+        let before = fixture.decode_physical(location).expect("slot is NORMAL");
+        assert_eq!(before.xmax, common::INVALID_XID);
+
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // After: the line pointer is still NORMAL (decode succeeds, not DEAD) and
+        // carries xmax = the deleter; the index entry is unchanged (retained).
+        let after = fixture
+            .decode_physical(location)
+            .expect("slot stays NORMAL after an MVCC delete");
+        assert_eq!(after.xmax, 20);
+        assert_eq!(after.t_ctid, crate::codec::INVALID_TID);
+        assert_eq!(after.row, row(1, "alive"));
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![location]);
+    }
+
+    /// DELETE then re-INSERT of the same primary key now SUCCEEDS: the
+    /// committed-deleted version no longer blocks the re-insert (the new capability
+    /// this commit unlocks). The live version is the re-inserted one.
+    #[test]
+    fn delete_then_reinsert_same_pk_succeeds() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // Re-insert the same key: the committed-deleted version does not conflict.
+        fixture
+            .engine
+            .insert(
+                &ctx(21, snapshot(22, vec![])),
+                TABLE_ID,
+                row(1, "reinserted"),
+            )
+            .unwrap();
+        fixture.commit(21);
+
+        // The live version is the re-inserted row, visible to a later snapshot.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "reinserted"))
+        );
+        // Internally both versions' PK entries linger (the old deleted one and the
+        // new live one), pending VACUUM.
+        assert_eq!(fixture.pk_index_tids(&key(1)).len(), 2);
+    }
+
+    /// Deleting a key with no visible version is a no-op (`Ok(false)`), matching the
+    /// missing-row semantics: a second DELETE of an already-deleted key affects no
+    /// row.
+    #[test]
+    fn delete_of_already_deleted_key_is_a_no_op() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // The row is already committed-deleted; a later deleter sees nothing to
+        // delete.
+        assert!(
+            !fixture
+                .engine
+                .delete(&ctx(21, snapshot(22, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+    }
+
+    /// An *aborted* DELETE leaves the row visible: the stamped `xmax` belongs to an
+    /// aborted deleter, so the delete never took effect.
+    #[test]
+    fn aborted_delete_leaves_row_visible() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(20, snapshot(21, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.abort(20);
+
+        // The deleter aborted, so a later reader still sees the row.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "alive"))
+        );
     }
 }

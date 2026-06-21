@@ -60,7 +60,9 @@ Each table is page-backed. Full rows live in heap pages; a durable, non-clustere
 - `get` does a primary-key lookup through the B-tree.
 - `scan` / `scan_range` walk the primary-key B-tree leaves in key order and read rows from their heap locations.
 - `index_scan` walks a secondary index, which points directly at heap TIDs, and reads each row from its heap location (no primary-key indirection; see Secondary Indexes).
-- `delete` / `update` keep every secondary index in sync with the heap.
+- `delete` marks the visible version deleted in place (MVCC delete; see below) and
+  retains its index entries. `update` keeps every secondary index in sync with the
+  heap.
 
 ### Snapshot visibility on reads
 
@@ -84,10 +86,12 @@ results are unchanged from the pre-MVCC engine.
   every candidate TID from the index and visibility-checks each at the heap; the
   forward `t_ctid` chain is not followed for `SELECT` (it serves update-locating
   and conflict detection in later milestones).
-- **Internal index maintenance is unfiltered.** `delete`/`update` and index
-  backfill read the *current physical* tuple (not the snapshot-visible version) to
-  recompute index keys, so they use the unfiltered heap read, not the
-  visibility-aware one.
+- **Internal index maintenance is unfiltered.** `update` and index backfill read
+  the *current physical* tuple (not the snapshot-visible version) to recompute
+  index keys, so they use the unfiltered heap read, not the visibility-aware one.
+  `delete` instead locates the *visible* version (the row the executor matched) via
+  the visibility predicate, then stamps its `xmax` in place; it removes no index
+  entry.
 
 ## Page Format
 
@@ -132,11 +136,13 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
 - `REDIRECT` (`3`) — points at another slot on the same page. *Reserved for HOT
   (Milestone H); no path produces it yet.*
 
-The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly today's
-"live" slot and `DEAD` is today's tombstoned slot; this milestone is a renaming
-with no behavior change (still one version per row, and `delete_row` still
-tombstones to `DEAD`). `validate` accepts only `NORMAL` and `DEAD` flags on a
-data page (the two states this milestone produces); any other value is corruption.
+The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly the
+former "live" slot and `DEAD` is the former tombstoned slot. MVCC `delete` no
+longer tombstones — it stamps `xmax` on a still-`NORMAL` line pointer (see MVCC
+Delete below), so the deleted tuple lingers physically until VACUUM. The `DEAD`
+state is now produced only by `update`'s relocate path (`delete_row`), retired in
+Milestone B4.9. `validate` accepts only `NORMAL` and `DEAD` flags on a data page
+(the two states produced today); any other value is corruption.
 
 **Stable `(page, slot)` contract.** An index entry references a
 `(page, line-pointer-slot)`. The tuple bytes a line pointer names may later be
@@ -157,8 +163,44 @@ not compacted. The header offsets live solely in
 byte range, so `page.rs` never duplicates the header layout. A non-live
 (`DEAD`/`UNUSED`/out-of-bounds) slot or a non-v2 tuple is a misuse and returns a
 structured `DbError` rather than panicking. This is the substrate for `UPDATE`
-/`DELETE` version stamping (Milestone B commits 8–9); it is not yet wired to the
-WAL (`HeapUpdateHeader`, a later commit) or emitted by the engine.
+/`DELETE` version stamping (Milestone B commits 8–9). MVCC `delete` already emits
+it under the WAL (`HeapUpdateHeader`; see MVCC Delete below); `update`'s version
+stamping arrives in B4.9.
+
+### MVCC Delete
+
+`delete(ctx, table, key)` marks the **visible** version of `key` deleted in place
+rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
+
+1. **Locate the visible version.** The primary-key index may carry an entry per
+   version, so `delete` collects the candidate TIDs (`scan_key(key)`), decodes each
+   tuple's physical header, and selects the one visible to the statement's snapshot
+   (`ctx.snapshot`/`ctx.txn_id`) via `common::is_visible` — the row the executor
+   matched (under snapshot isolation at most one version of a key is visible). If
+   none is visible (already deleted, aborted, or absent), the delete affects no row
+   and returns `Ok(false)` (the missing-row semantics).
+2. **Stamp `xmax` in place.** It stamps `xmax = ctx.txn_id` on that version's tuple
+   header through the WAL-logged path — append a `HeapUpdateHeader { file_id,
+   page_num, slot, xmax = ctx.txn_id, t_ctid = INVALID_TID, infomask = unchanged }`
+   (or a `FullPageImage` on the page's first touch since the last checkpoint), then
+   apply `page::set_tuple_header` with that record's LSN. `t_ctid` stays
+   `INVALID_TID` (a delete has no successor) and `infomask` is carried through
+   unchanged (no hint bits set here — that is the optional commit 10). The line
+   pointer **stays `NORMAL`**: the tuple is physically present and is hidden purely
+   by visibility once the deleter commits.
+3. **Retain index entries.** No primary-key or secondary index entry is removed.
+   The dead version and its entries linger until VACUUM (Milestone F) reclaims them.
+
+This is the first point internal state diverges from a single-version heap: a
+deleted tuple and its index entries persist (the accepted interim cost). External
+SQL behavior is unchanged — a committed `DELETE` then `SELECT` does not see the row
+— and **delete-then-reinsert of the same key now succeeds**, because the
+committed-deleted version no longer blocks the re-insert (the uniqueness check
+ignores committed-deleted/aborted versions). On abort, the buffer pool's
+before-image undo restores the page (un-stamping `xmax`); since no index entry was
+removed, no index repair is needed. Recovery replays the `HeapUpdateHeader` redo
+(PageLSN-gated), so a committed delete stays hidden and an aborted one (no durable
+`Commit`) leaves the row visible.
 
 ## Row Serialization
 
@@ -327,8 +369,9 @@ used for a secondary index.
   bound includes all of its rows. Results are returned in index order, each read
   directly from the heap at its TID. The `StoredRow.key` is recovered from the heap
   row's primary key.
-- **Maintenance.** `insert` adds an entry to every index; `delete` removes the
-  entry computed from the row being deleted; `update` removes the old entries and
+- **Maintenance.** `insert` adds an entry to every index. `delete` removes **no**
+  entry — it stamps the deleted version's `xmax` in place and retains its entries
+  (VACUUM reclaims them; see MVCC Delete). `update` removes the old entries and
   inserts the new ones (all removals before any insertion, so an unchanged unique
   value is not seen as a duplicate). A unique-index conflict during `insert` or
   `update` returns `SqlState::UniqueViolation`.
@@ -360,7 +403,7 @@ fsync; `sync_all` fsyncs all open files and the directory; `page_count` returns 
 file's on-disk extent in pages, used to seed page allocation after recovery.
 
 `apply_physical_redo(page, lsn, kind)` replays one physiological redo record
-(`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) onto a page buffer, gated by
+(`HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`) onto a page buffer, gated by
 the page-LSN: a record whose effect is already present (`page_lsn(page) >= lsn`) is
 skipped, making replay idempotent. `FullPageImage` is validated to be exactly
 `PAGE_SIZE` bytes before install. Recovery uses it to redo committed records after
@@ -371,7 +414,7 @@ the checkpoint LSN.
 Normal data operations append physiological redo records as they mutate pages, stamping the page-LSN with each record's LSN:
 
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
-- A row delete logs `HeapDelete { file_id, page_num, slot }` (or a `FullPageImage` on first touch). An update is a delete followed by an insert.
+- An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). `HeapDelete { file_id, page_num, slot }` is still logged by `update`'s relocate path (an update is a delete followed by an insert), retired in Milestone B4.9.
 - Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
 

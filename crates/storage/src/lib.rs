@@ -542,7 +542,9 @@ mod tests {
         assert!(index_ids(&harness, "Ada").is_empty());
         assert_eq!(index_ids(&harness, "Lovelace"), vec![1]);
 
-        // Delete removes the entry.
+        // Delete hides the row from the index scan. The entry is now *retained*
+        // internally (MVCC delete stamps xmax in place; VACUUM reclaims it), but
+        // the deleted version is invisible, so an index scan returns no id.
         harness.storage.delete(&ctx, 1, &pk(1)).unwrap();
         assert!(index_ids(&harness, "Lovelace").is_empty());
     }
