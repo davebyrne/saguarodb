@@ -121,7 +121,7 @@ psql / client -> | server            |
                                                               |
                                                               v
                 +----------+     +---------+     +------+     +-------+
-                | catalog  |     | storage | --> |buffer| <-> |control|
+                | catalog  |     | storage | --> |buffer|     |control|
                 | schemas  |     | tables  |     |pages |     |record |
                 +----------+     +----+----+     +------+     +-------+
                                       |
@@ -138,7 +138,7 @@ server
   -> protocol, parser, planner, executor, control, storage, buffer, wal,
      catalog, common
 
-executor -> planner, parser, storage, catalog, common
+executor -> planner, storage, catalog, common
 planner  -> parser, catalog, common
 storage  -> buffer, wal, common
 control  -> common
