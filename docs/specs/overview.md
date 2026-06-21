@@ -23,7 +23,6 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 ### V1 Non-Goals
 
 - Multi-statement transactions / MVCC (designed for, not implemented)
-- Secondary indexes (designed for, not implemented)
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
 - Replication
@@ -232,6 +231,7 @@ pub enum SqlState {
     NumericValueOutOfRange,     // 22003
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
+    QueryCanceled,              // 57014
     IoError,                    // 58030
     InternalError,              // XX000
     // ... extensible
@@ -331,7 +331,17 @@ pub enum ClientMessage {
     Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
     GssEncRequest,
-    Query(String),
+    CancelRequest { process_id: i32, secret_key: i32 },  // cancel an in-flight query
+    Query(String),                                       // simple query
+    // Extended query protocol:
+    Parse { name: String, query: String, param_types: Vec<i32> },
+    Bind { portal: String, statement: String, param_formats: Vec<i16>,
+           params: Vec<Option<Vec<u8>>>, result_formats: Vec<i16> },
+    Describe { kind: StatementKind, name: String },
+    Execute { portal: String, max_rows: i32 },
+    Close { kind: StatementKind, name: String },
+    Sync,
+    Flush,
     Terminate,
 }
 
@@ -340,11 +350,18 @@ pub enum ServerMessage {
     SslAccepted,                // single 'S' byte
     SslRejected,                // single 'N' byte
     AuthenticationOk,
+    BackendKeyData { process_id: i32, secret_key: i32 },  // identity for CancelRequest
     ParameterStatus { key: String, value: String },
     ReadyForQuery,
-    RowDescription(Vec<ColumnInfo>),
-    DataRow(Vec<Option<String>>),  // text-format values
+    RowDescription { columns: Vec<ColumnInfo>, formats: Vec<i16> },  // per-field 0=text,1=binary
+    DataRow(Vec<Option<Vec<u8>>>),  // each column already encoded to its wire bytes
     CommandComplete(String),
+    // Extended query protocol:
+    ParseComplete,
+    BindComplete,
+    CloseComplete,
+    ParameterDescription(Vec<i32>),
+    NoData,
     ErrorResponse { severity: String, code: String, message: String },
 }
 
@@ -458,7 +475,7 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, or `EXPLAIN`.
 - Server `ErrorResponse`: tag `E`, fields `S` severity, `C` SQLSTATE, `M` message, then final `\0`.
 
-Type mapping uses PostgreSQL OIDs `INTEGER` as `INT8` (`20`, size `8`), `TEXT` (`25`, size `-1`), and `BOOLEAN` (`16`, size `1`). V1 rows are text format only: integers are decimal i64 strings, text is raw UTF-8, booleans are `t`/`f`, and null fields use length `-1`.
+Type mapping uses PostgreSQL OIDs `INTEGER` as `INT8` (`20`, size `8`), `TEXT` (`25`, size `-1`), and `BOOLEAN` (`16`, size `1`). The simple query path always sends text: integers are decimal i64 strings, text is raw UTF-8, booleans are `t`/`f`, and null fields use length `-1`. The extended query protocol additionally supports binary parameters and results — `RowDescription` carries a per-field format code (`0` = text, `1` = binary) and `DataRow` carries the already-encoded wire bytes for that format.
 
 ### Server Query Service Boundary
 
@@ -1006,7 +1023,7 @@ pub trait PlanExecutor {
 }
 ```
 
-V1 has no executor cancellation token in the public crate API. A future version may add a cooperative token for CancelRequest or statement timeout without changing v1 operator semantics.
+V1 has a cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. A `CancelRequest` on a side connection sets that flag via the server's `CancelRegistry`. Operators themselves stay cancellation-free; the polling lives in the query engine, so a future statement-timeout can reuse the same token without changing operator semantics.
 
 `next_batch` has a default implementation so V1 operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
 
@@ -1676,7 +1693,7 @@ The `server` crate is the binary entry point.
 
 Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` records. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--shutdown-timeout-ms <MS>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, and `30000`. V1 parses these flags with `std::env::args`; `--port` accepts `1..=65535`, all other numeric flags must be positive nonzero integers, and invalid input prints usage to stderr and exits with code `2`.
+The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--shutdown-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, and `30000`. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). V1 parses these flags with `std::env::args`; `--port` accepts `1..=65535`, all other numeric flags must be positive nonzero integers, and invalid input prints usage to stderr and exits with code `2`.
 
 ### Connection Handling
 
@@ -1732,6 +1749,8 @@ pub struct Config {
     pub checkpoint_every_n_commits: u64, // default: 100
     pub checkpoint_wal_bytes: u64,    // default: 64 * 1024 * 1024
     pub shutdown_timeout_ms: u64,     // default: 30000
+    pub tls_cert_file: Option<PathBuf>, // default: None (PEM cert chain)
+    pub tls_key_file: Option<PathBuf>,  // default: None (PEM private key)
 }
 ```
 

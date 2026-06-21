@@ -109,6 +109,8 @@ cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev -
 - Defaults are `--data-dir ./data`, `--port 5433`,
   `--buffer-pool-frames 1024`, `--checkpoint-every-n-commits 100`,
   `--checkpoint-wal-bytes 67108864`, and `--shutdown-timeout-ms 30000`.
+- TLS is off by default. Pass both `--tls-cert-file <PATH>` (PEM cert chain) and
+  `--tls-key-file <PATH>` (PEM private key) to enable it; setting only one is an error.
 - The server listens on `0.0.0.0:<port>` and runs in the foreground. Stop it with
   `Ctrl-C` or SIGTERM for graceful shutdown.
 - Connect with `psql` using SSL disabled, for example:

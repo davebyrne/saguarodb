@@ -3,11 +3,11 @@
 SaguaroDB is a SQL-compatible relational database written in Rust. It runs as a
 standalone server, accepts client connections over the PostgreSQL simple-query
 wire protocol, executes SQL through a parse/bind/plan/execute pipeline, and
-stores data in page-oriented table snapshots with logical WAL recovery.
+stores data in page-oriented per-table files with write-ahead-log recovery.
 
 The current implementation is SaguaroDB v1: a compact, trait-boundary database
-intended to keep the major subsystems clear while leaving room for future MVCC,
-secondary indexes, physical WAL, and richer protocol support.
+intended to keep the major subsystems clear while leaving room for future MVCC
+and richer SQL support.
 
 ## What Works
 
@@ -19,13 +19,18 @@ secondary indexes, physical WAL, and richer protocol support.
   `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`.
 - Data types: `INTEGER` (`i64`), `TEXT`, `BOOLEAN`, and `NULL`.
 - Autocommit statement execution.
-- Rule-based planning with a primary-key access path and table scans.
-- Page-backed storage with an in-memory primary-key directory.
-- Logical WAL, full manifest snapshots, checkpointing, and crash recovery.
+- Rule-based planning with primary-key, secondary-index, and table-scan access
+  paths.
+- Page-backed storage with an on-disk B-tree primary-key index.
+- `CREATE [UNIQUE] INDEX` and `DROP INDEX` with a secondary-index access path.
+- Query cancellation (PostgreSQL `CancelRequest` / `BackendKeyData`).
+- TLS/SSL connections, prepared statements, and the PostgreSQL extended query
+  protocol (`Parse`/`Bind`/`Describe`/`Execute`).
+- Physiological redo WAL with full-page-image torn-page protection,
+  in-place checkpointing, and crash recovery.
 
-V1 deliberately does not implement authentication, SSL/TLS, prepared statements,
-the PostgreSQL extended query protocol, multi-statement transactions, MVCC,
-secondary indexes, replication, or a custom wire protocol.
+V1 deliberately does not implement authentication, multi-statement
+transactions, MVCC, replication, or a custom wire protocol.
 
 ## Quick Start
 
@@ -84,6 +89,8 @@ The server accepts:
 --checkpoint-every-n-commits <N>   default 100
 --checkpoint-wal-bytes <BYTES>     default 67108864
 --shutdown-timeout-ms <MS>         default 30000
+--tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)
+--tls-key-file <PATH>              PEM private key; enables TLS (needs --tls-cert-file)
 --help                             print usage and exit 0
 ```
 
@@ -114,8 +121,8 @@ psql / client -> | server            |
                                                               |
                                                               v
                 +----------+     +---------+     +------+     +-------+
-                | catalog  |     | storage | --> |buffer| <-> |snapshot|
-                | schemas  |     | tables  |     |pages |     |files  |
+                | catalog  |     | storage | --> |buffer| <-> |control|
+                | schemas  |     | tables  |     |pages |     |record |
                 +----------+     +----+----+     +------+     +-------+
                                       |
                                       v
@@ -128,13 +135,13 @@ Crate dependency flow:
 
 ```text
 server
-  -> protocol, parser, planner, executor, snapshot, storage, buffer, wal,
+  -> protocol, parser, planner, executor, control, storage, buffer, wal,
      catalog, common
 
-executor -> planner, storage, catalog, common
+executor -> planner, parser, storage, catalog, common
 planner  -> parser, catalog, common
 storage  -> buffer, wal, common
-snapshot -> buffer, common
+control  -> common
 protocol -> common
 parser   -> common
 buffer   -> common
@@ -154,11 +161,11 @@ crates/
   catalog/   table metadata, stable IDs, schema snapshots
   planner/   binding, logical plans, physical plans, EXPLAIN formatting
   executor/  expression evaluation and volcano-style operators
-  storage/   page-backed table storage and recovery operations
-  buffer/    page cache, latches, dirty tracking, rollback, snapshot iteration
-  wal/       logical write-ahead log, commit records, replay iterators
-  snapshot/  manifest, snapshot generation directories, table/catalog files
-  protocol/  PostgreSQL simple-query codec and connection state
+  storage/   page-backed table storage, on-disk B-tree index, recovery
+  buffer/    page cache, latches, dirty tracking, rollback, in-place flushing
+  wal/       physiological redo write-ahead log, commit records, replay iterators
+  control/   manifest.dat control record: redo boundary plus catalog snapshot
+  protocol/  PostgreSQL wire codec (simple and extended query) and connection state
   server/    binary, startup/recovery, TCP listener, query orchestration
 ```
 
@@ -203,23 +210,29 @@ the server rolls back storage, buffer, and catalog state for that statement.
 
 ## Data Files
 
-The data directory contains one logical WAL file and full snapshot generations.
-`manifest.dat` is the source of truth for the current snapshot.
+The data directory contains one write-ahead-log file, the control record, and
+per-table heap and index files. `manifest.dat` is the control record: the redo
+boundary (`checkpoint_lsn`), the live table ids, and the serialized catalog,
+written atomically as a single CRC-checked envelope. Each table persists in
+place to its own files under `heap/`: the row heap at `<TableId>.heap`, the
+primary-key B-tree at `<TableId>.idx`, and any secondary index at
+`<IndexId>.sidx`.
 
 ```text
 data/
   wal.dat
   manifest.dat
   manifest.dat.tmp
-  snap_<generation>/
-    catalog.dat
-    table_<TableId>.tbl
+  heap/
+    <TableId>.heap
+    <TableId>.idx
+    <IndexId>.sidx
 ```
 
-At runtime, the buffer pool holds clean pages loaded from the current snapshot
-plus dirty pages created by committed and in-flight statements. V1 does not
-flush dirty pages individually. Dirty table pages reach disk only through a full
-snapshot checkpoint.
+At runtime, the buffer pool holds clean pages loaded from the heap and index
+files plus dirty pages created by committed and in-flight statements. Dirty
+pages are flushed in place to their home files once their dirtying transaction
+has committed and its page-LSN is WAL-durable.
 
 ```text
              normal operation
@@ -228,51 +241,49 @@ snapshot checkpoint.
                 |
                 v
         +-----------------+
-        | logical WAL     |  fsynced on every commit
+        | redo WAL        |  fsynced on every commit
         | data/wal.dat    |
         +-----------------+
                 |
-                | records changes since last snapshot
+                | records page changes since the redo boundary
                 v
         +-----------------+
-        | buffer pool     |  dirty pages stay in memory
+        | buffer pool     |  dirty pages flushed in place
         +-----------------+
                 |
-                | checkpoint writes complete snapshot
+                | checkpoint flushes dirty pages, advances the redo boundary
                 v
         +-----------------+
-        | snap_<gen>/     |  table files + catalog.dat
+        | heap/ files     |  per-table heap + index pages, written in place
         +-----------------+
                 |
                 v
         +-----------------+
-        | manifest.dat    |  current generation + checkpoint_lsn
+        | manifest.dat    |  checkpoint_lsn + catalog snapshot
         +-----------------+
 ```
 
 ## Checkpointing
 
 Checkpoints are triggered after a configured number of committed statements, a
-configured amount of WAL growth, or graceful shutdown.
+configured amount of WAL growth, or graceful shutdown. A checkpoint flushes the
+dirty pages changed since the last one, so its cost is O(pages changed), not
+O(database size).
 
 ```text
 checkpoint
     |
     +-- take global write guard
     |
-    +-- choose checkpoint_lsn from WAL high-water mark
+    +-- flush WAL so every page it describes is durable
     |
-    +-- compose table pages
-    |       clean pages from current snapshot
-    |       overlaid with dirty pages from buffer pool
+    +-- flush committed dirty pages in place to heap/index files
     |
-    +-- write new snap_<generation>/
-    |       catalog.dat
-    |       table_<TableId>.tbl
+    +-- fsync the heap/index files
     |
-    +-- fsync snapshot files and directory
+    +-- choose checkpoint_lsn from the WAL high-water mark
     |
-    +-- write manifest.dat.tmp
+    +-- write manifest.dat.tmp (checkpoint_lsn + table ids + catalog)
     |
     +-- fsync manifest.dat.tmp
     |
@@ -280,43 +291,39 @@ checkpoint
     |
     +-- fsync data directory
     |
+    +-- append WAL Checkpoint metadata record and fsync
+    |
+    +-- truncate WAL records before checkpoint_lsn
+    |
     +-- mark buffer pages clean
-    |
-    +-- append WAL Checkpoint metadata record
-    |
-    +-- fsync WAL and truncate records before checkpoint_lsn
 ```
 
-The previous snapshot is not deleted until the new manifest is durable. If the
-server crashes mid-checkpoint, recovery uses whichever manifest survived and
-cleans orphan snapshot directories on the next startup.
+The control record is the commit point: it is written only after the heap and
+index pages it describes are durable, and the WAL prefix is truncated only after
+the control record is durable. If the server crashes mid-checkpoint, recovery
+falls back to the previous redo boundary, where this cycle's full-page images
+repair any torn page writes.
 
 ## Recovery
 
-Startup always begins from the manifest snapshot and replays committed WAL
-records after the manifest's `checkpoint_lsn`.
+Startup reads the control record for the redo boundary and catalog, then replays
+committed WAL records after `checkpoint_lsn` onto the heap and index pages.
 
 ```text
 server startup
     |
-    +-- open snapshot manager
-    |
-    +-- open data/wal.dat
+    +-- open control store, heap page store, and data/wal.dat
     |
     +-- read manifest.dat
     |       |
     |       +-- absent: fresh empty database
-    |       +-- present: load snap_<generation>/
+    |       +-- present: load checkpoint_lsn and the serialized catalog
     |
-    +-- load catalog.dat into catalog
-    |
-    +-- load table pages into buffer pool
-    |
-    +-- install schemas into storage
-    |
-    +-- rebuild in-memory primary-key directories from pages
+    +-- install table and secondary-index schemas into storage
     |
     +-- replay committed WAL records with LSN > checkpoint_lsn
+    |       page-LSN gating makes redo idempotent; torn or missing pages are
+    |       zeroed so a FullPageImage / HeapInit re-establishes them
     |
     +-- if replay changed state, run a checkpoint
     |
@@ -325,9 +332,11 @@ server startup
     +-- bind TCP listener
 ```
 
-Recovery operations update catalog, storage pages, and in-memory primary-key
-directories without appending new WAL records. Normal storage operations append
-WAL after startup switches to normal mode.
+Recovery replays redo records onto heap and index pages, and applies catalog and
+schema records, without appending new WAL records. The primary-key index is an
+on-disk B-tree recovered through the same redo path, so there is no in-memory
+directory to rebuild. Normal storage operations append WAL after startup switches
+to normal mode.
 
 ## Development
 
