@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::{ColumnInfo, DataType, DbError, Result, Row, SqlState, Value};
+use common::{ColumnInfo, DataType, DbError, Result, Row, SqlState};
 use executor::ExecutionResult;
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -221,9 +221,12 @@ where
     match result {
         ExecutionResult::Query { columns, rows } => {
             let mut messages = Vec::with_capacity(rows.len() + 3);
-            messages.push(ServerMessage::RowDescription(columns));
+            messages.push(ServerMessage::RowDescription {
+                columns,
+                formats: Vec::new(),
+            });
             for row in rows {
-                messages.push(ServerMessage::DataRow(format_row(&row)));
+                messages.push(ServerMessage::DataRow(encode_row(&row, 0)?));
             }
             let count = messages.len().saturating_sub(1);
             messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
@@ -247,13 +250,16 @@ where
                 socket,
                 codec,
                 &[
-                    ServerMessage::RowDescription(vec![ColumnInfo {
-                        name: "QUERY PLAN".to_string(),
-                        data_type: DataType::Text,
-                        table_id: None,
-                        column_id: None,
-                    }]),
-                    ServerMessage::DataRow(vec![Some(text)]),
+                    ServerMessage::RowDescription {
+                        columns: vec![ColumnInfo {
+                            name: "QUERY PLAN".to_string(),
+                            data_type: DataType::Text,
+                            table_id: None,
+                            column_id: None,
+                        }],
+                        formats: Vec::new(),
+                    },
+                    ServerMessage::DataRow(vec![Some(text.into_bytes())]),
                     ServerMessage::CommandComplete("EXPLAIN".to_string()),
                     ServerMessage::ReadyForQuery,
                 ],
@@ -280,18 +286,13 @@ where
     Ok(())
 }
 
-fn format_row(row: &Row) -> Vec<Option<String>> {
-    row.values.iter().map(format_value).collect()
-}
-
-fn format_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::Boolean(true) => Some("t".to_string()),
-        Value::Boolean(false) => Some("f".to_string()),
-        Value::Integer(value) => Some(value.to_string()),
-        Value::Text(value) => Some(value.clone()),
-    }
+/// Encode each column of a result row to its wire bytes in the given format
+/// code (`0` = text, `1` = binary), or `None` for SQL NULL.
+fn encode_row(row: &Row, format: i16) -> Result<Vec<Option<Vec<u8>>>> {
+    row.values
+        .iter()
+        .map(|value| protocol::encode_value(value, format))
+        .collect()
 }
 
 fn command_complete_tag(command: &str, count: u64) -> String {

@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use common::{ColumnInfo, DataType, DbError, Result, SqlState};
+use common::{ColumnInfo, DataType, DbError, Result, SqlState, Value};
 
 use crate::{ClientMessage, ServerMessage, StatementKind};
 
@@ -175,14 +175,15 @@ impl ProtocolCodec for PostgresCodec {
                 encode_server_message(b'S', body)
             }
             ServerMessage::ReadyForQuery => encode_server_message(b'Z', vec![b'I']),
-            ServerMessage::RowDescription(columns) => {
+            ServerMessage::RowDescription { columns, formats } => {
                 let mut body = Vec::new();
                 put_i16(
                     &mut body,
                     checked_i16(columns.len(), "too many row description columns"),
                 );
-                for column in columns {
-                    encode_column_info(&mut body, column);
+                for (index, column) in columns.iter().enumerate() {
+                    let format = formats.get(index).copied().unwrap_or(0);
+                    encode_column_info(&mut body, column, format);
                 }
                 encode_server_message(b'T', body)
             }
@@ -194,8 +195,7 @@ impl ProtocolCodec for PostgresCodec {
                 );
                 for value in values {
                     match value {
-                        Some(value) => {
-                            let bytes = value.as_bytes();
+                        Some(bytes) => {
                             put_i32(
                                 &mut body,
                                 checked_i32(bytes.len(), "data row value too large"),
@@ -433,7 +433,7 @@ fn encode_server_message(tag: u8, body: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo) {
+fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo, format: i16) {
     let (type_oid, type_size) = postgres_type(&column.data_type);
     put_cstr(body, &column.name);
     put_i32(body, 0);
@@ -441,7 +441,99 @@ fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo) {
     put_i32(body, type_oid);
     put_i16(body, type_size);
     put_i32(body, -1);
-    put_i16(body, 0);
+    put_i16(body, format);
+}
+
+/// PostgreSQL wire format code for a single value: text (`0`) or binary (`1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueFormat {
+    Text,
+    Binary,
+}
+
+impl ValueFormat {
+    fn from_code(code: i16) -> Result<Self> {
+        match code {
+            0 => Ok(ValueFormat::Text),
+            1 => Ok(ValueFormat::Binary),
+            _ => Err(protocol_error("unsupported value format code")),
+        }
+    }
+}
+
+/// Encode a value to its PostgreSQL wire bytes in the given format code (`0` =
+/// text, `1` = binary), or `None` for SQL NULL. For `TEXT` the text and binary
+/// encodings are identical (raw UTF-8 bytes).
+pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
+    let format = ValueFormat::from_code(format)?;
+    let bytes = match value {
+        Value::Null => return Ok(None),
+        Value::Boolean(flag) => match format {
+            ValueFormat::Text => {
+                if *flag {
+                    b"t".to_vec()
+                } else {
+                    b"f".to_vec()
+                }
+            }
+            ValueFormat::Binary => vec![u8::from(*flag)],
+        },
+        Value::Integer(int) => match format {
+            ValueFormat::Text => int.to_string().into_bytes(),
+            ValueFormat::Binary => int.to_be_bytes().to_vec(),
+        },
+        Value::Text(text) => text.clone().into_bytes(),
+    };
+    Ok(Some(bytes))
+}
+
+/// Decode a non-NULL parameter's wire bytes into a `Value` of the target type,
+/// using the given format code. (SQL NULL is represented by the absence of a
+/// value at the `Bind` layer, so it never reaches here.)
+pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Value> {
+    let format = ValueFormat::from_code(format)?;
+    match (data_type, format) {
+        (DataType::Integer, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "integer parameter")?;
+            let int = text
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| protocol_error("invalid integer parameter"))?;
+            Ok(Value::Integer(int))
+        }
+        (DataType::Integer, ValueFormat::Binary) => {
+            let array: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary integer parameter must be 8 bytes"))?;
+            Ok(Value::Integer(i64::from_be_bytes(array)))
+        }
+        (DataType::Boolean, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "boolean parameter")?;
+            parse_bool_text(text)
+        }
+        (DataType::Boolean, ValueFormat::Binary) => match bytes {
+            [0] => Ok(Value::Boolean(false)),
+            [1] => Ok(Value::Boolean(true)),
+            _ => Err(protocol_error(
+                "binary boolean parameter must be a single 0 or 1 byte",
+            )),
+        },
+        (DataType::Text, _) => Ok(Value::Text(
+            decode_utf8(bytes, "text parameter")?.to_string(),
+        )),
+    }
+}
+
+fn decode_utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str> {
+    std::str::from_utf8(bytes).map_err(|_| protocol_error(format!("{what} is not valid UTF-8")))
+}
+
+fn parse_bool_text(text: &str) -> Result<Value> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Value::Boolean(true)),
+        "f" | "false" | "n" | "no" | "off" | "0" => Ok(Value::Boolean(false)),
+        _ => Err(protocol_error("invalid boolean parameter")),
+    }
 }
 
 fn postgres_type(data_type: &DataType) -> (i32, i16) {

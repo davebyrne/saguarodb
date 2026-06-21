@@ -151,7 +151,9 @@ The codec may return errors after buffering bytes. In v1 the server treats any d
 - `Text` -> `TEXT` (`type_oid = 25`, `type_size = -1`)
 - `Boolean` -> `BOOL` (`type_oid = 16`, `type_size = 1`)
 
-V1 sends text format for all columns.
+The simple query path sends text format for all columns. The extended protocol
+lets a client request binary format (code `1`) per column via `Bind`;
+`RowDescription` then reports the chosen format code per field.
 
 ## PostgreSQL Wire Encoding Details
 
@@ -177,8 +179,8 @@ Server messages:
 - `AuthenticationOk`: tag `b'R'`, length `8`, `int32 auth_code = 0`.
 - `ParameterStatus`: tag `b'S'`, length, `key\0value\0`. Startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
 - `ReadyForQuery`: tag `b'Z'`, length `5`, status byte `b'I'`.
-- `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code = 0`.
-- `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus UTF-8 bytes, or `int32 -1` for `NULL`.
+- `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
+- `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus its wire bytes (text or binary per the `RowDescription` format codes), or `int32 -1` for `NULL`.
 - `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. V1 tags are `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, and `EXPLAIN`.
 - `ParseComplete`: tag `b'1'`, length `4`.
 - `BindComplete`: tag `b'2'`, length `4`.
@@ -193,6 +195,20 @@ Text value encoding:
 - `Text`: raw UTF-8 string bytes.
 - `Boolean`: `t` for true, `f` for false.
 - `NULL`: encoded as a `DataRow` field length of `-1`.
+
+Binary value encoding (extended protocol, format code `1`):
+
+- `Integer`: 8-byte big-endian `int64`.
+- `Boolean`: one byte, `0x01` true / `0x00` false.
+- `Text`: raw UTF-8 bytes (identical to text format).
+- `NULL`: `DataRow` field length of `-1`.
+
+`encode_value`/`decode_value` convert between `common::Value` and these wire
+encodings. Parameter decoding accepts text input (`Integer` as a decimal string,
+`Boolean` as `t`/`f`/`true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`, `Text` as raw
+bytes) or the binary encodings above, per each `Bind` parameter format code, and
+rejects malformed input (e.g. a binary `int8` that is not 8 bytes) and
+unsupported format codes.
 
 ## Non-Goals
 
@@ -214,7 +230,8 @@ Text value encoding:
 - Decodes StartupMessage (reading `user`, `database`, and `application_name`) and emits expected startup responses.
 - Startup echoes `application_name` in a `ParameterStatus`, reporting empty when the client omits it.
 - Decodes simple Query.
-- Encodes RowDescription for all v1 data types with PostgreSQL OIDs, text format, and `table_oid = 0`.
+- Encodes RowDescription for all v1 data types with PostgreSQL OIDs, the per-field format code, and `table_oid = 0`.
+- Round-trips int8/bool/text values through `encode_value`/`decode_value` in both text and binary formats, and rejects malformed binary input and unsupported format codes.
 - Encodes DataRow with `NULL` represented as null field.
 - Encodes ReadyForQuery as `b'Z'`, length `5`, status `b'I'`.
 - Encodes ErrorResponse with SQLSTATE code.

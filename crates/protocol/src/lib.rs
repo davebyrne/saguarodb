@@ -2,17 +2,17 @@ mod codec;
 mod messages;
 mod state;
 
-pub use codec::{PostgresCodec, ProtocolCodec};
+pub use codec::{PostgresCodec, ProtocolCodec, decode_value, encode_value};
 pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnInfo, DataType};
+    use common::{ColumnInfo, DataType, Value};
 
     use super::{
         ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
-        ServerMessage, StatementKind,
+        ServerMessage, StatementKind, decode_value, encode_value,
     };
 
     fn ssl_request_bytes() -> Vec<u8> {
@@ -340,6 +340,73 @@ mod tests {
         assert_eq!(read_i32(&bytes, &mut offset), 25);
     }
 
+    fn value_cases() -> Vec<(Value, DataType)> {
+        vec![
+            (Value::Integer(-42), DataType::Integer),
+            (Value::Text("hello".to_string()), DataType::Text),
+            (Value::Boolean(true), DataType::Boolean),
+            (Value::Boolean(false), DataType::Boolean),
+        ]
+    }
+
+    #[test]
+    fn value_codec_round_trips_text_and_binary() {
+        for format in [0i16, 1] {
+            for (value, data_type) in value_cases() {
+                let bytes = encode_value(&value, format).unwrap().unwrap();
+                let decoded = decode_value(&bytes, data_type, format).unwrap();
+                assert_eq!(decoded, value, "format {format}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_value_null_is_none_in_both_formats() {
+        assert_eq!(encode_value(&Value::Null, 0).unwrap(), None);
+        assert_eq!(encode_value(&Value::Null, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn binary_integer_encodes_as_eight_byte_big_endian() {
+        let bytes = encode_value(&Value::Integer(1), 1).unwrap().unwrap();
+        assert_eq!(bytes, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn text_value_encoding_is_identical_in_both_formats() {
+        let text = Value::Text("abc".to_string());
+        assert_eq!(
+            encode_value(&text, 0).unwrap(),
+            encode_value(&text, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn decode_value_rejects_malformed_input() {
+        // Binary int8 must be exactly 8 bytes.
+        assert!(decode_value(&[0, 0, 0, 1], DataType::Integer, 1).is_err());
+        // Binary bool must be a single 0/1 byte.
+        assert!(decode_value(&[2], DataType::Boolean, 1).is_err());
+        // Unparseable text integer.
+        assert!(decode_value(b"x", DataType::Integer, 0).is_err());
+        // Unsupported format code.
+        assert!(decode_value(b"x", DataType::Text, 2).is_err());
+        assert!(encode_value(&Value::Integer(1), 2).is_err());
+    }
+
+    #[test]
+    fn decode_value_accepts_common_text_boolean_forms() {
+        assert_eq!(
+            decode_value(b"TRUE", DataType::Boolean, 0).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            decode_value(b"off", DataType::Boolean, 0).unwrap(),
+            Value::Boolean(false)
+        );
+        assert!(decode_value(b"maybe", DataType::Boolean, 0).is_err());
+    }
+
     #[test]
     fn startup_state_emits_authentication_parameters_and_ready() {
         let mut state = PostgresConnectionState::new();
@@ -393,7 +460,7 @@ mod tests {
     #[test]
     fn data_row_encodes_null_field_as_negative_length() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::DataRow(vec![Some("7".to_string()), None]));
+        let bytes = codec.encode(&ServerMessage::DataRow(vec![Some(b"7".to_vec()), None]));
 
         assert!(
             bytes
@@ -497,11 +564,14 @@ mod tests {
     #[test]
     fn row_description_encodes_v1_type_oids_sizes_and_text_format() {
         let codec = PostgresCodec::new();
-        let bytes = codec.encode(&ServerMessage::RowDescription(vec![
-            column("id", DataType::Integer),
-            column("name", DataType::Text),
-            column("active", DataType::Boolean),
-        ]));
+        let bytes = codec.encode(&ServerMessage::RowDescription {
+            columns: vec![
+                column("id", DataType::Integer),
+                column("name", DataType::Text),
+                column("active", DataType::Boolean),
+            ],
+            formats: Vec::new(),
+        });
 
         assert_eq!(bytes[0], b'T');
         assert_eq!(

@@ -67,8 +67,16 @@ pub enum ServerMessage {
         value: String,
     },
     ReadyForQuery,
-    RowDescription(Vec<ColumnInfo>),
-    DataRow(Vec<Option<String>>),
+    /// Column metadata plus the wire format code (`0` = text, `1` = binary) the
+    /// values will be sent in. `formats` is parallel to `columns`; a shorter (or
+    /// empty) `formats` defaults missing columns to text.
+    RowDescription {
+        columns: Vec<ColumnInfo>,
+        formats: Vec<i16>,
+    },
+    /// One result row: each column is already encoded to its wire bytes (text or
+    /// binary per the `RowDescription` format), or `None` for SQL NULL.
+    DataRow(Vec<Option<Vec<u8>>>),
     CommandComplete(String),
     /// Extended protocol: reply to a successful Parse.
     ParseComplete,
