@@ -68,13 +68,14 @@ impl FileWalManager {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self>;
 }
 
-pub trait WalManager: Send + Sync {
+// `TxnStatusView` is a supertrait, so every WAL manager exposes CLOG status
+// (`status`/`is_committed`/`is_aborted`) — see "Transaction status" below.
+pub trait WalManager: Send + Sync + common::TxnStatusView {
     fn append(&self, record: WalRecord) -> Result<Lsn>;
     fn flush(&self) -> Result<Lsn>;
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
     fn replay_committed_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
-    fn is_committed(&self, txn_id: u64) -> bool;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 }
@@ -140,7 +141,27 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
 
 - LSNs are strictly increasing.
 - `flush()` only returns after fsync.
-- `is_committed(txn_id)` consults only durable commits: it is `clog.status(txn_id) == Committed`, which is true once the txn's `Commit` record is flushed. The CLOG (`Clog`, an in-memory `txn_id → TxnStatus` map; supersedes the old single-bit `committed_txns` set) is populated at open by scanning records with `lsn <= flushed_lsn` (`Commit` → `Committed`, `Abort` → `Aborted`) and updated on `flush` (pending commits → `Committed`) and `append` (`Abort` → `Aborted`). A commit that has been appended but not yet flushed is tracked separately as pending and `is_committed` returns false for it until the flush makes it durable. Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as `Committed`; an unrecorded normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F (see `docs/specs/mvcc.md` §5.4).
+- The WAL manager is the `common::TxnStatusView` for transaction status (a
+  supertrait of `WalManager`): `status(txn_id)` returns the CLOG status, and the
+  inherited `is_committed(txn_id)`/`is_aborted(txn_id)` convenience methods derive
+  from it (replacing the old inherent `WalManager::is_committed`). `is_committed`
+  consults only durable commits: it is `clog.status(txn_id) == Committed`, true
+  once the txn's `Commit` record is flushed. `Clog` itself implements
+  `TxnStatusView` (so the storage engine can probe status per tuple in B3.6 via
+  the WAL handle, which trait-upcasts to `&dyn TxnStatusView`). The CLOG (`Clog`,
+  an in-memory `txn_id → TxnStatus` map; supersedes the old single-bit
+  `committed_txns` set) is populated at open by scanning records with
+  `lsn <= flushed_lsn` (`Commit` → `Committed`, `Abort` → `Aborted`) and updated on
+  `flush` (pending commits → `Committed`) and `append` (`Abort` → `Aborted`). A
+  commit that has been appended but not yet flushed is tracked separately as
+  pending and `is_committed` returns false for it until the flush makes it durable.
+  `status` takes the WAL state lock briefly per call; the visibility predicate may
+  probe it per tuple during scans (B3.6), and lock contention under heavy
+  concurrent scanning is a Milestone E concern. Reserved ids below
+  `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as `Committed`; an unrecorded
+  normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and
+  rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F
+  (see `docs/specs/mvcc.md` §5.4).
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use common::{FIRST_NORMAL_XID, TxnId, TxnStatus};
+use common::{FIRST_NORMAL_XID, TxnId, TxnStatus, TxnStatusView};
 
 /// In-memory map `txn_id -> TxnStatus`.
 ///
@@ -69,6 +69,17 @@ impl Clog {
     /// Record `txn_id` as aborted (`Abort` / rollback).
     pub fn set_aborted(&mut self, txn_id: TxnId) {
         self.statuses.insert(txn_id, TxnStatus::Aborted);
+    }
+}
+
+/// The CLOG is the canonical [`TxnStatusView`] for the visibility predicate
+/// (`docs/specs/mvcc.md` §6): it answers `status(xid)` with the same reserved-id
+/// rule it uses everywhere. This is the impl injected into the storage engine
+/// (via the WAL manager handle) so snapshot-aware scans (Milestone B3.6) can probe
+/// transaction status per tuple.
+impl TxnStatusView for Clog {
+    fn status(&self, xid: TxnId) -> TxnStatus {
+        Clog::status(self, xid)
     }
 }
 

@@ -358,9 +358,9 @@ mod tests {
         delete_row, init_page, insert_row, line_pointer, read_slot, set_page_lsn, set_tuple_header,
         validate, write_checksum,
     };
-    use crate::codec::{XMAX_COMMITTED, decode_row, encode_row};
+    use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
-    use common::{ColumnDef, DataType, INVALID_XID, TableSchema, Value};
+    use common::{ColumnDef, DataType, INVALID_XID, TableSchema, Value, XMAX_COMMITTED};
 
     fn schema() -> TableSchema {
         TableSchema {

@@ -16,7 +16,10 @@ pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, TableId, TxnId,
 };
-pub use mvcc::{IsolationLevel, Snapshot, TxnStatus};
+pub use mvcc::{
+    IsolationLevel, Snapshot, TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED,
+    XMIN_COMMITTED, is_visible,
+};
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};
 pub use value::Value;

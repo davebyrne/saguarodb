@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
-    Result, Row, RowId, SqlState, StatementContext, StoredRow, TableId, TableSchema, Value,
+    Result, Row, RowId, SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView,
+    Value,
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -111,6 +112,22 @@ impl PageBackedStorageEngine {
     pub fn set_mode(&self, mode: StorageMode) -> Result<()> {
         self.lock_state()?.mode = mode;
         Ok(())
+    }
+
+    /// The CLOG-backed [`TxnStatusView`] for the visibility predicate
+    /// (`common::is_visible`, `docs/specs/mvcc.md` §6). The engine already holds an
+    /// `Arc<dyn WalManager>`, and the WAL manager *is* a `TxnStatusView` (backed by
+    /// its in-memory CLOG), so this hands out `&dyn TxnStatusView` with no extra
+    /// handle — the "injection" of transaction status into the engine. Snapshot-
+    /// aware scans/point-lookups consume it in Milestone B3.6; nothing reads it yet,
+    /// so reads are unchanged this commit.
+    #[allow(
+        dead_code,
+        reason = "consumed by snapshot-aware scans in B3.6 (Appendix A commit 6)"
+    )]
+    pub(crate) fn txn_status_view(&self) -> &dyn TxnStatusView {
+        // Trait upcast: `dyn WalManager` has `TxnStatusView` as a supertrait.
+        self.wal.as_ref()
     }
 
     pub(crate) fn apply_create_table_without_wal(&self, schema: TableSchema) -> Result<()> {

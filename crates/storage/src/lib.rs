@@ -24,7 +24,7 @@ mod tests {
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
         ColumnDef, DataType, IndexSchema, Key, KeyRange, Lsn, Result, Row, SqlState,
-        StatementContext, TableSchema, Value,
+        StatementContext, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use wal::{WalManager, WalRecord};
 
@@ -982,16 +982,18 @@ mod tests {
             Ok(())
         }
 
-        fn is_committed(&self, _txn_id: u64) -> bool {
-            false
-        }
-
         fn flushed_lsn(&self) -> Lsn {
             0
         }
 
         fn bytes_after(&self, _lsn: Lsn) -> Result<u64> {
             Ok(0)
+        }
+    }
+
+    impl TxnStatusView for CountingWal {
+        fn status(&self, _txn_id: TxnId) -> TxnStatus {
+            TxnStatus::InProgress
         }
     }
 

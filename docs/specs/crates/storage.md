@@ -147,7 +147,10 @@ WAL (`HeapUpdateHeader`, a later commit) or emitted by the engine.
     bit 2 `XMAX_COMMITTED`, bit 3 `XMAX_ABORTED` cache settled transaction status
     to skip a CLOG probe; bit 4 `HEAP_ONLY` and bit 5 `HOT_UPDATED` are reserved
     for HOT; bits 6–15 reserved (zero). No bits are set on insert; later
-    milestones populate them.
+    milestones populate them. The four `*_COMMITTED`/`*_ABORTED` settled-status
+    bit constants are owned by `common` (so the `common::is_visible` predicate and
+    the tuple codec share one definition) and re-exported by the codec; the two
+    HOT bits stay storage-private.
   - `xmin`: 8-byte `u64` creator transaction id.
   - `xmax`: 8-byte `u64` deleter transaction id; `0` (`INVALID_XID`) means the
     version is live/not-deleted.

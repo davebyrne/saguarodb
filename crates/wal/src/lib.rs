@@ -8,9 +8,14 @@ pub use codec::{decode_record, encode_record};
 pub use file::FileWalManager;
 pub use record::{WalRecord, WalRecordKind};
 
-use common::{Lsn, Result};
+use common::{Lsn, Result, TxnStatusView};
 
-pub trait WalManager: Send + Sync {
+/// A WAL manager is also a [`TxnStatusView`] (backed by its in-memory CLOG): the
+/// supertrait lets the storage engine — which already holds an
+/// `Arc<dyn WalManager>` — upcast to `&dyn TxnStatusView` for the visibility
+/// predicate (`docs/specs/mvcc.md` §6) with no extra handle. Implementors satisfy
+/// it by exposing their CLOG status (`Clog: TxnStatusView` does the work).
+pub trait WalManager: Send + Sync + TxnStatusView {
     fn append(&self, record: WalRecord) -> Result<Lsn>;
     fn flush(&self) -> Result<Lsn>;
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
@@ -19,7 +24,6 @@ pub trait WalManager: Send + Sync {
         lsn: Lsn,
     ) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
-    fn is_committed(&self, txn_id: u64) -> bool;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 }
@@ -29,7 +33,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    use common::{ErrorKind, Result};
+    use common::{ErrorKind, Result, TxnStatusView};
 
     use super::{
         FileWalManager, WalManager, WalRecord, WalRecordKind, decode_record, encode_record,

@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use common::{DbError, Lsn, Result};
+use common::{DbError, Lsn, Result, TxnId, TxnStatus, TxnStatusView};
 
 use crate::codec::{max_lsn, read_records};
 use crate::{Clog, WalManager, WalRecord, WalRecordKind, encode_record};
@@ -371,13 +371,6 @@ impl WalManager for FileWalManager {
         Ok(())
     }
 
-    fn is_committed(&self, txn_id: u64) -> bool {
-        self.state
-            .lock()
-            .map(|state| state.clog.is_committed(txn_id))
-            .unwrap_or(false)
-    }
-
     fn flushed_lsn(&self) -> Lsn {
         self.state
             .lock()
@@ -393,6 +386,21 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn > lsn)
             .map(|stored| stored.encoded_len)
             .sum())
+    }
+}
+
+impl TxnStatusView for FileWalManager {
+    fn status(&self, xid: TxnId) -> TxnStatus {
+        // A short lock per probe (acceptable for the B-milestone MVP; the
+        // visibility predicate calls this per tuple during scans in B3.6). A
+        // poisoned lock degrades to `InProgress` — the conservative "not yet
+        // committed" answer, so a tuple is hidden rather than wrongly shown.
+        // Contention under heavy concurrent scans is a Milestone E concern (the
+        // CLOG may then want a sharded or lock-free read path).
+        self.state
+            .lock()
+            .map(|state| state.clog.status(xid))
+            .unwrap_or(TxnStatus::InProgress)
     }
 }
 

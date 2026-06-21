@@ -1,6 +1,6 @@
 use common::{
     DataType, DbError, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row, SqlState, TableSchema,
-    TxnId, Value,
+    TxnId, Value, XMIN_COMMITTED,
 };
 
 /// On-page row encoding version. The current MVCC layout (v2) is
@@ -24,26 +24,19 @@ const V2_MVCC_HEADER_LEN: usize = 2 + 8 + 8 + 6;
 pub(crate) const INVALID_TID: (PageNum, u16) = (u32::MAX, u16::MAX);
 
 /// `infomask` hint bits (bit positions in the v2 header's `u16`). The four
-/// `*_COMMITTED`/`*_ABORTED` bits cache settled CLOG status so visibility checks
-/// can skip a CLOG probe; the two HEAP bits are reserved for HOT (Milestone H).
-/// None are set on insert in this milestone — they are populated by later work.
+/// `*_COMMITTED`/`*_ABORTED` settled-status bits are owned by `common` (re-used by
+/// the visibility predicate as a single source of truth) and re-exported here; the
+/// two HEAP bits are storage-private and reserved for HOT (Milestone H).
 ///
 /// ```text
-/// bit 0: XMIN_COMMITTED  bit 1: XMIN_ABORTED
-/// bit 2: XMAX_COMMITTED  bit 3: XMAX_ABORTED
-/// bit 4: HEAP_ONLY       bit 5: HOT_UPDATED   (reserved for HOT)
+/// bit 0: XMIN_COMMITTED  bit 1: XMIN_ABORTED   (in common, used by is_visible)
+/// bit 2: XMAX_COMMITTED  bit 3: XMAX_ABORTED   (in common, used by is_visible)
+/// bit 4: HEAP_ONLY       bit 5: HOT_UPDATED    (storage-private, reserved for HOT)
 /// bits 6-15: reserved (must be 0)
 /// ```
-// Reserved hint bits below are defined now (the v2 format owns the full layout)
-// but not yet read or set; visibility (Milestone B3) and HOT (Milestone H) wire
-// them in. The allow keeps the format definition complete without a placeholder.
-pub(crate) const XMIN_COMMITTED: u16 = 1 << 0;
-#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
-pub(crate) const XMIN_ABORTED: u16 = 1 << 1;
-#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
-pub(crate) const XMAX_COMMITTED: u16 = 1 << 2;
-#[allow(dead_code, reason = "settled-status hint set/read by visibility (B3)")]
-pub(crate) const XMAX_ABORTED: u16 = 1 << 3;
+/// `XMIN_COMMITTED` (used by the v1-decode synthesized header) and the other three
+/// settled-status bits come from [`common`]. The HOT bits are defined here but not
+/// yet read or set; HOT (Milestone H) wires them in.
 /// Reserved for HOT (Milestone H): tuple has no index entry of its own.
 #[allow(dead_code, reason = "reserved for HOT (Milestone H)")]
 pub(crate) const HEAP_ONLY: u16 = 1 << 4;
@@ -396,12 +389,14 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnDef, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema, Value};
+    use common::{
+        ColumnDef, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema, Value, XMAX_COMMITTED,
+        XMIN_COMMITTED,
+    };
 
     use super::{
-        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, XMAX_COMMITTED,
-        XMIN_COMMITTED, decode_key, decode_row, encode_key, encode_row, null_bitmap_len,
-        set_mvcc_header_fields,
+        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, decode_key,
+        decode_row, encode_key, encode_row, null_bitmap_len, set_mvcc_header_fields,
     };
 
     fn schema() -> TableSchema {

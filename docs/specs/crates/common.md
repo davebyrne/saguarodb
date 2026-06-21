@@ -16,7 +16,11 @@
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
 - Statement context and the transaction extension point.
 - Runtime MVCC types: `Snapshot`, `TxnStatus`, `IsolationLevel` (see `docs/specs/mvcc.md`).
-- Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`.
+- The tuple-visibility predicate `is_visible` and the `TxnStatusView` trait, plus
+  the `infomask` settled-status hint-bit constants `XMIN_COMMITTED`,
+  `XMIN_ABORTED`, `XMAX_COMMITTED`, `XMAX_ABORTED` (the single source of truth for
+  these bits; `storage`'s tuple codec re-uses them).
+- Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`, `TxnStatusView`.
 
 ## Public Types
 
@@ -206,8 +210,47 @@ pub enum IsolationLevel { ReadCommitted, RepeatableRead /* = snapshot isolation 
 
 `Snapshot::empty()` (also `Default`) is the degenerate `{ xmin: 0, xmax: 0, xip:
 [] }` placeholder; it is not a captured snapshot. `IsolationLevel::default()` is
-`ReadCommitted` (Postgres' default). These types are not yet consulted by any
-visibility or transaction logic; later milestones wire them in.
+`ReadCommitted` (Postgres' default). `Snapshot`/`IsolationLevel` are carried in
+`StatementContext` but not yet consulted by scans (B3.6 wires them in).
+
+## Visibility
+
+The pure tuple-visibility predicate (`docs/specs/mvcc.md` §6) lives in `common`,
+along with the transaction-status view it consults and the `infomask` hint bits.
+
+```rust
+pub const XMIN_COMMITTED: u16 = 1 << 0;
+pub const XMIN_ABORTED:   u16 = 1 << 1;
+pub const XMAX_COMMITTED: u16 = 1 << 2;
+pub const XMAX_ABORTED:   u16 = 1 << 3;
+
+pub trait TxnStatusView {
+    fn status(&self, xid: u64) -> TxnStatus;
+    fn is_committed(&self, xid: u64) -> bool { /* status == Committed */ }
+    fn is_aborted(&self, xid: u64) -> bool { /* status == Aborted */ }
+}
+
+pub fn is_visible(
+    xmin: u64, xmax: u64, infomask: u16,
+    snapshot: &Snapshot, current_txn: u64,
+    status: &dyn TxnStatusView,
+) -> bool;
+```
+
+- `TxnStatusView` exposes transaction status to the predicate without `common`
+  depending on `wal`. The CLOG-backed impl (`impl TxnStatusView for Clog`, and the
+  `dyn WalManager` supertrait) lives in `wal`; reserved ids (`< FIRST_NORMAL_XID`,
+  incl. `FROZEN_XID`) must read as `Committed`.
+- `is_visible` returns true iff the creator `xmin` is visible (own write, or
+  settled-committed and in the snapshot's past) **and** the deleter `xmax` does not
+  hide the row (invalid, or itself not visible). `xmax == current_txn` hides the
+  row (own delete); the Read-Committed command-id nuance is deferred to Milestone
+  G (no command ids yet).
+- `infomask` hint bits (`XMIN_*`/`XMAX_*`) short-circuit the `TxnStatusView` probe
+  for a settled xid. The four bits are the canonical definition shared with the
+  storage tuple codec, which re-exports them.
+- `is_visible` is pure (no I/O, no locks beyond whatever the caller's
+  `TxnStatusView` takes per probe) and is not yet called by any scan (B3.6).
 
 ## Flush Policy
 

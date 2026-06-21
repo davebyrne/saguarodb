@@ -75,11 +75,11 @@ fn redo_error(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use buffer::PageData;
-    use common::{ColumnDef, DataType, TableSchema, Value};
+    use common::{ColumnDef, DataType, TableSchema, Value, XMAX_COMMITTED};
     use wal::WalRecordKind;
 
     use super::apply_physical_redo;
-    use crate::codec::{XMAX_COMMITTED, decode_row, encode_row};
+    use crate::codec::{decode_row, encode_row};
     use crate::page;
 
     fn live_row_count(data: &[u8; buffer::PAGE_SIZE]) -> usize {
