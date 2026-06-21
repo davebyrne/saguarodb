@@ -830,4 +830,156 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
     }
+
+    fn first_index_scan_range(plan: &PhysicalPlan) -> Option<&common::KeyRange> {
+        match plan {
+            PhysicalPlan::IndexScan { range, .. } => Some(range),
+            PhysicalPlan::Projection { source, .. }
+            | PhysicalPlan::Filter { source, .. }
+            | PhysicalPlan::Sort { source, .. }
+            | PhysicalPlan::Limit { source, .. } => first_index_scan_range(source),
+            _ => None,
+        }
+    }
+
+    fn hash_join_keys(plan: &PhysicalPlan) -> Option<(&[usize], &[usize])> {
+        match plan {
+            PhysicalPlan::HashJoin {
+                left_keys,
+                right_keys,
+                ..
+            } => Some((left_keys, right_keys)),
+            PhysicalPlan::Projection { source, .. }
+            | PhysicalPlan::Filter { source, .. }
+            | PhysicalPlan::Sort { source, .. }
+            | PhysicalPlan::Limit { source, .. } => hash_join_keys(source),
+            _ => None,
+        }
+    }
+
+    fn plan_of(catalog: &MemoryCatalog, sql: &str) -> PhysicalPlan {
+        let stmt = parse(sql).unwrap();
+        let bound = bind(&stmt, catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        physical_plan(&logical, catalog).unwrap()
+    }
+
+    #[test]
+    fn physical_planner_builds_exclusive_lower_bound_range() {
+        use common::{Key, KeyRange};
+        use std::ops::Bound;
+        let catalog = catalog_with_users();
+        let physical = plan_of(&catalog, "select name from users where id > 7");
+        assert_eq!(
+            first_index_scan_range(&physical),
+            Some(&KeyRange::Range {
+                start: Bound::Excluded(Key(vec![Value::Integer(7)])),
+                end: Bound::Unbounded,
+            })
+        );
+    }
+
+    #[test]
+    fn physical_planner_builds_inclusive_lower_bound_range() {
+        use common::{Key, KeyRange};
+        use std::ops::Bound;
+        let catalog = catalog_with_users();
+        let physical = plan_of(&catalog, "select name from users where id >= 7");
+        assert_eq!(
+            first_index_scan_range(&physical),
+            Some(&KeyRange::Range {
+                start: Bound::Included(Key(vec![Value::Integer(7)])),
+                end: Bound::Unbounded,
+            })
+        );
+    }
+
+    #[test]
+    fn physical_planner_builds_exclusive_upper_bound_range() {
+        use common::{Key, KeyRange};
+        use std::ops::Bound;
+        let catalog = catalog_with_users();
+        let physical = plan_of(&catalog, "select name from users where id < 7");
+        assert_eq!(
+            first_index_scan_range(&physical),
+            Some(&KeyRange::Range {
+                start: Bound::Unbounded,
+                end: Bound::Excluded(Key(vec![Value::Integer(7)])),
+            })
+        );
+    }
+
+    #[test]
+    fn physical_planner_builds_inclusive_upper_bound_range() {
+        use common::{Key, KeyRange};
+        use std::ops::Bound;
+        let catalog = catalog_with_users();
+        let physical = plan_of(&catalog, "select name from users where id <= 7");
+        assert_eq!(
+            first_index_scan_range(&physical),
+            Some(&KeyRange::Range {
+                start: Bound::Unbounded,
+                end: Bound::Included(Key(vec![Value::Integer(7)])),
+            })
+        );
+    }
+
+    #[test]
+    fn physical_planner_rebases_single_hash_join_key() {
+        let catalog = catalog_with_users_and_accounts();
+        let physical = plan_of(
+            &catalog,
+            "select users.id from users join accounts on users.id = accounts.id",
+        );
+        // users = (id, name) -> left width 2; accounts.id is global slot 2.
+        // left key slot 0 (users.id), right key rebased to 0 (2 - 2).
+        assert_eq!(
+            hash_join_keys(&physical),
+            Some((&[0usize][..], &[0usize][..]))
+        );
+    }
+
+    #[test]
+    fn physical_planner_rebases_multiple_hash_join_keys() {
+        let catalog = catalog_with_users_and_accounts();
+        let physical = plan_of(
+            &catalog,
+            "select users.id from users join accounts \
+             on users.id = accounts.id and users.name = accounts.owner",
+        );
+        // left keys = [id=0, name=1]; right keys rebased = [id 2-2=0, owner 3-2=1].
+        assert_eq!(
+            hash_join_keys(&physical),
+            Some((&[0usize, 1][..], &[0usize, 1][..]))
+        );
+    }
+
+    #[test]
+    fn logical_planner_extracts_nested_aggregate_under_scalar_function() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select abs(sum(id)) from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        let LogicalPlan::Projection {
+            expressions,
+            source,
+            ..
+        } = &logical
+        else {
+            panic!("expected projection, got {logical:?}");
+        };
+        // The scalar ABS keeps its Function shape; its argument is the extracted
+        // aggregate, rewritten to a LocalRef into the Aggregate output row.
+        assert!(matches!(
+            expressions.as_slice(),
+            [BoundExpr::Function { args, .. }]
+                if matches!(args.as_slice(), [BoundExpr::LocalRef { slot: 0, .. }])
+        ));
+        let LogicalPlan::Aggregate { aggregates, .. } = source.as_ref() else {
+            panic!("expected aggregate source, got {source:?}");
+        };
+        assert_eq!(aggregates.len(), 1);
+        assert!(matches!(aggregates[0].func, AggregateFunc::Sum));
+    }
 }
