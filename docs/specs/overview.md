@@ -1366,7 +1366,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery replays committed records onto the heap pages. (`HeapUpdateHeader` is the MVCC in-place tuple-header mutation; its redo handler exists but the engine does not yet emit it — that arrives with Milestone B's `UPDATE`/`DELETE` versioning.)
 
 ### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1420,6 +1420,7 @@ This gives the invariants:
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
 | `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
 | `HeapDelete` | `FileId`, `PageNum`, `slot` |
+| `HeapUpdateHeader` | `FileId`, `PageNum`, `slot`, `xmax`, `t_ctid` (`PageNum`, `u16`), `infomask` — in-place mutation of a v2 tuple header (MVCC version stamping; redo via `page::set_tuple_header`, not yet emitted by the engine) |
 | `FullPageImage` | `FileId`, `PageNum`, full page image (torn-page protection) |
 
 `txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `Checkpoint`. User statement transaction IDs start at `1`.

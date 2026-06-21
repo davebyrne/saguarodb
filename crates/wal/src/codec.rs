@@ -6,6 +6,10 @@ use crate::{WalRecord, WalRecordKind};
 const HEADER_LEN: usize = 8 + 8 + 1 + 4;
 const CRC_LEN: usize = 4;
 
+/// `HeapUpdateHeader` payload: file_id(4) + page_num(4) + slot(2) + xmax(8) +
+/// t_ctid page(4) + t_ctid slot(2) + infomask(2).
+const HEAP_UPDATE_HEADER_LEN: usize = 4 + 4 + 2 + 8 + 4 + 2 + 2;
+
 const TYPE_CREATE_TABLE: u8 = 1;
 const TYPE_DROP_TABLE: u8 = 2;
 const TYPE_COMMIT: u8 = 3;
@@ -18,6 +22,7 @@ const TYPE_FULL_PAGE_IMAGE: u8 = 8;
 const TYPE_CREATE_INDEX: u8 = 9;
 const TYPE_DROP_INDEX: u8 = 10;
 const TYPE_ABORT: u8 = 11;
+const TYPE_HEAP_UPDATE_HEADER: u8 = 12;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -146,6 +151,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::HeapInit { .. } => TYPE_HEAP_INIT,
         WalRecordKind::HeapInsert { .. } => TYPE_HEAP_INSERT,
         WalRecordKind::HeapDelete { .. } => TYPE_HEAP_DELETE,
+        WalRecordKind::HeapUpdateHeader { .. } => TYPE_HEAP_UPDATE_HEADER,
         WalRecordKind::FullPageImage { .. } => TYPE_FULL_PAGE_IMAGE,
     }
 }
@@ -182,6 +188,25 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             payload.extend_from_slice(&file_id.to_le_bytes());
             payload.extend_from_slice(&page_num.to_le_bytes());
             payload.extend_from_slice(&slot.to_le_bytes());
+            Ok(payload)
+        }
+        WalRecordKind::HeapUpdateHeader {
+            file_id,
+            page_num,
+            slot,
+            xmax,
+            t_ctid,
+            infomask,
+        } => {
+            let (ctid_page, ctid_slot) = t_ctid;
+            let mut payload = Vec::with_capacity(HEAP_UPDATE_HEADER_LEN);
+            payload.extend_from_slice(&file_id.to_le_bytes());
+            payload.extend_from_slice(&page_num.to_le_bytes());
+            payload.extend_from_slice(&slot.to_le_bytes());
+            payload.extend_from_slice(&xmax.to_le_bytes());
+            payload.extend_from_slice(&ctid_page.to_le_bytes());
+            payload.extend_from_slice(&ctid_slot.to_le_bytes());
+            payload.extend_from_slice(&infomask.to_le_bytes());
             Ok(payload)
         }
         WalRecordKind::FullPageImage {
@@ -234,6 +259,19 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 slot: read_u16(payload, 8)?,
             })
         }
+        TYPE_HEAP_UPDATE_HEADER => {
+            if payload.len() != HEAP_UPDATE_HEADER_LEN {
+                return Err(wal_error("WAL heap-update-header payload is malformed"));
+            }
+            Ok(WalRecordKind::HeapUpdateHeader {
+                file_id: read_u32(payload, 0)?,
+                page_num: read_u32(payload, 4)?,
+                slot: read_u16(payload, 8)?,
+                xmax: read_u64(payload, 10)?,
+                t_ctid: (read_u32(payload, 18)?, read_u16(payload, 22)?),
+                infomask: read_u16(payload, 24)?,
+            })
+        }
         TYPE_FULL_PAGE_IMAGE => {
             if payload.len() < 8 {
                 return Err(wal_error("WAL full-page-image payload is truncated"));
@@ -260,6 +298,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
         .get(offset..offset + 4)
         .and_then(|slice| slice.try_into().ok())
         .map(u32::from_le_bytes)
+        .ok_or_else(|| wal_error("WAL physical payload is truncated"))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|slice| slice.try_into().ok())
+        .map(u64::from_le_bytes)
         .ok_or_else(|| wal_error("WAL physical payload is truncated"))
 }
 
@@ -322,6 +368,22 @@ mod tests {
                 file_id: 2,
                 page_num: 5,
                 slot: 3,
+            },
+            WalRecordKind::HeapUpdateHeader {
+                file_id: 2,
+                page_num: 5,
+                slot: 3,
+                xmax: 0x0102_0304_0506_0708,
+                t_ctid: (9, 11),
+                infomask: 0xABCD,
+            },
+            WalRecordKind::HeapUpdateHeader {
+                file_id: u32::MAX,
+                page_num: u32::MAX,
+                slot: u16::MAX,
+                xmax: u64::MAX,
+                t_ctid: (u32::MAX, u16::MAX),
+                infomask: u16::MAX,
             },
             WalRecordKind::FullPageImage {
                 file_id: 2,

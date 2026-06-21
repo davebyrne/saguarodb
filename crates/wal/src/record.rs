@@ -49,6 +49,20 @@ pub enum WalRecordKind {
         page_num: PageNum,
         slot: u16,
     },
+    /// Physiological redo: an in-place mutation of a v2 tuple header — set the
+    /// `xmax`, forward `t_ctid` pointer, and `infomask` of the live tuple at
+    /// `slot` without relocating it (fixed-width header fields ⇒ same-size
+    /// mutation). Emitted by `UPDATE`/`DELETE` version stamping (Milestone B
+    /// commits 8–9); recovery applies it PageLSN-gated like the other heap
+    /// records (see `docs/specs/mvcc.md` §5.3).
+    HeapUpdateHeader {
+        file_id: FileId,
+        page_num: PageNum,
+        slot: u16,
+        xmax: u64,
+        t_ctid: (PageNum, u16),
+        infomask: u16,
+    },
     /// Torn-page protection: a full page image, reinstalled during redo before
     /// any later delta for the same page is applied.
     FullPageImage {

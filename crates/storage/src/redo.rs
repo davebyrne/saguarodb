@@ -40,6 +40,17 @@ pub fn apply_physical_redo(
             page::delete_row(data, *slot)?;
             page::set_page_lsn(data, lsn);
         }
+        WalRecordKind::HeapUpdateHeader {
+            slot,
+            xmax,
+            t_ctid,
+            infomask,
+            ..
+        } => {
+            // `set_tuple_header` mutates the v2 header in place and stamps the
+            // page-LSN itself (no separate `set_page_lsn` like the siblings).
+            page::set_tuple_header(data, *slot, *xmax, *t_ctid, *infomask, lsn)?;
+        }
         WalRecordKind::FullPageImage { image, .. } => {
             if image.len() != PAGE_SIZE {
                 return Err(redo_error(format!(
@@ -64,9 +75,11 @@ fn redo_error(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use buffer::PageData;
+    use common::{ColumnDef, DataType, TableSchema, Value};
     use wal::WalRecordKind;
 
     use super::apply_physical_redo;
+    use crate::codec::{XMAX_COMMITTED, decode_row, encode_row};
     use crate::page;
 
     fn live_row_count(data: &[u8; buffer::PAGE_SIZE]) -> usize {
@@ -74,6 +87,62 @@ mod tests {
         (0..slots)
             .filter(|slot| page::read_row(data, *slot).unwrap().is_some())
             .count()
+    }
+
+    fn header_schema() -> TableSchema {
+        TableSchema {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "note".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn header_row() -> common::Row {
+        common::Row {
+            values: vec![Value::Integer(42), Value::Text("hi".to_string())],
+        }
+    }
+
+    /// Seed a fresh page with one v2 tuple at slot 0 stamped `xmin = 7`,
+    /// returning the page and the inserted slot.
+    fn page_with_one_tuple() -> (PageData, u16) {
+        let mut data = PageData::default();
+        apply_physical_redo(
+            &mut data.0,
+            1,
+            &WalRecordKind::HeapInit {
+                file_id: 1,
+                page_num: 0,
+            },
+        )
+        .unwrap();
+        let row_bytes = encode_row(&header_schema(), &header_row(), 7).unwrap();
+        apply_physical_redo(
+            &mut data.0,
+            2,
+            &WalRecordKind::HeapInsert {
+                file_id: 1,
+                page_num: 0,
+                slot: 0,
+                row_bytes,
+            },
+        )
+        .unwrap();
+        (data, 0)
     }
 
     #[test]
@@ -157,6 +226,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(page::read_row(&data.0, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn heap_update_header_mutates_in_place_and_stamps_lsn() {
+        let (mut data, slot) = page_with_one_tuple();
+
+        let record = WalRecordKind::HeapUpdateHeader {
+            file_id: 1,
+            page_num: 0,
+            slot,
+            xmax: 99,
+            t_ctid: (4, 5),
+            infomask: XMAX_COMMITTED,
+        };
+        assert!(apply_physical_redo(&mut data.0, 3, &record).unwrap());
+        assert_eq!(page::page_lsn(&data.0), 3);
+        page::validate(&data.0).unwrap();
+
+        // The three header fields are now set; xmin and the row payload survive.
+        let bytes = page::read_row(&data.0, slot).unwrap().unwrap();
+        let decoded = decode_row(&header_schema(), &bytes).unwrap();
+        assert_eq!(decoded.xmax, 99);
+        assert_eq!(decoded.t_ctid, (4, 5));
+        assert_eq!(decoded.infomask, XMAX_COMMITTED);
+        assert_eq!(decoded.xmin, 7);
+        assert_eq!(decoded.row, header_row());
+    }
+
+    #[test]
+    fn heap_update_header_is_idempotent_under_gating() {
+        let (mut data, slot) = page_with_one_tuple();
+        let record = WalRecordKind::HeapUpdateHeader {
+            file_id: 1,
+            page_num: 0,
+            slot,
+            xmax: 99,
+            t_ctid: (4, 5),
+            infomask: XMAX_COMMITTED,
+        };
+
+        assert!(apply_physical_redo(&mut data.0, 3, &record).unwrap());
+        let after_first = data.0;
+
+        // Re-applying the same record (page-LSN already >= record LSN) is a no-op
+        // and leaves the page byte-for-byte unchanged.
+        assert!(!apply_physical_redo(&mut data.0, 3, &record).unwrap());
+        assert_eq!(data.0, after_first);
+
+        // A record older than the page-LSN is likewise skipped without mutating.
+        let stale = WalRecordKind::HeapUpdateHeader {
+            file_id: 1,
+            page_num: 0,
+            slot,
+            xmax: 123,
+            t_ctid: (7, 8),
+            infomask: 0,
+        };
+        assert!(!apply_physical_redo(&mut data.0, 2, &stale).unwrap());
+        assert_eq!(data.0, after_first);
     }
 
     #[test]

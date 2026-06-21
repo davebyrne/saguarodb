@@ -330,10 +330,10 @@ fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> 
 ///
 /// Returns `InternalError` if the buffer is not a v2 tuple or is shorter than the
 /// v2 header, so misuse surfaces as a structured `DbError` instead of a panic.
-#[allow(
-    dead_code,
-    reason = "called by page::set_tuple_header, wired into UPDATE/DELETE in Milestone B commits 8-9"
-)]
+///
+/// Reachable via `page::set_tuple_header` ← `apply_physical_redo`'s
+/// `HeapUpdateHeader` arm; the engine's `UPDATE`/`DELETE` emission paths arrive
+/// in Milestone B commits 8–9.
 pub(crate) fn set_mvcc_header_fields(
     tuple: &mut [u8],
     xmax: TxnId,

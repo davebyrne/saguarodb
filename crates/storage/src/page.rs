@@ -211,10 +211,10 @@ pub fn delete_row(data: &mut [u8; PAGE_SIZE], slot_num: u16) -> Result<bool> {
 /// The line pointer must be `NORMAL` (live); a dead/unused/out-of-bounds slot is
 /// a misuse and returns a structured `DbError` rather than panicking, matching
 /// the sibling primitives.
-#[allow(
-    dead_code,
-    reason = "wired into UPDATE/DELETE version stamping in Milestone B commits 8-9"
-)]
+///
+/// Its first caller is `apply_physical_redo` (the `HeapUpdateHeader` redo arm);
+/// the engine's `UPDATE`/`DELETE` emission paths arrive in Milestone B commits
+/// 8–9.
 pub fn set_tuple_header(
     data: &mut [u8; PAGE_SIZE],
     slot_num: u16,

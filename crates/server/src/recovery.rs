@@ -169,6 +169,9 @@ fn apply_redo(
         | WalRecordKind::HeapDelete {
             file_id, page_num, ..
         }
+        | WalRecordKind::HeapUpdateHeader {
+            file_id, page_num, ..
+        }
         | WalRecordKind::FullPageImage {
             file_id, page_num, ..
         } => {
