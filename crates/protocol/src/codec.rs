@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use common::{ColumnInfo, DataType, DbError, Result, SqlState};
 
-use crate::{ClientMessage, ServerMessage};
+use crate::{ClientMessage, ServerMessage, StatementKind};
 
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const GSSENC_REQUEST_CODE: i32 = 80_877_104;
@@ -104,6 +104,23 @@ impl PostgresCodec {
                 }
                 messages.push(ClientMessage::Terminate);
             }
+            b'P' => messages.push(decode_parse(body)?),
+            b'B' => messages.push(decode_bind(body)?),
+            b'D' => messages.push(decode_describe(body)?),
+            b'E' => messages.push(decode_execute(body)?),
+            b'C' => messages.push(decode_close(body)?),
+            b'S' => {
+                if length != 4 {
+                    return Err(protocol_error("sync message has invalid length"));
+                }
+                messages.push(ClientMessage::Sync);
+            }
+            b'H' => {
+                if length != 4 {
+                    return Err(protocol_error("flush message has invalid length"));
+                }
+                messages.push(ClientMessage::Flush);
+            }
             _ => return Err(protocol_error("unsupported frontend message tag")),
         }
 
@@ -128,7 +145,9 @@ impl ProtocolCodec for PostgresCodec {
             }
 
             let decoded = match self.buffer[0] {
-                b'Q' | b'X' => self.decode_tagged(&mut messages)?,
+                b'Q' | b'X' | b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' => {
+                    self.decode_tagged(&mut messages)?
+                }
                 0 => self.decode_startup_style(&mut messages)?,
                 _ => return Err(protocol_error("unsupported frontend message tag")),
             };
@@ -193,6 +212,21 @@ impl ProtocolCodec for PostgresCodec {
                 put_cstr(&mut body, tag);
                 encode_server_message(b'C', body)
             }
+            ServerMessage::ParseComplete => encode_server_message(b'1', Vec::new()),
+            ServerMessage::BindComplete => encode_server_message(b'2', Vec::new()),
+            ServerMessage::CloseComplete => encode_server_message(b'3', Vec::new()),
+            ServerMessage::ParameterDescription(type_oids) => {
+                let mut body = Vec::new();
+                put_i16(
+                    &mut body,
+                    checked_i16(type_oids.len(), "too many parameter descriptions"),
+                );
+                for oid in type_oids {
+                    put_i32(&mut body, *oid);
+                }
+                encode_server_message(b't', body)
+            }
+            ServerMessage::NoData => encode_server_message(b'n', Vec::new()),
             ServerMessage::ErrorResponse {
                 severity,
                 code,
@@ -238,11 +272,145 @@ fn read_cstr<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a str> {
     let relative_nul = bytes
         .get(start..)
         .and_then(|remaining| remaining.iter().position(|byte| *byte == 0))
-        .ok_or_else(|| protocol_error("startup parameter is not nul terminated"))?;
+        .ok_or_else(|| protocol_error("string field is not nul terminated"))?;
     let end = start + relative_nul;
     *offset = end + 1;
     std::str::from_utf8(&bytes[start..end])
-        .map_err(|_| protocol_error("startup parameter is not valid UTF-8"))
+        .map_err(|_| protocol_error("string field is not valid UTF-8"))
+}
+
+fn decode_parse(body: &[u8]) -> Result<ClientMessage> {
+    let mut offset = 0;
+    let name = read_cstr(body, &mut offset)?.to_string();
+    let query = read_cstr(body, &mut offset)?.to_string();
+    let count = read_count(body, &mut offset, "parse parameter type")?;
+    let mut param_types = Vec::with_capacity(count);
+    for _ in 0..count {
+        param_types.push(read_i32_at(body, &mut offset)?);
+    }
+    require_consumed(body, offset)?;
+    Ok(ClientMessage::Parse {
+        name,
+        query,
+        param_types,
+    })
+}
+
+fn decode_bind(body: &[u8]) -> Result<ClientMessage> {
+    let mut offset = 0;
+    let portal = read_cstr(body, &mut offset)?.to_string();
+    let statement = read_cstr(body, &mut offset)?.to_string();
+    let param_formats = read_i16_array(body, &mut offset, "bind parameter format")?;
+    let param_count = read_count(body, &mut offset, "bind parameter")?;
+    let mut params = Vec::with_capacity(param_count);
+    for _ in 0..param_count {
+        params.push(read_param_value(body, &mut offset)?);
+    }
+    let result_formats = read_i16_array(body, &mut offset, "bind result format")?;
+    require_consumed(body, offset)?;
+    Ok(ClientMessage::Bind {
+        portal,
+        statement,
+        param_formats,
+        params,
+        result_formats,
+    })
+}
+
+fn decode_describe(body: &[u8]) -> Result<ClientMessage> {
+    let mut offset = 0;
+    let kind = read_kind(body, &mut offset)?;
+    let name = read_cstr(body, &mut offset)?.to_string();
+    require_consumed(body, offset)?;
+    Ok(ClientMessage::Describe { kind, name })
+}
+
+fn decode_close(body: &[u8]) -> Result<ClientMessage> {
+    let mut offset = 0;
+    let kind = read_kind(body, &mut offset)?;
+    let name = read_cstr(body, &mut offset)?.to_string();
+    require_consumed(body, offset)?;
+    Ok(ClientMessage::Close { kind, name })
+}
+
+fn decode_execute(body: &[u8]) -> Result<ClientMessage> {
+    let mut offset = 0;
+    let portal = read_cstr(body, &mut offset)?.to_string();
+    let max_rows = read_i32_at(body, &mut offset)?;
+    require_consumed(body, offset)?;
+    Ok(ClientMessage::Execute { portal, max_rows })
+}
+
+fn read_kind(bytes: &[u8], offset: &mut usize) -> Result<StatementKind> {
+    let tag = *bytes
+        .get(*offset)
+        .ok_or_else(|| protocol_error("describe/close message is truncated"))?;
+    *offset += 1;
+    match tag {
+        b'S' => Ok(StatementKind::Statement),
+        b'P' => Ok(StatementKind::Portal),
+        _ => Err(protocol_error("describe/close target must be 'S' or 'P'")),
+    }
+}
+
+fn read_i16_array(bytes: &[u8], offset: &mut usize, what: &str) -> Result<Vec<i16>> {
+    let count = read_count(bytes, offset, what)?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(read_i16_at(bytes, offset)?);
+    }
+    Ok(values)
+}
+
+fn read_param_value(bytes: &[u8], offset: &mut usize) -> Result<Option<Vec<u8>>> {
+    let length = read_i32_at(bytes, offset)?;
+    if length == -1 {
+        return Ok(None);
+    }
+    let length =
+        usize::try_from(length).map_err(|_| protocol_error("bind parameter has invalid length"))?;
+    let start = *offset;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| protocol_error("bind parameter length overflows"))?;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| protocol_error("bind parameter is truncated"))?;
+    *offset = end;
+    Ok(Some(slice.to_vec()))
+}
+
+/// Read a non-negative `int16` count field.
+fn read_count(bytes: &[u8], offset: &mut usize, what: &str) -> Result<usize> {
+    let count = read_i16_at(bytes, offset)?;
+    usize::try_from(count).map_err(|_| protocol_error(format!("{what} count is negative")))
+}
+
+fn read_i16_at(bytes: &[u8], offset: &mut usize) -> Result<i16> {
+    let start = *offset;
+    let end = start + 2;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| protocol_error("message is truncated reading int16"))?;
+    *offset = end;
+    Ok(i16::from_be_bytes([slice[0], slice[1]]))
+}
+
+fn read_i32_at(bytes: &[u8], offset: &mut usize) -> Result<i32> {
+    let start = *offset;
+    let end = start + 4;
+    let slice = bytes
+        .get(start..end)
+        .ok_or_else(|| protocol_error("message is truncated reading int32"))?;
+    *offset = end;
+    Ok(i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn require_consumed(body: &[u8], offset: usize) -> Result<()> {
+    if offset != body.len() {
+        return Err(protocol_error("message has unexpected trailing bytes"));
+    }
+    Ok(())
 }
 
 fn decode_nul_terminated_text<'a>(bytes: &'a [u8], error: &'static str) -> Result<&'a str> {

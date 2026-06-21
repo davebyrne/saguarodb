@@ -1,4 +1,4 @@
-use common::Result;
+use common::{DbError, Result};
 
 use crate::{ClientMessage, ServerMessage};
 
@@ -74,6 +74,19 @@ impl ConnectionState for PostgresConnectionState {
                 ServerMessage::ReadyForQuery,
             ]),
             ClientMessage::Query(_) => Ok(Vec::new()),
+            // Extended-query-protocol messages need socket and query-service
+            // access, so the server dispatches them directly (like Query) rather
+            // than through this state machine. Reaching here is a routing bug.
+            ClientMessage::Parse { .. }
+            | ClientMessage::Bind { .. }
+            | ClientMessage::Describe { .. }
+            | ClientMessage::Execute { .. }
+            | ClientMessage::Close { .. }
+            | ClientMessage::Sync
+            | ClientMessage::Flush => Err(DbError::internal(
+                "extended query protocol messages must be handled by the server, \
+                 not the connection state machine",
+            )),
             ClientMessage::Terminate => {
                 self.terminated = true;
                 Ok(Vec::new())

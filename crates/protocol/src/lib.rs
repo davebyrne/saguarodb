@@ -3,7 +3,7 @@ mod messages;
 mod state;
 
 pub use codec::{PostgresCodec, ProtocolCodec};
-pub use messages::{ClientMessage, ServerMessage};
+pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
 
 #[cfg(test)]
@@ -12,7 +12,7 @@ mod tests {
 
     use super::{
         ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
-        ServerMessage,
+        ServerMessage, StatementKind,
     };
 
     fn ssl_request_bytes() -> Vec<u8> {
@@ -134,6 +134,212 @@ mod tests {
         );
     }
 
+    fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut packet = vec![tag];
+        let length = i32::try_from(body.len() + 4).unwrap();
+        packet.extend_from_slice(&length.to_be_bytes());
+        packet.extend_from_slice(body);
+        packet
+    }
+
+    fn parse_bytes(name: &str, query: &str, param_oids: &[i32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(query.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&i16::try_from(param_oids.len()).unwrap().to_be_bytes());
+        for oid in param_oids {
+            body.extend_from_slice(&oid.to_be_bytes());
+        }
+        tagged(b'P', &body)
+    }
+
+    fn bind_bytes(
+        portal: &str,
+        statement: &str,
+        param_formats: &[i16],
+        params: &[Option<&[u8]>],
+        result_formats: &[i16],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(statement.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&i16::try_from(param_formats.len()).unwrap().to_be_bytes());
+        for format in param_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        body.extend_from_slice(&i16::try_from(params.len()).unwrap().to_be_bytes());
+        for param in params {
+            match param {
+                Some(bytes) => {
+                    body.extend_from_slice(&i32::try_from(bytes.len()).unwrap().to_be_bytes());
+                    body.extend_from_slice(bytes);
+                }
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        body.extend_from_slice(&i16::try_from(result_formats.len()).unwrap().to_be_bytes());
+        for format in result_formats {
+            body.extend_from_slice(&format.to_be_bytes());
+        }
+        tagged(b'B', &body)
+    }
+
+    fn describe_bytes(kind: u8, name: &str) -> Vec<u8> {
+        let mut body = vec![kind];
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        tagged(b'D', &body)
+    }
+
+    fn close_bytes(kind: u8, name: &str) -> Vec<u8> {
+        let mut body = vec![kind];
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        tagged(b'C', &body)
+    }
+
+    fn execute_bytes(portal: &str, max_rows: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(portal.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&max_rows.to_be_bytes());
+        tagged(b'E', &body)
+    }
+
+    #[test]
+    fn decodes_parse_message_with_param_type() {
+        let mut codec = PostgresCodec::new();
+        let messages = codec
+            .decode(&parse_bytes(
+                "stmt1",
+                "select id from t where id = $1",
+                &[20],
+            ))
+            .unwrap();
+        assert_eq!(
+            messages,
+            vec![ClientMessage::Parse {
+                name: "stmt1".to_string(),
+                query: "select id from t where id = $1".to_string(),
+                param_types: vec![20],
+            }]
+        );
+    }
+
+    #[test]
+    fn decodes_bind_message_with_text_and_null_params() {
+        let mut codec = PostgresCodec::new();
+        let bytes = bind_bytes("", "stmt1", &[0], &[Some(b"42"), None], &[0, 1]);
+        let messages = codec.decode(&bytes).unwrap();
+        assert_eq!(
+            messages,
+            vec![ClientMessage::Bind {
+                portal: String::new(),
+                statement: "stmt1".to_string(),
+                param_formats: vec![0],
+                params: vec![Some(b"42".to_vec()), None],
+                result_formats: vec![0, 1],
+            }]
+        );
+    }
+
+    #[test]
+    fn decodes_describe_execute_and_close() {
+        let mut codec = PostgresCodec::new();
+        assert_eq!(
+            codec.decode(&describe_bytes(b'S', "stmt1")).unwrap(),
+            vec![ClientMessage::Describe {
+                kind: StatementKind::Statement,
+                name: "stmt1".to_string(),
+            }]
+        );
+        assert_eq!(
+            codec.decode(&execute_bytes("", 0)).unwrap(),
+            vec![ClientMessage::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            }]
+        );
+        assert_eq!(
+            codec.decode(&close_bytes(b'P', "p1")).unwrap(),
+            vec![ClientMessage::Close {
+                kind: StatementKind::Portal,
+                name: "p1".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn decodes_sync_and_flush() {
+        let mut codec = PostgresCodec::new();
+        assert_eq!(
+            codec.decode(&tagged(b'S', &[])).unwrap(),
+            vec![ClientMessage::Sync]
+        );
+        assert_eq!(
+            codec.decode(&tagged(b'H', &[])).unwrap(),
+            vec![ClientMessage::Flush]
+        );
+    }
+
+    #[test]
+    fn describe_with_invalid_kind_is_protocol_error() {
+        let mut codec = PostgresCodec::new();
+        let err = codec.decode(&describe_bytes(b'Z', "x")).unwrap_err();
+        assert_eq!(err.code, common::SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn decodes_full_extended_sequence_in_one_buffer() {
+        let mut codec = PostgresCodec::new();
+        let mut bytes = parse_bytes("s", "select 1", &[]);
+        bytes.extend_from_slice(&bind_bytes("", "s", &[], &[], &[]));
+        bytes.extend_from_slice(&describe_bytes(b'P', ""));
+        bytes.extend_from_slice(&execute_bytes("", 0));
+        bytes.extend_from_slice(&tagged(b'S', &[]));
+
+        let messages = codec.decode(&bytes).unwrap();
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(messages[0], ClientMessage::Parse { .. }));
+        assert!(matches!(messages[1], ClientMessage::Bind { .. }));
+        assert!(matches!(messages[4], ClientMessage::Sync));
+    }
+
+    #[test]
+    fn encodes_extended_completion_messages_as_empty_tagged_frames() {
+        let codec = PostgresCodec::new();
+        assert_eq!(
+            codec.encode(&ServerMessage::ParseComplete),
+            vec![b'1', 0, 0, 0, 4]
+        );
+        assert_eq!(
+            codec.encode(&ServerMessage::BindComplete),
+            vec![b'2', 0, 0, 0, 4]
+        );
+        assert_eq!(
+            codec.encode(&ServerMessage::CloseComplete),
+            vec![b'3', 0, 0, 0, 4]
+        );
+        assert_eq!(codec.encode(&ServerMessage::NoData), vec![b'n', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn encodes_parameter_description_with_type_oids() {
+        let codec = PostgresCodec::new();
+        let bytes = codec.encode(&ServerMessage::ParameterDescription(vec![20, 25]));
+
+        assert_eq!(bytes[0], b't');
+        assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()), 14);
+        let mut offset = 5;
+        assert_eq!(read_i16(&bytes, &mut offset), 2);
+        assert_eq!(read_i32(&bytes, &mut offset), 20);
+        assert_eq!(read_i32(&bytes, &mut offset), 25);
+    }
+
     #[test]
     fn startup_state_emits_authentication_parameters_and_ready() {
         let mut state = PostgresConnectionState::new();
@@ -249,7 +455,8 @@ mod tests {
     #[test]
     fn unsupported_tagged_message_returns_protocol_error() {
         let mut codec = PostgresCodec::new();
-        let err = codec.decode(&[b'S', 0, 0, 0, 4]).unwrap_err();
+        // 'p' (password) is a frontend tag the v1 server does not support.
+        let err = codec.decode(&[b'p', 0, 0, 0, 4]).unwrap_err();
 
         assert_eq!(err.code, common::SqlState::SyntaxError);
     }

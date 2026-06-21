@@ -14,11 +14,30 @@
 ## Public Message Types
 
 ```rust
+pub enum StatementKind {
+    Statement,
+    Portal,
+}
+
 pub enum ClientMessage {
     Startup { user: String, database: Option<String>, application_name: Option<String> },
     SslRequest,
     GssEncRequest,
     Query(String),
+    // Extended query protocol.
+    Parse { name: String, query: String, param_types: Vec<i32> },
+    Bind {
+        portal: String,
+        statement: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Vec<u8>>>,
+        result_formats: Vec<i16>,
+    },
+    Describe { kind: StatementKind, name: String },
+    Execute { portal: String, max_rows: i32 },
+    Close { kind: StatementKind, name: String },
+    Sync,
+    Flush,
     Terminate,
 }
 
@@ -31,11 +50,22 @@ pub enum ServerMessage {
     RowDescription(Vec<ColumnInfo>),
     DataRow(Vec<Option<String>>),
     CommandComplete(String),
+    // Extended query protocol.
+    ParseComplete,
+    BindComplete,
+    CloseComplete,
+    ParameterDescription(Vec<i32>),
+    NoData,
     ErrorResponse { severity: String, code: String, message: String },
 }
 ```
 
-All row data is text-format in v1.
+All row data is text-format in v1's simple query path. The extended-protocol
+`Bind` carries raw parameter bytes and the PostgreSQL format-code arrays (`0` =
+text, `1` = binary); the codec only frames these bytes, leaving their
+interpretation to the server. The connection-level choreography of the extended
+messages (prepared statements, portals, Describe/Execute/Sync) is owned by
+`server`, not the codec; see the server spec.
 
 ## Codec API
 
@@ -133,6 +163,13 @@ Client messages:
 - `GSSENCRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877104`.
 - `Startup`: startup-style packet with `int32 protocol = 196608` for protocol 3.0, followed by nul-terminated key/value strings and a final `\0`. V1 reads `user`, optional `database`, and optional `application_name`; other parameters are ignored.
 - `Query`: tag `b'Q'`, length, SQL string terminated by `\0`.
+- `Parse`: tag `b'P'`, length, `statement_name\0`, `query\0`, `int16 param_type_count`, then that many `int32` parameter type OIDs (`0` = unspecified).
+- `Bind`: tag `b'B'`, length, `portal_name\0`, `statement_name\0`, `int16 param_format_count` + that many `int16` format codes, `int16 param_count` + that many parameters (each `int32 length` then `length` bytes, or `int32 -1` for NULL), `int16 result_format_count` + that many `int16` format codes. Format codes are `0` (text) or `1` (binary).
+- `Describe`: tag `b'D'`, length, `byte kind` (`b'S'` statement or `b'P'` portal), `name\0`.
+- `Execute`: tag `b'E'`, length, `portal_name\0`, `int32 max_rows` (`0` = all rows).
+- `Close`: tag `b'C'`, length, `byte kind` (`b'S'`/`b'P'`), `name\0`.
+- `Sync`: tag `b'S'`, length `4`.
+- `Flush`: tag `b'H'`, length `4`.
 - `Terminate`: tag `b'X'`, length `4`.
 
 Server messages:
@@ -143,6 +180,11 @@ Server messages:
 - `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code = 0`.
 - `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus UTF-8 bytes, or `int32 -1` for `NULL`.
 - `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. V1 tags are `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, and `EXPLAIN`.
+- `ParseComplete`: tag `b'1'`, length `4`.
+- `BindComplete`: tag `b'2'`, length `4`.
+- `CloseComplete`: tag `b'3'`, length `4`.
+- `ParameterDescription`: tag `b't'`, length, `int16 param_count`, then that many `int32` parameter type OIDs.
+- `NoData`: tag `b'n'`, length `4`.
 - `ErrorResponse`: tag `b'E'`, length, fields `b'S' severity\0`, `b'C' sqlstate\0`, `b'M' message\0`, then final `\0`.
 
 Text value encoding:
