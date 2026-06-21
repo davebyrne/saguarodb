@@ -80,7 +80,7 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 8. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
 9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.install_index_schemas(indexes)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain the secondary indexes.
 10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them). Heap, primary-key-index, and secondary-index pages replay the same way; DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) replay through `RecoveryOperations`.
-11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`, and an empty `active_txns` registry (the WAL manager rebuilt its CLOG from the retained `Commit`/`Abort` records on `open`).
 12. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
 13. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
 14. Construct query service from `components`.
@@ -160,6 +160,7 @@ pub struct ServerComponents {
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
+    pub active_txns: ActiveTxnRegistry,
     pub tls: Option<TlsAcceptor>,
     pub cancel_registry: CancelRegistry,
 }
@@ -169,6 +170,17 @@ pub struct AppState {
     pub query_service: Arc<QueryService>,
 }
 ```
+
+`active_txns` is the active-transaction registry: an `ActiveTxnRegistry` wrapping
+a `Mutex<BTreeSet<TxnId>>` of currently in-progress transaction ids, with an
+`O(log n)` minimum. The autocommit lifecycle registers a `txn_id` when it is
+allocated and deregisters it on commit or rollback, so it is empty between
+statements under v1's single-writer autocommit. It is bookkeeping in Milestone A
+(not yet consulted); snapshot capture (B3/C3) reads it for `xmin`/`xip`, and the
+GC horizon (Milestone F) reads its minimum. The CLOG that records settled
+transaction outcomes lives in the WAL manager (`Clog`, rebuilt from `Commit`/
+`Abort` records; see `docs/specs/crates/wal.md`), separate from this registry of
+still-running transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the

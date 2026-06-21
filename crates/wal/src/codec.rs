@@ -17,6 +17,7 @@ const TYPE_HEAP_DELETE: u8 = 7;
 const TYPE_FULL_PAGE_IMAGE: u8 = 8;
 const TYPE_CREATE_INDEX: u8 = 9;
 const TYPE_DROP_INDEX: u8 = 10;
+const TYPE_ABORT: u8 = 11;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -140,6 +141,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::CreateIndex { .. } => TYPE_CREATE_INDEX,
         WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
         WalRecordKind::Commit => TYPE_COMMIT,
+        WalRecordKind::Abort => TYPE_ABORT,
         WalRecordKind::Checkpoint { .. } => TYPE_CHECKPOINT,
         WalRecordKind::HeapInit { .. } => TYPE_HEAP_INIT,
         WalRecordKind::HeapInsert { .. } => TYPE_HEAP_INSERT,

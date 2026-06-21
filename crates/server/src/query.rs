@@ -152,6 +152,10 @@ impl QueryService {
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         let txn_id = self.components.next_txn_id.fetch_add(1, Ordering::AcqRel);
+        // The autocommit unit begins: register the transaction active. Its CLOG
+        // status is `InProgress` implicitly (the default for any unsettled normal
+        // id) until a `Commit`/`Abort` record settles it.
+        self.components.active_txns.register(txn_id);
         let catalog_before = self.components.catalog.snapshot()?;
         let ctx = self.execution_context(txn_id, cancel);
 
@@ -182,6 +186,9 @@ impl QueryService {
         if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
             self.fatal_after_durable_commit(err);
         }
+        // The commit is durable and cleaned up; the CLOG already recorded it
+        // `Committed` (set inside `wal.flush`). Drop it from the active set.
+        self.components.active_txns.deregister(txn_id);
         drop(guard);
 
         if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
@@ -220,6 +227,21 @@ impl QueryService {
         txn_id: u64,
         catalog_before: Option<catalog::CatalogSnapshot>,
     ) -> Result<()> {
+        // Record the abort: append an `Abort` record (which sets the CLOG to
+        // `Aborted`) and drop the transaction from the active set. The abort is
+        // not flushed — abort durability is not critical, since a transaction with
+        // no durable `Commit` is recovered as aborted regardless. A failure to
+        // append it is logged but not fatal: the in-memory rollback below (the
+        // mechanism A3 leaves in place until C3) still restores correctness.
+        if let Err(err) = self.components.wal.append(WalRecord {
+            lsn: 0,
+            txn_id,
+            kind: WalRecordKind::Abort,
+        }) {
+            eprintln!("failed to append Abort record for txn {txn_id}: {err}");
+        }
+        self.components.active_txns.deregister(txn_id);
+
         if let Err(err) = self.components.storage.rollback_txn(txn_id) {
             return Err(DbError::internal(format!(
                 "storage rollback failed for txn {txn_id}: {err}",
@@ -662,6 +684,45 @@ mod tests {
             .unwrap_err();
 
         assert!(err.message.contains("catalog restore failed"));
+    }
+
+    #[tokio::test]
+    async fn autocommit_commit_and_rollback_leave_registry_empty() {
+        use wal::WalRecordKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        // A committed autocommit unit deregisters itself.
+        assert!(app.components.active_txns.active_ids().is_empty());
+
+        // A duplicate-key insert fails and rolls back, also leaving the registry
+        // empty and appending an Abort record for the failed transaction.
+        let err = app
+            .query_service
+            .execute_sql("insert into users (id, name) values (1, 'Dup')")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+        assert!(app.components.active_txns.active_ids().is_empty());
+
+        let aborted: Vec<_> = app
+            .components
+            .wal
+            .replay_from(0)
+            .unwrap()
+            .collect::<common::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .filter(|record| matches!(record.kind, WalRecordKind::Abort))
+            .collect();
+        assert_eq!(aborted.len(), 1);
+        // The failed transaction's id is not committed (it aborted).
+        assert!(!app.components.wal.is_committed(aborted[0].txn_id));
     }
 
     #[tokio::test]

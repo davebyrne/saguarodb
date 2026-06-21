@@ -96,6 +96,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         },
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
+        active_txns: crate::registry::ActiveTxnRegistry::new(),
         tls,
         cancel_registry: crate::cancel::CancelRegistry::new(),
     });
@@ -180,9 +181,9 @@ fn apply_redo(
             storage::apply_physical_redo(guard.data_mut(), lsn, &kind)?;
             Ok(())
         }
-        WalRecordKind::Commit | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
-            "recovery replay received an unexpected WAL record",
-        )),
+        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. } => Err(
+            DbError::internal("recovery replay received an unexpected WAL record"),
+        ),
     }
 }
 

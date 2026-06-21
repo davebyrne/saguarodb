@@ -27,6 +27,7 @@ pub enum WalRecordKind {
     CreateIndex { schema: IndexSchema },
     DropIndex { index: IndexId },
     Commit,
+    Abort,
     Checkpoint { redo_lsn: Lsn },
     // Physiological redo records, compact binary payloads.
     HeapInit { file_id: FileId, page_num: PageNum },
@@ -36,7 +37,9 @@ pub enum WalRecordKind {
 }
 ```
 
-`txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `WalRecordKind::Checkpoint`. User statement transaction IDs start at `1`.
+`txn_id = 0` is reserved for non-transactional system metadata records. V1 uses it only for `WalRecordKind::Checkpoint`. User statement transaction IDs start at `FIRST_NORMAL_XID` (the allocator floors there so real transactions never stamp tuple headers with a reserved xid).
+
+`Commit` and `Abort` carry no payload; the `txn_id` is in the header. `Commit` marks a transaction durably committed; `Abort` marks it aborted. Together they are the durable source of truth for transaction outcome and the input to CLOG reconstruction during recovery (see the MVCC plan, `docs/specs/mvcc.md` §5.4, §8). Under MVCC the CLOG is kept in memory and rebuilt from these records; a durable CLOG file is deferred to Milestone F.
 
 The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) describe page-level changes. The storage mutation path produces them (stamping the page-LSN), and recovery replays them PageLSN-gated; `FullPageImage` provides torn-page recovery.
 
@@ -76,7 +79,7 @@ pub trait WalManager: Send + Sync {
 
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `decode_record` decodes exactly one record from a buffer: it returns an error on a partial buffer (`"incomplete WAL record"`) and on a buffer with bytes left over after the record (`"WAL buffer contains trailing bytes"`). `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit` and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`).
+`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit`, `Abort`, and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`).
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
 
@@ -101,8 +104,8 @@ If cleanup fails after step 3, the server treats it as fatal and exits after flu
 
 For failed write statements:
 
-1. Server query orchestration does not append `Commit`.
-2. Server query orchestration calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`.
+1. Server query orchestration does not append `Commit`. It appends an `Abort` record (which records the transaction `Aborted` in the CLOG) without flushing — abort durability is not critical, since a transaction with no durable `Commit` is recovered as aborted regardless.
+2. Server query orchestration calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`. (The buffer-pool before-image undo is retained in Milestone A; it is retired in Milestone C3 when abort becomes purely status-based.)
 3. Uncommitted WAL records remain but are ignored by recovery.
 
 If rollback cleanup fails before the commit record is durable, the server treats the process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits. Uncommitted WAL records remain ignored by recovery because no durable `Commit` record exists.
@@ -125,9 +128,8 @@ Recovery:
 
 - Reads the control record checkpoint LSN.
 - Calls `replay_from(checkpoint_lsn)`.
-- Builds a set of txn IDs with commit records where `LSN > checkpoint_lsn`.
-- Replays only operation records whose txn ID committed. `replay_committed_from(checkpoint_lsn)` provides this filtered committed-record stream through the `WalManager` abstraction.
-- Ignores uncommitted records.
+- Rebuilds the CLOG from durable `Commit`/`Abort` records, then replays only operation records whose txn ID committed. `replay_committed_from(checkpoint_lsn)` provides this filtered committed-record stream through the `WalManager` abstraction.
+- Ignores uncommitted records (in-flight, or aborted via an `Abort` record).
 
 The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`. On `open`, an incomplete trailing record is not merely ignored in memory — the WAL file is physically truncated to the last complete record's end and fsynced, so the torn tail is removed on disk. After such a truncation (and after `truncate_before`), `next_lsn` is derived from the maximum LSN among the retained records, so newly appended records continue monotonically past the highest retained LSN.
 
@@ -135,7 +137,7 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
 
 - LSNs are strictly increasing.
 - `flush()` only returns after fsync.
-- `is_committed(txn_id)` consults only durable commits: it is true once the txn's `Commit` record is flushed (recorded in `committed_txns`, populated at open from records with `lsn <= flushed_lsn` and extended on `flush`). A commit that has been appended but not yet flushed is tracked separately as pending and `is_committed` returns false for it until the flush makes it durable.
+- `is_committed(txn_id)` consults only durable commits: it is `clog.status(txn_id) == Committed`, which is true once the txn's `Commit` record is flushed. The CLOG (`Clog`, an in-memory `txn_id → TxnStatus` map; supersedes the old single-bit `committed_txns` set) is populated at open by scanning records with `lsn <= flushed_lsn` (`Commit` → `Committed`, `Abort` → `Aborted`) and updated on `flush` (pending commits → `Committed`) and `append` (`Abort` → `Aborted`). A commit that has been appended but not yet flushed is tracked separately as pending and `is_committed` returns false for it until the flush makes it durable. Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as `Committed`; an unrecorded normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F (see `docs/specs/mvcc.md` §5.4).
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests

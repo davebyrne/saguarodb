@@ -13,6 +13,7 @@ use crate::cancel::CancelRegistry;
 use crate::checkpoint::CheckpointState;
 use crate::config::Config;
 use crate::query::QueryService;
+use crate::registry::ActiveTxnRegistry;
 use crate::shutdown::ShutdownState;
 
 pub struct ServerComponents {
@@ -27,6 +28,10 @@ pub struct ServerComponents {
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
+    /// In-progress transaction ids. The CLOG (in the WAL manager) records settled
+    /// outcomes; this registry tracks which transactions are still running, for
+    /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
+    pub active_txns: ActiveTxnRegistry,
     /// TLS acceptor when the server is configured for SSL, else `None`.
     pub tls: Option<TlsAcceptor>,
     /// Per-connection cancellation keys, used to act on `CancelRequest`.

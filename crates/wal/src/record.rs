@@ -24,6 +24,10 @@ pub enum WalRecordKind {
         index: IndexId,
     },
     Commit,
+    /// Marks a transaction aborted. Payload is empty; the `txn_id` is in the
+    /// `WalRecord` header, mirroring `Commit`. Recovery rebuilds the CLOG from
+    /// `Commit`/`Abort` records and never redoes an aborted transaction's data.
+    Abort,
     Checkpoint {
         redo_lsn: Lsn,
     },

@@ -1,7 +1,9 @@
+mod clog;
 mod codec;
 mod file;
 mod record;
 
+pub use clog::Clog;
 pub use codec::{decode_record, encode_record};
 pub use file::FileWalManager;
 pub use record::{WalRecord, WalRecordKind};
@@ -96,6 +98,78 @@ mod tests {
             recovered.append(WalRecord::insert_for_test(12, 3)).unwrap(),
             4
         );
+    }
+
+    #[test]
+    fn abort_record_round_trips_through_the_codec() {
+        let record = WalRecord {
+            lsn: 5,
+            txn_id: 42,
+            kind: WalRecordKind::Abort,
+        };
+        let bytes = encode_record(&record).unwrap();
+        assert_eq!(decode_record(&bytes).unwrap(), record);
+    }
+
+    #[test]
+    fn recovery_rebuilds_clog_from_commit_and_abort_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+
+        // txn 10 commits, txn 11 aborts, txn 12 is left in flight (no marker).
+        wal.append(WalRecord::insert_for_test(10, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 10,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(11, 2)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 11,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(12, 3)).unwrap();
+        wal.flush().unwrap();
+
+        drop(wal);
+        let recovered = FileWalManager::open(&path).unwrap();
+        // The committed txn is committed; the aborted and in-flight txns are not.
+        assert!(recovered.is_committed(10));
+        assert!(!recovered.is_committed(11));
+        assert!(!recovered.is_committed(12));
+
+        // Redo replays only the committed txn's operation record; the aborted
+        // txn's records (and the Commit/Abort markers themselves) are excluded.
+        let committed: Vec<_> = recovered
+            .replay_committed_from(0)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].txn_id, 10);
+    }
+
+    #[test]
+    fn aborted_txn_is_recorded_before_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+
+        wal.append(WalRecord::insert_for_test(7, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 7,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap();
+        // Abort is not fsync-gated: the txn is not committed even unflushed, and
+        // stays not-committed after flush.
+        assert!(!wal.is_committed(7));
+        wal.flush().unwrap();
+        assert!(!wal.is_committed(7));
     }
 
     #[test]

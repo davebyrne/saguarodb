@@ -1366,7 +1366,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery replays committed records onto the heap pages.
 
 ### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1415,6 +1415,7 @@ This gives the invariants:
 | `CreateIndex` | serialized `IndexSchema` (id, table, name, columns, unique) |
 | `DropIndex` | `IndexId` |
 | `Commit` | (empty — marks the transaction as committed) |
+| `Abort` | (empty — marks the transaction as aborted; `txn_id` in the header) |
 | `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
 | `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
@@ -1481,13 +1482,13 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo (with full-pag
 All writes are serialized through the `ConcurrencyController`. The protocol for a single autocommit statement:
 
 1. Acquire exclusive write guard via `controller.begin_write()`
-2. Assign a statement-level `txn_id`
+2. Assign a statement-level `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete). Buffer pool saves before-images on first page touch.
-4. If execution fails: `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog restore when needed; return error to client and drop write guard if rollback cleanup succeeds. If rollback cleanup fails before the commit record is durable, log the rollback failure, attempt to flush WAL, and exit because the process may contain visible partial statement state.
+4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the CLOG; not flushed) and deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog restore when needed; return error to client and drop write guard if rollback cleanup succeeds. If rollback cleanup fails before the commit record is durable, log the rollback failure, attempt to flush WAL, and exit because the process may contain visible partial statement state. (The buffer-pool before-image undo of step 3 is retained; it is retired in Milestone C3 when abort becomes purely status-based.)
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
-8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — discard rollback metadata and before-images
+8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — discard rollback metadata and before-images; deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
 9. Drop write guard (releases exclusive lock)
 10. Call `record_commit_and_maybe_checkpoint(&components)`; it may acquire its own write guard for a checkpoint
 11. Return success to the client
@@ -1514,11 +1515,12 @@ The buffer pool saves a before-image (copy of the page data) on the first write 
 **Failure path:**
 1. `write_page(file, page, txn_id)` — saves before-image on first touch
 2. ... (statement fails mid-execution) ...
-3. `storage.rollback_txn(txn_id)` — restores table metadata (index and heap pages roll back via the buffer pool's before-images)
-4. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
-5. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
-6. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery
-7. Error returned to client
+3. Append an `Abort` record (CLOG → `Aborted`; not flushed) and deregister the txn from the active-transaction registry
+4. `storage.rollback_txn(txn_id)` — restores table metadata (index and heap pages roll back via the buffer pool's before-images)
+5. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
+6. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
+7. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery (its `Abort` record, durable or not, makes it not-committed)
+8. Error returned to client
 
 If any rollback cleanup step fails before the commit record is durable, the server treats process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits instead of returning to service.
 

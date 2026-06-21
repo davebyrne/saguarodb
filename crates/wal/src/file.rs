@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use common::{DbError, Lsn, Result};
 
 use crate::codec::{max_lsn, read_records};
-use crate::{WalManager, WalRecord, WalRecordKind, encode_record};
+use crate::{Clog, WalManager, WalRecord, WalRecordKind, encode_record};
 
 pub struct FileWalManager {
     path: PathBuf,
@@ -22,7 +22,10 @@ struct WalState {
     flushed_offset: u64,
     last_lsn: Lsn,
     last_offset: u64,
-    committed_txns: HashSet<u64>,
+    /// Authoritative transaction-status map, rebuilt at open from the durable
+    /// `Commit`/`Abort` records and updated as records are flushed (see
+    /// [`Clog`]). Supersedes the old single-bit committed set.
+    clog: Clog,
     pending_commits: HashSet<u64>,
     poisoned: Option<String>,
     #[cfg(test)]
@@ -96,7 +99,7 @@ impl FileWalManager {
         let retained: Vec<_> = records.iter().map(|stored| stored.record.clone()).collect();
         let flushed_lsn = max_lsn(&retained);
         let flushed_offset = records.iter().map(|stored| stored.encoded_len).sum();
-        let committed_txns = committed_transactions(&records, flushed_lsn);
+        let clog = rebuild_clog(&records, flushed_lsn);
         let last_lsn = flushed_lsn;
         let last_offset = flushed_offset;
 
@@ -110,7 +113,7 @@ impl FileWalManager {
                 flushed_offset,
                 last_lsn,
                 last_offset,
-                committed_txns,
+                clog,
                 pending_commits: HashSet::new(),
                 poisoned: None,
                 #[cfg(test)]
@@ -179,8 +182,18 @@ impl WalManager for FileWalManager {
             return Err(err);
         }
 
-        if matches!(record.kind, WalRecordKind::Commit) {
-            state.pending_commits.insert(record.txn_id);
+        match record.kind {
+            // A commit only becomes visible in the CLOG once it is durable, so it
+            // is staged as pending until `flush` fsyncs it.
+            WalRecordKind::Commit => {
+                state.pending_commits.insert(record.txn_id);
+            }
+            // Abort is not fsync-gated: recording it eagerly is safe because a
+            // transaction with no durable commit is recovered as aborted anyway.
+            WalRecordKind::Abort => {
+                state.clog.set_aborted(record.txn_id);
+            }
+            _ => {}
         }
         state.next_lsn += 1;
         state.last_lsn = assigned_lsn;
@@ -229,7 +242,9 @@ impl WalManager for FileWalManager {
         state.flushed_lsn = state.last_lsn;
         state.flushed_offset = state.last_offset;
         let pending = std::mem::take(&mut state.pending_commits);
-        state.committed_txns.extend(pending);
+        for txn_id in pending {
+            state.clog.set_committed(txn_id);
+        }
         Ok(state.flushed_lsn)
     }
 
@@ -254,7 +269,7 @@ impl WalManager for FileWalManager {
             .iter()
             .filter(|stored| stored.record.lsn > lsn)
             .filter(|stored| matches!(stored.record.kind, WalRecordKind::Commit))
-            .filter(|stored| state.committed_txns.contains(&stored.record.txn_id))
+            .filter(|stored| state.clog.is_committed(stored.record.txn_id))
             .map(|stored| stored.record.txn_id)
             .collect();
         let records: Vec<_> = state
@@ -350,7 +365,7 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn <= state.flushed_lsn)
             .map(|stored| stored.encoded_len)
             .sum();
-        state.committed_txns = committed_transactions(&state.records, state.flushed_lsn);
+        state.clog = rebuild_clog(&state.records, state.flushed_lsn);
         state.pending_commits = pending_commits(&state.records, state.flushed_lsn);
 
         Ok(())
@@ -359,7 +374,7 @@ impl WalManager for FileWalManager {
     fn is_committed(&self, txn_id: u64) -> bool {
         self.state
             .lock()
-            .map(|state| state.committed_txns.contains(&txn_id))
+            .map(|state| state.clog.is_committed(txn_id))
             .unwrap_or(false)
     }
 
@@ -417,13 +432,25 @@ impl FileWalManager {
     }
 }
 
-fn committed_transactions(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
-    records
+/// Rebuild the CLOG from the durable records (`lsn <= flushed_lsn`): each
+/// `Commit` marks its txn committed, each `Abort` marks its txn aborted. This is
+/// the recovery-time CLOG reconstruction described in `docs/specs/mvcc.md` §8 —
+/// the WAL `Commit`/`Abort` records are the durable source of truth; the CLOG
+/// itself is in-memory for the A–D MVP (a durable CLOG file is a Milestone F
+/// concern). A transaction with neither record is `InProgress` by default.
+fn rebuild_clog(records: &[StoredRecord], flushed_lsn: Lsn) -> Clog {
+    let mut clog = Clog::new();
+    for stored in records
         .iter()
         .filter(|stored| stored.record.lsn <= flushed_lsn)
-        .filter(|stored| matches!(stored.record.kind, WalRecordKind::Commit))
-        .map(|stored| stored.record.txn_id)
-        .collect()
+    {
+        match stored.record.kind {
+            WalRecordKind::Commit => clog.set_committed(stored.record.txn_id),
+            WalRecordKind::Abort => clog.set_aborted(stored.record.txn_id),
+            _ => {}
+        }
+    }
+    clog
 }
 
 fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
@@ -436,11 +463,11 @@ fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
 }
 
 /// A replayable operation record (anything that recovery applies), i.e. every
-/// record except the `Commit` / `Checkpoint` metadata markers.
+/// record except the `Commit` / `Abort` / `Checkpoint` metadata markers.
 fn is_redo_operation(kind: &WalRecordKind) -> bool {
     !matches!(
         kind,
-        WalRecordKind::Commit | WalRecordKind::Checkpoint { .. }
+        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. }
     )
 }
 

@@ -195,7 +195,9 @@ additively.
 ## 5. Format and contract changes (durable)
 
 The on-disk format break is confined to the tuple header (§5.1). All other
-durable changes are additive (new WAL record kinds, a new CLOG file).
+durable changes are additive (new WAL record kinds). For the A–D MVP the CLOG is
+kept **in memory**, rebuilt at recovery from the durable `Commit`/`Abort` WAL
+records (§5.4); a standalone durable CLOG file is deferred to Milestone F.
 
 ### 5.1 Tuple header — row format v2
 
@@ -252,18 +254,34 @@ Index-entry inserts/removals continue to be logged as today (full-page images of
 B-tree pages). VACUUM operations (heap prune, index vacuum, line-pointer reclaim)
 are likewise WAL-logged page mutations.
 
-### 5.4 CLOG — durable transaction status map
+### 5.4 CLOG — transaction status map
 
-A durable map `txn_id → {InProgress, Committed, Aborted}` (two bits per txn),
-recording the outcome of every transaction.
+A map `txn_id → {InProgress, Committed, Aborted}`, recording the outcome of every
+transaction.
 
-- Rebuilt at recovery from `Commit`/`Abort` WAL records (supersedes the
+**MVP decision (A–D): the CLOG is in-memory, rebuilt from the WAL.** The durable
+source of truth for a transaction's outcome is its `Commit`/`Abort` WAL record
+(already durable). The CLOG (`crates/wal/src/clog.rs`, `Clog`, keyed by `txn_id`
+and answering `status(txn_id) -> common::TxnStatus`) is an in-memory structure
+that is (i) updated at runtime on commit (set at flush) and abort (set at append),
+and (ii) **rebuilt at recovery by scanning the durable `Commit`/`Abort` records**,
+exactly as §8 describes. A standalone durable CLOG *file* and its truncation are
+only needed for GC (§9) and to bound recovery scans, so they are deferred to
+Milestone F — the A–D MVP invents no new versioned/checksummed durable format,
+because recovery rebuilds the CLOG from the WAL regardless. The `Clog` lives in
+`crates/wal` because it supersedes the `committed_txns` set previously in
+`crates/wal/src/file.rs` and is reconstructed during recovery's WAL scan.
+
+- Rebuilt at recovery from durable `Commit`/`Abort` WAL records (supersedes the
   single-bit `committed_txns` set in `crates/wal/src/file.rs` as the authoritative
-  status source).
-- Consulted by the visibility predicate and the flush policy at runtime.
-- Truncatable below the GC horizon (§9), coordinated with checkpoint/WAL
-  truncation. Transactions older than the horizon are implicitly committed
-  (their versions are either reclaimed or frozen).
+  status source). `FileWalManager::is_committed` is now `clog.status(txn) ==
+  Committed`, so the redo-committed-only flush/replay gate is behavior-identical.
+- Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as
+  `Committed`/visible; an unrecorded normal id reads as `InProgress`.
+- Consulted by the visibility predicate (B3) and the flush policy at runtime.
+- **(Deferred to F)** A durable CLOG file, truncatable below the GC horizon (§9)
+  and coordinated with checkpoint/WAL truncation. Transactions older than the
+  horizon are implicitly committed (their versions are either reclaimed or frozen).
 
 ### 5.5 `StatementContext` and the snapshot type (`crates/common`)
 
@@ -403,9 +421,11 @@ reference current files.
 - **A2 — `common` types.** `Snapshot`, `TxnStatus`, `IsolationLevel`; extend
   `StatementContext` (unused fields for now).
 - **A3 — CLOG + `Abort` record + active-txn registry.** Add `WalRecordKind::Abort`;
-  build the durable status map (supersedes `committed_txns` as authority); add the
-  active-txn registry on `ServerComponents`; route the existing autocommit
-  commit/rollback through CLOG.
+  build the in-memory status map (`Clog`, rebuilt at recovery from `Commit`/`Abort`
+  WAL records — the durable CLOG file is deferred to F per §5.4) that supersedes
+  `committed_txns` as authority; add the active-txn registry on `ServerComponents`;
+  route the existing autocommit commit/rollback through CLOG (rollback now also
+  appends an `Abort` record, unflushed). Autocommit behavior is unchanged.
 
 ### Milestone B — Index-per-version storage model *(single-writer/autocommit; MVCC-correct internally)*
 
@@ -534,6 +554,10 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
 - Index-vacuum strategy: bulk TID-list sweep vs incremental; interaction with
   concurrent scans under E.
 - CLOG on-disk representation and truncation cadence vs checkpoint frequency.
+  *(A–D MVP decision: the CLOG is in-memory, rebuilt at recovery from the durable
+  `Commit`/`Abort` WAL records — see §5.4. A durable CLOG file and its truncation
+  are deferred to Milestone F, when GC needs them to bound recovery scans; until
+  then this question is open only for F.)*
 - Snapshot representation cost (`xip` as `Vec` vs a more compact structure) — fine
   at the target concurrency; revisit only if measured.
 - Frozen-xid / wraparound handling for very old `xmin` values (far off; the
