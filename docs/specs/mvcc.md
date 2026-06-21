@@ -409,6 +409,8 @@ reference current files.
 
 ### Milestone B — Index-per-version storage model *(single-writer/autocommit; MVCC-correct internally)*
 
+*Commit-by-commit breakdown: Appendix A.*
+
 - **B1 — Line-pointer formalization.** Slot states `NORMAL/DEAD/UNUSED` (§5.2);
   the index→stable-line-pointer contract; `HeapUpdateHeader` WAL record + redo. No
   behavior change (still one version per row).
@@ -536,3 +538,146 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
   at the target concurrency; revisit only if measured.
 - Frozen-xid / wraparound handling for very old `xmin` values (far off; the
   monotonic `u64` allocator defers this, but VACUUM should freeze settled tuples).
+
+---
+
+## Appendix A — Milestone B commit plan
+
+Milestone B is the largest milestone and reworks merged B-tree / secondary-index
+code, so it is decomposed into ordered, commit-sized tasks. **Every commit
+compiles and keeps the existing test suite green; external autocommit behavior is
+unchanged across all of B** — the work is entirely internal (the storage engine
+becomes MVCC). The durability, rollback, and concurrency models are untouched
+(Milestones C–E), so B is self-contained on top of Milestone A.
+
+**Entry state (delivered by Milestone A):** tuples carry
+`xmin`/`xmax`/`t_ctid`/`infomask`, stamped on insert (`xmin = txn`,
+`xmax = invalid`, `t_ctid = self`); CLOG and the `Abort` record exist;
+`Snapshot`/`TxnStatus`/`IsolationLevel` exist and `StatementContext` has (unused)
+`snapshot`/`isolation` fields; an active-transaction registry exists on
+`ServerComponents`.
+
+### B1 — Heap line pointers & in-place header mutation
+
+1. **`feat(storage): in-place tuple-header mutation + line-pointer contract`**
+   - *Does:* page-level primitive to set `xmax`/`t_ctid`/`infomask` on an existing
+     tuple at a slot without relocating it (fixed-width fields ⇒ same-size
+     mutation; no compaction in B), refreshing PageLSN and checksum. Formalize the
+     slot as a line pointer with states `NORMAL`/`DEAD`/`UNUSED` (`REDIRECT`
+     reserved for HOT) and document the stable-`(page, slot)` contract;
+     `UNUSED`-reclaim and `REDIRECT` are defined-but-unexercised (owned by F/H).
+   - *Touches:* `storage/src/page.rs`, `storage/src/codec.rs`.
+   - *Tests:* decode-after-mutate round-trip; checksum/PageLSN refreshed.
+
+2. **`feat(wal): add HeapUpdateHeader record and redo`**
+   - *Does:* `WalRecordKind::HeapUpdateHeader { file_id, page_num, slot, xmax,
+     t_ctid, infomask }` with codec + `apply_physical_redo` under PageLSN gating;
+     not yet emitted by the engine.
+   - *Touches:* `wal/src/record.rs` (+ codec), `server/src/recovery.rs`; spec:
+     `wal.md` + overview WAL section.
+   - *Tests:* append→replay round-trip leaves the header identical; idempotent under
+     PageLSN gating.
+
+### B2 — Uniform heap-TID, multi-entry indexes *(single-version preserved)*
+
+3. **`feat(storage): multi-entry B-tree keyed by (key, tid)`**
+   - *Does:* replace the unique `key → RowLocation` tree (which rejects duplicate
+     keys) with a multi-entry tree ordered by `(key, tid)`: `insert(key, tid)`,
+     `remove(key, tid)`, `scan_key(key) → tids`, `range`; keep FullPageImage
+     logging. Migrate the PK index (one tid per key for now); PK uniqueness kept via
+     an engine presence-probe.
+   - *Touches:* `storage/src/btree.rs`, `storage/src/index_page.rs`,
+     `storage/src/engine.rs`; spec: `storage.md`.
+   - *Tests:* duplicate-key insert/remove/scan ordering; existing PK queries
+     unchanged.
+
+4. **`feat(storage): point secondary indexes directly at heap TIDs`**
+   - *Does:* convert `secondary→PK` to `secondary→heap-TID`; drop the PK-embedding
+     tiebreaker in `secondary_index_key` (now disambiguated by `(key, tid)`) and the
+     `secondary→PK→heap` indirection in `index_scan`; maintain secondary entries by
+     TID; unique secondary keeps a temporary presence-check.
+   - *Touches:* `storage/src/engine.rs`; spec re-documents the secondary-index
+     feature.
+   - *Tests:* secondary point/range scans, non-unique duplicates, NULLs — unchanged.
+
+### B3 — Visibility
+
+5. **`feat(common): tuple visibility predicate + transaction-status view`**
+   - *Does:* pure visibility function over
+     `(xmin, xmax, infomask, &Snapshot, &dyn TxnStatusView)` (§6); a `TxnStatusView`
+     trait (`status(xid)`) backed by CLOG, injected into the storage engine.
+   - *Touches:* `common`, `storage/src/engine.rs`, `server/src/app.rs` +
+     `recovery.rs` (wire CLOG → engine).
+   - *Tests:* table-driven predicate cases (committed/aborted/in-progress/own-write,
+     delete visible/not).
+
+6. **`feat(storage): apply snapshot visibility to scans and point lookups`**
+   - *Does:* thread the snapshot (via `StatementContext`) + status view into
+     `read_location`/`scan_range`/`index_scan`; filter invisible versions; replace
+     "index → dead row = error" with "skip invisible"; capture a degenerate
+     autocommit snapshot in `server/src/query.rs` (empty `xip`, sees all committed),
+     so results are unchanged.
+   - *Touches:* `storage/src/engine.rs`, `server/src/query.rs`.
+   - *Tests:* existing read results unchanged; one hand-built-snapshot test proves a
+     tuple is correctly hidden/shown.
+
+### B4 — Versioning writes
+
+> Land visibility-aware uniqueness (7) **before** the versioning commits (8–9), or
+> there is a window where delete-then-reinsert wrongly fails.
+
+7. **`feat(storage): MVCC-aware unique-constraint enforcement`**
+   - *Does:* probe for a *visible-or-in-flight* version with the key (PK + unique
+     secondary), ignoring dead/aborted versions; remove the presence-checks from
+     commits 3–4. A no-op while single-version, so it lands safely ahead of
+     versioning.
+   - *Touches:* `storage/src/engine.rs` (insert/update uniqueness paths).
+   - *Tests:* duplicate-key → `UniqueViolation`; unique-secondary respected.
+
+8. **`feat(storage): DELETE marks the version deleted in place (xmax)`**
+   - *Does:* locate the visible version, stamp its `xmax` in place (commits 1–2),
+     retain its index entries (VACUUM cleans them); drop slot-dead tombstoning.
+   - *Touches:* `storage/src/engine.rs` (`delete`, `delete_row_logged`).
+   - *Tests:* delete+select (autocommit) hides the row; entry retained;
+     delete-then-reinsert now allowed.
+
+9. **`feat(storage): UPDATE writes a new version and chains it`**
+   - *Does:* stamp the old version's `xmax` + `t_ctid→new`, write the new version
+     (`xmin = txn`, `xmax = invalid`, `t_ctid = self`), insert per-version index
+     entries into all indexes, retain old entries; drop relocate-tombstone-repoint;
+     keep rejecting PK changes; only touch a secondary index whose columns changed
+     (but never *remove* the old entry — VACUUM's job).
+   - *Touches:* `storage/src/engine.rs` (`update`).
+   - *Tests:* update+select sees the new value; both versions present internally; a
+     secondary scan by the *old* value resolves via a hand-built old snapshot.
+
+### Optional / follow-on (land in B or defer to G)
+
+10. **`perf(storage): cache settled status via infomask hint bits`** — set
+    `XMIN_COMMITTED`/`XMAX_COMMITTED`/`*_ABORTED` once a transaction is settled to
+    skip CLOG probes. Requires a durability decision (log via `HeapUpdateHeader`
+    vs. treat as recomputable), hence deferred-friendly; B is correct without it
+    (always consult CLOG).
+
+### Sequencing notes
+
+- **Structure → read → write:** B1–B2 build the substrate (header mutation, uniform
+  multi-entry TID indexes) with zero behavior change; B3 adds read-side visibility
+  (all-visible under autocommit); B4 flips writes to versioning — the first point
+  internal state diverges (old versions linger until Milestone F's VACUUM, the
+  accepted interim cost).
+- **No-regression window** is avoided by landing visibility-aware uniqueness (7)
+  before delete/update (8–9).
+- **Recovery is unaffected during B:** under autocommit single-writer every
+  statement is its own committed transaction, so the existing
+  `replay_committed_from` redo model replays the new
+  `HeapUpdateHeader`/`HeapInsert`/index records correctly and the flush policy still
+  never flushes uncommitted pages. Redo-all (Milestone D) is needed only once
+  multi-statement / concurrent writers arrive.
+- **Reads do not walk `t_ctid`:** with index-per-version every version is
+  independently indexed, so a scan collects all candidate TIDs from the index and
+  visibility-checks each; the forward `t_ctid` chain is maintained for later
+  update-locating / conflict detection (Milestone E), not for plain `SELECT`.
+- **Spec updates ride along** per `AGENTS.md`: commit 2 → `wal.md`; commits 3–4,
+  8–9 → `storage.md` (and re-spec the secondary-index feature); commit 6 → the
+  executor/storage read contract.
