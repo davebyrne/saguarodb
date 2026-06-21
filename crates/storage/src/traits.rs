@@ -44,4 +44,6 @@ pub trait SchemaOperations: Send + Sync {
 pub trait RecoveryOperations: Send + Sync {
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_drop_index(&self, index: IndexId) -> Result<()>;
 }

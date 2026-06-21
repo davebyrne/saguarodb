@@ -135,6 +135,29 @@ impl PageBackedStorageEngine {
         Ok(())
     }
 
+    pub(crate) fn apply_create_index_without_wal(&self, schema: IndexSchema) -> Result<()> {
+        // Like apply_create_table_without_wal: the secondary tree's pages are
+        // replayed from their full-page-image redo records, so this installs index
+        // metadata only and must not build or backfill the tree.
+        let mut state = self.lock_state()?;
+        state.indexes.insert(
+            schema.id,
+            IndexState {
+                schema,
+                dropped: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn apply_drop_index_without_wal(&self, index: IndexId) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if let Some(index_state) = state.indexes.get_mut(&index) {
+            index_state.dropped = true;
+        }
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, StorageState>> {
         self.state
             .lock()
@@ -641,6 +664,13 @@ impl SchemaOperations for PageBackedStorageEngine {
         let (table_schema, pk_file_id) = self.table_handle(schema.table)?;
         {
             let mut state = self.lock_state()?;
+            self.append_wal(
+                &state,
+                ctx,
+                WalRecordKind::CreateIndex {
+                    schema: schema.clone(),
+                },
+            )?;
             record_index_before(&mut state, ctx.txn_id, schema.id);
             state.indexes.insert(
                 schema.id,
@@ -678,6 +708,7 @@ impl SchemaOperations for PageBackedStorageEngine {
         {
             return Ok(());
         }
+        self.append_wal(&state, ctx, WalRecordKind::DropIndex { index })?;
         record_index_before(&mut state, ctx.txn_id, index);
         let index_state = state
             .indexes

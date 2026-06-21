@@ -24,6 +24,8 @@ pub enum WalRecordKind {
     // Logical (structured) records, JSON payloads.
     CreateTable { schema: TableSchema },
     DropTable { table: TableId },
+    CreateIndex { schema: IndexSchema },
+    DropIndex { index: IndexId },
     Commit,
     Checkpoint { redo_lsn: Lsn },
     // Physiological redo records, compact binary payloads.
@@ -74,7 +76,7 @@ pub trait WalManager: Send + Sync {
 
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit` and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`).
+`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit` and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`).
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
 
@@ -86,7 +88,7 @@ pub trait WalManager: Send + Sync {
 
 For a successful write statement:
 
-1. Storage appends physiological redo records (`HeapInit`/`HeapInsert`/`HeapDelete`, or a `FullPageImage` on the first modification of a page since the last checkpoint); DDL appends `CreateTable`/`DropTable`.
+1. Storage appends physiological redo records (`HeapInit`/`HeapInsert`/`HeapDelete`, or a `FullPageImage` on the first modification of a page since the last checkpoint); DDL appends `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`.
 2. Server query orchestration appends `Commit`.
 3. Server query orchestration calls `wal.flush()`.
 4. The statement is durable and must not be rolled back.

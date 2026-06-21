@@ -48,7 +48,15 @@ pub fn open_app(config: Config) -> Result<AppState> {
         wal.clone(),
         StorageMode::Recovery,
     )?);
-    storage.install_schemas(catalog.list_tables()?)?;
+    // Install both table and secondary-index schemas from the loaded catalog so
+    // recovery replay and later DML maintain the indexes.
+    let tables = catalog.list_tables()?;
+    let mut indexes = Vec::new();
+    for table in &tables {
+        indexes.extend(catalog.list_indexes_for_table(table.id)?);
+    }
+    storage.install_schemas(tables)?;
+    storage.install_index_schemas(indexes)?;
 
     // Redo: replay committed records after the checkpoint LSN onto the heap and
     // index pages. PageLSN gating makes this idempotent; torn/missing pages are
@@ -144,6 +152,14 @@ fn apply_redo(
             catalog.apply_drop_table(*table)?;
             storage.apply_drop_table(*table)
         }
+        WalRecordKind::CreateIndex { schema } => {
+            catalog.apply_create_index(schema.clone())?;
+            storage.apply_create_index(schema.clone())
+        }
+        WalRecordKind::DropIndex { index } => {
+            catalog.apply_drop_index(*index)?;
+            storage.apply_drop_index(*index)
+        }
         WalRecordKind::HeapInit { file_id, page_num }
         | WalRecordKind::HeapInsert {
             file_id, page_num, ..
@@ -212,6 +228,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn recovery_replays_create_index_and_rebuilds_the_secondary_tree() {
+        use std::sync::atomic::Ordering;
+
+        use common::{Key, KeyRange, StatementContext, Value};
+        use storage::{SchemaOperations, StorageEngine};
+
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        let index_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (1, 'Ada')")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (2, 'Grace')")
+                .unwrap();
+
+            // CREATE INDEX has no SQL yet (next increment); drive it as a committed
+            // statement through the components, mirroring execute_write's durability
+            // sequence, and do NOT checkpoint so recovery must replay it.
+            let comps = &app.components;
+            let schema = comps
+                .catalog
+                .create_index(
+                    "users_name".to_string(),
+                    "users",
+                    &["name".to_string()],
+                    false,
+                )
+                .unwrap();
+            table_id = schema.table;
+            index_id = schema.id;
+            let txn_id = comps.next_txn_id.fetch_add(1, Ordering::AcqRel);
+            let ctx = StatementContext { txn_id };
+            comps.storage.create_index(&ctx, &schema).unwrap();
+            comps
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            comps.wal.flush().unwrap();
+            comps.storage.commit_txn(txn_id).unwrap();
+            comps.buffer_pool.commit(txn_id).unwrap();
+        }
+
+        // Reopen: recovery replays the CreateIndex record into both catalog and
+        // storage and rebuilds the secondary tree from its full-page images.
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let comps = &reopened.components;
+        assert!(
+            comps
+                .catalog
+                .get_index_by_name("users_name")
+                .unwrap()
+                .is_some()
+        );
+
+        let ctx = StatementContext { txn_id: 0 };
+        let mut iter = comps
+            .storage
+            .index_scan(
+                &ctx,
+                table_id,
+                index_id,
+                &KeyRange::Exact(Key(vec![Value::Text("Ada".to_string())])),
+            )
+            .unwrap();
+        let row = iter
+            .next()
+            .unwrap()
+            .expect("Ada should be found through the recovered index");
+        assert_eq!(row.row.values[0], Value::Integer(1));
+        assert!(iter.next().unwrap().is_none());
     }
 
     #[test]

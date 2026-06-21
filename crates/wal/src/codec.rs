@@ -15,6 +15,8 @@ const TYPE_HEAP_INIT: u8 = 5;
 const TYPE_HEAP_INSERT: u8 = 6;
 const TYPE_HEAP_DELETE: u8 = 7;
 const TYPE_FULL_PAGE_IMAGE: u8 = 8;
+const TYPE_CREATE_INDEX: u8 = 9;
+const TYPE_DROP_INDEX: u8 = 10;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -135,6 +137,8 @@ fn record_type(kind: &WalRecordKind) -> u8 {
     match kind {
         WalRecordKind::CreateTable { .. } => TYPE_CREATE_TABLE,
         WalRecordKind::DropTable { .. } => TYPE_DROP_TABLE,
+        WalRecordKind::CreateIndex { .. } => TYPE_CREATE_INDEX,
+        WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
         WalRecordKind::Commit => TYPE_COMMIT,
         WalRecordKind::Checkpoint { .. } => TYPE_CHECKPOINT,
         WalRecordKind::HeapInit { .. } => TYPE_HEAP_INIT,
@@ -327,6 +331,31 @@ mod tests {
             let record = WalRecord {
                 lsn: 12,
                 txn_id: 4,
+                kind,
+            };
+            let bytes = encode_record(&record).unwrap();
+            assert_eq!(decode_record(&bytes).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn round_trips_logical_index_records() {
+        let kinds = [
+            WalRecordKind::CreateIndex {
+                schema: common::IndexSchema {
+                    id: 3,
+                    table: 1,
+                    name: "users_name".to_string(),
+                    columns: vec![1],
+                    unique: true,
+                },
+            },
+            WalRecordKind::DropIndex { index: 3 },
+        ];
+        for kind in kinds {
+            let record = WalRecord {
+                lsn: 7,
+                txn_id: 2,
                 kind,
             };
             let bytes = encode_record(&record).unwrap();

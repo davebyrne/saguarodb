@@ -111,7 +111,7 @@ On startup:
 
 1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
-3. Recovery replays post-checkpoint `CreateTable` and `DropTable` records into both catalog and storage using `apply_create_table` and `apply_drop_table`.
+3. Recovery replays post-checkpoint `CreateTable`, `DropTable`, `CreateIndex`, and `DropIndex` records into both catalog and storage using `apply_create_table` / `apply_drop_table` / `apply_create_index` / `apply_drop_index`.
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
@@ -119,7 +119,7 @@ Catalog mutations update memory immediately. Durability before the next checkpoi
 
 ## WAL Interaction
 
-`CREATE TABLE` and `DROP TABLE` are logged. The executor/storage orchestration must ensure catalog mutation and storage file mutation are part of the same statement-level commit.
+`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` are logged. The executor/storage orchestration must ensure catalog mutation and storage file mutation are part of the same statement-level commit.
 
 If a normal DDL statement fails after catalog mutation but before statement success, the caller must restore the previous catalog snapshot before returning the error.
 

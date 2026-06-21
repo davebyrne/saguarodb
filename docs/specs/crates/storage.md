@@ -45,6 +45,8 @@ pub trait SchemaOperations: Send + Sync {
 pub trait RecoveryOperations: Send + Sync {
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_drop_index(&self, index: IndexId) -> Result<()>;
 }
 ```
 
@@ -173,8 +175,9 @@ used for a secondary index.
   installed index schemas (`install_index_schemas`) plus in-session creates.
 - **Crash safety.** Like the primary-key index, every secondary node mutation
   logs a `FullPageImage` and stamps the page-LSN, so index pages recover through
-  the same redo path as the heap. Index *metadata* durability (which indexes
-  exist) is the catalog's responsibility (see `catalog.md`).
+  the same redo path as the heap. Index *metadata* (which indexes exist) is made
+  durable by the `CreateIndex` / `DropIndex` WAL records — replayed into both
+  catalog and storage — plus the catalog snapshot at each checkpoint.
 
 ## Heap Page Store
 
@@ -202,7 +205,7 @@ Normal data operations append physiological redo records as they mutate pages, s
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - A row delete logs `HeapDelete { file_id, page_num, slot }` (or a `FullPageImage` on first touch). An update is a delete followed by an insert.
 - Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
-- `SchemaOperations::create_table` / `drop_table` log `CreateTable` / `DropTable`.
+- `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
 
@@ -278,3 +281,5 @@ impl PageBackedStorageEngine {
 - Insert, update, and delete keep a secondary index in sync.
 - A unique index rejects a duplicate value on insert and on backfill, but allows multiple NULLs.
 - A dropped index is no longer maintained or scannable; a rolled-back create removes it.
+- `create_index` logs a `CreateIndex` record; recovery-apply index methods append no WAL.
+- After a restart, a secondary index created post-checkpoint is replayed (catalog + storage metadata and its rebuilt tree) and remains scannable.

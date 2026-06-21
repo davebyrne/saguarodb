@@ -118,9 +118,34 @@ mod tests {
     fn recovery_apply_ddl_does_not_append_wal() {
         let harness = StorageHarness::new();
         harness.storage.apply_create_table(users_schema()).unwrap();
+        harness
+            .storage
+            .apply_create_index(name_index(false))
+            .unwrap();
+        harness.storage.apply_drop_index(1).unwrap();
         harness.storage.apply_drop_table(1).unwrap();
 
         assert_eq!(harness.wal.record_count(), 0);
+    }
+
+    #[test]
+    fn create_index_logs_a_create_index_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = Arc::new(MemoryBufferPool::empty(64));
+        let wal = Arc::new(wal::FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let storage =
+            PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
+        let ctx = StatementContext { txn_id: 1 };
+        storage.create_table(&ctx, &users_schema()).unwrap();
+        storage.create_index(&ctx, &name_index(false)).unwrap();
+        wal.flush().unwrap();
+
+        let logged = wal
+            .replay_from(0)
+            .unwrap()
+            .filter_map(|record| record.ok())
+            .any(|record| matches!(record.kind, wal::WalRecordKind::CreateIndex { .. }));
+        assert!(logged, "create_index should log a CreateIndex WAL record");
     }
 
     #[test]

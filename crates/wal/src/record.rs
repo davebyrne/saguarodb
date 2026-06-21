@@ -1,4 +1,4 @@
-use common::{FileId, Lsn, PageNum, TableId, TableSchema};
+use common::{FileId, IndexId, IndexSchema, Lsn, PageNum, TableId, TableSchema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +16,12 @@ pub enum WalRecordKind {
     },
     DropTable {
         table: TableId,
+    },
+    CreateIndex {
+        schema: IndexSchema,
+    },
+    DropIndex {
+        index: IndexId,
     },
     Commit,
     Checkpoint {
