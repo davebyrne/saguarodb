@@ -1,8 +1,8 @@
 use std::ops::Bound;
 
 use common::{
-    ColumnId, ColumnInfo, IndexId, Key, KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result,
-    TableId, Value,
+    ColumnId, ColumnInfo, DataType, IndexId, Key, KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
+    Result, TableId, Value,
 };
 
 use crate::{AggregateExpr, BinOp, BoundExpr, BoundOrderByItem, JoinType, LogicalPlan};
@@ -210,20 +210,29 @@ fn plan_join(
     let left_plan = physical_plan(left, catalog)?;
     let right_plan = physical_plan(right, catalog)?;
 
-    // An inner join whose ON predicate is a conjunction of column equalities,
-    // each comparing a left column to a right column, can run as a hash join.
-    // Anything else (outer/cross joins, non-equi or expression predicates)
-    // falls back to the nested-loop join.
+    // An inner join whose ON predicate has at least one `left_col = right_col`
+    // equality conjunct can run as a hash join on those equality pairs. Any
+    // remaining (non-equi or expression) conjuncts are re-checked in a Filter
+    // above the hash join. Anything else (outer/cross joins, or inner joins with
+    // no column-equality conjunct) falls back to the nested-loop join.
     if join_type == JoinType::Inner
         && let Some(condition) = condition
     {
         let left_width = output_width(&left_plan, catalog)?;
-        if let Some((left_keys, right_keys)) = equi_join_keys(condition, left_width) {
-            return Ok(PhysicalPlan::HashJoin {
+        let split = split_equi_keys(condition, left_width);
+        if !split.left_keys.is_empty() {
+            let hash = PhysicalPlan::HashJoin {
                 left: Box::new(left_plan),
                 right: Box::new(right_plan),
-                left_keys,
-                right_keys,
+                left_keys: split.left_keys,
+                right_keys: split.right_keys,
+            };
+            return Ok(match split.residual {
+                Some(predicate) => PhysicalPlan::Filter {
+                    source: Box::new(hash),
+                    predicate,
+                },
+                None => hash,
             });
         }
     }
@@ -236,27 +245,51 @@ fn plan_join(
     })
 }
 
-/// Extracts paired join-key slots from an inner-join predicate, returning
-/// `None` if any conjunct is not a `left_column = right_column` equality.
-/// Returned slots are relative to each child row: left slots as-is, right
-/// slots rebased by `left_width` (join children are left-deep, so a child
-/// row's column positions match its global slots).
-fn equi_join_keys(condition: &BoundExpr, left_width: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+struct EquiSplit {
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    residual: Option<BoundExpr>,
+}
+
+/// Partition an inner-join predicate into `left_col = right_col` equality pairs
+/// (the hash keys) and the remaining conjuncts (a residual re-checked in a
+/// `Filter` above the join). Left key slots are as-is; right key slots are
+/// rebased by `left_width`. Residual conjuncts keep their global slots, which
+/// already index the joined (left ++ right) row.
+fn split_equi_keys(condition: &BoundExpr, left_width: usize) -> EquiSplit {
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();
-    if collect_equi_keys(condition, left_width, &mut left_keys, &mut right_keys) {
-        Some((left_keys, right_keys))
-    } else {
-        None
+    let mut residuals = Vec::new();
+    collect_split(
+        condition,
+        left_width,
+        &mut left_keys,
+        &mut right_keys,
+        &mut residuals,
+    );
+    let residual = residuals
+        .into_iter()
+        .reduce(|acc, next| BoundExpr::BinaryOp {
+            left: Box::new(acc),
+            op: BinOp::And,
+            right: Box::new(next),
+            data_type: DataType::Boolean,
+            nullable: true,
+        });
+    EquiSplit {
+        left_keys,
+        right_keys,
+        residual,
     }
 }
 
-fn collect_equi_keys(
+fn collect_split(
     expr: &BoundExpr,
     left_width: usize,
     left_keys: &mut Vec<usize>,
     right_keys: &mut Vec<usize>,
-) -> bool {
+    residuals: &mut Vec<BoundExpr>,
+) {
     match expr {
         BoundExpr::BinaryOp {
             left,
@@ -264,8 +297,8 @@ fn collect_equi_keys(
             right,
             ..
         } => {
-            collect_equi_keys(left, left_width, left_keys, right_keys)
-                && collect_equi_keys(right, left_width, left_keys, right_keys)
+            collect_split(left, left_width, left_keys, right_keys, residuals);
+            collect_split(right, left_width, left_keys, right_keys, residuals);
         }
         BoundExpr::BinaryOp {
             left,
@@ -276,11 +309,10 @@ fn collect_equi_keys(
             Some((left_slot, right_slot)) => {
                 left_keys.push(left_slot);
                 right_keys.push(right_slot);
-                true
             }
-            None => false,
+            None => residuals.push(expr.clone()),
         },
-        _ => false,
+        _ => residuals.push(expr.clone()),
     }
 }
 

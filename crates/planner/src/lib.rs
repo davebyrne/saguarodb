@@ -713,8 +713,7 @@ mod tests {
     #[test]
     fn binder_assigns_distinct_binding_ids_for_self_join() {
         let catalog = catalog_with_users();
-        let stmt =
-            parse("select a.id from users as a join users as b on a.id = b.id").unwrap();
+        let stmt = parse("select a.id from users as a join users as b on a.id = b.id").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
         let BoundStatement::Select(select) = bound else {
@@ -723,10 +722,18 @@ mod tests {
         let BoundFrom::Join { left, right, .. } = select.from else {
             panic!("expected join");
         };
-        let BoundFrom::Table { binding: left_binding, .. } = *left else {
+        let BoundFrom::Table {
+            binding: left_binding,
+            ..
+        } = *left
+        else {
             panic!("expected left table");
         };
-        let BoundFrom::Table { binding: right_binding, .. } = *right else {
+        let BoundFrom::Table {
+            binding: right_binding,
+            ..
+        } = *right
+        else {
             panic!("expected right table");
         };
         assert_ne!(
@@ -819,7 +826,11 @@ mod tests {
         };
         assert!(matches!(
             select.from,
-            BoundFrom::Join { join_type: JoinType::Cross, condition: None, .. }
+            BoundFrom::Join {
+                join_type: JoinType::Cross,
+                condition: None,
+                ..
+            }
         ));
     }
 
@@ -993,7 +1004,11 @@ mod tests {
 
         assert!(matches!(
             logical,
-            LogicalPlan::Limit { count: 5, offset: None, .. }
+            LogicalPlan::Limit {
+                count: 5,
+                offset: None,
+                ..
+            }
         ));
     }
 
@@ -1006,7 +1021,11 @@ mod tests {
 
         assert!(matches!(
             logical,
-            LogicalPlan::Limit { count: u64::MAX, offset: Some(3), .. }
+            LogicalPlan::Limit {
+                count: u64::MAX,
+                offset: Some(3),
+                ..
+            }
         ));
     }
 
@@ -1111,6 +1130,22 @@ mod tests {
                 }
             ),
             "fallible operand must be preserved (no collapse to constant), got {source:?}"
+        );
+    }
+
+    #[test]
+    fn physical_planner_hashes_equi_keys_and_filters_residual() {
+        let catalog = catalog_with_users_and_accounts();
+        let physical = plan_of(
+            &catalog,
+            "select users.id from users join accounts \
+             on users.id = accounts.id and users.id < accounts.id",
+        );
+        let text = format_explain(&physical);
+        assert!(text.contains("HashJoin keys=1"), "got: {text}");
+        assert!(
+            text.contains("Filter"),
+            "expected residual filter, got: {text}"
         );
     }
 }
