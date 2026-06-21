@@ -3,15 +3,17 @@ mod bound;
 mod explain;
 mod expr;
 mod logical;
+mod params;
 mod physical;
 
-pub use binder::bind;
+pub use binder::{bind, bind_parameterized};
 pub use bound::{BoundFrom, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement};
 pub use explain::format_explain;
 pub use expr::{
     AggregateExpr, AggregateFunc, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
 };
 pub use logical::{LogicalPlan, logical_plan};
+pub use params::{collect_param_types, substitute_params};
 pub use physical::{PhysicalPlan, physical_plan};
 
 #[cfg(test)]
@@ -592,5 +594,65 @@ mod tests {
                     } if values == &vec![Value::Integer(7)]
                 )
         ));
+    }
+
+    #[test]
+    fn binds_parameter_type_from_filter_context() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $1").unwrap();
+        let (bound, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        assert_eq!(params, vec![DataType::Integer]);
+
+        let substituted = substitute_params(&bound, &[Value::Integer(7)]).unwrap();
+        assert!(collect_param_types(&substituted, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn binds_insert_parameters_by_column_type() {
+        let catalog = catalog_with_users();
+        let stmt = parse("insert into users (id, name) values ($1, $2)").unwrap();
+        let (_, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        assert_eq!(params, vec![DataType::Integer, DataType::Text]);
+    }
+
+    #[test]
+    fn honors_declared_parameter_type() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where name = $1").unwrap();
+        let (_, params) = bind_parameterized(&stmt, &catalog, &[Some(DataType::Text)]).unwrap();
+        assert_eq!(params, vec![DataType::Text]);
+    }
+
+    #[test]
+    fn rejects_declared_type_conflicting_with_use() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $1").unwrap();
+        let err = bind_parameterized(&stmt, &catalog, &[Some(DataType::Text)]).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn errors_when_parameter_type_cannot_be_determined() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select $1 from users").unwrap();
+        let err = bind_parameterized(&stmt, &catalog, &[]).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn simple_bind_rejects_parameters() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $1").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn substitute_rejects_value_of_wrong_type() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $1").unwrap();
+        let (bound, _) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        let err = substitute_params(&bound, &[Value::Text("x".to_string())]).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 }

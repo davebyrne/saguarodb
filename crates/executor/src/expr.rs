@@ -4,6 +4,11 @@ use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
     match expr {
         BoundExpr::Literal { value, .. } => Ok(value.clone()),
+        // Parameters are replaced with literals by substitution before execution.
+        BoundExpr::Parameter { index, .. } => Err(DbError::internal(format!(
+            "unbound parameter ${} reached the executor",
+            index + 1
+        ))),
         BoundExpr::InputRef { slot, .. } | BoundExpr::LocalRef { slot, .. } => row
             .row
             .values

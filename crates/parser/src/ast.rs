@@ -92,6 +92,8 @@ pub struct OrderByItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Literal(Value),
+    /// Extended-protocol parameter placeholder `$n` (1-based as written).
+    Placeholder(u32),
     ColumnRef {
         table: Option<String>,
         column: String,

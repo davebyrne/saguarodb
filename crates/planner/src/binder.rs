@@ -30,9 +30,55 @@ struct BindContext {
     bindings: Vec<Binding>,
     next_binding: BindingId,
     next_slot: usize,
+    /// Parameter type OIDs declared by an extended-protocol `Parse` (mapped to
+    /// `DataType`), 0-based and `None` when unspecified. Empty for simple queries.
+    declared_params: Vec<Option<DataType>>,
 }
 
+impl BindContext {
+    fn new(declared_params: &[Option<DataType>]) -> Self {
+        Self {
+            declared_params: declared_params.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    fn declared_param(&self, index: usize) -> Option<DataType> {
+        self.declared_params.get(index).cloned().flatten()
+    }
+}
+
+/// Bind a statement from the simple query protocol. Query parameters are not
+/// allowed here.
 pub fn bind(statement: &Statement, catalog: &dyn CatalogManager) -> Result<BoundStatement> {
+    let bound = bind_inner(statement, catalog, &[])?;
+    if !crate::params::collect_param_types(&bound, &[])?.is_empty() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "query parameters are not supported in the simple query protocol",
+        ));
+    }
+    Ok(bound)
+}
+
+/// Bind a statement from the extended query protocol, resolving `$n` parameter
+/// types (honoring the `Parse`-declared OIDs, otherwise inferring from context).
+/// Returns the bound statement and the resolved parameter types by position.
+pub fn bind_parameterized(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared_param_types: &[Option<DataType>],
+) -> Result<(BoundStatement, Vec<DataType>)> {
+    let bound = bind_inner(statement, catalog, declared_param_types)?;
+    let params = crate::params::collect_param_types(&bound, declared_param_types)?;
+    Ok((bound, params))
+}
+
+fn bind_inner(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+) -> Result<BoundStatement> {
     match statement {
         Statement::CreateTable {
             name,
@@ -68,15 +114,21 @@ pub fn bind(statement: &Statement, catalog: &dyn CatalogManager) -> Result<Bound
             table,
             columns,
             source,
-        } => bind_insert(catalog, table, columns, source),
-        Statement::Select(select) => bind_select(catalog, select).map(BoundStatement::Select),
+        } => bind_insert(catalog, table, columns, source, declared),
+        Statement::Select(select) => {
+            bind_select(catalog, select, declared).map(BoundStatement::Select)
+        }
         Statement::Update {
             table,
             assignments,
             filter,
-        } => bind_update(catalog, table, assignments, filter.as_ref()),
-        Statement::Delete { table, filter } => bind_delete(catalog, table, filter.as_ref()),
-        Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind(inner, catalog)?))),
+        } => bind_update(catalog, table, assignments, filter.as_ref(), declared),
+        Statement::Delete { table, filter } => {
+            bind_delete(catalog, table, filter.as_ref(), declared)
+        }
+        Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
+            inner, catalog, declared,
+        )?))),
     }
 }
 
@@ -85,14 +137,17 @@ fn bind_insert(
     table_name: &str,
     column_names: &[String],
     source: &InsertSource,
+    declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let columns = insert_columns(&table, column_names)?;
     validate_insert_omissions(&table, &columns)?;
 
     let source = match source {
-        InsertSource::Values(rows) => bind_insert_values(&table, &columns, rows)?,
-        InsertSource::Query(select) => bind_insert_query(catalog, &table, &columns, select)?,
+        InsertSource::Values(rows) => bind_insert_values(&table, &columns, rows, declared)?,
+        InsertSource::Query(select) => {
+            bind_insert_query(catalog, &table, &columns, select, declared)?
+        }
     };
 
     Ok(BoundStatement::Insert {
@@ -106,6 +161,7 @@ fn bind_insert_values(
     table: &TableSchema,
     columns: &[ColumnId],
     rows: &[Vec<Expr>],
+    declared: &[Option<DataType>],
 ) -> Result<BoundInsertSource> {
     let mut bound_rows = Vec::with_capacity(rows.len());
     for row in rows {
@@ -120,7 +176,7 @@ fn bind_insert_values(
         for (expr, column_id) in row.iter().zip(columns) {
             let column = column_by_id(table, *column_id)?;
             let bound = bind_expr(
-                &mut BindContext::default(),
+                &mut BindContext::new(declared),
                 expr,
                 Some(column.data_type.clone()),
             )?;
@@ -150,8 +206,9 @@ fn bind_insert_query(
     table: &TableSchema,
     columns: &[ColumnId],
     select: &SelectStatement,
+    declared: &[Option<DataType>],
 ) -> Result<BoundInsertSource> {
-    let bound = bind_select(catalog, select)?;
+    let bound = bind_select(catalog, select, declared)?;
     if bound.columns.len() != columns.len() {
         return Err(plan_error(
             SqlState::DatatypeMismatch,
@@ -170,9 +227,10 @@ fn bind_update(
     table_name: &str,
     assignments: &[Assignment],
     filter: Option<&Expr>,
+    declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let mut ctx = BindContext::default();
+    let mut ctx = BindContext::new(declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
@@ -224,9 +282,10 @@ fn bind_delete(
     catalog: &dyn CatalogManager,
     table_name: &str,
     filter: Option<&Expr>,
+    declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let mut ctx = BindContext::default();
+    let mut ctx = BindContext::new(declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
@@ -251,7 +310,11 @@ fn bind_delete(
     })
 }
 
-fn bind_select(catalog: &dyn CatalogManager, select: &SelectStatement) -> Result<BoundSelect> {
+fn bind_select(
+    catalog: &dyn CatalogManager,
+    select: &SelectStatement,
+    declared: &[Option<DataType>],
+) -> Result<BoundSelect> {
     if select.from.is_empty() {
         return Err(plan_error(
             SqlState::UndefinedTable,
@@ -259,7 +322,7 @@ fn bind_select(catalog: &dyn CatalogManager, select: &SelectStatement) -> Result
         ));
     }
 
-    let mut ctx = BindContext::default();
+    let mut ctx = BindContext::new(declared);
     let from = bind_from_items(catalog, &mut ctx, &select.from)?;
     let filter = select
         .filter
@@ -498,6 +561,7 @@ fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
 fn bind_expr(ctx: &mut BindContext, expr: &Expr, expected: Option<DataType>) -> Result<BoundExpr> {
     match expr {
         Expr::Literal(value) => bind_literal(value, expected),
+        Expr::Placeholder(index) => bind_placeholder(ctx, *index, expected),
         Expr::ColumnRef { table, column } => resolve_column(ctx, table.as_deref(), column),
         Expr::BinaryOp { left, op, right } => bind_binary_op(ctx, left, op.clone(), right),
         Expr::UnaryOp { op, expr } => bind_unary_op(ctx, op.clone(), expr),
@@ -557,6 +621,39 @@ fn bind_expr(ctx: &mut BindContext, expr: &Expr, expected: Option<DataType>) -> 
             })
         }
     }
+}
+
+fn bind_placeholder(
+    ctx: &BindContext,
+    index: u32,
+    expected: Option<DataType>,
+) -> Result<BoundExpr> {
+    let slot = usize::try_from(index - 1)
+        .map_err(|_| plan_error(SqlState::SyntaxError, "invalid parameter index"))?;
+    let declared = ctx.declared_param(slot);
+    let data_type = match (declared, expected) {
+        (Some(declared), Some(expected)) if declared != expected => {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!("parameter ${index} type does not match its use"),
+            ));
+        }
+        (Some(declared), _) => declared,
+        (None, Some(expected)) => expected,
+        (None, None) => {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!("could not determine data type of parameter ${index}"),
+            ));
+        }
+    };
+    // A bound parameter value may be NULL; runtime NOT NULL checks (validate_not_null)
+    // enforce column constraints, so the slot is treated as non-null for binding.
+    Ok(BoundExpr::Parameter {
+        index: slot,
+        data_type,
+        nullable: false,
+    })
 }
 
 fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> {
@@ -1196,9 +1293,10 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             }
             Ok(())
         }
-        BoundExpr::Literal { .. } | BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => {
-            validate_grouped_expr(expr, group_by)
-        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. } => validate_grouped_expr(expr, group_by),
         BoundExpr::AggregateCall { .. } => Ok(()),
     }
 }
@@ -1235,9 +1333,10 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
                 || else_clause.as_deref().is_some_and(contains_aggregate)
         }
-        BoundExpr::Literal { .. } | BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => {
-            false
-        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. } => false,
     }
 }
 
@@ -1284,7 +1383,9 @@ fn references_input(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| references_input(when) || references_input(then))
                 || else_clause.as_deref().is_some_and(references_input)
         }
-        BoundExpr::Literal { .. } | BoundExpr::LocalRef { .. } => false,
+        BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } | BoundExpr::LocalRef { .. } => {
+            false
+        }
     }
 }
 

@@ -91,6 +91,7 @@ pub struct OrderByItem {
 
 pub enum Expr {
     Literal(Value),
+    Placeholder(u32), // extended-protocol parameter `$n` (1-based)
     ColumnRef { table: Option<String>, column: String },
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },

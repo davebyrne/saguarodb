@@ -838,8 +838,22 @@ fn convert_value(value: &sql::Value) -> Result<Expr> {
             Ok(Expr::Literal(Value::Integer(value)))
         }
         sql::Value::SingleQuotedString(value) => Ok(Expr::Literal(Value::Text(value.clone()))),
+        sql::Value::Placeholder(name) => convert_placeholder(name),
         _ => unsupported("unsupported literal"),
     }
+}
+
+fn convert_placeholder(name: &str) -> Result<Expr> {
+    let digits = name
+        .strip_prefix('$')
+        .ok_or_else(|| parse_error(format!("unsupported placeholder {name}")))?;
+    let index = digits
+        .parse::<u32>()
+        .map_err(|_| parse_error(format!("invalid placeholder {name}")))?;
+    if index == 0 {
+        return Err(parse_error("placeholder index must be >= 1"));
+    }
+    Ok(Expr::Placeholder(index))
 }
 
 fn convert_function(function: &sql::Function) -> Result<Expr> {

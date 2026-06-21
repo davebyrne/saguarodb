@@ -23,9 +23,26 @@ V1 physical planning is rule-based and naive, but the phase boundary is real.
 
 ```rust
 pub fn bind(statement: &Statement, catalog: &dyn CatalogManager) -> Result<BoundStatement>;
+pub fn bind_parameterized(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared_param_types: &[Option<DataType>],
+) -> Result<(BoundStatement, Vec<DataType>)>;
+pub fn collect_param_types(
+    statement: &BoundStatement,
+    declared: &[Option<DataType>],
+) -> Result<Vec<DataType>>;
+pub fn substitute_params(statement: &BoundStatement, params: &[Value]) -> Result<BoundStatement>;
 pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan>;
 pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Result<PhysicalPlan>;
 ```
+
+`bind` is the simple-query entry point and rejects `$n` parameters. `bind_parameterized`
+binds an extended-protocol statement, resolving each parameter's type from the
+`Parse`-declared OID when given, otherwise inferring it from context (like a `NULL`
+literal); it returns the bound statement and the resolved parameter types by position.
+`substitute_params` replaces each `BoundExpr::Parameter` with a type-checked literal of
+the bound value before planning and execution.
 
 ## Binder Contract
 
@@ -108,6 +125,11 @@ pub enum BoundFrom {
 pub enum BoundExpr {
     Literal {
         value: Value,
+        data_type: DataType,
+        nullable: bool,
+    },
+    Parameter {
+        index: usize, // 0-based; replaced with a Literal by substitute_params
         data_type: DataType,
         nullable: bool,
     },

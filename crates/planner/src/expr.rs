@@ -7,6 +7,13 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    /// Extended-protocol parameter slot (`$n`), `index` is 0-based. Resolved to a
+    /// `Literal` by parameter substitution before execution.
+    Parameter {
+        index: usize,
+        data_type: DataType,
+        nullable: bool,
+    },
     InputRef {
         input: BindingId,
         column: ColumnId,
@@ -153,6 +160,7 @@ impl BoundExpr {
     pub(crate) fn data_type(&self) -> DataType {
         match self {
             BoundExpr::Literal { data_type, .. }
+            | BoundExpr::Parameter { data_type, .. }
             | BoundExpr::InputRef { data_type, .. }
             | BoundExpr::BinaryOp { data_type, .. }
             | BoundExpr::UnaryOp { data_type, .. }
@@ -172,6 +180,7 @@ impl BoundExpr {
     pub(crate) fn nullable(&self) -> bool {
         match self {
             BoundExpr::Literal { nullable, .. }
+            | BoundExpr::Parameter { nullable, .. }
             | BoundExpr::InputRef { nullable, .. }
             | BoundExpr::BinaryOp { nullable, .. }
             | BoundExpr::UnaryOp { nullable, .. }

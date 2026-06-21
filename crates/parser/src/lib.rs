@@ -406,6 +406,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_parameter_placeholder() {
+        let stmt = parse("select id from users where id = $1").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        let Some(Expr::BinaryOp { right, .. }) = select.filter else {
+            panic!("expected filter comparison");
+        };
+        assert!(matches!(*right, Expr::Placeholder(1)));
+    }
+
+    #[test]
+    fn rejects_zero_parameter_placeholder() {
+        let err = parse("select id from users where id = $0").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+    }
+
+    #[test]
     fn rejects_unsupported_explain_and_create_table_options() {
         let err = parse("explain analyze select * from users").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);

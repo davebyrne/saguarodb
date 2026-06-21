@@ -354,7 +354,10 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
                 collect_aggregates(else_clause, output);
             }
         }
-        BoundExpr::Literal { .. } | BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => {}
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. } => {}
     }
 }
 
@@ -534,9 +537,10 @@ fn rewrite_aggregate_expr(
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
-        BoundExpr::Literal { .. } | BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => {
-            Ok(expr.clone())
-        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. } => Ok(expr.clone()),
         BoundExpr::AggregateCall { .. } => unreachable!(),
     }
 }
@@ -573,9 +577,10 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
                 || else_clause.as_deref().is_some_and(contains_aggregate)
         }
-        BoundExpr::Literal { .. } | BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => {
-            false
-        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. } => false,
     }
 }
 
