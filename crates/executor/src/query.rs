@@ -89,6 +89,7 @@ pub(crate) fn build_executor<'a>(
         ))),
         PhysicalPlan::IndexScan {
             table,
+            index,
             range,
             filter,
             ..
@@ -96,6 +97,7 @@ pub(crate) fn build_executor<'a>(
             ctx.statement,
             ctx.storage,
             *table,
+            *index,
             range.clone(),
             filter.clone(),
             table_output_schema(ctx.catalog, *table)?,

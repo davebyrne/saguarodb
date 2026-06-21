@@ -1,4 +1,7 @@
-use common::{ColumnInfo, ExecRow, KeyRange, Result, RowIdentity, StatementContext, TableId};
+use common::{
+    ColumnInfo, ExecRow, IndexId, KeyRange, PRIMARY_KEY_INDEX_ID, Result, RowIdentity,
+    StatementContext, TableId,
+};
 use planner::BoundExpr;
 use storage::{RowIterator, StorageEngine};
 
@@ -79,6 +82,7 @@ pub struct IndexScanOp<'a> {
     ctx: StatementContext,
     storage: &'a dyn StorageEngine,
     table: TableId,
+    index: IndexId,
     range: KeyRange,
     filter: Option<BoundExpr>,
     output_schema: Vec<ColumnInfo>,
@@ -90,6 +94,7 @@ impl<'a> IndexScanOp<'a> {
         ctx: StatementContext,
         storage: &'a dyn StorageEngine,
         table: TableId,
+        index: IndexId,
         range: KeyRange,
         filter: Option<BoundExpr>,
         output_schema: Vec<ColumnInfo>,
@@ -98,6 +103,7 @@ impl<'a> IndexScanOp<'a> {
             ctx,
             storage,
             table,
+            index,
             range,
             filter,
             output_schema,
@@ -112,10 +118,16 @@ impl PlanExecutor for IndexScanOp<'_> {
     }
 
     fn open(&mut self) -> Result<()> {
-        self.iter = Some(
+        // The primary-key index resolves to a row location directly; a secondary
+        // index resolves each entry's primary key through the primary-key index.
+        let iter = if self.index == PRIMARY_KEY_INDEX_ID {
             self.storage
-                .scan_range(&self.ctx, self.table, &self.range)?,
-        );
+                .scan_range(&self.ctx, self.table, &self.range)?
+        } else {
+            self.storage
+                .index_scan(&self.ctx, self.table, self.index, &self.range)?
+        };
+        self.iter = Some(iter);
         Ok(())
     }
 

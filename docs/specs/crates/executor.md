@@ -64,7 +64,7 @@ impl QueryEngine {
 | Operator | Behavior |
 |---|---|
 | `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present |
-| `IndexScanOp` | Calls `StorageEngine::scan_range`, converts `StoredRow` to `ExecRow`, then applies `PhysicalPlan::IndexScan.filter` when present |
+| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. Converts `StoredRow` to `ExecRow`, then applies `PhysicalPlan::IndexScan.filter` when present |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
 | `FilterOp` | Evaluates predicate, preserves identity |

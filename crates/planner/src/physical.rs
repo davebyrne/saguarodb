@@ -354,37 +354,65 @@ fn plan_scan(
     })?;
     let table_name = schema.name.clone();
 
-    let Some(primary_key) = schema.primary_key.first().copied() else {
+    let Some(filter_expr) = filter else {
         return Ok(PhysicalPlan::SeqScan {
             table,
             table_name,
-            filter,
+            filter: None,
         });
     };
 
-    if let Some(filter_expr) = filter {
-        if let Some(candidate) = best_key_candidate(&filter_expr, primary_key) {
-            let residual = residual_filter(filter_expr, &candidate.consumed);
-            return Ok(PhysicalPlan::IndexScan {
-                table,
-                table_name: table_name.clone(),
-                index: PRIMARY_KEY_INDEX_ID,
-                range: candidate.range,
-                filter: residual,
-            });
-        }
-        Ok(PhysicalPlan::SeqScan {
+    if let Some((index, candidate)) = best_index_scan(&schema, table, &filter_expr, catalog)? {
+        let residual = residual_filter(filter_expr, &candidate.consumed);
+        return Ok(PhysicalPlan::IndexScan {
             table,
             table_name,
-            filter: Some(filter_expr),
-        })
-    } else {
-        Ok(PhysicalPlan::SeqScan {
-            table,
-            table_name,
-            filter: None,
-        })
+            index,
+            range: candidate.range,
+            filter: residual,
+        });
     }
+
+    Ok(PhysicalPlan::SeqScan {
+        table,
+        table_name,
+        filter: Some(filter_expr),
+    })
+}
+
+/// Pick the index whose leading column the filter constrains best: an equality
+/// match beats a range, the primary key beats a secondary index (it avoids the
+/// secondary → primary-key → heap indirection), and a lower index id breaks
+/// remaining ties. Returns the chosen index id and its key candidate, or `None`
+/// to fall back to a sequential scan.
+fn best_index_scan(
+    schema: &common::TableSchema,
+    table: TableId,
+    filter: &BoundExpr,
+    catalog: &dyn catalog::CatalogManager,
+) -> Result<Option<(IndexId, KeyCandidate)>> {
+    let mut candidates: Vec<(IndexId, KeyCandidate)> = Vec::new();
+
+    if let Some(primary_key) = schema.primary_key.first().copied()
+        && let Some(candidate) = best_key_candidate(filter, primary_key)
+    {
+        candidates.push((PRIMARY_KEY_INDEX_ID, candidate));
+    }
+
+    for index in catalog.list_indexes_for_table(table)? {
+        if let Some(leading) = index.columns.first().copied()
+            && let Some(candidate) = best_key_candidate(filter, leading)
+        {
+            candidates.push((index.id, candidate));
+        }
+    }
+
+    Ok(candidates.into_iter().max_by(|(a_id, a), (b_id, b)| {
+        a.exact
+            .cmp(&b.exact)
+            .then_with(|| (*a_id == PRIMARY_KEY_INDEX_ID).cmp(&(*b_id == PRIMARY_KEY_INDEX_ID)))
+            .then_with(|| b_id.cmp(a_id))
+    }))
 }
 
 #[derive(Clone)]

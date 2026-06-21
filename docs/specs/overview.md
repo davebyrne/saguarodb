@@ -925,14 +925,14 @@ pub enum PhysicalPlan {
 
 The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column access is by slot index (`row.values[slot]`) — O(1), no lookups. The `BindingId` and `ColumnId` fields in `InputRef` exist only for EXPLAIN output and debugging.
 
-V1 has one index identifier: `PRIMARY_KEY_INDEX_ID = 0`. The physical planner uses that value for every primary-key `IndexScan`. `IndexScan.filter` holds residual predicates not consumed by the primary-key range. For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
+`PRIMARY_KEY_INDEX_ID = 0` identifies the primary-key index; secondary indexes use their own ids. An `IndexScan` carries the chosen index id, and `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` on the primary key and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 
 The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a future cost-based optimizer replaces only `physical_plan`, choosing among multiple physical alternatives per logical operator. The binder and logical planner are unchanged.
 
 ### Planner Rules (V1 — Applied in Order)
 
-1. **Primary key lookup:** If `WHERE` has an equality on the primary key, emit `IndexScan` with `index = PRIMARY_KEY_INDEX_ID`, `KeyRange::Exact`, and any non-key residual predicate in `filter`.
-2. **Primary key range:** If `WHERE` has a range comparison on the primary key, emit `IndexScan` with `index = PRIMARY_KEY_INDEX_ID`, `KeyRange::Range`, and any non-key residual predicate in `filter`.
+1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of an index — the primary-key index (`index = PRIMARY_KEY_INDEX_ID`) or a secondary index (its own id) — emit `IndexScan` with that index, a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, and any residual predicate in `filter`.
+2. **Index choice:** When several indexes' leading columns are constrained, prefer an equality over a range, the primary key over a secondary index, then the lower index id.
 3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
 4. **Join ordering:** Process joins left to right as written. All joins are `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
 5. **Projection pushdown:** Optional for initial v1. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
@@ -1018,7 +1018,7 @@ V1 has no executor cancellation token in the public crate API. A future version 
 | Operator | Behavior |
 |---|---|
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
-| `IndexScanOp` | Looks up rows by primary key via the storage primary-key access path and applies residual `IndexScan.filter` when present |
+| `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the primary key, `index_scan` for a secondary index — and applies residual `IndexScan.filter` when present |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
@@ -1122,7 +1122,7 @@ pub trait SchemaOperations: Send + Sync {
 
 Every operation takes a `StatementContext`. In V1 this carries only the autocommit `txn_id`. When MVCC is added, the context gains snapshot visibility, isolation level, and write-set tracking — without changing any call sites.
 
-`scan_range` serves `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. V1 uses this for primary key scans; secondary indexes can be added without changing the trait.
+`scan_range` serves primary-key `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. Secondary-index `IndexScan` nodes use `index_scan(table, index, range)`, which walks the secondary B-tree and resolves each entry's primary key through the primary-key index.
 
 ### Page Format (8KB Pages)
 

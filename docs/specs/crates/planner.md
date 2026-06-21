@@ -367,9 +367,9 @@ pub enum PhysicalPlan {
 
 ## V1 Physical Rules
 
-- Primary-key equality predicate becomes `IndexScan { index: PRIMARY_KEY_INDEX_ID, range: KeyRange::Exact, filter }`.
-- Primary-key range predicate becomes `IndexScan { index: PRIMARY_KEY_INDEX_ID, range: KeyRange::Range, filter }`.
-- `filter` stores residual predicates not consumed by the primary-key range. For `WHERE id = 7 AND name = 'Ada'`, the range is exact primary key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
+- A scan with an equality or range predicate on the leading column of an index — the primary-key index or a secondary index — becomes an `IndexScan` over that index (`index = PRIMARY_KEY_INDEX_ID` for the primary key, else the secondary index id), with `range` an exact or bounded `KeyRange` over that column.
+- When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it avoids the secondary → primary-key → heap indirection), and a lower index id breaks remaining ties.
+- `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
 - Otherwise scans are `SeqScan`.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 - Joins are left-to-right nested loop joins. V1 supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
@@ -396,7 +396,7 @@ The executor crate is not called for `EXPLAIN`.
 - Binder expands wildcard projection into explicit bound expressions.
 - Binder binds `INSERT ... SELECT` into `BoundInsertSource::Query`, rejecting column-count, type, and nullability mismatches against the target.
 - Logical planner emits logical nodes without `SeqScan` or `IndexScan`.
-- Physical planner chooses `IndexScan` for primary-key equality and preserves residual non-key predicates in `IndexScan.filter`.
-- Physical planner falls back to `SeqScan` for non-key filters.
+- Physical planner chooses `IndexScan` for an equality or range predicate on a primary-key or secondary-index leading column, preferring the primary key and exact matches, and preserves residual predicates in `IndexScan.filter`.
+- Physical planner falls back to `SeqScan` when no index's leading column is constrained.
 - Physical planner chooses `HashJoin` for an inner join with a column-equality `ON` predicate and falls back to `NestedLoopJoin` for outer, cross, and non-equi joins.
 - `EXPLAIN` returns a readable physical plan tree.

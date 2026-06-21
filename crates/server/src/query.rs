@@ -444,6 +444,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_uses_secondary_index_and_returns_correct_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "insert into users (id, name) values (1, 'Ada')",
+            "insert into users (id, name) values (2, 'Bob')",
+            "insert into users (id, name) values (3, 'Cleo')",
+            "create index users_name on users (name)",
+        ] {
+            app.query_service.execute_sql(sql).unwrap();
+        }
+
+        // EXPLAIN shows the secondary index (id 1) is chosen, not a seq scan.
+        let executor::ExecutionResult::Explanation { text } = app
+            .query_service
+            .execute_sql("explain select id from users where name = 'Bob'")
+            .unwrap()
+        else {
+            panic!("expected explanation");
+        };
+        assert!(text.contains("IndexScan"), "plan was: {text}");
+        assert!(text.contains("index=1"), "plan was: {text}");
+
+        // Equality through the secondary index returns exactly the matching row.
+        let executor::ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select id from users where name = 'Bob'")
+            .unwrap()
+        else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+            vec![vec![Value::Integer(2)]]
+        );
+
+        // A range over the indexed column returns the matching rows.
+        let executor::ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select name from users where name >= 'Bob' order by name")
+            .unwrap()
+        else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+            vec![
+                vec![Value::Text("Bob".to_string())],
+                vec![Value::Text("Cleo".to_string())],
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn overflowing_update_rolls_back_prior_row_mutations() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();

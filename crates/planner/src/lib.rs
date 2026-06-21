@@ -47,6 +47,21 @@ mod tests {
         catalog
     }
 
+    /// `users` plus a non-unique secondary index `users_name` on `name`
+    /// (index id 1, since the primary-key index is the reserved id 0).
+    fn catalog_with_users_and_name_index() -> MemoryCatalog {
+        let catalog = catalog_with_users();
+        catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+        catalog
+    }
+
     fn catalog_with_users_and_accounts() -> MemoryCatalog {
         let catalog = catalog_with_users();
         catalog
@@ -396,6 +411,44 @@ mod tests {
         let physical = physical_plan(&logical, &catalog).unwrap();
 
         assert!(format!("{physical:?}").contains("SeqScan"));
+    }
+
+    #[test]
+    fn physical_planner_uses_secondary_index_for_indexed_column() {
+        let catalog = catalog_with_users_and_name_index();
+        for predicate in ["name = 'Ada'", "name > 'Ada'"] {
+            let stmt = parse(&format!("select id from users where {predicate}")).unwrap();
+            let bound = bind(&stmt, &catalog).unwrap();
+            let logical = logical_plan(&bound).unwrap();
+            let physical = physical_plan(&logical, &catalog).unwrap();
+
+            let text = format!("{physical:?}");
+            assert!(
+                text.contains("IndexScan"),
+                "expected IndexScan for {predicate}"
+            );
+            // The secondary index is id 1 (the primary-key index is id 0).
+            assert!(
+                text.contains("index: 1"),
+                "expected secondary index for {predicate}"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_planner_prefers_primary_key_over_secondary_index() {
+        let catalog = catalog_with_users_and_name_index();
+        // Both columns are indexed; the primary key wins, and the name predicate
+        // becomes the residual filter.
+        let stmt = parse("select id from users where id = 7 and name = 'Ada'").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+
+        let text = format!("{physical:?}");
+        assert!(text.contains("IndexScan"));
+        assert!(text.contains(&format!("index: {PRIMARY_KEY_INDEX_ID}")));
+        assert!(text.contains("filter: Some"));
     }
 
     #[test]
