@@ -17,6 +17,7 @@ use wal::{WalRecord, WalRecordKind};
 
 use crate::app::ServerComponents;
 use crate::checkpoint::record_commit_and_maybe_checkpoint;
+use crate::registry::AdvertisedSnapshot;
 
 pub struct QueryService {
     components: Arc<ServerComponents>,
@@ -58,6 +59,13 @@ pub struct Transaction {
     /// reused. `None` under Read Committed (a fresh snapshot is captured per
     /// statement).
     rr_snapshot: Option<Arc<Snapshot>>,
+    /// The advertisement pinning the GC horizon at the snapshot's `xmin` for the
+    /// snapshot's usable lifetime (`docs/specs/mvcc.md` §9). Under Repeatable Read
+    /// the one `rr_snapshot` is reusable for the whole transaction, so its
+    /// advertisement is held here and released when the `Transaction` is dropped at
+    /// commit/abort. Under Read Committed each statement captures and drops its own
+    /// short-lived advertisement, so this stays `None`.
+    rr_advertised: Option<AdvertisedSnapshot>,
 }
 
 impl Transaction {
@@ -351,6 +359,7 @@ impl QueryService {
             failed: false,
             write_guard: None,
             rr_snapshot: None,
+            rr_advertised: None,
         })
     }
 
@@ -430,10 +439,20 @@ impl QueryService {
             }
         }
 
-        let snapshot = self.snapshot_for_transaction(&mut txn);
+        // Capture the snapshot and hold its GC-horizon advertisement across this
+        // statement's execution. Under Read Committed `advertised` is the
+        // per-statement guard dropped at the end of this call (releasing the prior
+        // statement's pinned xmin); under Repeatable Read it is `None` because the
+        // reusable snapshot's advertisement lives on `txn` for the whole
+        // transaction (`docs/specs/mvcc.md` §9).
+        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
         let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, cancel);
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
+        // The snapshot can no longer be used to read once `run_plan` has returned;
+        // drop the per-statement advertisement now (a no-op under Repeatable Read).
+        drop(ctx);
+        drop(advertised);
         match result {
             Ok(result) => (Some(txn), Ok(result)),
             Err(err) => {
@@ -513,7 +532,15 @@ impl QueryService {
         // A read is not its own transaction (txn_id 0 / INVALID_XID), so no own
         // txn is excluded; the snapshot sees all committed rows and skips any
         // in-flight writer's uncommitted versions via MVCC visibility.
-        let snapshot = self.capture_snapshot(0);
+        //
+        // Advertise the snapshot's `xmin` to the GC horizon and HOLD the guard
+        // across the whole scan (`docs/specs/mvcc.md` §9). This is the new behavior
+        // reads must gain: an autocommit `SELECT` is not in the active registry, so
+        // without advertising its `xmin` the GC horizon would ignore it and VACUUM
+        // could reclaim a version this long-lived read still sees live (data loss —
+        // the worst path). `_advertised` lives until the end of this function, i.e.
+        // exactly the snapshot's usable lifetime.
+        let (snapshot, _advertised) = self.capture_snapshot(0);
         let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), cancel);
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
@@ -542,8 +569,12 @@ impl QueryService {
         let txn_id = self.register_active_txn();
         let catalog_before = self.components.catalog.snapshot()?;
         // Capture the snapshot after registering, excluding the own id so own
-        // writes are seen via the predicate's `current_txn` path.
-        let snapshot = self.capture_snapshot(txn_id);
+        // writes are seen via the predicate's `current_txn` path. Advertise its
+        // `xmin` to the GC horizon and hold `_advertised` across execution and the
+        // commit/rollback that follow (`docs/specs/mvcc.md` §9): it lives until this
+        // function returns on every path (success, statement error, panic), exactly
+        // bracketing when the snapshot can still be used to read.
+        let (snapshot, _advertised) = self.capture_snapshot(txn_id);
         let ctx = self.execution_context(txn_id, snapshot, IsolationLevel::default(), cancel);
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
@@ -664,19 +695,38 @@ impl QueryService {
     }
 
     /// The snapshot a statement of `txn` reads with, per isolation level
-    /// (`docs/specs/mvcc.md` §6): Read Committed captures a fresh snapshot each
-    /// statement (seeing other transactions' commits between statements);
-    /// Repeatable Read captures one snapshot at the first statement and reuses it.
-    fn snapshot_for_transaction(&self, txn: &mut Transaction) -> Arc<Snapshot> {
+    /// (`docs/specs/mvcc.md` §6, §9), together with the per-statement GC-horizon
+    /// advertisement the caller must hold for the statement's execution.
+    ///
+    /// - **Read Committed** captures a fresh snapshot each statement (seeing other
+    ///   transactions' commits between statements). Its advertisement is returned as
+    ///   `Some(guard)` so the caller drops it at statement end, releasing the
+    ///   previous statement's pinned `xmin`.
+    /// - **Repeatable Read** captures one snapshot at the first statement and reuses
+    ///   it for the whole transaction. Its advertisement is held on `txn`
+    ///   (`rr_advertised`) for the transaction's life and released when the
+    ///   `Transaction` drops at commit/abort, so this returns `None` (no
+    ///   per-statement guard) — the snapshot stays pinned across statements.
+    fn snapshot_for_transaction(
+        &self,
+        txn: &mut Transaction,
+    ) -> (Arc<Snapshot>, Option<AdvertisedSnapshot>) {
         match txn.isolation {
-            IsolationLevel::ReadCommitted => self.capture_snapshot(txn.txn_id),
+            IsolationLevel::ReadCommitted => {
+                let (snapshot, advertised) = self.capture_snapshot(txn.txn_id);
+                (snapshot, Some(advertised))
+            }
             IsolationLevel::RepeatableRead => {
                 if let Some(snapshot) = &txn.rr_snapshot {
-                    snapshot.clone()
+                    (snapshot.clone(), None)
                 } else {
-                    let snapshot = self.capture_snapshot(txn.txn_id);
+                    let (snapshot, advertised) = self.capture_snapshot(txn.txn_id);
                     txn.rr_snapshot = Some(snapshot.clone());
-                    snapshot
+                    // Hold the advertisement for the transaction's life (released
+                    // when `txn` drops at commit/abort), so the reusable snapshot's
+                    // xmin stays pinned across every statement that reuses it.
+                    txn.rr_advertised = Some(advertised);
+                    (snapshot, None)
                 }
             }
         }
@@ -699,9 +749,12 @@ impl QueryService {
     }
 
     /// Capture a visibility snapshot consistently with the active-transaction
-    /// registry and the id allocator (`docs/specs/mvcc.md` §5.5, §7.1). Held under
-    /// the registry's brief latch (via `active_snapshot`) so the snapshot is not
-    /// torn relative to `next_txn_id`:
+    /// registry and the id allocator (`docs/specs/mvcc.md` §5.5, §7.1, §9), and
+    /// **advertise its `xmin`** to the GC horizon for the snapshot's lifetime.
+    /// Captured under the registry's brief latch (via `capture`) so the snapshot is
+    /// not torn relative to `next_txn_id` AND its `xmin` is published in the same
+    /// critical section that reads the active set (closing the capture-vs-horizon
+    /// race; see [`ActiveTxnRegistry::capture`](crate::registry::ActiveTxnRegistry::capture)):
     ///
     /// - `xmax` is the next id to be assigned; every already-allocated id is below
     ///   it (read after the latched active set so no concurrently-begun writer is
@@ -711,23 +764,33 @@ impl QueryService {
     ///   `own_txn = 0`; nothing is excluded.
     /// - `xmin` is the oldest active id, or `xmax` if none are active.
     ///
-    /// Returned behind an `Arc` so the executor shares it across scan operators
-    /// rather than deep-cloning the `xip` vector per operator.
-    fn capture_snapshot(&self, own_txn: u64) -> Arc<Snapshot> {
-        // Snapshot the active set and the allocator boundary under one latch so a
+    /// Returns the `Arc<Snapshot>` (shared by the executor across scan operators
+    /// rather than deep-cloning `xip` per operator) together with the
+    /// [`AdvertisedSnapshot`] guard. **The caller MUST hold the guard for exactly as
+    /// long as the snapshot can still be used to read**: dropping it sooner lets
+    /// VACUUM reclaim a version this snapshot sees live (data loss); holding it
+    /// longer over-pins the horizon (a space cost only).
+    fn capture_snapshot(&self, own_txn: u64) -> (Arc<Snapshot>, AdvertisedSnapshot) {
+        // Capture the active set and the allocator boundary under one latch so a
         // concurrent BEGIN cannot slip a new writer between reading `xmax` and
-        // reading `xip`. Reading `next_txn_id` first, then the active set, would
-        // risk a writer that registered after the `xmax` read being both `>= xmax`
-        // (so excluded as "future") and absent from `xip` — but visible. Reading
-        // the active set first guarantees any active id is reflected in `xip`, and
-        // `xmax` taken after only grows, so every active id stays `< xmax`.
-        let (active, xmax) = self
+        // reading `xip`, and publish the snapshot's `xmin` in the same section.
+        // Reading `next_txn_id` first, then the active set, would risk a writer that
+        // registered after the `xmax` read being both `>= xmax` (so excluded as
+        // "future") and absent from `xip` — but visible. Reading the active set
+        // first guarantees any active id is reflected in `xip`, and `xmax` taken
+        // after only grows, so every active id stays `< xmax`.
+        let (active, xmax, advertised) = self
             .components
             .active_txns
-            .snapshot_with_boundary(|| self.components.next_txn_id.load(Ordering::Acquire));
+            .capture(|| self.components.next_txn_id.load(Ordering::Acquire));
         let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
-        let xmin = active.iter().copied().next().unwrap_or(xmax);
-        Arc::new(Snapshot { xmin, xmax, xip })
+        let xmin = active.first().copied().unwrap_or(xmax);
+        debug_assert_eq!(
+            advertised.xmin(),
+            xmin,
+            "advertised xmin must match the snapshot's xmin"
+        );
+        (Arc::new(Snapshot { xmin, xmax, xip }), advertised)
     }
 
     fn append_and_flush_commit(&self, txn_id: u64) -> Result<()> {

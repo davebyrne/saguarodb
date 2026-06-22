@@ -156,7 +156,7 @@ Deferred from Milestone E (`mvcc.md` §12): a fully-concurrent / B-link writer p
 
 ### Snapshot capture (per isolation)
 
-Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistently with the registry and the id allocator under one registry latch (`snapshot_with_boundary`): it reads the active set, then reads `next_txn_id` as `xmax`, so a concurrently-begun writer can never be both absent from `xip` and `< xmax`. `xip = active_ids` minus `own_txn` (own writes are seen via the predicate's `current_txn` path), and `xmin = oldest active id` or `xmax` if none are active. A read uses `own_txn = 0`. Id allocation and registration are done together under the latch (`register_allocated`) to close the same torn-snapshot window. The snapshot is shared via `Arc<Snapshot>` (`StatementContext.snapshot`), so the executor clones a `StatementContext` per scan operator by bumping a refcount rather than deep-cloning the now-possibly-non-empty `xip` vector. Isolation is the capture-timing knob: **Read Committed** (default) captures a fresh snapshot per statement; **Repeatable Read** captures one snapshot at the transaction's first statement and reuses it.
+Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistently with the registry and the id allocator under one registry latch (`ActiveTxnRegistry::capture`): it reads the active set, then reads `next_txn_id` as `xmax`, so a concurrently-begun writer can never be both absent from `xip` and `< xmax`. `xip = active_ids` minus `own_txn` (own writes are seen via the predicate's `current_txn` path), and `xmin = oldest active id` or `xmax` if none are active. A read uses `own_txn = 0`. Id allocation and registration are done together under the latch (`register_allocated`) to close the same torn-snapshot window. In the **same** latched section, capture advertises the snapshot's `xmin` to the GC horizon and returns an RAII `AdvertisedSnapshot` guard alongside the `Arc<Snapshot>`; the caller holds the guard for exactly the snapshot's usable lifetime (`mvcc.md` §9). The snapshot is shared via `Arc<Snapshot>` (`StatementContext.snapshot`), so the executor clones a `StatementContext` per scan operator by bumping a refcount rather than deep-cloning the now-possibly-non-empty `xip` vector. Isolation is the capture-timing knob: **Read Committed** (default) captures a fresh snapshot per statement (its advertisement released at statement end); **Repeatable Read** captures one snapshot at the transaction's first statement and reuses it (its advertisement held on the `Transaction` and released at commit/abort). The autocommit read and write paths each advertise their snapshot across the statement's execution; the autocommit read in particular **must** advertise, since it is not its own transaction and so is otherwise invisible to the horizon.
 
 `QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_simple` for simple queries and `execute_prepared_in_session`/`execute_prepared_cancelable` for extended `Execute` (in-transaction vs. autocommit, respectively), passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
 
@@ -227,24 +227,39 @@ pub struct AppState {
 }
 ```
 
-`active_txns` is the active-transaction registry: an `ActiveTxnRegistry` wrapping
-a `Mutex<BTreeSet<TxnId>>` of currently in-progress transaction ids, with an
-`O(log n)` minimum. The lifecycle registers a `txn_id` when it is allocated
-(`register_allocated`, which advances `next_txn_id` and inserts the id under the
-same latch) and deregisters it on commit or rollback. With concurrent readers and
-**concurrent** writers (Stage 2, E2b), several write transactions may be registered
-at once, and a read's snapshot capture may observe any of them; the set is no longer
-always empty between statements. Snapshot capture (`capture_snapshot` via
-`snapshot_with_boundary`) reads `active_ids()` for `xip` (excluding the statement's
-own txn) and the minimum for `xmin`, taking the registry latch across the active-set
-read and the `next_txn_id` read so the snapshot is not torn relative to a
-concurrent `BEGIN`. The **GC horizon** (`ServerComponents::gc_horizon`, Milestone
-F1) reads the registry minimum (`active_txns.oldest()`) under its brief latch, or —
-when no transaction is active — `next_txn_id` (loaded `Acquire`); below it no live
-snapshot can see a committed delete as undone, so a version with `xmax < horizon`
-is reclaimable (`common::is_dead_to_all`, `mvcc.md` §9). It is captured once per
-VACUUM pass and only advances as transactions finish; it has no production caller
-until VACUUM wiring (F2/F4). The CLOG that records settled transaction outcomes
+`active_txns` is the active-transaction registry: an `ActiveTxnRegistry` over a
+shared `Mutex` holding both a `BTreeSet<TxnId>` of currently in-progress
+transaction ids (with an `O(log n)` minimum) and a refcounted
+`BTreeMap<TxnId, usize>` multiset of the `xmin`s advertised by currently-live
+snapshots (`xmin → count`, an `O(log n)` minimum). The lifecycle registers a
+`txn_id` when it is allocated (`register_allocated`, which advances `next_txn_id`
+and inserts the id under the same latch) and deregisters it on commit or rollback.
+With concurrent readers and **concurrent** writers (Stage 2, E2b), several write
+transactions may be registered at once, and a read's snapshot capture may observe
+any of them; the set is no longer always empty between statements. Snapshot capture
+(`capture_snapshot` via `ActiveTxnRegistry::capture`) reads `active_ids()` for `xip`
+(excluding the statement's own txn) and the minimum for `xmin`, taking the registry
+latch across the active-set read and the `next_txn_id` read so the snapshot is not
+torn relative to a concurrent `BEGIN`; in that **same** latched section it publishes
+the snapshot's `xmin` into the advertised-`xmin` multiset and returns an RAII
+`AdvertisedSnapshot` guard (whose `Drop` releases the advertisement under the latch).
+
+The **GC horizon** (`ServerComponents::gc_horizon`, Milestone F1) is the **minimum
+advertised snapshot `xmin`** (`active_txns.oldest_xmin()`) under the registry's brief
+latch, or — when no snapshot is advertised — `next_txn_id` (loaded `Acquire`). It is
+**not** the oldest active transaction id (`oldest()`): a snapshot freezes its `xmin`
+at capture for its whole life, so the active-id minimum can advance above a still-live
+snapshot's `xmin`, and an autocommit `SELECT` is not its own transaction and never
+registers at all — using `oldest()` could reclaim a version such a snapshot still sees
+live (data loss). The advertised min is always `<= oldest()`, so it is strictly safer.
+Below it no live snapshot can see a committed delete as undone, so a version with
+`xmax < horizon` is reclaimable (`common::is_dead_to_all`, `mvcc.md` §9). Every
+snapshot — including autocommit reads — advertises its `xmin` under the capture latch
+for the snapshot's exact usable lifetime; the same-latch publish (read `active` and
+`xmins[xmin]++` in one critical section, read by `oldest_xmin()` under the same latch)
+makes the capture-vs-horizon path race-free (`mvcc.md` §9). The horizon is captured
+once per VACUUM pass and only advances as snapshots are released; it has no production
+caller until VACUUM wiring (F2/F4). The CLOG that records settled transaction outcomes
 lives in the WAL manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
 `docs/specs/crates/wal.md`), separate from this registry of still-running
 transactions.

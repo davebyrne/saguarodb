@@ -168,7 +168,8 @@ pub fn is_visible(
 /// The pure VACUUM **reclaimability** predicate of `docs/specs/mvcc.md` §9: is a
 /// version with creator `xmin` and deleter `xmax` *dead to every possible
 /// snapshot* — and therefore safe to physically reclaim — given the GC `horizon`
-/// (the oldest still-running transaction id)?
+/// (the minimum `xmin` advertised by any live snapshot, `mvcc.md` §9; equivalently,
+/// no version with `xmax < horizon` is seen live by any current snapshot)?
 ///
 /// This is the **sibling of [`is_visible`]** but asks a different question.
 /// [`is_visible`] answers "is this version visible to **my** snapshot?" — a

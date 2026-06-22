@@ -505,12 +505,51 @@ becomes load-bearing once writers run concurrently (E2b).
 Required for bounded space — and more urgent than under a single-entry-index
 design, because index entries accumulate per version as well as heap tuples.
 
-- **Horizon**: the oldest `xmin` across the active-transaction registry, or — when
-  no transaction is active — the next id to be assigned (`next_txn_id`); nothing
-  older than the future can be needed. Captured **once** at the start of a VACUUM
-  pass (`ServerComponents::gc_horizon`, F1). It only advances as transactions
-  finish; a concurrent `BEGIN` can only register a newer (larger) id, so it never
-  lowers the captured horizon.
+- **Horizon**: the **minimum `xmin` advertised by any currently-live snapshot**
+  (`ActiveTxnRegistry::oldest_xmin`), or — when no snapshot is advertised — the next
+  id to be assigned (`next_txn_id`); nothing older than the future can be needed.
+  Captured **once** at the start of a VACUUM pass (`ServerComponents::gc_horizon`,
+  F1). It only advances as snapshots are released; a concurrent `BEGIN`/capture can
+  only advertise an `xmin >= horizon` once any already-finished transaction is
+  settled-past (see the race-free argument below), so it never lowers the captured
+  horizon.
+  - **Why not the oldest active transaction id.** VACUUM's committed-delete branch
+    reclaims a version when `xmax < horizon`, which is safe only when
+    `horizon <= every live snapshot's xmin`. A snapshot freezes its `xmin` at
+    capture (`xmin = oldest active id then`, or `next_txn_id` if none) for its whole
+    life, and `snapshot.xmin <= the capturing txn's own id`. As the then-oldest
+    transaction deregisters, the active-id minimum (`oldest()`) advances **above** a
+    still-live snapshot's frozen `xmin`. A version with committed `xmax = X` where
+    `X` is in that snapshot's `xip` is seen **live** by the snapshot
+    (`txn_effect_visible` treats an `xip` deleter as not-effective), so reclaiming
+    it (`horizon > X`) would lose a row the snapshot still scans. Worst case, an
+    **autocommit `SELECT` is not its own transaction and never registers in the
+    active set at all**, so the oldest-active-id rule ignores its snapshot entirely
+    — a single long `SELECT` + a concurrent commit-of-a-`DELETE` + a VACUUM pass
+    would lose a row. The min advertised `xmin` is always `<= oldest()`, so it is
+    strictly safer and never reclaims anything the oldest-active-id rule retained.
+  - **Advertisement**: every snapshot capture (`capture_snapshot`, including the
+    autocommit-read path) publishes its `xmin` into a refcounted multiset
+    (`xmins: BTreeMap<xmin, count>`) under the **same** registry latch that reads the
+    active set, and holds an RAII `AdvertisedSnapshot` guard for exactly the
+    snapshot's usable lifetime (its `Drop` releases the advertisement under the
+    latch). Read Committed advertises per statement (released at statement end);
+    Repeatable Read advertises once for the transaction (held on the `Transaction`,
+    released at commit/abort); the autocommit read/write paths advertise across the
+    statement's execution.
+  - **Race-freedom** (capture vs. horizon): at the instant `gc_horizon` reads the
+    min advertised `xmin` `H` under the registry latch, every snapshot that is live
+    OR being captured has `xmin >= H` or is not-yet-usable. A capture publishes
+    `xmins[xmin]++` in the *same* latched critical section that reads `active`, and
+    the snapshot is not returned/usable until that section completes; `gc_horizon`
+    reads `oldest_xmin()` under the same latch, so the mutex total order leaves no
+    window where the horizon exceeds a usable snapshot's `xmin`. A snapshot published
+    **after** the horizon read derives its `xmin` from an `active`/`next_txn_id`
+    state in which any txn already gone-from-active — i.e. any committed deleter the
+    horizon could have reclaimed — is settled-past, so that later snapshot's `xmin`
+    is above any reclaimed `xmax` and it cannot see a reclaimed version live. This
+    mirrors the existing `register_allocated`/capture latch discipline that closes
+    the torn-snapshot window.
 - **Reclaimability** (`common::is_dead_to_all(xmin, xmax, infomask, horizon,
   status)`, F1): a version is *dead to everyone* — safe to physically reclaim —
   iff **either** its **creator aborted** (`XMIN_ABORTED` hint, or
@@ -757,8 +796,10 @@ and per-tuple CLOG-probe contention reduction.
 - **F1 — Horizon + reclaimability predicate.** The pure
   `common::is_dead_to_all(xmin, xmax, infomask, horizon, status)` reclaimability
   oracle (sibling of `is_visible`; aborted-creator any age **or** committed-delete
-  `< horizon`) and the `ServerComponents::gc_horizon` accessor (oldest active xmin,
-  else `next_txn_id`). No engine wiring yet — runtime no-op. **F2 — Heap prune +
+  `< horizon`) and the `ServerComponents::gc_horizon` accessor (the **minimum
+  advertised snapshot `xmin`** via `ActiveTxnRegistry::oldest_xmin`, else
+  `next_txn_id` — not the oldest active id; see §9 Horizon). No engine wiring yet —
+  runtime no-op. **F2 — Heap prune +
   compaction.** **F3 — Index vacuum + line-pointer reclaim.** **F4 — On-demand
   `VACUUM`, opportunistic pruning, CLOG truncation** (§9).
 
