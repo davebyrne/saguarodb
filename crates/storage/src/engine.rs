@@ -612,40 +612,169 @@ impl PageBackedStorageEngine {
         Ok(Some(decode_row(schema, &bytes)?.row))
     }
 
-    /// Read the row at `location` only if it is **visible** to `snapshot` from
-    /// `current_txn` (`docs/specs/mvcc.md` §6). Decodes the v2 tuple header
-    /// (`xmin`/`xmax`/`infomask`) and applies [`is_visible`] against the CLOG-backed
-    /// status view; an invisible version yields `None` and is skipped by the caller.
-    /// A missing line pointer (DEAD/UNUSED) likewise yields `None` — an index entry
-    /// landing on an absent or invisible tuple is skipped, never an error (the
-    /// forward-looking hook for B4's retained index entries). Under the degenerate
-    /// autocommit snapshot every committed row and own write is visible, so this
-    /// filters nothing.
+    /// Resolve an index entry's TID — possibly a HOT root — to the heap slot of the
+    /// single version **visible** to `snapshot` from `current_txn`, reading the
+    /// `location` page once under a read latch (pure: no page mutation; pruning is
+    /// the UPDATE/VACUUM path's job, `mvcc.md` §10 Milestone H). The two-step
+    /// resolution (`mvcc.md` §5.2, §10 Milestone H1) is:
+    ///
+    /// 1. **REDIRECT resolution.** If `location.slot_num` is a `REDIRECT` line
+    ///    pointer (a HOT root whose original tuple was pruned), follow it to its
+    ///    same-page target. The target MUST be `NORMAL`: a redirect-to-redirect or
+    ///    redirect-to-dead is corruption and returns a structured error rather than
+    ///    looping. A `DEAD`/`UNUSED` root slot resolves to no version (`Ok(None)`).
+    /// 2. **Bounded HOT-chain walk.** From the resolved root tuple, walk the forward
+    ///    `t_ctid` chain, returning the first version [`is_visible`] accepts. THE
+    ///    correctness invariant: the walk follows `t_ctid` into a successor **only
+    ///    when the current tuple is `HOT_UPDATED` and the successor is `HEAP_ONLY`**
+    ///    on the same page — i.e. it stays strictly within one HOT-chain segment. It
+    ///    STOPS at any successor that is independently indexed (not `HEAP_ONLY`),
+    ///    because that successor is reachable via its OWN index entry; following it
+    ///    here would let one visible row be returned through two index entries
+    ///    (double-count). Termination is guaranteed by a visited-slot set (so a
+    ///    cyclic `t_ctid` from corruption errors instead of spinning).
+    ///
+    /// Returns the visible version's `(RowLocation, infomask)`; `None` when no
+    /// version in the chain is visible (deleted/aborted/never-present) or the root
+    /// slot is reclaimed. With no HOT tuples in the heap yet (H2/H3 unimplemented),
+    /// every root is `NORMAL` with `t_ctid = INVALID_TID`, so this resolves the root
+    /// slot itself and the walk is a single step — behavior-identical to the prior
+    /// single-tuple visibility check.
+    fn resolve_visible_in_chain(
+        &self,
+        schema: &TableSchema,
+        location: RowLocation,
+        snapshot: &Snapshot,
+        current_txn: u64,
+    ) -> Result<Option<(RowLocation, u16)>> {
+        let readable = self
+            .buffer_pool
+            .read_page(location.file_id, location.page_num)?;
+        let data = readable.data();
+        let page_num = location.page_num;
+        let file_id = location.file_id;
+
+        // Step 1: resolve a REDIRECT root to its same-page NORMAL target.
+        let mut current_slot = match page::slot_state(data, location.slot_num)? {
+            page::LinePointer::Normal => location.slot_num,
+            page::LinePointer::Redirect(target) => {
+                // A REDIRECT always points within the same page at a NORMAL slot.
+                match page::slot_state(data, target)? {
+                    page::LinePointer::Normal => target,
+                    _ => {
+                        return Err(storage_internal(
+                            "redirect line pointer target is not a NORMAL tuple",
+                        ));
+                    }
+                }
+            }
+            // A reclaimed (DEAD/UNUSED) root slot resolves to no version.
+            page::LinePointer::Dead | page::LinePointer::Unused => return Ok(None),
+        };
+
+        // Step 2: bounded HOT-chain walk from the resolved root. Termination is
+        // guaranteed by `visited` (a cyclic `t_ctid` becomes a structured error, not
+        // a spin); the slot count is only a capacity hint for that set.
+        let slot_count = page::next_slot(data)?;
+        let mut visited: HashSet<u16> = HashSet::with_capacity(slot_count as usize);
+        loop {
+            if !visited.insert(current_slot) {
+                return Err(storage_internal("cyclic HOT chain detected"));
+            }
+
+            // The resolved root is NORMAL (step 1) and every followed successor is
+            // validated NORMAL before we step onto it, so a missing tuple here is a
+            // corrupt chain, not a skippable reclaimed slot.
+            let Some(bytes) = page::read_row(data, current_slot)? else {
+                return Err(storage_internal("HOT chain member is not a live tuple"));
+            };
+            let decoded = decode_row(schema, &bytes)?;
+            if is_visible(
+                decoded.xmin,
+                decoded.xmax,
+                decoded.infomask,
+                snapshot,
+                current_txn,
+                self.txn_status_view(),
+            ) {
+                return Ok(Some((
+                    RowLocation {
+                        file_id,
+                        page_num,
+                        slot_num: current_slot,
+                    },
+                    decoded.infomask,
+                )));
+            }
+
+            // Decide whether to follow `t_ctid` into a heap-only successor. Stop
+            // unless: this tuple was HOT-updated, its successor is on THIS page, and
+            // that successor is HEAP_ONLY (so it has no index entry of its own and is
+            // reachable only here). Any other case — latest version, a non-HOT
+            // successor, or an off-page successor — is independently indexed/absent,
+            // so we must not cross into it (double-count guard).
+            if decoded.infomask & crate::codec::HOT_UPDATED == 0 {
+                return Ok(None);
+            }
+            let (succ_page, succ_slot) = decoded.t_ctid;
+            if succ_page != page_num {
+                return Ok(None);
+            }
+            // Peek the successor's header: only a HEAP_ONLY, NORMAL successor is part
+            // of this HOT-chain segment. A non-HEAP_ONLY successor is independently
+            // indexed (stop); a non-NORMAL successor under a HOT_UPDATED pointer is
+            // corruption.
+            match page::slot_state(data, succ_slot)? {
+                page::LinePointer::Normal => {}
+                _ => {
+                    return Err(storage_internal(
+                        "HOT_UPDATED successor slot is not a NORMAL tuple",
+                    ));
+                }
+            }
+            let Some(succ_bytes) = page::read_row(data, succ_slot)? else {
+                return Err(storage_internal(
+                    "HOT_UPDATED successor is not a live tuple",
+                ));
+            };
+            let (_xmin, _xmax, _t_ctid, succ_infomask) =
+                crate::codec::decode_mvcc_header(&succ_bytes)?;
+            if succ_infomask & crate::codec::HEAP_ONLY == 0 {
+                // The successor is independently indexed — it is reached via its own
+                // index entry, so stop here (do not double-count it).
+                return Ok(None);
+            }
+            current_slot = succ_slot;
+        }
+    }
+
+    /// Resolve a (possibly HOT) index entry to its visible heap version and read it,
+    /// returning the **resolved heap location** alongside the row so callers stamp
+    /// the right `RowId` (the live chain member, not the pruned root). Routes through
+    /// [`Self::resolve_visible_in_chain`] (REDIRECT + bounded `t_ctid` walk +
+    /// [`is_visible`], `docs/specs/mvcc.md` §6, §10 Milestone H1): an invisible chain
+    /// (or a reclaimed root slot) yields `None` and is skipped by the caller — never
+    /// an error. Under the degenerate autocommit snapshot every committed row and own
+    /// write is visible, so this filters nothing; with no HOT tuples in the heap yet
+    /// (H2/H3 unimplemented), the resolution is the prior single-tuple check at the
+    /// index TID itself.
     fn read_visible_row(
         &self,
         schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
         current_txn: u64,
-    ) -> Result<Option<Row>> {
-        let readable = self
-            .buffer_pool
-            .read_page(location.file_id, location.page_num)?;
-        let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
+    ) -> Result<Option<(RowLocation, Row)>> {
+        let Some((resolved, _infomask)) =
+            self.resolve_visible_in_chain(schema, location, snapshot, current_txn)?
+        else {
             return Ok(None);
         };
-        let decoded = decode_row(schema, &bytes)?;
-        if !is_visible(
-            decoded.xmin,
-            decoded.xmax,
-            decoded.infomask,
-            snapshot,
-            current_txn,
-            self.txn_status_view(),
-        ) {
+        // The resolved slot is the NORMAL, visible chain member; read its bytes.
+        let Some(row) = self.read_location(schema, resolved)? else {
             return Ok(None);
-        }
-        Ok(Some(decoded.row))
+        };
+        Ok(Some((resolved, row)))
     }
 
     /// Locate the single version of `key` visible to `snapshot` from `current_txn`
@@ -667,22 +796,15 @@ impl PageBackedStorageEngine {
         current_txn: u64,
     ) -> Result<Option<(RowLocation, u16)>> {
         for location in index_btree.scan_key(key)? {
-            let readable = self
-                .buffer_pool
-                .read_page(location.file_id, location.page_num)?;
-            let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
-                continue;
-            };
-            let decoded = decode_row(schema, &bytes)?;
-            if is_visible(
-                decoded.xmin,
-                decoded.xmax,
-                decoded.infomask,
-                snapshot,
-                current_txn,
-                self.txn_status_view(),
-            ) {
-                return Ok(Some((location, decoded.infomask)));
+            // Each index entry's TID is a (possibly HOT) root: resolve REDIRECT +
+            // the bounded `t_ctid` chain to the version this snapshot sees. Returns
+            // the heap location of the visible chain member (which UPDATE/DELETE then
+            // stamp), not the index TID — so a HOT-updated row is stamped at the live
+            // heap-only version, not its pruned root.
+            if let Some(resolved) =
+                self.resolve_visible_in_chain(schema, location, snapshot, current_txn)?
+            {
+                return Ok(Some(resolved));
             }
         }
         Ok(None)
@@ -1135,7 +1257,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // once versioning lands (B4); collect every candidate TID and return the
         // single one visible to this snapshot. Today there is one entry per key.
         for location in self.btree(index_fid).scan_key(key)? {
-            if let Some(row) =
+            if let Some((_resolved, row)) =
                 self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
             {
                 return Ok(Some(row));
@@ -1274,16 +1396,23 @@ impl StorageEngine for PageBackedStorageEngine {
 
         let mut rows = Vec::with_capacity(entries.len());
         for (key, location) in entries {
-            // Visibility-check the candidate TID at the heap; an invisible version
-            // (or an absent line pointer) is skipped, not returned or errored.
-            let Some(row) = self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+            // Resolve the index entry's TID (a possibly-HOT root: REDIRECT + bounded
+            // `t_ctid` chain) to the version this snapshot sees; an invisible chain
+            // (or a reclaimed root slot) is skipped, not returned or errored. A
+            // HEAP_ONLY successor has NO index entry of its own, so it is never
+            // yielded directly here — only via its root's chain — which is exactly
+            // why the bounded walk's stop-at-indexed-successor rule prevents a row
+            // from being returned twice (`mvcc.md` §10 Milestone H1). The yielded
+            // `RowId` is the resolved live version, not the index TID.
+            let Some((resolved, row)) =
+                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
             else {
                 continue;
             };
             rows.push(StoredRow {
                 row_id: RowId {
-                    page_num: location.page_num,
-                    slot_num: location.slot_num,
+                    page_num: resolved.page_num,
+                    slot_num: resolved.slot_num,
                 },
                 key,
                 row,
@@ -1309,27 +1438,30 @@ impl StorageEngine for PageBackedStorageEngine {
 
         // The secondary index points directly at heap TIDs (uniform with the
         // primary-key index), so a scan collects candidate TIDs from the index and
-        // reads the heap at each — no primary-key indirection, and no walking the
-        // `t_ctid` chain (every version is independently indexed; `mvcc.md` §6,
-        // Appendix A "Reads do not walk t_ctid").
+        // resolves each at the heap. Each TID is a (possibly HOT) root: a non-HOT
+        // version is independently indexed and resolves to itself; a HEAP_ONLY
+        // successor has no index entry and is reached only via its root's bounded
+        // `t_ctid` walk (REDIRECT + chain in `read_visible_row`; `mvcc.md` §5.2, §10
+        // Milestone H1). Because the walk stops at any independently-indexed
+        // successor, a row is never yielded via two index entries.
         let entries = self.secondary_btree(index).range(range)?;
         let mut rows = Vec::with_capacity(entries.len());
         for (_entry_key, location) in entries {
-            // Visibility-check the candidate TID at the heap. An index entry whose
-            // tuple is invisible to this snapshot (or whose line pointer is
-            // DEAD/absent) is skipped, not an error — the forward-looking hook for
-            // B4's retained per-version index entries.
-            let Some(row) = self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+            // Resolve to the visible version; an invisible chain (or a DEAD/absent
+            // root line pointer) is skipped, not an error.
+            let Some((resolved, row)) =
+                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
             else {
                 continue;
             };
             // The row's primary key is recovered from the heap row, preserving the
-            // `StoredRow.key` semantics callers relied on under secondary→PK.
+            // `StoredRow.key` semantics callers relied on under secondary→PK. The
+            // `RowId` is the resolved live version, not the index TID.
             let key = key_for_row(&schema, &row)?;
             rows.push(StoredRow {
                 row_id: RowId {
-                    page_num: location.page_num,
-                    slot_num: location.slot_num,
+                    page_num: resolved.page_num,
+                    slot_num: resolved.slot_num,
                 },
                 key,
                 row,
@@ -1685,8 +1817,8 @@ mod visibility_tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use common::{
-        ColumnDef, DataType, IndexSchema, Key, KeyRange, PageFlushInfo, Row, RowId, Snapshot,
-        StatementContext, TableSchema, Value,
+        ColumnDef, DataType, INVALID_XID, IndexSchema, Key, KeyRange, PageFlushInfo, Row, RowId,
+        Snapshot, SqlState, StatementContext, TableSchema, Value,
     };
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -1827,6 +1959,91 @@ mod visibility_tests {
                 .unwrap();
             let bytes = crate::page::read_row(readable.data(), location.slot_num).unwrap()?;
             Some(crate::codec::decode_row(&users_schema(), &bytes).unwrap())
+        }
+
+        // --- H1 HOT-chain synthesis helpers (no H2/H3 production path yet) ---
+
+        /// Append a raw tuple for `row` (creator `xmin`) directly onto an existing
+        /// heap `page_num`, stamping `infomask` (e.g. `HEAP_ONLY`) and an `xmax`
+        /// in place, and return its new slot. Used to build a synthetic heap-only
+        /// successor that — by HOT design — has NO index entry of its own, so it is
+        /// reachable only by walking `t_ctid` from its root.
+        fn append_raw_tuple(
+            &self,
+            page_num: u32,
+            row: &Row,
+            xmin: u64,
+            xmax: u64,
+            infomask: u16,
+        ) -> u16 {
+            let bytes = crate::codec::encode_row(&users_schema(), row, xmin).unwrap();
+            let mut guard = self
+                .engine
+                .buffer_pool
+                .write_page(TABLE_ID, page_num, xmin)
+                .unwrap();
+            let slot = crate::page::insert_row(guard.data_mut(), &bytes).unwrap();
+            // Stamp xmax/infomask on the freshly inserted NORMAL slot (its t_ctid
+            // stays the no-successor sentinel until a caller chains it).
+            let lsn = crate::page::page_lsn(guard.data());
+            crate::page::set_tuple_header(
+                guard.data_mut(),
+                slot,
+                xmax,
+                crate::codec::INVALID_TID,
+                infomask,
+                lsn,
+            )
+            .unwrap();
+            slot
+        }
+
+        /// Chain the tuple at `(page_num, slot)` forward to `successor` on the same
+        /// page: stamp `xmax`, `t_ctid -> successor`, and `infomask` (e.g.
+        /// `HOT_UPDATED`) — the root side of a HOT update. The slot must be NORMAL.
+        fn chain_to(&self, page_num: u32, slot: u16, successor: u16, xmax: u64, infomask: u16) {
+            let mut guard = self
+                .engine
+                .buffer_pool
+                .write_page(TABLE_ID, page_num, xmax)
+                .unwrap();
+            let lsn = crate::page::page_lsn(guard.data());
+            crate::page::set_tuple_header(
+                guard.data_mut(),
+                slot,
+                xmax,
+                (page_num, successor),
+                infomask,
+                lsn,
+            )
+            .unwrap();
+        }
+
+        /// Overwrite the line pointer at `(page_num, slot)` with a `REDIRECT` to
+        /// `target` on the same page (the H3 pruning result, synthesized here).
+        fn make_redirect(&self, page_num: u32, slot: u16, target: u16) {
+            let mut guard = self
+                .engine
+                .buffer_pool
+                .write_page(TABLE_ID, page_num, 0)
+                .unwrap();
+            crate::page::set_redirect(guard.data_mut(), slot, target).unwrap();
+        }
+
+        /// Resolve `key` to the visible version's `(RowLocation, infomask)` via the
+        /// engine's HOT-aware `locate_visible_version` (REDIRECT + bounded chain),
+        /// the path UPDATE/DELETE use to target the live version.
+        fn locate(
+            &self,
+            key: &Key,
+            snapshot: Snapshot,
+            current_txn: u64,
+        ) -> Option<(super::RowLocation, u16)> {
+            let schema = users_schema();
+            let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
+            self.engine
+                .locate_visible_version(&schema, &btree, key, &snapshot, current_txn)
+                .unwrap()
         }
     }
 
@@ -3215,6 +3432,310 @@ mod visibility_tests {
             rows.push(stored.row);
         }
         rows
+    }
+
+    // ----------------------------------------------------------------------
+    // H1 — HOT read-side resolution: REDIRECT + bounded HOT-chain walk.
+    //
+    // These synthesize HOT chains / REDIRECTs directly on the heap page (the H2
+    // HOT-update and H3 pruning production paths do not exist yet), then assert
+    // the index-lookup read paths resolve them correctly: REDIRECT → bounded
+    // `t_ctid` walk → visibility, never crossing into an independently-indexed
+    // successor (no double-return), and corruption → structured error not a loop.
+    // ----------------------------------------------------------------------
+
+    /// A fixture with `users` created (committed) and a single committed root row
+    /// (id `1`, "root", creator txn 10) inserted via the normal path, so the root
+    /// carries a real primary-key index entry. Returns the fixture and the root's
+    /// heap `RowLocation`.
+    fn fixture_with_root() -> (Fixture, super::RowLocation) {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_table(&ctx(100, snapshot(101, vec![])), &users_schema())
+            .unwrap();
+        fixture.commit(100);
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "root"))
+            .unwrap();
+        fixture.commit(10);
+        let location = fixture.pk_index_tids(&key(1))[0];
+        (fixture, location)
+    }
+
+    #[test]
+    fn redirect_resolves_to_its_normal_target() {
+        // A HOT root whose original tuple was pruned to a REDIRECT (H3) still
+        // resolves through the index: the index entry's stable root slot is a
+        // REDIRECT to the surviving NORMAL version on the same page.
+        let (fixture, root) = fixture_with_root();
+        // Build the surviving target version on the same page (creator txn 10,
+        // committed) and point the indexed root slot at it.
+        let target =
+            fixture.append_raw_tuple(root.page_num, &row(1, "redirected"), 10, INVALID_XID, 0);
+        fixture.make_redirect(root.page_num, root.slot_num, target);
+
+        let reader = ctx(0, snapshot(40, vec![]));
+        // Point lookup, sequential scan, and the UPDATE/DELETE locate path all
+        // follow the REDIRECT to the NORMAL target.
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "redirected"))
+        );
+        assert_eq!(
+            collect_names(
+                fixture
+                    .engine
+                    .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                    .unwrap()
+            ),
+            vec![row(1, "redirected")]
+        );
+        let (located, _infomask) = fixture.locate(&key(1), snapshot(40, vec![]), 0).unwrap();
+        assert_eq!(located.slot_num, target, "locate resolved through redirect");
+    }
+
+    #[test]
+    fn redirect_to_redirect_is_a_structured_error_not_a_loop() {
+        // A REDIRECT must point at a NORMAL slot; a redirect-to-redirect is
+        // corruption and must surface as a structured error, never loop.
+        let (fixture, root) = fixture_with_root();
+        // Two extra NORMAL slots so both redirect ids are in-bounds.
+        let mid = fixture.append_raw_tuple(root.page_num, &row(1, "mid"), 10, INVALID_XID, 0);
+        let _end = fixture.append_raw_tuple(root.page_num, &row(1, "end"), 10, INVALID_XID, 0);
+        // root → mid, but mid is itself a REDIRECT (→ end): redirect-to-redirect.
+        fixture.make_redirect(root.page_num, mid, _end);
+        fixture.make_redirect(root.page_num, root.slot_num, mid);
+
+        let err = fixture
+            .engine
+            .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("redirect"), "{}", err.message);
+    }
+
+    #[test]
+    fn redirect_to_dead_is_a_structured_error() {
+        // A REDIRECT to a DEAD (reclaimed-tuple) slot is corruption.
+        let (fixture, root) = fixture_with_root();
+        let dead = fixture.append_raw_tuple(root.page_num, &row(1, "dead"), 10, INVALID_XID, 0);
+        // Tombstone the target to DEAD via the page primitive.
+        {
+            let mut guard = fixture
+                .engine
+                .buffer_pool
+                .write_page(TABLE_ID, root.page_num, 0)
+                .unwrap();
+            crate::page::delete_row(guard.data_mut(), dead).unwrap();
+        }
+        fixture.make_redirect(root.page_num, root.slot_num, dead);
+
+        let err = fixture
+            .engine
+            .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+    }
+
+    #[test]
+    fn hot_chain_returns_visible_heap_only_successor_when_root_invisible() {
+        // Root (creator 10) HOT-updated by txn 20 to a HEAP_ONLY successor on the
+        // same page: root has xmax = 20 + HOT_UPDATED + t_ctid → successor; the
+        // successor (xmin = 20, HEAP_ONLY) has NO index entry. A reader that sees
+        // both 10 and 20 committed sees the root as deleted and must return the
+        // heap-only successor by walking the chain.
+        let (fixture, root) = fixture_with_root();
+        let succ = fixture.append_raw_tuple(
+            root.page_num,
+            &row(1, "hot_new"),
+            20,
+            INVALID_XID,
+            crate::codec::HEAP_ONLY,
+        );
+        fixture.chain_to(
+            root.page_num,
+            root.slot_num,
+            succ,
+            20,
+            crate::codec::HOT_UPDATED,
+        );
+        fixture.commit(20);
+
+        let reader = ctx(0, snapshot(40, vec![]));
+        // The walk reaches the heap-only successor; the (now-deleted) root is hidden.
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "hot_new"))
+        );
+        // Exactly one row is yielded by a scan (no double-count) and it is the new
+        // version, even though the heap holds two physical tuples for the key.
+        assert_eq!(
+            collect_names(
+                fixture
+                    .engine
+                    .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                    .unwrap()
+            ),
+            vec![row(1, "hot_new")]
+        );
+        // UPDATE/DELETE target the live heap-only successor, not the pruned root.
+        let (located, _infomask) = fixture.locate(&key(1), snapshot(40, vec![]), 0).unwrap();
+        assert_eq!(located.slot_num, succ);
+    }
+
+    #[test]
+    fn hot_chain_returns_root_when_it_is_the_visible_version() {
+        // Same chain, but a reader whose snapshot has txn 20 in-progress (the
+        // HOT-update has not committed for it): the root is still live/visible and
+        // must be returned; the in-flight successor is not.
+        let (fixture, root) = fixture_with_root();
+        let succ = fixture.append_raw_tuple(
+            root.page_num,
+            &row(1, "hot_new"),
+            20,
+            INVALID_XID,
+            crate::codec::HEAP_ONLY,
+        );
+        fixture.chain_to(
+            root.page_num,
+            root.slot_num,
+            succ,
+            20,
+            crate::codec::HOT_UPDATED,
+        );
+        // txn 20 left in-progress (no commit/abort).
+
+        // Reader sees 10 committed, 20 in-progress ⇒ the root's delete by 20 is not
+        // effective ⇒ root is visible.
+        let reader = ctx(0, snapshot(40, vec![20]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "root"))
+        );
+    }
+
+    #[test]
+    fn walk_stops_at_a_non_heap_only_successor_no_double_return() {
+        // THE double-count guard: a root HOT_UPDATED whose `t_ctid` successor is an
+        // INDEPENDENTLY-INDEXED version (NOT HEAP_ONLY) must NOT be crossed — that
+        // successor is reachable via its own index entry. With the root invisible
+        // (deleted by committed txn 20) and the successor NOT heap-only, the walk
+        // stops at the root and returns None (the successor is found via its index
+        // entry, not this chain).
+        let (fixture, root) = fixture_with_root();
+        // Successor lacks HEAP_ONLY ⇒ it is "independently indexed".
+        let succ =
+            fixture.append_raw_tuple(root.page_num, &row(1, "indexed_new"), 20, INVALID_XID, 0);
+        fixture.chain_to(
+            root.page_num,
+            root.slot_num,
+            succ,
+            20,
+            crate::codec::HOT_UPDATED,
+        );
+        fixture.commit(20);
+
+        // The chain walk from the root's index entry stops at the invisible root and
+        // does NOT descend into the non-heap-only successor, so the point lookup via
+        // the root entry yields nothing here (no double-return of `succ`).
+        let reader = ctx(0, snapshot(40, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            None
+        );
+        // Confirm the walk parameters: root is HOT_UPDATED, successor is NOT
+        // heap-only, so the stop rule (not the visibility) is what ends the walk.
+        let root_dec = fixture.decode_physical(root).unwrap();
+        assert_ne!(root_dec.infomask & crate::codec::HOT_UPDATED, 0);
+        let succ_loc = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: root.page_num,
+            slot_num: succ,
+        };
+        assert_eq!(
+            fixture.decode_physical(succ_loc).unwrap().infomask & crate::codec::HEAP_ONLY,
+            0
+        );
+    }
+
+    #[test]
+    fn cyclic_hot_chain_is_a_structured_error_not_an_infinite_loop() {
+        // A corrupt cycle among HEAP_ONLY members: root → a → b → a. `a` and `b` are
+        // both HEAP_ONLY + HOT_UPDATED (so the walk keeps following them), and `b`
+        // points back at `a`, closing the cycle. The bounded walk's visited-set
+        // guard must turn this into a structured error, never spin. (A back-edge to
+        // the non-heap-only root would instead stop cleanly, which is the
+        // `walk_stops_at_a_non_heap_only_successor` case — so the cycle is built
+        // strictly inside the heap-only segment.) All are invisible to the reader.
+        let (fixture, root) = fixture_with_root();
+        let a = fixture.append_raw_tuple(
+            root.page_num,
+            &row(1, "a"),
+            20,
+            20,
+            crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED,
+        );
+        let b = fixture.append_raw_tuple(
+            root.page_num,
+            &row(1, "b"),
+            20,
+            20,
+            crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED,
+        );
+        // root → a (root is HOT_UPDATED but not heap-only — the indexed root).
+        fixture.chain_to(
+            root.page_num,
+            root.slot_num,
+            a,
+            20,
+            crate::codec::HOT_UPDATED,
+        );
+        // a → b, b → a: the heap-only cycle.
+        fixture.chain_to(
+            root.page_num,
+            a,
+            b,
+            20,
+            crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED,
+        );
+        fixture.chain_to(
+            root.page_num,
+            b,
+            a,
+            20,
+            crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED,
+        );
+        fixture.commit(20);
+
+        let err = fixture
+            .engine
+            .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("cyclic"), "{}", err.message);
+    }
+
+    #[test]
+    fn non_hot_data_resolves_unchanged() {
+        // Regression: with no HOT machinery active (a plain NORMAL root, no
+        // HOT_UPDATED, no REDIRECT), resolution is the prior single-tuple check.
+        let (fixture, _root) = fixture_with_root();
+        let reader = ctx(0, snapshot(40, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "root"))
+        );
+        assert_eq!(
+            collect_names(
+                fixture
+                    .engine
+                    .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                    .unwrap()
+            ),
+            vec![row(1, "root")]
+        );
     }
 }
 

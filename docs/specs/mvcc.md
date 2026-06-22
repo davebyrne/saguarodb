@@ -238,8 +238,15 @@ will ever need:
   whereas an `UNUSED` slot is guaranteed (by the F2b → F3a → F3b ordering) to have
   no index entry, so recycling it cannot let a stale entry resolve to the new
   tuple.
-- `REDIRECT` *(reserved; used by HOT in Milestone H)* — points at another slot on
-  the same page.
+- `REDIRECT` — points at another slot **on the same page** (its target slot id is
+  held in the line pointer's `offset` field). Produced by HOT pruning (Milestone
+  H3) when a HOT root's original tuple is reclaimed but its stable, indexed root
+  slot must keep resolving to the surviving root version. **H1 implements reading
+  it** (the read-side resolution below); the read path follows a `REDIRECT` to its
+  target, which **must be a `NORMAL` slot** — a redirect-to-redirect or
+  redirect-to-dead is corruption and surfaces as a structured `DbError`, never a
+  loop. (`page.rs` validates a `REDIRECT`'s target slot id is in-bounds on every
+  page read; the NORMAL-target check is the resolver's.)
 
 Contract: **indexes reference `(page, line-pointer-slot)`; tuple bytes may be
 relocated within a page (compaction) by rewriting the line pointer without
@@ -992,10 +999,44 @@ savepoints via sub-transaction xids (optional, deferred).
 
 ### Milestone H — HOT *(deferred, purely additive)*
 
-- **H1** `REDIRECT` line pointers + root-line-pointer indexing. **H2** HOT-update
-  fast path (same-page + no indexed-column change ⇒ heap-only tuple, no new index
-  entries; index points at the root). **H3** HOT pruning folded into page access
-  and VACUUM. Reuses A–G unchanged.
+- **H1** `REDIRECT` line pointers + root-line-pointer indexing **(read-side
+  machinery; implemented)**. **H2** HOT-update fast path (same-page + no
+  indexed-column change ⇒ heap-only tuple, no new index entries; index points at
+  the root). **H3** HOT pruning folded into page access and VACUUM. Reuses A–G
+  unchanged.
+
+  **H1 — read-side resolution (implemented).** H1 installs the read machinery HOT
+  needs *without* producing any heap-only tuples or `REDIRECT`s (H2/H3), so it is
+  behaviorally inert on real data (no HOT tuples exist yet) and is proven against
+  synthetic chains. Every index-driven read path — point lookup (`get`),
+  sequential / range scan (`scan_range`), secondary `index_scan`, and the
+  UPDATE/DELETE target locator (`locate_visible_version`) — resolves an index
+  entry's TID through `resolve_visible_in_chain` (`storage/src/engine.rs`), which:
+  1. **resolves a `REDIRECT` root** to its same-page target (validated `NORMAL`,
+     else a structured error — §5.2); a `DEAD`/`UNUSED` root resolves to no
+     version; then
+  2. **walks the forward `t_ctid` chain** from the resolved root, returning the
+     first version `is_visible` accepts (§6).
+  - **Bounded-walk stop rule (the correctness invariant).** The walk follows
+    `t_ctid` into a successor **only when the current tuple is `HOT_UPDATED` and the
+    successor is `HEAP_ONLY` on the same page** — staying strictly within one HOT
+    chain segment. It **stops** at the latest version (`t_ctid` sentinel), at an
+    off-page successor, and at any successor that is **not `HEAP_ONLY`** (i.e.
+    independently indexed, reachable via its own index entry). This is what
+    guarantees a single visible row is never returned via two index entries
+    (double-count): in the index-per-version model every non-heap-only version has
+    its own index entry, and only `HEAP_ONLY` successors lack one, so the walk
+    crosses exactly the un-indexed members and no more. The walk is bounded by the
+    page's slot count and tracks visited slots, so a cyclic `t_ctid` (corruption)
+    is a structured error, not a spin. The walk is **pure** (read-latch only, no
+    page mutation): pruning lives on the UPDATE/VACUUM path (H3), never the
+    lock-free reader path.
+  - **Sequential-scan rule.** A `HEAP_ONLY` tuple has **no index entry of its
+    own**, so a PK/secondary index range scan never yields it directly; it is
+    reached only by walking `t_ctid` from its (indexed) root. The visible version
+    of each chain is therefore yielded **once**, via the root's index entry — a
+    heap-only chain member is never independently returned. The scan yields the
+    resolved live version's `RowId` (the visible chain member), not the index TID.
 
 ### Unlocks summary
 
@@ -1251,10 +1292,16 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
   `HeapUpdateHeader`/`HeapInsert`/index records correctly and the flush policy still
   never flushes uncommitted pages. Redo-all (Milestone D) is needed only once
   multi-statement / concurrent writers arrive.
-- **Reads do not walk `t_ctid`:** with index-per-version every version is
-  independently indexed, so a scan collects all candidate TIDs from the index and
-  visibility-checks each; the forward `t_ctid` chain is maintained for later
-  update-locating / conflict detection (Milestone E), not for plain `SELECT`.
+- **Reads do not walk `t_ctid` (through Milestone G):** with index-per-version
+  every version is independently indexed, so a scan collects all candidate TIDs
+  from the index and visibility-checks each; the forward `t_ctid` chain is
+  maintained for later update-locating / conflict detection (Milestone E), not for
+  plain `SELECT`. **Refined by Milestone H1:** once HOT exists, reads DO walk the
+  `t_ctid` chain, but **strictly within one HOT-chain segment** — following only
+  `HEAP_ONLY` (un-indexed) successors and stopping at any independently-indexed
+  successor (§10 Milestone H1). Because exactly the un-indexed members are crossed,
+  the "one visible row per index entry" invariant is preserved: the walk reaches
+  only versions that have no index entry of their own, so no row is double-counted.
 - **Spec updates ride along** per `AGENTS.md`: commit 2 → `wal.md`; commits 3–4,
   8–9 → `storage.md` (and re-spec the secondary-index feature); commit 6 → the
   executor/storage read contract.

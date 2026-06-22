@@ -26,22 +26,28 @@ pub(crate) const INVALID_TID: (PageNum, u16) = (u32::MAX, u16::MAX);
 /// `infomask` hint bits (bit positions in the v2 header's `u16`). The four
 /// `*_COMMITTED`/`*_ABORTED` settled-status bits are owned by `common` (re-used by
 /// the visibility predicate as a single source of truth) and re-exported here; the
-/// two HEAP bits are storage-private and reserved for HOT (Milestone H).
+/// two HEAP bits are storage-private and wired by HOT (read in H1, set in H2; see
+/// below).
 ///
 /// ```text
 /// bit 0: XMIN_COMMITTED  bit 1: XMIN_ABORTED   (in common, used by is_visible)
 /// bit 2: XMAX_COMMITTED  bit 3: XMAX_ABORTED   (in common, used by is_visible)
-/// bit 4: HEAP_ONLY       bit 5: HOT_UPDATED    (storage-private, reserved for HOT)
+/// bit 4: HEAP_ONLY       bit 5: HOT_UPDATED    (storage-private, HOT — see below)
 /// bits 6-15: reserved (must be 0)
 /// ```
 /// `XMIN_COMMITTED` (used by the v1-decode synthesized header) and the other three
-/// settled-status bits come from [`common`]. The HOT bits are defined here but not
-/// yet read or set; HOT (Milestone H) wires them in.
-/// Reserved for HOT (Milestone H): tuple has no index entry of its own.
-#[allow(dead_code, reason = "reserved for HOT (Milestone H)")]
+/// settled-status bits come from [`common`]. HOT (Milestone H) wires the two HEAP
+/// bits in: H1 *reads* them on the HOT-chain walk; H2 *sets* `HOT_UPDATED` on a
+/// HOT-updated root and `HEAP_ONLY` on its heap-only successor.
+///
+/// A `HEAP_ONLY` tuple has **no index entry of its own**: it is reachable only by
+/// walking `t_ctid` from its HOT-chain root (which IS indexed). The walk follows
+/// `t_ctid` into a successor only when the current tuple is `HOT_UPDATED` and the
+/// successor is `HEAP_ONLY` — staying strictly within one HOT-chain segment so a
+/// single visible row is never reached via two index entries (`mvcc.md` §5.1, §10
+/// Milestone H1).
 pub(crate) const HEAP_ONLY: u16 = 1 << 4;
-/// Reserved for HOT (Milestone H): tuple was HOT-updated in place.
-#[allow(dead_code, reason = "reserved for HOT (Milestone H)")]
+/// HOT: the tuple was HOT-updated in place; its `t_ctid` successor is `HEAP_ONLY`.
 pub(crate) const HOT_UPDATED: u16 = 1 << 5;
 
 /// A decoded row plus its MVCC tuple header. Later milestones (visibility,

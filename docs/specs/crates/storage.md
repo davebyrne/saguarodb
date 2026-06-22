@@ -83,10 +83,23 @@ results are unchanged from the pre-MVCC engine.
   invisible to the snapshot (or whose line pointer is `DEAD`/absent) is skipped
   rather than raising an internal error. This is the forward-looking contract for
   per-version index entries that VACUUM has not yet reclaimed (Milestone B4/F).
-- **No `t_ctid` walk on reads.** With one index entry per version, a scan collects
-  every candidate TID from the index and visibility-checks each at the heap; the
-  forward `t_ctid` chain is not followed for `SELECT` (it serves update-locating
-  and conflict detection in later milestones).
+- **`t_ctid` walk on reads (HOT, Milestone H1).** Every index-driven read path
+  (`get`, `scan_range`, `index_scan`, and the UPDATE/DELETE `locate_visible_version`)
+  resolves an index entry's TID through `resolve_visible_in_chain`: it follows a
+  `REDIRECT` root to its same-page `NORMAL` target (a redirect-to-redirect /
+  redirect-to-dead is a structured error), then walks the forward `t_ctid` chain
+  returning the first version `is_visible` accepts. The walk is **bounded to one HOT
+  chain segment**: it follows `t_ctid` into a successor only when the current tuple
+  is `HOT_UPDATED` and the successor is `HEAP_ONLY` (un-indexed) on the same page,
+  and **stops** at the latest version, an off-page successor, or any successor that
+  is *not* `HEAP_ONLY` (independently indexed, reached via its own entry). This
+  preserves "one visible row per index entry" — exactly the un-indexed members are
+  crossed — so no row is double-returned; a cyclic `t_ctid` is a structured error,
+  not a spin. The walk is read-latch-only (no page mutation; pruning is the
+  UPDATE/VACUUM path, H3). With no HOT tuples in the heap yet (H2/H3 unimplemented),
+  every root is `NORMAL` with no successor, so resolution is the prior single-tuple
+  visibility check and reads are unchanged. The resolved live version's `RowId` is
+  what a scan yields, not the index TID.
 - **Index backfill is unfiltered; DML locates the visible version.** `create_index`
   backfill reads the *current physical* tuple (not the snapshot-visible version) to
   recompute index keys, so it uses the unfiltered heap read. `delete` and `update`
@@ -141,8 +154,13 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
   It reuses **`UNUSED` only, never `DEAD`** (see `insert_row` below) — an `UNUSED`
   slot is guaranteed by the F2b → F3a → F3b ordering to have no dangling index
   entry, while a `DEAD` slot may still have one.
-- `REDIRECT` (`3`) — points at another slot on the same page. *Reserved for HOT
-  (Milestone H); no path produces it yet.*
+- `REDIRECT` (`3`) — points at another slot **on the same page**; the target slot
+  id is stored in the line pointer's `offset` field. Produced by HOT pruning
+  (Milestone H3) so a pruned HOT root's stable, indexed slot keeps resolving to the
+  surviving root version. **Read-side resolution is implemented (H1):**
+  `page::slot_state(data, slot)` classifies a slot (`Normal`/`Dead`/`Unused`/
+  `Redirect(target)`) without reading the tuple, and the engine follows a
+  `Redirect` to its target (which must be `NORMAL`).
 
 The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly the
 former "live" slot and `DEAD` is the former tombstoned slot. Neither MVCC `delete`
@@ -153,8 +171,11 @@ only producer of `DEAD` (via `page::prune_and_compact`, F2b) and `UNUSED` (via
 `page::reclaim_line_pointers`, F3b). The live VACUUM orchestration
 `PageBackedStorageEngine::vacuum` (F4a) drives both, so `VACUUM` now stamps heap
 slots `DEAD` (heap prune) then `UNUSED` (line-pointer reclaim).
-`validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
-VACUUM-compacted page is valid); `REDIRECT` and any other value is corruption.
+`validate` accepts `NORMAL`, `DEAD`, `UNUSED`, and `REDIRECT` flags on a data page
+(so both a VACUUM-compacted and a HOT-pruned page are valid); any other value is
+corruption. A `REDIRECT`'s `offset` field is a same-page **target slot id**, so
+`validate` requires it to be in-bounds (`< num_slots`) but does **not** subject it
+to the byte-region check; the resolver enforces the target is `NORMAL`.
 The `(offset, offset+len) ≤ FreeStart`/in-bounds invariant is enforced **only for
 `NORMAL` line pointers** — after compaction a `DEAD`/`UNUSED` slot's
 `(offset, len)` no longer names live bytes and is left unconstrained, while a

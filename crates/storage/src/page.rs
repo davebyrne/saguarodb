@@ -37,12 +37,11 @@ mod line_pointer {
     /// `insert_row` recycles the first `UNUSED` slot id before appending a fresh
     /// one (never a `DEAD` one — it may still have a dangling index entry).
     pub(super) const UNUSED: u16 = 0;
-    /// Points at another slot on the same page. Reserved for HOT (Milestone H);
-    /// no path produces it yet.
-    #[allow(
-        dead_code,
-        reason = "REDIRECT line pointers owned by HOT (Milestone H)"
-    )]
+    /// Points at another slot **on the same page** (its target slot id is held in
+    /// the line pointer's `offset` field). A HOT root slot whose original tuple has
+    /// been pruned is replaced by a `REDIRECT` to the surviving root version, so an
+    /// index entry referencing the stable root slot id still resolves (`mvcc.md`
+    /// §5.2). H1 implements *reading* (resolving) a `REDIRECT`; H3 produces them.
     pub(super) const REDIRECT: u16 = 3;
 }
 
@@ -64,6 +63,23 @@ impl Slot {
     fn is_live(self) -> bool {
         self.flags == line_pointer::NORMAL
     }
+}
+
+/// The resolved state of a heap line pointer, returned by [`slot_state`] so the
+/// engine's HOT read-side resolution (`mvcc.md` §5.2, Milestone H1) can branch on
+/// it without reaching into the private [`Slot`] representation. `Redirect` carries
+/// the target slot id (always on the same page, by the `REDIRECT` contract).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinePointer {
+    /// Addresses a live tuple on this page (`read_row` returns its bytes).
+    Normal,
+    /// Tuple removed; the slot id is retained (index entries may still point here).
+    Dead,
+    /// Free for reuse; no tuple and no dangling index entry.
+    Unused,
+    /// Points at another slot on the **same page** (HOT root indirection); the
+    /// payload is the target slot id.
+    Redirect(u16),
 }
 
 pub fn init_page(data: &mut [u8; PAGE_SIZE], page_id: PageNum) {
@@ -206,6 +222,29 @@ pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
 /// would make this O(1).
 fn first_unused_slot(data: &[u8; PAGE_SIZE], num_slots: u16) -> Option<u16> {
     (0..num_slots).find(|&slot_num| read_slot(data, slot_num).flags == line_pointer::UNUSED)
+}
+
+/// Classify the line pointer at `slot_num` (`mvcc.md` §5.2) without reading the
+/// tuple bytes — the read-side primitive HOT resolution (Milestone H1) needs to
+/// detect and follow a `REDIRECT` and to validate a redirect target is `NORMAL`.
+/// An out-of-bounds slot is a misuse and returns a structured `DbError` (never a
+/// panic), matching the sibling primitives.
+pub fn slot_state(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<LinePointer> {
+    let header = validate(data)?;
+    if slot_num >= header.num_slots {
+        return Err(corrupt_page("slot number is out of bounds"));
+    }
+    let slot = read_slot(data, slot_num);
+    Ok(match slot.flags {
+        line_pointer::NORMAL => LinePointer::Normal,
+        line_pointer::DEAD => LinePointer::Dead,
+        line_pointer::UNUSED => LinePointer::Unused,
+        // A REDIRECT stores its (same-page) target slot id in the `offset` field.
+        line_pointer::REDIRECT => LinePointer::Redirect(slot.offset),
+        // `validate_layout` already rejects any other flag value, so this is
+        // unreachable on a validated page; guard defensively rather than panic.
+        _ => return Err(corrupt_page("slot has invalid flags")),
+    })
 }
 
 pub fn read_row(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<Option<Vec<u8>>> {
@@ -398,6 +437,36 @@ pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn
     Ok(())
 }
 
+/// Overwrite the line pointer at `slot_num` with a `REDIRECT` to `target_slot`
+/// (on the same page) and refresh the checksum — the synthetic constructor the
+/// HOT read-side resolution tests (Milestone H1) use to build a `REDIRECT` slot
+/// without the production pruning path (H3) existing yet. The target is stored in
+/// the line pointer's `offset` field. Both ids must be in-bounds; this does not
+/// validate that the target is `NORMAL` (a test may deliberately build a corrupt
+/// redirect-to-redirect to exercise the resolver's guard).
+#[cfg(test)]
+pub(crate) fn set_redirect(
+    data: &mut [u8; PAGE_SIZE],
+    slot_num: u16,
+    target_slot: u16,
+) -> Result<()> {
+    let header = validate(data)?;
+    if slot_num >= header.num_slots || target_slot >= header.num_slots {
+        return Err(corrupt_page("slot number is out of bounds"));
+    }
+    write_slot(
+        data,
+        slot_num,
+        Slot {
+            offset: target_slot,
+            len: 0,
+            flags: line_pointer::REDIRECT,
+        },
+    );
+    write_checksum(data);
+    Ok(())
+}
+
 fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
     if header.free_start as usize > PAGE_SIZE {
         return Err(corrupt_page("free space offset is outside page"));
@@ -418,12 +487,12 @@ fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
     for slot_num in 0..header.num_slots {
         let slot = read_slot(data, slot_num);
         // NORMAL/DEAD are produced by inserts/deletes; UNUSED is produced by
-        // line-pointer reclaim (VACUUM, Milestone F). REDIRECT (HOT, Milestone H)
-        // is reserved and not yet written, so a page carrying it — or any other
-        // flag value — is corrupt.
+        // line-pointer reclaim (VACUUM, Milestone F); REDIRECT by HOT pruning
+        // (Milestone H). Any other flag value is corrupt.
         if slot.flags != line_pointer::NORMAL
             && slot.flags != line_pointer::DEAD
             && slot.flags != line_pointer::UNUSED
+            && slot.flags != line_pointer::REDIRECT
         {
             return Err(corrupt_page("slot has invalid flags"));
         }
@@ -438,6 +507,13 @@ fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
             if start < HEADER_LEN || end > header.free_start as usize {
                 return Err(corrupt_page("slot points outside row region"));
             }
+        }
+        // A REDIRECT's `offset` field is not a byte offset but a same-page target
+        // slot id (`mvcc.md` §5.2); it must reference an in-bounds slot. (Whether
+        // the target is itself `NORMAL` is enforced by the resolver, not here —
+        // `validate` runs on every page read and must stay cheap/local.)
+        if slot.flags == line_pointer::REDIRECT && slot.offset >= header.num_slots {
+            return Err(corrupt_page("redirect target slot is out of bounds"));
         }
     }
 
@@ -520,10 +596,11 @@ pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use super::{
-        FREE_SPACE_OFFSET, HEADER_LEN, NUM_SLOTS_OFFSET, PAGE_LSN_OFFSET, PAGE_TYPE_DATA,
-        PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page, insert_row,
-        line_pointer, prune_and_compact, read_row, read_slot, read_u16, reclaim_line_pointers,
-        set_page_lsn, set_tuple_header, validate, write_checksum, write_slot,
+        FREE_SPACE_OFFSET, HEADER_LEN, LinePointer, NUM_SLOTS_OFFSET, PAGE_LSN_OFFSET,
+        PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page,
+        insert_row, line_pointer, prune_and_compact, read_row, read_slot, read_u16,
+        reclaim_line_pointers, set_page_lsn, set_redirect, set_tuple_header, slot_state, validate,
+        write_checksum, write_slot,
     };
     use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
@@ -1012,5 +1089,82 @@ mod tests {
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
         let _ = b;
+    }
+
+    // --- H1: REDIRECT line pointers + slot_state read-side accessor ---
+
+    #[test]
+    fn slot_state_classifies_normal_dead_and_unused() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let normal = insert_blob(&mut data, 0xA0, 8);
+        let dead = insert_blob(&mut data, 0xB0, 8);
+        let unused = insert_blob(&mut data, 0xC0, 8);
+        // Drive `dead` to DEAD and `unused` to UNUSED via the VACUUM primitives.
+        prune_and_compact(&mut data.0, &[dead, unused], 1).unwrap();
+        reclaim_line_pointers(&mut data.0, &[unused], 2).unwrap();
+
+        assert_eq!(slot_state(&data.0, normal).unwrap(), LinePointer::Normal);
+        assert_eq!(slot_state(&data.0, dead).unwrap(), LinePointer::Dead);
+        assert_eq!(slot_state(&data.0, unused).unwrap(), LinePointer::Unused);
+    }
+
+    #[test]
+    fn slot_state_reports_redirect_target() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let root = insert_blob(&mut data, 0x11, 8);
+        let target = insert_blob(&mut data, 0x22, 8);
+        set_redirect(&mut data.0, root, target).unwrap();
+
+        assert_eq!(
+            slot_state(&data.0, root).unwrap(),
+            LinePointer::Redirect(target)
+        );
+        // The target itself is untouched and still NORMAL.
+        assert_eq!(slot_state(&data.0, target).unwrap(), LinePointer::Normal);
+        // A redirect slot reads no tuple bytes directly.
+        assert_eq!(read_row(&data.0, root).unwrap(), None);
+    }
+
+    #[test]
+    fn slot_state_rejects_out_of_bounds_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let _ = insert_blob(&mut data, 0x33, 8);
+        assert!(slot_state(&data.0, 99).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_an_in_bounds_redirect() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let root = insert_blob(&mut data, 0x44, 8);
+        let target = insert_blob(&mut data, 0x55, 8);
+        set_redirect(&mut data.0, root, target).unwrap();
+
+        // A page carrying a NORMAL target + a REDIRECT to it is valid.
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_a_redirect_to_an_out_of_bounds_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let root = insert_blob(&mut data, 0x66, 8);
+        let _target = insert_blob(&mut data, 0x77, 8);
+        // Hand-write a REDIRECT whose target slot id is past the slot array.
+        let num_slots = read_u16(&data.0, NUM_SLOTS_OFFSET);
+        write_slot(
+            &mut data.0,
+            root,
+            super::Slot {
+                offset: num_slots, // out of bounds
+                len: 0,
+                flags: line_pointer::REDIRECT,
+            },
+        );
+        write_checksum(&mut data.0);
+        assert!(validate(&data.0).is_err());
     }
 }
