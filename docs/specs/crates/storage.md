@@ -214,8 +214,49 @@ page-LSN with `lsn` and refreshes the checksum via `set_page_lsn`. Because
 `UNUSED` slot), reclaiming frees no space today — it is correct and
 forward-looking; slot-id reuse on insert is a separate, later change.
 
-Both primitives have no engine caller yet (the heap-prune pass is F2b and
-line-pointer reclaim is F3b), so they are runtime no-ops at this milestone.
+`prune_and_compact` is consumed by the heap-prune VACUUM pass (`vacuum_heap`,
+F2b, below); `reclaim_line_pointers` has no engine caller yet (line-pointer
+reclaim is F3b), so it is a runtime no-op at this milestone.
+
+### Heap-Prune VACUUM Pass (`vacuum_heap`, F2b)
+
+`vacuum_heap(schema, horizon) -> Vec<RowLocation>` is the engine heap-prune pass
+(`mvcc.md` §9 / Milestone F2b). It physically reclaims the tuples that are
+dead-to-everyone at `horizon` from every heap page of `schema`'s table and returns
+their TIDs. It has no production caller yet (VACUUM orchestration is F4a), so it is
+a runtime no-op at this milestone.
+
+- **Classify.** For each `NORMAL` slot on a page it decodes the tuple's MVCC header
+  (`codec::decode_mvcc_header` ⇒ `xmin`/`xmax`/`infomask`) and calls
+  `common::is_dead_to_all(xmin, xmax, infomask, horizon, txn_status_view())` against
+  the live CLOG. Only dead-to-all slots are pruned: a live version (`xmax ==
+  INVALID_XID`), an in-flight or aborted deleter, and a committed delete at or above
+  the horizon are all left `NORMAL` and untouched (the predicate's
+  aborted-creator-any-age / committed-delete-strictly-below-horizon asymmetry).
+- **Prune + log.** A page with at least one dead slot is rewritten by
+  `page::prune_and_compact` (survivors stay byte-identical at their stable slot ids,
+  so no index entry is touched) and logged as a **single unconditional**
+  `FullPageImage` — a prune+compact relocates survivors and is not expressible as a
+  delta, so it is never gated on `take_needs_fpi` (mirrors `btree::log_full_page`).
+  The FPI's LSN becomes the page's new PageLSN. A page with no dead slots is skipped
+  entirely: no WAL record and no mutation.
+- **Full-extent scan.** It iterates `0..BufferPool::page_count(heap_file_id)`,
+  faulting each page in (resident or from disk), rather than only the resident pages
+  `iter_pages` reports — an evicted page holding dead tuples must still be vacuumed,
+  else GC is incomplete.
+- **Latching.** Per page it takes the per-heap structural latch then the frame write
+  latch (lock order structural → frame → WAL) and releases both before the next page
+  (never held across pages). VACUUM runs under the exclusive concurrency guard at
+  this milestone (no concurrent writers), so these uncontended latches are
+  forward-looking.
+- **Maintenance txn.** Pages are dirtied and logged under txn id `0` — the
+  recovery/maintenance convention (shared with `fetch_for_redo`) — because VACUUM is
+  non-transactional maintenance: its reclamation must not be undone by an abort or
+  depend on a user commit. Recovery reinstalls each `FullPageImage` purely by
+  PageLSN gating, independent of the record's `txn_id`, so a crash mid-VACUUM leaves
+  every pruned page either pre-prune or exactly the compacted image, never torn.
+- It does **not** reclaim line pointers `DEAD → UNUSED` (F3b) or vacuum indexes
+  (F3a); those are separate, later steps.
 
 ### MVCC Delete
 

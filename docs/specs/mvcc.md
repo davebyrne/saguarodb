@@ -523,9 +523,25 @@ design, because index entries accumulate per version as well as heap tuples.
     is never reclaimable; a committed delete with `xmax >= horizon` is not *yet*
     reclaimable. The predicate is pure and honours the same `infomask` hint bits as
     `is_visible` to skip CLOG probes.
-- **Heap prune** (intra-page): mark dead tuples' line pointers `DEAD` and compact
-  live tuples (this finally adds the page compaction that `page.rs` lacks today —
-  `DELETE` is currently a non-reclaiming tombstone). WAL-logged.
+- **Heap prune** (intra-page, `storage::vacuum_heap`, F2b): for every heap page of
+  a table — scanning the **full extent** `0..page_count` (resident *and* evicted
+  pages, via `BufferPool::page_count`, so an evicted dead tuple is never missed),
+  not just resident pages — classify each `NORMAL` tuple with
+  `is_dead_to_all(horizon)` (decoding its `xmin`/`xmax`/`infomask` and settling
+  against the live CLOG), mark the dead-to-all line pointers `DEAD`, and compact the
+  surviving tuples (`page::prune_and_compact`; this finally adds the page compaction
+  that `page.rs` lacks today — `DELETE` is currently a non-reclaiming tombstone). Per
+  page the pass takes the per-heap structural latch then the frame write latch (lock
+  order structural → frame → WAL), released before the next page. Each pruned page is
+  logged as a **single unconditional `FullPageImage`** (a compaction relocates
+  survivors and is not expressible as a delta), so recovery reinstalls the compacted
+  page byte-for-byte by PageLSN gating; a page with no dead tuples is skipped (no WAL,
+  no mutation). Survivors stay byte-identical at their stable slot ids, so no index
+  entry is touched. The pass runs under the maintenance txn id (`0`) so its
+  reclamation is never undone by an abort, and returns the reclaimed dead TIDs (fed to
+  index vacuum). It does **not** reclaim line pointers `DEAD → UNUSED` (that is the
+  separate step below) — `vacuum_heap` has no production caller until the VACUUM
+  orchestration (F4a).
 - **Index vacuum**: remove index entries pointing at dead TIDs from every index.
 - **Line-pointer reclaim**: `DEAD → UNUSED` once no index entry references the
   slot.

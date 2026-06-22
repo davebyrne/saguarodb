@@ -47,6 +47,7 @@ pub trait BufferPool: Send + Sync {
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard>;
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
+    fn page_count(&self, file_id: FileId) -> Result<PageNum>;
     fn mark_all_clean(&self) -> Result<()>;
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
@@ -68,7 +69,7 @@ In production, the server supplies a `HeapPageStore` (a `PageStore`) backed by p
 
 `MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageStore` returning `Ok(None)` from `load_page` and discarding writes.
 
-`load_page(file_id, page_num, data)` inserts `data` as a clean frame if the page is not resident. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, and dirty transaction ID unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty. `iter_pages` returns pages currently known to the buffer pool (used by checkpoint flushing and the storage page scan).
+`load_page(file_id, page_num, data)` inserts `data` as a clean frame if the page is not resident. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, and dirty transaction ID unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty. `iter_pages` returns pages currently known to the buffer pool (used by checkpoint flushing and the storage page scan). `page_count(file_id)` returns the file's **full extent** — `max(PageStore::page_count, next_page_num_by_file)` — i.e. every page `0..page_count` that has ever existed for the file, including pages currently evicted to disk (which `iter_pages` omits) and freshly allocated pages not yet flushed (which the on-disk extent omits). A full-extent scan (VACUUM, `mvcc.md` §9) iterates `0..page_count` and faults each page in via `read_page`/`write_page`, so an evicted dead tuple is never missed.
 
 `rollback(txn_id)` and `commit(txn_id)` are both no-op bookkeeping clears: under status-based abort (`mvcc.md` §4 Decision 3) the buffer pool tracks no per-transaction page state, undoes nothing, and reclaims nothing. A rolled-back transaction's pages — both ones it modified and ones it freshly allocated (`new_page`) — stay resident as dirty-but-evictable frames; the CLOG hides their tuples and VACUUM (Milestone F) reclaims them. They must not be I/O and should not fail for a valid `txn_id`; if `commit` fails after a durable WAL commit, the server treats that as fatal and does not roll back.
 

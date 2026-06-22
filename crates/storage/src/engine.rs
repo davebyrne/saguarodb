@@ -62,6 +62,15 @@ pub enum StorageMode {
     Normal,
 }
 
+/// The transaction id VACUUM stamps on the pages it prunes (`docs/specs/mvcc.md`
+/// §9). It is `0` — the recovery/maintenance convention shared with
+/// `fetch_for_redo` and the recovery DDL cascade ("txn 0 means no rollback
+/// tracking") — because VACUUM is non-transactional maintenance: its reclamation
+/// must never be undone by an abort and must not hinge on a user commit. A pruned
+/// page is logged as an unconditional `FullPageImage`, which recovery reinstalls by
+/// PageLSN gating alone, independent of this txn id.
+const VACUUM_TXN: u64 = 0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RowLocation {
     pub file_id: FileId,
@@ -751,6 +760,126 @@ impl PageBackedStorageEngine {
             .collect();
         pages.sort_unstable();
         Ok(pages)
+    }
+
+    /// The heap-prune VACUUM pass (`docs/specs/mvcc.md` §9, Milestone F2b): for every
+    /// heap page of `schema`'s table, physically reclaim the tuples that are
+    /// dead-to-everyone at `horizon` and return their TIDs. Reclaiming an aborted or
+    /// committed-deleted version's space is what bounds heap bloat once the system has
+    /// MVCC versions (`DELETE`/`UPDATE` only *tombstone* in milestones B–E).
+    ///
+    /// For each page, every `NORMAL` slot's tuple is classified with
+    /// [`common::is_dead_to_all`] (its `xmin`/`xmax`/`infomask` from
+    /// [`crate::codec::decode_mvcc_header`], settled against the live CLOG via
+    /// [`Self::txn_status_view`]). Only dead-to-all slots are pruned: a live version
+    /// (`xmax == INVALID_XID`), an in-flight or aborted deleter, and a committed delete
+    /// at or above the horizon are all left untouched (the predicate's
+    /// aborted-creator-any-age / committed-delete-below-horizon asymmetry — §9). A page
+    /// with at least one dead slot is rewritten by [`page::prune_and_compact`] (dead
+    /// slots → `DEAD`, survivors compacted, offsets/`free_start`/PageLSN/checksum
+    /// rewritten) and logged as a single **unconditional** `FullPageImage`: a
+    /// prune+compact relocates survivors and is not expressible as a delta, so it is
+    /// never gated on `take_needs_fpi` (mirrors `btree::log_full_page`). A page with no
+    /// dead slots is skipped entirely — no WAL record, no mutation. Survivors are
+    /// byte-identical at their stable slot ids (`prune_and_compact`'s contract), so no
+    /// index entry is touched (the line pointer stays addressable; `DEAD → UNUSED`
+    /// reclaim and index vacuum are F3, not done here).
+    ///
+    /// **Full-extent scan.** Iterates `0..page_count` of the heap file via
+    /// [`BufferPool::page_count`], faulting each page in (resident or from disk), rather
+    /// than only the resident pages [`Self::table_page_nums`] reports — an evicted page
+    /// holding dead tuples must still be vacuumed, else GC is incomplete.
+    ///
+    /// **Latching (lock order: structural → frame → WAL).** Per page, takes the
+    /// per-heap structural latch then the frame write latch, releasing both before the
+    /// next page (never held across pages). VACUUM runs under the exclusive
+    /// concurrency guard today (no concurrent writers, §10 Milestone F), so these
+    /// uncontended latches are forward-looking: a future concurrent VACUUM is then a
+    /// guard change, not a rewrite of this method.
+    ///
+    /// **`vacuum_txn` = 0 (the recovery/maintenance convention).** Pages are dirtied
+    /// and logged under txn id `0`, the same id recovery uses for non-transactional
+    /// page work (`fetch_for_redo`; `apply_drop_table_without_wal`'s "txn 0 means no
+    /// rollback tracking"). VACUUM is maintenance, not a user transaction: its
+    /// reclamation must never be undone by an abort and must not depend on a user
+    /// commit. A `FullPageImage` is unconditional torn-page repair — recovery's redo
+    /// arm reinstalls it purely by PageLSN gating (`page_lsn(data) >= lsn` skips it,
+    /// else `copy_from_slice` + force the record LSN), independent of the record's
+    /// `txn_id` — so a crash mid-VACUUM leaves every pruned page either pre-prune or
+    /// exactly the compacted image, never torn.
+    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
+    pub(crate) fn vacuum_heap(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+    ) -> Result<Vec<RowLocation>> {
+        // A table's heap file id is its table id (no high bit; see `heap::index_file_id`).
+        let file_id = schema.id;
+        let page_count = self.buffer_pool.page_count(file_id)?;
+        let latch = self.structural_latch(file_id);
+
+        let mut reclaimed: Vec<RowLocation> = Vec::new();
+        for page_num in 0..page_count {
+            // Lock order: structural latch → frame write latch → (WAL mutex inside the
+            // append). Both are released at the end of each iteration so no latch is
+            // held across pages (rule 1: never two structural latches; forward-looking
+            // for a concurrent VACUUM).
+            let _heap_guard = latch.lock();
+            let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
+
+            // An uninitialized frame (e.g. a never-written page in the extent) carries
+            // no tuples to classify.
+            if !page::is_initialized(guard.data()) {
+                continue;
+            }
+
+            // Classify every NORMAL slot. `page::read_row` returns `Some` only for a
+            // NORMAL line pointer (a DEAD/UNUSED slot reads as `None`), so the slot ids
+            // it yields are exactly the live candidates; `next_slot` is the slot count.
+            let slot_count = page::next_slot(guard.data())?;
+            let mut dead_slots: Vec<u16> = Vec::new();
+            for slot in 0..slot_count {
+                let Some(tuple) = page::read_row(guard.data(), slot)? else {
+                    continue;
+                };
+                let (xmin, xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
+                if common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
+                    dead_slots.push(slot);
+                }
+            }
+
+            if dead_slots.is_empty() {
+                continue;
+            }
+
+            // Prune + compact, then log the compacted page as a single unconditional
+            // FullPageImage (a compaction relocates survivors and is not a delta), and
+            // stamp the FPI's LSN as the new page-LSN — the `btree::log_full_page`
+            // pattern. `prune_and_compact` stamps a provisional LSN; the FPI append
+            // below overwrites it with the record's LSN so redo gating is exact.
+            let provisional_lsn = page::page_lsn(guard.data());
+            page::prune_and_compact(guard.data_mut(), &dead_slots, provisional_lsn)?;
+            let fpi_lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id: VACUUM_TXN,
+                kind: WalRecordKind::FullPageImage {
+                    file_id,
+                    page_num,
+                    image: guard.data().to_vec(),
+                },
+            })?;
+            page::set_page_lsn(guard.data_mut(), fpi_lsn);
+
+            for slot in dead_slots {
+                reclaimed.push(RowLocation {
+                    file_id,
+                    page_num,
+                    slot_num: slot,
+                });
+            }
+        }
+
+        Ok(reclaimed)
     }
 }
 
@@ -3671,5 +3800,435 @@ mod concurrent_writers_tests {
             ids, expected,
             "no row lost to a reused page number under concurrent steal-eviction"
         );
+    }
+}
+
+/// `vacuum_heap` (`docs/specs/mvcc.md` §9, Milestone F2b): the heap-prune VACUUM
+/// pass classifies each NORMAL tuple with `is_dead_to_all(horizon)`, prunes+compacts
+/// pages with dead tuples, logs each pruned page as an unconditional FullPageImage,
+/// and returns the dead TIDs. These tests drive the CLOG via `Commit`/`Abort` records
+/// (the same fixture style as `visibility_tests`) so they control exactly which
+/// `xmin`/`xmax` are committed/aborted/in-flight at a chosen `horizon`.
+#[cfg(test)]
+mod vacuum_tests {
+    use std::sync::Arc;
+
+    use buffer::{BufferPool, MemoryBufferPool, PageStore};
+    use common::{
+        ColumnDef, DataType, PageFlushInfo, Row, Snapshot, StatementContext, TableSchema, Value,
+    };
+    use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    use super::{PageBackedStorageEngine, RowLocation, VACUUM_TXN};
+    use crate::HeapPageStore;
+    use crate::traits::{SchemaOperations, StorageEngine};
+
+    const TABLE_ID: u32 = 1;
+
+    struct AlwaysFlush;
+    impl common::FlushPolicy for AlwaysFlush {
+        fn can_flush(&self, _info: &PageFlushInfo) -> bool {
+            true
+        }
+    }
+
+    struct Fixture {
+        engine: PageBackedStorageEngine,
+        wal: Arc<FileWalManager>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn PageStore> =
+                Arc::new(HeapPageStore::open(dir.path().join("data")).unwrap());
+            let buffer = Arc::new(MemoryBufferPool::new(256, Box::new(AlwaysFlush), store));
+            buffer.enable_stealing();
+            let wal = Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+            let engine =
+                PageBackedStorageEngine::open(buffer, wal.clone(), super::StorageMode::Normal)
+                    .unwrap();
+            let fixture = Self {
+                engine,
+                wal,
+                _dir: dir,
+            };
+            // DDL under a committed setup transaction, then create the heap.
+            fixture
+                .engine
+                .create_table(&ctx(100), &users_schema())
+                .unwrap();
+            fixture.commit(100);
+            fixture
+        }
+
+        /// Append a `Commit` for `txn_id` and flush so the CLOG records it Committed
+        /// (a commit only settles once durable).
+        fn commit(&self, txn_id: u64) {
+            self.wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            self.wal.flush().unwrap();
+        }
+
+        /// Append an `Abort` for `txn_id` so the CLOG records it Aborted (abort is not
+        /// fsync-gated).
+        fn abort(&self, txn_id: u64) {
+            self.wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+        }
+
+        /// Insert a committed row, returning its heap TID.
+        fn insert_committed(&self, txn_id: u64, row: Row) -> RowLocation {
+            let rid = self.engine.insert(&ctx(txn_id), TABLE_ID, row).unwrap();
+            self.commit(txn_id);
+            RowLocation {
+                file_id: TABLE_ID,
+                page_num: rid.page_num,
+                slot_num: rid.slot_num,
+            }
+        }
+
+        /// Delete the row keyed by `id` under `deleter` (stamps xmax). The caller then
+        /// decides whether to commit/abort/leave-in-flight the deleter.
+        fn delete(&self, deleter: u64, id: i64) {
+            assert!(
+                self.engine
+                    .delete(&ctx(deleter), TABLE_ID, &key(id))
+                    .unwrap(),
+                "delete of id {id} should have matched a visible row"
+            );
+        }
+
+        /// Whether the physical line pointer at `location` is still NORMAL (decodes a
+        /// live tuple), reading past visibility.
+        fn is_normal(&self, location: RowLocation) -> bool {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)
+                .unwrap();
+            crate::page::read_row(readable.data(), location.slot_num)
+                .unwrap()
+                .is_some()
+        }
+
+        /// The physical row bytes at `location`, or `None` if the slot is not NORMAL.
+        fn physical_bytes(&self, location: RowLocation) -> Option<Vec<u8>> {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)
+                .unwrap();
+            crate::page::read_row(readable.data(), location.slot_num).unwrap()
+        }
+
+        /// Free bytes on the heap page (slot-array start minus free_start), used to
+        /// assert a prune reclaimed space.
+        fn free_bytes(&self, page_num: u32) -> usize {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, page_num)
+                .unwrap();
+            let free_start =
+                crate::page::read_u16(readable.data(), crate::page::FREE_SPACE_OFFSET) as usize;
+            // The first slot lives at the top of the page growing down; with `n` slots
+            // the slot array occupies `n * SLOT_LEN` bytes from the page end. Free space
+            // is everything between free_start and that slot array.
+            let num_slots =
+                crate::page::read_u16(readable.data(), crate::page::NUM_SLOTS_OFFSET) as usize;
+            let slot_array = num_slots * crate::page::SLOT_LEN;
+            buffer::PAGE_SIZE - slot_array - free_start
+        }
+
+        /// Every `FullPageImage` record in the WAL, as `(page_num, image)` pairs.
+        fn full_page_images(&self) -> Vec<(u32, Vec<u8>)> {
+            self.wal
+                .replay_from(0)
+                .unwrap()
+                .filter_map(|record| match record.unwrap().kind {
+                    WalRecordKind::FullPageImage {
+                        file_id,
+                        page_num,
+                        image,
+                    } if file_id == TABLE_ID => Some((page_num, image)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn ctx(txn_id: u64) -> StatementContext {
+        // A snapshot that sees every committed id below the next id, with no in-flight
+        // exclusions — DML under it reads the latest committed state.
+        StatementContext::with_snapshot(
+            txn_id,
+            Arc::new(Snapshot {
+                xmin: 1,
+                xmax: txn_id + 1,
+                xip: vec![],
+            }),
+        )
+    }
+
+    fn users_schema() -> TableSchema {
+        TableSchema {
+            id: TABLE_ID,
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn row(id: i64, name: &str) -> Row {
+        Row {
+            values: vec![Value::Integer(id), Value::Text(name.to_string())],
+        }
+    }
+
+    fn key(id: i64) -> common::Key {
+        common::Key(vec![Value::Integer(id)])
+    }
+
+    #[test]
+    fn reclaims_committed_deleted_below_horizon() {
+        let fixture = Fixture::new();
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+
+        // The deleter (txn 20) commits; choose a horizon above it so the committed
+        // delete is universally effective.
+        fixture.delete(20, 2);
+        fixture.commit(20);
+
+        let keep_bytes = fixture.physical_bytes(keep).expect("survivor is NORMAL");
+        let free_before = fixture.free_bytes(keep.page_num);
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+
+        // The deleted slot is the only reclaimed TID; its line pointer is now DEAD
+        // (read_row -> None) while the survivor stays NORMAL and byte-identical.
+        assert_eq!(reclaimed, vec![gone]);
+        assert!(fixture.physical_bytes(gone).is_none());
+        assert_eq!(
+            fixture.physical_bytes(keep),
+            Some(keep_bytes),
+            "the survivor's bytes are unchanged at its stable slot id"
+        );
+        assert!(
+            fixture.free_bytes(keep.page_num) > free_before,
+            "pruning the dead tuple reclaimed page free space"
+        );
+    }
+
+    #[test]
+    fn leaves_non_dead_versions_untouched() {
+        let fixture = Fixture::new();
+        // A live committed row (xmax == INVALID): never reclaimable.
+        let live = fixture.insert_committed(10, row(1, "live"));
+        // A committed delete AT the horizon (xmax == horizon): not yet reclaimable
+        // (a snapshot at the boundary may still see the row live).
+        let at_horizon = fixture.insert_committed(11, row(2, "at_horizon"));
+        // An aborted-deleter row: the delete rolled back, the row is still live.
+        let aborted_delete = fixture.insert_committed(12, row(3, "aborted_delete"));
+        // An in-flight deleter row: the deleter never committed/aborted.
+        let in_flight_delete = fixture.insert_committed(13, row(4, "in_flight_delete"));
+
+        // Stamp the deletes. xmax = horizon (40) for the boundary row; an aborted
+        // deleter (41) and an in-flight deleter (42).
+        fixture.delete(40, 2);
+        fixture.commit(40);
+        fixture.delete(41, 3);
+        fixture.abort(41);
+        fixture.delete(42, 4); // txn 42 left in-flight (no commit, no abort)
+
+        let before: Vec<_> = [live, at_horizon, aborted_delete, in_flight_delete]
+            .iter()
+            .map(|&loc| fixture.physical_bytes(loc))
+            .collect();
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 40).unwrap();
+
+        // Nothing is reclaimed: the only candidate at horizon 40 would be a committed
+        // delete strictly below 40, and there is none.
+        assert!(
+            reclaimed.is_empty(),
+            "no version is dead-to-all at horizon 40: {reclaimed:?}"
+        );
+        for (loc, was) in [live, at_horizon, aborted_delete, in_flight_delete]
+            .iter()
+            .zip(before)
+        {
+            assert!(fixture.is_normal(*loc), "{loc:?} must stay NORMAL");
+            assert_eq!(
+                fixture.physical_bytes(*loc),
+                was,
+                "{loc:?} bytes must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn no_dead_tuples_is_a_noop() {
+        let fixture = Fixture::new();
+        let a = fixture.insert_committed(10, row(1, "a"));
+        let b = fixture.insert_committed(11, row(2, "b"));
+        let fpis_before = fixture.full_page_images().len();
+        let bytes_a = fixture.physical_bytes(a);
+        let bytes_b = fixture.physical_bytes(b);
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 100).unwrap();
+
+        assert!(reclaimed.is_empty(), "no reclaimable tuples");
+        assert_eq!(
+            fixture.full_page_images().len(),
+            fpis_before,
+            "a no-dead VACUUM appends no FullPageImage"
+        );
+        assert_eq!(fixture.physical_bytes(a), bytes_a, "page A is unmutated");
+        assert_eq!(fixture.physical_bytes(b), bytes_b, "page B is unmutated");
+    }
+
+    #[test]
+    fn pruned_page_survives_recovery_replay() {
+        let fixture = Fixture::new();
+        let _keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        assert_eq!(reclaimed, vec![gone]);
+
+        // The runtime page after pruning, captured from the buffer pool.
+        let pruned = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, gone.page_num)
+                .unwrap();
+            *readable.data()
+        };
+
+        // VACUUM logged exactly one FullPageImage for the pruned page; replaying it
+        // onto a fresh (zeroed) page under PageLSN gating reinstalls the compacted
+        // page byte-for-byte — the crash-safety guarantee (no torn page).
+        let fpis: Vec<_> = fixture
+            .full_page_images()
+            .into_iter()
+            .filter(|(page_num, _)| *page_num == gone.page_num)
+            .collect();
+        assert_eq!(
+            fpis.len(),
+            1,
+            "exactly one FullPageImage per pruned page (unconditional)"
+        );
+
+        let mut recovered = [0u8; buffer::PAGE_SIZE];
+        for record in fixture.wal.replay_from(0).unwrap() {
+            let record = record.unwrap();
+            if let WalRecordKind::FullPageImage {
+                file_id, page_num, ..
+            } = &record.kind
+                && *file_id == TABLE_ID
+                && *page_num == gone.page_num
+            {
+                crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            }
+        }
+        assert_eq!(
+            recovered, pruned,
+            "the FullPageImage reinstalls the compacted page byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn finds_dead_tuples_across_multiple_pages() {
+        let fixture = Fixture::new();
+        // Wide rows (~4 KiB) so at most two fit per 8 KiB page, forcing the dead
+        // tuples onto distinct heap pages and exercising the full-extent scan.
+        let wide = "x".repeat(4000);
+        let mut dead: Vec<RowLocation> = Vec::new();
+        let mut survivors: Vec<RowLocation> = Vec::new();
+        for id in 0..6i64 {
+            let txn = 10 + id as u64;
+            let loc = fixture.insert_committed(txn, row(id, &wide));
+            if id % 2 == 0 {
+                dead.push(loc);
+            } else {
+                survivors.push(loc);
+            }
+        }
+
+        // The dead rows span more than one heap page (the precondition the test wants
+        // to prove the scan covers).
+        let dead_pages: std::collections::BTreeSet<u32> =
+            dead.iter().map(|loc| loc.page_num).collect();
+        assert!(
+            dead_pages.len() >= 2,
+            "test setup must spread dead tuples across >=2 pages, got {dead_pages:?}"
+        );
+
+        // Delete the even-id rows (ids 0, 2, 4) under committed deleters below the
+        // horizon.
+        for (i, _loc) in dead.iter().enumerate() {
+            let deleter = 100 + i as u64;
+            let id = i as i64 * 2;
+            fixture.delete(deleter, id);
+            fixture.commit(deleter);
+        }
+
+        let mut reclaimed = fixture.engine.vacuum_heap(&users_schema(), 200).unwrap();
+        reclaimed.sort_by_key(|loc| (loc.page_num, loc.slot_num));
+        let mut expected = dead.clone();
+        expected.sort_by_key(|loc| (loc.page_num, loc.slot_num));
+
+        assert_eq!(
+            reclaimed, expected,
+            "every dead tuple across all heap pages is reclaimed"
+        );
+        for loc in &dead {
+            assert!(
+                fixture.physical_bytes(*loc).is_none(),
+                "{loc:?} is pruned to DEAD"
+            );
+        }
+        for loc in &survivors {
+            assert!(
+                fixture.is_normal(*loc),
+                "{loc:?} survives untouched and NORMAL"
+            );
+        }
+    }
+
+    #[test]
+    fn vacuum_txn_is_the_recovery_maintenance_id() {
+        // VACUUM stamps its pages under txn 0 (the recovery/maintenance convention),
+        // never a user txn id: its reclamation must not be undone by an abort.
+        assert_eq!(VACUUM_TXN, 0);
     }
 }

@@ -102,6 +102,16 @@ pub trait BufferPool: Send + Sync {
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard>;
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
+
+    /// The number of pages in `file_id`'s full extent: `max(on-disk extent, the
+    /// highest page allocated in memory)`. Unlike [`BufferPool::iter_pages`] (which
+    /// reports only *resident* frames), this counts every page `0..page_count` that
+    /// has ever existed for the file, including pages currently evicted to disk and
+    /// freshly allocated pages not yet flushed. A full-extent scan (VACUUM,
+    /// `docs/specs/mvcc.md` §9) iterates `0..page_count` and faults each page in via
+    /// [`BufferPool::read_page`]/[`BufferPool::write_page`], so an evicted dead tuple
+    /// is never missed.
+    fn page_count(&self, file_id: FileId) -> Result<PageNum>;
     fn mark_all_clean(&self) -> Result<()>;
     /// Release the pages an aborting transaction freshly *allocated* but never
     /// durably committed (drop their frames, restore the allocation counter). Abort
@@ -493,6 +503,19 @@ impl BufferPool for MemoryBufferPool {
             })
             .collect();
         Ok(Box::new(pages.into_iter()))
+    }
+
+    fn page_count(&self, file_id: FileId) -> Result<PageNum> {
+        // The on-disk extent (flushed pages) and the in-memory allocation counter
+        // can disagree: a freshly allocated page is dirty-resident and not yet on
+        // disk (so `store.page_count` lags), while after eviction the page exists
+        // only on disk (so the on-disk extent leads). Take the max so the reported
+        // extent covers every page that has ever existed for the file regardless of
+        // where it currently lives. `next_page_num` is the next id to assign, i.e.
+        // the count of allocated pages.
+        let on_disk = self.store.page_count(file_id)?;
+        let in_memory = self.state.lock().next_page_num(file_id);
+        Ok(on_disk.max(in_memory))
     }
 
     fn mark_all_clean(&self) -> Result<()> {
@@ -1049,6 +1072,30 @@ mod tests {
         let page = pool.new_page(7, 1).unwrap();
 
         assert_eq!(page.page_num(), 4);
+    }
+
+    #[test]
+    fn page_count_is_the_max_of_disk_extent_and_in_memory_allocation() {
+        // Three pages live on disk (the store reports extent 3); none are resident.
+        let loader = Arc::new(TestPageLoader::new([
+            ((7, 0), PageData::default()),
+            ((7, 1), PageData::default()),
+            ((7, 2), PageData::default()),
+        ]));
+        let pool = MemoryBufferPool::new(8, Box::new(NeverFlush), loader);
+
+        // Before any allocation the full extent is the on-disk count, even though no
+        // page of file 7 is resident — this is what a full-extent VACUUM scan needs.
+        assert_eq!(pool.page_count(7).unwrap(), 3);
+
+        // Allocating a fresh (in-memory, not-yet-flushed) page extends the count past
+        // the on-disk extent: page_count must include it so the scan visits it.
+        let allocated = pool.new_page(7, 1).unwrap();
+        assert_eq!(allocated.page_num(), 3);
+        assert_eq!(pool.page_count(7).unwrap(), 4);
+
+        // A different, never-touched file has an empty extent.
+        assert_eq!(pool.page_count(99).unwrap(), 0);
     }
 
     #[test]
