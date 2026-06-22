@@ -463,7 +463,15 @@ impl PageBackedStorageEngine {
             page::set_page_lsn(guard.data_mut(), lsn);
             Ok(slot_num)
         } else {
-            let slot_num = page::next_slot(guard.data())?;
+            // Insert into the buffer FIRST, then log the slot id it actually landed
+            // in. `insert_row` recycles an UNUSED slot id before appending (F3b), so
+            // the produced slot is no longer predictable as `next_slot`; logging the
+            // real slot keeps the `HeapInsert` redo exact (its redo re-runs
+            // `insert_row` and asserts the same slot id is reproduced). Mutating the
+            // buffer before appending the record mirrors the FPI arm above and is
+            // WAL-safe: the page-LSN is stamped with the record's LSN below, so the
+            // dirty page cannot be flushed ahead of its WAL record.
+            let slot_num = page::insert_row(guard.data_mut(), row_bytes)?;
             let lsn = self.wal.append(WalRecord {
                 lsn: 0,
                 txn_id,
@@ -474,10 +482,8 @@ impl PageBackedStorageEngine {
                     row_bytes: row_bytes.to_vec(),
                 },
             })?;
-            let produced = page::insert_row(guard.data_mut(), row_bytes)?;
-            debug_assert_eq!(produced, slot_num);
             page::set_page_lsn(guard.data_mut(), lsn);
-            Ok(produced)
+            Ok(slot_num)
         }
     }
 
@@ -937,6 +943,97 @@ impl PageBackedStorageEngine {
             let _index_guard = latch.lock();
             self.secondary_btree(index.id)
                 .remove_values_in(VACUUM_TXN, dead_tids)?;
+        }
+
+        Ok(())
+    }
+
+    /// Line-pointer reclaim, the third VACUUM phase (`docs/specs/mvcc.md` §9,
+    /// Milestone F3b): flip each `dead_tid`'s heap line pointer `DEAD → UNUSED`,
+    /// freeing its slot id for reuse by a future `insert_row`. `dead_tids` are the
+    /// TIDs `vacuum_heap` (F2b) pruned to `DEAD` and `vacuum_indexes` (F3a) has since
+    /// stripped of every index entry; reclaiming them to `UNUSED` is what bounds the
+    /// slot array under delete→vacuum→insert churn (a `DEAD` line pointer is dead
+    /// weight `insert_row` will not recycle).
+    ///
+    /// **Ordering invariant — F2b → F3a → F3b.** This MUST run only after
+    /// `vacuum_indexes` removed every index entry for these TIDs. The invariant is
+    /// the safety hinge for slot reuse: `insert_row` recycles an `UNUSED` slot id,
+    /// so an `UNUSED` slot must have *no* dangling index entry, or a stale entry
+    /// would resolve to the new tuple written into the reclaimed slot (silent
+    /// corruption). The F4a VACUUM orchestration enforces the F2b → F3a → F3b order;
+    /// at this milestone this is a documented precondition the caller owns.
+    /// `page::reclaim_line_pointers` debug-asserts each slot is currently `DEAD` (a
+    /// `NORMAL`/`UNUSED`/out-of-bounds slot is a hard error), which catches the gross
+    /// misordering of reclaiming a never-pruned slot, though it cannot by itself
+    /// prove the *index* entries are gone — that is F4a's ordering responsibility.
+    ///
+    /// **Per page, lock order structural → frame → WAL.** TIDs are grouped by heap
+    /// page; each page is reclaimed under the per-heap structural latch then the
+    /// frame write latch (released before the next page, never held across pages —
+    /// rule 1), and logged as a single unconditional `FullPageImage` under the
+    /// maintenance txn id (`0`, [`VACUUM_TXN`]), the same crash-safety pattern as
+    /// `vacuum_heap`/`vacuum_indexes`: recovery reinstalls the reclaimed page purely
+    /// by PageLSN gating, independent of the record's `txn_id`. A reclaim
+    /// (slot → `UNUSED`) followed by a later insert-into-reused-slot (`HeapInsert`)
+    /// replay in LSN order to the final state (the new row at that slot), so a crash
+    /// mid-reclaim leaves the page either pre-reclaim or exactly the reclaimed image,
+    /// never torn.
+    ///
+    /// No production caller yet (VACUUM orchestration is F4a), so it is a runtime
+    /// no-op at this milestone.
+    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
+    pub(crate) fn reclaim_line_pointers(
+        &self,
+        schema: &TableSchema,
+        dead_tids: &HashSet<RowLocation>,
+    ) -> Result<()> {
+        if dead_tids.is_empty() {
+            return Ok(());
+        }
+
+        // A table's heap file id is its table id (no high bit; see `heap::index_file_id`).
+        let file_id = schema.id;
+        let latch = self.structural_latch(file_id);
+
+        // Group the dead slots by heap page so each page is rewritten once. A TID
+        // from another file (an index TID) is a caller bug — these are heap TIDs that
+        // `vacuum_heap` returned for this table's heap file.
+        let mut by_page: BTreeMap<PageNum, Vec<u16>> = BTreeMap::new();
+        for tid in dead_tids {
+            debug_assert_eq!(
+                tid.file_id, file_id,
+                "reclaim_line_pointers expects heap TIDs for this table's heap file",
+            );
+            if tid.file_id == file_id {
+                by_page.entry(tid.page_num).or_default().push(tid.slot_num);
+            }
+        }
+
+        for (page_num, slots) in by_page {
+            // Lock order: structural latch → frame write latch → (WAL mutex inside the
+            // append). Both released at the end of each iteration so no latch is held
+            // across pages (rule 1; forward-looking for a concurrent VACUUM).
+            let _heap_guard = latch.lock();
+            let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
+
+            // Flip DEAD → UNUSED, then log the reclaimed page as a single unconditional
+            // FullPageImage and stamp the FPI's LSN as the new page-LSN (the
+            // `vacuum_heap` / `btree::log_full_page` pattern). `reclaim_line_pointers`
+            // stamps a provisional LSN; the FPI append overwrites it with the record's
+            // LSN so redo gating is exact.
+            let provisional_lsn = page::page_lsn(guard.data());
+            page::reclaim_line_pointers(guard.data_mut(), &slots, provisional_lsn)?;
+            let fpi_lsn = self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id: VACUUM_TXN,
+                kind: WalRecordKind::FullPageImage {
+                    file_id,
+                    page_num,
+                    image: guard.data().to_vec(),
+                },
+            })?;
+            page::set_page_lsn(guard.data_mut(), fpi_lsn);
         }
 
         Ok(())
@@ -4611,6 +4708,337 @@ mod vacuum_tests {
                 "{loc:?} survives untouched and NORMAL"
             );
         }
+    }
+
+    // --- F3b: reclaim_line_pointers (DEAD -> UNUSED) + insert reuses UNUSED ---
+
+    impl Fixture {
+        /// The number of slots in the heap page (the slot-array length).
+        fn num_slots(&self, page_num: u32) -> u16 {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, page_num)
+                .unwrap();
+            crate::page::read_u16(readable.data(), crate::page::NUM_SLOTS_OFFSET)
+        }
+
+        /// Run the full F2b → F3a → F3b VACUUM sequence at `horizon` and return the
+        /// reclaimed (now `UNUSED`) TIDs — the canonical ordering for slot reuse.
+        fn vacuum_full(&self, horizon: u64) -> HashSet<RowLocation> {
+            let reclaimed = self.engine.vacuum_heap(&users_schema(), horizon).unwrap();
+            let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
+            self.engine.vacuum_indexes(&users_schema(), &dead).unwrap();
+            self.engine
+                .reclaim_line_pointers(&users_schema(), &dead)
+                .unwrap();
+            dead
+        }
+    }
+
+    #[test]
+    fn reclaim_line_pointers_flips_dead_to_unused_and_logs_per_page() {
+        let fixture = Fixture::new();
+        let _keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+
+        // F2b: prune to DEAD; F3a: strip index entries; F3b: reclaim DEAD -> UNUSED.
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
+        fixture
+            .engine
+            .vacuum_indexes(&users_schema(), &dead)
+            .unwrap();
+        let fpis_before = fixture.full_page_images().len();
+
+        fixture
+            .engine
+            .reclaim_line_pointers(&users_schema(), &dead)
+            .unwrap();
+
+        // The reclaimed slot reads as absent and the page validates; F3b logs exactly
+        // one FullPageImage for the single touched page.
+        assert!(fixture.physical_bytes(gone).is_none());
+        {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, gone.page_num)
+                .unwrap();
+            crate::page::validate(readable.data()).unwrap();
+        }
+        assert_eq!(
+            fixture.full_page_images().len(),
+            fpis_before + 1,
+            "F3b logs one FullPageImage per reclaimed page"
+        );
+    }
+
+    #[test]
+    fn reclaim_line_pointers_rejects_a_normal_slot() {
+        // Calling F3b on a slot that was never pruned (still NORMAL) is a misuse:
+        // `page::reclaim_line_pointers` requires DEAD and errors otherwise. This is
+        // the cheap guard against gross misordering (reclaiming a never-pruned slot).
+        let fixture = Fixture::new();
+        let live = fixture.insert_committed(10, row(1, "live"));
+        let err = fixture
+            .engine
+            .reclaim_line_pointers(&users_schema(), &HashSet::from([live]))
+            .unwrap_err();
+        assert!(
+            err.message.contains("not DEAD"),
+            "reclaiming a NORMAL slot must error: {}",
+            err.message
+        );
+        assert!(fixture.is_normal(live), "the live slot is untouched");
+    }
+
+    #[test]
+    fn reclaim_line_pointers_empty_set_is_a_noop() {
+        let fixture = Fixture::new();
+        let _a = fixture.insert_committed(10, row(1, "a"));
+        let fpis_before = fixture.full_page_images().len();
+        fixture
+            .engine
+            .reclaim_line_pointers(&users_schema(), &HashSet::new())
+            .unwrap();
+        assert_eq!(
+            fixture.full_page_images().len(),
+            fpis_before,
+            "an empty F3b set logs no WAL"
+        );
+    }
+
+    #[test]
+    fn insert_reuses_a_reclaimed_unused_slot_without_growing_the_array() {
+        let fixture = Fixture::new();
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        // `keep` and `gone` share a page (small rows); record the slot count there.
+        assert_eq!(keep.page_num, gone.page_num);
+        let slots_before = fixture.num_slots(gone.page_num);
+
+        fixture.delete(20, 2);
+        fixture.commit(20);
+        let dead = fixture.vacuum_full(21);
+        assert!(dead.contains(&gone));
+
+        // A new row inserted after the full VACUUM recycles the freed slot id `gone`
+        // rather than appending: the slot array does not grow.
+        let rid = fixture
+            .engine
+            .insert(&ctx(30), TABLE_ID, row(3, "new"))
+            .unwrap();
+        fixture.commit(30);
+        assert_eq!(
+            (rid.page_num, rid.slot_num),
+            (gone.page_num, gone.slot_num),
+            "the new row reused the freed UNUSED slot id"
+        );
+        assert_eq!(
+            fixture.num_slots(gone.page_num),
+            slots_before,
+            "reusing a slot did not grow the slot array"
+        );
+        // The new row is readable at the reused slot, and `keep` is intact.
+        assert_eq!(
+            fixture.engine.get(&ctx(31), TABLE_ID, &key(3)).unwrap(),
+            Some(row(3, "new"))
+        );
+        assert_eq!(
+            fixture.engine.get(&ctx(31), TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "keep"))
+        );
+    }
+
+    #[test]
+    fn insert_does_not_reuse_a_dead_slot() {
+        // A DEAD slot (F2b ran, but F3a/F3b did NOT) must never be reused: it may
+        // still carry an index entry. With no UNUSED slot, insert appends instead.
+        let fixture = Fixture::new();
+        let _keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        let slots_before = fixture.num_slots(gone.page_num);
+
+        fixture.delete(20, 2);
+        fixture.commit(20);
+        // ONLY the heap prune: the slot is DEAD, not yet UNUSED.
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        assert_eq!(reclaimed, vec![gone]);
+        assert!(fixture.physical_bytes(gone).is_none());
+
+        let rid = fixture
+            .engine
+            .insert(&ctx(30), TABLE_ID, row(3, "new"))
+            .unwrap();
+        fixture.commit(30);
+        assert_ne!(
+            (rid.page_num, rid.slot_num),
+            (gone.page_num, gone.slot_num),
+            "a DEAD slot must NEVER be reused by insert"
+        );
+        assert_eq!(
+            fixture.num_slots(gone.page_num),
+            slots_before + 1,
+            "with no UNUSED slot, insert appended a fresh slot id"
+        );
+    }
+
+    #[test]
+    fn no_stale_index_resolution_after_reclaim_and_reuse() {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_index(&ctx(101), &name_index())
+            .unwrap();
+        fixture.commit(101);
+
+        // Three rows; delete two and commit, then run the full VACUUM cycle.
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone_a = fixture.insert_committed(11, row(2, "del-a"));
+        let gone_b = fixture.insert_committed(12, row(3, "del-b"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+        fixture.delete(21, 3);
+        fixture.commit(21);
+        let dead = fixture.vacuum_full(30);
+        assert_eq!(dead, HashSet::from([gone_a, gone_b]));
+
+        // After F3a there is NO leftover index entry for a dead TID, so no stale
+        // resolution is even possible: every PK/secondary entry resolves to a live row.
+        for tid in pk_index_tids(&fixture.engine)
+            .iter()
+            .chain(name_index_tids(&fixture.engine).iter())
+        {
+            assert!(!dead.contains(tid), "{tid:?} still indexed after F3a");
+        }
+
+        // Insert a new row that reuses a freed slot id; its PK and secondary entries
+        // are brand new (the reclaimed slot had none).
+        let rid = fixture
+            .engine
+            .insert(&ctx(40), TABLE_ID, row(4, "fresh"))
+            .unwrap();
+        fixture.commit(40);
+        let reused = RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+        assert!(
+            reused == gone_a || reused == gone_b,
+            "the new row reused one of the freed UNUSED slot ids: {reused:?}"
+        );
+
+        // A full PK scan returns exactly the live set {keep, fresh}: no dead key, and
+        // the reused slot resolves only to the NEW row, never a stale one.
+        let mut live: Vec<Row> = fixture
+            .engine
+            .btree(index_file_id(TABLE_ID))
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, loc)| {
+                fixture
+                    .physical_bytes(loc)
+                    .map(|b| crate::codec::decode_row(&users_schema(), &b).unwrap().row)
+            })
+            .collect();
+        live.sort_by_key(|r| match &r.values[0] {
+            Value::Integer(i) => *i,
+            _ => unreachable!(),
+        });
+        assert_eq!(live, vec![row(1, "keep"), row(4, "fresh")]);
+
+        // A point lookup on the deleted keys finds nothing; on the live keys finds the
+        // right rows; the secondary index resolves "fresh" to the reused slot's row.
+        assert_eq!(
+            fixture.engine.get(&ctx(41), TABLE_ID, &key(2)).unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture.engine.get(&ctx(41), TABLE_ID, &key(3)).unwrap(),
+            None
+        );
+        assert_eq!(
+            fixture.engine.get(&ctx(41), TABLE_ID, &key(4)).unwrap(),
+            Some(row(4, "fresh"))
+        );
+        let _ = keep;
+    }
+
+    #[test]
+    fn reclaim_then_reuse_survives_recovery_replay() {
+        let fixture = Fixture::new();
+        let _keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+        let dead = fixture.vacuum_full(21);
+        assert!(dead.contains(&gone));
+
+        // Insert a new row that reuses the freed slot id (logged as a HeapInsert or a
+        // FullPageImage), then capture the runtime page as the recovery target.
+        let rid = fixture
+            .engine
+            .insert(&ctx(30), TABLE_ID, row(3, "new"))
+            .unwrap();
+        fixture.commit(30);
+        assert_eq!(
+            (rid.page_num, rid.slot_num),
+            (gone.page_num, gone.slot_num),
+            "the new row reused the freed slot id"
+        );
+        let final_page = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, gone.page_num)
+                .unwrap();
+            *readable.data()
+        };
+
+        // Replay every physiological redo record for this heap page in LSN order onto
+        // a fresh zeroed buffer: the reclaim (FPI: slot -> UNUSED) followed by the
+        // insert-into-reused-slot (HeapInsert/FPI) must converge to the final state.
+        let mut recovered = [0u8; buffer::PAGE_SIZE];
+        for record in fixture.wal.replay_from(0).unwrap() {
+            let record = record.unwrap();
+            let target = match &record.kind {
+                WalRecordKind::HeapInit {
+                    file_id, page_num, ..
+                }
+                | WalRecordKind::HeapInsert {
+                    file_id, page_num, ..
+                }
+                | WalRecordKind::HeapUpdateHeader {
+                    file_id, page_num, ..
+                }
+                | WalRecordKind::FullPageImage {
+                    file_id, page_num, ..
+                } => Some((*file_id, *page_num)),
+                _ => None,
+            };
+            if target == Some((TABLE_ID, gone.page_num)) {
+                crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            }
+        }
+        assert_eq!(
+            recovered, final_page,
+            "reclaim + insert-into-reused-slot replays to the final state"
+        );
+        // And the recovered page resolves the reused slot to the NEW row.
+        let bytes = crate::page::read_row(&recovered, gone.slot_num)
+            .unwrap()
+            .expect("reused slot is NORMAL after replay");
+        assert_eq!(
+            crate::codec::decode_row(&users_schema(), &bytes)
+                .unwrap()
+                .row,
+            row(3, "new")
+        );
     }
 
     #[test]

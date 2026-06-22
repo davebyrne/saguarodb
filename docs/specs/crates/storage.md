@@ -136,9 +136,11 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
   index entries may still reference it; reclaimed to `UNUSED` only after index
   vacuum.
 - `UNUSED` (`0`) — free for reuse. Produced by `page::reclaim_line_pointers`
-  (VACUUM, Milestone F); `insert_row` does not yet reuse an `UNUSED` slot id (it
-  always appends a fresh one), so reclaiming reclaims no space today but is
-  correct and forward-looking.
+  (VACUUM, Milestone F3b); `insert_row` recycles the lowest `UNUSED` slot id before
+  appending a fresh one, bounding the slot array under delete→vacuum→insert churn.
+  It reuses **`UNUSED` only, never `DEAD`** (see `insert_row` below) — an `UNUSED`
+  slot is guaranteed by the F2b → F3a → F3b ordering to have no dangling index
+  entry, while a `DEAD` slot may still have one.
 - `REDIRECT` (`3`) — points at another slot on the same page. *Reserved for HOT
   (Milestone H); no path produces it yet.*
 
@@ -146,10 +148,11 @@ The numeric values preserve the pre-MVCC encoding, so `NORMAL` is exactly the
 former "live" slot and `DEAD` is the former tombstoned slot. Neither MVCC `delete`
 nor MVCC `update` tombstones any more — both keep the superseded version on a
 still-`NORMAL` line pointer and hide it by visibility (see MVCC Delete / MVCC
-Update below), so dead tuples linger physically until VACUUM (Milestone F), which
-is the only future producer of `DEAD` (via `page::prune_and_compact`) and
-`UNUSED` (via `page::reclaim_line_pointers`). No path produces `DEAD` today.
-`validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
+Update below), so dead tuples linger physically until VACUUM (Milestone F), the
+only producer of `DEAD` (via `page::prune_and_compact`, F2b) and `UNUSED` (via
+`page::reclaim_line_pointers`, F3b). The VACUUM passes have no production caller
+until the orchestration (F4a), so at this milestone no runtime path yet stamps a
+heap slot `DEAD`/`UNUSED`. `validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
 VACUUM-compacted page is valid); `REDIRECT` and any other value is corruption.
 The `(offset, offset+len) ≤ FreeStart`/in-bounds invariant is enforced **only for
 `NORMAL` line pointers** — after compaction a `DEAD`/`UNUSED` slot's
@@ -208,15 +211,29 @@ this primitive does **not** classify — it only rewrites the page. In one pass 
 `page::reclaim_line_pointers(data, slots, lsn)` flips each listed line pointer
 `DEAD → UNUSED`, making its slot id reusable (`mvcc.md` §9 / Milestone F3b). Each
 slot must currently be `DEAD`; a non-`DEAD` slot (still `NORMAL`/already `UNUSED`,
-or out of bounds) is a misuse and returns a structured `DbError`. It stamps the
-page-LSN with `lsn` and refreshes the checksum via `set_page_lsn`. Because
-`insert_row` always appends a fresh slot id (it never scans for a reusable
-`UNUSED` slot), reclaiming frees no space today — it is correct and
-forward-looking; slot-id reuse on insert is a separate, later change.
+or out of bounds) is a misuse and returns a structured `DbError` — the cheap guard
+against reclaiming a never-pruned slot. It stamps the page-LSN with `lsn` and
+refreshes the checksum via `set_page_lsn`.
+
+`insert_row` recycles the **lowest `UNUSED`** slot id before appending a fresh one
+(F3b): it scans the slot array, and if a slot is `UNUSED` rewrites it to
+`(new_offset, len, NORMAL)`, otherwise appends at `num_slots` (the historical
+behavior). This bounds the slot array under delete→vacuum→insert churn. It reuses
+**`UNUSED` only, never `DEAD`** — a `DEAD` slot may still have a dangling index
+entry (index vacuum has not run for it), so reusing it would let a stale entry
+resolve to the new tuple (silent corruption); an `UNUSED` slot is guaranteed by
+the F2b → F3a → F3b ordering to have no index entry, the safety hinge for reuse.
+The scan is O(slots-on-page) per insert (a free-slot map is a deferred
+optimization). With no `UNUSED` slot the append path runs exactly as before, so
+existing insert behavior is unchanged until VACUUM produces an `UNUSED` slot. The
+`log_insert` path logs the `HeapInsert` for the slot id `insert_row` actually
+produced (the reused or appended one), so its redo — which re-runs `insert_row` —
+reproduces the same slot id under LSN-ordered replay.
 
 `prune_and_compact` is consumed by the heap-prune VACUUM pass (`vacuum_heap`,
-F2b, below); `reclaim_line_pointers` has no engine caller yet (line-pointer
-reclaim is F3b), so it is a runtime no-op at this milestone.
+F2b, below); `page::reclaim_line_pointers` is consumed by the engine's
+`reclaim_line_pointers` pass (F3b, below), which has no production caller until
+the VACUUM orchestration (F4a).
 
 ### Heap-Prune VACUUM Pass (`vacuum_heap`, F2b)
 
@@ -300,6 +317,35 @@ so it is a runtime no-op at this milestone.
   gating, independent of the record's `txn_id`.
 - It does **not** reclaim line pointers `DEAD → UNUSED` (F3b); the slots stay `DEAD`
   until that later step.
+
+### Line-Pointer Reclaim Pass (`reclaim_line_pointers`, F3b)
+
+`reclaim_line_pointers(schema, dead_tids: &HashSet<RowLocation>)` is the third
+VACUUM phase (`mvcc.md` §9 / Milestone F3b): it flips each `dead_tid`'s heap line
+pointer `DEAD → UNUSED`, freeing its slot id so a future `insert_row` can recycle
+it (bounding the slot array under churn). `dead_tids` are the TIDs `vacuum_heap`
+(F2b) pruned to `DEAD` and `vacuum_indexes` (F3a) has since stripped of every index
+entry. It has no production caller yet (VACUUM orchestration is F4a), so it is a
+runtime no-op at this milestone.
+
+- **Ordering invariant — F2b → F3a → F3b.** This MUST run only after
+  `vacuum_indexes` removed every index entry for these TIDs, so an `UNUSED` slot
+  has no dangling index entry. That is the safety hinge for `insert_row`'s
+  `UNUSED`-only reuse: reusing a slot with a surviving index entry would let a stale
+  entry resolve to the new tuple written into it (silent corruption). F4a enforces
+  the order; here it is a documented precondition the caller owns. The underlying
+  `page::reclaim_line_pointers` errors on a non-`DEAD` slot, which catches the gross
+  misordering of reclaiming a never-pruned slot (it cannot by itself prove the index
+  entries are gone — that is F4a's responsibility).
+- **Per page, lock order structural → frame → WAL.** TIDs are grouped by heap page;
+  each page is reclaimed under the per-heap structural latch then the frame write
+  latch (released before the next page — rule 1), and logged as a single
+  unconditional `FullPageImage` under the maintenance txn id (`0`). Recovery
+  reinstalls the reclaimed page by PageLSN gating, independent of the record's
+  `txn_id`. A reclaim (FPI: slot → `UNUSED`) followed by a later
+  insert-into-reused-slot (`HeapInsert`) replays in LSN order to the final state
+  (the new row at that slot), so a crash mid-reclaim leaves the page either
+  pre-reclaim or exactly the reclaimed image, never torn.
 
 ### MVCC Delete
 

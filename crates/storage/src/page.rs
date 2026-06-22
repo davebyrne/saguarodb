@@ -34,7 +34,8 @@ mod line_pointer {
     /// after index vacuum.
     pub(super) const DEAD: u16 = 1;
     /// Free for reuse. Produced by `reclaim_line_pointers` (VACUUM, Milestone F);
-    /// `insert_row` does not yet reuse an `UNUSED` slot id (it always appends).
+    /// `insert_row` recycles the first `UNUSED` slot id before appending a fresh
+    /// one (never a `DEAD` one — it may still have a dangling index entry).
     pub(super) const UNUSED: u16 = 0;
     /// Points at another slot on the same page. Reserved for HOT (Milestone H);
     /// no path produces it yet.
@@ -136,6 +137,27 @@ pub fn has_space_for(data: &[u8; PAGE_SIZE], row_len: usize) -> Result<bool> {
     Ok(free_bytes(header) >= row_len)
 }
 
+/// Insert `row` into the page and return the slot id it landed in.
+///
+/// A free `UNUSED` slot id is reused before a fresh one is appended: the slot
+/// array is scanned for the first `UNUSED` line pointer and, if one exists, that
+/// slot id is rewritten to `(new_offset, len, NORMAL)`; otherwise a fresh slot id
+/// is appended at `num_slots` (the historical behavior). Reuse bounds the slot
+/// array under delete→vacuum→insert churn (`mvcc.md` §9 / Milestone F3b); without
+/// it, every reclaimed line pointer would remain dead weight and the array would
+/// grow unboundedly.
+///
+/// **Reuse `UNUSED` only, never `DEAD` — the F3b safety invariant.** A `DEAD` line
+/// pointer may still have index entries pointing at it (index vacuum, F3a, has not
+/// run for it yet); reusing it would let a stale index entry resolve to the *new*
+/// tuple at that slot id — silent corruption. An `UNUSED` slot is guaranteed (by
+/// the F2b→F3a→F3b VACUUM ordering: `reclaim_line_pointers` flips `DEAD → UNUSED`
+/// only after `vacuum_indexes` removed every entry for the TID) to have no index
+/// entry referencing it, so it is the only safe slot id to recycle. The scan is
+/// O(slots-on-page) per insert; a free-space/free-slot map is the deferred
+/// optimization (`mvcc.md` §12). Until VACUUM produces an `UNUSED` slot the scan
+/// finds none and the append path runs exactly as before, so existing insert
+/// behavior is unchanged.
 pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
     let header = validate(data)?;
     let row_len = u16::try_from(row.len())
@@ -147,23 +169,43 @@ pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
         ));
     }
 
-    let slot_num = header.num_slots;
     let row_offset = header.free_start;
     let row_end = row_offset as usize + row.len();
     data[row_offset as usize..row_end].copy_from_slice(row);
-    write_slot(
-        data,
-        slot_num,
-        Slot {
-            offset: row_offset,
-            len: row_len,
-            flags: line_pointer::NORMAL,
-        },
-    );
-    write_u16(data, NUM_SLOTS_OFFSET, slot_num + 1);
+    let new_slot = Slot {
+        offset: row_offset,
+        len: row_len,
+        flags: line_pointer::NORMAL,
+    };
+
+    // Reuse the first UNUSED slot id if one exists (safety invariant above: ONLY
+    // UNUSED, never DEAD). Reuse does not grow the slot array, so `free_bytes`
+    // above (which is computed from `num_slots`) stays a valid lower bound. When no
+    // UNUSED slot exists the append path runs, identical to the pre-F3b behavior.
+    let slot_num = match first_unused_slot(data, header.num_slots) {
+        Some(reused) => {
+            write_slot(data, reused, new_slot);
+            reused
+        }
+        None => {
+            let appended = header.num_slots;
+            write_slot(data, appended, new_slot);
+            write_u16(data, NUM_SLOTS_OFFSET, appended + 1);
+            appended
+        }
+    };
     write_u16(data, FREE_SPACE_OFFSET, row_offset + row_len);
     write_checksum(data);
     Ok(slot_num)
+}
+
+/// The lowest slot id in `0..num_slots` whose line pointer is `UNUSED` (free for
+/// reuse), or `None` if every slot is `NORMAL`/`DEAD`. A `DEAD` slot is
+/// deliberately skipped: it may still have a dangling index entry (see
+/// `insert_row`'s safety invariant). O(num_slots) — the deferred free-slot map
+/// would make this O(1).
+fn first_unused_slot(data: &[u8; PAGE_SIZE], num_slots: u16) -> Option<u16> {
+    (0..num_slots).find(|&slot_num| read_slot(data, slot_num).flags == line_pointer::UNUSED)
 }
 
 pub fn read_row(data: &[u8; PAGE_SIZE], slot_num: u16) -> Result<Option<Vec<u8>>> {
@@ -330,10 +372,11 @@ pub fn prune_and_compact(data: &mut [u8; PAGE_SIZE], dead_slots: &[u16], lsn: Ls
 /// misuse and returns a structured `DbError`. The PageLSN is stamped with `lsn`
 /// and the checksum refreshed via `set_page_lsn`.
 ///
-/// Note `insert_row` currently always **appends** a fresh slot id (it never
-/// scans for a reusable `UNUSED` slot), so flipping `DEAD -> UNUSED` reclaims no
-/// space today — it is correct and forward-looking; slot-id reuse on insert is a
-/// separate, later change and is intentionally not added here.
+/// A slot reclaimed here becomes reusable: `insert_row` recycles the first
+/// `UNUSED` slot id before appending a fresh one, which bounds the slot array
+/// under delete→vacuum→insert churn. Reuse is safe precisely because this reclaim
+/// runs only after index vacuum (F3a) has removed every entry for the TID, so an
+/// `UNUSED` slot has no dangling index entry (see `insert_row`'s invariant).
 #[allow(dead_code, reason = "consumed by VACUUM in F2b/F3b")]
 pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn) -> Result<()> {
     let header = validate(data)?;
@@ -477,10 +520,10 @@ pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use super::{
-        FREE_SPACE_OFFSET, HEADER_LEN, PAGE_LSN_OFFSET, PAGE_TYPE_DATA, PAGE_TYPE_OFFSET,
-        PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page, insert_row, line_pointer,
-        prune_and_compact, read_row, read_slot, read_u16, reclaim_line_pointers, set_page_lsn,
-        set_tuple_header, validate, write_checksum, write_slot,
+        FREE_SPACE_OFFSET, HEADER_LEN, NUM_SLOTS_OFFSET, PAGE_LSN_OFFSET, PAGE_TYPE_DATA,
+        PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page, insert_row,
+        line_pointer, prune_and_compact, read_row, read_slot, read_u16, reclaim_line_pointers,
+        set_page_lsn, set_tuple_header, validate, write_checksum, write_slot,
     };
     use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
@@ -801,6 +844,103 @@ mod tests {
         assert!(delete_row(&mut data.0, a).unwrap());
         reclaim_line_pointers(&mut data.0, &[a], 1).unwrap();
         assert!(reclaim_line_pointers(&mut data.0, &[a], 1).is_err());
+    }
+
+    #[test]
+    fn insert_row_reuses_an_unused_slot_without_growing_the_array() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x10, 10);
+        let b = insert_blob(&mut data, 0x20, 12); // will be freed to UNUSED
+        let c = insert_blob(&mut data, 0x30, 8);
+        let slots_before = read_u16(&data.0, NUM_SLOTS_OFFSET);
+
+        // Free slot `b` to UNUSED via the VACUUM primitives (prune -> DEAD, then
+        // reclaim -> UNUSED), the only path that produces a reusable slot.
+        prune_and_compact(&mut data.0, &[b], 1).unwrap();
+        reclaim_line_pointers(&mut data.0, &[b], 2).unwrap();
+        assert_eq!(read_slot(&data.0, b).flags, line_pointer::UNUSED);
+
+        // A new insert recycles the UNUSED slot id `b` rather than appending a new
+        // one: the slot count is unchanged and the new row reads back at slot `b`.
+        let reused = insert_row(&mut data.0, &blob(0x40, 15)).unwrap();
+        assert_eq!(reused, b, "insert reused the freed UNUSED slot id");
+        assert_eq!(
+            read_u16(&data.0, NUM_SLOTS_OFFSET),
+            slots_before,
+            "reusing a slot must not grow the slot array"
+        );
+        assert_eq!(read_row(&data.0, reused).unwrap(), Some(blob(0x40, 15)));
+        assert_eq!(read_slot(&data.0, reused).flags, line_pointer::NORMAL);
+        // The untouched neighbours still read their own bytes.
+        assert_eq!(read_row(&data.0, a).unwrap(), Some(blob(0x10, 10)));
+        assert_eq!(read_row(&data.0, c).unwrap(), Some(blob(0x30, 8)));
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn insert_row_picks_the_lowest_unused_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x11, 6);
+        let b = insert_blob(&mut data, 0x22, 6);
+        let c = insert_blob(&mut data, 0x33, 6);
+
+        // Free both `a` and `c` to UNUSED; the lower id (`a`) must be reused first.
+        prune_and_compact(&mut data.0, &[a, c], 1).unwrap();
+        reclaim_line_pointers(&mut data.0, &[a, c], 2).unwrap();
+
+        let first = insert_row(&mut data.0, &blob(0x44, 6)).unwrap();
+        assert_eq!(first, a, "the lowest UNUSED slot id is reused first");
+        let second = insert_row(&mut data.0, &blob(0x55, 6)).unwrap();
+        assert_eq!(second, c, "the next UNUSED slot id is reused next");
+        let _ = b;
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn insert_row_never_reuses_a_dead_slot() {
+        // THE safety invariant: a DEAD slot (vacuum_heap ran, but the line pointer
+        // was NOT reclaimed to UNUSED) may still have a dangling index entry, so
+        // `insert_row` must never recycle it. A new insert appends a fresh slot id.
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0xA1, 10); // survivor
+        let dead = insert_blob(&mut data, 0xD1, 12); // pruned to DEAD, NOT reclaimed
+        prune_and_compact(&mut data.0, &[dead], 1).unwrap();
+        assert_eq!(read_slot(&data.0, dead).flags, line_pointer::DEAD);
+        let slots_before = read_u16(&data.0, NUM_SLOTS_OFFSET);
+
+        let produced = insert_row(&mut data.0, &blob(0xE1, 9)).unwrap();
+        assert_ne!(produced, dead, "a DEAD slot id must NEVER be reused");
+        assert_eq!(
+            read_u16(&data.0, NUM_SLOTS_OFFSET),
+            slots_before + 1,
+            "with no UNUSED slot, insert appends a fresh slot id"
+        );
+        // The DEAD slot is still DEAD (untouched) and reads as absent.
+        assert_eq!(read_slot(&data.0, dead).flags, line_pointer::DEAD);
+        assert_eq!(read_row(&data.0, dead).unwrap(), None);
+        // The new row landed at the freshly appended slot, and the survivor is intact.
+        assert_eq!(read_row(&data.0, produced).unwrap(), Some(blob(0xE1, 9)));
+        assert_eq!(read_row(&data.0, a).unwrap(), Some(blob(0xA1, 10)));
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn insert_row_appends_when_no_unused_slot_exists() {
+        // The normal, no-vacuum-yet path: every slot is NORMAL, so insert appends a
+        // fresh slot id at `num_slots`, exactly as before F3b.
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x01, 5);
+        let b = insert_blob(&mut data, 0x02, 5);
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        let c = insert_row(&mut data.0, &blob(0x03, 5)).unwrap();
+        assert_eq!(c, 2, "with no UNUSED slot, ids are assigned sequentially");
+        assert_eq!(read_u16(&data.0, NUM_SLOTS_OFFSET), 3);
+        validate(&data.0).unwrap();
     }
 
     #[test]

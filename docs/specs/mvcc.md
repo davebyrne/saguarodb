@@ -231,7 +231,13 @@ will ever need:
 - `NORMAL` — `(offset, len)` address a live tuple on this page.
 - `DEAD` — tuple removed but the line pointer is retained because index entries
   may still reference it (reclaimed to `UNUSED` only after index vacuum).
-- `UNUSED` — free for reuse.
+- `UNUSED` — free for reuse. `insert_row` recycles the **lowest** `UNUSED` slot id
+  before appending a fresh one (F3b), which bounds the slot array under
+  delete→vacuum→insert churn. It reuses **`UNUSED` only, never `DEAD`** — a `DEAD`
+  slot may still have a dangling index entry (index vacuum has not run for it),
+  whereas an `UNUSED` slot is guaranteed (by the F2b → F3a → F3b ordering) to have
+  no index entry, so recycling it cannot let a stale entry resolve to the new
+  tuple.
 - `REDIRECT` *(reserved; used by HOT in Milestone H)* — points at another slot on
   the same page.
 
@@ -558,8 +564,22 @@ design, because index entries accumulate per version as well as heap tuples.
   bloat), and the per-leaf write latch is mutually exclusive with a reader's per-leaf
   read latch, so a concurrent scanner can neither miss nor duplicate a live entry. It
   does **not** reclaim line pointers (the next step). No production caller until F4a.
-- **Line-pointer reclaim**: `DEAD → UNUSED` once no index entry references the
-  slot.
+- **Line-pointer reclaim** (`storage::reclaim_line_pointers(schema, dead_tids)`,
+  F3b): flip each `dead_tid`'s heap line pointer `DEAD → UNUSED`, freeing its slot
+  id for reuse. The TIDs are grouped by heap page and each page is rewritten once
+  under the per-heap structural latch then the frame write latch (lock order
+  structural → frame → WAL, released before the next page), logged as a single
+  unconditional `FullPageImage` under the maintenance txn id (`0`); recovery
+  reinstalls it by PageLSN gating. **This MUST run only after `vacuum_indexes`
+  (F3a) removed every index entry for these TIDs** — the F2b → F3a → F3b ordering
+  is the safety hinge for slot reuse below. `insert_row` recycles the lowest
+  `UNUSED` slot id before appending a fresh one (bounding the slot array under
+  churn), reusing **`UNUSED` only, never `DEAD`**: a `DEAD` slot may still have a
+  dangling index entry, whereas the ordering guarantees an `UNUSED` slot has none,
+  so the recycled slot cannot let a stale index entry resolve to the new tuple
+  (silent corruption). A reclaim (FPI: slot → `UNUSED`) followed by a later
+  insert-into-reused-slot (`HeapInsert`) replays in LSN order to the final state.
+  No production caller until F4a.
 - **Triggering**: an on-demand `VACUUM` command plus opportunistic pruning during
   scans. CLOG truncation below the horizon piggybacks here.
 
