@@ -144,14 +144,16 @@ fn bind_inner(
         Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
             inner, catalog, declared,
         )?))),
-        // TEMPORARY: replaced by real lifecycle in Milestone C3. Transaction
-        // control is dispatched before binding (see `statement_class` in the
-        // server), so the binder should not normally see these; this defensive
-        // arm keeps the public `bind` API honest if called directly, and never
-        // silently no-ops a BEGIN.
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(plan_error(
+        // Transaction control is dispatched before binding (see `statement_class`
+        // in the server), so the binder should not normally see these; this
+        // defensive arm keeps the public `bind` API honest if called directly, and
+        // never silently no-ops a BEGIN / SET TRANSACTION.
+        Statement::Begin { .. }
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::SetTransaction { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
-            "multi-statement transactions are not yet supported",
+            "transaction control statements do not bind",
         )),
         // VACUUM is a maintenance command dispatched to `run_vacuum` before binding
         // (it is not relational and never binds/plans). This defensive arm keeps the

@@ -1,4 +1,4 @@
-use common::{DataType, ParsedColumnDef, Value};
+use common::{DataType, IsolationLevel, ParsedColumnDef, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
@@ -35,15 +35,30 @@ pub enum Statement {
         filter: Option<Expr>,
     },
     Explain(Box<Statement>),
-    /// `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION`. v1 supports only the
-    /// plain form; isolation-level and other transaction modes are rejected at
-    /// parse time. Execution is wired in MVCC Milestone C3.
-    Begin,
-    /// `COMMIT` / `END`. Execution is wired in MVCC Milestone C3.
+    /// `BEGIN [TRANSACTION] [ISOLATION LEVEL <level>] [READ WRITE]` /
+    /// `START TRANSACTION ...`. `isolation` carries an explicit
+    /// `ISOLATION LEVEL <level>` mode mapped onto our two levels (the four SQL
+    /// levels collapse to Read Committed / Repeatable Read; see `convert.rs`),
+    /// or `None` to use the transaction default. Access mode `READ WRITE` is
+    /// accepted and ignored; `READ ONLY`, MySQL-style modifiers, `AND CHAIN`,
+    /// atomic-block bodies, and savepoints are rejected at parse time
+    /// (`docs/specs/mvcc.md` §10 Milestone G).
+    Begin {
+        isolation: Option<IsolationLevel>,
+    },
+    /// `COMMIT` / `END`.
     Commit,
-    /// `ROLLBACK`. Savepoints are not supported in v1. Execution is wired in
-    /// MVCC Milestone C3.
+    /// `ROLLBACK`. Savepoints are not supported in v1.
     Rollback,
+    /// `SET TRANSACTION ISOLATION LEVEL <level>` (transaction-scoped). Sets the
+    /// CURRENT transaction's isolation level; valid only before the transaction
+    /// has run its first query (`docs/specs/mvcc.md` §10 Milestone G). `isolation`
+    /// is `None` for a `SET TRANSACTION` with no isolation-level mode (e.g.
+    /// `READ WRITE` only). `SET SESSION CHARACTERISTICS` (session default) is a
+    /// later milestone and is rejected here.
+    SetTransaction {
+        isolation: Option<IsolationLevel>,
+    },
     /// `VACUUM` (all user tables) or `VACUUM <table>` (one table). A maintenance
     /// command that reclaims dead MVCC versions; `table` is the lowercase-normalized
     /// identifier, `None` for the whole database. sqlparser 0.56 does not parse

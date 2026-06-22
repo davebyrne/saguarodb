@@ -46,7 +46,19 @@ pub enum SessionTxnStatus {
 /// checkpoint (the exclusive guard) excludes writers. Readers stay lock-free.
 pub struct Transaction {
     txn_id: u64,
+    /// The transaction's isolation level (`docs/specs/mvcc.md` §6, §10 Milestone
+    /// G). Set at BEGIN from an explicit `ISOLATION LEVEL` mode or the default
+    /// (Read Committed), and adjustable by `SET TRANSACTION ISOLATION LEVEL`
+    /// before the first query. Threaded into `StatementContext.isolation`, which
+    /// drives `snapshot_for_transaction`: Read Committed captures a fresh snapshot
+    /// per statement, Repeatable Read captures one at the first statement and
+    /// reuses it.
     isolation: IsolationLevel,
+    /// `true` once the transaction has run its first query/data statement (i.e.
+    /// captured its snapshot). `SET TRANSACTION ISOLATION LEVEL` is only valid
+    /// while this is `false` (Postgres: "SET TRANSACTION ... must be called before
+    /// any query"), so this is the before-first-query guard.
+    first_statement_ran: bool,
     /// `true` once any statement has entered the `Failed` ('E') state. While set,
     /// every statement except COMMIT/ROLLBACK is rejected with `25P02`.
     failed: bool,
@@ -381,15 +393,22 @@ impl QueryService {
         _cancel: &AtomicBool,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         match kind {
-            TransactionControl::Begin => match slot {
+            TransactionControl::Begin(isolation) => match slot {
                 // Postgres: BEGIN inside a transaction is a warning + no-op that
-                // stays 'T'. We keep the open transaction and report success.
+                // stays 'T'. We keep the open transaction (and its existing
+                // isolation) and report success; the requested level is ignored,
+                // matching Postgres' "there is already a transaction in progress".
                 Some(txn) => (Some(txn), Ok(begin_complete())),
-                None => match self.begin_transaction() {
+                // No explicit level uses the transaction default (Read Committed
+                // until session defaults land in a later milestone).
+                None => match self.begin_transaction(isolation.unwrap_or_default()) {
                     Ok(txn) => (Some(txn), Ok(begin_complete())),
                     Err(err) => (None, Err(err)),
                 },
             },
+            TransactionControl::SetTransaction(isolation) => {
+                self.handle_set_transaction(isolation, slot)
+            }
             TransactionControl::Commit => match slot {
                 // COMMIT of a healthy transaction commits durably.
                 Some(txn) if !txn.failed => {
@@ -417,13 +436,70 @@ impl QueryService {
         }
     }
 
+    /// Handle `SET TRANSACTION ISOLATION LEVEL <level>` against the session's
+    /// transaction `slot` (`docs/specs/mvcc.md` §10 Milestone G). Postgres
+    /// semantics:
+    ///
+    /// - **Failed ('E') block**: rejected with `25P02` like any non-COMMIT/ROLLBACK
+    ///   statement (the block must be ended first).
+    /// - **Open transaction, before its first query** (`!first_statement_ran`): set
+    ///   the current transaction's isolation level. A `SET TRANSACTION` with no
+    ///   isolation-level mode is a successful no-op.
+    /// - **Open transaction, after its first query**: error
+    ///   (`SET TRANSACTION ... must be called before any query`), which — like any
+    ///   statement error inside a block — poisons it to 'E'.
+    /// - **No open transaction** (autocommit): a no-op success. A bare
+    ///   `SET TRANSACTION` runs as its own implicit single-statement transaction
+    ///   that does no query, so there is nothing for the level to affect; Postgres
+    ///   treats it as a no-op (and warns), which we mirror as a plain success.
+    fn handle_set_transaction(
+        &self,
+        isolation: Option<IsolationLevel>,
+        slot: Option<Transaction>,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        match slot {
+            Some(txn) if txn.failed => {
+                // A failed block rejects everything but COMMIT/ROLLBACK with `25P02`
+                // and stays 'E', matching the data-statement gate in
+                // `run_bound_in_transaction`.
+                (
+                    Some(txn),
+                    Err(DbError::execute(
+                        SqlState::InFailedSqlTransaction,
+                        "current transaction is aborted, commands ignored until end of transaction block",
+                    )),
+                )
+            }
+            Some(mut txn) => {
+                if txn.first_statement_ran {
+                    txn.failed = true;
+                    return (
+                        Some(txn),
+                        Err(DbError::execute(
+                            SqlState::FeatureNotSupported,
+                            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+                        )),
+                    );
+                }
+                if let Some(level) = isolation {
+                    txn.isolation = level;
+                }
+                (Some(txn), Ok(set_transaction_complete()))
+            }
+            // No open transaction: a no-op success (autocommit).
+            None => (None, Ok(set_transaction_complete())),
+        }
+    }
+
     /// Allocate a transaction id, register it active, and build the explicit
-    /// transaction. The write guard is acquired lazily on the first write.
-    fn begin_transaction(&self) -> Result<Transaction> {
+    /// transaction at `isolation`. The write guard is acquired lazily on the first
+    /// write; the snapshot is captured on the first statement (per isolation).
+    fn begin_transaction(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let txn_id = self.register_active_txn();
         Ok(Transaction {
             txn_id,
-            isolation: IsolationLevel::default(),
+            isolation,
+            first_statement_ran: false,
             failed: false,
             write_guard: None,
             rr_snapshot: None,
@@ -515,6 +591,14 @@ impl QueryService {
         // reusable snapshot's advertisement lives on `txn` for the whole
         // transaction (`docs/specs/mvcc.md` §9).
         let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        // This statement has now captured the transaction's snapshot, so the
+        // transaction has "run a query": a later `SET TRANSACTION ISOLATION LEVEL`
+        // must be rejected (the before-first-query guard). Set here, before
+        // `run_plan`, so an execute-time error still counts as a run first command.
+        // (A first statement that fails earlier, at bind or write-guard acquisition,
+        // returns above with `failed = true` and never reaches here; a following
+        // `SET TRANSACTION` is then gated by the 'E' state instead.)
+        txn.first_statement_ran = true;
         let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, cancel);
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
@@ -1223,6 +1307,14 @@ fn rollback_complete() -> ExecutionResult {
     }
 }
 
+fn set_transaction_complete() -> ExecutionResult {
+    // Postgres tags `SET TRANSACTION` (and a no-op `SET`) with the `SET` command tag.
+    ExecutionResult::Modified {
+        command: "SET".to_string(),
+        count: 0,
+    }
+}
+
 /// The statement supplied to the in-transaction execution path: either an
 /// unbound AST (simple query, bound here against the live catalog) or an
 /// already-bound statement (extended-protocol `Execute`, with its parameters
@@ -1234,9 +1326,16 @@ enum BindSource {
 
 #[derive(Clone, Copy)]
 enum TransactionControl {
-    Begin,
+    /// `BEGIN`/`START TRANSACTION`, carrying an optional explicit
+    /// `ISOLATION LEVEL` (`None` uses the transaction default, Read Committed
+    /// until session defaults land in a later milestone).
+    Begin(Option<IsolationLevel>),
     Commit,
     Rollback,
+    /// `SET TRANSACTION ISOLATION LEVEL <level>`: set the current transaction's
+    /// isolation level, valid only before its first query. `None` isolation is a
+    /// `SET TRANSACTION` with no level mode (a no-op for v1).
+    SetTransaction(Option<IsolationLevel>),
 }
 
 #[derive(Clone, Copy)]
@@ -1322,14 +1421,17 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::DropTable { .. }
         | Statement::CreateIndex { .. }
         | Statement::DropIndex { .. } => Ok(StatementClass::Ddl),
-        Statement::Begin => Ok(StatementClass::TransactionControl(
-            TransactionControl::Begin,
+        Statement::Begin { isolation } => Ok(StatementClass::TransactionControl(
+            TransactionControl::Begin(*isolation),
         )),
         Statement::Commit => Ok(StatementClass::TransactionControl(
             TransactionControl::Commit,
         )),
         Statement::Rollback => Ok(StatementClass::TransactionControl(
             TransactionControl::Rollback,
+        )),
+        Statement::SetTransaction { isolation } => Ok(StatementClass::TransactionControl(
+            TransactionControl::SetTransaction(*isolation),
         )),
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
     }

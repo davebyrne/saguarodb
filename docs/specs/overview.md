@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
 - Autocommit only (no multi-statement transactions)
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, and the maintenance command `VACUUM [table]`; binder rejects unsupported parsed forms
+- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read; SERIALIZABLE aliases Repeatable Read, no SSI), and the maintenance command `VACUUM [table]`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery

@@ -63,9 +63,12 @@ precedence.
 - Preserve the v1 SQL subset unless the specs are intentionally updated:
   `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
   `INSERT ... VALUES`, `SELECT` with v1 clauses and joins, `UPDATE`, `DELETE`,
-  `EXPLAIN`, and the maintenance command `VACUUM [table]` (non-relational: it does
-  not bind/plan, takes the exclusive guard, and is rejected inside a transaction
-  block).
+  `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
+  [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, and transaction-scoped
+  `SET TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read,
+  with SERIALIZABLE aliased to Repeatable Read; no SSI), and the maintenance
+  command `VACUUM [table]` (non-relational: it does not bind/plan, takes the
+  exclusive guard, and is rejected inside a transaction block).
 - Unsupported parsed forms should be rejected by the binder or server with
   structured `common::DbError` values and accurate SQLSTATE codes.
 - Do not introduce implicit casts. Type mismatches return

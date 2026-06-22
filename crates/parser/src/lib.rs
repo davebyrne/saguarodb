@@ -178,9 +178,13 @@ mod tests {
 
     #[test]
     fn parses_transaction_control_statements() {
-        // BEGIN and its synonyms parse to the same plain `Begin` variant.
+        // BEGIN and its synonyms parse to a `Begin` with no explicit isolation.
         for sql in ["begin", "begin transaction", "start transaction"] {
-            assert_eq!(parse(sql).unwrap(), Statement::Begin, "for `{sql}`");
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Begin { isolation: None },
+                "for `{sql}`"
+            );
         }
         // COMMIT and END both parse to `Commit`.
         for sql in ["commit", "end"] {
@@ -190,18 +194,88 @@ mod tests {
     }
 
     #[test]
+    fn parses_transaction_scoped_isolation_levels() {
+        use common::IsolationLevel;
+
+        // BEGIN / START TRANSACTION ISOLATION LEVEL <level> carries the mapped level.
+        // The four SQL levels collapse onto two: READ UNCOMMITTED/READ COMMITTED ->
+        // ReadCommitted; REPEATABLE READ/SERIALIZABLE -> RepeatableRead (SERIALIZABLE
+        // aliases snapshot isolation; we do not implement SSI).
+        for (sql, level) in [
+            (
+                "begin isolation level read uncommitted",
+                IsolationLevel::ReadCommitted,
+            ),
+            (
+                "begin transaction isolation level read committed",
+                IsolationLevel::ReadCommitted,
+            ),
+            (
+                "begin isolation level repeatable read",
+                IsolationLevel::RepeatableRead,
+            ),
+            (
+                "start transaction isolation level serializable",
+                IsolationLevel::RepeatableRead,
+            ),
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Begin {
+                    isolation: Some(level)
+                },
+                "for `{sql}`"
+            );
+        }
+
+        // SET TRANSACTION ISOLATION LEVEL <level> parses to the transaction-scoped
+        // variant with the mapped level.
+        for (sql, level) in [
+            (
+                "set transaction isolation level read committed",
+                IsolationLevel::ReadCommitted,
+            ),
+            (
+                "set transaction isolation level serializable",
+                IsolationLevel::RepeatableRead,
+            ),
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::SetTransaction {
+                    isolation: Some(level)
+                },
+                "for `{sql}`"
+            );
+        }
+
+        // `READ WRITE` is accepted and ignored (the default access mode).
+        assert_eq!(
+            parse("begin read write").unwrap(),
+            Statement::Begin { isolation: None }
+        );
+        assert_eq!(
+            parse("begin isolation level repeatable read read write").unwrap(),
+            Statement::Begin {
+                isolation: Some(IsolationLevel::RepeatableRead)
+            }
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_transaction_control_forms() {
         // sqlparser 0.56's PostgreSQL dialect does not recognize `ABORT`, so it
         // is a syntax error rather than mapping to ROLLBACK; v1 does not add it.
-        // Isolation modes, chaining, and savepoints are deferred to later
-        // milestones and are rejected at parse time.
+        // READ ONLY (we don't enforce read-only), chaining, savepoints, and the
+        // session-default `SET SESSION CHARACTERISTICS` are rejected at parse time.
         for sql in [
             "abort",
-            "begin isolation level serializable",
             "start transaction read only",
+            "begin read only",
             "commit and chain",
             "rollback and chain",
             "rollback to savepoint s1",
+            "set session characteristics as transaction isolation level serializable",
         ] {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");

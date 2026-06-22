@@ -32,9 +32,14 @@ pub enum Statement {
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },
     Explain(Box<Statement>),
-    Begin,
+    // `BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`. `isolation` is the
+    // requested level mapped onto the two we support (`None` = transaction default).
+    Begin { isolation: Option<IsolationLevel> },
     Commit,
     Rollback,
+    // `SET TRANSACTION ISOLATION LEVEL <level>` (transaction-scoped). `isolation` is
+    // the mapped level, `None` for a `SET TRANSACTION` with no isolation-level mode.
+    SetTransaction { isolation: Option<IsolationLevel> },
     // `VACUUM` (all user tables) or `VACUUM <table>` (one table). `table` is the
     // lowercase-normalized identifier, `None` for the whole database.
     Vacuum { table: Option<String> },
@@ -168,7 +173,8 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but v1 only accepts a `SELECT` inner statement; any other inner statement is rejected as unsupported.
-- Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. Only the plain forms are accepted: isolation-level and access modes, MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints are rejected at parse time. `ABORT` is not recognized by the dialect and is a syntax error (v1 does not add it). These statements parse to first-class variants for the MVCC effort; the multi-statement transaction lifecycle is wired in MVCC Milestone C3. Until then the server rejects them with `SqlState::FeatureNotSupported` rather than silently treating a `BEGIN` as a started transaction.
+- Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin { isolation }`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. An optional `ISOLATION LEVEL <level>` mode is carried on `Begin.isolation` (and on `SetTransaction.isolation`), with the four SQL levels mapped onto SaguaroDB's two: `READ UNCOMMITTED`/`READ COMMITTED` → `IsolationLevel::ReadCommitted`, `REPEATABLE READ`/`SERIALIZABLE`/`SNAPSHOT` → `IsolationLevel::RepeatableRead` (SERIALIZABLE is **aliased** to snapshot isolation; no SSI — see `mvcc.md` §10 Milestone G). The `READ WRITE` access mode is accepted and ignored (the default); `READ ONLY` is rejected (v1 enforces no read-only restriction, so silently ignoring it would mislead), as are MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this position and is an upstream syntax error. `ABORT` is not recognized by the dialect and is a syntax error (v1 does not add it).
+- Set transaction: `SET TRANSACTION ISOLATION LEVEL <level>` (sqlparser's `Set(SetTransaction { session: false, .. })`) parses to `Statement::SetTransaction { isolation }` with the level mapped as above. `SET SESSION CHARACTERISTICS AS TRANSACTION ...` (the session default, `session: true`) and `SET TRANSACTION SNAPSHOT` are rejected at parse time (`SyntaxError`); the session-default level is a later milestone (G2). The transaction-scoped `SET TRANSACTION` is honored only before the transaction's first query (enforced by the server, `mvcc.md` §10 Milestone G1).
 
 - Maintenance: `VACUUM` parses to `Statement::Vacuum { table: None }` and `VACUUM <table>` to `Statement::Vacuum { table: Some(<lowercased name>) }`. **sqlparser 0.56 cannot parse `VACUUM`** (it errors), so `parse_statement` intercepts it *before* handing the string to sqlparser: it strips an optional trailing `;`, matches the leading `vacuum` keyword case-insensitively (a glued word like `vacuumfoo` is not a VACUUM and falls through to sqlparser), and accepts at most one bare-identifier argument (lowercase-normalized, the v1 unquoted-identifier rule). Parenthesized options, multiple tables, qualified (`schema.table`) or quoted names, and Postgres option keywords (`FULL`/`FREEZE`/`ANALYZE`/`VERBOSE`/…) are rejected with `ErrorKind::Parse` / `SqlState::SyntaxError`; none are supported in v1. `VACUUM` does not bind/plan — it is a maintenance command the server dispatches separately (`docs/specs/crates/server.md`, `docs/specs/mvcc.md` §9/§10 Milestone F).
 

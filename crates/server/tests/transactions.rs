@@ -690,6 +690,257 @@ async fn checkpoint_drains_concurrent_writers_and_stays_consistent() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
+/// The payoff of Milestone G: Read Committed vs Repeatable Read end-to-end. Under
+/// the default Read Committed a transaction's second SELECT sees a row another
+/// connection committed between the two reads; under `BEGIN ISOLATION LEVEL
+/// REPEATABLE READ` the transaction holds one snapshot for its whole life, so the
+/// second SELECT does NOT see the concurrently-committed row.
+#[tokio::test]
+async fn repeatable_read_holds_a_stable_snapshot_unlike_read_committed() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    // Baseline (default Read Committed): the second read sees the concurrent commit.
+    let mut rc = Connection::connect(&server).await.unwrap();
+    rc.ok("begin").await;
+    assert_eq!(
+        rc.ok("select id from users order by id").await.rows(),
+        vec![vec![Some("1".to_string())]],
+        "first read sees the initial row"
+    );
+    let mut writer_rc = Connection::connect(&server).await.unwrap();
+    writer_rc.ok("insert into users (id) values (2)").await;
+    assert_eq!(
+        rc.ok("select id from users order by id").await.rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+        "Read Committed's second read sees the concurrently-committed row"
+    );
+    rc.ok("commit").await;
+
+    // Repeatable Read: the second read does NOT see a row committed after the
+    // transaction's first statement captured its snapshot.
+    let mut rr = Connection::connect(&server).await.unwrap();
+    let begin = rr.ok("begin isolation level repeatable read").await;
+    assert_eq!(begin.status, b'T');
+    let first = rr.ok("select id from users order by id").await.rows();
+    assert_eq!(
+        first,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+        "the RR snapshot is captured at the first statement"
+    );
+
+    // A concurrent connection inserts and commits a brand-new row.
+    let mut writer_rr = Connection::connect(&server).await.unwrap();
+    writer_rr.ok("insert into users (id) values (3)").await;
+
+    // Back in the RR transaction: the second read is identical to the first — the
+    // new row (3) is invisible because the snapshot is frozen.
+    let second = rr.ok("select id from users order by id").await.rows();
+    assert_eq!(
+        second, first,
+        "Repeatable Read's second read does NOT see the concurrently-committed row"
+    );
+    rr.ok("commit").await;
+
+    // After commit, a fresh transaction sees all three rows.
+    assert_eq!(
+        setup.ok("select id from users order by id").await.rows(),
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// `SERIALIZABLE` aliases Repeatable Read (we do not implement SSI): a
+/// `START TRANSACTION ISOLATION LEVEL SERIALIZABLE` transaction behaves as RR — its
+/// snapshot is stable across a concurrent commit.
+#[tokio::test]
+async fn serializable_aliases_repeatable_read_with_a_stable_snapshot() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    let mut txn = Connection::connect(&server).await.unwrap();
+    txn.ok("start transaction isolation level serializable")
+        .await;
+    let first = txn.ok("select id from users order by id").await.rows();
+    assert_eq!(first, vec![vec![Some("1".to_string())]]);
+
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("insert into users (id) values (2)").await;
+
+    // SERIALIZABLE -> snapshot isolation: the second read is unchanged.
+    assert_eq!(
+        txn.ok("select id from users order by id").await.rows(),
+        first,
+        "a SERIALIZABLE transaction gets a stable per-transaction snapshot (aliased to RR)"
+    );
+    txn.ok("commit").await;
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// Repeatable Read write-write conflict: an RR transaction reads a row, another
+/// transaction updates+commits it, and the RR transaction's UPDATE of that row
+/// surfaces `40001` (`SerializationFailure`) — the first-updater-wins machinery
+/// also enforces RR's "cannot write a row changed after my snapshot".
+#[tokio::test]
+async fn repeatable_read_update_of_a_concurrently_changed_row_is_40001() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table accounts (id integer primary key, balance integer)")
+        .await;
+    setup
+        .ok("insert into accounts (id, balance) values (1, 100)")
+        .await;
+
+    // The RR transaction reads the row, fixing its snapshot.
+    let mut rr = Connection::connect(&server).await.unwrap();
+    rr.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        rr.ok("select balance from accounts where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("100".to_string())]]
+    );
+
+    // Another connection updates and commits the same row (autocommit).
+    let mut other = Connection::connect(&server).await.unwrap();
+    other
+        .ok("update accounts set balance = 200 where id = 1")
+        .await;
+
+    // The RR transaction's UPDATE of that row now conflicts: the row was changed
+    // and committed after the RR snapshot, so the write fails with 40001 and the
+    // transaction is poisoned to 'E'.
+    let conflict = rr
+        .ok("update accounts set balance = 300 where id = 1")
+        .await;
+    assert_eq!(conflict.status, b'E', "the RR transaction enters 'E'");
+    let message = conflict
+        .result
+        .err()
+        .expect("the RR update of a concurrently-changed row must fail")
+        .message;
+    assert!(
+        message.contains("40001"),
+        "the RR write conflict surfaces SQLSTATE 40001, got: {message}"
+    );
+    rr.ok("rollback").await;
+
+    // The winner's committed value survives.
+    assert_eq!(
+        setup
+            .ok("select balance from accounts where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("200".to_string())]]
+    );
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL` guards: it is honored before the transaction's
+/// first query (and then RR holds a stable snapshot), and rejected after a query has
+/// run (poisoning the block to 'E', matching Postgres' "must be called before any
+/// query"). A bare `SET TRANSACTION` in autocommit is a no-op success.
+#[tokio::test]
+async fn set_transaction_isolation_level_is_guarded_by_the_first_query() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    // Before the first query: SET TRANSACTION sets the level, and the transaction
+    // then behaves as Repeatable Read (stable snapshot).
+    let mut ok = Connection::connect(&server).await.unwrap();
+    ok.ok("begin").await;
+    let set = ok
+        .ok("set transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        set.status, b'T',
+        "SET TRANSACTION before any query succeeds"
+    );
+    let first = ok.ok("select id from users order by id").await.rows();
+    assert_eq!(first, vec![vec![Some("1".to_string())]]);
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("insert into users (id) values (2)").await;
+    assert_eq!(
+        ok.ok("select id from users order by id").await.rows(),
+        first,
+        "after SET TRANSACTION REPEATABLE READ the snapshot is stable"
+    );
+    ok.ok("commit").await;
+
+    // After a query has run: SET TRANSACTION is rejected and poisons the block.
+    let mut late = Connection::connect(&server).await.unwrap();
+    late.ok("begin").await;
+    late.ok("select id from users").await;
+    let rejected = late
+        .ok("set transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        rejected.status, b'E',
+        "the rejection poisons the block to 'E'"
+    );
+    let message = rejected
+        .result
+        .err()
+        .expect("SET TRANSACTION after a query must error")
+        .message;
+    assert!(
+        message.to_ascii_lowercase().contains("before any query"),
+        "the error explains the before-first-query rule, got: {message}"
+    );
+    late.ok("rollback").await;
+
+    // In autocommit (no open transaction): SET TRANSACTION is a no-op success.
+    let no_txn = setup
+        .ok("set transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        no_txn.status, b'I',
+        "SET TRANSACTION with no open transaction is a no-op and stays Idle"
+    );
+    assert!(no_txn.result.is_ok());
+
+    // Inside a failed ('E') block: SET TRANSACTION is rejected with 25P02 like any
+    // non-COMMIT/ROLLBACK statement, and stays 'E'.
+    let mut aborted = Connection::connect(&server).await.unwrap();
+    aborted.ok("begin").await;
+    let bad = aborted.query("select id from ghosts").await.unwrap();
+    assert!(bad.result.is_err(), "the bad statement poisons the block");
+    assert_eq!(bad.status, b'E');
+    let in_failed = aborted
+        .ok("set transaction isolation level repeatable read")
+        .await;
+    assert_eq!(in_failed.status, b'E', "SET TRANSACTION stays in 'E'");
+    let message = in_failed
+        .result
+        .err()
+        .expect("SET TRANSACTION in a failed block is rejected")
+        .message;
+    assert!(
+        message.contains("current transaction is aborted"),
+        "SET TRANSACTION in a failed block surfaces 25P02, got: {message}"
+    );
+    aborted.ok("rollback").await;
+
+    assert_eq!(server.active_txn_count(), 0);
+}
+
 /// Poll `condition` until it holds or `timeout` elapses; panics on timeout.
 async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + timeout;

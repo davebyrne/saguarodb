@@ -1,4 +1,4 @@
-use common::{DataType, DbError, ParsedColumnDef, Result, SqlState, Value};
+use common::{DataType, DbError, IsolationLevel, ParsedColumnDef, Result, SqlState, Value};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -114,21 +114,24 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             exception_statements,
             has_end_keyword,
         } => {
-            // Accept plain `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION`.
-            // `transaction`/`begin` are pure keyword spellings of the same plain
-            // form, so they are intentionally ignored. Everything else (isolation
-            // modes, MySQL-style modifiers, atomic-block bodies) is a later
-            // milestone and is rejected here.
-            if !modes.is_empty()
-                || modifier.is_some()
+            // Accept plain `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION`, with
+            // an optional `ISOLATION LEVEL <level>` and access mode. `transaction`/
+            // `begin` are pure keyword spellings of the same form, so they are
+            // intentionally ignored. MySQL-style modifiers and atomic-block bodies
+            // are rejected. (sqlparser 0.56 does not parse `[NOT] DEFERRABLE` in this
+            // position, so a `DEFERRABLE` clause is already a parse-time syntax error
+            // upstream and never reaches here.)
+            if modifier.is_some()
                 || !statements.is_empty()
                 || exception_statements.is_some()
                 || has_end_keyword
             {
                 return unsupported("unsupported BEGIN/START TRANSACTION form");
             }
-            Ok(Statement::Begin)
+            let isolation = transaction_isolation_mode(&modes)?;
+            Ok(Statement::Begin { isolation })
         }
+        sql::Statement::Set(set) => convert_set(set),
         sql::Statement::Commit {
             chain,
             end: _,
@@ -149,6 +152,80 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             Ok(Statement::Rollback)
         }
         _ => unsupported("unsupported SQL statement"),
+    }
+}
+
+/// Convert a `SET ...` statement. v1 supports only transaction-scoped
+/// `SET TRANSACTION ISOLATION LEVEL <level>` (`session == false`); `SET SESSION
+/// CHARACTERISTICS AS TRANSACTION ...` (`session == true`, the session default) is
+/// a later milestone, and every other `SET` form is unsupported.
+fn convert_set(set: sql::Set) -> Result<Statement> {
+    let sql::Set::SetTransaction {
+        modes,
+        snapshot,
+        session,
+    } = set
+    else {
+        return unsupported("unsupported SET statement");
+    };
+    if snapshot.is_some() {
+        return unsupported("SET TRANSACTION SNAPSHOT is not supported in v1");
+    }
+    if session {
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION ...` sets the session-default
+        // isolation, which is a later milestone (G2). Reject it cleanly rather than
+        // silently treating it as a transaction-scoped set.
+        return unsupported("SET SESSION CHARACTERISTICS is not supported in v1");
+    }
+    let isolation = transaction_isolation_mode(&modes)?;
+    Ok(Statement::SetTransaction { isolation })
+}
+
+/// Extract an optional `ISOLATION LEVEL <level>` from a list of transaction modes,
+/// mapping the SQL level onto our two levels. Access modes are validated but carry
+/// no value here: `READ WRITE` (the default) is accepted and ignored, while
+/// `READ ONLY` is rejected because v1 does not enforce read-only and silently
+/// ignoring it would be misleading. At most one isolation-level mode is allowed.
+fn transaction_isolation_mode(modes: &[sql::TransactionMode]) -> Result<Option<IsolationLevel>> {
+    let mut isolation = None;
+    for mode in modes {
+        match mode {
+            sql::TransactionMode::IsolationLevel(level) => {
+                if isolation.is_some() {
+                    return unsupported("multiple ISOLATION LEVEL modes");
+                }
+                isolation = Some(map_isolation_level(*level));
+            }
+            sql::TransactionMode::AccessMode(sql::TransactionAccessMode::ReadWrite) => {
+                // The default; accepted and ignored (v1 is always read-write).
+            }
+            sql::TransactionMode::AccessMode(sql::TransactionAccessMode::ReadOnly) => {
+                return unsupported("READ ONLY transactions are not supported in v1");
+            }
+        }
+    }
+    Ok(isolation)
+}
+
+/// Map the four SQL isolation levels (plus the non-standard `SNAPSHOT`) onto
+/// SaguaroDB's two: Read Committed and Repeatable Read (= snapshot isolation).
+///
+/// - `READ UNCOMMITTED` -> Read Committed (we never expose uncommitted data; the
+///   weaker level is strengthened to the weakest we offer).
+/// - `READ COMMITTED` -> Read Committed.
+/// - `REPEATABLE READ` -> Repeatable Read.
+/// - `SERIALIZABLE` -> Repeatable Read. We do **not** implement SSI / true
+///   serializability; SERIALIZABLE is aliased to snapshot isolation (Repeatable
+///   Read), so it gets a stable per-transaction snapshot but no predicate-based
+///   serialization. Documented in `docs/specs/mvcc.md` §10 Milestone G.
+/// - `SNAPSHOT` -> Repeatable Read (snapshot isolation by definition).
+fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel {
+    match level {
+        sql::TransactionIsolationLevel::ReadUncommitted
+        | sql::TransactionIsolationLevel::ReadCommitted => IsolationLevel::ReadCommitted,
+        sql::TransactionIsolationLevel::RepeatableRead
+        | sql::TransactionIsolationLevel::Serializable
+        | sql::TransactionIsolationLevel::Snapshot => IsolationLevel::RepeatableRead,
     }
 }
 

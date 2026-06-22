@@ -391,7 +391,8 @@ the first visitor after a transaction settles sets the hint.
 
 Snapshot acquisition timing is the isolation knob: **Read Committed** captures a
 fresh snapshot per statement; **Repeatable Read** captures one snapshot at the
-first statement of the transaction and reuses it (see Milestone G).
+first statement of the transaction and reuses it. The level is selected per
+transaction by `BEGIN`/`SET TRANSACTION ISOLATION LEVEL` (Milestone G1, §10).
 
 ---
 
@@ -907,9 +908,55 @@ and per-tuple CLOG-probe contention reduction.
 
 ### Milestone G — Isolation levels & polish
 
-`SET TRANSACTION ISOLATION LEVEL`; Read Committed (per-statement snapshot) vs
-Repeatable Read (per-transaction snapshot); `'E'` failed-transaction handling;
-serialization-failure surfacing; savepoints via sub-transaction xids (optional).
+Read Committed (per-statement snapshot) vs Repeatable Read (per-transaction
+snapshot); `'E'` failed-transaction handling; serialization-failure surfacing;
+savepoints via sub-transaction xids (optional, deferred).
+
+- **G1 — transaction-scoped isolation SQL.** *(implemented.)*
+  `BEGIN [TRANSACTION] ISOLATION LEVEL <level>`,
+  `START TRANSACTION ISOLATION LEVEL <level>`, and
+  `SET TRANSACTION ISOLATION LEVEL <level>` are parsed and applied to the current
+  transaction, **activating Repeatable Read** (the per-transaction snapshot,
+  advertisement, and write-conflict machinery were built in C–F and were dormant
+  until now — G1 is only the SQL + wiring that selects the level).
+  - **Four SQL levels → two.** SaguaroDB has two levels, so the four standard SQL
+    levels are mapped: `READ UNCOMMITTED` → **Read Committed** (we never expose
+    uncommitted data; the weaker request is strengthened to our weakest);
+    `READ COMMITTED` → **Read Committed**; `REPEATABLE READ` → **Repeatable Read**;
+    `SERIALIZABLE` → **Repeatable Read**. SERIALIZABLE is an **alias** for snapshot
+    isolation (Repeatable Read): we do **not** implement SSI / predicate-based
+    serializability, so a SERIALIZABLE transaction gets a stable per-transaction
+    snapshot but no serialization-anomaly prevention beyond write-write conflicts.
+    The non-standard `SNAPSHOT` level also maps to Repeatable Read.
+  - **`BEGIN`/`START TRANSACTION` isolation** is read at BEGIN: an explicit
+    `ISOLATION LEVEL` mode sets `Transaction.isolation`; with no mode the
+    transaction uses the default (Read Committed — a session/global default is
+    deferred to G2). An explicit level on a `BEGIN` issued **inside** an already-open
+    block is ignored (Postgres: there is already a transaction in progress).
+  - **`SET TRANSACTION ISOLATION LEVEL`** sets the **current** transaction's level
+    and is valid **only before the transaction's first query** (i.e. before its
+    snapshot was captured). After the first statement it errors with
+    `SET TRANSACTION ISOLATION LEVEL must be called before any query`
+    (`FeatureNotSupported`), which — like any in-block statement error — poisons the
+    block to `'E'`. The guard is the `Transaction.first_statement_ran` flag, set
+    when a data/query statement captures the transaction snapshot. Inside an
+    already-failed (`'E'`) block it is rejected with `25P02`
+    (`InFailedSqlTransaction`) like any non-COMMIT/ROLLBACK statement. With **no**
+    open transaction (autocommit) `SET TRANSACTION` is a no-op success that stays
+    `Idle`
+    (the implicit single-statement transaction runs no query for the level to
+    affect; Postgres warns and no-ops — we mirror the no-op).
+  - **Access modes.** `READ WRITE` (the default) is accepted and ignored — v1 is
+    always read-write. `READ ONLY` is **rejected** (`SyntaxError`) rather than
+    silently ignored, since v1 enforces no read-only restriction and accepting it
+    would be misleading. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this
+    position and so is already an upstream parse error.
+  - **Write conflicts under RR.** No new machinery: a Repeatable Read transaction
+    that writes a row another transaction changed and committed **after** its
+    snapshot hits the existing first-updater-wins detection and surfaces `40001`
+    (`SerializationFailure`), exactly as a concurrent autocommit conflict does.
+- **G2 — session-default isolation** (`SET SESSION CHARACTERISTICS AS TRANSACTION
+  ISOLATION LEVEL <level>`) is deferred; it is rejected at parse time for now.
 
 ### Milestone H — HOT *(deferred, purely additive)*
 
