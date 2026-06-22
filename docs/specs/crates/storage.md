@@ -258,6 +258,49 @@ a runtime no-op at this milestone.
 - It does **not** reclaim line pointers `DEAD → UNUSED` (F3b) or vacuum indexes
   (F3a); those are separate, later steps.
 
+### Index VACUUM Pass (`vacuum_indexes`, F3a)
+
+`vacuum_indexes(schema, dead_tids: &HashSet<RowLocation>)` removes the dangling
+index entries that `vacuum_heap` left behind (`mvcc.md` §9 / Milestone F3a). After
+the heap prune marks a dead tuple's line pointer `DEAD`, every index entry pointing
+at that TID still lingers (it would resolve to a DEAD slot); this pass deletes those
+entries from the table's **primary-key index and every live secondary index**, so no
+index entry resolves to a dead slot before the line pointers are reclaimed
+`DEAD → UNUSED` (F3b). It has no production caller yet (VACUUM orchestration is F4a),
+so it is a runtime no-op at this milestone.
+
+- **Remove by dead-TID membership, not by key.** The heap prune already compacted the
+  page, so the dead tuple's key bytes are gone and the entry's key cannot be
+  recomputed. Each index leaf stores the heap TID as its value, so entries are matched
+  by **value-set (dead-TID) membership** instead: an entry is removed iff its stored
+  `RowLocation` is in `dead_tids`. Live versions' entries (value not in the set) are
+  left intact.
+- **Single-pass leaf walk.** Each index is vacuumed by `BTree::remove_values_in`,
+  which walks the leaf chain once (left to right via the right-sibling `link`s),
+  decodes each leaf entry's value, and shifts the matching entries out with
+  `index_page::remove_entry` under that leaf's frame write latch — no re-descent per
+  entry. A leaf that changed is logged as a single `FullPageImage` (the
+  `btree::log_full_page` pattern); an unchanged leaf is skipped (no WAL, no mutation).
+- **No node merging — B-link safe vs lock-free scanners.** VACUUM runs under the
+  exclusive guard but lock-free readers scan concurrently (they take no guard, only a
+  short-lived per-leaf read latch, and follow the right-sibling `link`). The pass
+  never merges or frees a leaf and never rewrites a right-sibling link, so the leaf
+  chain a reader is walking is structurally unchanged; an emptied leaf is left in
+  place (accepted bloat, mirroring the heap's leave-pages-in-place stance). The
+  per-leaf write latch a removal takes is mutually exclusive with a reader's read latch
+  on the same leaf, so a reader sees each leaf either fully before or fully after the
+  shift, never torn; and because only *dead* TIDs are shifted, a concurrent scanner
+  can never miss or duplicate a *live* entry.
+- **Latching.** Each index is vacuumed under *its own* per-index structural latch,
+  acquired and released around that index's whole walk and never held while another
+  index's latch is taken (rule 1: never two structural latches at once).
+- **Maintenance txn.** Removals are logged under txn id `0` (`VACUUM_TXN`), the
+  recovery/maintenance convention, so they are never undone by an abort and do not pin
+  WAL truncation. Recovery reinstalls each changed leaf's `FullPageImage` by PageLSN
+  gating, independent of the record's `txn_id`.
+- It does **not** reclaim line pointers `DEAD → UNUSED` (F3b); the slots stay `DEAD`
+  until that later step.
+
 ### MVCC Delete
 
 `delete(ctx, table, key)` marks the **visible** version of `key` deleted in place

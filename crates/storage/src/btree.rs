@@ -267,6 +267,21 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         }
     }
 
+    /// The leftmost leaf of the tree: descend the left spine (following each
+    /// internal node's leftmost-child `link`) until a leaf is reached. The leaf
+    /// chain starts here.
+    fn first_leaf(&self) -> Result<PageNum> {
+        let mut page_num = self.root()?;
+        loop {
+            let guard = self.buffer.read_page(self.file_id, page_num)?;
+            let data = guard.data();
+            if index_page::is_leaf(data) {
+                return Ok(page_num);
+            }
+            page_num = index_page::link(data);
+        }
+    }
+
     /// Collect `(key, value)` for every entry within `range`, in `(key, value)`
     /// order. A user-key may now appear multiple times (one per value); all are
     /// returned.
@@ -576,6 +591,75 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         })?;
         crate::page::set_page_lsn(guard.data_mut(), lsn);
         Ok(())
+    }
+}
+
+impl<'a> BTree<'a, RowLocation> {
+    /// Remove every leaf entry whose stored value (the heap `RowLocation`/TID) is in
+    /// `dead`, returning how many were removed. This is index VACUUM's primitive
+    /// (`docs/specs/mvcc.md` §9, Milestone F3a): after `vacuum_heap` prunes a dead
+    /// tuple the heap key bytes are gone, so the dangling entry cannot be recomputed
+    /// and removed by key — it is matched by value-set (dead-TID) membership instead.
+    /// The pass walks the leaf chain once (left to right via the right-sibling
+    /// `link`s), and for each leaf removes the matching entries under that leaf's
+    /// frame write latch, logging a single `FullPageImage` of the leaf only when it
+    /// changed. Entries with a value not in `dead` (live versions) are left intact.
+    ///
+    /// **B-link safety vs concurrent lock-free scanners.** A reader traverses leaves
+    /// under a short-lived per-leaf read latch and follows the right-sibling `link` to
+    /// the next; it takes no structural latch. This removal is safe against such a
+    /// reader because:
+    /// - It never merges or frees a leaf and never rewrites a right-sibling `link`, so
+    ///   the leaf chain a reader is walking is structurally unchanged. An emptied leaf
+    ///   stays in place (accepted bloat, mirroring the heap's leave-pages-in-place
+    ///   stance); a reader landing on it finds no matching entries and follows `link`
+    ///   as before.
+    /// - Within one leaf the entry shift runs under that leaf's *write* latch, which is
+    ///   mutually exclusive with a reader's *read* latch on the SAME leaf, so a reader
+    ///   sees the leaf either fully before or fully after the shift, never torn.
+    /// - A reader that already passed a leaf, or sits between two leaves, is
+    ///   unaffected: right-links are never rewritten, so its traversal still reaches
+    ///   every later leaf. A removed entry was a *dead* TID, never a live one, so no
+    ///   live entry is ever shifted out of a concurrent reader's path — a scanner
+    ///   never misses or duplicates a live entry.
+    ///
+    /// The whole pass runs under the index's per-index structural latch (held by the
+    /// engine caller), so it never races another structural writer on this index.
+    pub(crate) fn remove_values_in(
+        &self,
+        txn_id: u64,
+        dead: &std::collections::HashSet<RowLocation>,
+    ) -> Result<usize> {
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut page_num = self.first_leaf()?;
+        let mut removed = 0usize;
+        loop {
+            let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+            // Walk entries from the end so each `remove_entry` shift never disturbs the
+            // index of an entry still to be examined.
+            let mut changed = false;
+            let mut pos = index_page::entry_count(guard.data());
+            while pos > 0 {
+                pos -= 1;
+                let value = RowLocation::decode(index_page::entry_value(guard.data(), pos))?;
+                if dead.contains(&value) {
+                    index_page::remove_entry(guard.data_mut(), pos)?;
+                    removed += 1;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.log_full_page(txn_id, &mut guard)?;
+            }
+            let next = index_page::link(guard.data());
+            drop(guard);
+            if next == 0 {
+                return Ok(removed);
+            }
+            page_num = next;
+        }
     }
 }
 
@@ -1377,5 +1461,141 @@ mod tests {
             })
             .unwrap();
         assert_eq!(slots(bounded), vec![1, 5, 2]);
+    }
+
+    #[test]
+    fn remove_values_in_drops_exactly_the_dead_tids() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.tree();
+        tree.create(1).unwrap();
+
+        // Distinct keys, one entry each. Mark a scattered subset of TIDs dead.
+        let n = 40i64;
+        for value in 0..n {
+            tree.insert(1, &key(value), &location(value as u32, 0))
+                .unwrap();
+        }
+        let dead: std::collections::HashSet<RowLocation> = (0..n)
+            .filter(|v| v % 3 == 0)
+            .map(|v| location(v as u32, 0))
+            .collect();
+
+        let removed = tree.remove_values_in(1, &dead).unwrap();
+        assert_eq!(removed, dead.len());
+
+        // No surviving entry resolves to a dead TID; every live TID is still present.
+        let surviving: Vec<RowLocation> = tree
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        for value in &surviving {
+            assert!(!dead.contains(value), "{value:?} should have been removed");
+        }
+        let expected: Vec<RowLocation> = (0..n)
+            .filter(|v| v % 3 != 0)
+            .map(|v| location(v as u32, 0))
+            .collect();
+        assert_eq!(surviving, expected);
+        for value in 0..n {
+            let want = (value % 3 != 0).then(|| location(value as u32, 0));
+            assert_eq!(tree.search(&key(value)).unwrap(), want, "key {value}");
+        }
+    }
+
+    #[test]
+    fn remove_values_in_spans_multiple_leaves_and_dup_key_runs() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.tree();
+        tree.create(1).unwrap();
+
+        // One user-key, many distinct values, built like
+        // `point_remove_targets_entries_in_later_leaves_of_a_dup_key_run` so the run
+        // spans several leaves and dead TIDs land in the middle and at leaf
+        // boundaries of the run.
+        let dup_key = key(42);
+        let n = 600u32;
+        let value_of = |page: u32| location(page, 0);
+        let order: Vec<u32> = {
+            let values: Vec<u32> = (0..n).collect();
+            let mut shuffled = Vec::with_capacity(n as usize);
+            let (lo, hi) = values.split_at((n / 2) as usize);
+            for index in 0..lo.len().max(hi.len()) {
+                if let Some(value) = hi.get(index) {
+                    shuffled.push(*value);
+                }
+                if let Some(value) = lo.get(index) {
+                    shuffled.push(*value);
+                }
+            }
+            shuffled
+        };
+        for page in &order {
+            tree.insert(1, &dup_key, &value_of(*page)).unwrap();
+        }
+
+        // Also a couple of distinct neighbor keys with dead and live entries, so the
+        // pass crosses leaves carrying more than one key.
+        for value in [700u32, 800] {
+            tree.insert(1, &key(value as i64), &value_of(value))
+                .unwrap();
+        }
+
+        // Mark every even page_num (within the dup run) plus one neighbor dead.
+        let dead: std::collections::HashSet<RowLocation> = (0..n)
+            .filter(|p| p % 2 == 0)
+            .chain(std::iter::once(700))
+            .map(value_of)
+            .collect();
+
+        let removed = tree.remove_values_in(1, &dead).unwrap();
+        assert_eq!(removed, dead.len());
+
+        // The dup-key run now holds exactly the odd page_nums, each once, in order.
+        let mut expected: Vec<RowLocation> = (0..n).filter(|p| p % 2 != 0).map(value_of).collect();
+        expected.sort_by_key(|loc| loc.encode().unwrap());
+        assert_eq!(tree.scan_key(&dup_key).unwrap(), expected);
+
+        // A full range scan returns every survivor exactly once and never a dead TID.
+        let all: Vec<RowLocation> = tree
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        for value in &all {
+            assert!(!dead.contains(value), "{value:?} should have been removed");
+        }
+        // Neighbor key 700 was dead (gone), 800 survives.
+        assert!(tree.scan_key(&key(700)).unwrap().is_empty());
+        assert_eq!(tree.scan_key(&key(800)).unwrap(), vec![value_of(800)]);
+
+        // Idempotent: re-running with the same set removes nothing more.
+        assert_eq!(tree.remove_values_in(1, &dead).unwrap(), 0);
+        assert_eq!(tree.scan_key(&dup_key).unwrap(), expected);
+    }
+
+    #[test]
+    fn remove_values_in_empty_set_is_a_noop() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.tree();
+        tree.create(1).unwrap();
+        for value in 0..10i64 {
+            tree.insert(1, &key(value), &location(value as u32, 0))
+                .unwrap();
+        }
+        let empty: std::collections::HashSet<RowLocation> = std::collections::HashSet::new();
+        assert_eq!(tree.remove_values_in(1, &empty).unwrap(), 0);
+        let all: Vec<RowLocation> = tree
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(
+            all,
+            (0..10).map(|v| location(v as u32, 0)).collect::<Vec<_>>()
+        );
     }
 }

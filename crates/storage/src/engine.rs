@@ -37,7 +37,7 @@
 //! on its latch, while writers on different indexes/heaps run in parallel. A
 //! checkpoint takes the exclusive concurrency guard and so never overlaps a writer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use buffer::{BufferPool, PageWriteGuard};
@@ -71,7 +71,7 @@ pub enum StorageMode {
 /// PageLSN gating alone, independent of this txn id.
 const VACUUM_TXN: u64 = 0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RowLocation {
     pub file_id: FileId,
     pub page_num: PageNum,
@@ -880,6 +880,66 @@ impl PageBackedStorageEngine {
         }
 
         Ok(reclaimed)
+    }
+
+    /// Index VACUUM (`docs/specs/mvcc.md` §9, Milestone F3a): remove every index
+    /// entry — across the table's primary-key index and every live secondary index —
+    /// whose value (the heap `RowLocation`/TID) is in `dead_tids`. `dead_tids` are the
+    /// TIDs `vacuum_heap` pruned to `DEAD`; their index entries still dangle (pointing
+    /// at a now-DEAD slot) and must be removed before the line pointers can be
+    /// reclaimed `DEAD → UNUSED` (F3b).
+    ///
+    /// Entries are matched by **dead-TID membership, not by key**: after the heap
+    /// prune compacted the page the dead tuple's key bytes are gone, so the key cannot
+    /// be recomputed; the index leaf's stored value (the TID) is the only handle left.
+    /// Each index is vacuumed in a single leaf-chain walk (`BTree::remove_values_in`),
+    /// shifting matching entries out of each leaf under its frame write latch and
+    /// logging a `FullPageImage` of every changed leaf — the `vacuum_heap` /
+    /// `btree::log_full_page` crash-safety pattern, redone by PageLSN gating regardless
+    /// of txn id. The pass runs under the maintenance txn id (`0`, [`VACUUM_TXN`]) so
+    /// its removals are never undone by an abort and do not pin WAL truncation.
+    ///
+    /// **Latching.** Each index is vacuumed under *its own* per-index structural latch,
+    /// acquired and released around that index's whole walk and never held while
+    /// another index's latch is taken (rule 1: never two structural latches at once).
+    /// The per-leaf write latch a removal takes inside `remove_values_in` is mutually
+    /// exclusive with a concurrent lock-free scanner's per-leaf read latch on the same
+    /// leaf, and no leaf is merged/freed and no right-sibling link is rewritten, so a
+    /// concurrent scanner can neither miss nor duplicate a live entry (B-link safe).
+    ///
+    /// No production caller yet (VACUUM orchestration is F4a), so it is a runtime
+    /// no-op at this milestone. It does **not** reclaim line pointers `DEAD → UNUSED`
+    /// (F3b); the slots stay `DEAD` until that later step.
+    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
+    pub(crate) fn vacuum_indexes(
+        &self,
+        schema: &TableSchema,
+        dead_tids: &HashSet<RowLocation>,
+    ) -> Result<()> {
+        if dead_tids.is_empty() {
+            return Ok(());
+        }
+
+        // Primary-key index, under its own structural latch (released before the next).
+        let pk_file_id = index_file_id(schema.id);
+        {
+            let latch = self.structural_latch(pk_file_id);
+            let _pk_guard = latch.lock();
+            self.btree(pk_file_id)
+                .remove_values_in(VACUUM_TXN, dead_tids)?;
+        }
+
+        // Every live secondary index, each under its own structural latch (one at a
+        // time — rule 1: never two structural latches simultaneously).
+        for index in self.table_indexes(schema.id)? {
+            let secondary_file_id = secondary_index_file_id(index.id);
+            let latch = self.structural_latch(secondary_file_id);
+            let _index_guard = latch.lock();
+            self.secondary_btree(index.id)
+                .remove_values_in(VACUUM_TXN, dead_tids)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -3813,17 +3873,22 @@ mod concurrent_writers_tests {
 mod vacuum_tests {
     use std::sync::Arc;
 
+    use std::collections::HashSet;
+
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use common::{
-        ColumnDef, DataType, PageFlushInfo, Row, Snapshot, StatementContext, TableSchema, Value,
+        ColumnDef, DataType, IndexSchema, KeyRange, PageFlushInfo, Row, Snapshot, StatementContext,
+        TableSchema, Value,
     };
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     use super::{PageBackedStorageEngine, RowLocation, VACUUM_TXN};
     use crate::HeapPageStore;
+    use crate::heap::index_file_id;
     use crate::traits::{SchemaOperations, StorageEngine};
 
     const TABLE_ID: u32 = 1;
+    const NAME_INDEX_ID: u32 = 7;
 
     struct AlwaysFlush;
     impl common::FlushPolicy for AlwaysFlush {
@@ -4012,6 +4077,329 @@ mod vacuum_tests {
 
     fn key(id: i64) -> common::Key {
         common::Key(vec![Value::Integer(id)])
+    }
+
+    /// A non-unique secondary index on the `name` column.
+    fn name_index() -> IndexSchema {
+        IndexSchema {
+            id: NAME_INDEX_ID,
+            table: TABLE_ID,
+            name: "users_name".to_string(),
+            columns: vec![1],
+            unique: false,
+        }
+    }
+
+    /// Every TID stored in the primary-key index, in `(key, tid)` order.
+    fn pk_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
+        engine
+            .btree(index_file_id(TABLE_ID))
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, tid)| tid)
+            .collect()
+    }
+
+    /// Every TID stored in the `name` secondary index, in `(key, tid)` order.
+    fn name_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
+        engine
+            .secondary_btree(NAME_INDEX_ID)
+            .range(&KeyRange::All)
+            .unwrap()
+            .into_iter()
+            .map(|(_, tid)| tid)
+            .collect()
+    }
+
+    #[test]
+    fn vacuum_indexes_removes_dangling_entries_from_pk_and_secondary() {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_index(&ctx(101), &name_index())
+            .unwrap();
+        fixture.commit(101);
+
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        let also_gone = fixture.insert_committed(12, row(3, "gone-too"));
+
+        // Two rows are deleted-and-committed below the horizon; one survives. Prune the
+        // heap so their TIDs are DEAD (their index entries now dangle).
+        fixture.delete(20, 2);
+        fixture.commit(20);
+        fixture.delete(21, 3);
+        fixture.commit(21);
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 30).unwrap();
+        let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
+        assert_eq!(dead, HashSet::from([gone, also_gone]));
+
+        // Before index vacuum the dangling entries still resolve to the dead TIDs.
+        assert!(pk_index_tids(&fixture.engine).contains(&gone));
+        assert!(name_index_tids(&fixture.engine).contains(&gone));
+
+        fixture
+            .engine
+            .vacuum_indexes(&users_schema(), &dead)
+            .unwrap();
+
+        // No PK or secondary entry resolves to a dead TID anymore.
+        let pk = pk_index_tids(&fixture.engine);
+        let secondary = name_index_tids(&fixture.engine);
+        for tid in pk.iter().chain(secondary.iter()) {
+            assert!(!dead.contains(tid), "{tid:?} should have been vacuumed");
+        }
+        // The live row's entry survives in both indexes and still resolves correctly.
+        assert_eq!(pk, vec![keep]);
+        assert_eq!(secondary, vec![keep]);
+    }
+
+    #[test]
+    fn vacuum_indexes_handles_multiple_leaves_and_duplicate_keys() {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_index(&ctx(101), &name_index())
+            .unwrap();
+        fixture.commit(101);
+
+        // Many rows; half will be deleted. Use a small set of repeated names so the
+        // secondary index has dup-key runs (many TIDs share one indexed value).
+        let n = 300i64;
+        let names = ["alpha", "beta", "gamma", "delta"];
+        let mut live: Vec<RowLocation> = Vec::new();
+        let mut dead: HashSet<RowLocation> = HashSet::new();
+        for id in 0..n {
+            let txn = 1000 + id as u64;
+            let loc = fixture.insert_committed(txn, row(id, names[(id % 4) as usize]));
+            if id % 2 == 0 {
+                let deleter = 5000 + id as u64;
+                fixture.delete(deleter, id);
+                fixture.commit(deleter);
+                dead.insert(loc);
+            } else {
+                live.push(loc);
+            }
+        }
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
+        assert_eq!(
+            reclaimed.iter().copied().collect::<HashSet<_>>(),
+            dead,
+            "heap prune reclaims exactly the deleted TIDs"
+        );
+
+        fixture
+            .engine
+            .vacuum_indexes(&users_schema(), &dead)
+            .unwrap();
+
+        // Every surviving entry in both indexes is a live TID; each live TID appears
+        // exactly once per index; no dead TID remains.
+        let mut pk = pk_index_tids(&fixture.engine);
+        let mut secondary = name_index_tids(&fixture.engine);
+        pk.sort_by_key(|l| (l.page_num, l.slot_num));
+        secondary.sort_by_key(|l| (l.page_num, l.slot_num));
+        let mut expected = live.clone();
+        expected.sort_by_key(|l| (l.page_num, l.slot_num));
+        assert_eq!(pk, expected, "PK index holds exactly the live TIDs");
+        assert_eq!(
+            secondary, expected,
+            "secondary index holds exactly the live TIDs"
+        );
+    }
+
+    #[test]
+    fn vacuum_indexes_empty_set_changes_nothing_and_logs_no_wal() {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_index(&ctx(101), &name_index())
+            .unwrap();
+        fixture.commit(101);
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+
+        let pk_before = pk_index_tids(&fixture.engine);
+        let secondary_before = name_index_tids(&fixture.engine);
+        let wal_len_before = fixture.wal.replay_from(0).unwrap().count();
+
+        fixture
+            .engine
+            .vacuum_indexes(&users_schema(), &HashSet::new())
+            .unwrap();
+
+        assert_eq!(pk_index_tids(&fixture.engine), pk_before);
+        assert_eq!(name_index_tids(&fixture.engine), secondary_before);
+        assert_eq!(pk_before, vec![keep]);
+        assert_eq!(
+            fixture.wal.replay_from(0).unwrap().count(),
+            wal_len_before,
+            "an empty dead set appends no WAL"
+        );
+    }
+
+    #[test]
+    fn vacuumed_index_page_survives_recovery_replay() {
+        let fixture = Fixture::new();
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
+        assert_eq!(dead, HashSet::from([gone]));
+
+        let pk_file_id = index_file_id(TABLE_ID);
+        fixture
+            .engine
+            .vacuum_indexes(&users_schema(), &dead)
+            .unwrap();
+
+        // The runtime PK leaf page after index vacuum, captured from the buffer pool.
+        // The single leaf is page 1 of the index file (page 0 is the metapage).
+        let leaf_page = 1u32;
+        let vacuumed = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(pk_file_id, leaf_page)
+                .unwrap();
+            *readable.data()
+        };
+        assert_eq!(
+            pk_index_tids(&fixture.engine),
+            vec![keep],
+            "the vacuumed PK index holds only the live entry"
+        );
+
+        // Replaying the index file's FullPageImages onto a fresh page under PageLSN
+        // gating reinstalls the vacuumed leaf byte-for-byte (the crash-safety
+        // guarantee — FPI redo regardless of txn id).
+        let mut recovered = [0u8; buffer::PAGE_SIZE];
+        for record in fixture.wal.replay_from(0).unwrap() {
+            let record = record.unwrap();
+            if let WalRecordKind::FullPageImage {
+                file_id, page_num, ..
+            } = &record.kind
+                && *file_id == pk_file_id
+                && *page_num == leaf_page
+            {
+                crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            }
+        }
+        assert_eq!(
+            recovered, vacuumed,
+            "the FullPageImage reinstalls the vacuumed leaf byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn vacuum_indexes_is_b_link_safe_against_a_concurrent_scanner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Barrier, Mutex as StdMutex};
+
+        // Many distinct keys, half deleted, spread across many index leaves so the
+        // scanner and the vacuum genuinely overlap on the leaf chain.
+        let fixture = Arc::new(Fixture::new());
+        let n = 800i64;
+        let mut live: HashSet<RowLocation> = HashSet::new();
+        let mut dead: HashSet<RowLocation> = HashSet::new();
+        for id in 0..n {
+            let txn = 1000 + id as u64;
+            let loc = fixture.insert_committed(txn, row(id, "x"));
+            if id % 2 == 0 {
+                let deleter = 6000 + id as u64;
+                fixture.delete(deleter, id);
+                fixture.commit(deleter);
+                dead.insert(loc);
+            } else {
+                live.insert(loc);
+            }
+        }
+        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
+        assert_eq!(reclaimed.iter().copied().collect::<HashSet<_>>(), dead);
+
+        let pk_file_id = index_file_id(TABLE_ID);
+        let live = Arc::new(live);
+        let dead = Arc::new(dead);
+        let barrier = Arc::new(Barrier::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+
+        // Reader thread: lock-free range scans in a loop (no structural latch). Each
+        // pass must see every LIVE entry exactly once and never panic. A dead entry
+        // may or may not be present depending on timing (it is being removed), so the
+        // invariant is: no live entry missing and no entry duplicated.
+        let reader = {
+            let fixture = Arc::clone(&fixture);
+            let live = Arc::clone(&live);
+            let barrier = Arc::clone(&barrier);
+            let stop = Arc::clone(&stop);
+            let failure = Arc::clone(&failure);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut passes = 0u32;
+                while !stop.load(Ordering::Relaxed) || passes < 2 {
+                    let scanned: Vec<RowLocation> = fixture
+                        .engine
+                        .btree(pk_file_id)
+                        .range(&KeyRange::All)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, tid)| tid)
+                        .collect();
+                    let mut seen: HashSet<RowLocation> = HashSet::new();
+                    for tid in &scanned {
+                        if !seen.insert(*tid) {
+                            *failure.lock().unwrap() =
+                                Some(format!("scanner saw duplicate entry {tid:?}"));
+                            return;
+                        }
+                    }
+                    for tid in live.iter() {
+                        if !seen.contains(tid) {
+                            *failure.lock().unwrap() =
+                                Some(format!("scanner missed live entry {tid:?}"));
+                            return;
+                        }
+                    }
+                    passes += 1;
+                    if stop.load(Ordering::Relaxed) && passes >= 2 {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let writer = {
+            let fixture = Arc::clone(&fixture);
+            let dead = Arc::clone(&dead);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                fixture
+                    .engine
+                    .vacuum_indexes(&users_schema(), &dead)
+                    .unwrap();
+            })
+        };
+
+        writer.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        if let Some(message) = failure.lock().unwrap().take() {
+            panic!("{message}");
+        }
+        // After the dust settles, exactly the live entries remain.
+        let mut pk = pk_index_tids(&fixture.engine);
+        pk.sort_by_key(|l| (l.page_num, l.slot_num));
+        let mut expected: Vec<RowLocation> = live.iter().copied().collect();
+        expected.sort_by_key(|l| (l.page_num, l.slot_num));
+        assert_eq!(pk, expected, "only live entries remain after index vacuum");
     }
 
     #[test]

@@ -542,7 +542,22 @@ design, because index entries accumulate per version as well as heap tuples.
   index vacuum). It does **not** reclaim line pointers `DEAD → UNUSED` (that is the
   separate step below) — `vacuum_heap` has no production caller until the VACUUM
   orchestration (F4a).
-- **Index vacuum**: remove index entries pointing at dead TIDs from every index.
+- **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
+  dangling index entries `vacuum_heap` left behind — for the table's primary-key
+  index **and every live secondary index**, delete every entry whose value (the heap
+  TID) is in `dead_tids`. Entries are matched by **dead-TID membership, not by key**:
+  the heap prune already compacted the page, so the dead tuple's key bytes are gone
+  and the key cannot be recomputed; the leaf's stored TID is the only handle left.
+  Each index is vacuumed in a single leaf-chain walk (`BTree::remove_values_in`),
+  shifting matching entries out of each leaf under its frame write latch and logging a
+  `FullPageImage` of every changed leaf (the `btree::log_full_page` pattern, redone by
+  PageLSN gating regardless of txn id), under the maintenance txn id (`0`). Each index
+  is vacuumed under **its own** per-index structural latch (never two at once). It is
+  **B-link-safe against concurrent lock-free scanners**: no leaf is merged or freed and
+  no right-sibling link is rewritten (an emptied leaf is left in place — accepted
+  bloat), and the per-leaf write latch is mutually exclusive with a reader's per-leaf
+  read latch, so a concurrent scanner can neither miss nor duplicate a live entry. It
+  does **not** reclaim line pointers (the next step). No production caller until F4a.
 - **Line-pointer reclaim**: `DEAD → UNUSED` once no index entry references the
   slot.
 - **Triggering**: an on-demand `VACUUM` command plus opportunistic pruning during
