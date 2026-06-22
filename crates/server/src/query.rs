@@ -37,17 +37,22 @@ pub enum SessionTxnStatus {
 }
 
 /// An open explicit transaction's runtime state, held on the connection `Session`
-/// across statements (`docs/specs/mvcc.md` §7.2). It owns the exclusive write
-/// guard (acquired lazily on the first write) for the whole write-transaction so
-/// concurrent readers stay lock-free while at most one writer runs.
+/// across statements (`docs/specs/mvcc.md` §7.2). It owns the SHARED writer guard
+/// (acquired lazily on the first write) for the whole write-transaction. Under the
+/// E2b lock inversion (§7.1 Stage 2, §10 E2b) the writer guard is shared, so many
+/// write-transactions run concurrently; per-row conflict detection (E1) and the
+/// per-index / per-heap structural latches (E2a) provide write-write safety. Only a
+/// checkpoint (the exclusive guard) excludes writers. Readers stay lock-free.
 pub struct Transaction {
     txn_id: u64,
     isolation: IsolationLevel,
     /// `true` once any statement has entered the `Failed` ('E') state. While set,
     /// every statement except COMMIT/ROLLBACK is rejected with `25P02`.
     failed: bool,
-    /// The exclusive write guard, acquired lazily on the first write statement and
-    /// held until COMMIT/ROLLBACK. A read-only transaction never acquires it.
+    /// The SHARED writer guard, acquired lazily on the first write statement and
+    /// held until COMMIT/ROLLBACK. A read-only transaction never acquires it. It is
+    /// shared (concurrent with other writers); only a checkpoint, holding the
+    /// exclusive guard, waits for it to drain.
     write_guard: Option<WriteGuard>,
     /// The Repeatable Read snapshot: captured once at the first statement and
     /// reused. `None` under Read Committed (a fresh snapshot is captured per
@@ -444,31 +449,31 @@ impl QueryService {
         }
     }
 
-    /// Acquire the exclusive write guard for an explicit transaction's first
-    /// write, holding it on `txn` for the whole write-transaction.
+    /// Acquire the SHARED writer guard for an explicit transaction's first write,
+    /// holding it on `txn` for the whole write-transaction. The guard is shared
+    /// (E2b lock inversion, `docs/specs/mvcc.md` §10 E2b): acquiring it does not
+    /// block on another connection's writer — only on a checkpoint holding the
+    /// exclusive guard.
     ///
-    /// Reentrancy tripwire: a connection must acquire the write guard AT MOST ONCE.
-    /// `parking_lot::RwLock` is non-reentrant, so re-acquiring a held guard would
-    /// block this connection forever (and wedge every other writer, since the guard
-    /// is process-wide). The routing in this module guarantees a single acquire per
-    /// connection; this assertion converts a would-be self-deadlock from a future
-    /// regression into a clear error instead of a silent hang. It does NOT weaken
-    /// writer-vs-writer serialization: a *different* connection's writer (whose
-    /// `txn` has no guard) still blocks and waits inside `begin_write`.
+    /// Correctness assertion (no longer a deadlock guard): a transaction must hold
+    /// AT MOST ONE writer guard. The shared guard IS re-entrant — re-acquiring it on
+    /// the same thread cannot self-deadlock — so this is a cheap invariant check
+    /// ("one writer guard per transaction"), not a hang-prevention measure. It
+    /// catches a routing regression that would leak a second guard, which would keep
+    /// a writer in flight past commit/abort and could stall a checkpoint waiting to
+    /// drain.
     fn acquire_write_guard(&self, txn: &mut Transaction) -> Result<()> {
         if txn.write_guard.is_some() {
             debug_assert!(
                 false,
-                "reentrant write-guard acquisition: this transaction already holds \
-                 the exclusive write guard"
+                "duplicate write-guard acquisition: this transaction already holds \
+                 a writer guard"
             );
             return Err(DbError::internal(
-                "reentrant write-guard acquisition (transaction already holds the write guard)",
+                "duplicate write-guard acquisition (transaction already holds a writer guard)",
             ));
         }
-        // Only reached when this transaction holds no guard, so the blocking acquire
-        // can wait only on another connection's writer, never on ourselves.
-        let guard = self.components.concurrency.begin_write()?;
+        let guard = self.components.concurrency.begin_writer()?;
         txn.write_guard = Some(guard);
         Ok(())
     }
@@ -515,14 +520,19 @@ impl QueryService {
         self.engine.execute(&ctx, &physical)
     }
 
-    /// Execute a write/DDL statement as an autocommit unit under the exclusive
-    /// write guard, committing durably on success and aborting on error.
+    /// Execute a write/DDL statement as an autocommit unit under the SHARED writer
+    /// guard, committing durably on success and aborting on error. The guard is
+    /// shared (E2b, `docs/specs/mvcc.md` §10 E2b), so this autocommit write runs
+    /// concurrently with other writers; only a checkpoint (the exclusive guard)
+    /// excludes it. DDL routes here too — it runs under the same shared guard and
+    /// commits immediately (non-transactional, §4 Decision 6); its own structural
+    /// latches and immediate commit keep it consistent with concurrent writers.
     fn autocommit_write(
         &self,
         bound: BoundStatement,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
-        let guard = self.components.concurrency.begin_write()?;
+        let guard = self.components.concurrency.begin_writer()?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // The autocommit unit begins: allocate the transaction id and register it

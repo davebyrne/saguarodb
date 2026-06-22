@@ -8,7 +8,9 @@ pub mod row;
 pub mod schema;
 pub mod value;
 
-pub use concurrency::{ConcurrencyController, ReadGuard, RwLockConcurrencyController, WriteGuard};
+pub use concurrency::{
+    CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
+};
 pub use context::StatementContext;
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use flush::{FlushPolicy, PageFlushInfo};

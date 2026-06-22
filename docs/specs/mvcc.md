@@ -294,9 +294,11 @@ transaction is never *below* the floor. So:
   of the *oldest* transaction below the requested boundary whose CLOG status is not
   `Committed` (aborted or, under Stage 2, in-flight). That transaction "pins"
   truncation — its records (notably its `Abort`) are retained so its status stays
-  reconstructible at the next recovery. Under Stage-1 serialized writers no write
-  transaction is in-flight during a checkpoint, so in practice the pin is an
-  *aborted* transaction.
+  reconstructible at the next recovery. No write transaction is ever in-flight
+  during a checkpoint — under Stage-1 serialized writers trivially, and under
+  Stage-2 (E2b) because the checkpoint takes the **exclusive** guard that drains all
+  shared writers first — so in practice the pin is an *aborted* transaction. (This
+  preserved invariant is exactly why the E2b inversion needs no fuzzy checkpoint.)
 - The floor is advanced (at truncation, and re-established at recovery) only up to
   — never across — that oldest non-committed transaction: at recovery the floor is
   `min(allocation_boundary, oldest_non_committed_retained_xid)`. Because truncation
@@ -366,9 +368,16 @@ first statement of the transaction and reuses it (see Milestone G).
   `ConcurrencyController` guard). Writers serialize by holding the existing
   exclusive guard (`crates/common/src/concurrency.rs`) for the **whole
   write-transaction** (the owned guard is stored on the connection `Session`).
-- **Stage 2 (Milestone E): concurrent writers.** The global writer lock is
-  replaced by a transaction manager; many write-transactions run concurrently,
-  relying on the buffer pool's existing frame latches for page safety.
+- **Stage 2 (Milestone E): concurrent writers.** *(implemented, E2b.)* The global
+  exclusive writer lock is **inverted** into a shared-writer / exclusive-checkpoint
+  guard: writers take the **shared** guard (`begin_writer`) and run concurrently,
+  the checkpoint takes the **exclusive** guard (`begin_checkpoint`) and drains them.
+  Write-write safety comes from the E1 first-updater-wins conflict detection
+  (`40001`) and the E2a per-index / per-heap structural latches plus the buffer
+  pool's per-frame latches — not from a writer lock. Readers stay lock-free. The
+  exclusive checkpoint guard preserves the "no in-flight writer at checkpoint"
+  invariant verbatim, so Milestone-D recovery / conservative WAL truncation stays
+  correct with no fuzzy checkpoint.
 
 ### 7.2 Lifecycle
 
@@ -653,12 +662,18 @@ plus a checkpoint-coordination guard.
   (no B-link/right-link hand-over-hand), so a per-index latch is the correct
   granularity for now.
 - **E2b — Shared-writer / exclusive-checkpoint guard (the lock inversion).**
-  Invert the existing exclusive writer lock into a shared-writer / exclusive-
-  checkpoint guard: many writers share it, the checkpointer takes it exclusively.
-  This **preserves the "no in-flight writer at checkpoint" invariant** that
+  *(implemented.)* Invert the existing exclusive writer lock into a shared-writer /
+  exclusive-checkpoint guard: writers take the shared guard (`begin_writer`) and run
+  concurrently; the checkpointer takes the exclusive guard (`begin_checkpoint`),
+  draining all writers and running alone. This turns the E1 conflict detection and
+  the E2a per-index / per-heap structural latches into load-bearing, contended
+  mechanisms. It **preserves the "no in-flight writer at checkpoint" invariant** that
   Milestone-D recovery/truncation relies on (conservative truncation never crosses
   an in-flight writer — §8, §5.4), so recovery stays correct without a fuzzy
-  checkpoint.
+  checkpoint. The buffer pool's steal-eviction is made concurrency-safe under
+  overlapping writers (an `evicting` frame is never handed out, so a steal can never
+  flush a stale snapshot of a frame a writer is concurrently modifying; page-number
+  allocation and the extent seed are pool-lock-atomic).
 
 **Deferred from Milestone E** (§12): the true concurrent / B-link writer protocol
 (latch-coupled, fully-concurrent B-tree); blocking + deadlock detection (instead

@@ -228,39 +228,43 @@ async fn read_committed_sees_concurrent_commit_between_statements() {
     reader.ok("commit").await;
 }
 
-/// Two write transactions are serialized by the exclusive guard: the second
-/// proceeds only after the first ends, and neither corrupts the other. A read
-/// runs concurrently with the open writer.
+/// Two write transactions on DIFFERENT rows run CONCURRENTLY (E2b: writers share
+/// the writer guard). Writer B is NOT blocked behind A's open write transaction —
+/// it inserts a different key and commits WHILE A is still open. Neither corrupts
+/// the other, and a read runs concurrently with both open writers.
 #[tokio::test]
-async fn write_transactions_serialize_and_a_read_runs_concurrently() {
+async fn write_transactions_run_concurrently_and_a_read_runs_concurrently() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
         .ok("create table accounts (id integer primary key, balance integer)")
         .await;
 
-    // Writer A opens a transaction and inserts; it now holds the exclusive guard.
+    // Writer A opens a transaction and inserts; it holds the SHARED writer guard.
     let mut a = Connection::connect(&server).await.unwrap();
     a.ok("begin").await;
     a.ok("insert into accounts (id, balance) values (1, 100)")
         .await;
+    assert_eq!(server.active_txn_count(), 1, "A's writer is in-flight");
 
-    // Writer B (its own connection) tries to insert in its own transaction. The
-    // insert blocks on the write guard until A's transaction ends. Run it in a
-    // task and confirm it is still pending while A holds the guard.
-    let addr_server = &server;
-    let mut b = Connection::connect(addr_server).await.unwrap();
-    let b_task = tokio::spawn(async move {
+    // Writer B (its own connection) inserts a DIFFERENT key in its own transaction
+    // WHILE A is still open. Under E2b the shared writer guard does not block it, so
+    // B's whole BEGIN/INSERT/COMMIT must complete promptly even though A is open.
+    let mut b = Connection::connect(&server).await.unwrap();
+    let b_done = tokio::time::timeout(Duration::from_secs(5), async {
         b.ok("begin").await;
-        // This insert blocks until A commits.
         b.ok("insert into accounts (id, balance) values (2, 200)")
             .await;
         b.ok("commit").await;
-        b
-    });
+    })
+    .await;
+    assert!(
+        b_done.is_ok(),
+        "writer B must run concurrently with the still-open writer A (not block on it)"
+    );
 
-    // Give B's task a moment to reach (and block on) the write guard. A read on a
-    // third connection still completes concurrently with the open writer A.
+    // A read on a third connection completes concurrently with the still-open A and
+    // sees only B's committed row (Read Committed), not A's uncommitted insert.
     let mut reader = Connection::connect(&server).await.unwrap();
     let read = tokio::time::timeout(
         Duration::from_secs(2),
@@ -269,24 +273,14 @@ async fn write_transactions_serialize_and_a_read_runs_concurrently() {
     .await
     .expect("a read runs concurrently with an open writer")
     .unwrap();
-    // The read sees nothing yet (A and B are both uncommitted).
-    assert!(read.result.unwrap().unwrap_rows().is_empty());
-
-    // B's task should still be blocked on the guard (A has not ended). It must not
-    // have finished yet.
-    assert!(
-        !b_task.is_finished(),
-        "B's writer must wait behind A's open write transaction"
+    assert_eq!(
+        read.result.unwrap().unwrap_rows(),
+        vec![vec![Some("2".to_string())]],
+        "the read sees B's committed row but not A's uncommitted one"
     );
 
-    // A commits, releasing the guard; B now proceeds and commits too.
+    // A commits; both rows are present and uncorrupted.
     a.ok("commit").await;
-    let _b = tokio::time::timeout(Duration::from_secs(5), b_task)
-        .await
-        .expect("B proceeds once A ends")
-        .unwrap();
-
-    // Both rows are present and uncorrupted.
     let rows = setup
         .ok("select id, balance from accounts order by id")
         .await
@@ -508,6 +502,192 @@ async fn extended_execute_is_gated_by_failed_transaction_state() {
     // The poisoned insert never committed.
     let rows = conn.ok("select id from users").await.rows();
     assert!(rows.is_empty());
+}
+
+/// End-to-end lost-update / `40001` (E2b): two connections each `BEGIN; UPDATE` the
+/// SAME row under their own in-flight transaction. First-updater-wins: exactly one
+/// UPDATE commits; the other surfaces `40001` (`SerializationFailure`) over the
+/// protocol and is poisoned to 'E' (must ROLLBACK). The surviving committed value is
+/// the winner's. The two UPDATEs are aligned with a barrier (no sleeps); the test
+/// asserts the OUTCOME (one winner, one 40001), not which connection wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_update_same_row_yields_one_winner_and_one_40001() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let server = Arc::new(TestServer::start().await.unwrap());
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table accounts (id integer primary key, balance integer)")
+        .await;
+    setup
+        .ok("insert into accounts (id, balance) values (1, 100)")
+        .await;
+
+    // Two writers each open a transaction, then align on the barrier before issuing
+    // the conflicting UPDATE so both transactions are in-flight when they race.
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for (conn_idx, new_balance) in [(0u8, 200), (1u8, 300)] {
+        let server = server.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            let mut conn = Connection::connect(&server).await.unwrap();
+            conn.ok("begin").await;
+            barrier.wait().await;
+            let outcome = conn
+                .ok(&format!(
+                    "update accounts set balance = {new_balance} where id = 1"
+                ))
+                .await;
+            match outcome.result {
+                Ok(_) => {
+                    // The winner commits its update durably.
+                    conn.ok("commit").await;
+                    (conn_idx, Ok(new_balance))
+                }
+                Err(err) => {
+                    // The loser is poisoned to 'E' and must roll back. Its error must
+                    // be the 40001 serialization failure (wire SQLSTATE 40001).
+                    assert_eq!(outcome.status, b'E', "the losing updater enters 'E'");
+                    conn.ok("rollback").await;
+                    (conn_idx, Err(err.message))
+                }
+            }
+        }));
+    }
+
+    let mut winners = 0;
+    let mut conflicts = 0;
+    let mut winning_balance = 0;
+    for handle in handles {
+        let (_idx, result) = handle.await.expect("updater task finished");
+        match result {
+            Ok(balance) => {
+                winners += 1;
+                winning_balance = balance;
+            }
+            Err(message) => {
+                conflicts += 1;
+                assert!(
+                    message.contains("40001"),
+                    "the loser must surface SQLSTATE 40001, got: {message}"
+                );
+            }
+        }
+    }
+    assert_eq!(winners, 1, "exactly one updater commits");
+    assert_eq!(conflicts, 1, "exactly one updater gets 40001");
+
+    // The surviving committed balance is the winner's.
+    let rows = setup
+        .ok("select balance from accounts where id = 1")
+        .await
+        .rows();
+    assert_eq!(rows, vec![vec![Some(winning_balance.to_string())]]);
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// A read-only transaction stays non-blocking while a writer is open (E2b: readers
+/// are lock-free, writers share the guard): connection R opens a transaction and
+/// reads repeatedly while connection W holds an open write transaction; none of R's
+/// reads block, and R does not see W's uncommitted row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_transaction_is_non_blocking_while_a_writer_is_open() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+
+    // Writer W opens a transaction and inserts, holding the shared writer guard.
+    let mut w = Connection::connect(&server).await.unwrap();
+    w.ok("begin").await;
+    w.ok("insert into users (id) values (1)").await;
+    assert_eq!(server.active_txn_count(), 1);
+
+    // Reader R, in its own (read-only) transaction, reads several times while W is
+    // open. Each read must complete promptly (no write guard taken) and never see
+    // W's uncommitted row.
+    let mut r = Connection::connect(&server).await.unwrap();
+    r.ok("begin").await;
+    for _ in 0..5 {
+        let read = tokio::time::timeout(Duration::from_secs(2), r.query("select id from users"))
+            .await
+            .expect("a read-only transaction must stay non-blocking while a writer is open")
+            .unwrap();
+        assert!(
+            read.result.unwrap().unwrap_rows().is_empty(),
+            "the read-only transaction must not see the writer's uncommitted row"
+        );
+    }
+    r.ok("commit").await;
+
+    // W commits; a fresh read now sees the row.
+    w.ok("commit").await;
+    let rows = setup.ok("select id from users").await.rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// Checkpoint-vs-writer (E2b): a forced checkpoint runs WHILE several writer
+/// connections hammer the database. The checkpoint takes the EXCLUSIVE guard, so it
+/// drains all in-flight writers and runs alone — it must complete with no
+/// "unflushable dirty page" error, and afterward every committed row is intact. This
+/// exercises the preserved Milestone-D "no in-flight writer at checkpoint" invariant
+/// under concurrent writers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_drains_concurrent_writers_and_stays_consistent() {
+    use std::sync::Arc;
+
+    let server = Arc::new(TestServer::start().await.unwrap());
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup.ok("create table t (id integer primary key)").await;
+
+    // Several writer tasks insert disjoint key ranges (autocommit per statement) so
+    // many short write transactions are in flight while the checkpoint fires.
+    const WRITERS: i64 = 4;
+    const PER_WRITER: i64 = 60;
+    let mut writers = Vec::new();
+    for w in 0..WRITERS {
+        let server = server.clone();
+        writers.push(tokio::spawn(async move {
+            let mut conn = Connection::connect(&server).await.unwrap();
+            let base = w * PER_WRITER;
+            for i in 0..PER_WRITER {
+                let id = base + i + 1;
+                conn.ok(&format!("insert into t (id) values ({id})")).await;
+            }
+        }));
+    }
+
+    // Fire a checkpoint concurrently with the writers. It must complete cleanly (its
+    // `flush_dirty_pages` would Err on an unflushable page); it drains writers via
+    // the exclusive guard. Run a couple to overlap more of the writers' lifetimes.
+    for _ in 0..2 {
+        server.force_checkpoint().await.expect(
+            "checkpoint must complete cleanly while writers run (drained, no unflushable page)",
+        );
+    }
+
+    for handle in writers {
+        handle.await.expect("writer task finished");
+    }
+    // A final checkpoint after all writers have drained.
+    server.force_checkpoint().await.unwrap();
+
+    // Every committed row survived the concurrent checkpointing.
+    let rows = setup.ok("select id from t order by id").await.rows();
+    let expected: Vec<Vec<Option<String>>> = (1..=(WRITERS * PER_WRITER))
+        .map(|id| vec![Some(id.to_string())])
+        .collect();
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "no committed row lost across concurrent checkpointing"
+    );
+    assert_eq!(rows, expected);
+    assert_eq!(server.active_txn_count(), 0);
 }
 
 /// Poll `condition` until it holds or `timeout` elapses; panics on timeout.

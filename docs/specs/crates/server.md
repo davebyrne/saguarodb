@@ -144,10 +144,15 @@ The query path is a real transaction lifecycle; autocommit is an implicit single
 - **Autocommit**: a data/DDL statement with no open block runs as an implicit `BEGIN…COMMIT` around the one statement (allocate, snapshot, execute, commit-or-abort), preserving the prior external behavior exactly.
 - **Disconnect**: an open transaction held on a dropped `Session` is aborted (status-based: `Abort` record + `CLOG=Aborted` + write-guard release + deregister, no page undo), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry.
 
-### Concurrency — Stage 1 (concurrent readers, serialized writers)
+### Concurrency — Stage 2 (concurrent readers AND writers; Milestone E)
 
-- **Readers run lock-free.** A read-only statement/transaction takes **no** `ConcurrencyController` guard. It captures its snapshot under the active-transaction-registry latch and reads via the buffer pool's per-frame latches, so it runs concurrently with an in-flight writer and skips that writer's uncommitted versions by MVCC visibility.
-- **Writers serialize.** A write transaction acquires the exclusive write guard **lazily** on its first write statement and holds the owned guard on the `Session` for the whole write-transaction, releasing it at COMMIT/ROLLBACK/disconnect. Autocommit write = acquire for the one statement, release at the implicit commit. DDL takes the exclusive guard and commits immediately. This is Stage 1: many readers concurrent with at most one writer (concurrent writers + conflict detection are Milestone E).
+As of Milestone E2b the global writer lock is **inverted** into a shared-writer / exclusive-checkpoint guard (`common.md`, `mvcc.md` §10 E2b), so write-transactions now run concurrently.
+
+- **Readers run lock-free.** A read-only statement/transaction takes **no** `ConcurrencyController` guard. It captures its snapshot under the active-transaction-registry latch and reads via the buffer pool's per-frame latches, so it runs concurrently with in-flight writers and skips their uncommitted versions by MVCC visibility. (Unchanged from Stage 1.)
+- **Writers run concurrently.** A write transaction acquires the **SHARED** writer guard (`begin_writer`) **lazily** on its first write statement and holds the owned guard on the `Session` for the whole write-transaction, releasing it at COMMIT/ROLLBACK/disconnect. Many writers hold it at once; write-write safety comes from per-row conflict detection (E1: first-updater-wins `40001`) and the per-index / per-heap structural latches in `storage` (E2a), not from this lock. Autocommit write = acquire the shared guard for the one statement, release at the implicit commit. DDL also runs under the shared guard and commits immediately (non-transactional, rejected inside a block); a fresh DDL-built file is not yet visible to other transactions, so its backfill is uncontended.
+- **Checkpoint excludes writers.** `run_checkpoint` takes the **EXCLUSIVE** checkpoint guard (`begin_checkpoint`), which drains all in-flight writers and then runs alone — preserving the Milestone-D "no in-flight writer at checkpoint" invariant verbatim (so recovery / conservative WAL truncation stay correct without a fuzzy checkpoint). The `acquire-at-most-one-writer-guard-per-transaction` reentrancy tripwire is now a cheap correctness assertion (the shared guard is re-entrant), not a deadlock guard.
+
+Deferred from Milestone E (`mvcc.md` §12): a fully-concurrent / B-link writer protocol (so E2a takes per-index latches instead), blocking + deadlock detection (instead of fail-fast `40001`), and a fuzzy checkpoint (checkpointing with writers in flight).
 
 ### Snapshot capture (per isolation)
 
@@ -160,14 +165,15 @@ Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistentl
 Statement guard policy:
 
 - No guard: SELECT and EXPLAIN (lock-free readers), and a read-only explicit transaction.
-- Write guard (exclusive, held for the whole write-transaction): INSERT, UPDATE, DELETE, and an explicit transaction once its first write runs. Acquired lazily.
-- Write guard (exclusive, per statement): CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX (DDL is non-transactional and rejected inside a block), and checkpoint.
+- Shared writer guard (`begin_writer`, held for the whole write-transaction, many concurrent): INSERT, UPDATE, DELETE, and an explicit transaction once its first write runs. Acquired lazily.
+- Shared writer guard (`begin_writer`, per statement): CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX (DDL is non-transactional and rejected inside a block).
+- Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): checkpoint only.
 
 Bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution.
 
 Write statement protocol (autocommit; an explicit write transaction is the same but the guard spans all its statements and the commit/abort happens at COMMIT/ROLLBACK):
 
-1. Acquire the exclusive write guard (lazily, on the first write in an explicit transaction).
+1. Acquire the shared writer guard (lazily, on the first write in an explicit transaction; concurrent with other writers).
 2. Allocate `txn_id` and register it active (atomically under the registry latch).
 3. Execute storage/catalog operations.
 4. If execution fails, append `Abort` (`CLOG=Aborted`), call `storage.rollback_txn(txn_id)` (DDL-metadata restore only), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog `restore` when needed, then return error. Abort is status-based — the failed statement's heap versions stay invisible via the CLOG, not undone. In an explicit transaction the statement error instead poisons the block to `'E'` and the abort runs at ROLLBACK.
@@ -175,7 +181,7 @@ Write statement protocol (autocommit; an explicit write transaction is the same 
 6. Flush WAL.
 7. The statement/transaction is now durable and must not be rolled back or reported as a normal SQL failure.
 8. Call `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` to discard in-memory rollback metadata.
-9. Release write guard.
+9. Release the shared writer guard.
 10. Call `record_commit_and_maybe_checkpoint(&components)`.
 11. Return success.
 
@@ -185,7 +191,7 @@ If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails be
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback and must not restore the catalog. Treat it as a fatal internal error: log it, flush WAL, and terminate the process because recovery will replay the durable commit.
 
-Checkpoint may run after successful writes according to configured thresholds. It is called after the statement write guard is released because `run_checkpoint` acquires its own write guard.
+Checkpoint may run after successful writes according to configured thresholds. It is called after the statement's shared writer guard is released because `run_checkpoint` acquires the exclusive checkpoint guard, which must drain all writers (including this connection's, were it still held).
 
 `ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>` in v1. Startup uses it for `install_schemas` and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
@@ -226,9 +232,9 @@ a `Mutex<BTreeSet<TxnId>>` of currently in-progress transaction ids, with an
 `O(log n)` minimum. The lifecycle registers a `txn_id` when it is allocated
 (`register_allocated`, which advances `next_txn_id` and inserts the id under the
 same latch) and deregisters it on commit or rollback. With concurrent readers and
-serialized writers (Stage 1), at most one write transaction is registered at a
-time, but a read's snapshot capture may observe it; the set is no longer always
-empty between statements. Snapshot capture (`capture_snapshot` via
+**concurrent** writers (Stage 2, E2b), several write transactions may be registered
+at once, and a read's snapshot capture may observe any of them; the set is no longer
+always empty between statements. Snapshot capture (`capture_snapshot` via
 `snapshot_with_boundary`) reads `active_ids()` for `xip` (excluding the statement's
 own txn) and the minimum for `xmin`, taking the registry latch across the active-set
 read and the `next_txn_id` read so the snapshot is not torn relative to a
@@ -239,9 +245,10 @@ registry of still-running transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the
-server under the exclusive write guard:
+server under the **exclusive checkpoint guard** (E2b), which drains all in-flight
+shared writers and runs alone:
 
-1. Acquire write guard.
+1. Acquire the exclusive checkpoint guard (`begin_checkpoint`) — waits for all in-flight writers to drain, then holds off any new writer until the checkpoint returns.
 2. `wal.flush()` (a page's redo must be durable before the page is written).
 3. `buffer_pool.flush_dirty_pages()` — write every flushable dirty page to the heap `PageStore`. With the relaxed flush gate (Milestone D1, `mvcc.md` §8) this spills committed, aborted, and — under Stage 2 — in-flight dirty pages alike; all are WAL-durable after (2), and the CLOG hides the non-committed tuples.
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
@@ -249,7 +256,7 @@ server under the exclusive write guard:
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
 7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`. Truncation is **conservative**: it never drops an aborted/in-flight transaction's records (it pins on the oldest non-committed one), so aborted-but-flushed versions stay invisible across restart (`wal.md`, `mvcc.md` §5.4/§8).
 8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
-9. Release write guard.
+9. Release the shared writer guard.
 
 The durability-critical ordering is: heap fsync (4) before the control record (6) before WAL truncation (7). A crash before the control record falls back to the previous redo boundary, where this cycle's full-page images repair any torn heap writes.
 
@@ -303,9 +310,12 @@ rejects non-control statements with `25P02`, and a transaction-control portal
 affects `Session.txn` exactly like a simple-query control statement. With no open
 transaction (`Session.txn` is `None`), `Execute` is its own autocommit unit via
 `QueryService::execute_prepared_cancelable`. Routing both protocols through the one
-transaction slot keeps the invariant that a connection acquires the exclusive write
-guard at most once, so an extended write on a connection already inside a write
-transaction never re-acquires the guard (which would self-deadlock). `Sync` sends
+transaction slot keeps the invariant that a connection acquires the (shared) writer
+guard at most once per transaction, so an extended write on a connection already
+inside a write transaction never acquires a second guard. Under E2b the shared guard
+is re-entrant (a second acquire would not self-deadlock), so this is now a cheap
+correctness assertion — leaking a second guard would keep a writer in flight past
+commit/abort and could stall a checkpoint draining writers. `Sync` sends
 `ReadyForQuery`; `Flush` flushes; `Close` drops a statement or portal and replies
 `CloseComplete`. An error inside an extended sequence sends `ErrorResponse` and then
 skips the remaining extended messages until `Sync`; a simple `Query` also clears

@@ -157,14 +157,23 @@ impl MemoryBufferPool {
         Self::new(frame_count, Box::new(NeverFlush), Arc::new(NoopPageStore))
     }
 
-    fn read_resident_page(&self, file_id: FileId, page_num: PageNum) -> Option<PageReadGuard> {
-        let frame = {
-            let state = self.state.lock();
-            let frame = state.frames.get(&(file_id, page_num)).cloned()?;
-            frame.pin();
-            frame
-        };
-        Some(read_guard(file_id, page_num, frame))
+    /// Look up a resident frame for use, classifying the page-table state under the
+    /// pool lock so an in-transition (`evicting`) frame is never handed out
+    /// (Milestone E2b). `Found` pins the frame ready to use; `Evicting` means a steal
+    /// is flushing this exact page — the caller must drop the lock, yield, and retry
+    /// (after the steal removes it, a fresh load from disk sees the flushed bytes);
+    /// `Absent` means load it from the store.
+    fn lookup_resident(&self, file_id: FileId, page_num: PageNum) -> ResidentLookup {
+        let state = self.state.lock();
+        match state.frames.get(&(file_id, page_num)) {
+            Some(frame) if frame.evicting.load(Ordering::Acquire) => ResidentLookup::Evicting,
+            Some(frame) => {
+                let frame = frame.clone();
+                frame.pin();
+                ResidentLookup::Found(frame)
+            }
+            None => ResidentLookup::Absent,
+        }
     }
 
     /// Run `attempt` under the pool lock. `Ok(Some)` succeeds; `Ok(None)` means the
@@ -210,40 +219,54 @@ impl MemoryBufferPool {
                 }
             };
 
-            // Flush the reserved victim to its home without holding the pool lock.
-            // Safety rests on the per-frame latch and pin discipline, not on any
-            // global controller (lock-free readers take no controller guard): a
-            // victim is only reclaimed when unpinned, and any frame with an
-            // in-flight write is pinned by its live `PageWriteGuard`, so it is never
-            // chosen here. We snapshot the page bytes under the frame's read latch
-            // (`victim.data.read()`), so a concurrent reader or a writer on a
-            // *different* frame cannot tear this copy. The reservation pin keeps
-            // another eviction from racing this one; a reader that pins the victim
-            // during the flush is detected below.
+            // Flush the reserved victim to its home WITHOUT holding the pool lock.
+            // Safety rests on the per-frame pin/latch discipline plus the `evicting`
+            // flag, not on any global controller (lock-free readers take no controller
+            // guard; under E2b writers no longer serialize either):
             //
-            // Either fallible step (`ensure_durable` — write-ahead logging, forcing
-            // the WAL so the possibly-uncommitted victim's records are durable before
-            // its page reaches the heap, Milestone D1 — or the page write) must
-            // release the reservation pin on error, or the victim frame leaks
-            // (stays pinned, never evictable).
+            // - A victim is reclaimed only when `pin_count == 0`, so no frame with an
+            //   in-flight read/write (each pins via its live guard) is ever chosen.
+            // - `reclaim_victim` set `evicting` under the pool lock at reservation, so
+            //   from now until removal NO accessor can hand this frame out or modify it
+            //   (`read`/`write`/`get_or_insert_clean` see `evicting` and retry). With
+            //   `pin_count == 0` at reservation and no new pins afterward, the bytes are
+            //   frozen — the snapshot below is a stable, consistent copy. This closes
+            //   the lost-update race a concurrent writer could otherwise win (modify the
+            //   frame after the snapshot, then the steal marks it clean and drops it),
+            //   which the single global writer lock previously masked (pre-E2b).
+            // - `ensure_durable` forces the WAL so the possibly-uncommitted page's
+            //   records are durable before it reaches the heap (write-ahead logging,
+            //   Milestone D1).
+            //
+            // Either fallible step (`ensure_durable` or the page write) must clear
+            // `evicting` and release the reservation pin on error, or the victim frame
+            // leaks (stays pinned + un-handout-able, never evictable).
             let flush_result = self.flush_policy.ensure_durable().and_then(|()| {
                 let data = victim.data.read().clone();
                 self.store
                     .write_page(victim.file_id, victim.page_num, &data)
             });
             if let Err(err) = flush_result {
-                victim.unpin(); // release the flush reservation before propagating
+                // Abort the eviction: clear `evicting` so the frame is usable again,
+                // then release the reservation pin before propagating.
+                victim.evicting.store(false, Ordering::Release);
+                victim.unpin();
                 return Err(err);
             }
 
             let mut state = self.state.lock();
             victim.unpin(); // release the flush reservation
+            // With `evicting` set no accessor could re-pin the frame after reservation,
+            // so `pin_count` is 0 here. Remove it. (The defensive re-check stays: were
+            // it ever non-zero, abort the eviction rather than drop a referenced frame.)
             if victim.pin_count.load(Ordering::Acquire) == 0 {
                 victim.mark_clean();
                 state.remove_frame((victim.file_id, victim.page_num));
                 return Ok(());
             }
-            // A reader pinned the victim during the flush; try another frame.
+            // Defensive: a frame somehow still referenced — abort this eviction and
+            // try another. Clear `evicting` so it is usable again.
+            victim.evicting.store(false, Ordering::Release);
         }
     }
 
@@ -253,15 +276,35 @@ impl MemoryBufferPool {
     /// without this the counter would start at 0 for checkpointed-but-not-replayed
     /// files and `new_page` would overwrite committed data.
     ///
-    /// The extent read happens outside the pool lock; that is sound because the
-    /// single writer holds the server's exclusive statement guard, so no
-    /// concurrent flush can extend the file between the read and the seed.
+    /// Concurrent-writer safety (Milestone E2b). The on-disk extent read and the
+    /// seed are done under ONE continuous hold of the pool lock, so the
+    /// "read `page_count` → `ensure_next_page_at_least`" pair is atomic against any
+    /// concurrent pool-lock holder (another `new_page`/`load_page` advancing the
+    /// counter, or a steal removing a frame). Seeding happens at most once per file
+    /// (`extent_seeded`). Independently, the only on-disk extender of `file_id`
+    /// besides this seed is (a) the checkpoint's `flush_dirty_pages`, which runs
+    /// alone under the EXCLUSIVE guard so no writer — hence no seed — is concurrent,
+    /// and (b) steal-eviction writing a stolen dirty page, whose page number was
+    /// already allocated by a prior `new_page(file_id)` that already seeded
+    /// `file_id` — so a steal of `file_id` implies `file_id` is already seeded and
+    /// cannot grow it out from under a first seed. (Pre-E2b this read happened
+    /// OUTSIDE the lock, justified only by the now-removed single global writer
+    /// guard; the lock-held read makes the seed self-contained.)
     fn ensure_extent_seeded(&self, file_id: FileId) -> Result<()> {
-        if self.state.lock().extent_seeded.contains(&file_id) {
+        // Read the extent and seed under ONE continuous hold of the pool lock, so
+        // the "read `page_count` → `ensure_next_page_at_least`" pair is atomic: no
+        // concurrent pool-lock holder (another `new_page`/`load_page` advancing the
+        // counter, or a steal removing a frame) can interleave between the read and
+        // the seed and leave the counter seeded below the true extent. Seeding
+        // happens at most once per file (`extent_seeded`), so the page-count syscall
+        // under the lock runs at most once per file — cheap — and it cannot re-enter
+        // the pool lock (it takes only the page store's own file-handle lock, never
+        // this one).
+        let mut state = self.state.lock();
+        if state.extent_seeded.contains(&file_id) {
             return Ok(());
         }
         let extent = self.store.page_count(file_id)?;
-        let mut state = self.state.lock();
         if state.extent_seeded.insert(file_id) {
             state.ensure_next_page_at_least(file_id, extent);
         }
@@ -323,17 +366,26 @@ impl MemoryBufferPool {
         })
     }
 
+    /// Classify a resident frame for a write, like `lookup_resident`, but marking the
+    /// frame dirty under `txn_id` when found. An `evicting` frame is not handed out
+    /// (the caller retries); a missing frame loads from the store.
     fn prepare_write_frame(
         &self,
         file_id: FileId,
         page_num: PageNum,
         txn_id: u64,
-    ) -> Option<Arc<Frame>> {
+    ) -> ResidentLookup {
         let state = self.state.lock();
-        let frame = state.frames.get(&(file_id, page_num)).cloned()?;
-        frame.mark_dirty(txn_id);
-        frame.pin();
-        Some(frame)
+        match state.frames.get(&(file_id, page_num)) {
+            Some(frame) if frame.evicting.load(Ordering::Acquire) => ResidentLookup::Evicting,
+            Some(frame) => {
+                let frame = frame.clone();
+                frame.mark_dirty(txn_id);
+                frame.pin();
+                ResidentLookup::Found(frame)
+            }
+            None => ResidentLookup::Absent,
+        }
     }
 
     fn storage_internal_error(message: impl Into<String>) -> DbError {
@@ -343,15 +395,23 @@ impl MemoryBufferPool {
 
 impl BufferPool for MemoryBufferPool {
     fn read_page(&self, file_id: FileId, page_num: PageNum) -> Result<PageReadGuard> {
-        if let Some(guard) = self.read_resident_page(file_id, page_num) {
-            return Ok(guard);
-        }
-
-        match self.store.load_page(file_id, page_num)? {
-            Some(data) => self.insert_loaded_read_page(file_id, page_num, data),
-            None => Err(Self::storage_internal_error(format!(
-                "page not found: file_id={file_id}, page_num={page_num}"
-            ))),
+        loop {
+            match self.lookup_resident(file_id, page_num) {
+                ResidentLookup::Found(frame) => return Ok(read_guard(file_id, page_num, frame)),
+                // A steal is flushing this page; wait for it to finish (it removes the
+                // frame under the lock), then load the flushed bytes from the store.
+                ResidentLookup::Evicting => {
+                    std::thread::yield_now();
+                }
+                ResidentLookup::Absent => {
+                    return match self.store.load_page(file_id, page_num)? {
+                        Some(data) => self.insert_loaded_read_page(file_id, page_num, data),
+                        None => Err(Self::storage_internal_error(format!(
+                            "page not found: file_id={file_id}, page_num={page_num}"
+                        ))),
+                    };
+                }
+            }
         }
     }
 
@@ -361,19 +421,29 @@ impl BufferPool for MemoryBufferPool {
         page_num: PageNum,
         txn_id: u64,
     ) -> Result<PageWriteGuard> {
-        let frame = if let Some(frame) = self.prepare_write_frame(file_id, page_num, txn_id) {
-            frame
-        } else {
-            match self.store.load_page(file_id, page_num)? {
-                Some(data) => self.insert_loaded_write_page(file_id, page_num, txn_id, data)?,
-                None => {
-                    return Err(Self::storage_internal_error(format!(
-                        "page not found: file_id={file_id}, page_num={page_num}"
-                    )));
+        loop {
+            match self.prepare_write_frame(file_id, page_num, txn_id) {
+                ResidentLookup::Found(frame) => {
+                    return Ok(write_guard(file_id, page_num, frame));
+                }
+                ResidentLookup::Evicting => {
+                    std::thread::yield_now();
+                }
+                ResidentLookup::Absent => {
+                    let frame = match self.store.load_page(file_id, page_num)? {
+                        Some(data) => {
+                            self.insert_loaded_write_page(file_id, page_num, txn_id, data)?
+                        }
+                        None => {
+                            return Err(Self::storage_internal_error(format!(
+                                "page not found: file_id={file_id}, page_num={page_num}"
+                            )));
+                        }
+                    };
+                    return Ok(write_guard(file_id, page_num, frame));
                 }
             }
-        };
-        Ok(write_guard(file_id, page_num, frame))
+        }
     }
 
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard> {
@@ -497,12 +567,24 @@ impl BufferPool for MemoryBufferPool {
 
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard> {
         const RECOVERY_TXN: u64 = 0;
-        if let Some(frame) = self.prepare_write_frame(file_id, page_num, RECOVERY_TXN) {
-            return Ok(write_guard(file_id, page_num, frame));
+        // Recovery is single-threaded (no concurrent steal), so `Evicting` cannot
+        // occur here; loop anyway to keep the contract uniform with `write_page`.
+        loop {
+            match self.prepare_write_frame(file_id, page_num, RECOVERY_TXN) {
+                ResidentLookup::Found(frame) => {
+                    return Ok(write_guard(file_id, page_num, frame));
+                }
+                ResidentLookup::Evicting => {
+                    std::thread::yield_now();
+                }
+                ResidentLookup::Absent => {
+                    let data = self.store.load_page(file_id, page_num)?.unwrap_or_default();
+                    let frame =
+                        self.insert_loaded_write_page(file_id, page_num, RECOVERY_TXN, data)?;
+                    return Ok(write_guard(file_id, page_num, frame));
+                }
+            }
         }
-        let data = self.store.load_page(file_id, page_num)?.unwrap_or_default();
-        let frame = self.insert_loaded_write_page(file_id, page_num, RECOVERY_TXN, data)?;
-        Ok(write_guard(file_id, page_num, frame))
     }
 }
 
@@ -540,8 +622,9 @@ impl PoolState {
     }
 
     /// Return the resident frame for `(file_id, page_num)`, or insert `data` as a
-    /// clean frame if there is room. `None` means the pool is full; the caller
-    /// frees a frame and retries. A resident page is returned unchanged (bytes,
+    /// clean frame if there is room. `None` means the pool is full **or** the resident
+    /// frame is mid-eviction (`evicting`); either way the caller frees a frame / waits
+    /// and retries (Milestone E2b). A resident page is returned unchanged (bytes,
     /// dirty state, and rollback metadata are left intact).
     fn get_or_insert_clean(
         &mut self,
@@ -552,6 +635,12 @@ impl PoolState {
     ) -> Option<Arc<Frame>> {
         let key = (file_id, page_num);
         if let Some(frame) = self.frames.get(&key) {
+            // A frame a steal is flushing must not be handed out (a writer could lose
+            // its modification against the in-flight flush). Signal a retry; the steal
+            // removes the frame shortly and the retry re-loads the flushed bytes.
+            if frame.evicting.load(Ordering::Acquire) {
+                return None;
+            }
             frame.reference_bit.store(true, Ordering::Release);
             return Some(frame.clone());
         }
@@ -644,7 +733,14 @@ impl PoolState {
                     page_lsn: None,
                 };
                 if flush_policy.can_flush(&info) {
-                    frame.pin(); // reserve across the unlocked flush
+                    // Reserve across the unlocked flush. `pin_count == 0` here (checked
+                    // above), so no accessor currently holds this frame; setting
+                    // `evicting` under the pool lock now makes every subsequent
+                    // resident-page lookup skip it, so no NEW accessor can grab it and
+                    // modify its bytes while the steal flushes them. The pin keeps
+                    // another steal from also reserving it.
+                    frame.evicting.store(true, Ordering::Release);
+                    frame.pin();
                     return ReclaimOutcome::ReservedDirty(frame);
                 }
             }
@@ -652,6 +748,17 @@ impl PoolState {
         }
         ReclaimOutcome::NoVictim
     }
+}
+
+/// Classification of a resident-page lookup under the pool lock (Milestone E2b).
+enum ResidentLookup {
+    /// The page is resident and usable; the frame is pinned and ready.
+    Found(Arc<Frame>),
+    /// A steal is flushing this exact page (`evicting`): the caller must drop the
+    /// lock, yield, and retry, then load the flushed bytes from the store.
+    Evicting,
+    /// The page is not resident; load it from the store.
+    Absent,
 }
 
 /// Outcome of a clock-sweep victim search (see `PoolState::reclaim_victim`).
@@ -673,6 +780,14 @@ struct Frame {
     dirty_txn_id: AtomicU64,
     reference_bit: AtomicBool,
     needs_fpi: AtomicBool,
+    /// Set under the pool lock when a steal reserves this dirty frame for an
+    /// out-of-lock flush+evict (Milestone E2b). While set, no accessor may hand the
+    /// frame out for use (`read`/`write`/`get_or_insert_clean` treat it as in
+    /// transition and retry), so a concurrent writer can never modify a frame whose
+    /// bytes the steal is flushing — closing the lost-update race the single global
+    /// writer lock previously masked. Cleared if the eviction is aborted (the frame
+    /// got re-pinned); a removed frame drops, so the flag need not be reset there.
+    evicting: AtomicBool,
 }
 
 impl Frame {
@@ -692,6 +807,7 @@ impl Frame {
             dirty_txn_id: AtomicU64::new(0),
             reference_bit: AtomicBool::new(true),
             needs_fpi: AtomicBool::new(needs_fpi),
+            evicting: AtomicBool::new(false),
         }
     }
 
@@ -1396,5 +1512,75 @@ mod tests {
         // A loaded (on-disk) page needs a full-page image on first modification.
         assert!(page.take_needs_fpi());
         assert!(!page.take_needs_fpi());
+    }
+
+    /// Concurrent steal-vs-write regression (Milestone E2b). Several threads each
+    /// allocate fresh pages and stamp a unique byte into each through a TINY pool, so
+    /// most pages are continuously stolen out to the store while others allocate and
+    /// write. Every page's stamped byte must survive — read back from the pool (which
+    /// reloads stolen pages from the store). Before the `evicting`-flag guard a steal
+    /// could flush a stale snapshot of a frame a writer was concurrently modifying and
+    /// then drop the frame, silently losing the write; this test would then read back
+    /// the wrong byte (or a missing page).
+    #[test]
+    fn concurrent_writes_survive_steal_eviction() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let store = Arc::new(MemStore::default());
+        // A small pool with just a little headroom over the concurrent in-flight set
+        // (one pinned write page per thread): enough that `new_page` always finds a
+        // victim, but small enough that nearly every page is stolen out to the store —
+        // maximizing the steal-vs-write overlap the `evicting` guard must make safe.
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 80;
+        let pool = Arc::new(MemoryBufferPool::new(
+            THREADS as usize + 2,
+            Box::new(FlushAll),
+            store.clone(),
+        ));
+        pool.enable_stealing();
+        let barrier = Arc::new(Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let file_id: FileId = t; // disjoint file per thread (distinct page space)
+                let txn = u64::from(t) + 1;
+                barrier.wait();
+                let mut pages = Vec::new();
+                for i in 0..PER_THREAD {
+                    let mut page = pool.new_page(file_id, txn).unwrap();
+                    // A byte pattern unique to (thread, sequence) so a lost/overwritten
+                    // write is detectable on read-back.
+                    let stamp = ((t << 4) ^ i) as u8;
+                    page.data_mut()[0] = stamp;
+                    page.data_mut()[1] = t as u8;
+                    let page_num = page.page_num();
+                    drop(page); // unpin so the frame is steal-eligible
+                    pages.push((page_num, stamp));
+                }
+                pool.commit(txn).unwrap();
+                (file_id, pages)
+            }));
+        }
+
+        let mut all = Vec::new();
+        for handle in handles {
+            all.push(handle.join().expect("writer thread finished"));
+        }
+
+        // Every page's stamp survives (read back, reloading stolen pages from store).
+        for (file_id, pages) in all {
+            for (page_num, stamp) in pages {
+                let page = pool.read_page(file_id, page_num).unwrap();
+                assert_eq!(
+                    page.data()[0],
+                    stamp,
+                    "page {file_id}/{page_num} lost its concurrently-written byte to a steal"
+                );
+            }
+        }
     }
 }

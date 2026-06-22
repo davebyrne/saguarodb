@@ -267,7 +267,11 @@ mod tests {
             })
             .unwrap();
         let _in_flight = app.components.shutdown.begin_query().unwrap();
-        let statement_guard = app.components.concurrency.begin_read().unwrap();
+        // A concurrent writer holds the SHARED writer guard (E2b): the shutdown
+        // checkpoint, which takes the EXCLUSIVE guard, would block behind it. The
+        // timeout on the in-flight query must fire first so shutdown bails out
+        // *before* reaching (and blocking on) that checkpoint.
+        let statement_guard = app.components.concurrency.begin_writer().unwrap();
 
         let shutdown = {
             let app = app.clone();

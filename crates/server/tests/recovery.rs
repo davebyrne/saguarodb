@@ -909,6 +909,95 @@ async fn aborted_autocommit_statement_stays_invisible_after_restart() {
     );
 }
 
+/// Checkpoint-vs-writer under concurrent writers, then crash + recover (E2b). While
+/// several writer connections insert committed rows, a checkpoint fires concurrently:
+/// it takes the EXCLUSIVE guard, drains every in-flight (shared) writer, and runs
+/// alone — so it must complete with no "unflushable dirty page" error (the preserved
+/// "no in-flight writer at checkpoint" invariant). One extra transaction is left
+/// uncommitted at the "crash" (the process drops without COMMIT). After restart the
+/// committed rows all survive and the uncommitted one is invisible (in-flight-at-
+/// crash = aborted) — confirming the inverted lock keeps the Milestone-D guarantees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_concurrent_with_writers_then_crash_recovers_consistently() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    const WRITERS: i64 = 4;
+    const PER_WRITER: i64 = 40;
+    {
+        let server = Arc::new(TestServer::start_with_data_dir(dir.path()).await.unwrap());
+        {
+            let mut setup = Connection::connect(&server).await.unwrap();
+            setup.ok("create table t (id integer primary key)").await;
+        }
+
+        // Writer tasks insert disjoint committed key ranges (autocommit per row), so
+        // many short write transactions are in flight while the checkpoint fires.
+        let mut writers = Vec::new();
+        for w in 0..WRITERS {
+            let server = server.clone();
+            writers.push(tokio::spawn(async move {
+                let mut conn = Connection::connect(&server).await.unwrap();
+                let base = w * PER_WRITER;
+                for i in 0..PER_WRITER {
+                    let id = base + i + 1;
+                    conn.ok(&format!("insert into t (id) values ({id})")).await;
+                }
+            }));
+        }
+
+        // Fire checkpoints concurrently with the writers. Each must complete cleanly
+        // (a drained, no-in-flight-writer body); `force_checkpoint` propagates any
+        // "unflushable dirty page" error, so a panic here would fail the test.
+        for _ in 0..3 {
+            server
+                .force_checkpoint()
+                .await
+                .expect("checkpoint drains writers and completes cleanly under concurrency");
+        }
+
+        for handle in writers {
+            handle.await.expect("writer task finished");
+        }
+
+        // Leave one transaction UNCOMMITTED at the crash: open it and insert a
+        // sentinel row (id 100000), then "crash" without committing. Note we do NOT
+        // checkpoint while this writer is open: a checkpoint takes the EXCLUSIVE guard
+        // and would (correctly) block waiting for this in-flight writer's SHARED guard
+        // to drain. Recovery replays the in-flight insert's WAL records under redo-all
+        // and the CLOG hides them (in-flight-at-crash = aborted), so the sentinel is
+        // invisible after restart regardless of whether its page reached the heap.
+        let mut dangling = Connection::connect(&server).await.unwrap();
+        dangling.ok("begin").await;
+        dangling.ok("insert into t (id) values (100000)").await;
+        // "Crash": drop the connection and the server without committing `dangling`.
+        dangling.close().await;
+        // The server (and its Arc) is dropped at the end of this scope.
+    }
+
+    // Recover and assert consistency: every committed row survives; the uncommitted
+    // sentinel (id 100000) is invisible (in-flight-at-crash = aborted).
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    let expected: Vec<Vec<Option<String>>> = (1..=(WRITERS * PER_WRITER))
+        .map(|id| vec![Some(id.to_string())])
+        .collect();
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "every committed row survives the concurrent checkpoint + crash"
+    );
+    assert_eq!(rows, expected);
+    assert!(
+        !rows.iter().any(|r| r[0] == Some("100000".to_string())),
+        "the uncommitted sentinel row is invisible after recovery"
+    );
+}
+
 /// A 4-frame pool with checkpoints effectively disabled, so a transaction's
 /// working set must exceed the pool and spill (steal) to the heap mid-flight.
 fn small_pool_config(dir: &Path) -> saguarodb_server::config::Config {

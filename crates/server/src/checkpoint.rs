@@ -21,7 +21,16 @@ pub struct CheckpointState {
 /// truncated. A crash before the control record falls back to the previous redo
 /// boundary, where this cycle's full-page images repair any torn heap writes.
 pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
-    let _guard = components.concurrency.begin_write()?;
+    // Take the EXCLUSIVE checkpoint guard (E2b lock inversion, `docs/specs/mvcc.md`
+    // §7.1 Stage 2, §10 E2b). Under concurrent writers (each holding a SHARED writer
+    // guard) this blocks until every in-flight writer has drained, then holds off
+    // any new writer until the checkpoint returns — so the checkpoint body runs with
+    // **no in-flight writer**, exactly as under Stage 1's single exclusive writer.
+    // That preserves the Milestone-D recovery / conservative-truncation invariant
+    // (no in-flight writer is ever below the truncation boundary — §5.4, §8) without
+    // a fuzzy checkpoint, and keeps the `txn_high_water` stamping below correct (no
+    // concurrent writer advances `next_txn_id` while we hold the exclusive guard).
+    let _guard = components.concurrency.begin_checkpoint()?;
 
     // The WAL must be durable before any page it describes is written to the heap.
     // With the relaxed flush gate (`docs/specs/mvcc.md` §8, Milestone D1) this
