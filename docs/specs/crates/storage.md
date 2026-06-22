@@ -38,7 +38,7 @@ pub trait StorageEngine: Send + Sync {
 pub trait SchemaOperations: Send + Sync {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
-    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()>;
+    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema, gc_horizon: u64) -> Result<()>;
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
 }
 
@@ -96,17 +96,33 @@ results are unchanged from the pre-MVCC engine.
   preserves "one visible row per index entry" — exactly the un-indexed members are
   crossed — so no row is double-returned; a cyclic `t_ctid` is a structured error,
   not a spin. The walk is read-latch-only (no page mutation; pruning is the
-  UPDATE/VACUUM path, H3). With no HOT tuples in the heap yet (H2/H3 unimplemented),
-  every root is `NORMAL` with no successor, so resolution is the prior single-tuple
-  visibility check and reads are unchanged. The resolved live version's `RowId` is
-  what a scan yields, not the index TID.
-- **Index backfill is unfiltered; DML locates the visible version.** `create_index`
-  backfill reads the *current physical* tuple (not the snapshot-visible version) to
-  recompute index keys, so it uses the unfiltered heap read. `delete` and `update`
-  instead locate the *visible* version (the row the executor matched) via the
-  visibility predicate (`locate_visible_version`); `delete` stamps its `xmax` in
-  place, `update` stamps it and chains it to the new version. Neither removes an
-  index entry.
+  UPDATE/VACUUM path, H3). The resolved live version's `RowId` is what a scan yields,
+  not the index TID.
+- **HOT-update fast path (Milestone H2).** `update` attempts a HOT update before the
+  normal path (`try_hot_update`): eligible when no indexed column changed (the new
+  row's PK and every secondary key match the predecessor's) AND the new tuple fits on
+  the predecessor's own page (`try_hot_insert_on_page` → `page::try_insert_row`). When
+  eligible it writes the new version as a `HEAP_ONLY` tuple on that page
+  (`codec::encode_row_with_infomask`), stamps the predecessor `xmax`/`t_ctid → new`
+  with `HOT_UPDATED` (`stamp_xmax_logged`, keeping the first-updater-wins `40001`
+  check), and inserts **no index entries** — the H1 walk reaches the new version via
+  the root. Logged with existing `HeapInsert` (`HEAP_ONLY` carried in the row bytes) +
+  `HeapUpdateHeader` records; recovery redoes both. When ineligible (indexed column
+  changed OR no same-page room) it falls back to the normal fully-indexed update
+  (update-path pruning-to-make-room is H3).
+- **Index backfill; DML locates the visible version; HOT broken-chain guard.**
+  `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
+  the chain view is stable) with the GC horizon threaded in. A non-HOT single-version
+  root is indexed from its *current physical* tuple exactly as before. A HOT chain
+  (root + heap-only members, via `collect_chain_versions`) is checked for a **broken
+  chain**: if two or more not-`is_dead_to_all` versions disagree on the new index's
+  key(s), the build aborts with retryable `SerializationFailure` (`40001`); otherwise
+  the single distinct live key is indexed (unconditionally — not gated on the builder's
+  snapshot, so an older concurrent reader's version is still indexable), the entry
+  pointing at the chain ROOT.
+  `delete` and `update` locate the *visible* version via `locate_visible_version`;
+  `delete` stamps its `xmax` in place, `update` stamps it and chains it to the new
+  version (HOT or non-HOT). Neither removes an index entry.
 
 ## Page Format
 
@@ -272,6 +288,18 @@ below).
   INVALID_XID`), an in-flight or aborted deleter, and a committed delete at or above
   the horizon are all left `NORMAL` and untouched (the predicate's
   aborted-creator-any-age / committed-delete-strictly-below-horizon asymmetry).
+- **HOT-chain skip (Milestone H2).** Among the dead-to-all slots, a HOT-chain member
+  (`HEAP_ONLY` OR `HOT_UPDATED` set) is reclaimed **only when its creator aborted**
+  (`XMIN_ABORTED` hint or `status(xmin) == Aborted`); a HOT tuple dead-to-all via a
+  COMMITTED delete is left untouched (skipped). The split is by hazard: an
+  aborted-creator HOT tuple is a dead-end orphan — an aborted UPDATE never sits in the
+  middle of a live chain (its `xmin` is the chain's youngest id and no later version
+  was committed onto it), so reclaiming it cannot sever a still-live successor, and
+  leaving it would leak space and (per `mvcc.md` §5.4 / §9 F4c) keep a surviving on-disk
+  reference to the aborted txn. A committed-deleted HOT member, by contrast, may be the
+  middle of a live committed chain, so reclaiming it would sever the `t_ctid` walk to a
+  still-live successor — that case is deferred to H3's chain-aware pruning (redirect the
+  root, splice the chain). Non-HOT tuples are reclaimed unconditionally on dead-to-all.
 - **Prune + log.** A page with at least one dead slot is rewritten by
   `page::prune_and_compact` (survivors stay byte-identical at their stable slot ids,
   so no index entry is touched) and logged as a **single unconditional**

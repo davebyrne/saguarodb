@@ -247,6 +247,66 @@ async fn committed_update_new_version_survives_restart() {
 }
 
 #[tokio::test]
+async fn hot_update_and_its_chain_survive_restart() {
+    // A HOT update (only the NON-indexed `note` column changes, the new heap-only
+    // tuple fits on the predecessor's page) writes a HeapInsert(HEAP_ONLY) for the
+    // new version and a HeapUpdateHeader(HOT_UPDATED) for the predecessor — NO new
+    // index entry. Recovery redoes both (they are just header/tuple bytes). After
+    // restart the chain is intact: a PK scan sees the NEW note, and the secondary
+    // index on `name` (unchanged, pointing at the chain root) still resolves the row.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text, note text)")
+            .await
+            .unwrap();
+        // Index only `name`, NOT `note`, so updating `note` is HOT-eligible.
+        server
+            .simple_query("create index users_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name, note) values (1, 'Ada', 'v1')")
+            .await
+            .unwrap();
+        // Update only the non-indexed `note` ⇒ a HOT update (same page, no index
+        // change, no new index entry).
+        server
+            .simple_query("update users set note = 'v2' where id = 1")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    // After restart: the heap-only successor (note 'v2') is reached via the chain.
+    let rows = server
+        .simple_query("select id, name, note from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some("Ada".to_string()),
+            Some("v2".to_string())
+        ]]
+    );
+    // The secondary index on the unchanged `name` still resolves the HOT chain to the
+    // updated row (the entry points at the chain root; the bounded walk reaches v2).
+    let rows = server
+        .simple_query("select id, note from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("v2".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn aborted_update_leaves_old_value_after_restart() {
     // An UPDATE that violates a unique secondary constraint errors; the autocommit
     // transaction aborts. Abort is status-based (Milestone D1): the new version

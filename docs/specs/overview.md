@@ -1194,7 +1194,7 @@ V1 development builds do not migrate older page formats. Existing page files wit
 ```
 
 - `row_format_version`: `2`, the MVCC tuple layout. `decode_row` still accepts legacy `1` tuples (`[version=1][null_bitmap][columns]`, no MVCC header); other versions are rejected as corrupt.
-- MVCC tuple header (v2 only, little-endian): `infomask` (2-byte hint bits — `XMIN_COMMITTED`/`XMIN_ABORTED`/`XMAX_COMMITTED`/`XMAX_ABORTED` cache settled CLOG status, `HEAP_ONLY`/`HOT_UPDATED` reserved for HOT, rest reserved-zero), `xmin` (8-byte creator txn id), `xmax` (8-byte deleter txn id; `0` = live), and `t_ctid` (forward successor pointer `(page: u32, slot: u16)`; sentinel `(u32::MAX, u16::MAX)` = latest version).
+- MVCC tuple header (v2 only, little-endian): `infomask` (2-byte hint bits — `XMIN_COMMITTED`/`XMIN_ABORTED`/`XMAX_COMMITTED`/`XMAX_ABORTED` cache settled CLOG status, `HEAP_ONLY`/`HOT_UPDATED` mark HOT-chain tuples (Milestone H: a heap-only successor and the root that was HOT-updated to it), rest reserved-zero), `xmin` (8-byte creator txn id), `xmax` (8-byte deleter txn id; `0` = live), and `t_ctid` (forward successor pointer `(page: u32, slot: u16)`; sentinel `(u32::MAX, u16::MAX)` = latest version).
 - Insert stamps `xmin = txn_id` (from `StatementContext.txn_id`), `xmax = 0`, `t_ctid = sentinel`, `infomask = 0`. Legacy v1 tuples decode as frozen/always-visible (`xmin = FROZEN_XID`, `xmax = 0`).
 - `INTEGER`: 8 bytes, little-endian i64
 - `TEXT`: 4-byte length prefix + UTF-8 bytes

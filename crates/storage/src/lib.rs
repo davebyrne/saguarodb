@@ -137,7 +137,7 @@ mod tests {
             PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap();
         let ctx = StatementContext::new(1);
         storage.create_table(&ctx, &users_schema()).unwrap();
-        storage.create_index(&ctx, &name_index(false)).unwrap();
+        storage.create_index(&ctx, &name_index(false), 0).unwrap();
         wal.flush().unwrap();
 
         let logged = wal
@@ -537,7 +537,7 @@ mod tests {
         // Build the index after the rows exist; backfill must pick them up.
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
 
         let rows = collect(
@@ -556,7 +556,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
 
         // Insert is reflected in the index.
@@ -588,7 +588,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
         harness
             .storage
@@ -611,7 +611,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
         for (id, name) in [(1, "Ada"), (2, "Cleo"), (3, "Bob")] {
             harness
@@ -645,7 +645,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap();
         harness
             .storage
@@ -675,7 +675,7 @@ mod tests {
 
         let err = harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap_err();
         assert_eq!(err.code, SqlState::UniqueViolation);
     }
@@ -687,7 +687,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap();
 
         // name is nullable; SQL treats NULLs as distinct, so two are allowed.
@@ -717,7 +717,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
         harness
             .storage
@@ -750,7 +750,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
         for id in [1, 2, 3] {
             harness
@@ -775,7 +775,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap();
 
         for id in [1, 2, 3] {
@@ -814,7 +814,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap();
         harness
             .storage
@@ -835,7 +835,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(true))
+            .create_index(&ctx, &name_index(true), 0)
             .unwrap();
         harness
             .storage
@@ -867,7 +867,7 @@ mod tests {
         let ctx = StatementContext::new(5);
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
 
         harness.storage.rollback_txn(ctx.txn_id).unwrap();
@@ -888,7 +888,7 @@ mod tests {
         harness.create_users_table(&ctx).unwrap();
         harness
             .storage
-            .create_index(&ctx, &name_index(false))
+            .create_index(&ctx, &name_index(false), 0)
             .unwrap();
         harness
             .storage

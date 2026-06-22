@@ -487,6 +487,54 @@ impl PageBackedStorageEngine {
         }
     }
 
+    /// Write a HOT heap-only successor tuple onto **the predecessor's own page**
+    /// (`page_num`), or return `Ok(None)` when the page has no room (so the caller
+    /// falls back to a normal fully-indexed update). This is the placement half of
+    /// the HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2): unlike
+    /// [`Self::write_new_row`] (which picks *any* page with space), HOT must keep the
+    /// new version on the predecessor's page so the bounded `t_ctid` walk (H1) reaches
+    /// it from the indexed root without a new index entry.
+    ///
+    /// The tuple is encoded with [`crate::codec::HEAP_ONLY`] set in its header
+    /// (`xmin = txn_id`, `xmax = invalid`, `t_ctid = self`), so the bit is carried
+    /// into the logged `HeapInsert` image and redone on recovery (the row bytes are
+    /// the source of truth for `infomask`). It is logged exactly like
+    /// [`Self::log_insert`] (a `FullPageImage` on first touch since the checkpoint,
+    /// else a `HeapInsert` delta), so recovery reinstalls it identically.
+    ///
+    /// **Latching.** Takes the per-heap structural latch then the frame write latch
+    /// for `page_num` (lock order structural → frame → WAL), both released on return.
+    /// The space peek is done **before** consuming the page's first-touch FPI flag,
+    /// so a no-room fall-back does not perturb the page's WAL state.
+    fn try_hot_insert_on_page(
+        &self,
+        schema: &TableSchema,
+        page_num: PageNum,
+        row: &Row,
+        txn_id: u64,
+    ) -> Result<Option<RowLocation>> {
+        let file_id = schema.id;
+        let row_bytes =
+            crate::codec::encode_row_with_infomask(schema, row, txn_id, crate::codec::HEAP_ONLY)?;
+
+        let latch = self.structural_latch(file_id);
+        let _heap_guard = latch.lock();
+        let mut guard = self.buffer_pool.write_page(file_id, page_num, txn_id)?;
+
+        // Peek whether the new tuple fits on THIS page before touching any WAL state
+        // (so a fall-back leaves the page's first-touch FPI flag intact).
+        if !page::has_space_for(guard.data(), row_bytes.len())? {
+            return Ok(None);
+        }
+
+        let slot_num = self.log_insert(&mut guard, txn_id, file_id, page_num, &row_bytes)?;
+        Ok(Some(RowLocation {
+            file_id,
+            page_num,
+            slot_num,
+        }))
+    }
+
     /// Stamp `xmax = txn_id` and `t_ctid` on the version at `location` **in place**
     /// and log its redo record (a full-page image on first touch since the last
     /// checkpoint, else a `HeapUpdateHeader` delta). The line pointer stays
@@ -748,6 +796,100 @@ impl PageBackedStorageEngine {
         }
     }
 
+    /// Collect the physically-present versions of the HOT chain rooted at `root`, in
+    /// chain order: the resolved root tuple plus every heap-only successor reached by
+    /// the bounded `t_ctid` walk (the same `HOT_UPDATED → HEAP_ONLY`, same-page,
+    /// stop-at-independently-indexed rule as [`Self::resolve_visible_in_chain`], but
+    /// gathering ALL members instead of returning the first visible one). Each element
+    /// is `(RowLocation, DecodedRow)` for a `NORMAL` member.
+    ///
+    /// Used by `create_index`'s HOT broken-chain check (`docs/specs/mvcc.md` §10
+    /// Milestone H2): a non-HOT root resolves to a one-element vec (so a plain
+    /// single-version table is untouched); a HOT chain yields its root + heap-only
+    /// members so the build can test whether two not-dead-to-all versions disagree on
+    /// the new index's key. Runs under the exclusive guard (stable physical view), so
+    /// the walk is a pure read with no concurrent mutation. A `DEAD`/`UNUSED` root
+    /// resolves to no versions (`Ok(vec![])`); a corrupt chain (cycle, bad redirect,
+    /// non-NORMAL HOT successor) is a structured error, never a spin.
+    fn collect_chain_versions(
+        &self,
+        schema: &TableSchema,
+        root: RowLocation,
+    ) -> Result<Vec<(RowLocation, crate::codec::DecodedRow)>> {
+        let readable = self.buffer_pool.read_page(root.file_id, root.page_num)?;
+        let data = readable.data();
+        let page_num = root.page_num;
+        let file_id = root.file_id;
+
+        // Step 1: resolve a REDIRECT root to its same-page NORMAL target (mirrors
+        // `resolve_visible_in_chain`).
+        let mut current_slot = match page::slot_state(data, root.slot_num)? {
+            page::LinePointer::Normal => root.slot_num,
+            page::LinePointer::Redirect(target) => match page::slot_state(data, target)? {
+                page::LinePointer::Normal => target,
+                _ => {
+                    return Err(storage_internal(
+                        "redirect line pointer target is not a NORMAL tuple",
+                    ));
+                }
+            },
+            page::LinePointer::Dead | page::LinePointer::Unused => return Ok(Vec::new()),
+        };
+
+        let slot_count = page::next_slot(data)?;
+        let mut visited: HashSet<u16> = HashSet::with_capacity(slot_count as usize);
+        let mut versions = Vec::new();
+        loop {
+            if !visited.insert(current_slot) {
+                return Err(storage_internal("cyclic HOT chain detected"));
+            }
+            let Some(bytes) = page::read_row(data, current_slot)? else {
+                return Err(storage_internal("HOT chain member is not a live tuple"));
+            };
+            let decoded = decode_row(schema, &bytes)?;
+            let infomask = decoded.infomask;
+            let t_ctid = decoded.t_ctid;
+            versions.push((
+                RowLocation {
+                    file_id,
+                    page_num,
+                    slot_num: current_slot,
+                },
+                decoded,
+            ));
+
+            // Follow only a same-page HEAP_ONLY successor of a HOT_UPDATED tuple — the
+            // bounded HOT-chain segment.
+            if infomask & crate::codec::HOT_UPDATED == 0 {
+                return Ok(versions);
+            }
+            let (succ_page, succ_slot) = t_ctid;
+            if succ_page != page_num {
+                return Ok(versions);
+            }
+            match page::slot_state(data, succ_slot)? {
+                page::LinePointer::Normal => {}
+                _ => {
+                    return Err(storage_internal(
+                        "HOT_UPDATED successor slot is not a NORMAL tuple",
+                    ));
+                }
+            }
+            let Some(succ_bytes) = page::read_row(data, succ_slot)? else {
+                return Err(storage_internal(
+                    "HOT_UPDATED successor is not a live tuple",
+                ));
+            };
+            let (_xmin, _xmax, _t_ctid, succ_infomask) =
+                crate::codec::decode_mvcc_header(&succ_bytes)?;
+            if succ_infomask & crate::codec::HEAP_ONLY == 0 {
+                // Independently indexed successor: stop (it is its own root).
+                return Ok(versions);
+            }
+            current_slot = succ_slot;
+        }
+    }
+
     /// Resolve a (possibly HOT) index entry to its visible heap version and read it,
     /// returning the **resolved heap location** alongside the row so callers stamp
     /// the right `RowId` (the live chain member, not the pruned root). Routes through
@@ -970,9 +1112,29 @@ impl PageBackedStorageEngine {
                     continue;
                 };
                 let (xmin, xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
-                if common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
-                    dead_slots.push(slot);
+                if !common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
+                    continue;
                 }
+                // The tuple is dead-to-all. HOT-chain safety (H2/H3, `docs/specs/mvcc.md`
+                // §10 Milestone H2/H3): a HOT-chain member (`HEAP_ONLY` successor or
+                // `HOT_UPDATED` root) is reclaimable ONLY when its creator aborted. An
+                // aborted-creator HOT tuple is a dead-end orphan — an aborted UPDATE never
+                // sits in the MIDDLE of a live chain (its xmin is the chain's youngest id
+                // and no later version was committed onto it), so reclaiming it cannot
+                // sever a still-live successor; leaving it would both leak space and
+                // (per F4c) keep a surviving on-disk reference to an aborted txn. A HOT
+                // tuple dead-to-all via a COMMITTED delete is the genuine "could be a live
+                // committed chain's middle" case — reclaiming it would sever the `t_ctid`
+                // walk to a still-live successor — so it is deferred to H3's chain-aware
+                // pruning (redirect the root, splice the chain). Non-HOT tuples are
+                // reclaimed unconditionally on dead-to-all.
+                let is_hot = infomask & (crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED) != 0;
+                let creator_aborted =
+                    infomask & common::XMIN_ABORTED != 0 || self.txn_status_view().is_aborted(xmin);
+                if is_hot && !creator_aborted {
+                    continue;
+                }
+                dead_slots.push(slot);
             }
 
             if dead_slots.is_empty() {
@@ -1199,6 +1361,92 @@ impl PageBackedStorageEngine {
         }
         Ok(reclaimed)
     }
+
+    /// Attempt the HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2) for
+    /// an `UPDATE` whose visible predecessor is at `previous_location` (`infomask` its
+    /// current header hints). Returns:
+    ///
+    /// - `Ok(Some(true))` — the HOT update was performed (the caller returns it).
+    /// - `Ok(None)` — NOT eligible; the caller falls back to the normal fully-indexed
+    ///   update path.
+    ///
+    /// Eligible iff BOTH:
+    /// 1. **No indexed column changed.** The new row's key equals the predecessor's
+    ///    for the primary key (already enforced by the caller — a PK change is
+    ///    rejected) AND for every secondary index ([`secondary_index_key`]). If all
+    ///    index keys match, only non-indexed columns differ.
+    /// 2. **Same-page room.** The new heap-only tuple, encoded, fits in the free space
+    ///    of the predecessor's own page ([`Self::try_hot_insert_on_page`] returns
+    ///    `Some`). Reusing an `UNUSED` slot or appending both count; if it does not
+    ///    fit, fall back (H3 will prune-to-make-room — not done here).
+    ///
+    /// When eligible: write the heap-only successor on the predecessor's page, then
+    /// stamp the predecessor `xmax = txn`, `t_ctid → new`, and `HOT_UPDATED` via
+    /// [`Self::stamp_xmax_logged`] (which keeps the atomic first-updater-wins check —
+    /// a concurrent claimer yields `40001`). NO index entries are inserted: the index
+    /// still points at the chain root, and the H1 bounded walk reaches the new version.
+    ///
+    /// **Orphan-on-conflict safety.** The heap-only tuple is placed BEFORE the
+    /// stamp-with-conflict-check, mirroring the non-HOT path: on a `40001` the
+    /// just-written heap-only tuple is left unreferenced (no predecessor `t_ctid`
+    /// points at it, and it has no index entry), so its aborting `xmin` makes it
+    /// invisible via CLOG ⇒ dead-to-all ⇒ reclaimable by VACUUM — harmless, exactly
+    /// like the non-HOT orphan.
+    fn try_hot_update(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        table: TableId,
+        previous_location: RowLocation,
+        infomask: u16,
+        row: &Row,
+    ) -> Result<Option<bool>> {
+        // Eligibility (1): no indexed column changed. Read the predecessor's CURRENT
+        // physical row (not a snapshot read — we need its actual indexed values) and
+        // compare every secondary index's key against the new row's. The primary key
+        // is already known unchanged (the caller rejects a PK change). A missing
+        // predecessor here means it was reclaimed under us — not eligible.
+        let Some(previous_row) = self.read_location(schema, previous_location)? else {
+            return Ok(None);
+        };
+        for index in self.table_indexes(table)? {
+            let (old_key, _) = secondary_index_key(schema, &index, &previous_row)?;
+            let (new_key, _) = secondary_index_key(schema, &index, row)?;
+            if old_key != new_key {
+                // An indexed column changed ⇒ the new version needs its own index
+                // entry ⇒ not a HOT update; fall back.
+                return Ok(None);
+            }
+        }
+
+        // Eligibility (2): the new heap-only tuple fits on the predecessor's page.
+        // `try_hot_insert_on_page` returns `None` (no room) ⇒ fall back (H3 pruning is
+        // out of scope for H2).
+        let Some(new_location) =
+            self.try_hot_insert_on_page(schema, previous_location.page_num, row, ctx.txn_id)?
+        else {
+            return Ok(None);
+        };
+
+        // Stamp the predecessor: xmax = txn, t_ctid → the new heap-only tuple, and
+        // HOT_UPDATED set (preserving its other infomask hints). This keeps the atomic
+        // first-updater-wins check; on a `40001` the heap-only tuple written above is a
+        // harmless orphan (see this method's doc). The new tuple is on the SAME page as
+        // the predecessor by construction, so the H1 walk's same-page `HOT_UPDATED →
+        // HEAP_ONLY` step reaches it.
+        let new_tid = (new_location.page_num, new_location.slot_num);
+        self.stamp_xmax_logged(
+            previous_location,
+            new_tid,
+            infomask | crate::codec::HOT_UPDATED,
+            ctx.txn_id,
+        )?;
+
+        // No index entries: the index keeps pointing at the chain root; the new
+        // heap-only version is reached only by the bounded `t_ctid` walk from it. This
+        // is the whole point of HOT — the un-indexed in-place version.
+        Ok(Some(true))
+    }
 }
 
 impl StorageEngine for PageBackedStorageEngine {
@@ -1310,6 +1558,20 @@ impl StorageEngine for PageBackedStorageEngine {
                 SqlState::DatatypeMismatch,
                 "primary key updates are not supported",
             ));
+        }
+
+        // HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2). When BOTH (a)
+        // no indexed column changed and (b) the new tuple fits on the predecessor's
+        // own page, write the new version as a heap-only tuple on that page, chain the
+        // predecessor to it, and insert NO index entries — the index keeps pointing at
+        // the chain root, and H1's bounded `t_ctid` walk reaches the new version via
+        // the `HOT_UPDATED → HEAP_ONLY` segment. Falls through to the normal
+        // fully-indexed path when ineligible. Pruning-to-make-room on a full page is
+        // H3; here a full page simply falls back.
+        if let Some(result) =
+            self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
+        {
+            return Ok(result);
         }
 
         // MVCC UPDATE (Postgres-style, non-HOT): write the new tuple as a fresh heap
@@ -1564,7 +1826,12 @@ impl SchemaOperations for PageBackedStorageEngine {
         Ok(())
     }
 
-    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()> {
+    fn create_index(
+        &self,
+        ctx: &StatementContext,
+        schema: &IndexSchema,
+        gc_horizon: u64,
+    ) -> Result<()> {
         let (table_schema, pk_file_id) = self.table_handle(schema.table)?;
         {
             let mut state = self.lock_state()?;
@@ -1585,25 +1852,88 @@ impl SchemaOperations for PageBackedStorageEngine {
             );
         }
         // Build the empty secondary tree (its pages are full-page-image redo), then
-        // backfill it from the live rows via the primary-key index. Each secondary
-        // entry points directly at the heap TID (uniform with the primary key). The
-        // backfill inserts go through `insert_secondary_entry`, which holds the new
-        // index's structural latch across each check-and-insert (Milestone E2a); the
-        // initial `create` builds a brand-new file's metapage + root with no possible
-        // concurrent contention. As of E2b, DDL runs under the shared writer guard
-        // alongside other writers, but the index file is brand-new and not yet visible
-        // to any other transaction, so the backfill into it is uncontended in practice;
-        // a checkpoint (exclusive guard) never overlaps it.
+        // backfill it from the live rows via the primary-key index. Each PK entry's
+        // TID is a HOT-chain ROOT; the new secondary entry points at that ROOT
+        // (uniform with how HOT chains are addressed — the H1 walk resolves a root to
+        // the live version).
+        //
+        // **HOT broken-chain safety (fail-fast, H2 — `docs/specs/mvcc.md` §10).** The
+        // caller runs CREATE INDEX under the EXCLUSIVE guard (no concurrent writer), so
+        // the physical chain view is stable for the duration of the build. For each
+        // chain we examine its physically-present versions; if TWO OR MORE are NOT
+        // dead-to-all at `gc_horizon` and DIFFER on the new index's column(s), some
+        // live snapshot may span the chain and a single root-pointed entry cannot
+        // serve all snapshots (the planner consumes equality predicates into the index
+        // range and does not re-check them), so we abort with a retryable `40001`.
         let secondary = self.secondary_btree(schema.id);
         secondary.create(ctx.txn_id)?;
-        for (_pk, location) in self.btree(pk_file_id).range(&KeyRange::All)? {
-            let row = self
-                .read_location(&table_schema, location)?
-                .ok_or_else(|| {
-                    storage_internal("primary-key index points to a dead row during index backfill")
-                })?;
-            let (key, has_null) = secondary_index_key(&table_schema, schema, &row)?;
-            self.insert_secondary_entry(ctx, &table_schema, schema, &key, has_null, &location)?;
+        for (_pk, root) in self.btree(pk_file_id).range(&KeyRange::All)? {
+            // The physically-present versions reachable from this chain root (the root
+            // plus any heap-only HOT-chain members on its page), in chain order.
+            let versions = self.collect_chain_versions(&table_schema, root)?;
+
+            // A non-HOT root is its own one-element chain (no HOT successors). Index its
+            // PHYSICAL row unconditionally, pointing at the root — exactly the pre-HOT
+            // backfill behavior: every physically-present row (committed, in-flight, or
+            // aborted) gets an entry, and the scan filters by visibility at read time.
+            // The broken-chain hazard cannot arise for a single-version chain. Use the
+            // version `collect_chain_versions` resolved (which already followed a
+            // REDIRECT root to its NORMAL target) rather than re-reading `root` — a
+            // REDIRECT slot reads no bytes directly. A reclaimed (DEAD/UNUSED) root
+            // resolves to no versions; nothing to index.
+            if versions.len() <= 1 {
+                if let Some((_loc, decoded)) = versions.first() {
+                    let (key, has_null) = secondary_index_key(&table_schema, schema, &decoded.row)?;
+                    self.insert_secondary_entry(ctx, &table_schema, schema, &key, has_null, &root)?;
+                }
+                continue;
+            }
+
+            // A HOT chain (root HOT_UPDATED → heap-only successors) is reached via the
+            // SINGLE root entry; H1's bounded walk resolves it per a reader's snapshot.
+            // Collect the DISTINCT new-index keys across the chain's not-dead-to-all
+            // versions — i.e. the versions some still-live snapshot may see. Aborted-
+            // creator / committed-deleted-below-`gc_horizon` versions are dead to
+            // everyone and cannot be spanned by any snapshot, so they are excluded.
+            let mut live_entries: Vec<(Key, bool)> = Vec::new();
+            for (_loc, decoded) in &versions {
+                if common::is_dead_to_all(
+                    decoded.xmin,
+                    decoded.xmax,
+                    decoded.infomask,
+                    gc_horizon,
+                    self.txn_status_view(),
+                ) {
+                    continue;
+                }
+                let (new_key, has_null) = secondary_index_key(&table_schema, schema, &decoded.row)?;
+                if !live_entries.iter().any(|(k, _)| *k == new_key) {
+                    live_entries.push((new_key, has_null));
+                }
+            }
+
+            // Two or more distinct live keys ⇒ the chain is broken: a single
+            // root-pointed entry cannot serve every snapshot's value. Abort with a
+            // retryable `40001` (`docs/specs/mvcc.md` §10 Milestone H2).
+            if live_entries.len() >= 2 {
+                return Err(DbError::execute(
+                    SqlState::SerializationFailure,
+                    "cannot build index over a live HOT chain with differing key values; \
+                     retry after the transaction ends or after VACUUM",
+                ));
+            }
+
+            // Exactly one live key (all live versions agree): index it, pointing the
+            // entry at the chain ROOT — UNCONDITIONALLY, not gated on the BUILDER's
+            // snapshot. A version may be not-dead-to-all (visible to an older concurrent
+            // lock-free reader) yet invisible to this builder's own newer snapshot;
+            // indexing it anyway is what lets that older reader find the row via the new
+            // index (the planner does not re-check the equality at the heap). Zero live
+            // keys means every version is dead-to-all — no snapshot can see the chain —
+            // so there is nothing to index.
+            if let Some((key, has_null)) = live_entries.into_iter().next() {
+                self.insert_secondary_entry(ctx, &table_schema, schema, &key, has_null, &root)?;
+            }
         }
         Ok(())
     }
@@ -2198,7 +2528,7 @@ mod visibility_tests {
         let builder = ctx(101, snapshot(102, vec![]));
         fixture
             .engine
-            .create_index(&builder, &name_index())
+            .create_index(&builder, &name_index(), 0)
             .unwrap();
         fixture.commit(101);
 
@@ -2426,7 +2756,10 @@ mod visibility_tests {
             columns: vec![1],
             unique: true,
         };
-        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &unique_name, 0)
+            .unwrap();
         fixture.commit(100);
 
         // Creator txn 10 inserts (id 1, name "amy"), then aborts ⇒ dead version.
@@ -2471,7 +2804,10 @@ mod visibility_tests {
             .engine
             .create_table(&setup, &users_schema())
             .unwrap();
-        fixture.engine.create_index(&setup, &name_index()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
         fixture.commit(100);
         fixture
     }
@@ -2568,7 +2904,10 @@ mod visibility_tests {
             columns: vec![1],
             unique: true,
         };
-        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &unique_name, 0)
+            .unwrap();
         fixture.commit(100);
         fixture
     }
@@ -2676,7 +3015,10 @@ mod visibility_tests {
             .engine
             .create_table(&setup, &users_schema())
             .unwrap();
-        fixture.engine.create_index(&setup, &name_index()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
         fixture.commit(100);
 
         let rid = fixture
@@ -2875,8 +3217,8 @@ mod visibility_tests {
             columns: vec![0],
             unique: false,
         };
-        fixture.engine.create_index(&setup, &name_idx).unwrap();
-        fixture.engine.create_index(&setup, &id_idx).unwrap();
+        fixture.engine.create_index(&setup, &name_idx, 0).unwrap();
+        fixture.engine.create_index(&setup, &id_idx, 0).unwrap();
         fixture.commit(100);
 
         fixture
@@ -3068,7 +3410,10 @@ mod visibility_tests {
             columns: vec![1],
             unique: true,
         };
-        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &unique_name, 0)
+            .unwrap();
         fixture.commit(100);
 
         // Two committed-live rows with distinct unique names.
@@ -3737,6 +4082,621 @@ mod visibility_tests {
             vec![row(1, "root")]
         );
     }
+
+    // ----------------------------------------------------------------------
+    // H2 — HOT-update fast path + its two safety guards (CREATE INDEX
+    // broken-chain fail-fast, VACUUM skip of HOT-chain tuples).
+    // ----------------------------------------------------------------------
+
+    /// A HOT update (only the non-indexed `id`... no — `name` IS indexed; here we add
+    /// a NON-indexed column). The fixture's `name` is indexed, so to exercise HOT we
+    /// need a table whose updated column is not indexed. Build a 3-column table.
+    fn hot_schema() -> TableSchema {
+        TableSchema {
+            id: TABLE_ID,
+            name: "users".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "note".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn hot_row(id: i64, name: &str, note: &str) -> Row {
+        Row {
+            values: vec![
+                Value::Integer(id),
+                Value::Text(name.to_string()),
+                Value::Text(note.to_string()),
+            ],
+        }
+    }
+
+    /// A `users(id pk, name, note)` table with a secondary index on `name` (NOT on
+    /// `note`), one committed row, all under txn 100/10. Returns the fixture and the
+    /// row's heap location (the chain root).
+    fn hot_fixture() -> (Fixture, super::RowLocation) {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture.engine.create_table(&setup, &hot_schema()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
+        fixture.commit(100);
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                hot_row(1, "Ada", "v1"),
+            )
+            .unwrap();
+        fixture.commit(10);
+        let root = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+        (fixture, root)
+    }
+
+    fn decode_hot(fixture: &Fixture, loc: super::RowLocation) -> crate::codec::DecodedRow {
+        let readable = fixture
+            .engine
+            .buffer_pool
+            .read_page(loc.file_id, loc.page_num)
+            .unwrap();
+        let bytes = crate::page::read_row(readable.data(), loc.slot_num)
+            .unwrap()
+            .expect("slot is NORMAL");
+        crate::codec::decode_row(&hot_schema(), &bytes).unwrap()
+    }
+
+    #[test]
+    fn hot_update_same_page_no_new_index_entry_and_reads_once() {
+        // Updating only the NON-indexed `note` column is a HOT update: the new
+        // version lands on the SAME page with HEAP_ONLY, the root gets HOT_UPDATED +
+        // t_ctid -> it, and NO new index entry is created. Reads (PK and secondary)
+        // see the updated row exactly once.
+        let (fixture, root) = hot_fixture();
+
+        // Index-entry counts BEFORE the update: one PK entry, one secondary entry.
+        assert_eq!(fixture.pk_index_tids(&key(1)).len(), 1);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada").len(),
+            1
+        );
+
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "v2"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // The root was HOT-updated: xmax = 20, HOT_UPDATED set, t_ctid -> a slot on
+        // the SAME page.
+        let root_dec = decode_hot(&fixture, root);
+        assert_eq!(root_dec.xmax, 20);
+        assert_ne!(root_dec.infomask & crate::codec::HOT_UPDATED, 0);
+        let (succ_page, succ_slot) = root_dec.t_ctid;
+        assert_eq!(
+            succ_page, root.page_num,
+            "HOT successor is on the same page"
+        );
+
+        // The successor is a live HEAP_ONLY tuple carrying the new note.
+        let succ_loc = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: succ_page,
+            slot_num: succ_slot,
+        };
+        let succ = decode_hot(&fixture, succ_loc);
+        assert_eq!(succ.xmin, 20);
+        assert_eq!(succ.xmax, common::INVALID_XID);
+        assert_ne!(succ.infomask & crate::codec::HEAP_ONLY, 0);
+        assert_eq!(succ.row, hot_row(1, "Ada", "v2"));
+
+        // NO new index entries: still exactly one PK entry (the root) and one
+        // secondary entry — both pointing at the ROOT, not the heap-only successor.
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada"),
+            vec![root]
+        );
+
+        // Reads see the updated row exactly once: PK get, sequential scan, and the
+        // secondary index scan all resolve the chain to the heap-only successor.
+        let reader = ctx(0, snapshot(30, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", "v2"))
+        );
+        let seq: Vec<Row> = collect_names(
+            fixture
+                .engine
+                .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                .unwrap(),
+        );
+        assert_eq!(seq, vec![hot_row(1, "Ada", "v2")]);
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", "v2")]);
+    }
+
+    #[test]
+    fn indexed_column_change_falls_back_to_a_normal_update() {
+        // Changing the INDEXED `name` is NOT HOT: a fresh fully-indexed version is
+        // written (new PK + secondary entries appear) and the new version is NOT
+        // HEAP_ONLY.
+        let (fixture, root) = hot_fixture();
+
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Bea", "v2"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        // Two PK entries now (one per version): a fully-indexed (non-HOT) update.
+        let pk = fixture.pk_index_tids(&key(1));
+        assert_eq!(pk.len(), 2, "a new fully-indexed version was inserted");
+        let new_loc = *pk.iter().find(|loc| **loc != root).unwrap();
+        // The new version is NOT heap-only.
+        let new_dec = decode_hot(&fixture, new_loc);
+        assert_eq!(new_dec.infomask & crate::codec::HEAP_ONLY, 0);
+        // The root is chained but NOT HOT_UPDATED (a normal MVCC update).
+        let root_dec = decode_hot(&fixture, root);
+        assert_eq!(root_dec.infomask & crate::codec::HOT_UPDATED, 0);
+
+        // Both indexes find the new version by the NEW name; the old name is gone.
+        let reader = ctx(0, snapshot(30, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Bea", "v2"))
+        );
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Bea").len(),
+            1
+        );
+        let by_new = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Bea"))
+                .unwrap(),
+        );
+        assert_eq!(by_new, vec![hot_row(1, "Bea", "v2")]);
+    }
+
+    #[test]
+    fn same_page_full_falls_back_to_a_normal_update() {
+        // When the predecessor's page has no room for the new tuple, the HOT path is
+        // ineligible and we fall back to a normal fully-indexed update (a new tuple on
+        // ANOTHER page + a new index entry).
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture.engine.create_table(&setup, &hot_schema()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
+        fixture.commit(100);
+
+        // Fill the first heap page nearly full with one big-note row plus filler rows,
+        // so a subsequent same-size HOT update of row 1 cannot also fit on it.
+        let big = "x".repeat(3000);
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                hot_row(1, "Ada", &big),
+            )
+            .unwrap();
+        let root = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+        // Pad the same page with one more ~3000-byte note row (write_new_row fills a
+        // page before extending), so ~6000 of the page's 8192 bytes are used and the
+        // free space is below one more big-note tuple.
+        fixture
+            .engine
+            .insert(
+                &ctx(12, snapshot(13, vec![])),
+                TABLE_ID,
+                hot_row(2, "filler", &big),
+            )
+            .unwrap();
+        fixture.commit(12);
+        fixture.commit(10);
+
+        // The filler shares row 1's page, so that page is now too full for another
+        // big-note tuple (the HOT update below).
+        assert_eq!(
+            fixture.pk_index_tids(&key(2))[0].page_num,
+            root.page_num,
+            "filler row must share row 1's page",
+        );
+
+        // HOT-update row 1's NON-indexed note with another big value: no same-page
+        // room ⇒ fall back to a normal update (new tuple on a fresh page, new PK
+        // entry).
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(40, snapshot(41, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", &"y".repeat(3000)),
+                )
+                .unwrap()
+        );
+        fixture.commit(40);
+
+        let pk = fixture.pk_index_tids(&key(1));
+        assert_eq!(pk.len(), 2, "fell back to a fully-indexed update");
+        let new_loc = *pk.iter().find(|loc| **loc != root).unwrap();
+        assert_ne!(
+            new_loc.page_num, root.page_num,
+            "new version is on another page"
+        );
+        let new_dec = decode_hot(&fixture, new_loc);
+        assert_eq!(
+            new_dec.infomask & crate::codec::HEAP_ONLY,
+            0,
+            "not heap-only"
+        );
+        // The root is a normal (non-HOT) update.
+        let root_dec = decode_hot(&fixture, root);
+        assert_eq!(root_dec.infomask & crate::codec::HOT_UPDATED, 0);
+        // The updated row reads back.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(50, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", &"y".repeat(3000)))
+        );
+    }
+
+    #[test]
+    fn concurrent_hot_update_first_updater_wins_40001() {
+        // Two writers HOT-update the same row. The first stamps the predecessor's
+        // xmax; the second observes the committed xmax and aborts with 40001. The
+        // orphaned heap-only tuple the loser wrote is harmless (invisible once its txn
+        // aborts).
+        let (fixture, _root) = hot_fixture();
+
+        // Writer 30 HOT-updates and commits (the winner of the row lock).
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(30, snapshot(31, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "w30"),
+                )
+                .unwrap()
+        );
+        fixture.commit(30);
+
+        // Writer 40 holds a snapshot in which 30 is still in-progress (in `xip`), so
+        // the root's deleter (xmax = 30) is not visible and 40 sees the ORIGINAL v1 as
+        // the live version and targets the root. The root's physical xmax is now 30
+        // (committed in the CLOG), so the atomic first-updater-wins check fires `40001`
+        // — the actual-status row-lock check ignores the snapshot.
+        let err = fixture
+            .engine
+            .update(
+                &ctx(40, snapshot(41, vec![30])),
+                TABLE_ID,
+                &key(1),
+                hot_row(1, "Ada", "w40"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+
+        // The committed winner's value is what a later reader sees.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(50, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", "w30"))
+        );
+    }
+
+    #[test]
+    fn vacuum_does_not_sever_a_hot_chain() {
+        // Build a multi-version HOT chain, advance the horizon so the middle/root
+        // versions are dead_to_all, run VACUUM, then read: the chain is intact and the
+        // latest version is still visible (the vacuum skip-guard, H2 part 3).
+        let (fixture, root) = hot_fixture();
+
+        // Three successive HOT updates of the non-indexed note (txns 20, 21, 22),
+        // building root -> v2 -> v3 -> v4, all on the same page, no new index entries.
+        for (txn, note) in [(20u64, "v2"), (21, "v3"), (22, "v4")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", note),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        // Still exactly one PK + one secondary entry (HOT added none).
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada"),
+            vec![root]
+        );
+
+        // Horizon 100: every superseded version (xmax in {20,21,22}, all < 100 and
+        // committed) is dead_to_all — but they are HOT-chain members, so VACUUM must
+        // SKIP them rather than sever the chain.
+        let schema = hot_schema();
+        let reclaimed = fixture.engine.vacuum(&schema, 100).unwrap();
+        assert_eq!(reclaimed, 0, "HOT-chain tuples are not reclaimed in H2");
+
+        // The chain survives: the latest version is still resolvable, and the entries
+        // still point at the (intact) root.
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(120, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", "v4"))
+        );
+    }
+
+    #[test]
+    fn vacuum_reclaims_an_aborted_creator_hot_heap_only_tuple() {
+        // An aborted HOT update leaves a HEAP_ONLY successor whose creator (xmin)
+        // aborted: it is a dead-end orphan (no committed version chained onto it), so
+        // VACUUM MUST reclaim it (the corrected H2 skip-guard). Leaving it would leak
+        // space and — per F4c — keep a surviving on-disk reference to the aborted txn.
+        // After reclaim, the root still reads its ORIGINAL value (the rolled-back HOT
+        // successor is gone, no resurrection).
+        let (fixture, root) = hot_fixture();
+
+        // HOT-update the note v1 -> v2 under txn 20, then ABORT it (no undo): the
+        // successor (xmin = 20, HEAP_ONLY) and the root's xmax = 20 + HOT_UPDATED both
+        // belong to the aborted txn. The root stays live (the update rolled back).
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "v2"),
+                )
+                .unwrap()
+        );
+        fixture.abort(20);
+
+        // The root currently points its t_ctid at the heap-only successor.
+        let root_dec = decode_hot(&fixture, root);
+        assert_ne!(root_dec.infomask & crate::codec::HOT_UPDATED, 0);
+        let (succ_page, succ_slot) = root_dec.t_ctid;
+        let succ_loc = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: succ_page,
+            slot_num: succ_slot,
+        };
+        // Pre-VACUUM: the heap-only successor is a live NORMAL slot (aborted creator).
+        let succ = decode_hot(&fixture, succ_loc);
+        assert_eq!(succ.xmin, 20);
+        assert_ne!(succ.infomask & crate::codec::HEAP_ONLY, 0);
+
+        // VACUUM at any horizon reclaims the aborted-creator successor (aborted-creator
+        // reclaim has NO age requirement).
+        let schema = hot_schema();
+        let reclaimed = fixture.engine.vacuum(&schema, 100).unwrap();
+        assert!(
+            reclaimed >= 1,
+            "the aborted-creator HOT heap-only successor must be reclaimed"
+        );
+
+        // The root still reads its ORIGINAL value: the aborted update's successor is
+        // gone (no resurrection), and the root's own xmax = 20 is an aborted deleter, so
+        // the row stays visible.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(120, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", "v1"))
+        );
+        // The index still points at the (intact) root.
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+    }
+
+    #[test]
+    fn create_index_over_a_broken_live_hot_chain_aborts_retryable() {
+        // A HOT chain whose versions differ on a NOT-yet-indexed column (`note`),
+        // with an OLD version kept live by a low horizon, makes CREATE INDEX(note)
+        // fail-fast with 40001; with the horizon advanced past those versions the
+        // build succeeds.
+        let (fixture, _root) = hot_fixture();
+
+        // HOT-update the note v1 -> v2 (both versions present on the chain). The root
+        // (note "v1", xmax = 20 committed) and the heap-only successor (note "v2").
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "v2"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+
+        let note_index = IndexSchema {
+            id: 2,
+            table: TABLE_ID,
+            name: "users_note".to_string(),
+            columns: vec![2], // the `note` column
+            unique: false,
+        };
+
+        // Horizon 15 (below the deleter xmax = 20): the root version (note "v1") is
+        // NOT dead_to_all, and the heap-only successor (note "v2") is live too — two
+        // live versions differing on `note` ⇒ broken chain ⇒ retryable 40001.
+        let builder = ctx(101, snapshot(102, vec![]));
+        let err = fixture
+            .engine
+            .create_index(&builder, &note_index, 15)
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+        assert!(err.message.contains("HOT chain"), "{}", err.message);
+
+        // Horizon 21 (above xmax = 20): the root (committed-deleted below horizon) is
+        // dead_to_all, so only the heap-only "v2" is live ⇒ NOT broken ⇒ build
+        // succeeds and the new index finds the live row by its `note`.
+        fixture
+            .engine
+            .create_index(&builder, &note_index, 21)
+            .unwrap();
+        fixture.commit(101);
+
+        let by_note = collect_names(
+            fixture
+                .engine
+                .index_scan(
+                    &ctx(0, snapshot(120, vec![])),
+                    TABLE_ID,
+                    note_index.id,
+                    &KeyRange::Exact(Key(vec![Value::Text("v2".to_string())])),
+                )
+                .unwrap(),
+        );
+        assert_eq!(by_note, vec![hot_row(1, "Ada", "v2")]);
+    }
+
+    #[test]
+    fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder() {
+        // A not-dead-to-all version that the BUILDER's own snapshot cannot see (it is
+        // deleted in the builder's past, but the deleter is at/above the GC horizon so
+        // an OLDER lock-free reader still sees it) MUST still get an index entry —
+        // indexing is unconditional, not gated on the builder's snapshot. (Regression:
+        // a build-visibility gate would skip it and lose that older reader's read.)
+        let (fixture, root) = hot_fixture();
+
+        // HOT-update note v1 -> v2 (txn 20), then DELETE the row (txn 80). The chain is
+        // root("v1", xmax=20) -> heap-only("v2", xmin=20, xmax=80). Both deleters
+        // commit.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "v2"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(80, snapshot(81, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(80);
+
+        let note_index = IndexSchema {
+            id: 2,
+            table: TABLE_ID,
+            name: "users_note".to_string(),
+            columns: vec![2],
+            unique: false,
+        };
+
+        // Horizon 50: the root (xmax=20 < 50, committed) is dead_to_all, but the
+        // heap-only "v2" (xmax=80 >= 50) is NOT — an older reader with xmin around 50
+        // could still see it. The BUILDER's snapshot (xmax=120) sees the whole chain as
+        // deleted. The single live key "v2" must still be indexed at the root.
+        let builder = ctx(101, snapshot(120, vec![]));
+        fixture
+            .engine
+            .create_index(&builder, &note_index, 50)
+            .unwrap();
+        fixture.commit(101);
+
+        // The entry exists and points at the chain ROOT.
+        let tids: Vec<_> = fixture
+            .engine
+            .secondary_btree(note_index.id)
+            .scan_key(&Key(vec![Value::Text("v2".to_string())]))
+            .unwrap();
+        assert_eq!(tids, vec![root], "v2 is indexed at the chain root");
+
+        // An older reader (snapshot where the deleter 80 is still in-progress) finds
+        // the row via the new index — the read that the build-visibility gate would
+        // have lost.
+        let older = ctx(0, snapshot(90, vec![80]));
+        let by_note = collect_names(
+            fixture
+                .engine
+                .index_scan(
+                    &older,
+                    TABLE_ID,
+                    note_index.id,
+                    &KeyRange::Exact(Key(vec![Value::Text("v2".to_string())])),
+                )
+                .unwrap(),
+        );
+        assert_eq!(by_note, vec![hot_row(1, "Ada", "v2")]);
+    }
 }
 
 /// Structural-write-latch registry tests (Milestone E2a). These assert the latch
@@ -3886,7 +4846,7 @@ mod structural_latch_tests {
         let (engine, wal, _dir) = engine();
         let setup = ctx(100);
         engine.create_table(&setup, &users_schema()).unwrap();
-        engine.create_index(&setup, &name_index()).unwrap();
+        engine.create_index(&setup, &name_index(), 0).unwrap();
         commit(&wal, 100);
 
         // create_index's backfill (none here) plus the create touch the secondary
@@ -4414,7 +5374,10 @@ mod concurrent_writers_tests {
         let shared = SharedEngine::new();
         let setup = ctx(100, 101);
         shared.engine.create_table(&setup, &users_schema()).unwrap();
-        shared.engine.create_index(&setup, &name_index()).unwrap();
+        shared
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
         shared.commit(100);
 
         const THREADS: usize = 6;
@@ -4774,7 +5737,7 @@ mod vacuum_tests {
         let fixture = Fixture::new();
         fixture
             .engine
-            .create_index(&ctx(101), &name_index())
+            .create_index(&ctx(101), &name_index(), 0)
             .unwrap();
         fixture.commit(101);
 
@@ -4817,7 +5780,7 @@ mod vacuum_tests {
         let fixture = Fixture::new();
         fixture
             .engine
-            .create_index(&ctx(101), &name_index())
+            .create_index(&ctx(101), &name_index(), 0)
             .unwrap();
         fixture.commit(101);
 
@@ -4872,7 +5835,7 @@ mod vacuum_tests {
         let fixture = Fixture::new();
         fixture
             .engine
-            .create_index(&ctx(101), &name_index())
+            .create_index(&ctx(101), &name_index(), 0)
             .unwrap();
         fixture.commit(101);
         let keep = fixture.insert_committed(10, row(1, "keep"));
@@ -5451,7 +6414,7 @@ mod vacuum_tests {
         let fixture = Fixture::new();
         fixture
             .engine
-            .create_index(&ctx(101), &name_index())
+            .create_index(&ctx(101), &name_index(), 0)
             .unwrap();
         fixture.commit(101);
 
@@ -5615,7 +6578,7 @@ mod vacuum_tests {
         let fixture = Fixture::new();
         fixture
             .engine
-            .create_index(&ctx(101), &name_index())
+            .create_index(&ctx(101), &name_index(), 0)
             .unwrap();
         fixture.commit(101);
 

@@ -67,6 +67,7 @@ impl ExecutorHarness {
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
             cancel,
         };
         let result = self.engine.execute(&ctx, &physical);
@@ -364,7 +365,12 @@ impl SchemaOperations for MemoryStorage {
         Ok(())
     }
 
-    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()> {
+    fn create_index(
+        &self,
+        ctx: &StatementContext,
+        schema: &IndexSchema,
+        _gc_horizon: u64,
+    ) -> Result<()> {
         let mut state = self
             .state
             .lock()

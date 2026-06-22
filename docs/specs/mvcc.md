@@ -1002,8 +1002,9 @@ savepoints via sub-transaction xids (optional, deferred).
 - **H1** `REDIRECT` line pointers + root-line-pointer indexing **(read-side
   machinery; implemented)**. **H2** HOT-update fast path (same-page + no
   indexed-column change ⇒ heap-only tuple, no new index entries; index points at
-  the root). **H3** HOT pruning folded into page access and VACUUM. Reuses A–G
-  unchanged.
+  the root) **plus the two safety guards introducing HOT updates requires
+  (implemented)**. **H3** HOT pruning folded into page access and VACUUM. Reuses
+  A–G unchanged.
 
   **H1 — read-side resolution (implemented).** H1 installs the read machinery HOT
   needs *without* producing any heap-only tuples or `REDIRECT`s (H2/H3), so it is
@@ -1037,6 +1038,71 @@ savepoints via sub-transaction xids (optional, deferred).
     of each chain is therefore yielded **once**, via the root's index entry — a
     heap-only chain member is never independently returned. The scan yields the
     resolved live version's `RowId` (the visible chain member), not the index TID.
+
+  **H2 — HOT-update fast path + its two safety guards (implemented).** H2 produces
+  the first heap-only tuples (the read machinery H1 installed now has real data). It
+  introduces HOT updates AND the two guards their introduction requires, as one sound
+  change — the tree is correct at every step.
+
+  - **HOT-update fast path** (`storage/src/engine.rs` `update` → `try_hot_update`).
+    Before the normal "fresh fully-indexed version + all-index inserts" path, `update`
+    attempts a HOT update, eligible iff BOTH:
+    1. **No indexed column changed.** The new row's key equals the predecessor's for
+       the primary key (already required — a PK change is rejected) AND for every
+       secondary index (`secondary_index_key`). If all index keys match, only
+       non-indexed columns differ.
+    2. **Same-page room.** The new tuple, encoded, fits in the free space of the SAME
+       heap page as the predecessor (`previous_location.page_num`, the version
+       `locate_visible_version` resolved). Reusing an `UNUSED` slot or appending both
+       count; if it does not fit, NOT eligible (fall back).
+
+    When eligible: write the new tuple ONTO THE PREDECESSOR'S PAGE
+    (`try_hot_insert_on_page` → `page::try_insert_row`, the page-local insert-or-fail
+    primitive) stamped `xmin = txn`, `xmax = invalid`, `t_ctid = self`, and `HEAP_ONLY`
+    in `infomask` (carried into the logged `HeapInsert` image via
+    `codec::encode_row_with_infomask`, so recovery redoes it — the row bytes are the
+    source of truth for `infomask`). Then stamp the predecessor `xmax = txn`,
+    `t_ctid → new`, and `HOT_UPDATED` via `stamp_xmax_logged` (which keeps the atomic
+    first-updater-wins check — E1b/§7.3: a concurrent claimer yields `40001`). Insert
+    **no index entries**: the index keeps pointing at the chain root, and H1's bounded
+    walk reaches the new heap-only version via the `HOT_UPDATED → HEAP_ONLY` segment.
+    Logged via existing records only (`HeapInsert` + `HeapUpdateHeader`; no new kinds).
+    **Orphan-on-conflict** is safe exactly as in the non-HOT path: the heap-only tuple
+    is placed before the conflict-checked stamp, so a `40001` leaves it unreferenced —
+    its aborting `xmin` makes it invisible via CLOG ⇒ dead-to-all ⇒ VACUUM-reclaimable.
+    When NOT eligible, `update` falls back to the unchanged non-HOT path
+    (update-path pruning-to-make-room is H3, not H2 — a full page simply falls back).
+
+  - **Guard 1 — CREATE INDEX broken-HOT-chain safety (fail-fast).** A "broken HOT
+    chain" disagrees, across its versions, on a column a later `CREATE INDEX` targets;
+    a single root-pointed entry then cannot serve all snapshots (the planner consumes
+    equality predicates into the index range and does not re-check them —
+    `planner/src/physical.rs` `residual_filter`). So `create_index` runs its backfill
+    under the **EXCLUSIVE guard** (`begin_checkpoint`, like VACUUM — taken in the
+    server's `autocommit_write` for `CREATE INDEX`) so the physical chain view is
+    stable, with the **GC horizon** captured once under that guard and threaded in
+    (`SchemaOperations::create_index(ctx, schema, gc_horizon)`). For each chain
+    reachable from the PK index it examines the physically-present versions
+    (`collect_chain_versions`): if TWO OR MORE are **not** `is_dead_to_all` at the
+    horizon and their **new-index key(s) DIFFER**, the chain is broken and the build
+    aborts with a retryable `SqlState::SerializationFailure` (`40001`, "retry after the
+    transaction ends or after VACUUM"). Otherwise (the chain's not-dead-to-all versions
+    all agree on the new key — at most one distinct live key) it indexes **that single
+    live key**, pointing the entry at the chain **ROOT** (uniform HOT addressing). This
+    is done **unconditionally**, NOT gated on the builder's own snapshot: a version may
+    be not-dead-to-all (visible to an older concurrent lock-free reader) yet invisible
+    to the builder's newer snapshot, so indexing it anyway is what lets that older
+    reader find the row via the new index (a too-narrow build-visibility gate would lose
+    that read). When every version is dead-to-all (no snapshot can see the chain) there
+    is nothing to index. A non-HOT (single-version) root indexes its physical row
+    exactly as before — unchanged backfill behavior for pre-HOT data.
+
+  - **Guard 2 — VACUUM skips HOT-chain tuples.** The existing (F) heap-prune reclaims
+    any `is_dead_to_all` version; with HOT chains present that could reclaim a
+    dead-to-all MIDDLE member while a later member is still live, severing the `t_ctid`
+    chain. Until H3 adds proper HOT-aware pruning, `vacuum_heap` treats any tuple with
+    `HEAP_ONLY` OR `HOT_UPDATED` set as **non-reclaimable** (skipped), deferring all
+    HOT-chain reclamation to H3.
 
 ### Unlocks summary
 

@@ -37,7 +37,21 @@ pub trait StorageEngine: Send + Sync {
 pub trait SchemaOperations: Send + Sync {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
-    fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema) -> Result<()>;
+    /// Build a new secondary index and backfill it from the table's rows.
+    ///
+    /// `gc_horizon` is the GC horizon (minimum advertised snapshot `xmin`,
+    /// [`crate::PageBackedStorageEngine::vacuum`]'s `horizon`); the caller captures it
+    /// under the exclusive guard. It is used for the HOT broken-chain safety check
+    /// (`docs/specs/mvcc.md` §10 Milestone H2): a chain with two or more
+    /// not-dead-to-all versions whose new-index-column values differ is rejected with
+    /// a retryable `SerializationFailure`, because a single root-pointed entry cannot
+    /// serve every live snapshot of such a chain.
+    fn create_index(
+        &self,
+        ctx: &StatementContext,
+        schema: &IndexSchema,
+        gc_horizon: u64,
+    ) -> Result<()>;
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
 }
 

@@ -157,6 +157,22 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
 /// `infomask = 0` (no settled-status or HOT hints). `txn_id` flows from the
 /// inserting statement's `StatementContext.txn_id`.
 pub fn encode_row(schema: &TableSchema, row: &Row, txn_id: TxnId) -> Result<Vec<u8>> {
+    encode_row_with_infomask(schema, row, txn_id, 0)
+}
+
+/// Like [`encode_row`] but stamps an explicit `infomask` into the freshly inserted
+/// tuple's header (the rest of the header is the fresh-insert default: `xmin =
+/// txn_id`, `xmax = INVALID_XID`, `t_ctid = INVALID_TID`). The HOT-update fast path
+/// (`mvcc.md` §10 Milestone H2) uses this to write a heap-only successor with
+/// [`HEAP_ONLY`] already set in its header, so the bit is carried into the logged
+/// `HeapInsert` image and redone on recovery (the row bytes are the source of truth
+/// for `infomask`).
+pub(crate) fn encode_row_with_infomask(
+    schema: &TableSchema,
+    row: &Row,
+    txn_id: TxnId,
+    infomask: u16,
+) -> Result<Vec<u8>> {
     if row.values.len() != schema.columns.len() {
         return Err(DbError::storage(
             SqlState::DatatypeMismatch,
@@ -173,6 +189,9 @@ pub fn encode_row(schema: &TableSchema, row: &Row, txn_id: TxnId) -> Result<Vec<
     let mut bytes = vec![0; 1 + V2_MVCC_HEADER_LEN + bitmap_len];
     bytes[0] = ROW_FORMAT_VERSION;
     write_v2_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], txn_id);
+    // Stamp the requested infomask over the fresh-insert default (0). HOT uses this
+    // to set HEAP_ONLY on the new heap-only tuple; the default path passes 0.
+    bytes[1..3].copy_from_slice(&infomask.to_le_bytes());
 
     let bitmap_start = 1 + V2_MVCC_HEADER_LEN;
     let bitmap_end = bitmap_start + bitmap_len;

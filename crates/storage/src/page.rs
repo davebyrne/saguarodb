@@ -175,14 +175,32 @@ pub fn has_space_for(data: &[u8; PAGE_SIZE], row_len: usize) -> Result<bool> {
 /// finds none and the append path runs exactly as before, so existing insert
 /// behavior is unchanged.
 pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
+    try_insert_row(data, row)?.ok_or_else(|| {
+        DbError::storage(
+            SqlState::InternalError,
+            "page does not have enough free space",
+        )
+    })
+}
+
+/// Insert `row` into **this specific page** and return the slot id it landed in,
+/// or `Ok(None)` when the page has no room (rather than erroring). This is the
+/// page-local primitive the HOT-update fast path (`mvcc.md` §10 Milestone H2)
+/// needs: a HOT update must place the new heap-only tuple on the SAME page as its
+/// predecessor or fall back, so it must be able to ask "does it fit here?" and
+/// proceed only if so. The general heap insert (`engine::write_new_row`) is free to
+/// pick any page, which is NOT what HOT wants.
+///
+/// Slot selection is identical to [`insert_row`] (reuse the lowest `UNUSED` slot id
+/// before appending a fresh one), so the slot a HOT insert lands in is reproduced
+/// exactly by the `HeapInsert` redo (which re-runs [`insert_row`] and asserts the
+/// same slot). `insert_row` is just this with the `None` mapped to a hard error.
+pub fn try_insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<Option<u16>> {
     let header = validate(data)?;
     let row_len = u16::try_from(row.len())
         .map_err(|_| DbError::storage(SqlState::InternalError, "row is too large"))?;
     if free_bytes(header) < row.len() {
-        return Err(DbError::storage(
-            SqlState::InternalError,
-            "page does not have enough free space",
-        ));
+        return Ok(None);
     }
 
     let row_offset = header.free_start;
@@ -212,7 +230,7 @@ pub fn insert_row(data: &mut [u8; PAGE_SIZE], row: &[u8]) -> Result<u16> {
     };
     write_u16(data, FREE_SPACE_OFFSET, row_offset + row_len);
     write_checksum(data);
-    Ok(slot_num)
+    Ok(Some(slot_num))
 }
 
 /// The lowest slot id in `0..num_slots` whose line pointer is `UNUSED` (free for

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    ColumnInfo, DataType, DbError, IsolationLevel, Result, Snapshot, SqlState, StatementContext,
-    Value, WriteGuard,
+    CheckpointGuard, ColumnInfo, DataType, DbError, IsolationLevel, Result, Snapshot, SqlState,
+    StatementContext, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
@@ -22,6 +22,19 @@ use crate::registry::AdvertisedSnapshot;
 pub struct QueryService {
     components: Arc<ServerComponents>,
     engine: QueryEngine,
+}
+
+/// The concurrency guard an autocommit write/DDL unit holds for its lifetime. Most
+/// writes take the SHARED writer guard (concurrent with other writers); CREATE INDEX
+/// takes the EXCLUSIVE guard so its HOT broken-chain backfill sees a stable physical
+/// view (`docs/specs/mvcc.md` §10 Milestone H2). Dropping this drops the inner guard
+/// either way, so the autocommit path holds one variable across execution + commit.
+/// The inner guards are held purely for their RAII `Drop` (they own the lock), never
+/// read — like `WriteGuard`/`CheckpointGuard`'s own `_guard` fields.
+#[allow(dead_code, reason = "guards are held for RAII Drop, never read")]
+enum WriteUnitGuard {
+    Shared(WriteGuard),
+    Exclusive(CheckpointGuard),
 }
 
 /// The transaction-block status a session reports to the protocol layer after a
@@ -679,7 +692,10 @@ impl QueryService {
         // returns above with `failed = true` and never reaches here; a following
         // `SET TRANSACTION` is then gated by the 'E' state instead.)
         txn.first_statement_ran = true;
-        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, cancel);
+        // The GC horizon is consumed only by CREATE INDEX, which is non-transactional
+        // and rejected inside an explicit block (above), so it never reaches here; pass
+        // `0` (unused on this path).
+        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, 0, cancel);
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
         // The snapshot can no longer be used to read once `run_plan` has returned;
@@ -789,25 +805,39 @@ impl QueryService {
         // the worst path). `_advertised` lives until the end of this function, i.e.
         // exactly the snapshot's usable lifetime.
         let (snapshot, _advertised) = self.capture_snapshot(0);
-        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), cancel);
+        // A read never runs CREATE INDEX (the only horizon consumer), so the horizon
+        // is unused on this path; pass `0`.
+        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), 0, cancel);
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         self.engine.execute(&ctx, &physical)
     }
 
-    /// Execute a write/DDL statement as an autocommit unit under the SHARED writer
-    /// guard, committing durably on success and aborting on error. The guard is
-    /// shared (E2b, `docs/specs/mvcc.md` §10 E2b), so this autocommit write runs
-    /// concurrently with other writers; only a checkpoint (the exclusive guard)
-    /// excludes it. DDL routes here too — it runs under the same shared guard and
-    /// commits immediately (non-transactional, §4 Decision 6); its own structural
-    /// latches and immediate commit keep it consistent with concurrent writers.
+    /// Execute a write/DDL statement as an autocommit unit, committing durably on
+    /// success and aborting on error.
+    ///
+    /// Most writes (and most DDL) take the SHARED writer guard (E2b,
+    /// `docs/specs/mvcc.md` §10 E2b), running concurrently with other writers; only a
+    /// checkpoint (the exclusive guard) excludes them. **CREATE INDEX is the
+    /// exception:** it takes the EXCLUSIVE guard (like VACUUM) so its backfill sees a
+    /// stable physical chain view with no concurrent writer (HOT updates) mutating a
+    /// chain mid-scan, which its HOT broken-chain safety check requires
+    /// (`docs/specs/mvcc.md` §10 Milestone H2). The GC horizon, threaded into the
+    /// backfill for that check, is captured ONCE under the exclusive guard (so a
+    /// writer cannot advance it mid-build), mirroring `run_vacuum`.
     fn autocommit_write(
         &self,
         bound: BoundStatement,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
-        let guard = self.components.concurrency.begin_writer()?;
+        // CREATE INDEX takes the exclusive guard (stable chain view for the HOT
+        // broken-chain check); every other write/DDL takes the shared writer guard.
+        let needs_exclusive = matches!(bound, BoundStatement::CreateIndex { .. });
+        let guard = if needs_exclusive {
+            WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
+        } else {
+            WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
+        };
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // The autocommit unit begins: allocate the transaction id and register it
@@ -823,7 +853,21 @@ impl QueryService {
         // function returns on every path (success, statement error, panic), exactly
         // bracketing when the snapshot can still be used to read.
         let (snapshot, _advertised) = self.capture_snapshot(txn_id);
-        let ctx = self.execution_context(txn_id, snapshot, IsolationLevel::default(), cancel);
+        // Capture the GC horizon for CREATE INDEX's broken-chain check AFTER the
+        // exclusive guard is held (so no writer can advance it), exactly as
+        // `run_vacuum` does. For non-CREATE-INDEX statements the horizon is unused.
+        let gc_horizon = if needs_exclusive {
+            self.components.gc_horizon()
+        } else {
+            0
+        };
+        let ctx = self.execution_context(
+            txn_id,
+            snapshot,
+            IsolationLevel::default(),
+            gc_horizon,
+            cancel,
+        );
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {
@@ -1081,6 +1125,7 @@ impl QueryService {
         txn_id: u64,
         snapshot: Arc<Snapshot>,
         isolation: IsolationLevel,
+        gc_horizon: u64,
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
@@ -1088,6 +1133,7 @@ impl QueryService {
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
+            gc_horizon,
             cancel,
         }
     }

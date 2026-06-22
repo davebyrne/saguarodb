@@ -371,6 +371,7 @@ mod tests {
             catalog: &catalog,
             storage: &storage,
             schema_ops: &storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
         };
         let plan = PhysicalPlan::Insert {

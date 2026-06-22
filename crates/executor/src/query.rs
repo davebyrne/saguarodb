@@ -20,6 +20,12 @@ pub struct ExecutionContext<'a> {
     pub catalog: &'a dyn CatalogManager,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
+    /// The GC horizon (minimum advertised snapshot `xmin`) captured by the server,
+    /// threaded into `CREATE INDEX` for its HOT broken-chain safety check
+    /// (`docs/specs/mvcc.md` §10 Milestone H2). For non-DDL statements it is unused;
+    /// the server sets it under the exclusive guard for DDL and to any value
+    /// otherwise.
+    pub gc_horizon: u64,
     /// Set from another connection's `CancelRequest`; the engine polls it
     /// between rows and aborts with `QueryCanceled` when it becomes true.
     pub cancel: &'a AtomicBool,
@@ -365,7 +371,10 @@ fn execute_create_index(
     let schema = ctx
         .catalog
         .create_index(name.to_string(), table, columns, unique)?;
-    if let Err(err) = ctx.schema_ops.create_index(&ctx.statement, &schema) {
+    if let Err(err) = ctx
+        .schema_ops
+        .create_index(&ctx.statement, &schema, ctx.gc_horizon)
+    {
         let _ = ctx.catalog.drop_index(schema.id);
         return Err(err);
     }
