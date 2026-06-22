@@ -68,7 +68,14 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     let threshold = components.config.auto_vacuum_dead_rows;
     if threshold != 0 && components.dead_rows_since_vacuum.load(Ordering::Acquire) >= threshold {
         let horizon = components.gc_horizon();
-        crate::query::vacuum_all_user_tables(components, horizon)?;
+        // Full pass over every user table, AND advance the vacuum floor (F4c,
+        // `docs/specs/mvcc.md` §9): this captures `B = next_txn_id` under the guard,
+        // reclaims every aborted-creator tuple below `B`, then sets the floor to `B`.
+        // It runs BEFORE `flush_dirty_pages`/`store.sync_all`, so this pass's
+        // reclamation is fsynced by THIS checkpoint *before* the `truncate_before`
+        // below consults the floor — so an `Abort` is only dropped after its reclaimed
+        // tuples are durable (the F4c durability-ordering invariant).
+        crate::query::full_vacuum_pass(components, horizon)?;
         // Reset the accumulator: churn from here on counts toward the next auto-prune.
         components
             .dead_rows_since_vacuum

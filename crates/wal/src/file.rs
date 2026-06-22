@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use common::{DbError, Lsn, Result, TxnId, TxnStatus, TxnStatusView};
+use common::{DbError, FIRST_NORMAL_XID, Lsn, Result, TxnId, TxnStatus, TxnStatusView};
 
 use crate::codec::{max_lsn, read_records};
 use crate::{Clog, WalManager, WalRecord, WalRecordKind, encode_record};
@@ -27,6 +27,14 @@ struct WalState {
     /// [`Clog`]). Supersedes the old single-bit committed set.
     clog: Clog,
     pending_commits: HashSet<u64>,
+    /// The vacuum floor (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c): the boundary
+    /// below which a FULL VACUUM pass has reclaimed every aborted-creator tuple, so
+    /// `truncate_before` may drop those aborted transactions' `Abort` records and
+    /// float the implicit-committed floor past them. In-memory only; it starts at
+    /// `FIRST_NORMAL_XID` (no aborted txn is below it ⇒ the pin is fully conservative)
+    /// and resets there at every reopen — see [`WalManager::set_vacuum_floor`] for why
+    /// reset-at-restart is safe.
+    vacuum_floor: TxnId,
     poisoned: Option<String>,
     #[cfg(test)]
     fail_next_flush: Option<String>,
@@ -115,6 +123,9 @@ impl FileWalManager {
                 last_offset,
                 clog,
                 pending_commits: HashSet::new(),
+                // In-memory; reset to the fully-conservative boundary at every open
+                // (reset-at-restart, see `WalManager::set_vacuum_floor`).
+                vacuum_floor: FIRST_NORMAL_XID,
                 poisoned: None,
                 #[cfg(test)]
                 fail_next_flush: None,
@@ -262,28 +273,50 @@ impl WalManager for FileWalManager {
     fn truncate_before(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.lock_state()?;
 
-        // CONSERVATIVE TRUNCATION (`docs/specs/mvcc.md` §5.4, §8, Milestone D).
+        // CONSERVATIVE TRUNCATION (`docs/specs/mvcc.md` §5.4, §8, Milestone D) with
+        // the Milestone-F4c relaxation for vacuumed aborts (§9).
         // The relaxed flush gate (D1) lets an aborted/in-flight transaction's pages
         // reach the heap, and recovery rebuilds the CLOG from the retained WAL. So
-        // truncation must never drop a non-committed transaction's records: if it
-        // did, its `Abort` record (or absence of a `Commit`) would be gone, the
-        // implicit-committed floor would float above it, and its on-disk versions
-        // would wrongly read as committed (corruption — VACUUM, Milestone F, is what
-        // will reclaim aborted data and re-enable aggressive truncation).
+        // truncation must never drop a non-committed transaction's records UNLESS its
+        // on-disk versions are provably gone: if it did, its `Abort` record (or absence
+        // of a `Commit`) would be gone, the implicit-committed floor would float above
+        // it, and its on-disk versions would wrongly read as committed (corruption).
         //
-        // Find the oldest transaction with a record below the requested boundary
-        // that is NOT durably committed (aborted or in-flight). It "pins"
-        // truncation: clamp the effective boundary to its earliest record so that
-        // record, and everything after it, is retained. Under Stage-1 serialized
-        // writers no write transaction is in-flight during a checkpoint, so in
-        // practice this pin is an *aborted* transaction; the active case is covered
-        // for safety/Stage-2.
+        // Find the oldest transaction with a record below the requested boundary that
+        // "pins" truncation: a NON-committed transaction whose on-disk versions are NOT
+        // provably reclaimed. The clamp retains its earliest record and everything
+        // after it. Under Stage-1 serialized writers — and under Stage-2's exclusive
+        // checkpoint/VACUUM guard — no write transaction is in-flight during a
+        // checkpoint, so in practice a pin is an *aborted* transaction; the in-flight
+        // case is covered for safety.
+        //
+        // F4c relaxation: an aborted transaction whose id is `< vacuum_floor` does NOT
+        // pin. A FULL VACUUM pass reclaimed every aborted-creator tuple with creator id
+        // below that boundary (heap + index), so dropping its `Abort` and flooring the
+        // implicit-committed boundary past it cannot resurrect anything ("implicit-
+        // committed below floor" is vacuously correct — there is no surviving version
+        // to read). This relaxation is gated STRICTLY on a CLOG-recorded `Aborted`
+        // status (`is_aborted`): an in-flight / not-yet-settled id below `vacuum_floor`
+        // (which should not exist under the exclusive guard, but we are defensive) is
+        // NOT provably reclaimed and therefore still pins. The reclamation is durable
+        // before this runs — the checkpoint flushes+fsyncs all dirty pages
+        // (`flush_dirty_pages` + `store.sync_all`) before `truncate_before` consults the
+        // floor — so no `Abort` is ever dropped while its tuples remain on disk.
+        let vacuum_floor = state.vacuum_floor;
         let pin = state
             .records
             .iter()
             .filter(|stored| stored.record.lsn < lsn)
             .filter(|stored| represents_transaction(&stored.record))
-            .filter(|stored| !state.clog.is_committed(stored.record.txn_id))
+            .filter(|stored| {
+                let txn_id = stored.record.txn_id;
+                // A transaction pins truncation when it is not durably committed AND
+                // its on-disk versions are not provably reclaimed. The F4c relaxation
+                // is the second clause: a CLOG-recorded `Aborted` txn below the vacuum
+                // floor has no surviving version, so it stops pinning.
+                let reclaimed_abort = state.clog.is_aborted(txn_id) && txn_id < vacuum_floor;
+                !state.clog.is_committed(txn_id) && !reclaimed_abort
+            })
             .min_by_key(|stored| stored.record.lsn)
             .map(|stored| (stored.record.lsn, stored.record.txn_id));
         let effective_lsn = match pin {
@@ -297,14 +330,17 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn >= effective_lsn)
             .cloned()
             .collect();
-        // Every transaction dropped below `effective_lsn` is committed (the pin
-        // above retained the oldest non-committed one), so advancing the
-        // implicit-committed floor past them keeps their surviving tuples readable
-        // as committed even though their `Commit` records are gone. Crucially the
-        // floor never crosses the pinned (non-committed) transaction: its records
-        // are retained, so it is not among the dropped set, and the max below is the
-        // greatest *dropped* (committed) id. A retained `Abort` keeps its explicit
-        // status regardless (recorded status wins over the floor).
+        // Every transaction dropped below `effective_lsn` is either committed or a
+        // VACUUM-reclaimed abort below `vacuum_floor` (the pin above retained the
+        // oldest non-committed, not-yet-reclaimed one). Advancing the
+        // implicit-committed floor past them is safe: a committed txn's surviving
+        // tuples stay readable as committed even though its `Commit` is gone, and a
+        // reclaimed-aborted txn has NO surviving tuple, so reading it
+        // implicitly-committed is vacuous (nothing references it). Crucially the
+        // floor never crosses a still-pinned (non-committed, un-reclaimed)
+        // transaction: its records are retained, so it is not among the dropped set,
+        // and the max below is the greatest *dropped* id. A retained `Abort` keeps
+        // its explicit status regardless (recorded status wins over the floor).
         let truncated_floor = state
             .records
             .iter()
@@ -446,6 +482,16 @@ impl WalManager for FileWalManager {
             None => allocation_boundary,
         };
         state.clog.set_committed_floor(floor);
+        Ok(())
+    }
+
+    fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
+        // Monotonic, in-memory only (see the trait doc): a full VACUUM pass under the
+        // exclusive guard reclaimed every aborted-creator tuple below `boundary`, so
+        // `truncate_before` may now drop those aborted transactions' `Abort` records
+        // and float the implicit-committed floor past them. Never lowered.
+        let mut state = self.lock_state()?;
+        state.vacuum_floor = state.vacuum_floor.max(boundary);
         Ok(())
     }
 }

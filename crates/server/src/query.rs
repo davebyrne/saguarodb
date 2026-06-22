@@ -749,8 +749,10 @@ impl QueryService {
         let horizon = self.components.gc_horizon();
 
         // `VACUUM t` targets just `t` (error if it does not exist); `VACUUM` (no table)
-        // targets every user table in the catalog.
-        let targets = match table {
+        // is a FULL pass over every user table — and ONLY a full pass advances the
+        // vacuum floor (`docs/specs/mvcc.md` §9, F4c), since a single-table pass leaves
+        // other tables' aborted-creator tuples on disk.
+        match table {
             Some(name) => {
                 let schema = self
                     .components
@@ -762,15 +764,19 @@ impl QueryService {
                             format!("table {name} does not exist"),
                         )
                     })?;
-                vec![schema]
+                // Single-table pass: reclaim `t`'s dead versions but DO NOT advance the
+                // vacuum floor (other tables may still hold aborted-creator tuples).
+                vacuum_tables(&self.components, std::slice::from_ref(&schema), horizon)?;
             }
-            None => self.components.catalog.list_tables()?,
-        };
-
-        // Run F4a's three-phase orchestration (`engine.vacuum`) over each target. The
-        // checkpoint auto-prune path reuses the same helper (`vacuum_tables`) under its
-        // own exclusive guard, so the reclamation logic lives in exactly one place.
-        vacuum_tables(&self.components, &targets, horizon)?;
+            None => {
+                // Full pass: capture the boundary BEFORE the pass and advance the vacuum
+                // floor AFTER it (the F4c contract — see `full_vacuum_pass`). The
+                // reclamation becomes durable in the NEXT checkpoint, which flushes all
+                // dirty pages before its `truncate_before` consults the floor, so no
+                // `Abort` is ever dropped while its tuples remain on disk.
+                full_vacuum_pass(&self.components, horizon)?;
+            }
+        }
 
         Ok(ExecutionResult::Modified {
             command: "VACUUM".to_string(),
@@ -1147,10 +1153,41 @@ fn vacuum_tables(
     Ok(())
 }
 
+/// Run a FULL VACUUM pass over every user table AND advance the WAL **vacuum floor**
+/// (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c). Used by the on-demand `VACUUM`
+/// (no table) and the checkpoint auto-prune (F4b) — the two full-pass callers.
+///
+/// The boundary `B = next_txn_id` is captured BEFORE the pass and the floor is
+/// advanced to `B` AFTER it. Both reads happen under the exclusive guard the caller
+/// holds (same contract as [`vacuum_tables`]: `horizon` was captured under it), so no
+/// id is allocated mid-pass and `B` is the exact id high-water at scan time. Because
+/// the aborted-creator reclaim has NO age requirement, a full pass reclaims EVERY
+/// aborted-creator tuple (heap + index) that exists at scan time across every user
+/// table, so every aborted transaction with id `< B` now has no surviving on-disk
+/// version. Advancing the floor to `B` is therefore safe: `truncate_before` may drop
+/// those aborted txns' `Abort` records and float the implicit-committed floor past
+/// them (the catalog is NOT MVCC-versioned, so user-table tuples are the only place
+/// aborted-creator versions live).
+///
+/// **Durability ordering.** The floor is only ever CONSULTED by `truncate_before`,
+/// which a checkpoint runs AFTER `flush_dirty_pages` + `store.sync_all` — so by the
+/// time the floor is used, every dirty page this pass produced (auto-prune: this same
+/// checkpoint; on-demand: a later checkpoint) is fsynced to the heap. No `Abort` is
+/// dropped while its reclaimed tuples are still only in memory.
+pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> Result<()> {
+    // Capture B BEFORE the pass, under the guard (no concurrent allocation).
+    let boundary = components.next_txn_id.load(Ordering::Acquire);
+    vacuum_all_user_tables(components, horizon)?;
+    // Advance the floor only AFTER the pass has reclaimed every aborted-creator tuple
+    // below B. Monotonic; in-memory; reset-at-restart (see `WalManager::set_vacuum_floor`).
+    components.wal.set_vacuum_floor(boundary)
+}
+
 /// Vacuum every user table in the catalog, for the checkpoint auto-prune path (F4b).
 /// Same caller contract as [`vacuum_tables`]: the exclusive guard is held and
-/// `horizon` was captured under it.
-pub(crate) fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
+/// `horizon` was captured under it. This does NOT advance the vacuum floor; callers
+/// that perform a *full* pass and want the floor advanced use [`full_vacuum_pass`].
+fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
     let tables = components.catalog.list_tables()?;
     vacuum_tables(components, &tables, horizon)
 }

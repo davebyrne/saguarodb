@@ -777,6 +777,164 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
 }
 
 #[tokio::test]
+async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_restart() {
+    // THE critical Milestone-F4c test (`docs/specs/mvcc.md` §5.4, §9). This is the
+    // relaxation of the conservative-truncation guard, and the place where a mistake
+    // reintroduces the aborted-data-visible-after-crash hole. Sequence:
+    //   1. A committed base row 'Ada'.
+    //   2. An explicit transaction inserts 'Ghost', then ROLLBACKs (status-based abort,
+    //      no undo); its heap+index pages stay dirty.
+    //   3. A checkpoint FLUSHES the aborted txn's pages to the heap and PINS its WAL
+    //      records (Abort retained) — the conservative guard, still in force here.
+    //   4. A FULL `VACUUM` reclaims the aborted-creator 'Ghost' tuple (heap + index;
+    //      aborted-creator reclaim has NO age requirement) and advances the vacuum
+    //      floor past the aborted txn.
+    //   5. A later committed row 'Bea', then another checkpoint: now the aborted txn is
+    //      BELOW the vacuum floor, so truncation DROPS its `Abort` and floats the
+    //      implicit-committed floor past it — safe, because the VACUUM already made the
+    //      'Ghost' reclamation durable (the checkpoint flush+fsync the VACUUM's pages
+    //      before this checkpoint's `truncate_before` consults the floor).
+    //   6. Crash + restart: 'Ghost' must be ABSENT — no committed ghost. There is no
+    //      surviving on-disk version to resurrect, so flooring past the aborted txn is
+    //      vacuously correct.
+    // Without the F4c gating, blindly flooring past a NON-vacuumed abort (the
+    // counter-test `aborted_transaction_stays_invisible_across_checkpoint_and_restart`)
+    // WOULD resurrect 'Ghost'; here the relaxation is licensed only because VACUUM
+    // reclaimed its tuples first.
+    let dir = tempfile::tempdir().unwrap();
+    let wal_bytes_before_truncation;
+    let wal_bytes_after_truncation;
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+
+        // Abort a transaction that inserted 'Ghost'.
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("insert into users (id, name) values (2, 'Ghost')")
+            .await;
+        assert_eq!(conn.ok("rollback").await.status, b'I');
+        conn.close().await;
+
+        // Checkpoint: flush the aborted txn's pages; its Abort is still PINNED here
+        // (no VACUUM yet), so truncation retains it. Record the retained WAL size.
+        server.force_checkpoint().await.unwrap();
+        wal_bytes_before_truncation = server.app().components.wal.bytes_after(0).unwrap();
+
+        // FULL VACUUM: reclaim the aborted-creator 'Ghost' tuple (heap + index) and
+        // advance the vacuum floor past the aborted txn. `VACUUM` with no table is a
+        // full pass over every user table.
+        let vacuum = server.simple_query("vacuum").await;
+        assert!(vacuum.is_ok(), "full VACUUM should succeed");
+
+        // A later committed row, then a checkpoint: the aborted txn is now below the
+        // vacuum floor, so truncation drops its Abort and floats the floor past it. The
+        // VACUUM's reclamation is flushed+fsynced by THIS checkpoint before its
+        // truncate_before consults the floor (the durability-ordering invariant).
+        server
+            .simple_query("insert into users (id, name) values (3, 'Bea')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        wal_bytes_after_truncation = server.app().components.wal.bytes_after(0).unwrap();
+    }
+
+    // The relaxation had EFFECT: after VACUUM, the second checkpoint truncated past the
+    // previously-pinning aborted txn, so the retained WAL did not just grow by the new
+    // committed row — it dropped the pinned prefix. (A weaker but robust check that the
+    // truncation reached past the abort: the retained size did not balloon.)
+    assert!(
+        wal_bytes_after_truncation <= wal_bytes_before_truncation,
+        "after VACUUM the checkpoint truncated past the reclaimed aborted txn \
+         (before={wal_bytes_before_truncation}, after={wal_bytes_after_truncation})"
+    );
+
+    // Crash + restart: 'Ghost' is gone — no committed-ghost resurrection.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("3".to_string()), Some("Bea".to_string())],
+        ],
+        "the VACUUM-reclaimed aborted 'Ghost' row must NOT resurrect after restart"
+    );
+}
+
+#[tokio::test]
+async fn single_table_vacuum_does_not_relax_truncation_for_other_tables() {
+    // A single-table `VACUUM t` must NOT advance the vacuum floor (`docs/specs/mvcc.md`
+    // §9, F4c): it leaves OTHER tables' aborted-creator tuples on disk, so flooring
+    // past those aborts would resurrect them. Here an aborted txn writes to `other`,
+    // then `VACUUM users` (a DIFFERENT table) runs — which must NOT reclaim `other`'s
+    // ghost nor advance the floor — and after a checkpoint + restart the ghost stays
+    // invisible (the abort still pins, exactly as in the no-VACUUM counter-test).
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create table other (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into other (id, name) values (1, 'Keep')")
+            .await
+            .unwrap();
+
+        // Abort a transaction that inserted a ghost into `other`.
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("insert into other (id, name) values (2, 'Ghost')")
+            .await;
+        assert_eq!(conn.ok("rollback").await.status, b'I');
+        conn.close().await;
+
+        server.force_checkpoint().await.unwrap();
+
+        // VACUUM a DIFFERENT table: does not reclaim `other`'s ghost and does not
+        // advance the vacuum floor, so `other`'s aborted txn must still pin truncation.
+        assert!(server.simple_query("vacuum users").await.is_ok());
+
+        server
+            .simple_query("insert into other (id, name) values (3, 'Also')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from other order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Keep".to_string())],
+            vec![Some("3".to_string()), Some("Also".to_string())],
+        ],
+        "a single-table VACUUM must not relax truncation for another table's abort"
+    );
+}
+
+#[tokio::test]
 async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
     // With a small buffer pool, a large transaction's uncommitted pages are stolen
     // (flushed to the heap) under buffer pressure — the relaxed flush gate

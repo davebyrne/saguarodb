@@ -310,15 +310,45 @@ transaction is never *below* the floor. So:
   `min(allocation_boundary, oldest_non_committed_retained_xid)`. Because truncation
   guarantees everything dropped below the oldest retained non-committed transaction
   was committed, ids below the floor are all genuinely committed.
-- **F dependency / cost.** Aborted transactions therefore *pin* WAL truncation
-  (bounded extra WAL retained), until VACUUM (Milestone F) reclaims their on-disk
-  versions; only then is it safe to truncate past an aborted transaction and let
-  the floor cover it (a transaction with no surviving versions is trivially
-  implicit-committed). Aggressive truncation past aborted transactions is enabled
-  in Milestone F.
-- **(Deferred to F)** A durable CLOG file, truncatable below the GC horizon (§9)
-  and coordinated with checkpoint/WAL truncation. Transactions older than the
-  horizon are implicitly committed (their versions are either reclaimed or frozen).
+- **F4c relaxation (live) — the vacuum floor.** An aborted transaction pins WAL
+  truncation only *until VACUUM reclaims its on-disk versions*. The WAL manager
+  tracks a **vacuum floor** `B`: the boundary below which a FULL VACUUM pass (every
+  user table, under the exclusive guard) has reclaimed every aborted-creator tuple
+  (heap + index; aborted-creator reclaim has **no age requirement** — §9 F1, so one
+  pass reclaims every such tuple it scans). `truncate_before` then stops pinning an
+  aborted transaction with id `< B` and lets the floor float past it:
+  `pin = represents_transaction(rec) && !is_committed(txn) && !(is_aborted(txn) && txn < B)`.
+  This is safe because the transaction has **no surviving on-disk version**, so
+  "implicit-committed below floor" is vacuously correct for it. The relaxation is
+  gated STRICTLY on a CLOG-recorded `Aborted` status: an in-flight / not-yet-settled
+  id below `B` (which cannot occur under the exclusive guard, but is handled
+  defensively) is **not** provably reclaimed and still pins. An aborted transaction
+  `>= B` still pins.
+  - **Computing/advancing `B`.** `B = next_txn_id` captured at the *start* of a full
+    pass under the exclusive guard (no id is allocated mid-pass), set as
+    `vacuum_floor = max(vacuum_floor, B)` *after* the pass. Only a FULL pass advances
+    it (on-demand `VACUUM` with no table, and the checkpoint auto-prune over all
+    tables — F4b); a single-table `VACUUM t` does **not** (other tables' aborted
+    tuples survive). The catalog is not MVCC-versioned, so user-table tuples are the
+    only place aborted-creator versions live.
+  - **Durability ordering (the critical invariant).** The vacuum floor is only ever
+    *consulted* by `truncate_before`, which a checkpoint runs **after**
+    `flush_dirty_pages` + `store.sync_all`. So by the time any `Abort` is dropped, the
+    VACUUM's reclamation is fsynced into the heap — auto-prune is reclaimed in the
+    *same* checkpoint (it runs before `flush_dirty_pages`); an on-demand full VACUUM's
+    dirtied pages are flushed by the *next* checkpoint before that checkpoint's
+    `truncate_before`. No `Abort` is ever dropped while its reclaimed tuples are still
+    only in memory.
+  - **In-memory, reset-at-restart.** The vacuum floor is **not** durable; it resets to
+    `FIRST_NORMAL_XID` at every WAL open. That is safe: after a crash the WAL is
+    un-truncated again, so truncation is conservative once more (every aborted txn
+    pins) until the first post-restart full VACUUM — never less safe, only less
+    aggressive — and recovery rebuilds the CLOG from the surviving WAL regardless.
+- **(Still deferred to F — durable CLOG file)** A standalone durable CLOG file,
+  truncatable below the GC horizon (§9) and coordinated with checkpoint/WAL
+  truncation, would let the vacuum floor / implicit-committed boundary survive
+  restart. It remains deferred; the in-memory vacuum floor above is the F4c
+  mechanism and needs no new durable format.
 
 ### 5.5 `StatementContext` and the snapshot type (`crates/common`)
 
@@ -490,10 +520,14 @@ becomes load-bearing once writers run concurrently (E2b).
   has run and the CLOG hides the non-committed ones.)
 - **Conservative WAL truncation / `committed_floor`** (the critical D guard; see
   §5.4): truncation never drops a transaction that is not durably committed
-  (aborted or in-flight), and the implicit-committed floor never crosses one.
-  Otherwise an aborted transaction's flushed-but-now-orphan versions, with its
-  `Abort` record truncated and the floor floated above it, would read as
-  *committed* after restart — corruption, since no VACUUM yet reclaims them.
+  (aborted or in-flight) **and whose on-disk versions are not provably reclaimed**,
+  and the implicit-committed floor never crosses such a transaction. Otherwise an
+  aborted transaction's flushed-but-now-orphan versions, with its `Abort` record
+  truncated and the floor floated above it, would read as *committed* after restart
+  — corruption. **F4c relaxation (live):** an aborted transaction below the **vacuum
+  floor** `B` (a full VACUUM pass reclaimed every aborted-creator tuple `< B`, made
+  durable before the truncation that consults `B`) no longer pins, because it has no
+  surviving version to resurrect; see §5.4.
 - **Consequence**: after a crash the heap may contain flushed-then-aborted/dead
   versions. This is correct (CLOG hides them; VACUUM reclaims them). Heap
   cleanliness is a VACUUM responsibility, not a recovery responsibility.
@@ -659,8 +693,19 @@ design, because index entries accumulate per version as well as heap tuples.
   made durable by that same checkpoint — then resets the counter. This bounds heap +
   index space under sustained churn with no operator action. It inherits F4a's
   no-data-loss safety verbatim (horizon captured under the guard; only versions no live
-  snapshot can see are reclaimed). Opportunistic pruning during scans is deferred. CLOG
-  truncation below the horizon piggybacks here (F4c).
+  snapshot can see are reclaimed). Opportunistic pruning during scans is deferred.
+- **F4c — WAL-truncation relaxation for reclaimed aborts (live).** A FULL VACUUM pass
+  (on-demand `VACUUM` with no table, or the auto-prune over all tables) advances the WAL
+  **vacuum floor** `B = next_txn_id` captured under the guard at the start of the pass.
+  Because aborted-creator reclaim has no age requirement, the pass reclaims every
+  aborted-creator tuple (heap + index) below `B`, so `truncate_before` may then drop
+  those aborted transactions' `Abort` records and float the implicit-committed floor
+  past them — they have no surviving on-disk version, so it is vacuously committed-
+  below-floor (§5.4). The floor is in-memory (reset-at-restart, conservative again until
+  the first post-restart full VACUUM) and consulted only after the reclamation is durable
+  (the checkpoint flushes+fsyncs dirty pages before `truncate_before`). A single-table
+  `VACUUM t` does NOT advance it. A *durable CLOG file* (which would carry the floor
+  across restart) remains deferred (§5.4).
 
 ---
 
@@ -851,7 +896,14 @@ and per-tuple CLOG-probe contention reduction.
   guard it already holds, with the horizon captured under that guard and the vacuum run
   before `flush_dirty_pages` so its pages/FPIs are durable that checkpoint — bounding
   space without operator `VACUUM`, with F4a's no-data-loss safety. **F4c —
-  WAL-truncation relaxation + CLOG truncation** (§9). F4c remains to do.
+  WAL-truncation relaxation for reclaimed aborts (live).** A full VACUUM pass advances
+  the in-memory WAL **vacuum floor** `B` (= `next_txn_id` at the start of the pass,
+  captured under the guard); `truncate_before` then stops pinning — and floats the
+  implicit-committed floor past — aborted transactions `< B`, whose on-disk versions the
+  pass reclaimed, while still pinning in-flight or un-vacuumed aborts. The reclamation is
+  durable before the truncation that drops the `Abort` (checkpoint flush+fsync precedes
+  `truncate_before`); the floor is reset-at-restart (conservative again until the first
+  post-restart full VACUUM). A durable CLOG file remains deferred (§5.4).
 
 ### Milestone G — Isolation levels & polish
 
@@ -952,10 +1004,14 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
   the WAL only across a prefix of committed transactions; an aborted (or in-flight)
   transaction pins truncation and keeps its `Abort` record, and the recovery floor
   never crosses it (§5.4, §8). This keeps aborted-but-flushed versions invisible
-  across restart without a durable CLOG or an undo pass. The remaining open part is
-  purely for F: once VACUUM reclaims an aborted transaction's versions, truncation
-  may advance past it — its versions are gone, so it is trivially
-  implicit-committed — bounding the WAL retained for long-lived aborted ids.)*
+  across restart without a durable CLOG or an undo pass. **F4c resolution (live):**
+  once a FULL VACUUM pass reclaims an aborted transaction's on-disk versions, the WAL
+  **vacuum floor** advances past it, truncation drops its `Abort`, and the
+  implicit-committed floor floats past it — its versions are gone, so it is trivially
+  implicit-committed — bounding the WAL retained for long-lived aborted ids. The
+  floor is in-memory (reset-at-restart, conservative again after a crash) and is only
+  consulted after the reclamation is durable; a standalone durable CLOG file that
+  carries the floor across restart remains deferred to F.)*
 - Snapshot representation cost (`xip` as `Vec` vs a more compact structure) — fine
   at the target concurrency; revisit only if measured.
 - Frozen-xid / wraparound handling for very old `xmin` values (far off; the

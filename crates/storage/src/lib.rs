@@ -1031,6 +1031,10 @@ mod tests {
         fn establish_recovery_committed_floor(&self, _allocation_boundary: u64) -> Result<()> {
             Ok(())
         }
+
+        fn set_vacuum_floor(&self, _boundary: TxnId) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl TxnStatusView for CountingWal {

@@ -95,6 +95,15 @@ impl Clog {
         self.status(txn_id) == TxnStatus::Committed
     }
 
+    /// Whether `txn_id` is recorded as `Aborted`. Equivalent to
+    /// `self.status(txn_id) == TxnStatus::Aborted`. Used by the F4c truncation
+    /// relaxation, which floors past an aborted transaction only when it is BELOW
+    /// the vacuum floor — never an unrecorded/in-progress id (which is not
+    /// `Aborted` here).
+    pub fn is_aborted(&self, txn_id: TxnId) -> bool {
+        self.status(txn_id) == TxnStatus::Aborted
+    }
+
     /// Record `txn_id` as in-progress (statement/transaction begin).
     pub fn set_in_progress(&mut self, txn_id: TxnId) {
         self.statuses.insert(txn_id, TxnStatus::InProgress);
