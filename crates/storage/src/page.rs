@@ -33,9 +33,8 @@ mod line_pointer {
     /// still reference it (today's tombstoned slot). Reclaimed to `UNUSED` only
     /// after index vacuum.
     pub(super) const DEAD: u16 = 1;
-    /// Free for reuse. Defined now; reclaim (`DEAD`/`REDIRECT` -> `UNUSED`) is
-    /// owned by VACUUM (Milestone F), so nothing assigns it yet.
-    #[allow(dead_code, reason = "line-pointer reclaim owned by Milestone F")]
+    /// Free for reuse. Produced by `reclaim_line_pointers` (VACUUM, Milestone F);
+    /// `insert_row` does not yet reuse an `UNUSED` slot id (it always appends).
     pub(super) const UNUSED: u16 = 0;
     /// Points at another slot on the same page. Reserved for HOT (Milestone H);
     /// no path produces it yet.
@@ -241,6 +240,121 @@ pub fn set_tuple_header(
     Ok(())
 }
 
+/// Prune the listed dead slots and compact the page's live tuples in a single
+/// pass (the intra-page heap-prune primitive, `mvcc.md` §9 / Milestone F2).
+///
+/// `dead_slots` are line pointers the caller (F2b) has classified as
+/// dead-to-everyone via `is_dead_to_all` — this function does **not** classify;
+/// it only rewrites the page. For each:
+///
+/// - Each `dead_slot` is flipped `NORMAL -> DEAD`. The slot id is **retained**
+///   (index entries may still reference it); reclaiming the line pointer to
+///   `UNUSED` is a later step (`reclaim_line_pointers`, owned by F3b).
+/// - The surviving `NORMAL` tuples are relocated so their bytes are contiguous
+///   from `HEADER_LEN` upward, reclaiming the bytes freed by the now-`DEAD`
+///   slots and any prior gaps. Each survivor's line-pointer **`offset` is
+///   rewritten** to its new location; the slot-id array order/ids and every
+///   survivor's `len` are unchanged, so `read_row(data, slot)` returns the
+///   identical bytes for the same slot id after compaction. `free_start` is
+///   recomputed for the compacted layout.
+/// - The PageLSN is stamped with `lsn` and the checksum refreshed (via
+///   `set_page_lsn`, exactly like `set_tuple_header`), so the checksum covers
+///   the compacted bytes.
+///
+/// Survivors are copied through a scratch buffer before being written back, so
+/// overlapping source/destination ranges never corrupt a tuple regardless of
+/// the survivors' original order on the page. A `dead_slot` that is not a live
+/// `NORMAL` line pointer (already `DEAD`/`UNUSED`, or out of bounds) is a misuse
+/// and returns a structured `DbError` rather than silently skipping.
+#[allow(dead_code, reason = "consumed by VACUUM in F2b/F3b")]
+pub fn prune_and_compact(data: &mut [u8; PAGE_SIZE], dead_slots: &[u16], lsn: Lsn) -> Result<()> {
+    let header = validate(data)?;
+
+    // Mark the listed slots DEAD first, validating each is a live target.
+    for &slot_num in dead_slots {
+        if slot_num >= header.num_slots {
+            return Err(corrupt_page("slot number is out of bounds"));
+        }
+        let mut slot = read_slot(data, slot_num);
+        if !slot.is_live() {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "cannot prune a non-live slot",
+            ));
+        }
+        slot.flags = line_pointer::DEAD;
+        write_slot(data, slot_num, slot);
+    }
+
+    // Snapshot every surviving NORMAL tuple's bytes into a scratch buffer so the
+    // copy-back never reads a region a prior survivor has already overwritten.
+    let mut survivors: Vec<(u16, Vec<u8>)> = Vec::new();
+    for slot_num in 0..header.num_slots {
+        let slot = read_slot(data, slot_num);
+        if slot.is_live() {
+            let start = slot.offset as usize;
+            let end = start + slot.len as usize;
+            survivors.push((slot_num, data[start..end].to_vec()));
+        }
+    }
+
+    // Lay survivors back down contiguously from HEADER_LEN, rewriting offsets.
+    let mut cursor = HEADER_LEN;
+    for (slot_num, bytes) in &survivors {
+        let new_offset = cursor;
+        let new_end = new_offset + bytes.len();
+        data[new_offset..new_end].copy_from_slice(bytes);
+        let mut slot = read_slot(data, *slot_num);
+        slot.offset =
+            u16::try_from(new_offset).map_err(|_| corrupt_page("compacted offset overflows"))?;
+        write_slot(data, *slot_num, slot);
+        cursor = new_end;
+    }
+
+    write_u16(
+        data,
+        FREE_SPACE_OFFSET,
+        u16::try_from(cursor).map_err(|_| corrupt_page("compacted free_start overflows"))?,
+    );
+    set_page_lsn(data, lsn);
+
+    // Re-derive and revalidate the compacted layout (covers checksum + offsets).
+    validate(data)?;
+    Ok(())
+}
+
+/// Reclaim the listed `DEAD` line pointers to `UNUSED`, making their slot ids
+/// reusable by a future `insert_row` (the line-pointer reclaim primitive,
+/// `mvcc.md` §9 / Milestone F3b). Each slot must currently be `DEAD`; a
+/// non-`DEAD` slot (still `NORMAL`/already `UNUSED`, or out of bounds) is a
+/// misuse and returns a structured `DbError`. The PageLSN is stamped with `lsn`
+/// and the checksum refreshed via `set_page_lsn`.
+///
+/// Note `insert_row` currently always **appends** a fresh slot id (it never
+/// scans for a reusable `UNUSED` slot), so flipping `DEAD -> UNUSED` reclaims no
+/// space today — it is correct and forward-looking; slot-id reuse on insert is a
+/// separate, later change and is intentionally not added here.
+#[allow(dead_code, reason = "consumed by VACUUM in F2b/F3b")]
+pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn) -> Result<()> {
+    let header = validate(data)?;
+    for &slot_num in slots {
+        if slot_num >= header.num_slots {
+            return Err(corrupt_page("slot number is out of bounds"));
+        }
+        let mut slot = read_slot(data, slot_num);
+        if slot.flags != line_pointer::DEAD {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "cannot reclaim a slot that is not DEAD",
+            ));
+        }
+        slot.flags = line_pointer::UNUSED;
+        write_slot(data, slot_num, slot);
+    }
+    set_page_lsn(data, lsn);
+    Ok(())
+}
+
 fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
     if header.free_start as usize > PAGE_SIZE {
         return Err(corrupt_page("free space offset is outside page"));
@@ -260,18 +374,27 @@ fn validate_layout(data: &[u8; PAGE_SIZE], header: PageHeader) -> Result<()> {
 
     for slot_num in 0..header.num_slots {
         let slot = read_slot(data, slot_num);
-        // Only NORMAL and DEAD line pointers are produced in this milestone;
-        // UNUSED/REDIRECT (reclaim/HOT) are reserved and not yet written, so a
-        // page carrying any other flag value is corrupt.
-        if slot.flags != line_pointer::NORMAL && slot.flags != line_pointer::DEAD {
+        // NORMAL/DEAD are produced by inserts/deletes; UNUSED is produced by
+        // line-pointer reclaim (VACUUM, Milestone F). REDIRECT (HOT, Milestone H)
+        // is reserved and not yet written, so a page carrying it — or any other
+        // flag value — is corrupt.
+        if slot.flags != line_pointer::NORMAL
+            && slot.flags != line_pointer::DEAD
+            && slot.flags != line_pointer::UNUSED
+        {
             return Err(corrupt_page("slot has invalid flags"));
         }
-        let start = slot.offset as usize;
-        let end = start
-            .checked_add(slot.len as usize)
-            .ok_or_else(|| corrupt_page("slot length overflows"))?;
-        if start < HEADER_LEN || end > header.free_start as usize {
-            return Err(corrupt_page("slot points outside row region"));
+        // Only NORMAL line pointers name live bytes, so only they must lie within
+        // the live region. After compaction/reclaim a DEAD or UNUSED slot's
+        // `(offset, len)` no longer addresses live data and is left unconstrained.
+        if slot.flags == line_pointer::NORMAL {
+            let start = slot.offset as usize;
+            let end = start
+                .checked_add(slot.len as usize)
+                .ok_or_else(|| corrupt_page("slot length overflows"))?;
+            if start < HEADER_LEN || end > header.free_start as usize {
+                return Err(corrupt_page("slot points outside row region"));
+            }
         }
     }
 
@@ -354,9 +477,10 @@ pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_LSN_OFFSET, PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET,
-        delete_row, init_page, insert_row, line_pointer, read_slot, set_page_lsn, set_tuple_header,
-        validate, write_checksum,
+        FREE_SPACE_OFFSET, HEADER_LEN, PAGE_LSN_OFFSET, PAGE_TYPE_DATA, PAGE_TYPE_OFFSET,
+        PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page, insert_row, line_pointer,
+        prune_and_compact, read_row, read_slot, read_u16, reclaim_line_pointers, set_page_lsn,
+        set_tuple_header, validate, write_checksum, write_slot,
     };
     use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
@@ -509,5 +633,244 @@ mod tests {
         let slot = insert_row(&mut data.0, &encode_row(&schema(), &row(), 7).unwrap()).unwrap();
         let bytes = super::read_row(&data.0, slot).unwrap().unwrap();
         assert_eq!(decode_row(&schema(), &bytes).unwrap().xmax, INVALID_XID);
+    }
+
+    // --- F2a: prune_and_compact / reclaim_line_pointers / validate_layout ---
+
+    /// A page-level tuple is an opaque byte payload as far as compaction cares,
+    /// so these tests insert distinct-byte blobs of varied length. Using a unique
+    /// fill byte per slot proves a survivor's bytes belong to its own slot id after
+    /// relocation (not a neighbour's), which an encoded-row helper would obscure.
+    fn blob(fill: u8, len: usize) -> Vec<u8> {
+        vec![fill; len]
+    }
+
+    fn insert_blob(data: &mut PageData, fill: u8, len: usize) -> u16 {
+        insert_row(&mut data.0, &blob(fill, len)).unwrap()
+    }
+
+    #[test]
+    fn prune_and_compact_relocates_survivors_and_frees_dead_bytes() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        // Varied sizes; record each slot's id, fill byte, and length.
+        let specs: [(u8, usize); 5] = [(0xA1, 10), (0xB2, 30), (0xC3, 5), (0xD4, 20), (0xE5, 15)];
+        let slots: Vec<u16> = specs
+            .iter()
+            .map(|&(fill, len)| insert_blob(&mut data, fill, len))
+            .collect();
+        let free_before = read_u16(&data.0, FREE_SPACE_OFFSET);
+
+        // Dead slots interleaved among survivors (indices 1 and 3 in insert order).
+        let dead = [slots[1], slots[3]];
+        let dead_bytes: usize = specs[1].1 + specs[3].1;
+
+        prune_and_compact(&mut data.0, &dead, 0xFEED).unwrap();
+
+        // Survivors readable by their ORIGINAL slot id with IDENTICAL bytes.
+        for (i, &(fill, len)) in specs.iter().enumerate() {
+            let got = read_row(&data.0, slots[i]).unwrap();
+            if dead.contains(&slots[i]) {
+                assert_eq!(got, None, "dead slot {i} must read None");
+                assert_eq!(read_slot(&data.0, slots[i]).flags, line_pointer::DEAD);
+            } else {
+                assert_eq!(
+                    got,
+                    Some(blob(fill, len)),
+                    "survivor {i} bytes/len preserved"
+                );
+            }
+        }
+
+        // Checksum verifies and the PageLSN was stamped.
+        validate(&data.0).unwrap();
+        assert_eq!(super::page_lsn(&data.0), 0xFEED);
+
+        // free_start moved down by exactly the dead tuples' total size (no gaps
+        // before either dead slot in this layout, so compaction reclaims exactly
+        // those bytes).
+        let free_after = read_u16(&data.0, FREE_SPACE_OFFSET);
+        assert_eq!(free_before as usize - free_after as usize, dead_bytes);
+
+        // Survivors are contiguous from HEADER_LEN, in stable slot-id order.
+        let mut cursor = HEADER_LEN;
+        for (i, _) in specs.iter().enumerate() {
+            if dead.contains(&slots[i]) {
+                continue;
+            }
+            let s = read_slot(&data.0, slots[i]);
+            assert_eq!(
+                s.offset as usize, cursor,
+                "survivor {i} packed contiguously"
+            );
+            cursor += s.len as usize;
+        }
+        assert_eq!(cursor, free_after as usize);
+    }
+
+    #[test]
+    fn prune_and_compact_all_slots_dead_yields_empty_valid_page() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x11, 12);
+        let b = insert_blob(&mut data, 0x22, 7);
+
+        prune_and_compact(&mut data.0, &[a, b], 9).unwrap();
+
+        // No live tuples remain; both read None and the page still validates.
+        assert_eq!(read_row(&data.0, a).unwrap(), None);
+        assert_eq!(read_row(&data.0, b).unwrap(), None);
+        validate(&data.0).unwrap();
+        // free_start collapsed back to the header (no live bytes).
+        assert_eq!(read_u16(&data.0, FREE_SPACE_OFFSET) as usize, HEADER_LEN);
+    }
+
+    #[test]
+    fn prune_and_compact_no_dead_slots_is_a_lossless_noop() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x33, 9);
+        let b = insert_blob(&mut data, 0x44, 25);
+        let free_before = read_u16(&data.0, FREE_SPACE_OFFSET);
+
+        prune_and_compact(&mut data.0, &[], 5).unwrap();
+
+        assert_eq!(read_row(&data.0, a).unwrap(), Some(blob(0x33, 9)));
+        assert_eq!(read_row(&data.0, b).unwrap(), Some(blob(0x44, 25)));
+        // Already contiguous from the bottom, so nothing moved.
+        assert_eq!(read_u16(&data.0, FREE_SPACE_OFFSET), free_before);
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn prune_and_compact_single_survivor_relocates_to_header() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x55, 8); // becomes dead
+        let b = insert_blob(&mut data, 0x66, 16); // survivor, starts above `a`
+
+        prune_and_compact(&mut data.0, &[a], 1).unwrap();
+
+        // The lone survivor slid down to HEADER_LEN; its bytes are intact.
+        assert_eq!(read_row(&data.0, b).unwrap(), Some(blob(0x66, 16)));
+        assert_eq!(read_slot(&data.0, b).offset as usize, HEADER_LEN);
+        assert_eq!(
+            read_u16(&data.0, FREE_SPACE_OFFSET) as usize,
+            HEADER_LEN + 16
+        );
+        validate(&data.0).unwrap();
+    }
+
+    #[test]
+    fn prune_and_compact_rejects_a_non_live_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x77, 10);
+        assert!(delete_row(&mut data.0, a).unwrap());
+
+        // Pruning an already-DEAD slot is a misuse, not a silent skip.
+        assert!(prune_and_compact(&mut data.0, &[a], 1).is_err());
+        // Out-of-bounds slot likewise errors.
+        assert!(prune_and_compact(&mut data.0, &[99], 1).is_err());
+    }
+
+    #[test]
+    fn reclaim_line_pointers_moves_dead_to_unused() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x88, 10);
+        assert!(delete_row(&mut data.0, a).unwrap());
+        assert_eq!(read_slot(&data.0, a).flags, line_pointer::DEAD);
+
+        reclaim_line_pointers(&mut data.0, &[a], 0xABCD).unwrap();
+
+        assert_eq!(read_slot(&data.0, a).flags, line_pointer::UNUSED);
+        assert_eq!(read_row(&data.0, a).unwrap(), None);
+        validate(&data.0).unwrap();
+        assert_eq!(super::page_lsn(&data.0), 0xABCD);
+    }
+
+    #[test]
+    fn reclaim_line_pointers_rejects_a_normal_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x99, 10); // still NORMAL
+
+        assert!(reclaim_line_pointers(&mut data.0, &[a], 1).is_err());
+        // And a slot that is already UNUSED is also not a valid DEAD target.
+        assert!(delete_row(&mut data.0, a).unwrap());
+        reclaim_line_pointers(&mut data.0, &[a], 1).unwrap();
+        assert!(reclaim_line_pointers(&mut data.0, &[a], 1).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_normal_dead_and_unused_after_compaction() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0xA0, 10); // survivor (NORMAL)
+        let b = insert_blob(&mut data, 0xB0, 12); // pruned -> DEAD
+        let c = insert_blob(&mut data, 0xC0, 8); // pruned -> DEAD -> reclaimed UNUSED
+
+        prune_and_compact(&mut data.0, &[b, c], 1).unwrap();
+        reclaim_line_pointers(&mut data.0, &[c], 2).unwrap();
+
+        // A page carrying NORMAL + DEAD + UNUSED slots is valid.
+        validate(&data.0).unwrap();
+        assert_eq!(read_slot(&data.0, a).flags, line_pointer::NORMAL);
+        assert_eq!(read_slot(&data.0, b).flags, line_pointer::DEAD);
+        assert_eq!(read_slot(&data.0, c).flags, line_pointer::UNUSED);
+    }
+
+    #[test]
+    fn validate_still_rejects_a_corrupt_normal_slot() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0xAA, 10);
+
+        // Push the NORMAL slot's end past free_start (out of the live region).
+        let free_start = read_u16(&data.0, FREE_SPACE_OFFSET);
+        let mut slot = read_slot(&data.0, a);
+        slot.offset = free_start - 4; // end = free_start - 4 + 10 > free_start
+        write_slot(&mut data.0, a, slot);
+        write_checksum(&mut data.0);
+        assert!(validate(&data.0).is_err());
+
+        // Reset, then corrupt with an out-of-bounds offset below the header.
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0xAB, 10);
+        let mut slot = read_slot(&data.0, a);
+        slot.offset = (HEADER_LEN - 1) as u16;
+        write_slot(&mut data.0, a, slot);
+        write_checksum(&mut data.0);
+        assert!(validate(&data.0).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_an_unconstrained_offset_only_when_normal() {
+        // A DEAD slot with a stale (out-of-region) offset is valid; flipping the
+        // same slot back to NORMAL makes the identical offset corrupt.
+        //
+        // `b` survives at the bottom; `a` is pruned. `a` sits ABOVE `b` on the
+        // page, so after `b` compacts down, `free_start` shrinks below `a`'s
+        // (retained) stale offset — exactly the case the extension must tolerate
+        // for DEAD but reject for NORMAL.
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let b = insert_blob(&mut data, 0xDD, 6); // survivor, near the bottom
+        let a = insert_blob(&mut data, 0xCC, 40); // pruned; high stale offset
+        prune_and_compact(&mut data.0, &[a], 1).unwrap(); // `a` is DEAD, offset stale
+        validate(&data.0).unwrap();
+
+        // The DEAD slot's offset still names its pre-compaction location, which is
+        // now beyond the shrunken live region — unconstrained for DEAD, but as
+        // NORMAL it must point into the live region.
+        let mut dead = read_slot(&data.0, a);
+        let live_end = read_u16(&data.0, FREE_SPACE_OFFSET);
+        assert!(dead.offset as usize + dead.len as usize > live_end as usize);
+        dead.flags = line_pointer::NORMAL;
+        write_slot(&mut data.0, a, dead);
+        write_checksum(&mut data.0);
+        assert!(validate(&data.0).is_err());
+        let _ = b;
     }
 }

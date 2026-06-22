@@ -122,7 +122,9 @@ Page body (data page):
 - Slot array grows down from the top.
 - Row bytes grow up from the bottom.
 - Delete marks slots dead.
-- Compaction may be implemented lazily.
+- Intra-page compaction (`page::prune_and_compact`, Milestone F) relocates the
+  surviving live tuples down to the bottom, rewriting their line pointers'
+  `offset` and recomputing `FreeStart`; it is driven by VACUUM, not by inserts.
 
 ### Line Pointers (heap slot array)
 
@@ -133,8 +135,10 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
 - `DEAD` (`1`) — the tuple was removed but the line pointer is retained because
   index entries may still reference it; reclaimed to `UNUSED` only after index
   vacuum.
-- `UNUSED` (`0`) — free for reuse. *Defined; the `DEAD`/`REDIRECT → UNUSED`
-  reclaim is owned by VACUUM (Milestone F), so no path produces it yet.*
+- `UNUSED` (`0`) — free for reuse. Produced by `page::reclaim_line_pointers`
+  (VACUUM, Milestone F); `insert_row` does not yet reuse an `UNUSED` slot id (it
+  always appends a fresh one), so reclaiming reclaims no space today but is
+  correct and forward-looking.
 - `REDIRECT` (`3`) — points at another slot on the same page. *Reserved for HOT
   (Milestone H); no path produces it yet.*
 
@@ -143,9 +147,15 @@ former "live" slot and `DEAD` is the former tombstoned slot. Neither MVCC `delet
 nor MVCC `update` tombstones any more — both keep the superseded version on a
 still-`NORMAL` line pointer and hide it by visibility (see MVCC Delete / MVCC
 Update below), so dead tuples linger physically until VACUUM (Milestone F), which
-is the only future producer of `DEAD`. No path produces `DEAD` today. `validate`
-still accepts `NORMAL` and `DEAD` flags on a data page (so a future VACUUM page is
-valid); any other value is corruption.
+is the only future producer of `DEAD` (via `page::prune_and_compact`) and
+`UNUSED` (via `page::reclaim_line_pointers`). No path produces `DEAD` today.
+`validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
+VACUUM-compacted page is valid); `REDIRECT` and any other value is corruption.
+The `(offset, offset+len) ≤ FreeStart`/in-bounds invariant is enforced **only for
+`NORMAL` line pointers** — after compaction a `DEAD`/`UNUSED` slot's
+`(offset, len)` no longer names live bytes and is left unconstrained, while a
+genuinely corrupt `NORMAL` slot (overlap, out of bounds, end past `FreeStart`)
+still fails validation.
 
 **Stable `(page, slot)` contract.** An index entry references a
 `(page, line-pointer-slot)`. The tuple bytes a line pointer names may later be
@@ -170,6 +180,42 @@ structured `DbError` rather than panicking. This is the substrate for `UPDATE`
 `t_ctid = INVALID_TID`) and MVCC `update` (with `t_ctid = new_tid`, the forward
 chain pointer) emit it under the WAL (`HeapUpdateHeader`; see MVCC Delete / MVCC
 Update below).
+
+### Intra-Page Compaction and Line-Pointer Reclaim (VACUUM primitives)
+
+`page::prune_and_compact(data, dead_slots, lsn)` is the intra-page heap-prune
+primitive (`mvcc.md` §9 / Milestone F2). `dead_slots` are line pointers the caller
+(F2b) has already classified as dead-to-everyone via `common::is_dead_to_all`;
+this primitive does **not** classify — it only rewrites the page. In one pass it:
+
+- Flips each `dead_slot` `NORMAL → DEAD`, **retaining** the slot id (index entries
+  may still reference it; reclaiming to `UNUSED` is the separate step below). A
+  `dead_slot` that is not currently a live `NORMAL` line pointer (already
+  `DEAD`/`UNUSED`, or out of bounds) is a misuse and returns a structured
+  `DbError`.
+- Compacts the surviving `NORMAL` tuples so their bytes are contiguous from
+  `HeaderLen` upward — reclaiming the freed bytes of the now-`DEAD` slots and any
+  prior gaps — and **rewrites each survivor's line-pointer `offset`** to its new
+  location. The slot-id array order and ids are stable and every survivor's `len`
+  is unchanged, so `read_row(data, slot)` returns the identical bytes for the same
+  slot id after compaction. `FreeStart` is recomputed for the compacted layout.
+  Survivors are copied through a scratch buffer before being written back, so
+  overlapping source/destination ranges never corrupt a tuple.
+- Stamps the page-LSN with `lsn` and refreshes the checksum via `set_page_lsn`
+  (exactly like `set_tuple_header`), so the checksum covers the compacted bytes,
+  then revalidates the result.
+
+`page::reclaim_line_pointers(data, slots, lsn)` flips each listed line pointer
+`DEAD → UNUSED`, making its slot id reusable (`mvcc.md` §9 / Milestone F3b). Each
+slot must currently be `DEAD`; a non-`DEAD` slot (still `NORMAL`/already `UNUSED`,
+or out of bounds) is a misuse and returns a structured `DbError`. It stamps the
+page-LSN with `lsn` and refreshes the checksum via `set_page_lsn`. Because
+`insert_row` always appends a fresh slot id (it never scans for a reusable
+`UNUSED` slot), reclaiming frees no space today — it is correct and
+forward-looking; slot-id reuse on insert is a separate, later change.
+
+Both primitives have no engine caller yet (the heap-prune pass is F2b and
+line-pointer reclaim is F3b), so they are runtime no-ops at this milestone.
 
 ### MVCC Delete
 
