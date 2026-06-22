@@ -64,9 +64,9 @@ impl ActiveTxnRegistry {
 
     /// The oldest in-progress transaction id, or `None` if none are active.
     ///
-    /// This is the GC horizon source for Milestone F; it has no consumer in
-    /// Milestone A but is the reason the registry is an ordered set.
-    #[allow(dead_code, reason = "GC horizon consumer arrives in Milestone F")]
+    /// This is the GC horizon source for Milestone F: it backs
+    /// [`ServerComponents::gc_horizon`](crate::app::ServerComponents::gc_horizon),
+    /// and is the reason the registry is an ordered set.
     pub fn oldest(&self) -> Option<TxnId> {
         self.lock().iter().next().copied()
     }

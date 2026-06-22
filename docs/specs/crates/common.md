@@ -25,6 +25,10 @@
   `classify_unique_conflict -> UniqueConflict` (`None`/`Violation`/`InFlight`, which
   splits a definite duplicate `23505` from an in-flight-other `40001`), and the
   write-write row-lock check `write_conflict -> WriteConflict`.
+- The pure VACUUM reclaimability oracle `is_dead_to_all` (see
+  `docs/specs/mvcc.md` §9), the sibling of `is_visible`: it answers "is this
+  version dead to **every** snapshot?" against a single scalar GC `horizon`, used
+  by VACUUM (Milestone F) rather than by snapshot-relative reads.
 - Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`, `TxnStatusView`.
 
 ## Public Types
@@ -276,6 +280,12 @@ pub fn is_visible(
     snapshot: &Snapshot, current_txn: u64,
     status: &dyn TxnStatusView,
 ) -> bool;
+
+pub fn is_dead_to_all(
+    xmin: u64, xmax: u64, infomask: u16,
+    horizon: u64,
+    status: &dyn TxnStatusView,
+) -> bool;
 ```
 
 - `TxnStatusView` exposes transaction status to the predicate without `common`
@@ -292,6 +302,17 @@ pub fn is_visible(
   storage tuple codec, which re-exports them.
 - `is_visible` is pure (no I/O, no locks beyond whatever the caller's
   `TxnStatusView` takes per probe) and is not yet called by any scan (B3.6).
+- `is_dead_to_all` is the VACUUM-side sibling of `is_visible` (`mvcc.md` §9): it
+  returns true iff the version is dead to **every** possible snapshot, given the GC
+  `horizon` (the oldest still-running xid). Reclaimable iff **either** the creator
+  aborted (`XMIN_ABORTED`, or `status(xmin) == Aborted`) — **no age requirement**,
+  an aborted creator is universally invisible — **or** it is committed-deleted
+  below the horizon (`xmax != 0`, settled-committed via `XMAX_COMMITTED` or
+  `status(xmax) == Committed`, **and** `xmax < horizon`, strict). A live committed
+  version, an aborted/in-progress deleter, or a committed delete with
+  `xmax >= horizon` is not reclaimable. Pure and honours the same `infomask` hint
+  bits to skip CLOG probes; takes a scalar `horizon` rather than a `Snapshot`. No
+  production caller yet (Milestone F2+ wires it into prune/vacuum).
 
 ## Flush Policy
 

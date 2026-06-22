@@ -238,10 +238,16 @@ always empty between statements. Snapshot capture (`capture_snapshot` via
 `snapshot_with_boundary`) reads `active_ids()` for `xip` (excluding the statement's
 own txn) and the minimum for `xmin`, taking the registry latch across the active-set
 read and the `next_txn_id` read so the snapshot is not torn relative to a
-concurrent `BEGIN`. The GC horizon (Milestone F) reads its minimum. The CLOG that
-records settled transaction outcomes lives in the WAL manager (`Clog`, rebuilt from
-`Commit`/`Abort` records; see `docs/specs/crates/wal.md`), separate from this
-registry of still-running transactions.
+concurrent `BEGIN`. The **GC horizon** (`ServerComponents::gc_horizon`, Milestone
+F1) reads the registry minimum (`active_txns.oldest()`) under its brief latch, or —
+when no transaction is active — `next_txn_id` (loaded `Acquire`); below it no live
+snapshot can see a committed delete as undone, so a version with `xmax < horizon`
+is reclaimable (`common::is_dead_to_all`, `mvcc.md` §9). It is captured once per
+VACUUM pass and only advances as transactions finish; it has no production caller
+until VACUUM wiring (F2/F4). The CLOG that records settled transaction outcomes
+lives in the WAL manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
+`docs/specs/crates/wal.md`), separate from this registry of still-running
+transactions.
 
 Checkpoint flushes dirty pages in place to the heap and advances the redo
 boundary; its cost is O(pages changed), not O(database size). Driven by the

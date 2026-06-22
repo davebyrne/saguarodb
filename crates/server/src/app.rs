@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use buffer::{BufferPool, PageStore};
 use catalog::CatalogManager;
@@ -38,6 +38,28 @@ pub struct ServerComponents {
     pub cancel_registry: CancelRegistry,
 }
 
+impl ServerComponents {
+    /// The GC horizon (`docs/specs/mvcc.md` §9): the oldest still-running
+    /// transaction id, below which no live snapshot can see a committed delete as
+    /// undone — so a committed-deleted version with `xmax < horizon` is dead to
+    /// everyone (see [`common::is_dead_to_all`]). It is captured **once** at the
+    /// start of a VACUUM pass.
+    ///
+    /// When no transaction is active there is nothing to protect, so the horizon is
+    /// the next id to be assigned — nothing older than the future can be needed.
+    /// Reads the registry minimum (`oldest`) under its brief latch, then loads
+    /// `next_txn_id` with [`Ordering::Acquire`], matching `capture_snapshot` /
+    /// `register_allocated`. The horizon may only *advance* as transactions finish;
+    /// a concurrent BEGIN can only register a *newer* (larger) id, so it never lowers
+    /// the captured horizon.
+    #[allow(dead_code, reason = "consumed by VACUUM in F2/F4")]
+    pub fn gc_horizon(&self) -> u64 {
+        self.active_txns
+            .oldest()
+            .unwrap_or_else(|| self.next_txn_id.load(Ordering::Acquire))
+    }
+}
+
 pub struct AppState {
     pub components: Arc<ServerComponents>,
     pub query_service: Arc<QueryService>,
@@ -59,5 +81,40 @@ impl AppState {
 
     pub fn wal_flushed_for_test(&self) -> bool {
         self.components.wal.flushed_lsn() > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppState;
+
+    /// `gc_horizon` is the oldest active xid, or `next_txn_id` when the registry is
+    /// empty, and advances as the oldest transaction deregisters (`mvcc.md` §9).
+    #[test]
+    fn gc_horizon_tracks_oldest_active_else_next_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let components = &app.components;
+
+        // No active txns ⇒ horizon is the next id to be assigned (nothing older
+        // than the future can be needed).
+        components
+            .next_txn_id
+            .store(42, std::sync::atomic::Ordering::Release);
+        assert!(components.active_txns.active_ids().is_empty());
+        assert_eq!(components.gc_horizon(), 42);
+
+        // With active txns ⇒ horizon is the oldest, regardless of next_txn_id.
+        components.active_txns.register(30);
+        components.active_txns.register(50);
+        assert_eq!(components.gc_horizon(), 30);
+
+        // After the oldest deregisters the horizon advances to the next-oldest.
+        components.active_txns.deregister(30);
+        assert_eq!(components.gc_horizon(), 50);
+
+        // After the last deregisters it falls back to next_txn_id again.
+        components.active_txns.deregister(50);
+        assert_eq!(components.gc_horizon(), 42);
     }
 }

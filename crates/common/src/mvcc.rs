@@ -165,6 +165,85 @@ pub fn is_visible(
     !deleter_visible
 }
 
+/// The pure VACUUM **reclaimability** predicate of `docs/specs/mvcc.md` §9: is a
+/// version with creator `xmin` and deleter `xmax` *dead to every possible
+/// snapshot* — and therefore safe to physically reclaim — given the GC `horizon`
+/// (the oldest still-running transaction id)?
+///
+/// This is the **sibling of [`is_visible`]** but asks a different question.
+/// [`is_visible`] answers "is this version visible to **my** snapshot?" — a
+/// snapshot-relative read. `is_dead_to_all` answers "is this version invisible to
+/// **everyone**, now and for the rest of its on-disk life?" — the VACUUM oracle.
+/// A version that `is_dead_to_all` may be pruned, its index entries vacuumed, and
+/// its line pointer reclaimed without any live or future snapshot ever missing it.
+///
+/// A version is reclaimable iff **either**:
+///
+/// - **its creator aborted** — `XMIN_ABORTED` hint, or `status(xmin) == Aborted`.
+///   An aborted creator's version was never visible to any snapshot (no snapshot
+///   can ever see an aborted creator), so it is dead to everyone the instant the
+///   abort is settled. **There is no age requirement here**: unlike a committed
+///   delete, the creator's `xmin` need not be below the horizon — reclaimability
+///   does not depend on `xmin`'s relation to any live snapshot, because *no*
+///   snapshot (past, present, or future) could see it. **or**
+/// - **it is committed-deleted below the horizon** — `xmax != INVALID_XID` **and**
+///   the delete is settled-committed (`XMAX_COMMITTED` hint, or
+///   `status(xmax) == Committed`) **and** `xmax < horizon` (strict). The
+///   `< horizon` gate is **required**: a delete with `xmax >= horizon` may still
+///   fall in some live snapshot's future/in-progress set, so that snapshot still
+///   sees the row as *live* and the version must be retained.
+///
+/// **The asymmetry** (aborted-creator needs no age; committed-delete needs
+/// `< horizon`) follows from *which* xid a live snapshot could care about. An
+/// aborted creator is universally invisible — no snapshot's `xmin`/`xip`/`xmax`
+/// can resurrect it — so age is irrelevant. A committed delete only hides the row
+/// from snapshots that consider the deleter settled-and-past; a snapshot taken at
+/// or before `xmax` still sees the pre-delete row, and the horizon is the oldest
+/// such snapshot still alive, so the delete is universally effective only once
+/// `xmax < horizon`.
+///
+/// Everything else is **not (yet) reclaimable**: a live committed version
+/// (`xmax == INVALID_XID`) is never reclaimable; an aborted-deleter or
+/// in-progress-deleter (the delete did not commit) leaves the row alive; and a
+/// committed delete with `xmax >= horizon` is not *yet* reclaimable.
+///
+/// **Hint bits** short-circuit the CLOG probe exactly as in [`is_visible`]:
+/// `XMIN_ABORTED` settles the aborted-creator branch and `XMAX_COMMITTED` settles
+/// the committed-delete branch, each without calling [`TxnStatusView::status`].
+///
+/// Pure: no [`Snapshot`] (the single scalar `horizon` summarizes every live
+/// snapshot), no I/O beyond whatever the caller's [`TxnStatusView`] probe takes.
+pub fn is_dead_to_all(
+    xmin: u64,
+    xmax: u64,
+    infomask: u16,
+    horizon: u64,
+    status: &dyn TxnStatusView,
+) -> bool {
+    // Aborted-creator branch (no horizon gate): an aborted creator is invisible to
+    // every snapshot regardless of age. The `XMIN_ABORTED` hint settles it without
+    // a CLOG probe.
+    if infomask & XMIN_ABORTED != 0 {
+        return true;
+    }
+    // Committed-delete branch: a delete settled-committed and strictly below the
+    // horizon is universally effective — every live snapshot considers the deleter
+    // settled-and-past, so none still sees the row as live. A delete at or above
+    // the horizon may still be live to some snapshot ⇒ retain. Evaluated before the
+    // (potential) `xmin` CLOG probe so a `XMAX_COMMITTED` hint short-circuits the
+    // whole predicate without ever touching the view: both branches return "dead",
+    // so a hint-settled committed delete reclaims regardless of `xmin`'s status.
+    if xmax != INVALID_XID
+        && xmax < horizon
+        && (infomask & XMAX_COMMITTED != 0 || status.status(xmax) == TxnStatus::Committed)
+    {
+        return true;
+    }
+    // No settled hint for either branch and the delete did not reclaim: fall back
+    // to the CLOG for the aborted-creator branch.
+    status.status(xmin) == TxnStatus::Aborted
+}
+
 /// The visibility-aware **uniqueness conflict** predicate of `docs/specs/mvcc.md`
 /// §6/§7.3: whether a candidate index version with creator `xmin` and deleter
 /// `xmax` is **alive or potentially-alive** and therefore conflicts with an
@@ -474,7 +553,7 @@ mod tests {
     use super::{
         IsolationLevel, Snapshot, TxnStatus, TxnStatusView, UniqueConflict, WriteConflict,
         XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,
-        is_visible, version_conflicts, write_conflict,
+        is_dead_to_all, is_visible, version_conflicts, write_conflict,
     };
 
     #[test]
@@ -1025,6 +1104,105 @@ mod tests {
             let boolean = version_conflicts(xmin, xmax, 0, CURRENT_TXN, &view);
             assert_eq!(classified, boolean, "xmin={xmin} xmax={xmax}");
         }
+    }
+
+    // --- is_dead_to_all (VACUUM reclaimability, §9) ---
+    //
+    // The horizon is the oldest still-running xid. A version is reclaimable iff its
+    // creator aborted (ANY age — no horizon gate) OR it is committed-deleted with
+    // `xmax < horizon` (strict). These pin the asymmetry and the strict boundary.
+
+    const HORIZON: u64 = 50;
+
+    #[test]
+    fn dead_aborted_creator_below_horizon_is_reclaimable() {
+        // Creator aborted (CLOG); xmin < horizon. No snapshot can see an aborted
+        // creator ⇒ reclaimable regardless of the deleter.
+        let view = MockStatus::new(&[(7, TxnStatus::Aborted)]);
+        assert!(is_dead_to_all(7, INVALID_XID, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_aborted_creator_above_horizon_is_reclaimable() {
+        // Creator aborted but xmin > horizon: proves there is NO age requirement
+        // for an aborted creator — it is dead to everyone the instant the abort is
+        // settled, whatever its relation to the horizon.
+        // xmin = 80 > HORIZON (50).
+        let view = MockStatus::new(&[(80, TxnStatus::Aborted)]);
+        assert!(is_dead_to_all(80, INVALID_XID, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_committed_delete_below_horizon_is_reclaimable() {
+        // Committed creator, committed delete with xmax = 9 < HORIZON (50) ⇒ every
+        // live snapshot considers the delete settled-and-past ⇒ reclaimable.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::Committed)]);
+        assert!(is_dead_to_all(7, 9, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_committed_delete_above_horizon_is_not_reclaimable() {
+        // Committed delete but xmax = 80 > HORIZON (50): some live snapshot may still
+        // place the deleter in its future/in-progress set and see the row as live ⇒
+        // NOT reclaimable.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (80, TxnStatus::Committed)]);
+        assert!(!is_dead_to_all(7, 80, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_committed_delete_at_horizon_is_not_reclaimable() {
+        // Boundary: xmax == horizon. The gate is `< horizon` (strict), so the
+        // snapshot whose xmax == horizon still sees the row as live ⇒ NOT yet
+        // reclaimable.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (HORIZON, TxnStatus::Committed)]);
+        assert!(!is_dead_to_all(7, HORIZON, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_live_committed_version_is_not_reclaimable() {
+        // Committed creator, no deleter (xmax == INVALID) ⇒ alive ⇒ never
+        // reclaimable, however old.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+        assert!(!is_dead_to_all(7, INVALID_XID, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_aborted_deleter_is_not_reclaimable() {
+        // The delete aborted ⇒ the row is still alive ⇒ not reclaimable (even
+        // though the deleter's xmax = 9 < HORIZON).
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::Aborted)]);
+        assert!(!is_dead_to_all(7, 9, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_in_progress_deleter_is_not_reclaimable() {
+        // The delete is only in-progress (may yet roll back) ⇒ the row is still
+        // alive ⇒ not reclaimable, even with xmax = 9 < HORIZON.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::InProgress)]);
+        assert!(!is_dead_to_all(7, 9, 0, HORIZON, &view));
+    }
+
+    #[test]
+    fn dead_aborted_creator_hint_short_circuits_clog_probe() {
+        // XMIN_ABORTED hint ⇒ reclaimable without consulting the view. PanicStatus
+        // proves status() is never called.
+        assert!(is_dead_to_all(
+            7,
+            INVALID_XID,
+            XMIN_ABORTED,
+            HORIZON,
+            &PanicStatus
+        ));
+    }
+
+    #[test]
+    fn dead_committed_delete_hint_short_circuits_clog_probe() {
+        // XMAX_COMMITTED hint with xmax < horizon ⇒ reclaimable without any probe.
+        // The committed-delete branch is evaluated before the `xmin` CLOG fallback,
+        // so a hint-settled committed delete reclaims regardless of `xmin`'s status
+        // (both branches mean "dead"). PanicStatus proves status() is never called
+        // for either xid. (xmax = 9 < HORIZON.)
+        assert!(is_dead_to_all(7, 9, XMAX_COMMITTED, HORIZON, &PanicStatus));
     }
 
     // --- write_conflict (write-write row-lock check, first-updater-wins) ---

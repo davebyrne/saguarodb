@@ -499,9 +499,30 @@ becomes load-bearing once writers run concurrently (E2b).
 Required for bounded space — and more urgent than under a single-entry-index
 design, because index entries accumulate per version as well as heap tuples.
 
-- **Horizon**: the oldest `xmin` across the active-transaction registry; a version
-  is *dead to everyone* when its `xmax` is committed and `< horizon`, or its `xmin`
-  is aborted.
+- **Horizon**: the oldest `xmin` across the active-transaction registry, or — when
+  no transaction is active — the next id to be assigned (`next_txn_id`); nothing
+  older than the future can be needed. Captured **once** at the start of a VACUUM
+  pass (`ServerComponents::gc_horizon`, F1). It only advances as transactions
+  finish; a concurrent `BEGIN` can only register a newer (larger) id, so it never
+  lowers the captured horizon.
+- **Reclaimability** (`common::is_dead_to_all(xmin, xmax, infomask, horizon,
+  status)`, F1): a version is *dead to everyone* — safe to physically reclaim —
+  iff **either** its **creator aborted** (`XMIN_ABORTED` hint, or
+  `status(xmin) == Aborted`) **or** it is **committed-deleted below the horizon**
+  (`xmax != 0` **and** the delete is settled-committed via the `XMAX_COMMITTED`
+  hint or `status(xmax) == Committed` **and** `xmax < horizon`, strict). This is
+  the VACUUM-side **sibling of `is_visible`**: `is_visible` answers "visible to
+  **my** snapshot?"; `is_dead_to_all` answers "invisible to **everyone**, now and
+  forever?" — over a single scalar `horizon` that summarizes every live snapshot.
+  - **The asymmetry** — the aborted-creator branch has **no age requirement** (an
+    aborted creator is universally invisible, so its `xmin` need not be below the
+    horizon), whereas the committed-delete branch **requires `xmax < horizon`** (a
+    delete at or above the horizon may still be in some live snapshot's
+    future/in-progress set, which therefore still sees the row as live). A live
+    committed version (`xmax == 0`), an aborted-deleter, or an in-progress-deleter
+    is never reclaimable; a committed delete with `xmax >= horizon` is not *yet*
+    reclaimable. The predicate is pure and honours the same `infomask` hint bits as
+    `is_visible` to skip CLOG probes.
 - **Heap prune** (intra-page): mark dead tuples' line pointers `DEAD` and compact
   live tuples (this finally adds the page compaction that `page.rs` lacks today —
   `DELETE` is currently a non-reclaiming tombstone). WAL-logged.
@@ -682,9 +703,13 @@ and per-tuple CLOG-probe contention reduction.
 
 ### Milestone F — VACUUM / GC *(near-MVP in this model)*
 
-- **F1 — Horizon.** **F2 — Heap prune + compaction.** **F3 — Index vacuum +
-  line-pointer reclaim.** **F4 — On-demand `VACUUM`, opportunistic pruning, CLOG
-  truncation** (§9).
+- **F1 — Horizon + reclaimability predicate.** The pure
+  `common::is_dead_to_all(xmin, xmax, infomask, horizon, status)` reclaimability
+  oracle (sibling of `is_visible`; aborted-creator any age **or** committed-delete
+  `< horizon`) and the `ServerComponents::gc_horizon` accessor (oldest active xmin,
+  else `next_txn_id`). No engine wiring yet — runtime no-op. **F2 — Heap prune +
+  compaction.** **F3 — Index vacuum + line-pointer reclaim.** **F4 — On-demand
+  `VACUUM`, opportunistic pruning, CLOG truncation** (§9).
 
 ### Milestone G — Isolation levels & polish
 
