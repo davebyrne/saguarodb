@@ -9,6 +9,13 @@ use crate::{
 };
 
 pub fn parse_statement(sql: &str) -> Result<Statement> {
+    // sqlparser 0.56 errors on `VACUUM`, so intercept it before handing the string
+    // to the parser (`docs/specs/crates/parser.md`). `VACUUM` is a maintenance
+    // command, not a relational statement, and never reaches bind/plan.
+    if let Some(statement) = try_parse_vacuum(sql)? {
+        return Ok(statement);
+    }
+
     let dialect = PostgreSqlDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql)
         .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?;
@@ -1092,6 +1099,89 @@ fn reject_wildcard_options(options: &sql::WildcardAdditionalOptions) -> Result<(
         return unsupported("unsupported wildcard options");
     }
     Ok(())
+}
+
+/// Intercept `VACUUM` (and `VACUUM <table>`) before sqlparser, which cannot parse
+/// it. Returns `Ok(Some(_))` for a VACUUM statement, `Ok(None)` when the input does
+/// not start with the `vacuum` keyword (so the normal parse path runs), and `Err`
+/// for a VACUUM with an unsupported clause (parenthesized options, multiple tables,
+/// a qualified/quoted name). The optional target identifier is lowercase-normalized,
+/// matching the v1 unquoted-identifier rule (`ident_name`).
+fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
+    // Strip a single trailing semicolon and surrounding whitespace; the rest is the
+    // VACUUM body. `VACUUM`, `VACUUM;`, `VACUUM t`, and `VACUUM t ;` are all accepted.
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+
+    // Split off the leading keyword; bail to the normal path if it is not `vacuum`
+    // (case-insensitive). The first token must be exactly `vacuum` — `vacuumfoo` is
+    // some other word, not a VACUUM with a glued argument.
+    let mut tokens = body.split_whitespace();
+    let Some(keyword) = tokens.next() else {
+        return Ok(None);
+    };
+    if !keyword.eq_ignore_ascii_case("vacuum") {
+        return Ok(None);
+    }
+
+    // At most one argument: the target table. Any further token (a second table, a
+    // `(`-options list, …) is an unsupported VACUUM form.
+    let table = match tokens.next() {
+        None => None,
+        Some(target) => {
+            if tokens.next().is_some() {
+                return unsupported("VACUUM supports an optional single table name only in v1");
+            }
+            // The single argument is the target table. Reject Postgres VACUUM option
+            // keywords (FULL/FREEZE/ANALYZE/VERBOSE/…) so `VACUUM FULL` is a clear
+            // unsupported-option error rather than silently meaning a table named
+            // `full`; v1 supports none of these options.
+            if is_vacuum_option_keyword(target) {
+                return unsupported("VACUUM options are not supported in v1");
+            }
+            Some(normalize_vacuum_target(target)?)
+        }
+    };
+
+    Ok(Some(Statement::Vacuum { table }))
+}
+
+/// Whether `token` is a Postgres VACUUM option keyword (none supported in v1). Used
+/// to reject `VACUUM FULL`/`VACUUM ANALYZE`/… with an explicit unsupported-option
+/// error instead of treating the keyword as a table name.
+fn is_vacuum_option_keyword(token: &str) -> bool {
+    const OPTIONS: [&str; 6] = [
+        "full",
+        "freeze",
+        "analyze",
+        "verbose",
+        "disable_page_skipping",
+        "skip_locked",
+    ];
+    OPTIONS.iter().any(|opt| token.eq_ignore_ascii_case(opt))
+}
+
+/// Validate and lowercase-normalize a `VACUUM <table>` target. The name must be a
+/// bare unquoted identifier: no parenthesized options, no `schema.table`
+/// qualification, no quoting — consistent with the v1 identifier rules elsewhere.
+fn normalize_vacuum_target(target: &str) -> Result<String> {
+    if target.starts_with('(') {
+        return unsupported("VACUUM with options is not supported in v1");
+    }
+    if target.contains('.') {
+        return unsupported("qualified names are not supported in v1");
+    }
+    if target.contains('"') {
+        return Err(parse_error("quoted identifiers are not supported"));
+    }
+    let valid = !target.is_empty()
+        && target
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    if !valid {
+        return unsupported("VACUUM target must be a simple table name in v1");
+    }
+    Ok(target.to_ascii_lowercase())
 }
 
 fn parse_error(message: impl Into<String>) -> DbError {

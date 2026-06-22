@@ -511,7 +511,8 @@ impl Session {
         // `self.txn` like a simple-query control statement. Otherwise (a data
         // statement with no open transaction), `Execute` stays a self-contained
         // autocommit unit.
-        let route_through_session = self.txn.is_some() || statement.is_transaction_control();
+        let route_through_session =
+            self.txn.is_some() || statement.is_transaction_control() || statement.is_maintenance();
         let result = if route_through_session {
             // Move the transaction slot into the blocking task (like the simple-
             // query path) so the whole statement, including any owned write guard,

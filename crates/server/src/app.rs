@@ -77,7 +77,6 @@ impl ServerComponents {
     ///
     /// [`ActiveTxnRegistry::oldest_xmin`]: crate::registry::ActiveTxnRegistry::oldest_xmin
     /// [`ActiveTxnRegistry::capture`]: crate::registry::ActiveTxnRegistry::capture
-    #[allow(dead_code, reason = "consumed by VACUUM in F2/F4")]
     pub fn gc_horizon(&self) -> u64 {
         self.active_txns
             .oldest_xmin()

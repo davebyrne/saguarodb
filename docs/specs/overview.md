@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
 - Autocommit only (no multi-statement transactions)
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`; binder rejects unsupported parsed forms
+- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, and the maintenance command `VACUUM [table]`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -478,7 +478,7 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). The session is always idle in v1's autocommit model, so the byte is `I` in every interaction; the non-idle bytes arrive with transaction lifecycle support.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
-- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, or `EXPLAIN`.
+- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, or `VACUUM`.
 - Server `ErrorResponse`: tag `E`, fields `S` severity, `C` SQLSTATE, `M` message, then final `\0`.
 
 Type mapping uses PostgreSQL OIDs `INTEGER` as `INT8` (`20`, size `8`), `TEXT` (`25`, size `-1`), and `BOOLEAN` (`16`, size `1`). The simple query path always sends text: integers are decimal i64 strings, text is raw UTF-8, booleans are `t`/`f`, and null fields use length `-1`. The extended query protocol additionally supports binary parameters and results — `RowDescription` carries a per-field format code (`0` = text, `1` = binary) and `DataRow` carries the already-encoded wire bytes for that format.
@@ -1720,6 +1720,7 @@ All concurrency is managed through the `ConcurrencyController` trait (defined in
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Multiple readers proceed concurrently.
 - **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): server query orchestration parses SQL to classify the statement, calls `begin_write()`, receives a write guard, binds and plans, allocates the statement `txn_id`, then invokes `QueryEngine`. Blocks until all other guards are released. Writes are fully serialized.
+- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. See `docs/specs/mvcc.md` §9/§10 Milestone F for the orchestration (heap-prune → index-vacuum → line-pointer-reclaim) and the GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive write guard and `WalFlushPolicy` admits only committed pages, so uncommitted data never reaches the heap.
 
 **V1 implementation:** The concrete `ConcurrencyController` is an `RwLock`. `begin_read()` acquires a shared lock, `begin_write()` acquires an exclusive lock. This is the foundation for safe page mutation, DDL, concurrent scans, and redo-only recovery.

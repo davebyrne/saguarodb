@@ -142,6 +142,7 @@ The query path is a real transaction lifecycle; autocommit is an implicit single
 - **ROLLBACK** (or any statement error): append `Abort` → `CLOG=Aborted` → deregister → release the write guard → `Idle`. Abort is **status-based** (Milestone D1, `mvcc.md` §4 Decision 3): there is no page undo. The transaction's modified tuples stay in the heap, hidden by the CLOG and reclaimed by VACUUM. The `storage.rollback_txn`/`buffer_pool.rollback` calls still run, but `storage.rollback_txn` only restores engine-owned DDL metadata (table/index schema shadow state) and `buffer_pool.rollback` is now a bookkeeping clear that reclaims no pages. Abort is not fsync-gated (a transaction with no durable `Commit` is recovered as aborted regardless).
 - **Failed (`'E'`) state**: any statement error inside an explicit block poisons it to `'E'` and does **not** end it. While `'E'`, every statement except `COMMIT`/`ROLLBACK` is rejected with `SqlState::InFailedSqlTransaction` (SQLSTATE `25P02`). `COMMIT` of an `'E'` block issues `ROLLBACK` (returns `Idle`). `COMMIT`/`ROLLBACK` with no open block are no-op warnings that stay `Idle`.
 - **Autocommit**: a data/DDL statement with no open block runs as an implicit `BEGIN…COMMIT` around the one statement (allocate, snapshot, execute, commit-or-abort), preserving the prior external behavior exactly.
+- **Maintenance (`VACUUM [table]`)**: classified `StatementClass::Maintenance`, it does **not** bind or plan and is rejected inside an explicit transaction block (`FeatureNotSupported`, like DDL — `VACUUM` is non-transactional). `dispatch` routes it to `QueryService::run_vacuum`, which resolves the target table(s) (`VACUUM` = every user table; `VACUUM t` = just `t`, error if it does not exist), acquires the **exclusive** checkpoint guard (`begin_checkpoint`) for the whole pass, captures `gc_horizon()` **once after the guard is held**, and calls `engine.vacuum(schema, horizon)` per target (heap-prune → index-vacuum → line-pointer-reclaim). Command tag `VACUUM`. Safe because no writer runs under the exclusive guard and the horizon accounts for active reader snapshots, so VACUUM never reclaims a version any live snapshot needs (`mvcc.md` §9/§10 Milestone F4a).
 - **Disconnect**: an open transaction held on a dropped `Session` is aborted (status-based: `Abort` record + `CLOG=Aborted` + write-guard release + deregister, no page undo), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry.
 
 ### Concurrency — Stage 2 (concurrent readers AND writers; Milestone E)
@@ -167,7 +168,7 @@ Statement guard policy:
 - No guard: SELECT and EXPLAIN (lock-free readers), and a read-only explicit transaction.
 - Shared writer guard (`begin_writer`, held for the whole write-transaction, many concurrent): INSERT, UPDATE, DELETE, and an explicit transaction once its first write runs. Acquired lazily.
 - Shared writer guard (`begin_writer`, per statement): CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX (DDL is non-transactional and rejected inside a block).
-- Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): checkpoint only.
+- Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): checkpoint and `VACUUM` (the maintenance pass runs with no concurrent writer; readers stay lock-free).
 
 Bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution.
 
@@ -258,8 +259,10 @@ snapshot — including autocommit reads — advertises its `xmin` under the capt
 for the snapshot's exact usable lifetime; the same-latch publish (read `active` and
 `xmins[xmin]++` in one critical section, read by `oldest_xmin()` under the same latch)
 makes the capture-vs-horizon path race-free (`mvcc.md` §9). The horizon is captured
-once per VACUUM pass and only advances as snapshots are released; it has no production
-caller until VACUUM wiring (F2/F4). The CLOG that records settled transaction outcomes
+once per VACUUM pass and only advances as snapshots are released; `QueryService::run_vacuum`
+captures it **after** acquiring the exclusive guard so it cannot be advanced by a
+concurrent writer and accounts for every reader advertised at that instant (Milestone
+F4a). The CLOG that records settled transaction outcomes
 lives in the WAL manager (`Clog`, rebuilt from `Commit`/`Abort` records; see
 `docs/specs/crates/wal.md`), separate from this registry of still-running
 transactions.

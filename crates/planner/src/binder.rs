@@ -153,6 +153,13 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "multi-statement transactions are not yet supported",
         )),
+        // VACUUM is a maintenance command dispatched to `run_vacuum` before binding
+        // (it is not relational and never binds/plans). This defensive arm keeps the
+        // public `bind` API total if called directly.
+        Statement::Vacuum { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "VACUUM is a maintenance command and does not bind",
+        )),
     }
 }
 

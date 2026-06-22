@@ -813,7 +813,6 @@ impl PageBackedStorageEngine {
     /// else `copy_from_slice` + force the record LSN), independent of the record's
     /// `txn_id` — so a crash mid-VACUUM leaves every pruned page either pre-prune or
     /// exactly the compacted image, never torn.
-    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
     pub(crate) fn vacuum_heap(
         &self,
         schema: &TableSchema,
@@ -913,10 +912,9 @@ impl PageBackedStorageEngine {
     /// leaf, and no leaf is merged/freed and no right-sibling link is rewritten, so a
     /// concurrent scanner can neither miss nor duplicate a live entry (B-link safe).
     ///
-    /// No production caller yet (VACUUM orchestration is F4a), so it is a runtime
-    /// no-op at this milestone. It does **not** reclaim line pointers `DEAD → UNUSED`
-    /// (F3b); the slots stay `DEAD` until that later step.
-    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
+    /// Called by [`vacuum`](Self::vacuum) as F4a's middle phase (F2b → **F3a** →
+    /// F3b). It does **not** reclaim line pointers `DEAD → UNUSED` (F3b); the slots
+    /// stay `DEAD` until that later step.
     pub(crate) fn vacuum_indexes(
         &self,
         schema: &TableSchema,
@@ -961,8 +959,8 @@ impl PageBackedStorageEngine {
     /// the safety hinge for slot reuse: `insert_row` recycles an `UNUSED` slot id,
     /// so an `UNUSED` slot must have *no* dangling index entry, or a stale entry
     /// would resolve to the new tuple written into the reclaimed slot (silent
-    /// corruption). The F4a VACUUM orchestration enforces the F2b → F3a → F3b order;
-    /// at this milestone this is a documented precondition the caller owns.
+    /// corruption). [`vacuum`](Self::vacuum) (F4a) enforces the F2b → F3a → F3b order
+    /// by calling these three phases in sequence on one set of dead TIDs.
     /// `page::reclaim_line_pointers` debug-asserts each slot is currently `DEAD` (a
     /// `NORMAL`/`UNUSED`/out-of-bounds slot is a hard error), which catches the gross
     /// misordering of reclaiming a never-pruned slot, though it cannot by itself
@@ -980,9 +978,7 @@ impl PageBackedStorageEngine {
     /// mid-reclaim leaves the page either pre-reclaim or exactly the reclaimed image,
     /// never torn.
     ///
-    /// No production caller yet (VACUUM orchestration is F4a), so it is a runtime
-    /// no-op at this milestone.
-    #[allow(dead_code, reason = "wired into VACUUM orchestration in F4a")]
+    /// Called by [`vacuum`](Self::vacuum) as F4a's final phase (F2b → F3a → **F3b**).
     pub(crate) fn reclaim_line_pointers(
         &self,
         schema: &TableSchema,
@@ -1037,6 +1033,49 @@ impl PageBackedStorageEngine {
         }
 
         Ok(())
+    }
+
+    /// VACUUM one table (`docs/specs/mvcc.md` §9, §10 Milestone F4a): the live
+    /// orchestration that ties the three reclamation phases together in their
+    /// mandatory order — heap-prune (F2b) → index-vacuum (F3a) → line-pointer
+    /// reclaim (F3b) — and returns the number of heap tuples reclaimed (for the
+    /// `VACUUM` command tag / observability). `horizon` is the GC horizon
+    /// (`ServerComponents::gc_horizon`), the minimum `xmin` advertised by any live
+    /// snapshot; a version with `xmax < horizon` is dead to every current and
+    /// future snapshot ([`common::is_dead_to_all`]).
+    ///
+    /// **The order is the safety invariant (F3b's hinge).** `vacuum_heap` returns the
+    /// TIDs it pruned to `DEAD`; `vacuum_indexes` must strip every index entry for
+    /// those TIDs **before** `reclaim_line_pointers` flips them `DEAD → UNUSED`,
+    /// because `insert_row` recycles an `UNUSED` slot — a dangling index entry over a
+    /// reclaimed-then-reused slot would resolve to the wrong (new) tuple (silent
+    /// corruption). Running the three calls in this fixed sequence on one dead-TID
+    /// set is exactly what discharges that precondition. When the heap prune finds
+    /// nothing dead, the index and line-pointer phases are skipped (an empty set is a
+    /// documented no-op for both, but skipping avoids even the empty-set call).
+    ///
+    /// **Safety against data loss (the horizon-under-the-guard argument).** The caller
+    /// runs this under the EXCLUSIVE checkpoint guard, so NO writer executes during
+    /// the pass: no committed-deleter can appear mid-pass, and `horizon` is captured
+    /// once (after acquiring the guard) as the min advertised `xmin` over all live
+    /// snapshots — INCLUDING lock-free readers, which advertise their `xmin`. So every
+    /// version this reclaims has `xmax < horizon`, meaning its delete committed before
+    /// any still-live snapshot's `xmin`; no current snapshot can see it live, and any
+    /// reader that starts mid-pass freezes `xmin >= horizon` (the deleter is in its
+    /// settled past). VACUUM therefore never reclaims a version a snapshot needs.
+    pub fn vacuum(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
+        // Phase F2b — heap-prune dead-to-all tuples to DEAD, collecting their TIDs.
+        let dead = self.vacuum_heap(schema, horizon)?;
+        let reclaimed = dead.len();
+        if !dead.is_empty() {
+            let dead: HashSet<RowLocation> = dead.into_iter().collect();
+            // Phase F3a — strip every PK + secondary index entry for those TIDs.
+            self.vacuum_indexes(schema, &dead)?;
+            // Phase F3b — reclaim the now entry-free line pointers DEAD → UNUSED.
+            // MUST follow F3a (above): see this method's ordering invariant.
+            self.reclaim_line_pointers(schema, &dead)?;
+        }
+        Ok(reclaimed)
     }
 }
 
@@ -5046,5 +5085,124 @@ mod vacuum_tests {
         // VACUUM stamps its pages under txn 0 (the recovery/maintenance convention),
         // never a user txn id: its reclamation must not be undone by an abort.
         assert_eq!(VACUUM_TXN, 0);
+    }
+
+    // --- F4a: the `engine.vacuum` orchestration (F2b -> F3a -> F3b in one call) ---
+
+    #[test]
+    fn vacuum_orchestrates_heap_index_and_line_pointers_in_order() {
+        let fixture = Fixture::new();
+        fixture
+            .engine
+            .create_index(&ctx(101), &name_index())
+            .unwrap();
+        fixture.commit(101);
+
+        let keep = fixture.insert_committed(10, row(1, "keep"));
+        let gone = fixture.insert_committed(11, row(2, "gone"));
+        fixture.delete(20, 2);
+        fixture.commit(20);
+
+        // Before the deleted entry still dangles in both indexes.
+        assert!(pk_index_tids(&fixture.engine).contains(&gone));
+        assert!(name_index_tids(&fixture.engine).contains(&gone));
+
+        // One `vacuum` call runs F2b -> F3a -> F3b: prune the heap, strip index
+        // entries, reclaim the line pointer. It reports one reclaimed TID.
+        let reclaimed = fixture.engine.vacuum(&users_schema(), 30).unwrap();
+        assert_eq!(reclaimed, 1, "exactly the deleted TID is reclaimed");
+
+        // Heap slot is reclaimed (reads as absent); both index entries are gone; the
+        // live row's entries survive in both indexes.
+        assert!(
+            fixture.physical_bytes(gone).is_none(),
+            "dead slot reclaimed"
+        );
+        assert_eq!(pk_index_tids(&fixture.engine), vec![keep]);
+        assert_eq!(name_index_tids(&fixture.engine), vec![keep]);
+        assert!(fixture.is_normal(keep), "the live row survives untouched");
+
+        // The reclaimed slot id is now UNUSED and a new insert reuses it — proof F3b
+        // ran (a still-DEAD slot would not be recycled).
+        let rid = fixture
+            .engine
+            .insert(&ctx(40), TABLE_ID, row(3, "new"))
+            .unwrap();
+        fixture.commit(40);
+        assert_eq!(
+            (rid.page_num, rid.slot_num),
+            (gone.page_num, gone.slot_num),
+            "the reclaimed slot id is reused by a later insert"
+        );
+
+        // The live row and the new row both resolve; the resurrected-dead row does not.
+        let reader = ctx(50);
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(row(1, "keep"))
+        );
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(3)).unwrap(),
+            Some(row(3, "new"))
+        );
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(2)).unwrap(),
+            None,
+            "the vacuumed row stays gone"
+        );
+    }
+
+    #[test]
+    fn vacuum_with_nothing_dead_reclaims_zero_and_logs_no_wal() {
+        let fixture = Fixture::new();
+        let live = fixture.insert_committed(10, row(1, "live"));
+        let fpis_before = fixture.full_page_images().len();
+
+        // No committed-deleted version below the horizon: F2b finds nothing, so F3a/F3b
+        // are skipped — zero reclaimed, no FullPageImage logged.
+        let reclaimed = fixture.engine.vacuum(&users_schema(), 30).unwrap();
+        assert_eq!(reclaimed, 0);
+        assert_eq!(
+            fixture.full_page_images().len(),
+            fpis_before,
+            "a no-dead VACUUM logs no WAL"
+        );
+        assert!(fixture.is_normal(live), "the live row is untouched");
+    }
+
+    #[test]
+    fn vacuum_retains_a_version_a_horizon_below_the_delete_still_protects() {
+        // The horizon-safety invariant at the engine level: a committed DELETE at
+        // xmax = 50 is reclaimable ONLY when the horizon is above 50. With a horizon of
+        // 50 (a live snapshot froze its xmin at 50 and can still see the row live), the
+        // version is NOT below the horizon, so VACUUM must retain it — no data loss.
+        let fixture = Fixture::new();
+        let row_loc = fixture.insert_committed(10, row(1, "protected"));
+        fixture.delete(50, 1);
+        fixture.commit(50);
+
+        // Horizon = 50: 50 < 50 is false, so the version is NOT dead-to-all. VACUUM
+        // reclaims nothing and the row is still physically present (a snapshot with
+        // xmin = 50 that sees the delete in-flight would still resolve it).
+        let reclaimed = fixture.engine.vacuum(&users_schema(), 50).unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "a version the horizon protects is NOT reclaimed"
+        );
+        assert!(
+            fixture.is_normal(row_loc),
+            "the protected version is retained in the heap"
+        );
+        assert!(
+            pk_index_tids(&fixture.engine).contains(&row_loc),
+            "its index entry is retained too"
+        );
+
+        // Once the horizon advances past the deleter (51 > 50), the version becomes
+        // reclaimable and VACUUM frees it.
+        let reclaimed = fixture.engine.vacuum(&users_schema(), 51).unwrap();
+        assert_eq!(reclaimed, 1, "above the deleter the version is reclaimed");
+        assert!(fixture.physical_bytes(row_loc).is_none());
+        assert!(!pk_index_tids(&fixture.engine).contains(&row_loc));
     }
 }

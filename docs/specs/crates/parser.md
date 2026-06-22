@@ -32,6 +32,12 @@ pub enum Statement {
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },
     Explain(Box<Statement>),
+    Begin,
+    Commit,
+    Rollback,
+    // `VACUUM` (all user tables) or `VACUUM <table>` (one table). `table` is the
+    // lowercase-normalized identifier, `None` for the whole database.
+    Vacuum { table: Option<String> },
 }
 
 pub enum InsertSource {
@@ -163,6 +169,8 @@ Parser may produce AST variants for syntax that binder rejects. V1 parser must p
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but v1 only accepts a `SELECT` inner statement; any other inner statement is rejected as unsupported.
 - Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. Only the plain forms are accepted: isolation-level and access modes, MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints are rejected at parse time. `ABORT` is not recognized by the dialect and is a syntax error (v1 does not add it). These statements parse to first-class variants for the MVCC effort; the multi-statement transaction lifecycle is wired in MVCC Milestone C3. Until then the server rejects them with `SqlState::FeatureNotSupported` rather than silently treating a `BEGIN` as a started transaction.
+
+- Maintenance: `VACUUM` parses to `Statement::Vacuum { table: None }` and `VACUUM <table>` to `Statement::Vacuum { table: Some(<lowercased name>) }`. **sqlparser 0.56 cannot parse `VACUUM`** (it errors), so `parse_statement` intercepts it *before* handing the string to sqlparser: it strips an optional trailing `;`, matches the leading `vacuum` keyword case-insensitively (a glued word like `vacuumfoo` is not a VACUUM and falls through to sqlparser), and accepts at most one bare-identifier argument (lowercase-normalized, the v1 unquoted-identifier rule). Parenthesized options, multiple tables, qualified (`schema.table`) or quoted names, and Postgres option keywords (`FULL`/`FREEZE`/`ANALYZE`/`VERBOSE`/…) are rejected with `ErrorKind::Parse` / `SqlState::SyntaxError`; none are supported in v1. `VACUUM` does not bind/plan — it is a maintenance command the server dispatches separately (`docs/specs/crates/server.md`, `docs/specs/mvcc.md` §9/§10 Milestone F).
 
 Binder rejects parsed forms that exceed the v1 semantic subset, such as composite primary keys and unknown functions.
 

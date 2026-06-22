@@ -210,6 +210,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_vacuum_with_optional_table() {
+        // sqlparser 0.56 cannot parse VACUUM; it is intercepted before sqlparser.
+        // Bare VACUUM (and its trailing-semicolon spelling) targets the whole DB.
+        for sql in ["vacuum", "VACUUM", "vacuum;", "  VACUUM ;  "] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Vacuum { table: None },
+                "for `{sql}`"
+            );
+        }
+        // VACUUM <table> targets one table; the identifier is lowercase-normalized.
+        for sql in ["vacuum users", "VACUUM Users", "vacuum users ;"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Vacuum {
+                    table: Some("users".to_string()),
+                },
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_vacuum_forms() {
+        // Parenthesized options, multiple tables, qualified/quoted names, and a glued
+        // keyword argument are all rejected as parse errors.
+        for sql in [
+            "vacuum (full) users",  // parenthesized options
+            "vacuum full",          // FULL keyword as a bare second token
+            "vacuum users orders",  // multiple tables
+            "vacuum public.users",  // qualified name
+            "vacuum \"Users\"",     // quoted identifier
+            "vacuum analyze users", // ANALYZE keyword
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+        // `vacuumfoo` is not a VACUUM at all (no whitespace after the keyword); it
+        // falls through to sqlparser, which rejects it as an unknown statement.
+        assert!(parse("vacuumfoo").is_err());
+    }
+
+    #[test]
     fn parses_create_index_forms() {
         assert_eq!(
             parse("create index users_name on users (name)").unwrap(),

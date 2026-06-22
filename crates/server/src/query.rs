@@ -143,6 +143,19 @@ impl QueryService {
             return Ok(PreparedStatement {
                 class,
                 bound: None,
+                maintenance: None,
+                param_types: Vec::new(),
+                result_columns: None,
+            });
+        }
+        if let StatementClass::Maintenance = class {
+            // VACUUM takes no parameters, produces no rows, and does not bind/plan.
+            // Carry the parsed statement (the target table) so an extended-protocol
+            // `Execute` routes it through `run_vacuum`, exactly like the simple path.
+            return Ok(PreparedStatement {
+                class,
+                bound: None,
+                maintenance: Some(statement),
                 param_types: Vec::new(),
                 result_columns: None,
             });
@@ -156,6 +169,7 @@ impl QueryService {
         Ok(PreparedStatement {
             class,
             bound: Some(bound),
+            maintenance: None,
             param_types,
             result_columns,
         })
@@ -183,10 +197,19 @@ impl QueryService {
         params: &[Value],
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
+        // Maintenance does not bind/plan; run it before parameter substitution. The
+        // connection routes maintenance through `execute_prepared_in_session`, so this
+        // arm is reached only if a caller bypasses that routing — keep it total.
+        if let StatementClass::Maintenance = prepared.class {
+            return self.run_prepared_vacuum(prepared);
+        }
         let bound = self.substitute_prepared_params(prepared, params)?;
         match prepared.class {
             StatementClass::Read => self.autocommit_read(bound, cancel),
             StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            StatementClass::Maintenance => {
+                unreachable!("maintenance is dispatched above before substitution")
+            }
             StatementClass::TransactionControl(_) => Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "transaction control statements require the simple query protocol",
@@ -218,6 +241,23 @@ impl QueryService {
             return self.handle_transaction_control(kind, slot, cancel);
         }
 
+        // VACUUM does not bind/plan: dispatch it before parameter substitution.
+        // Inside an open transaction block it is rejected (poisoning it to 'E', like
+        // DDL); otherwise it runs as a standalone maintenance unit.
+        if let StatementClass::Maintenance = prepared.class {
+            if let Some(mut txn) = slot {
+                txn.failed = true;
+                return (
+                    Some(txn),
+                    Err(DbError::plan(
+                        SqlState::FeatureNotSupported,
+                        "VACUUM cannot run inside a transaction block",
+                    )),
+                );
+            }
+            return (None, self.run_prepared_vacuum(prepared));
+        }
+
         let bound = match self.substitute_prepared_params(prepared, params) {
             Ok(bound) => bound,
             // A parameter-count/substitution error inside an open transaction
@@ -237,6 +277,9 @@ impl QueryService {
                     StatementClass::Read => self.autocommit_read(bound, cancel),
                     StatementClass::Write | StatementClass::Ddl => {
                         self.autocommit_write(bound, cancel)
+                    }
+                    StatementClass::Maintenance => {
+                        unreachable!("maintenance is dispatched above before substitution")
                     }
                     StatementClass::TransactionControl(_) => {
                         unreachable!("transaction control is dispatched above before substitution")
@@ -292,6 +335,24 @@ impl QueryService {
 
         if let StatementClass::TransactionControl(kind) = class {
             return self.handle_transaction_control(kind, slot, cancel);
+        }
+
+        // VACUUM is a maintenance command: it does not bind/plan, and like DDL it is
+        // forbidden inside an explicit transaction block (Postgres: "VACUUM cannot run
+        // inside a transaction block"). Reject it with the open transaction poisoned to
+        // the 'E' failed state, matching the DDL-in-block contract.
+        if let StatementClass::Maintenance = class {
+            if let Some(mut txn) = slot {
+                txn.failed = true;
+                return (
+                    Some(txn),
+                    Err(DbError::plan(
+                        SqlState::FeatureNotSupported,
+                        "VACUUM cannot run inside a transaction block",
+                    )),
+                );
+            }
+            return (None, self.run_vacuum(statement));
         }
 
         match slot {
@@ -509,6 +570,11 @@ impl QueryService {
         match class {
             StatementClass::Read => self.autocommit_read(bound, cancel),
             StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            // Maintenance (VACUUM) never reaches here: `dispatch` runs it via
+            // `run_vacuum` before the autocommit data path.
+            StatementClass::Maintenance => Err(DbError::internal(
+                "maintenance reached the autocommit data path",
+            )),
             // Transaction-control statements never reach here (dispatch routes
             // them through `handle_transaction_control`).
             StatementClass::TransactionControl(_) => Err(DbError::internal(
@@ -608,6 +674,82 @@ impl QueryService {
         }
 
         Ok(result)
+    }
+
+    /// Run a prepared (extended-protocol) `VACUUM`. The statement carries no bound
+    /// payload — it is the raw `Statement::Vacuum` parsed at `prepare_sql` time.
+    fn run_prepared_vacuum(&self, prepared: &PreparedStatement) -> Result<ExecutionResult> {
+        let statement = prepared.maintenance.as_ref().ok_or_else(|| {
+            DbError::internal("maintenance prepared statement has no carried VACUUM payload")
+        })?;
+        self.run_vacuum(statement.clone())
+    }
+
+    /// Run `VACUUM` (Milestone F4a, `docs/specs/mvcc.md` §9/§10 F): reclaim dead MVCC
+    /// versions from one table or every user table, under the EXCLUSIVE checkpoint
+    /// guard. Returns a `CommandComplete`-style result tagged `VACUUM`.
+    ///
+    /// **Concurrency + safety (no data loss — the horizon-under-the-guard argument).**
+    /// VACUUM takes the exclusive guard ([`ConcurrencyController::begin_checkpoint`]),
+    /// which drains all in-flight writers and holds off new ones, so NO writer runs
+    /// during the pass (lock-free readers still run concurrently). The GC horizon is
+    /// captured **once, after the guard is held**, as the minimum `xmin` advertised by
+    /// any live snapshot — INCLUDING active lock-free readers and autocommit reads,
+    /// which advertise their `xmin` ([`ServerComponents::gc_horizon`]). Each phase only
+    /// reclaims versions with `xmax < horizon` ([`common::is_dead_to_all`]), i.e.
+    /// deletes that committed before every live snapshot's `xmin`; no current snapshot
+    /// can see such a version live, and any reader that starts mid-pass freezes
+    /// `xmin >= horizon` (the deleter is in its settled past). Capturing the horizon
+    /// AFTER acquiring the guard is load-bearing: it cannot then be advanced by a
+    /// concurrent writer/commit, and it already accounts for every reader advertised at
+    /// that instant. VACUUM therefore never reclaims a version any snapshot needs.
+    fn run_vacuum(&self, statement: Statement) -> Result<ExecutionResult> {
+        let Statement::Vacuum { table } = statement else {
+            return Err(DbError::internal(
+                "run_vacuum called with a non-VACUUM statement",
+            ));
+        };
+
+        // Acquire the EXCLUSIVE guard for the whole pass FIRST: it drains in-flight
+        // writers and excludes new ones, so the pass runs with no concurrent writer
+        // (readers stay lock-free) and the catalog cannot change under us (DDL takes
+        // the shared writer guard, which is excluded here). The guard is released when
+        // `_guard` drops at return. Resolving the target table(s) under the guard —
+        // like `run_checkpoint` — means the resolved schema is stable for the pass.
+        let _guard = self.components.concurrency.begin_checkpoint()?;
+
+        // Capture the horizon ONCE, AFTER the guard is held (see the method doc): it is
+        // the min advertised snapshot `xmin`, so no version a live snapshot can see is
+        // reclaimable, and it cannot be advanced by a writer while we hold the guard.
+        let horizon = self.components.gc_horizon();
+
+        // `VACUUM t` targets just `t` (error if it does not exist); `VACUUM` (no table)
+        // targets every user table in the catalog.
+        let targets = match table {
+            Some(name) => {
+                let schema = self
+                    .components
+                    .catalog
+                    .get_table_by_name(&name)?
+                    .ok_or_else(|| {
+                        DbError::plan(
+                            SqlState::UndefinedTable,
+                            format!("table {name} does not exist"),
+                        )
+                    })?;
+                vec![schema]
+            }
+            None => self.components.catalog.list_tables()?,
+        };
+
+        for schema in &targets {
+            self.components.storage.vacuum(schema, horizon)?;
+        }
+
+        Ok(ExecutionResult::Modified {
+            command: "VACUUM".to_string(),
+            count: 0,
+        })
     }
 
     /// Commit an explicit transaction: append a `Commit` record, flush (fsync),
@@ -981,6 +1123,9 @@ enum StatementClass {
     Read,
     Write,
     Ddl,
+    /// A maintenance command (`VACUUM`) — not relational, so it never binds or
+    /// plans, and like DDL it is forbidden inside an explicit transaction block.
+    Maintenance,
     TransactionControl(TransactionControl),
 }
 
@@ -991,6 +1136,10 @@ enum StatementClass {
 pub struct PreparedStatement {
     class: StatementClass,
     bound: Option<BoundStatement>,
+    /// The parsed maintenance statement (`VACUUM`), carried unbound for the
+    /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can run
+    /// it through `run_vacuum`. `None` for every other class.
+    maintenance: Option<Statement>,
     param_types: Vec<DataType>,
     result_columns: Option<Vec<ColumnInfo>>,
 }
@@ -1007,6 +1156,13 @@ impl PreparedStatement {
     /// than running as an autocommit unit.
     pub fn is_transaction_control(&self) -> bool {
         matches!(self.class, StatementClass::TransactionControl(_))
+    }
+
+    /// Whether this is a maintenance command (`VACUUM`). The connection routes such
+    /// an `Execute` through the session path so it is rejected inside an open
+    /// transaction block and otherwise runs as a standalone maintenance unit.
+    pub fn is_maintenance(&self) -> bool {
+        matches!(self.class, StatementClass::Maintenance)
     }
 
     /// Result column metadata, or `None` for a statement that returns no rows.
@@ -1054,6 +1210,7 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::Rollback => Ok(StatementClass::TransactionControl(
             TransactionControl::Rollback,
         )),
+        Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
     }
 }
 

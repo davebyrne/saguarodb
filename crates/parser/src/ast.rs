@@ -44,6 +44,13 @@ pub enum Statement {
     /// `ROLLBACK`. Savepoints are not supported in v1. Execution is wired in
     /// MVCC Milestone C3.
     Rollback,
+    /// `VACUUM` (all user tables) or `VACUUM <table>` (one table). A maintenance
+    /// command that reclaims dead MVCC versions; `table` is the lowercase-normalized
+    /// identifier, `None` for the whole database. sqlparser 0.56 does not parse
+    /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
+    Vacuum {
+        table: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

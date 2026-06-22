@@ -150,9 +150,10 @@ nor MVCC `update` tombstones any more — both keep the superseded version on a
 still-`NORMAL` line pointer and hide it by visibility (see MVCC Delete / MVCC
 Update below), so dead tuples linger physically until VACUUM (Milestone F), the
 only producer of `DEAD` (via `page::prune_and_compact`, F2b) and `UNUSED` (via
-`page::reclaim_line_pointers`, F3b). The VACUUM passes have no production caller
-until the orchestration (F4a), so at this milestone no runtime path yet stamps a
-heap slot `DEAD`/`UNUSED`. `validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
+`page::reclaim_line_pointers`, F3b). The live VACUUM orchestration
+`PageBackedStorageEngine::vacuum` (F4a) drives both, so `VACUUM` now stamps heap
+slots `DEAD` (heap prune) then `UNUSED` (line-pointer reclaim).
+`validate` accepts `NORMAL`, `DEAD`, and `UNUSED` flags on a data page (so a
 VACUUM-compacted page is valid); `REDIRECT` and any other value is corruption.
 The `(offset, offset+len) ≤ FreeStart`/in-bounds invariant is enforced **only for
 `NORMAL` line pointers** — after compaction a `DEAD`/`UNUSED` slot's
@@ -232,16 +233,16 @@ reproduces the same slot id under LSN-ordered replay.
 
 `prune_and_compact` is consumed by the heap-prune VACUUM pass (`vacuum_heap`,
 F2b, below); `page::reclaim_line_pointers` is consumed by the engine's
-`reclaim_line_pointers` pass (F3b, below), which has no production caller until
-the VACUUM orchestration (F4a).
+`reclaim_line_pointers` pass (F3b, below). Both are reached from the live VACUUM
+orchestration `PageBackedStorageEngine::vacuum` (F4a, below).
 
 ### Heap-Prune VACUUM Pass (`vacuum_heap`, F2b)
 
 `vacuum_heap(schema, horizon) -> Vec<RowLocation>` is the engine heap-prune pass
 (`mvcc.md` §9 / Milestone F2b). It physically reclaims the tuples that are
 dead-to-everyone at `horizon` from every heap page of `schema`'s table and returns
-their TIDs. It has no production caller yet (VACUUM orchestration is F4a), so it is
-a runtime no-op at this milestone.
+their TIDs. It is the first phase of the live VACUUM orchestration `vacuum` (F4a,
+below).
 
 - **Classify.** For each `NORMAL` slot on a page it decodes the tuple's MVCC header
   (`codec::decode_mvcc_header` ⇒ `xmin`/`xmax`/`infomask`) and calls
@@ -283,8 +284,8 @@ the heap prune marks a dead tuple's line pointer `DEAD`, every index entry point
 at that TID still lingers (it would resolve to a DEAD slot); this pass deletes those
 entries from the table's **primary-key index and every live secondary index**, so no
 index entry resolves to a dead slot before the line pointers are reclaimed
-`DEAD → UNUSED` (F3b). It has no production caller yet (VACUUM orchestration is F4a),
-so it is a runtime no-op at this milestone.
+`DEAD → UNUSED` (F3b). It is the middle phase of the live VACUUM orchestration
+`vacuum` (F4a, below).
 
 - **Remove by dead-TID membership, not by key.** The heap prune already compacted the
   page, so the dead tuple's key bytes are gone and the entry's key cannot be
@@ -325,15 +326,15 @@ VACUUM phase (`mvcc.md` §9 / Milestone F3b): it flips each `dead_tid`'s heap li
 pointer `DEAD → UNUSED`, freeing its slot id so a future `insert_row` can recycle
 it (bounding the slot array under churn). `dead_tids` are the TIDs `vacuum_heap`
 (F2b) pruned to `DEAD` and `vacuum_indexes` (F3a) has since stripped of every index
-entry. It has no production caller yet (VACUUM orchestration is F4a), so it is a
-runtime no-op at this milestone.
+entry. It is the final phase of the live VACUUM orchestration `vacuum` (F4a, below).
 
 - **Ordering invariant — F2b → F3a → F3b.** This MUST run only after
   `vacuum_indexes` removed every index entry for these TIDs, so an `UNUSED` slot
   has no dangling index entry. That is the safety hinge for `insert_row`'s
   `UNUSED`-only reuse: reusing a slot with a surviving index entry would let a stale
-  entry resolve to the new tuple written into it (silent corruption). F4a enforces
-  the order; here it is a documented precondition the caller owns. The underlying
+  entry resolve to the new tuple written into it (silent corruption). The `vacuum`
+  orchestration (F4a, below) enforces the order by calling F2b → F3a → F3b in
+  sequence. The underlying
   `page::reclaim_line_pointers` errors on a non-`DEAD` slot, which catches the gross
   misordering of reclaiming a never-pruned slot (it cannot by itself prove the index
   entries are gone — that is F4a's responsibility).
@@ -346,6 +347,30 @@ runtime no-op at this milestone.
   insert-into-reused-slot (`HeapInsert`) replays in LSN order to the final state
   (the new row at that slot), so a crash mid-reclaim leaves the page either
   pre-reclaim or exactly the reclaimed image, never torn.
+
+### VACUUM Orchestration (`vacuum`, F4a)
+
+`vacuum(schema, horizon) -> usize` is the live entry point (`mvcc.md` §9 / Milestone
+F4a) that ties the three reclamation phases together for one table and returns the
+count of heap tuples reclaimed (for the `VACUUM` command tag). It calls, **in this
+mandatory order on one dead-TID set**:
+
+1. `vacuum_heap(schema, horizon)` (F2b) — prune dead-to-all tuples to `DEAD`,
+   collecting their TIDs.
+2. `vacuum_indexes(schema, &dead)` (F3a) — strip every PK + secondary index entry for
+   those TIDs.
+3. `reclaim_line_pointers(schema, &dead)` (F3b) — flip the now entry-free line
+   pointers `DEAD → UNUSED`.
+
+When the heap prune finds nothing dead, the index and line-pointer phases are skipped.
+The order is the safety invariant: F3b must run only after F3a removed every index
+entry for these TIDs, or `insert_row`'s `UNUSED`-slot reuse could resolve a stale index
+entry to the new tuple (silent corruption). The server's `run_vacuum` calls this under
+the **exclusive** checkpoint guard with the GC horizon captured once after the guard,
+so no writer runs during the pass and the horizon accounts for every live reader
+snapshot — VACUUM reclaims only versions `xmax < horizon` that no current-or-future
+snapshot can see live (no data loss; see `docs/specs/crates/server.md` and `mvcc.md`
+§9/§10 F4a).
 
 ### MVCC Delete
 

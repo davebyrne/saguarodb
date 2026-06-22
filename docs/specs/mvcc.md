@@ -585,8 +585,8 @@ design, because index entries accumulate per version as well as heap tuples.
   entry is touched. The pass runs under the maintenance txn id (`0`) so its
   reclamation is never undone by an abort, and returns the reclaimed dead TIDs (fed to
   index vacuum). It does **not** reclaim line pointers `DEAD → UNUSED` (that is the
-  separate step below) — `vacuum_heap` has no production caller until the VACUUM
-  orchestration (F4a).
+  separate step below). Called by the live VACUUM orchestration (F4a, below) as its
+  first phase.
 - **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
   dangling index entries `vacuum_heap` left behind — for the table's primary-key
   index **and every live secondary index**, delete every entry whose value (the heap
@@ -602,7 +602,8 @@ design, because index entries accumulate per version as well as heap tuples.
   no right-sibling link is rewritten (an emptied leaf is left in place — accepted
   bloat), and the per-leaf write latch is mutually exclusive with a reader's per-leaf
   read latch, so a concurrent scanner can neither miss nor duplicate a live entry. It
-  does **not** reclaim line pointers (the next step). No production caller until F4a.
+  does **not** reclaim line pointers (the next step). Called by the F4a orchestration
+  as its middle phase.
 - **Line-pointer reclaim** (`storage::reclaim_line_pointers(schema, dead_tids)`,
   F3b): flip each `dead_tid`'s heap line pointer `DEAD → UNUSED`, freeing its slot
   id for reuse. The TIDs are grouped by heap page and each page is rewritten once
@@ -618,9 +619,36 @@ design, because index entries accumulate per version as well as heap tuples.
   so the recycled slot cannot let a stale index entry resolve to the new tuple
   (silent corruption). A reclaim (FPI: slot → `UNUSED`) followed by a later
   insert-into-reused-slot (`HeapInsert`) replays in LSN order to the final state.
-  No production caller until F4a.
-- **Triggering**: an on-demand `VACUUM` command plus opportunistic pruning during
-  scans. CLOG truncation below the horizon piggybacks here.
+  Called by the F4a orchestration as its final phase.
+- **Orchestration** (`storage::PageBackedStorageEngine::vacuum(schema, horizon)`,
+  F4a): the live entry point that ties the three phases together **in their mandatory
+  order** — `vacuum_heap` (F2b) → `vacuum_indexes` (F3a) → `reclaim_line_pointers`
+  (F3b) — on one set of dead TIDs, returning the count reclaimed. The order is the
+  safety invariant: index entries for a TID must be gone (F3a) *before* its line
+  pointer is reclaimed to `UNUSED` (F3b), or `insert_row`'s slot reuse could resolve a
+  stale index entry to the new tuple. When the heap prune finds nothing dead, the
+  index and line-pointer phases are skipped.
+- **The `VACUUM` SQL command** (server, F4a): `VACUUM` (every user table) or
+  `VACUUM <table>` (one table; errors if it does not exist). Classified
+  `StatementClass::Maintenance` — it does **not** bind or plan — and rejected inside an
+  explicit transaction block (like DDL, with `SqlState::FeatureNotSupported`, since
+  `VACUUM` is non-transactional). `QueryService::run_vacuum` resolves the target
+  table(s), then acquires the **exclusive** checkpoint guard (`begin_checkpoint`) for
+  the whole pass, captures `gc_horizon()` **once, after the guard is held**, and calls
+  `engine.vacuum(schema, horizon)` for each target; the command tag is `VACUUM`.
+  **No data loss (the horizon-under-the-guard argument):** under the exclusive guard no
+  writer runs, so no committed-deleter appears mid-pass; and the horizon — captured
+  after acquiring the guard — is the minimum `xmin` advertised by any live snapshot,
+  **including lock-free readers** (which advertise their `xmin`, §9). Every reclaimed
+  version has `xmax < horizon`, i.e. its delete committed before every live snapshot's
+  `xmin`, so no current snapshot can see it live, and any reader that starts mid-pass
+  freezes `xmin >= horizon` (the deleter is in its settled past). Capturing the horizon
+  *after* the guard is load-bearing: a concurrent writer cannot then advance it, and it
+  already accounts for every reader advertised at that instant. VACUUM therefore never
+  reclaims a version any snapshot needs. This is exactly why the GC-horizon fix
+  (minimum advertised `xmin`, not oldest active id) had to land before VACUUM went live.
+- **Triggering**: an on-demand `VACUUM` command (F4a, live) plus opportunistic pruning
+  during scans (deferred). CLOG truncation below the horizon piggybacks here.
 
 ---
 
@@ -799,9 +827,14 @@ and per-tuple CLOG-probe contention reduction.
   `< horizon`) and the `ServerComponents::gc_horizon` accessor (the **minimum
   advertised snapshot `xmin`** via `ActiveTxnRegistry::oldest_xmin`, else
   `next_txn_id` — not the oldest active id; see §9 Horizon). No engine wiring yet —
-  runtime no-op. **F2 — Heap prune +
-  compaction.** **F3 — Index vacuum + line-pointer reclaim.** **F4 — On-demand
-  `VACUUM`, opportunistic pruning, CLOG truncation** (§9).
+  runtime no-op. **F2 — Heap prune + compaction.** **F3 — Index vacuum +
+  line-pointer reclaim.** **F4a — On-demand `VACUUM` (live).** `engine.vacuum`
+  orchestrates F2b → F3a → F3b in order; the `VACUUM [table]` command
+  (`StatementClass::Maintenance`, parsed before sqlparser, rejected in a transaction
+  block) runs under the exclusive checkpoint guard with the GC horizon captured once
+  after the guard — the first real reclamation behavior change (§9). **F4b —
+  opportunistic prune at checkpoint.** **F4c — WAL-truncation relaxation + CLOG
+  truncation** (§9). F4b/F4c remain to do.
 
 ### Milestone G — Isolation levels & polish
 
