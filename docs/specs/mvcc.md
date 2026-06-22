@@ -647,8 +647,20 @@ design, because index entries accumulate per version as well as heap tuples.
   already accounts for every reader advertised at that instant. VACUUM therefore never
   reclaims a version any snapshot needs. This is exactly why the GC-horizon fix
   (minimum advertised `xmin`, not oldest active id) had to land before VACUUM went live.
-- **Triggering**: an on-demand `VACUUM` command (F4a, live) plus opportunistic pruning
-  during scans (deferred). CLOG truncation below the horizon piggybacks here.
+- **Triggering**: an on-demand `VACUUM` command (F4a, live) **plus auto-prune folded
+  into the checkpoint behind a threshold** (F4b, live). A server-wide counter
+  (`ServerComponents::dead_rows_since_vacuum`) accumulates committed dead versions —
+  each committed `DELETE` row and each committed `UPDATE` row is one dead version, added
+  on a successful, durable commit only (never on abort). When a checkpoint runs and the
+  count reaches `config.auto_vacuum_dead_rows` (CLI `--auto-vacuum-dead-rows`, default
+  `10000`; `0` disables auto-prune), the checkpoint captures `gc_horizon()` **under the
+  exclusive guard it already holds** and runs the F4a orchestration over every user
+  table **before** flushing dirty pages — so the vacuum's pages and full-page images are
+  made durable by that same checkpoint — then resets the counter. This bounds heap +
+  index space under sustained churn with no operator action. It inherits F4a's
+  no-data-loss safety verbatim (horizon captured under the guard; only versions no live
+  snapshot can see are reclaimed). Opportunistic pruning during scans is deferred. CLOG
+  truncation below the horizon piggybacks here (F4c).
 
 ---
 
@@ -833,8 +845,13 @@ and per-tuple CLOG-probe contention reduction.
   (`StatementClass::Maintenance`, parsed before sqlparser, rejected in a transaction
   block) runs under the exclusive checkpoint guard with the GC horizon captured once
   after the guard — the first real reclamation behavior change (§9). **F4b —
-  opportunistic prune at checkpoint.** **F4c — WAL-truncation relaxation + CLOG
-  truncation** (§9). F4b/F4c remain to do.
+  auto-prune at checkpoint (live).** A checkpoint folds a VACUUM pass over every user
+  table into itself when `dead_rows_since_vacuum >= --auto-vacuum-dead-rows` (committed
+  dead versions since the last auto-prune; default `10000`, `0` disables), under the
+  guard it already holds, with the horizon captured under that guard and the vacuum run
+  before `flush_dirty_pages` so its pages/FPIs are durable that checkpoint — bounding
+  space without operator `VACUUM`, with F4a's no-data-loss safety. **F4c —
+  WAL-truncation relaxation + CLOG truncation** (§9). F4c remains to do.
 
 ### Milestone G — Isolation levels & polish
 

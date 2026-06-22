@@ -88,6 +88,7 @@ The server accepts:
 --buffer-pool-frames <N>           default 1024
 --checkpoint-every-n-commits <N>   default 100
 --checkpoint-wal-bytes <BYTES>     default 67108864
+--auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)
 --shutdown-timeout-ms <MS>         default 30000
 --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)
 --tls-key-file <PATH>              PEM private key; enables TLS (needs --tls-cert-file)

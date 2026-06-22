@@ -32,6 +32,49 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // concurrent writer advances `next_txn_id` while we hold the exclusive guard).
     let _guard = components.concurrency.begin_checkpoint()?;
 
+    // Auto-prune (Milestone F4b, `docs/specs/mvcc.md` §9/§10 F): when enough dead
+    // versions have accumulated since the last auto-prune, fold a VACUUM pass over
+    // every user table into THIS checkpoint, under the exclusive guard we already
+    // hold. This bounds heap + index space under sustained DELETE/UPDATE churn with
+    // no operator `VACUUM`. It runs HERE — at the very start of the checkpoint body,
+    // BEFORE `flush_dirty_pages` — so the pages the vacuum dirties and the full-page
+    // images it logs are flushed and made durable by THIS checkpoint, and its WAL
+    // records precede the WAL truncation below.
+    //
+    // **No data loss (same safety as on-demand VACUUM, F4a):** the horizon is
+    // captured by `gc_horizon()` HERE, *under* the exclusive guard. Under that guard
+    // no writer runs, so no committed-deleter appears mid-pass, and the horizon is
+    // the minimum `xmin` advertised by any live snapshot — INCLUDING lock-free
+    // readers (which advertise their `xmin`). Every reclaimed version has
+    // `xmax < horizon`, i.e. its delete committed before every live snapshot's `xmin`,
+    // so no current snapshot can see it live. Capturing the horizon under the guard is
+    // load-bearing: a concurrent writer/commit cannot then advance it. The auto-prune
+    // reclaims only the orchestration's reclaimable versions (F4a) — never a version
+    // a live snapshot needs.
+    //
+    // **Recovery / ordering invariants are intact:** the vacuum appends its
+    // `FullPageImage` records BEFORE the `wal.flush()` below, so they are flushed by
+    // this checkpoint and sit at LSNs *below* `checkpoint_lsn` (the flushed LSN
+    // captured after that flush). The matching dirtied pages are written to the heap
+    // by `flush_dirty_pages()` and fsynced by `store.sync_all()` BEFORE the control
+    // record (the commit point) — exactly the existing WAL-before-page ordering. So
+    // once this checkpoint commits, the vacuum's effects are durably in the heap and
+    // the redo boundary advances past them; truncating the vacuum's now-redundant WAL
+    // records below `checkpoint_lsn` is therefore safe (their effect is already on
+    // disk). A crash BEFORE the control record falls back to the previous redo
+    // boundary, where the prior cycle's images repair any torn write and the vacuum
+    // simply did not happen. The conservative-truncation guard is unchanged (F4c
+    // relaxes it later).
+    let threshold = components.config.auto_vacuum_dead_rows;
+    if threshold != 0 && components.dead_rows_since_vacuum.load(Ordering::Acquire) >= threshold {
+        let horizon = components.gc_horizon();
+        crate::query::vacuum_all_user_tables(components, horizon)?;
+        // Reset the accumulator: churn from here on counts toward the next auto-prune.
+        components
+            .dead_rows_since_vacuum
+            .store(0, Ordering::Release);
+    }
+
     // The WAL must be durable before any page it describes is written to the heap.
     // With the relaxed flush gate (`docs/specs/mvcc.md` §8, Milestone D1) this
     // spills ALL WAL-durable dirty pages — committed, aborted, and (under Stage-2)

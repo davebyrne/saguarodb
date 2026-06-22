@@ -28,6 +28,16 @@ pub struct ServerComponents {
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,
     pub next_txn_id: AtomicU64,
+    /// Dead MVCC versions produced by committed statements since the last
+    /// auto-prune (`docs/specs/mvcc.md` §9, Milestone F4b). Each committed `DELETE`
+    /// row and each committed `UPDATE` row creates one dead version; this counts
+    /// those (incremented only on a successful commit, never on abort). When a
+    /// checkpoint runs and this reaches `config.auto_vacuum_dead_rows`, the
+    /// checkpoint vacuums every user table under its exclusive guard and resets this
+    /// to 0. A purely additive proxy: it never needs a scan to decide whether to
+    /// prune, and over-counting (e.g. a version a live snapshot still pins, so it is
+    /// not yet reclaimable) only triggers an extra, harmless pass.
+    pub dead_rows_since_vacuum: AtomicU64,
     /// In-progress transaction ids. The CLOG (in the WAL manager) records settled
     /// outcomes; this registry tracks which transactions are still running, for
     /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
@@ -81,6 +91,18 @@ impl ServerComponents {
         self.active_txns
             .oldest_xmin()
             .unwrap_or_else(|| self.next_txn_id.load(Ordering::Acquire))
+    }
+
+    /// Add `count` dead MVCC versions to the auto-prune accumulator
+    /// (`dead_rows_since_vacuum`, `docs/specs/mvcc.md` §9, Milestone F4b). Called by
+    /// the commit paths only on a successful, durable commit (an aborted statement
+    /// never reaches the call), so the counter reflects committed dead versions. A
+    /// zero `count` is a cheap no-op.
+    pub fn add_dead_versions(&self, count: u64) {
+        if count != 0 {
+            self.dead_rows_since_vacuum
+                .fetch_add(count, Ordering::Relaxed);
+        }
     }
 }
 

@@ -41,6 +41,59 @@ impl TestServer {
         Self::start_inner(path, None).await
     }
 
+    /// Start with a caller-supplied [`Config`] (port is forced to an ephemeral one),
+    /// for tests that need a specific checkpoint cadence or auto-vacuum threshold. If
+    /// the config still carries the default `./data` dir a fresh temp dir is created
+    /// and owned by the returned server; a caller-set `data_dir` is used as-is (so a
+    /// restart test can reopen the same directory).
+    pub async fn start_with_config(mut config: Config) -> Result<Self> {
+        config.port = 0;
+        if config.data_dir == Config::default().data_dir {
+            let temp_dir = tempfile::tempdir().map_err(|err| {
+                common::DbError::io(format!("failed to create test data directory: {err}"))
+            })?;
+            config.data_dir = temp_dir.path().to_path_buf();
+            Self::start_inner_with_config(config, Some(temp_dir)).await
+        } else {
+            Self::start_inner_with_config(config, None).await
+        }
+    }
+
+    /// The number of completed checkpoints (observability).
+    pub fn checkpoint_count(&self) -> usize {
+        self.app
+            .components
+            .checkpoint
+            .checkpoints
+            .load(std::sync::atomic::Ordering::Acquire) as usize
+    }
+
+    /// The current dead-versions-since-last-auto-prune accumulator (Milestone F4b).
+    pub fn dead_rows_since_vacuum(&self) -> u64 {
+        self.app
+            .components
+            .dead_rows_since_vacuum
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The full-extent heap page count for a table (resident + evicted pages), used
+    /// to assert space stays bounded under churn. Resolves the table's heap
+    /// `FileId` (== its `TableId`) from the catalog.
+    pub fn heap_page_count(&self, table: &str) -> u32 {
+        let schema = self
+            .app
+            .components
+            .catalog
+            .get_table_by_name(table)
+            .expect("catalog lookup")
+            .expect("table exists");
+        self.app
+            .components
+            .buffer_pool
+            .page_count(schema.id)
+            .expect("page count")
+    }
+
     pub async fn simple_query(&self, sql: &str) -> Result<SimpleQueryResult> {
         let mut stream = TcpStream::connect(self.addr).await.map_err(|err| {
             common::DbError::io(format!("failed to connect to test server: {err}"))
@@ -97,6 +150,10 @@ impl TestServer {
             shutdown_timeout_ms: 1_000,
             ..Config::default()
         };
+        Self::start_inner_with_config(config, temp_dir).await
+    }
+
+    async fn start_inner_with_config(config: Config, temp_dir: Option<TempDir>) -> Result<Self> {
         let app = Arc::new(open_app(config)?);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

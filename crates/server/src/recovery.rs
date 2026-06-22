@@ -134,6 +134,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         },
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
+        dead_rows_since_vacuum: AtomicU64::new(0),
         active_txns: crate::registry::ActiveTxnRegistry::new(),
         tls,
         cancel_registry: crate::cancel::CancelRegistry::new(),

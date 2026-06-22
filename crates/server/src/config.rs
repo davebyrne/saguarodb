@@ -8,6 +8,12 @@ pub struct Config {
     pub buffer_pool_frames: usize,
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
+    /// Auto-prune threshold: when a checkpoint runs and at least this many dead
+    /// versions have accumulated since the last auto-prune, the checkpoint runs a
+    /// VACUUM pass over every user table under its exclusive guard before flushing
+    /// dirty pages (`docs/specs/mvcc.md` §9, Milestone F4b). `0` disables
+    /// auto-prune entirely (space is then bounded only by explicit `VACUUM`).
+    pub auto_vacuum_dead_rows: u64,
     pub shutdown_timeout_ms: u64,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
@@ -21,6 +27,7 @@ impl Default for Config {
             buffer_pool_frames: 1024,
             checkpoint_every_n_commits: 100,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
+            auto_vacuum_dead_rows: 10000,
             shutdown_timeout_ms: 30000,
             tls_cert_file: None,
             tls_key_file: None,
@@ -86,6 +93,11 @@ where
                 let value = next_value(&mut args, "--checkpoint-wal-bytes")?;
                 config.checkpoint_wal_bytes = parse_positive_u64(&value, "--checkpoint-wal-bytes")?;
             }
+            "--auto-vacuum-dead-rows" => {
+                // 0 is allowed and disables auto-prune (see Config::auto_vacuum_dead_rows).
+                let value = next_value(&mut args, "--auto-vacuum-dead-rows")?;
+                config.auto_vacuum_dead_rows = parse_u64(&value, "--auto-vacuum-dead-rows")?;
+            }
             "--shutdown-timeout-ms" => {
                 let value = next_value(&mut args, "--shutdown-timeout-ms")?;
                 config.shutdown_timeout_ms = parse_positive_u64(&value, "--shutdown-timeout-ms")?;
@@ -117,6 +129,7 @@ pub fn usage(program: &str) -> String {
            --buffer-pool-frames <N>           default 1024\n\
            --checkpoint-every-n-commits <N>   default 100\n\
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
+           --auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
            --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)\n\
            --tls-key-file <PATH>              PEM private key; enables TLS (needs --tls-cert-file)\n\
@@ -151,6 +164,14 @@ fn parse_positive_u64(value: &str, flag: &str) -> Result<u64, String> {
     Ok(parsed)
 }
 
+/// Parse a `u64` allowing `0` (used by flags where 0 is a meaningful "disabled"
+/// value, e.g. `--auto-vacuum-dead-rows`).
+fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid value for {flag}: {value}"))
+}
+
 fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -176,6 +197,7 @@ mod tests {
         assert_eq!(config.buffer_pool_frames, 1024);
         assert_eq!(config.checkpoint_every_n_commits, 100);
         assert_eq!(config.checkpoint_wal_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.auto_vacuum_dead_rows, 10000);
         assert_eq!(config.shutdown_timeout_ms, 30000);
         assert_eq!(config.tls_cert_file, None);
         assert_eq!(config.tls_key_file, None);
@@ -229,6 +251,8 @@ mod tests {
             "5",
             "--checkpoint-wal-bytes",
             "4096",
+            "--auto-vacuum-dead-rows",
+            "250",
             "--shutdown-timeout-ms",
             "99",
         ])
@@ -242,7 +266,17 @@ mod tests {
         assert_eq!(config.buffer_pool_frames, 32);
         assert_eq!(config.checkpoint_every_n_commits, 5);
         assert_eq!(config.checkpoint_wal_bytes, 4096);
+        assert_eq!(config.auto_vacuum_dead_rows, 250);
         assert_eq!(config.shutdown_timeout_ms, 99);
+    }
+
+    #[test]
+    fn auto_vacuum_dead_rows_accepts_zero_to_disable() {
+        let parsed = parse_args(["saguarodb", "--auto-vacuum-dead-rows", "0"]).unwrap();
+        let ConfigAction::Run(config) = parsed else {
+            panic!("expected runnable config");
+        };
+        assert_eq!(config.auto_vacuum_dead_rows, 0);
     }
 
     #[test]

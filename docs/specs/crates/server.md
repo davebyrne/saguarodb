@@ -61,6 +61,7 @@ Binary CLI flags:
 - `--buffer-pool-frames <N>` sets `Config.buffer_pool_frames`; default `1024`.
 - `--checkpoint-every-n-commits <N>` sets `Config.checkpoint_every_n_commits`; default `100`.
 - `--checkpoint-wal-bytes <BYTES>` sets `Config.checkpoint_wal_bytes`; default `67108864`.
+- `--auto-vacuum-dead-rows <N>` sets `Config.auto_vacuum_dead_rows`; default `10000`. When at least this many committed dead versions have accumulated since the last auto-prune, the next checkpoint folds a VACUUM pass over every user table into itself (Milestone F4b, `mvcc.md` §9). `0` disables auto-prune (space is then bounded only by explicit `VACUUM`); unlike the other numeric flags, `0` is accepted here.
 - `--shutdown-timeout-ms <MS>` sets `Config.shutdown_timeout_ms`; default `30000`.
 - `--tls-cert-file <PATH>` sets `Config.tls_cert_file`; PEM certificate chain. Optional; defaults to disabled.
 - `--tls-key-file <PATH>` sets `Config.tls_key_file`; PEM private key. Optional; defaults to disabled.
@@ -273,6 +274,7 @@ server under the **exclusive checkpoint guard** (E2b), which drains all in-fligh
 shared writers and runs alone:
 
 1. Acquire the exclusive checkpoint guard (`begin_checkpoint`) — waits for all in-flight writers to drain, then holds off any new writer until the checkpoint returns.
+1a. **Auto-prune (Milestone F4b, `mvcc.md` §9).** If `config.auto_vacuum_dead_rows` is non-zero and `dead_rows_since_vacuum >= config.auto_vacuum_dead_rows`, capture `horizon = gc_horizon()` **under the guard just acquired** and run `engine.vacuum(schema, horizon)` over every user table (the same F4a orchestration the on-demand `VACUUM` uses), then reset `dead_rows_since_vacuum` to `0`. This runs at the very start of the checkpoint body, **before** `flush_dirty_pages` (3), so the pages the vacuum dirties and the `FullPageImage` records it logs are flushed and made durable by **this** checkpoint and their WAL records precede the truncation in (7). Skipped (no vacuum) when the count is below the threshold. **No data loss — identical safety to on-demand `VACUUM`:** the horizon is captured under the exclusive guard, so no writer runs and the horizon is the minimum `xmin` advertised by any live snapshot (including lock-free readers); every reclaimed version has `xmax < horizon`, so no live snapshot can see it. Recovery is unaffected: the vacuum's FPIs sit below `checkpoint_lsn` and their pages are flushed before the control record, so a crash before the control record simply replays the previous redo boundary (the vacuum did not happen); the conservative-truncation invariant is unchanged (F4c relaxes it later).
 2. `wal.flush()` (a page's redo must be durable before the page is written).
 3. `buffer_pool.flush_dirty_pages()` — write every flushable dirty page to the heap `PageStore`. With the relaxed flush gate (Milestone D1, `mvcc.md` §8) this spills committed, aborted, and — under Stage 2 — in-flight dirty pages alike; all are WAL-durable after (2), and the CLOG hides the non-committed tuples.
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
@@ -298,6 +300,8 @@ pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Resu
 ```
 
 `run_checkpoint` resets `last_checkpoint_lsn` to the checkpoint LSN and `commits_since_checkpoint` to `0` after the control record and WAL checkpoint marker are durable. `record_commit_and_maybe_checkpoint` is called after each successful write statement, after the statement write guard has been dropped. It increments `commits_since_checkpoint` and triggers `run_checkpoint` when either `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. If checkpoint fails, leave the counters unchanged except for the recorded commit so a later write can retry.
+
+**Auto-prune threshold metric (F4b).** `ServerComponents.dead_rows_since_vacuum: AtomicU64` tracks committed dead versions since the last auto-prune. Each committed `DELETE` row and each committed `UPDATE` row creates one dead version, so the commit paths add the affected-row count from a `DELETE`/`UPDATE` result to this counter **only on a successful, durable commit** (`ServerComponents::add_dead_versions`): the autocommit-write path adds it before `record_commit_and_maybe_checkpoint`; an explicit transaction accumulates each statement's count on the `Transaction` and folds the total in on `COMMIT` (never on `ROLLBACK`/abort — a rolled-back delete/update produces no committed dead version). The counter is purely additive and never requires a scan to decide whether to prune; over-counting (e.g. a version a live snapshot still pins, so not yet reclaimable) only triggers an extra, harmless pass. The checkpoint reads and resets it in step (1a) above.
 
 ## Connection Handling
 

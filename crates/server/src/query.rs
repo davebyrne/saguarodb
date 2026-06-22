@@ -66,6 +66,13 @@ pub struct Transaction {
     /// commit/abort. Under Read Committed each statement captures and drops its own
     /// short-lived advertisement, so this stays `None`.
     rr_advertised: Option<AdvertisedSnapshot>,
+    /// Dead MVCC versions this transaction's statements have produced so far
+    /// (`docs/specs/mvcc.md` §9, Milestone F4b). Accumulated per write statement, but
+    /// folded into the server-wide auto-prune counter ONLY on a durable COMMIT — on
+    /// ROLLBACK the transaction's own new versions are the ones that become dead (the
+    /// old versions it superseded stay live), so a rolled-back DELETE/UPDATE produces
+    /// no committed dead version and this is discarded.
+    dead_versions_pending: u64,
 }
 
 impl Transaction {
@@ -421,6 +428,7 @@ impl QueryService {
             write_guard: None,
             rr_snapshot: None,
             rr_advertised: None,
+            dead_versions_pending: 0,
         })
     }
 
@@ -515,7 +523,17 @@ impl QueryService {
         drop(ctx);
         drop(advertised);
         match result {
-            Ok(result) => (Some(txn), Ok(result)),
+            Ok(result) => {
+                // Accumulate this statement's dead-version count on the transaction
+                // (`docs/specs/mvcc.md` §9, F4b). It is folded into the server-wide
+                // auto-prune counter only when the transaction COMMITS durably; on
+                // ROLLBACK it is discarded (the dead versions then belong to this
+                // transaction's own aborted writes, not to committed deletes/updates).
+                txn.dead_versions_pending = txn
+                    .dead_versions_pending
+                    .saturating_add(dead_versions_in(&result));
+                (Some(txn), Ok(result))
+            }
             Err(err) => {
                 // Any statement error poisons the transaction: it enters 'E' and
                 // must be ended with COMMIT/ROLLBACK. No partial-statement undo is
@@ -669,6 +687,13 @@ impl QueryService {
         self.components.active_txns.deregister(txn_id);
         drop(guard);
 
+        // Account this committed statement's dead versions toward the auto-prune
+        // threshold BEFORE the checkpoint trigger, so a checkpoint fired by this same
+        // commit observes the updated count (`docs/specs/mvcc.md` §9, F4b). Only a
+        // durable commit reaches here; an aborted statement returned above without
+        // counting.
+        self.components.add_dead_versions(dead_versions_in(&result));
+
         if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
             eprintln!("checkpoint failed after committed statement: {err}");
         }
@@ -742,9 +767,10 @@ impl QueryService {
             None => self.components.catalog.list_tables()?,
         };
 
-        for schema in &targets {
-            self.components.storage.vacuum(schema, horizon)?;
-        }
+        // Run F4a's three-phase orchestration (`engine.vacuum`) over each target. The
+        // checkpoint auto-prune path reuses the same helper (`vacuum_tables`) under its
+        // own exclusive guard, so the reclamation logic lives in exactly one place.
+        vacuum_tables(&self.components, &targets, horizon)?;
 
         Ok(ExecutionResult::Modified {
             command: "VACUUM".to_string(),
@@ -758,6 +784,7 @@ impl QueryService {
     /// this returns.
     fn commit_transaction(&self, txn: Transaction) -> Result<()> {
         let txn_id = txn.txn_id;
+        let dead_versions = txn.dead_versions_pending;
         // A read-only explicit transaction (no write guard, no writes) has nothing
         // durable to commit: just deregister and return. Appending a `Commit` for
         // it is harmless but unnecessary; skip it so a pure-reader transaction
@@ -784,6 +811,11 @@ impl QueryService {
         self.components.active_txns.deregister(txn_id);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
+
+        // Fold the committed transaction's dead versions into the auto-prune counter
+        // BEFORE the checkpoint trigger (`docs/specs/mvcc.md` §9, F4b): only a durable
+        // commit reaches here, so an aborted transaction never advances the counter.
+        self.components.add_dead_versions(dead_versions);
 
         if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
             eprintln!("checkpoint failed after committed transaction: {err}");
@@ -1069,6 +1101,58 @@ fn run_plan(
         Ok(result) => result,
         Err(_) => Err(DbError::internal("statement execution panicked")),
     }
+}
+
+/// The number of dead MVCC versions a statement's result implies, for the
+/// auto-prune threshold (`docs/specs/mvcc.md` §9, Milestone F4b). Each committed
+/// `DELETE` row leaves a dead version (the committed-deleted tuple) and each
+/// committed `UPDATE` row leaves a dead version (the superseded old tuple); both
+/// carry their affected-row count in the `Modified` command tag the executor
+/// already produces. `INSERT`, DDL, and read/explain results imply no dead version.
+/// Counted only on a successful commit by the callers.
+fn dead_versions_in(result: &ExecutionResult) -> u64 {
+    match result {
+        ExecutionResult::Modified { command, count }
+            if command == "DELETE" || command == "UPDATE" =>
+        {
+            *count
+        }
+        _ => 0,
+    }
+}
+
+/// Vacuum each `table` with F4a's three-phase orchestration
+/// ([`PageBackedStorageEngine::vacuum`]: heap-prune → index-vacuum →
+/// line-pointer-reclaim), reclaiming versions dead to `horizon`. Shared by the
+/// on-demand `VACUUM` command and the checkpoint auto-prune so the reclamation logic
+/// is defined once (`docs/specs/mvcc.md` §9/§10 F4a/F4b).
+///
+/// **Caller contract (the no-data-loss safety):** the caller MUST already hold the
+/// EXCLUSIVE checkpoint guard ([`ConcurrencyController::begin_checkpoint`]) and MUST
+/// have captured `horizon` from [`ServerComponents::gc_horizon`] *after* acquiring
+/// that guard. Under the guard no writer runs, and the horizon is the minimum `xmin`
+/// advertised by any live snapshot (including lock-free readers), so every reclaimed
+/// version (`xmax < horizon`) is one no live snapshot can see — identical safety to
+/// the on-demand `VACUUM` (F4a). This helper does not take the guard or capture the
+/// horizon itself, precisely so it cannot be misused to vacuum with an
+/// outside-the-guard horizon.
+fn vacuum_tables(
+    components: &ServerComponents,
+    tables: &[common::TableSchema],
+    horizon: u64,
+) -> Result<()> {
+    for schema in tables {
+        components.storage.vacuum(schema, horizon)?;
+    }
+    Ok(())
+}
+
+/// Vacuum every user table in the catalog, for the checkpoint auto-prune path (F4b).
+/// Same caller contract as [`vacuum_tables`]: the exclusive guard is held and
+/// `horizon` was captured under it.
+pub(crate) fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
+    let tables = components.catalog.list_tables()?;
+    vacuum_tables(components, &tables, horizon)
 }
 
 /// Poison an open transaction's slot to the failed state on a statement error
