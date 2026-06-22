@@ -261,9 +261,10 @@ version carries the same PK as the old. The flow is ordered for correct uniquene
    would find only the superseded old version's entry. Skipping unchanged-column
    indexes is a HOT optimization (Milestone H) and would be a correctness bug here.
    Unique indexes (PK and unique secondary) run the visibility-aware
-   `unique_conflict_exists` check: a value unchanged from the old version does not
+   `unique_conflict_kind` check: a value unchanged from the old version does not
    self-conflict (the old version is own-deleted), but a value colliding with a
-   *different* live row raises `UniqueViolation`.
+   *different* live row raises `UniqueViolation` (or `SerializationFailure` if that
+   row is held only by an in-progress inserter — §7.3, E1c).
 5. **Retain all old entries.** No old index entry — PK or secondary — is removed.
 
 After a committed `UPDATE`, both versions coexist in the heap: the old version
@@ -394,21 +395,37 @@ one `RowLocation` per key (single version).
 
 **Primary-key uniqueness (visibility/CLOG-aware liveness check).** Because the tree
 no longer rejects duplicate keys, the engine `insert` enforces uniqueness with a
-shared visibility-aware check (`unique_conflict_exists`): it `scan_key(pk)`s the
+shared visibility-aware check (`unique_conflict_kind`): it `scan_key(pk)`s the
 primary-key index and, for each candidate TID, reads the *physical* tuple header
-and asks whether that version is **alive or potentially-alive**
-(`common::version_conflicts`). It returns `SqlState::UniqueViolation` only when
-such a conflicting version exists. The decision is a **liveness ("dirty") check,
-not a snapshot read**: it consults the CLOG (`TxnStatusView`) plus the tuple's
-`infomask` hint bits — never a `Snapshot` — so it sees concurrently in-flight and
-already-committed state. A candidate is *definitively dead and ignored* iff its
-creator is aborted, or it is committed-deleted (`xmax` committed, or
-`xmax == current_txn` deleted-by-me); any other version (committed-live,
-in-progress creator, aborted/in-progress delete) conflicts. A DEAD/UNUSED line
+and classifies that version (`common::classify_unique_conflict` →
+`UniqueConflict`). The decision is a **liveness ("dirty") check, not a snapshot
+read**: it consults the CLOG (`TxnStatusView`) plus the tuple's `infomask` hint
+bits — never a `Snapshot` — so it sees concurrently in-flight and already-committed
+state. The three-way classification (Milestone E1c, `mvcc.md` §7.3):
+
+- **`None` (dead, ignored)** — the creator is aborted, or the version is
+  committed-deleted (`xmax` committed, or `xmax == current_txn` deleted-by-me, e.g.
+  an UPDATE's own superseded old version). It does not occupy the key.
+- **`Violation` ⇒ `SqlState::UniqueViolation` (`23505`)** — the version is alive
+  *and* a definite duplicate: its creator is committed, is `current_txn` itself (a
+  live version I already hold), or is frozen/reserved.
+- **`InFlight` ⇒ `SqlState::SerializationFailure` (`40001`)** — the version is
+  alive but only *potentially* a duplicate: its creator is **another in-progress
+  transaction** that has not committed and may yet abort. Under the fail-fast
+  first-updater-wins policy (§7.3) uniqueness is undecidable, so the inserter fails
+  fast for the client to retry rather than blocking; if the other inserter aborts,
+  the retry succeeds.
+
+`unique_conflict_kind` returns the **strongest** conflict across all candidates
+(precedence `Violation > InFlight > None`): a single committed-live duplicate is a
+definite `23505` even if another candidate is only in-flight. A DEAD/UNUSED line
 pointer contributes no conflict. This replaces the earlier temporary
-presence-probe; while the engine is single-version it rejects exactly the same
-inputs, and once versioning (Milestone B4) stamps `xmax`/writes aborted versions a
-dead version with the same key no longer blocks a re-insert.
+presence-probe; **under serialized writers (Stage 1) no concurrent uncommitted
+inserter exists, so the `InFlight` arm never fires at runtime and the check rejects
+exactly the same inputs with `23505` as before** — it becomes load-bearing once
+writers run concurrently (Milestone E2b). Once versioning (Milestone B4) stamps
+`xmax`/writes aborted versions, a dead version with the same key no longer blocks a
+re-insert.
 
 The B-tree is generic over its leaf value type, but every index — primary-key and
 secondary — now stores a fixed-width `RowLocation` (heap TID), so all indexes are
@@ -434,15 +451,19 @@ used for a secondary index.
   disambiguated by the trailing heap TID in the tree's `(key, tid)` ordering. A
   unique secondary index enforces uniqueness through the **same shared
   visibility/CLOG-aware liveness check** the primary-key index uses
-  (`unique_conflict_exists` / `common::version_conflicts`): it conflicts only with
-  an alive-or-potentially-alive version of the key, ignoring dead (creator-aborted)
-  and committed-deleted versions, and returns `SqlState::UniqueViolation` when the
-  indexed value is non-NULL and such a version exists. The check is **skipped for a
-  NULL indexed value**: SQL treats NULLs as distinct, so NULL never participates in
-  a unique constraint, and distinct NULL rows coexist naturally via their differing
-  heap TIDs. This replaces the earlier temporary presence-probe; single-version
-  behavior is unchanged, and it becomes load-bearing once versioning (Milestone B4)
-  lands.
+  (`unique_conflict_kind` / `common::classify_unique_conflict`): it conflicts only
+  with an alive-or-potentially-alive version of the key, ignoring dead
+  (creator-aborted) and committed-deleted versions. For a non-NULL indexed value it
+  returns `SqlState::UniqueViolation` (`23505`) when a committed/own/frozen-live
+  duplicate exists, and `SqlState::SerializationFailure` (`40001`, retry — §7.3,
+  Milestone E1c) when the only conflicting version was created by another
+  in-progress transaction (undecidable). The check is **skipped for a NULL indexed
+  value**: SQL treats NULLs as distinct, so NULL never participates in a unique
+  constraint (neither `23505` nor `40001`), and distinct NULL rows coexist naturally
+  via their differing heap TIDs. This replaces the earlier temporary presence-probe;
+  under serialized writers the `40001` arm never fires and single-version behavior
+  is unchanged — it becomes load-bearing once writers run concurrently (Milestone
+  E2b).
 - **Lookup / range.** `index_scan(table, index, range)` constrains the leading
   indexed columns; the range bounds hold exactly those columns, and comparison
   ignores each stored key's trailing TID tiebreaker (the leaf value). An equality
@@ -455,7 +476,9 @@ used for a secondary index.
   (VACUUM reclaims them; see MVCC Delete). `update` removes the old entries and
   inserts the new ones (all removals before any insertion, so an unchanged unique
   value is not seen as a duplicate). A unique-index conflict during `insert` or
-  `update` returns `SqlState::UniqueViolation`.
+  `update` returns `SqlState::UniqueViolation` for a committed-live duplicate, or
+  `SqlState::SerializationFailure` (`40001`) when the key is held only by another
+  in-progress inserter (Milestone E1c, §7.3).
 - **Create / drop.** `create_index` registers the index, builds an empty tree,
   and backfills it by scanning the live rows through the primary-key index
   (a duplicate value for a unique index fails the build with `UniqueViolation`).
@@ -549,8 +572,9 @@ impl PageBackedStorageEngine {
 
 ## Error Handling
 
-- Duplicate primary key: `SqlState::UniqueViolation`.
-- Duplicate value in a unique secondary index (insert, update, or backfill): `SqlState::UniqueViolation`.
+- Duplicate primary key (committed-live duplicate): `SqlState::UniqueViolation`.
+- Duplicate value in a unique secondary index (insert, update, or backfill, committed-live duplicate): `SqlState::UniqueViolation`.
+- Unique key (primary or secondary) held only by another in-progress inserter — undecidable: `SqlState::SerializationFailure` (`40001`, retry — §7.3, Milestone E1c).
 - Update that changes the primary key: `SqlState::DatatypeMismatch` (primary-key updates are not supported).
 - `index_scan` on a dropped or unknown index: `SqlState::UndefinedTable`.
 - Missing update/delete key: return `Ok(false)`.

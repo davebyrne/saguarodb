@@ -411,9 +411,29 @@ the row lock is an actual-status check, not a snapshot-relative read. It is a
 sibling of `version_conflicts`, not a duplicate: `version_conflicts` answers "is
 *some* version with this key alive?" (uniqueness, keyed on a candidate's creator);
 `write_conflict` answers "may I lock *this* version, or did another txn beat me to
-its `xmax`?" (first-updater-wins, keyed on the candidate's deleter). Concurrent
-inserts of the same unique key are resolved by the same fail-fast policy on the
-conflicting index entry's tuple.
+its `xmax`?" (first-updater-wins, keyed on the candidate's deleter).
+
+Concurrent inserts of the same unique key are resolved by the **same status check**
+(Milestone E1c). The uniqueness classifier `common::mvcc::classify_unique_conflict(
+xmin, xmax, infomask, current_txn, status) -> UniqueConflict`
+(`None`/`Violation`/`InFlight`) refines the boolean `version_conflicts` (which is
+just `classify != None`) by distinguishing, for an alive candidate, whether its
+creator is settled or in-flight:
+
+- **`None`** — the candidate is dead (creator aborted, or committed-deleted /
+  deleted-by-me): no conflict.
+- **`Violation`** — alive *and* a definite duplicate (creator committed, is
+  `current_txn` itself, or frozen/reserved) ⇒ `SqlState::UniqueViolation` (`23505`).
+- **`InFlight`** — alive but its creator is **another in-progress transaction** that
+  may yet abort, so uniqueness is undecidable ⇒ fail fast with
+  `SqlState::SerializationFailure` (`40001`, retry) rather than blocking — the same
+  first-updater-wins policy as `write_conflict`.
+
+The engine (`unique_conflict_kind`) returns the strongest conflict across the key's
+candidates (precedence `Violation > InFlight > None`). Under serialized writers
+(Stage 1) no concurrent uncommitted inserter exists, so the `InFlight` arm never
+fires at runtime and a duplicate key still raises `23505` exactly as before; it
+becomes load-bearing once writers run concurrently (E2b).
 
 ---
 
@@ -879,7 +899,7 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
    - *Uniqueness:* the new version must not conflict with the old version it
      supersedes but must conflict with other live rows. Stamping the old version's
      `xmax = txn` *before* the new entries' uniqueness checks makes the MVCC
-     `unique_conflict_exists` treat it as own-deleted (non-conflicting); a changed
+     `unique_conflict_kind` treat it as own-deleted (non-conflicting); a changed
      unique secondary value colliding with a different live row raises
      `UniqueViolation` (the statement error → txn abort → before-image undo restores
      everything).

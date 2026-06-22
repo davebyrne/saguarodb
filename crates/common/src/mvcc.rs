@@ -197,20 +197,105 @@ pub fn version_conflicts(
     current_txn: TxnId,
     status: &dyn TxnStatusView,
 ) -> bool {
+    classify_unique_conflict(xmin, xmax, infomask, current_txn, status) != UniqueConflict::None
+}
+
+/// The three-way outcome of the concurrent-inserter uniqueness check of
+/// `docs/specs/mvcc.md` §7.3 ("concurrent inserts of the same unique key are
+/// resolved by the same status check"). It refines the boolean
+/// [`version_conflicts`] by distinguishing a *definite* duplicate from one that is
+/// only *potentially* a duplicate because the conflicting version's creator is
+/// another still-running transaction that may yet abort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniqueConflict {
+    /// The candidate version is **dead** (its creator aborted, or it is
+    /// committed-deleted / deleted-by-me) ⇒ it does not occupy the key. The
+    /// inserter may proceed.
+    None,
+    /// The candidate version is **alive and definitely a duplicate**: its creator
+    /// is committed, is `current_txn` itself (I already hold this key), or is
+    /// frozen/reserved. The inserter must fail with a
+    /// [`SqlState::UniqueViolation`](crate::SqlState::UniqueViolation) (`23505`).
+    Violation,
+    /// The candidate version is **alive but only potentially a duplicate**: its
+    /// creator is **another in-progress transaction** (not me, not committed) that
+    /// has not yet committed or aborted. Under the fail-fast first-updater-wins
+    /// policy the inserter cannot determine uniqueness, so it fails with
+    /// [`SqlState::SerializationFailure`](crate::SqlState::SerializationFailure)
+    /// (`40001`, "retry") rather than blocking — should that creator abort, the
+    /// retry would succeed.
+    InFlight,
+}
+
+/// The three-way **concurrent-inserter uniqueness** classifier of
+/// `docs/specs/mvcc.md` §7.3. Given a candidate index version with creator `xmin`
+/// and deleter `xmax`, decide whether it blocks `current_txn` claiming the same
+/// unique key, and if so whether the conflict is **definite** ([`UniqueConflict::Violation`])
+/// or **in-flight** ([`UniqueConflict::InFlight`]).
+///
+/// This builds on the liveness logic of [`version_conflicts`] (the same "dirty",
+/// non-snapshot CLOG + hint-bit check; do not route it through [`is_visible`]) and
+/// then, for an alive candidate, classifies its creator:
+///
+/// - **Dead ⇒ [`UniqueConflict::None`]:** the creator aborted (`XMIN_ABORTED`, or
+///   `status(xmin) == Aborted`), **or** the version is committed-deleted —
+///   `xmax` is set and either the delete is by me (`xmax == current_txn`, e.g. an
+///   UPDATE's own superseded old version, so an UPDATE does not false-conflict on
+///   the row it supersedes), the deleter committed (`XMAX_COMMITTED`, or
+///   `status(xmax) == Committed`). The candidate does not occupy the key.
+/// - **Alive, creator settled-as-mine-or-committed ⇒ [`UniqueConflict::Violation`]:**
+///   the creator is `current_txn` (a live version I created myself still occupies
+///   the key — a real duplicate within my own txn), or it is committed
+///   (`XMIN_COMMITTED`, or `status(xmin) == Committed`, which the reserved/frozen
+///   `< FIRST_NORMAL_XID ⇒ Committed` rule also covers). Definitely a duplicate.
+/// - **Alive, creator is another in-progress txn ⇒ [`UniqueConflict::InFlight`]:**
+///   the creator is neither me nor committed (`status(xmin) == InProgress`). It may
+///   yet abort, so we cannot call it a definite duplicate; fail fast with `40001`.
+///
+/// **Hint bits** short-circuit the CLOG probe exactly as in [`version_conflicts`]:
+/// `XMIN_ABORTED` settles a dead creator, `XMIN_COMMITTED` settles a `Violation`
+/// creator, and the `XMAX_*` bits settle the committed-deleted check — all without
+/// calling [`TxnStatusView::status`].
+pub fn classify_unique_conflict(
+    xmin: TxnId,
+    xmax: TxnId,
+    infomask: u16,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> UniqueConflict {
+    // Resolve the creator's settled status once (hint bits short-circuit the CLOG
+    // probe; my own write is always treated as committed-to-me). `current_txn`
+    // takes precedence so PanicStatus is never consulted for an own write.
+    let creator = if xmin == current_txn || infomask & XMIN_COMMITTED != 0 {
+        TxnStatus::Committed
+    } else if infomask & XMIN_ABORTED != 0 {
+        TxnStatus::Aborted
+    } else {
+        status.status(xmin)
+    };
+
     // Creator aborted ⇒ the version is definitively dead; never conflicts.
-    if infomask & XMIN_ABORTED != 0 || status.status(xmin) == TxnStatus::Aborted {
-        return false;
+    if creator == TxnStatus::Aborted {
+        return UniqueConflict::None;
     }
-    // Committed-deleted (including deleted-by-me) ⇒ the row is gone; no conflict.
+    // Committed-deleted (including deleted-by-me, e.g. an UPDATE's superseded old
+    // version) ⇒ the row is gone; no conflict.
     if xmax != INVALID_XID
         && (xmax == current_txn
             || infomask & XMAX_COMMITTED != 0
             || status.status(xmax) == TxnStatus::Committed)
     {
-        return false;
+        return UniqueConflict::None;
     }
-    // Otherwise alive or potentially-alive ⇒ conflict.
-    true
+    // Alive: classify the creator. A committed creator (or my own live version, or
+    // reserved/frozen via the status rule) is a definite duplicate; only ANOTHER
+    // txn's still-running creator is in-flight — it may yet abort, so uniqueness is
+    // undecidable ⇒ retry (40001).
+    if creator == TxnStatus::Committed {
+        UniqueConflict::Violation
+    } else {
+        UniqueConflict::InFlight
+    }
 }
 
 /// The outcome of the write-write conflict check of `docs/specs/mvcc.md` §7.3:
@@ -387,9 +472,9 @@ mod tests {
     use crate::ids::{FIRST_NORMAL_XID, FROZEN_XID, INVALID_XID, TxnId};
 
     use super::{
-        IsolationLevel, Snapshot, TxnStatus, TxnStatusView, WriteConflict, XMAX_ABORTED,
-        XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, is_visible, version_conflicts,
-        write_conflict,
+        IsolationLevel, Snapshot, TxnStatus, TxnStatusView, UniqueConflict, WriteConflict,
+        XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,
+        is_visible, version_conflicts, write_conflict,
     };
 
     #[test]
@@ -782,6 +867,164 @@ mod tests {
         // snapshot argument to pass; this documents the contract.)
         let view = MockStatus::new(&[(50, TxnStatus::Committed)]);
         assert!(version_conflicts(50, INVALID_XID, 0, CURRENT_TXN, &view));
+    }
+
+    // --- classify_unique_conflict (3-way concurrent-inserter resolution, §7.3) ---
+    //
+    // The boolean `version_conflicts` is just `classify != None`; these tests pin
+    // the Violation-vs-InFlight split it cannot express. A creator that is committed
+    // / own / frozen is a definite duplicate (Violation ⇒ 23505); a creator that is
+    // ANOTHER still-running txn is undecidable (InFlight ⇒ 40001).
+
+    #[test]
+    fn classify_aborted_creator_is_none() {
+        // Creator aborted (CLOG) ⇒ dead ⇒ no conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Aborted)]);
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::None
+        );
+    }
+
+    #[test]
+    fn classify_aborted_creator_hint_is_none_without_probe() {
+        // XMIN_ABORTED hint ⇒ dead, no CLOG probe.
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, XMIN_ABORTED, CURRENT_TXN, &PanicStatus),
+            UniqueConflict::None
+        );
+    }
+
+    #[test]
+    fn classify_committed_deleted_is_none() {
+        // Committed creator, committed delete ⇒ the row is gone ⇒ no conflict.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::Committed)]);
+        assert_eq!(
+            classify_unique_conflict(7, 9, 0, CURRENT_TXN, &view),
+            UniqueConflict::None
+        );
+    }
+
+    #[test]
+    fn classify_own_deleted_old_version_is_none() {
+        // An UPDATE's superseded old version: created by me, deleted by me
+        // (xmax == current_txn) ⇒ own-deleted ⇒ dead ⇒ no false self-conflict.
+        // PanicStatus proves the own-write fast paths avoid the CLOG.
+        assert_eq!(
+            classify_unique_conflict(CURRENT_TXN, CURRENT_TXN, 0, CURRENT_TXN, &PanicStatus),
+            UniqueConflict::None
+        );
+    }
+
+    #[test]
+    fn classify_committed_live_is_violation() {
+        // Committed creator, no deleter ⇒ alive AND definitely a duplicate ⇒ 23505.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::Violation
+        );
+    }
+
+    #[test]
+    fn classify_own_alive_version_is_violation() {
+        // A live version I created myself (xmin == current_txn) still occupies the
+        // key ⇒ a real duplicate within my own txn ⇒ Violation, no CLOG probe.
+        assert_eq!(
+            classify_unique_conflict(CURRENT_TXN, INVALID_XID, 0, CURRENT_TXN, &PanicStatus),
+            UniqueConflict::Violation
+        );
+    }
+
+    #[test]
+    fn classify_frozen_creator_is_violation() {
+        // A frozen/reserved creator reads Committed via the status rule ⇒ a live
+        // pre-MVCC/frozen tuple is a definite duplicate.
+        let view = MockStatus::new(&[]);
+        assert_eq!(
+            classify_unique_conflict(FROZEN_XID, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::Violation
+        );
+        assert_eq!(
+            classify_unique_conflict(FIRST_NORMAL_XID - 1, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::Violation
+        );
+    }
+
+    #[test]
+    fn classify_committed_hint_is_violation_without_probe() {
+        // XMIN_COMMITTED hint ⇒ Violation without probing the creator.
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, XMIN_COMMITTED, CURRENT_TXN, &PanicStatus),
+            UniqueConflict::Violation
+        );
+    }
+
+    #[test]
+    fn classify_another_in_progress_creator_is_in_flight() {
+        // The key is held only by ANOTHER txn's still-running, uncommitted insert
+        // (creator in-progress, not me, not committed) ⇒ uniqueness undecidable ⇒
+        // 40001 (it may yet abort).
+        let view = MockStatus::new(&[(7, TxnStatus::InProgress)]);
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::InFlight
+        );
+    }
+
+    #[test]
+    fn classify_another_in_progress_creator_unrecorded_is_in_flight() {
+        // An unrecorded creator reads InProgress (the CLOG default) ⇒ InFlight.
+        let view = MockStatus::new(&[]);
+        assert_eq!(
+            classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
+            UniqueConflict::InFlight
+        );
+    }
+
+    #[test]
+    fn classify_in_progress_creator_with_aborted_delete_is_in_flight() {
+        // Another txn's in-progress creator whose (in-progress) delete aborted is
+        // still alive-but-undecidable ⇒ InFlight, not Violation. Guards against the
+        // aborted-delete branch reclassifying the creator.
+        let view = MockStatus::new(&[(7, TxnStatus::InProgress), (9, TxnStatus::Aborted)]);
+        assert_eq!(
+            classify_unique_conflict(7, 9, 0, CURRENT_TXN, &view),
+            UniqueConflict::InFlight
+        );
+    }
+
+    #[test]
+    fn classify_committed_creator_with_in_progress_delete_is_violation() {
+        // Committed creator whose delete is only in-progress (may roll back) is still
+        // alive ⇒ a definite duplicate of a committed version ⇒ Violation.
+        let view = MockStatus::new(&[(7, TxnStatus::Committed), (9, TxnStatus::InProgress)]);
+        assert_eq!(
+            classify_unique_conflict(7, 9, 0, CURRENT_TXN, &view),
+            UniqueConflict::Violation
+        );
+    }
+
+    #[test]
+    fn classify_matches_version_conflicts_boolean() {
+        // The boolean `version_conflicts` must agree with `classify != None` across
+        // the representative states (the documented relationship).
+        let view = MockStatus::new(&[
+            (7, TxnStatus::Committed),
+            (8, TxnStatus::InProgress),
+            (9, TxnStatus::Aborted),
+        ]);
+        for (xmin, xmax) in [
+            (7u64, INVALID_XID), // committed-live  -> Violation -> conflict
+            (8, INVALID_XID),    // in-progress     -> InFlight  -> conflict
+            (9, INVALID_XID),    // aborted creator -> None      -> no conflict
+            (7, 9),              // committed, aborted delete -> Violation -> conflict
+        ] {
+            let classified =
+                classify_unique_conflict(xmin, xmax, 0, CURRENT_TXN, &view) != UniqueConflict::None;
+            let boolean = version_conflicts(xmin, xmax, 0, CURRENT_TXN, &view);
+            assert_eq!(classified, boolean, "xmin={xmin} xmax={xmax}");
+        }
     }
 
     // --- write_conflict (write-write row-lock check, first-updater-wins) ---

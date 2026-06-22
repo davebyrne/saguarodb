@@ -20,6 +20,11 @@
   the `infomask` settled-status hint-bit constants `XMIN_COMMITTED`,
   `XMIN_ABORTED`, `XMAX_COMMITTED`, `XMAX_ABORTED` (the single source of truth for
   these bits; `storage`'s tuple codec re-uses them).
+- The pure write-conflict classifiers (see `docs/specs/mvcc.md` §7.3): the
+  uniqueness liveness check `version_conflicts` and its three-way refinement
+  `classify_unique_conflict -> UniqueConflict` (`None`/`Violation`/`InFlight`, which
+  splits a definite duplicate `23505` from an in-flight-other `40001`), and the
+  write-write row-lock check `write_conflict -> WriteConflict`.
 - Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`, `TxnStatusView`.
 
 ## Public Types
@@ -177,11 +182,16 @@ than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction blo
 The server raises it while gating an aborted transaction block (see
 `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7.2).
 
-`SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write-write conflict
-under MVCC's fail-fast, first-updater-wins policy. The losing writer aborts when it
-finds the target version's `xmax` row-lock already held by a committed or
-in-progress transaction (no blocking, no deadlock detection). The pure classifier
-is `common::mvcc::write_conflict` (see `docs/specs/mvcc.md` §7.3, Milestone E).
+`SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write conflict under
+MVCC's fail-fast, first-updater-wins policy. It arises in two cases (no blocking, no
+deadlock detection): a **write-write** conflict, when the losing UPDATE/DELETE finds
+the target version's `xmax` row-lock already held by a committed or in-progress
+transaction (classifier `common::mvcc::write_conflict`); and a **concurrent-inserter
+unique** conflict (Milestone E1c), when an INSERT finds the unique key held only by
+another in-progress inserter that may yet abort, so uniqueness is undecidable
+(classifier `common::mvcc::classify_unique_conflict` → `UniqueConflict::InFlight`).
+A committed-live duplicate is instead a definite `UniqueViolation` (`23505`). See
+`docs/specs/mvcc.md` §7.3, Milestone E.
 
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 

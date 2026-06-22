@@ -5,7 +5,8 @@ use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
     Result, Row, RowId, Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema,
-    TxnStatusView, Value, WriteConflict, is_visible, version_conflicts, write_conflict,
+    TxnStatusView, UniqueConflict, Value, WriteConflict, classify_unique_conflict, is_visible,
+    write_conflict,
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -244,11 +245,14 @@ impl PageBackedStorageEngine {
     /// for a unique index. The secondary key is the indexed column(s) alone (no pk
     /// tiebreaker); duplicate indexed values are disambiguated by the heap TID in
     /// `(key, tid)` order. A unique index rejects a duplicate non-NULL indexed value
-    /// via the shared visibility-aware [`Self::unique_conflict_exists`] check (it
+    /// via the shared visibility-aware [`Self::unique_conflict_kind`] check (it
     /// conflicts only with an alive-or-potentially-alive version; dead/aborted
-    /// versions are ignored). A NULL indexed value never participates in a unique
-    /// constraint (SQL treats NULLs as distinct), so the check is skipped when
-    /// `has_null`; distinct NULL rows coexist because their heap TIDs differ.
+    /// versions are ignored). A committed-live duplicate raises
+    /// [`SqlState::UniqueViolation`] (`23505`); a value held only by another
+    /// in-progress inserter raises [`SqlState::SerializationFailure`] (`40001`,
+    /// retry — §7.3). A NULL indexed value never participates in a unique constraint
+    /// (SQL treats NULLs as distinct), so the check is skipped when `has_null`;
+    /// distinct NULL rows coexist because their heap TIDs differ.
     fn insert_secondary_entry(
         &self,
         ctx: &StatementContext,
@@ -259,11 +263,12 @@ impl PageBackedStorageEngine {
         location: &RowLocation,
     ) -> Result<()> {
         let secondary = self.secondary_btree(index.id);
-        if index.unique
-            && !has_null
-            && self.unique_conflict_exists(&secondary, entry_key, table_schema, ctx.txn_id)?
-        {
-            return Err(duplicate_unique_index(&index.name));
+        if index.unique && !has_null {
+            match self.unique_conflict_kind(&secondary, entry_key, table_schema, ctx.txn_id)? {
+                UniqueConflict::Violation => return Err(duplicate_unique_index(&index.name)),
+                UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+                UniqueConflict::None => {}
+            }
         }
         secondary.insert(ctx.txn_id, entry_key, location)
     }
@@ -580,8 +585,9 @@ impl PageBackedStorageEngine {
     /// with a unique-constraint insert by `current_txn` — the shared,
     /// visibility-aware uniqueness check for the primary-key index and unique
     /// secondary indexes (`docs/specs/mvcc.md` §6/§7.3). It replaces the temporary
-    /// presence-probes (B2 commits 3–4): "any entry for the key" became "any
-    /// *alive-or-potentially-alive* version for the key".
+    /// presence-probes (B2 commits 3–4): "any entry for the key" became "the
+    /// strongest [`UniqueConflict`] across the *alive-or-potentially-alive* versions
+    /// for the key".
     ///
     /// This is a **liveness ("dirty") check, not a snapshot read**: it consults the
     /// CLOG (`TxnStatusView`) + the tuple's `infomask` hint bits — never a
@@ -591,21 +597,32 @@ impl PageBackedStorageEngine {
     /// [`Self::read_visible_row`], which would wrongly hide non-visible-but-alive
     /// versions); a DEAD/UNUSED line pointer (`read_row` ⇒ `None`) is a reclaimed
     /// slot and contributes no conflict. The per-candidate decision is
-    /// [`common::version_conflicts`]: a creator-aborted or committed-deleted (incl.
-    /// deleted-by-me) version is dead and ignored; anything else conflicts.
+    /// [`common::classify_unique_conflict`]: a creator-aborted or committed-deleted
+    /// (incl. deleted-by-me) version is [`UniqueConflict::None`] and ignored; a
+    /// committed/own/frozen-live version is a definite [`UniqueConflict::Violation`]
+    /// (`23505`); a version created by another still-running txn is
+    /// [`UniqueConflict::InFlight`] (`40001`, "retry").
     ///
-    /// While the engine is single-version every index entry is a committed,
-    /// non-deleted tuple, so this returns `true` exactly when the old presence-probe
-    /// did — existing uniqueness behavior is unchanged. It becomes load-bearing once
-    /// versioning (B4 commits 8–9) starts stamping `xmax`/writing aborted versions.
-    fn unique_conflict_exists(
+    /// **Precedence `Violation > InFlight > None`** (returns the strongest across
+    /// candidates): a single committed-live duplicate is a definite `23505` even if
+    /// another candidate is only in-flight; only when no candidate is a definite
+    /// duplicate but at least one is in-flight do we return `InFlight`.
+    ///
+    /// While writers are serialized (Stage 1) no concurrent uncommitted inserter
+    /// exists, so this never returns `InFlight` at runtime and every index entry is a
+    /// committed, non-deleted tuple — it returns `Violation` exactly when the old
+    /// presence-probe / boolean check did, so existing uniqueness behavior is
+    /// unchanged. The `InFlight` arm becomes load-bearing once writers run
+    /// concurrently (Milestone E2b).
+    fn unique_conflict_kind(
         &self,
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         schema: &TableSchema,
         current_txn: u64,
-    ) -> Result<bool> {
+    ) -> Result<UniqueConflict> {
         let status = self.txn_status_view();
+        let mut strongest = UniqueConflict::None;
         for location in index_btree.scan_key(key)? {
             let readable = self
                 .buffer_pool
@@ -615,17 +632,22 @@ impl PageBackedStorageEngine {
                 continue;
             };
             let decoded = decode_row(schema, &bytes)?;
-            if version_conflicts(
+            match classify_unique_conflict(
                 decoded.xmin,
                 decoded.xmax,
                 decoded.infomask,
                 current_txn,
                 status,
             ) {
-                return Ok(true);
+                // A committed-live duplicate is definitive; nothing outranks it.
+                UniqueConflict::Violation => return Ok(UniqueConflict::Violation),
+                // An in-flight candidate is the strongest seen so far, but a later
+                // candidate could still be a definite Violation, so keep scanning.
+                UniqueConflict::InFlight => strongest = UniqueConflict::InFlight,
+                UniqueConflict::None => {}
             }
         }
-        Ok(false)
+        Ok(strongest)
     }
 
     fn table_page_nums(&self, file_id: FileId) -> Result<Vec<PageNum>> {
@@ -648,13 +670,15 @@ impl StorageEngine for PageBackedStorageEngine {
         // Visibility-aware primary-key uniqueness: the multi-entry tree no longer
         // rejects duplicate keys structurally, so reject only when an
         // alive-or-potentially-alive version already holds the key (dead/aborted
-        // versions do not block a re-insert). Single-version today ⇒ behaves like a
-        // presence check; correct once versioning (B4) lands.
-        if self.unique_conflict_exists(&btree, &key, &schema, ctx.txn_id)? {
-            return Err(DbError::storage(
-                SqlState::UniqueViolation,
-                "duplicate primary key",
-            ));
+        // versions do not block a re-insert). A committed-live duplicate is a
+        // definite `UniqueViolation`; a key held only by another in-progress inserter
+        // is undecidable ⇒ `SerializationFailure` (retry — §7.3). Under serialized
+        // writers no concurrent uncommitted inserter exists, so this stays a definite
+        // duplicate check; the in-flight arm becomes load-bearing at E2b.
+        match self.unique_conflict_kind(&btree, &key, &schema, ctx.txn_id)? {
+            UniqueConflict::Violation => return Err(duplicate_primary_key()),
+            UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+            UniqueConflict::None => {}
         }
 
         let location = self.write_new_row(&schema, &row, ctx.txn_id)?;
@@ -745,7 +769,7 @@ impl StorageEngine for PageBackedStorageEngine {
         let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
 
         // Stamp the old version *before* the new version's uniqueness checks, so its
-        // `xmax = ctx.txn_id` makes `unique_conflict_exists` treat it as own-deleted
+        // `xmax = ctx.txn_id` makes `unique_conflict_kind` treat it as own-deleted
         // (non-conflicting): the new version must not collide with the logical row it
         // supersedes, but must still collide with any *other* live row. The forward
         // `t_ctid` points at the new version (invariant 5).
@@ -767,12 +791,14 @@ impl StorageEngine for PageBackedStorageEngine {
         // Primary-key entry for the new version. The key is unchanged (a PK change is
         // rejected above), so this adds a second `(key, new_tid)` entry alongside the
         // retained old one. The uniqueness check now sees the old version as
-        // own-deleted, so the unchanged PK does not falsely self-conflict.
-        if self.unique_conflict_exists(&btree, key, &schema, ctx.txn_id)? {
-            return Err(DbError::storage(
-                SqlState::UniqueViolation,
-                "duplicate primary key",
-            ));
+        // own-deleted (`xmax == ctx.txn_id` ⇒ `UniqueConflict::None`), so the
+        // unchanged PK does not falsely self-conflict; a collision with a *different*
+        // committed-live row is a `UniqueViolation`, and one with another in-progress
+        // inserter is a `SerializationFailure` (retry — §7.3).
+        match self.unique_conflict_kind(&btree, key, &schema, ctx.txn_id)? {
+            UniqueConflict::Violation => return Err(duplicate_primary_key()),
+            UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+            UniqueConflict::None => {}
         }
         btree.insert(ctx.txn_id, key, &new_location)?;
 
@@ -1181,6 +1207,21 @@ fn duplicate_unique_index(name: &str) -> DbError {
     DbError::storage(
         SqlState::UniqueViolation,
         format!("duplicate key value violates unique index {name}"),
+    )
+}
+
+fn duplicate_primary_key() -> DbError {
+    DbError::storage(SqlState::UniqueViolation, "duplicate primary key")
+}
+
+/// A concurrent inserter held the unique key with an as-yet-uncommitted version, so
+/// uniqueness is undecidable. The fail-fast first-updater-wins policy (§7.3) returns
+/// [`SqlState::SerializationFailure`] (`40001`) rather than blocking; the client may
+/// retry, and if the other inserter aborts the retry succeeds.
+fn unique_conflict_retry() -> DbError {
+    DbError::storage(
+        SqlState::SerializationFailure,
+        "could not determine uniqueness: a concurrent transaction holds this key; retry",
     )
 }
 
@@ -1742,6 +1783,219 @@ mod visibility_tests {
             .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(3, "amy"))
             .unwrap_err();
         assert_eq!(err.code, common::SqlState::UniqueViolation);
+    }
+
+    // --- E1c: concurrent-inserter unique conflicts as 40001 vs 23505 (mvcc.md §7.3) ---
+    //
+    // A key held by another transaction's still-uncommitted insert is undecidable:
+    // the inserter cannot tell whether it is a true duplicate (that txn may yet
+    // abort), so it returns `SerializationFailure` (40001, retry) rather than the
+    // definite `UniqueViolation` (23505). These are planted with the existing
+    // CLOG-driving fixture: insert under a creator txn and leave it in-progress
+    // (no Commit/Abort) to model the concurrent uncommitted inserter, then commit or
+    // abort it to settle the outcome. Under serialized writers this case cannot
+    // arise at runtime (E2b), so the engine tests plant it directly.
+
+    /// A committed table with a (non-unique by default) `users_name` secondary index.
+    fn fixture_with_table_and_name_index() -> Fixture {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        fixture.engine.create_index(&setup, &name_index()).unwrap();
+        fixture.commit(100);
+        fixture
+    }
+
+    /// INSERT racing an **in-progress** other inserter of the same primary key fails
+    /// fast with `SerializationFailure` (40001), not `UniqueViolation`: the key's
+    /// only version has an uncommitted creator that may yet abort, so uniqueness is
+    /// undecidable.
+    #[test]
+    fn insert_pk_in_flight_other_inserter_is_serialization_failure() {
+        let fixture = fixture_with_table_and_name_index();
+
+        // Creator txn 10 inserts key 1 and is left in-progress (no commit/abort).
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "inflight"))
+            .unwrap();
+
+        // Txn 11 races to insert the same key: the in-flight version is undecidable.
+        let err = fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "racer"))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+    }
+
+    /// Sequencing the same race: once the in-flight creator **commits**, a later
+    /// INSERT of that key is a definite duplicate ⇒ `UniqueViolation` (23505).
+    #[test]
+    fn insert_pk_in_flight_then_committed_becomes_unique_violation() {
+        let fixture = fixture_with_table_and_name_index();
+
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "inflight"))
+            .unwrap();
+
+        // Phase 1 — still in-flight ⇒ 40001.
+        let retry = fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "racer"))
+            .unwrap_err();
+        assert_eq!(retry.code, common::SqlState::SerializationFailure);
+
+        // Phase 2 — the creator commits ⇒ a later INSERT is a definite duplicate.
+        fixture.commit(10);
+        let dup = fixture
+            .engine
+            .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(1, "racer"))
+            .unwrap_err();
+        assert_eq!(dup.code, common::SqlState::UniqueViolation);
+    }
+
+    /// If the in-flight creator **aborts** instead, its version is dead, so a later
+    /// INSERT of that key succeeds (no conflict).
+    #[test]
+    fn insert_pk_in_flight_then_aborted_succeeds() {
+        let fixture = fixture_with_table_and_name_index();
+
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "inflight"))
+            .unwrap();
+        fixture.abort(10);
+
+        // The aborted version does not occupy the key ⇒ the re-insert succeeds.
+        fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "winner"))
+            .unwrap();
+        fixture.commit(11);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(20, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "winner"))
+        );
+    }
+
+    /// A committed table with a UNIQUE `users_name` secondary index.
+    fn fixture_with_unique_name_index() -> Fixture {
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture
+            .engine
+            .create_table(&setup, &users_schema())
+            .unwrap();
+        let unique_name = IndexSchema {
+            id: 1,
+            table: TABLE_ID,
+            name: "users_name_unique".to_string(),
+            columns: vec![1],
+            unique: true,
+        };
+        fixture.engine.create_index(&setup, &unique_name).unwrap();
+        fixture.commit(100);
+        fixture
+    }
+
+    /// The same in-flight→40001 / committed→23505 split for a UNIQUE SECONDARY index:
+    /// a duplicate unique name held only by an uncommitted inserter is `40001`; once
+    /// that inserter commits it becomes a definite `UniqueViolation`.
+    #[test]
+    fn insert_unique_secondary_in_flight_then_committed_split() {
+        let fixture = fixture_with_unique_name_index();
+
+        // Creator txn 10 inserts (id 1, name "amy") and is left in-progress.
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+            .unwrap();
+
+        // Phase 1 — a different row with the same unique name, while the holder is
+        // in-flight ⇒ undecidable ⇒ 40001 (note: a DIFFERENT pk, so the conflict is
+        // on the secondary index, not the PK).
+        let retry = fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "amy"))
+            .unwrap_err();
+        assert_eq!(retry.code, common::SqlState::SerializationFailure);
+
+        // Phase 2 — the holder commits ⇒ the duplicate unique name is definite ⇒ 23505.
+        fixture.commit(10);
+        let dup = fixture
+            .engine
+            .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(3, "amy"))
+            .unwrap_err();
+        assert_eq!(dup.code, common::SqlState::UniqueViolation);
+    }
+
+    /// Unique-secondary in-flight holder that **aborts** ⇒ a later insert of the same
+    /// unique name succeeds.
+    #[test]
+    fn insert_unique_secondary_in_flight_then_aborted_succeeds() {
+        let fixture = fixture_with_unique_name_index();
+
+        fixture
+            .engine
+            .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
+            .unwrap();
+        fixture.abort(10);
+
+        fixture
+            .engine
+            .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "amy"))
+            .unwrap();
+        fixture.commit(11);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(20, vec![])), TABLE_ID, &key(2))
+                .unwrap(),
+            Some(row(2, "amy"))
+        );
+    }
+
+    /// Multiple NULL indexed values under a UNIQUE secondary index still coexist:
+    /// the NULL-secondary skip is preserved (SQL treats NULLs as distinct), so an
+    /// in-flight NULL holder never yields 40001 either.
+    #[test]
+    fn insert_unique_secondary_multiple_nulls_allowed_with_in_flight_holder() {
+        let fixture = fixture_with_unique_name_index();
+
+        // Creator txn 10 inserts a NULL-name row and is left in-progress.
+        fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                Row {
+                    values: vec![Value::Integer(1), Value::Null],
+                },
+            )
+            .unwrap();
+
+        // A second NULL-name row (different pk) is accepted despite the in-flight
+        // holder: the unique check is skipped for NULL ⇒ no 40001 and no 23505.
+        fixture
+            .engine
+            .insert(
+                &ctx(11, snapshot(12, vec![])),
+                TABLE_ID,
+                Row {
+                    values: vec![Value::Integer(2), Value::Null],
+                },
+            )
+            .unwrap();
+        fixture.commit(11);
     }
 
     // --- MVCC DELETE: stamp xmax in place, retain entries (Milestone B commit 8) ---
