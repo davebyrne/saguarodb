@@ -560,9 +560,73 @@ impl PageBackedStorageEngine {
 
 `RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter in v1; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`) defined on `PageBackedStorageEngine` in `engine.rs`.
 
+## Structural Write Latches (Milestone E2a)
+
+Stage-2 concurrency (`docs/specs/mvcc.md` §7.1, §10 E2a) serializes structural
+mutations **within** one index or one table heap, while allowing concurrent
+writers across *different* indexes/heaps and lock-free B-link readers. The on-disk
+B-tree splits without latch coupling (it releases the page latch between levels and
+re-acquires the parent to propagate a split), and heap free-space search reads a
+page, drops the read latch, then re-acquires write — both are unsafe for concurrent
+structural writers (a fully-concurrent B-link tree and a free-space map are deferred,
+`mvcc.md` §12). A per-index / per-heap structural latch held across the *whole*
+operation closes both windows.
+
+- **Registry.** `PageBackedStorageEngine` holds a registry mapping `FileId →
+  Arc<parking_lot::Mutex<()>>` (a `Mutex<HashMap<…>>`, lazily populated).
+  `structural_latch(file_id)` locks the registry mutex only **briefly** — to look up
+  or lazily insert the file's latch — and drops it before the caller locks the
+  returned `Arc`, so the registry never serializes the structural work; only
+  same-file structural ops contend. It returns the SAME `Arc` for a given `FileId`
+  across calls (so two writers on one index/heap share a latch) and a DIFFERENT one
+  per file (so writers on different indexes/heaps run concurrently). The engine is
+  shared via `Arc`, so the latches are shared across all transactions/connections.
+- **Per-index latch — atomic uniqueness-check-AND-insert.** Every index structural
+  mutation holds that index's `structural_latch(index_file_id)` across the WHOLE
+  operation. The critical correctness requirement: the visibility-aware uniqueness
+  check (`unique_conflict_kind`, which scans the index) and the `BTree::insert` (which
+  mutates it, including any leaf split, parent-split propagation, and root split +
+  metapage `set_root`) run under **one** hold of the latch — otherwise two concurrent
+  inserts of the same key could both pass the check and both insert a duplicate. This
+  applies to the PK insert path (`insert` and `update`'s new-version PK entry),
+  `insert_secondary_entry` (each secondary; a non-unique secondary just holds the
+  latch across the insert), and `create_index`'s backfill inserts (each holds the new
+  index's latch). The dead-code `BTree::remove`/`search` (future VACUUM) are not wired
+  yet.
+- **Per-heap-file insertion latch — closes the free-space TOCTOU.** `write_new_row`
+  holds `structural_latch(heap_file_id)` across the whole free-space search +
+  `new_page`/`insert_row` + WAL log, making "find space / extend / insert / log"
+  atomic against another inserter on the same table heap (two concurrent inserters can
+  no longer both target the last slot). The UPDATE/DELETE in-place `xmax` stamping
+  (`stamp_xmax_logged`) targets a known slot under the buffer-pool frame latch + the
+  E1b conflict check and allocates no free space, so it does **not** take the heap
+  insertion latch.
+- **Lock-ordering contract** (followed uniformly to prevent deadlock):
+  1. **Never hold two structural latches simultaneously.** Each structural latch is
+     acquired, the mutation runs, then it is released *before* the next is taken — the
+     heap-insertion latch (in `write_new_row`) is released before the index latches;
+     the PK-index latch is released before each secondary-index latch. Because no
+     structural latch is ever held while acquiring another, there is no multi-latch
+     deadlock regardless of index order. (`insert`/`update` therefore write the heap
+     tuple first under the heap latch, then take the PK latch for the atomic
+     check-and-insert.)
+  2. **Never acquire a structural latch while holding a buffer-pool frame latch.** The
+     order is always structural latch → (inside the btree/heap op) frame latch →
+     (inside the WAL append) WAL mutex. No path takes `read_page`/`write_page` and then
+     acquires a structural latch. The E1b `stamp_xmax_logged` takes only a frame latch
+     (no structural latch), so it does not participate in this ordering.
+
+These latches are **uncontended** until E2b removes the global exclusive writer lock:
+under serialized writers only one writer runs at a time, so this commit installs the
+substrate with zero runtime behavior change. Real contention/atomicity stress tests
+arrive in E2b once writers overlap.
+
 ## Page-Backed V1 Simplifications
 
-- Single writer means heap and index page modifications do not need fine-grained locks.
+- Structural mutations within one index or one heap file serialize on that file's
+  per-`FileId` structural write latch (above); under the still-global writer lock
+  (E2b removes it) the latches are uncontended, so heap and index page modifications
+  effectively run single-writer today.
 - The primary-key index is durable on disk, so nothing is rebuilt after recovery.
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.

@@ -9,6 +9,7 @@ buffer = { package = "saguarodb-buffer", path = "../buffer" }
 common = { package = "saguarodb-common", path = "../common" }
 wal = { package = "saguarodb-wal", path = "../wal" }
 crc32fast.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
