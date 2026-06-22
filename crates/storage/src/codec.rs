@@ -295,6 +295,31 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
     })
 }
 
+/// Decode just the MVCC header of a tuple buffer (version byte included),
+/// returning `(xmin, xmax, t_ctid, infomask)` without needing a schema or
+/// decoding the column payloads. Mirrors the header branch of [`decode_row`]: a v1
+/// tuple synthesizes a frozen, never-deleted header (always visible / unlocked).
+///
+/// The write-write conflict check (`stamp_xmax_logged`, `docs/specs/mvcc.md` §7.3)
+/// uses this to read the target version's *current physical* `xmax`/`infomask`
+/// under the page's write latch, immediately before stamping — it only needs the
+/// header fields, not the row values, and has no schema in hand.
+pub(crate) fn decode_mvcc_header(tuple: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> {
+    match tuple.first() {
+        Some(&ROW_FORMAT_VERSION) => {
+            let header = tuple
+                .get(1..1 + V2_MVCC_HEADER_LEN)
+                .ok_or_else(|| corrupt_row("tuple is shorter than its v2 header"))?;
+            read_v2_header(header)
+        }
+        Some(&ROW_FORMAT_VERSION_V1) => Ok((FROZEN_XID, INVALID_XID, INVALID_TID, XMIN_COMMITTED)),
+        Some(other) => Err(corrupt_row(format!(
+            "unsupported row format version {other}"
+        ))),
+        None => Err(corrupt_row("row is shorter than its header")),
+    }
+}
+
 /// Write the v2 MVCC header into `header` (exactly `V2_MVCC_HEADER_LEN` bytes):
 /// `[infomask:2][xmin:8][xmax:8][t_ctid:6]` for a freshly inserted tuple.
 fn write_v2_header(header: &mut [u8], txn_id: TxnId) {

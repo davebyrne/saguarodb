@@ -183,15 +183,28 @@ rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
    matched (under snapshot isolation at most one version of a key is visible). If
    none is visible (already deleted, aborted, or absent), the delete affects no row
    and returns `Ok(false)` (the missing-row semantics).
-2. **Stamp `xmax` in place.** It stamps `xmax = ctx.txn_id` on that version's tuple
-   header through the WAL-logged path — append a `HeapUpdateHeader { file_id,
-   page_num, slot, xmax = ctx.txn_id, t_ctid = INVALID_TID, infomask = unchanged }`
-   (or a `FullPageImage` on the page's first touch since the last checkpoint), then
-   apply `page::set_tuple_header` with that record's LSN. `t_ctid` stays
-   `INVALID_TID` (a delete has no successor) and `infomask` is carried through
-   unchanged (no hint bits set here — that is the optional commit 10). The line
-   pointer **stays `NORMAL`**: the tuple is physically present and is hidden purely
-   by visibility once the deleter commits.
+2. **Stamp `xmax` in place (with an atomic conflict check).** It stamps
+   `xmax = ctx.txn_id` on that version's tuple header through the shared
+   `stamp_xmax_logged` path. Under the page's `write_page` frame latch — and
+   **before** appending any WAL record or mutating the page — it re-reads the
+   version's *current physical* header `xmax`/`infomask` and runs the first-updater-
+   wins check `common::write_conflict` (`mvcc.md` §7.3, Milestone E1b). On
+   `Conflict` (another transaction has already claimed this version's `xmax` and is
+   committed or still in-flight) it fails fast with `SqlState::SerializationFailure`
+   (`40001`) **without appending the `HeapUpdateHeader` or stamping** — the winning
+   writer's `xmax` stands. On `Proceed` (no deleter, the deleter aborted, or it is
+   this txn's own lock) it appends a `HeapUpdateHeader { file_id, page_num, slot,
+   xmax = ctx.txn_id, t_ctid = INVALID_TID, infomask = unchanged }` (or a
+   `FullPageImage` on the page's first touch since the last checkpoint) and applies
+   `page::set_tuple_header` with that record's LSN. The read-classify-stamp sequence
+   is atomic on the frame latch, so two concurrent writers racing for this version
+   serialize on the latch and the loser observes the winner's `xmax` (no TOCTOU). Under
+   the current serialized-writer model the located version's `xmax` is `INVALID_XID`
+   (or own), so the check is a runtime no-op; it becomes load-bearing under
+   concurrent writers (Milestone E2b). `t_ctid` stays `INVALID_TID` (a delete has no
+   successor) and `infomask` is carried through unchanged (no hint bits set here —
+   that is the optional commit 10). The line pointer **stays `NORMAL`**: the tuple is
+   physically present and is hidden purely by visibility once the deleter commits.
 3. **Retain index entries.** No primary-key or secondary index entry is removed.
    The dead version and its entries linger until VACUUM (Milestone F) reclaims them.
 
@@ -224,13 +237,22 @@ version carries the same PK as the old. The flow is ordered for correct uniquene
    at a **new TID** through the normal insert/heap-write + WAL path, stamping
    `xmin = ctx.txn_id`, `xmax = INVALID_XID`, `t_ctid = INVALID_TID` (it is the
    latest version).
-3. **Chain the old version forward.** The old version's header is stamped
-   `xmax = ctx.txn_id` **and** `t_ctid = new_tid` in place via the WAL-logged
-   `HeapUpdateHeader` path (a `FullPageImage` on the page's first touch since the
-   last checkpoint). The line pointer stays `NORMAL`; `infomask` is carried through.
-   This stamping happens *before* the new version's uniqueness checks, so the old
-   version reads as own-deleted (`xmax == ctx.txn_id`) and does not falsely
-   self-conflict.
+3. **Chain the old version forward (with an atomic conflict check).** The old
+   version's header is stamped `xmax = ctx.txn_id` **and** `t_ctid = new_tid` in
+   place via the same `stamp_xmax_logged` path as `delete`, so it runs the identical
+   atomic first-updater-wins `write_conflict` check under the frame latch before any
+   WAL append (step 2 above): if another transaction already claimed the old
+   version's `xmax`, the update fails fast with `SqlState::SerializationFailure`
+   (`40001`). The line pointer stays `NORMAL`; `infomask` is carried through. This
+   stamping happens *before* the new version's uniqueness checks, so the old version
+   reads as own-deleted (`xmax == ctx.txn_id`) and does not falsely self-conflict.
+   Because the new version (step 2) was written *before* this stamp, a `40001` here
+   leaves a transient **orphan**: the new heap tuple (the per-version index entries
+   of step 4 below have not run yet, so only the tuple is orphaned). No manual
+   cleanup is needed — the error aborts the transaction, so the orphan (xmin = the
+   aborting txn) becomes invisible via CLOG = Aborted and is reclaimed by VACUUM
+   (Milestone F). (An early pre-write conflict check to avoid the transient orphan is
+   a deferred optimization; the authoritative check stays atomic at stamp time.)
 4. **Insert per-version entries into all indexes.** A new `(key, new_tid)` entry is
    inserted into the primary-key index and a new `(secondary_key, new_tid)` entry
    into **every** secondary index — changed-column or not. Because reads do not walk

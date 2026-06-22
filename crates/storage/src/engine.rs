@@ -5,7 +5,7 @@ use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
     Result, Row, RowId, Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema,
-    TxnStatusView, Value, is_visible, version_conflicts,
+    TxnStatusView, Value, WriteConflict, is_visible, version_conflicts, write_conflict,
 };
 use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -388,6 +388,21 @@ impl PageBackedStorageEngine {
     /// `UPDATE` passes `t_ctid = new_tid`, the forward version-chain pointer to the
     /// new tuple (invariant 5). It never removes the tuple or its index entries
     /// (VACUUM reclaims them, Milestone F).
+    ///
+    /// **First-updater-wins conflict check (E1b, `docs/specs/mvcc.md` §7.3).**
+    /// `xmax` doubles as the row lock. Under the `write_page` frame latch — and
+    /// **before** appending any WAL record or mutating the page — this re-reads the
+    /// target version's *current physical* header (`xmax`/`infomask`) and runs
+    /// [`common::write_conflict`]. The read-classify-stamp sequence is atomic on the
+    /// frame latch: two concurrent writers racing to claim this version serialize on
+    /// the latch, so the loser observes the winner's just-stamped `xmax` and aborts
+    /// with [`SqlState::SerializationFailure`] (`40001`) — no WAL is appended and the
+    /// header is left untouched on conflict. Checking `xmax` earlier (e.g. at
+    /// `locate_visible_version` time) and stamping later under a fresh latch would be
+    /// a TOCTOU race that defeats first-updater-wins, so the check lives here, inside
+    /// the latch, next to the stamp. Under the current serialized-writer model the
+    /// located version's `xmax` is `INVALID_XID` (or this txn's own), so the check is
+    /// a runtime no-op; it becomes load-bearing once writers run concurrently (E2b).
     fn stamp_xmax_logged(
         &self,
         location: RowLocation,
@@ -398,6 +413,29 @@ impl PageBackedStorageEngine {
         let mut guard = self
             .buffer_pool
             .write_page(location.file_id, location.page_num, txn_id)?;
+
+        // Atomic first-updater-wins check: read the version's CURRENT physical
+        // `xmax`/`infomask` under this frame latch and classify against the live
+        // CLOG. A `Conflict` (the deleter committed-after-my-snapshot or is another
+        // in-flight writer) fails fast — returning here appends NO WAL record and
+        // leaves the header unstamped, so the winning writer's `xmax` stands.
+        let current = page::read_row(guard.data(), location.slot_num)?
+            .ok_or_else(|| storage_internal("cannot stamp xmax on a non-live slot"))?;
+        let (_xmin, current_xmax, _t_ctid, current_infomask) =
+            crate::codec::decode_mvcc_header(&current)?;
+        if write_conflict(
+            current_xmax,
+            current_infomask,
+            txn_id,
+            self.txn_status_view(),
+        ) == WriteConflict::Conflict
+        {
+            return Err(DbError::execute(
+                SqlState::SerializationFailure,
+                "could not serialize access due to concurrent update",
+            ));
+        }
+
         if guard.take_needs_fpi() {
             // Mutate the header first, then capture the page in a full-page image.
             // Keep the existing page-LSN on this in-place stamp; the FPI append
@@ -711,6 +749,18 @@ impl StorageEngine for PageBackedStorageEngine {
         // (non-conflicting): the new version must not collide with the logical row it
         // supersedes, but must still collide with any *other* live row. The forward
         // `t_ctid` points at the new version (invariant 5).
+        //
+        // The atomic first-updater-wins check lives in `stamp_xmax_logged` (E1b,
+        // §7.3): if another writer already claimed the old version's `xmax`, this
+        // returns `40001` *after* the new version was written above (the index
+        // inserts below have not run yet, so only the heap tuple is orphaned). That
+        // transient new tuple is an **orphan-on-conflict** and needs no manual
+        // cleanup: the `40001` error aborts the transaction, so the new version
+        // (xmin = the aborting txn) becomes invisible via CLOG = Aborted and is
+        // reclaimed by VACUUM (Milestone F) — the abort + visibility machinery
+        // handles it. (A pre-write conflict check to avoid the transient orphan is a
+        // deferred optimization; the authoritative check stays atomic at stamp time
+        // to keep first-updater-wins race-free.)
         let new_tid = (new_location.page_num, new_location.slot_num);
         self.stamp_xmax_logged(previous_location, new_tid, infomask, ctx.txn_id)?;
 
@@ -2243,6 +2293,210 @@ mod visibility_tests {
                 .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
                 .unwrap(),
             Some(row(1, "updated"))
+        );
+    }
+
+    // --- E1b: write-write conflict detection on UPDATE/DELETE (mvcc.md §7.3) ---
+    //
+    // Each test plants a conflicting `xmax = DELETER` on the target version BEFORE
+    // the operation, under a writer snapshot in which that deleter is NOT visible (in
+    // `xip`, so its delete looks in-progress to the writer) — so the row stays
+    // VISIBLE, `locate_visible_version` returns it, and the stamp-time check fires
+    // against the deleter's *actual* CLOG status. `xmax` is planted with `infomask =
+    // 0` so `write_conflict` probes the CLOG rather than short-circuiting on a hint.
+    // The writer is txn `WRITER` (`> DELETER`), its snapshot's future starting just
+    // above `WRITER`.
+
+    const DELETER: u64 = 50;
+    const WRITER: u64 = 60;
+
+    /// A committed table with one committed-live row (creator txn 10), plus a planted
+    /// `xmax = DELETER` (no hint bits) on that row's tuple. The deleter's CLOG status
+    /// is left for the caller to settle (commit/abort/leave-in-progress). Returns the
+    /// fixture and the row's TID.
+    fn fixture_with_planted_deleter() -> (Fixture, RowId) {
+        let (fixture, rid) = fixture_with_one_row_and_index();
+        // Plant a deleter's lock on the row, no settled-status hint bits, so the
+        // stamp-time check resolves the deleter via the CLOG.
+        fixture.stamp_xmax(rid.page_num, rid.slot_num, DELETER, 0);
+        (fixture, rid)
+    }
+
+    /// The writer's snapshot: the future starts just above `WRITER`, and `DELETER` is
+    /// in-progress at capture (in `xip`) so the planted delete does not hide the row
+    /// from the writer — `locate_visible_version` returns it and the conflict check
+    /// fires on the deleter's actual status.
+    fn writer_snapshot() -> Snapshot {
+        Snapshot {
+            xmin: 1,
+            xmax: WRITER + 1,
+            xip: vec![DELETER],
+        }
+    }
+
+    /// DELETE conflicts with a **committed-after-snapshot** deleter: the planted
+    /// `xmax = DELETER` belongs to a txn that committed but is invisible to the
+    /// writer's snapshot (in `xip`), so the row is still visible to the writer; the
+    /// atomic stamp-time check sees `DELETER` committed in the CLOG ⇒ `40001`.
+    #[test]
+    fn delete_conflicts_with_committed_deleter() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+        fixture.commit(DELETER);
+
+        let err = fixture
+            .engine
+            .delete(&ctx(WRITER, writer_snapshot()), TABLE_ID, &key(1))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+    }
+
+    /// UPDATE conflicts with a **committed-after-snapshot** deleter, same setup as the
+    /// DELETE case (both stamp `xmax` through `stamp_xmax_logged`).
+    #[test]
+    fn update_conflicts_with_committed_deleter() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+        fixture.commit(DELETER);
+
+        let err = fixture
+            .engine
+            .update(
+                &ctx(WRITER, writer_snapshot()),
+                TABLE_ID,
+                &key(1),
+                row(1, "new"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+    }
+
+    /// DELETE conflicts with an **in-progress** deleter: `xmax = DELETER` is planted
+    /// with no Commit/Abort, so the CLOG reads it `InProgress`; the fail-fast policy
+    /// treats a live lock holder as a hard conflict ⇒ `40001`.
+    #[test]
+    fn delete_conflicts_with_in_progress_deleter() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+        // DELETER neither committed nor aborted ⇒ in-progress.
+
+        let err = fixture
+            .engine
+            .delete(&ctx(WRITER, writer_snapshot()), TABLE_ID, &key(1))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+    }
+
+    /// UPDATE conflicts with an **in-progress** deleter (same fail-fast policy).
+    #[test]
+    fn update_conflicts_with_in_progress_deleter() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+
+        let err = fixture
+            .engine
+            .update(
+                &ctx(WRITER, writer_snapshot()),
+                TABLE_ID,
+                &key(1),
+                row(1, "new"),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SerializationFailure);
+    }
+
+    /// DELETE does **not** conflict with an **aborted** deleter: the planted lock
+    /// evaporated (its delete never happened), so the writer proceeds and the DELETE
+    /// applies — a later reader sees no row.
+    #[test]
+    fn delete_proceeds_when_deleter_aborted() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+        fixture.abort(DELETER);
+
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(WRITER, writer_snapshot()), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(WRITER);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(WRITER + 2, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            None
+        );
+    }
+
+    /// UPDATE does **not** conflict with an **aborted** deleter: the writer proceeds
+    /// and the new value applies — a later reader sees the updated row.
+    #[test]
+    fn update_proceeds_when_deleter_aborted() {
+        let (fixture, _rid) = fixture_with_planted_deleter();
+        fixture.abort(DELETER);
+
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(WRITER, writer_snapshot()),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "updated"),
+                )
+                .unwrap()
+        );
+        fixture.commit(WRITER);
+
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(WRITER + 2, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "updated"))
+        );
+    }
+
+    /// The no-op-under-serialized-writers case: a plain DELETE/UPDATE of a row whose
+    /// `xmax = INVALID` (no prior lock) proceeds normally — the conflict check returns
+    /// `Proceed` and behavior is unchanged.
+    #[test]
+    fn delete_and_update_of_unlocked_row_proceed() {
+        let (fixture, _rid) = fixture_with_one_row_and_index();
+
+        // UPDATE an unlocked row.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(20, snapshot(21, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    row(1, "updated"),
+                )
+                .unwrap()
+        );
+        fixture.commit(20);
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(row(1, "updated"))
+        );
+
+        // DELETE the (still unlocked) live version.
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(21, snapshot(22, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(21);
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(40, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            None
         );
     }
 
