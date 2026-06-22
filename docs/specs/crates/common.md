@@ -286,10 +286,13 @@ pub struct PageFlushInfo {
 
 pub trait FlushPolicy: Send + Sync {
     fn can_flush(&self, info: &PageFlushInfo) -> bool;
+    /// Force every WAL record durable up to now, so a dirty page about to be
+    /// written to its home satisfies write-ahead logging. Default no-op (tests).
+    fn ensure_durable(&self) -> Result<()> { Ok(()) }
 }
 ```
 
-V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; the checkpoint flushes them in place to the heap. The `page_lsn` field lets eviction-flush-on-steal check WAL durability without changing the trait.
+`WalFlushPolicy` admits any **WAL-durable** dirty page (`page_lsn ≤ wal.flushed_lsn()`), committed or not (Milestone D1, `mvcc.md` §8): the committedness gate of earlier milestones is dropped because a heap page holds versions from several transactions, and the CLOG hides the non-committed ones. The checkpoint flushes such pages in place to the heap. `ensure_durable` (implemented by `WalFlushPolicy` as `wal.flush`) is called by the buffer pool's steal path before writing a stolen — possibly uncommitted — dirty page, giving write-ahead logging (the page's records reach disk before the page does); the pre-D1 committed-only steal needed no such force.
 
 ## Concurrency Controller
 

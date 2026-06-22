@@ -261,16 +261,19 @@ pub struct StatementContext {
 /// can be flushed. The struct is extensible so new fields don't change the
 /// trait signature.
 pub struct PageFlushInfo {
-    pub dirty_txn_id: u64,
-    pub page_lsn: Option<Lsn>,  // reserved; checkpoint and eviction-steal pass None (a committed page is already WAL-durable).
+    pub dirty_txn_id: u64,      // informational; the MVCC gate no longer reads it.
+    pub page_lsn: Option<Lsn>,  // WAL-durability check; checkpoint/steal pass None (WAL flushed first).
 }
 
 /// Abstraction so the buffer pool can decide whether a dirty page is safe to
-/// flush, without depending on the wal crate. V1's WalFlushPolicy admits
-/// committed (or recovery, txn 0), WAL-durable pages; checkpoint flushes them in
-/// place via flush_committed_pages. Eviction-flush-on-steal reuses the same policy.
+/// flush, without depending on the wal crate. WalFlushPolicy admits any
+/// WAL-durable dirty page (with MVCC the committedness gate is dropped — an
+/// uncommitted/aborted page may be flushed, hidden by the CLOG); checkpoint
+/// flushes them via flush_dirty_pages. The steal path calls `ensure_durable`
+/// (forces the WAL) before writing a possibly-uncommitted stolen page.
 pub trait FlushPolicy: Send + Sync {
     fn can_flush(&self, info: &PageFlushInfo) -> bool;
+    fn ensure_durable(&self) -> Result<()> { Ok(()) }
 }
 ```
 
@@ -309,7 +312,7 @@ pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
 All layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves names to IDs and assigns physical slot positions via the catalog. The logical planner, physical planner, executor, and storage engine never do name lookups — they work exclusively with stable IDs and slot indices.
 
-`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. V1's `WalFlushPolicy` admits committed (or recovery, txn 0), WAL-durable pages; checkpoint uses it via `flush_committed_pages` to flush dirty pages in place to the heap, and eviction-flush-on-steal uses it to steal committed dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
+`FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. `WalFlushPolicy` admits any WAL-durable dirty page (with MVCC the committedness gate is dropped — uncommitted/aborted pages may be flushed and are hidden by the CLOG); checkpoint uses it via `flush_dirty_pages` to flush dirty pages in place to the heap, and eviction-flush-on-steal uses it (plus `ensure_durable`, which forces the WAL first) to steal dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
 
 ## 3. Wire Protocol
 
@@ -1227,10 +1230,8 @@ pub trait BufferPool: Send + Sync {
     fn read_page(&self, file_id: FileId, page_num: PageNum) -> Result<PageReadGuard>;
 
     /// Fetch a page for writing. txn_id identifies the active statement.
-    /// On the first write to a page by this txn_id, the buffer pool saves a
-    /// before-image (copy of the page data before mutation). This enables
-    /// rollback if the statement fails.
     /// Returns a guard that unpins on drop and automatically marks dirty.
+    /// (With MVCC, abort is status-based — no before-image is saved.)
     fn write_page(&self, file_id: FileId, page_num: PageNum, txn_id: u64) -> Result<PageWriteGuard>;
 
     /// Allocate a new page in the given file, return it locked for writing.
@@ -1240,13 +1241,14 @@ pub trait BufferPool: Send + Sync {
     /// Insert an exact clean page into the pool (does not mark it dirty).
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
 
-    /// Rollback: restore all pages modified by this txn_id to their before-images,
-    /// and invalidate/free all pages allocated by this txn_id via new_page().
-    /// Discards both tracking structures after restore.
+    /// Rollback: a no-op bookkeeping clear. With MVCC, abort is status-based
+    /// (`docs/specs/mvcc.md` §4 Decision 3) — no page undo, no page reclamation.
+    /// A rolled-back transaction's pages stay dirty-but-evictable, hidden by the
+    /// CLOG and reclaimed by VACUUM.
     fn rollback(&self, txn_id: u64) -> Result<()>;
 
-    /// Commit: discard before-images and new-page tracking for this txn_id.
-    /// Changes are now permanent and eligible to be flushed at the next checkpoint.
+    /// Commit: a no-op cleanup (no per-transaction page metadata is tracked).
+    /// Changes are eligible to be flushed at the next checkpoint.
     fn commit(&self, txn_id: u64) -> Result<()>;
 
     /// Iterate all frames (used by checkpoint flushing and the storage page scan). Returns (file_id, page_num, data, is_dirty).
@@ -1254,7 +1256,7 @@ pub trait BufferPool: Send + Sync {
 
     /// Mark all dirty pages as clean (called by checkpoint after flushing them to the heap).
     fn mark_all_clean(&self) -> Result<()>;
-    // (Checkpoint flush and recovery redo add flush_committed_pages / fetch_for_redo; see buffer.md.)
+    // (Checkpoint flush and recovery redo add flush_dirty_pages / fetch_for_redo; see buffer.md.)
 }
 ```
 
@@ -1296,11 +1298,7 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
 
 - **Frame:** A slot holding one 8KB page. Pool size is configurable (default: 1024 frames = 8MB).
 - **Page descriptor:** Tracks `(file_id, page_number)`, pin count, dirty flag, reference bit, `dirty_txn_id` (the txn that last dirtied it), and `needs_fpi` (whether the next modification must log a full-page image).
-- **Before-image store:** Per active `txn_id`, two tracking structures:
-  - `before_images: HashMap<(FileId, PageNum), PageData>` — on the first `write_page` call for an existing page by a `txn_id`, the current page data is copied here.
-  - `new_pages: Vec<(FileId, PageNum)>` — pages allocated via `new_page` by this `txn_id`.
-  
-  On `rollback(txn_id)`: before-images are restored (existing pages return to pre-statement state) and newly allocated pages are invalidated/freed. On `commit(txn_id)`: both tracking structures are discarded. This correctly handles the case where a page was already dirtied by a prior committed txn (rollback restores to the post-prior-commit state, not the on-disk state) and also handles failed inserts that allocated new pages before the error.
+- **No rollback tracking (MVCC):** the buffer pool keeps no per-transaction page state. Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3): `rollback(txn_id)` undoes nothing and reclaims nothing — a rolled-back transaction's pages (modified or freshly allocated) stay resident as dirty-but-evictable frames, hidden by the CLOG and reclaimed by VACUUM. (The before-image store and new-page rollback tracking that the pre-MVCC v1 model used are retired in Milestone D1.)
 - **PageStore / PageLoader:** The buffer pool is constructed with an `Arc<dyn PageStore>`, which extends the read-only `PageLoader`:
 
 ```rust
@@ -1311,7 +1309,7 @@ pub trait PageLoader: Send + Sync {
 
 On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` is inserted as a clean frame; `None` returns `ErrorKind::Storage` / `SqlState::InternalError` with message `page not found`; loader I/O failures propagate as `ErrorKind::Io`. In production, the server supplies a `HeapPageStore` (a `PageStore`) that reads page `n` of table `file_id` from `data/heap/<file_id>.heap`. `MemoryBufferPool::empty(frame_count)` is a test helper using a never-flush policy and a no-op store that returns `Ok(None)`.
 
-- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_committed_pages` (checkpoint) consults it per dirty page: V1's `WalFlushPolicy` admits committed (or txn 0) pages whose page-LSN is WAL-durable. The same policy gates eviction-flush-on-steal.
+- **FlushPolicy:** The buffer pool is constructed with a `Box<dyn FlushPolicy>`. `flush_dirty_pages` (checkpoint) consults it per dirty page: `WalFlushPolicy` admits any dirty page whose page-LSN is WAL-durable (with MVCC the committedness check is gone). The same policy gates eviction-flush-on-steal, whose path also calls `ensure_durable` to force the WAL before writing a possibly-uncommitted stolen page.
 
 ### Eviction: Clock Algorithm (Single-Bit)
 
@@ -1319,14 +1317,14 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 - Each frame has a reference bit, set on access
 - On sweep: if bit is 1, clear to 0 and skip. If bit is 0 and unpinned, check dirty flag.
 - **If clean:** evict immediately. The page can be re-read from its heap file if needed later.
-- **If dirty:** when stealing is enabled, steal it if the `FlushPolicy` admits it (committed): flush the page to its heap home outside the pool lock, then evict. A page the policy refuses (uncommitted), or any dirty page when stealing is off, is skipped. The server enables stealing at startup, before redo.
-- If no frame can be freed — every frame is pinned, or every unpinned frame is dirty and unflushable (uncommitted) — the buffer pool returns an out-of-frames error.
+- **If dirty:** when stealing is enabled, steal it if the `FlushPolicy` admits it (WAL-durable): force the WAL (`ensure_durable`), flush the page to its heap home outside the pool lock, then evict. With MVCC a stolen page need not be committed (the CLOG hides an uncommitted/aborted one). A page the policy refuses (not WAL-durable), or any dirty page when stealing is off, is skipped. The server enables stealing at startup, before redo.
+- If no frame can be freed — every frame is pinned, or every unpinned frame is dirty and unflushable (not WAL-durable) — the buffer pool returns an out-of-frames error.
 
 ### Working Set and the Buffer Pool
 
-During normal operation the working set is not bound by the pool size: eviction-flush-on-steal writes committed dirty pages to the heap and evicts them, so a large dataset spills rather than erroring. With V1's single-writer autocommit:
+During normal operation the working set is not bound by the pool size: eviction-flush-on-steal writes dirty pages to the heap and evicts them, so a large dataset (or a large in-flight transaction) spills rather than erroring. With V1's single-writer autocommit:
 - Each statement dirtys a modest number of pages
-- After commit, pages are dirty but committed — they stay in memory until a checkpoint flushes them in place or an eviction steals them
+- Pages stay dirty in memory until a checkpoint flushes them in place or an eviction steals them
 - The buffer pool default (1024 frames = 8MB) keeps a small-to-medium working set resident; larger sets spill to the heap
 - **Recovery** spills too: stealing is enabled before redo, so the redo working set is not bounded by the buffer pool either (the durable on-disk index means nothing is rebuilt in memory)
 
@@ -1364,11 +1362,11 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ### checkpoint_lsn
 
-`checkpoint_lsn` is the **authoritative redo boundary**: the WAL high-water mark whose effects are reflected in the heap. Recovery reads it from the control record and replays committed WAL records with `LSN > checkpoint_lsn`. The WAL `Checkpoint` record is optional metadata; the control record is authoritative.
+`checkpoint_lsn` is the **authoritative redo boundary**: the WAL high-water mark whose effects are reflected in the heap. Recovery reads it from the control record and replays WAL records with `LSN > checkpoint_lsn` (redo-all — see below). The WAL `Checkpoint` record is optional metadata; the control record is authoritative.
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery replays committed records onto the heap pages. (`HeapUpdateHeader` is the MVCC in-place tuple-header mutation; its redo handler exists but the engine does not yet emit it — that arrives with Milestone B's `UPDATE`/`DELETE` versioning.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. With MVCC (`feat/mvcc`), recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records replay only for committed transactions. (See `docs/specs/mvcc.md` §8 for the full Milestone-D recovery contract.)
 
 ### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1376,15 +1374,15 @@ Table data lives in mutable per-table heap files; pages are mutated in the buffe
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
-- **Flush-based checkpoint**: dirty committed pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the WAL prefix is truncated.
+- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the WAL prefix is truncated. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM. WAL truncation is conservative: it never drops an aborted/in-flight transaction's records (`docs/specs/mvcc.md` §5.4/§8).
 
 This gives the invariants:
-1. After a crash, recovery loads the heap as of the last control record and replays committed redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe.
-2. The WAL captures all committed operations since the redo boundary.
+1. After a crash, recovery loads the heap as of the last control record and replays redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe. (With MVCC this is redo-all + CLOG visibility.)
+2. The WAL captures all operations since the redo boundary.
 3. Checkpoint cost is O(pages changed), not O(database size).
 
 **Trade-offs:**
-- Normal operation and recovery both spill committed dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory).
+- Normal operation and recovery both spill dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory). The steal path forces the WAL durable before writing a stolen page (write-ahead), so a possibly-uncommitted stolen page is always recoverable.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
 **Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
@@ -1437,41 +1435,40 @@ pub trait WalManager: Send + Sync {
     /// Flush all buffered WAL records to disk (fsync). Returns the flushed LSN.
     fn flush(&self) -> Result<Lsn>;
 
-    /// Iterate records from a given LSN (for recovery). The iterator is
+    /// Iterate records from a given LSN (for recovery, redo-all). The iterator is
     /// fallible — a corrupt record mid-replay returns an error.
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
 
-    /// Iterate only operation records whose transaction has a commit record
-    /// after the given LSN. Used by recovery.
-    fn replay_committed_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
-
-    /// Truncate WAL records before the given LSN (after checkpoint).
+    /// Truncate WAL records before the given LSN (after checkpoint). Conservative:
+    /// never drops a non-committed transaction's records (see below).
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
-
-    /// Query whether a txn_id has a durable or replayed commit record.
-    fn is_committed(&self, txn_id: u64) -> bool;
 
     /// Last LSN known to be durable after fsync.
     fn flushed_lsn(&self) -> Lsn;
 
     /// Total encoded bytes of retained records whose stored LSN is > lsn.
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
+
+    /// Establish the CLOG implicit-committed floor at recovery, conservatively.
+    fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
 }
+// `WalManager: TxnStatusView`, so `status`/`is_committed`/`is_aborted` come from the
+// rebuilt CLOG. The redo-committed-only `replay_committed_from` is retired with MVCC.
 ```
 
 `append(record)` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. Replay preserves the stored LSN from disk.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — everything except the `Commit`/`Checkpoint` markers — applied as physiological redo and DDL replay.
+`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap, and (redo-all) applies every page-mutation record, deciding visibility via the CLOG.
 
-`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
+`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Conservative truncation (MVCC):** it never drops an aborted/in-flight transaction's records — it pins on the oldest non-committed transaction below `lsn` — so an aborted-but-flushed transaction stays invisible across restart (`docs/specs/mvcc.md` §5.4/§8). Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
 
 `bytes_after(lsn)` is server checkpoint accounting only. It counts encoded bytes for retained WAL records with stored `LSN > lsn`; if `lsn` predates the retained WAL after truncation, it returns the encoded byte size of all retained records.
 
 ### V1 Durability Rules
 
-One rule ensures redo-only recovery is correct:
+One rule ensures redo recovery is correct:
 
-**In-place page flushing.** Dirty committed pages are written back to their heap file by the checkpoint and by eviction-steal. Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo.
+**In-place page flushing.** Dirty pages are written back to their heap file by the checkpoint and by eviction-steal. Each write is protected by the page's redo records — a full-page image on the first modification since the last checkpoint, deltas thereafter — so a torn write is repairable during redo. With MVCC, uncommitted/aborted dirty pages may also be flushed (the flush gate requires only WAL-durability); they are hidden by the CLOG and reclaimed by VACUUM, and the steal path forces the WAL before writing a possibly-uncommitted page.
 
 The WAL is the source of durability between checkpoints:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
@@ -1486,12 +1483,12 @@ All writes are serialized through the `ConcurrencyController`. The protocol for 
 
 1. Acquire exclusive write guard via `controller.begin_write()`
 2. Assign a statement-level `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
-3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete). Buffer pool saves before-images on first page touch.
-4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the CLOG; not flushed) and deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog restore when needed; return error to client and drop write guard if rollback cleanup succeeds. If rollback cleanup fails before the commit record is durable, log the rollback failure, attempt to flush WAL, and exit because the process may contain visible partial statement state. (The buffer-pool before-image undo of step 3 is retained; it is retired in Milestone C3 when abort becomes purely status-based.)
+3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
+4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the CLOG; not fsynced) and deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore when needed; return error to client and drop write guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If cleanup fails before the commit record is durable, log the failure, attempt to flush WAL, and exit.
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
-8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — discard rollback metadata and before-images; deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
+8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — cleanup-only (the buffer pool tracks no rollback metadata under status-based abort); deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
 9. Drop write guard (releases exclusive lock)
 10. Call `record_commit_and_maybe_checkpoint(&components)`; it may acquire its own write guard for a checkpoint
 11. Return success to the client
@@ -1504,32 +1501,29 @@ Reads acquire a shared read guard via `controller.begin_read()` and proceed conc
 
 If a write statement errors after mutating pages but before commit (e.g., a constraint violation mid-batch INSERT, or an internal error after allocating a page), dirty pages from that `txn_id` must be rolled back — they must not be visible to subsequent reads or included in the next checkpoint.
 
-**V1 policy: before-image rollback.**
+**Policy (MVCC): status-based abort, no page undo.**
 
-The buffer pool saves a before-image (copy of the page data) on the first write to each page by a `txn_id`. On failure, before-images are restored; on success, they are discarded.
+With MVCC (Milestone D1, `docs/specs/mvcc.md` §4 Decision 3) abort is purely status-based: a transaction's heap/index page mutations are **not** undone. A rolled-back transaction's versions stay in the heap, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM (Milestone F). This replaces the pre-MVCC before-image rollback (the buffer pool no longer saves or restores before-images), which could not un-flush a page the relaxed flush gate may already have evicted and is incompatible with concurrent writers (Milestone E).
 
 **Success path:**
-1. `write_page(file, page, txn_id)` — saves before-image on first touch, returns write guard
+1. `write_page(file, page, txn_id)` — marks the page dirty, returns write guard
 2. ... (statement executes, modifying pages) ...
-3. Append `Commit` record, flush WAL
-4. `storage.commit_txn(txn_id)` — discards storage-owned rollback metadata
-5. `buffer_pool.commit(txn_id)` — discards before-images (changes are permanent)
+3. Append `Commit` record, flush WAL (sets CLOG → `Committed`)
+4. `storage.commit_txn(txn_id)` / `buffer_pool.commit(txn_id)` — no-op cleanup
 
 **Failure path:**
-1. `write_page(file, page, txn_id)` — saves before-image on first touch
+1. `write_page(file, page, txn_id)` — marks the page dirty
 2. ... (statement fails mid-execution) ...
-3. Append an `Abort` record (CLOG → `Aborted`; not flushed) and deregister the txn from the active-transaction registry
-4. `storage.rollback_txn(txn_id)` — restores table metadata (index and heap pages roll back via the buffer pool's before-images)
-5. `buffer_pool.rollback(txn_id)` — restores all pages to their before-images
+3. Append an `Abort` record (CLOG → `Aborted`; not fsynced) and deregister the txn from the active-transaction registry
+4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index schema shadow state); it does NOT touch heap/index page content
+5. `buffer_pool.rollback(txn_id)` — no-op bookkeeping clear (the dirty pages stay, hidden by the CLOG)
 6. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
-7. WAL records for this `txn_id` remain but have no `Commit` — ignored by recovery (its `Abort` record, durable or not, makes it not-committed)
+7. WAL records for this `txn_id` remain but have no `Commit` — recovery replays them (redo-all) and the CLOG hides them
 8. Error returned to client
 
-If any rollback cleanup step fails before the commit record is durable, the server treats process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits instead of returning to service.
+If any cleanup step fails before the commit record is durable, the server treats process state as unsafe: it logs the failure, attempts to flush WAL, and exits instead of returning to service.
 
-**Why before-images, not reload-from-heap:** A page may have been dirtied by a prior *committed* transaction that has not yet been flushed. Reloading from the heap file would lose that committed change. Before-images capture the page state *at the moment this txn_id first touched it*, which correctly preserves prior committed modifications.
-
-**Memory cost:** One 8KB copy per page touched by the active statement, held only for the statement duration. With V1's single-writer autocommit, this is bounded by the number of pages a single statement modifies.
+**Why no undo:** an aborted version is hidden by the CLOG check the visibility predicate already performs — the same mechanism snapshot isolation needs — so undoing the page would be redundant work, and (post-D1) impossible once the page has been stolen to disk. VACUUM reclaims the space later.
 
 ### Checkpoint
 
@@ -1537,13 +1531,13 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 **Checkpoint protocol:**
 
-1. Acquire exclusive write guard (no statement in-flight; every dirty page is committed).
+1. Acquire exclusive write guard (no statement in-flight).
 2. `wal.flush()` — a page's redo must be durable before the page is written.
-3. `buffer_pool.flush_committed_pages()` — write flushable dirty pages to the heap `PageStore`.
+3. `buffer_pool.flush_dirty_pages()` — write flushable dirty pages to the heap `PageStore` (committed, aborted, and — under Stage 2 — in-flight alike; all WAL-durable after step 2, and the CLOG hides the non-committed tuples).
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point (atomic temp + fsync + rename + directory fsync).
-7. Append `WalRecord { txn_id: 0, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)`.
+7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)` (conservative — never drops an aborted/in-flight transaction's records, `mvcc.md` §5.4).
 8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
 9. Drop write guard.
 
@@ -1588,7 +1582,7 @@ impl PageBackedStorageEngine {
 1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
 2. Initialize storage in recovery mode and the catalog; `install_schemas`.
 3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
-4. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike — DDL via `RecoveryOperations`.
+4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — DDL via `RecoveryOperations` only for committed transactions. The CLOG (rebuilt from `Commit`/`Abort`) decides visibility; aborted/in-flight versions are invisible.
 5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
 6. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
@@ -1691,7 +1685,7 @@ The `server` crate is the binary entry point.
 6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
 7. Initialize catalog from the control catalog bytes (or empty); `storage.install_schemas(catalog.list_tables()?)`
 8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
-9. Replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike, DDL via `RecoveryOperations` — no WAL appended in recovery mode
+9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, DDL via `RecoveryOperations` only for committed transactions — the CLOG decides visibility; no WAL appended in recovery mode
 10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
 11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
 12. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)

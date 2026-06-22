@@ -24,8 +24,14 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     let _guard = components.concurrency.begin_write()?;
 
     // The WAL must be durable before any page it describes is written to the heap.
+    // With the relaxed flush gate (`docs/specs/mvcc.md` §8, Milestone D1) this
+    // spills ALL WAL-durable dirty pages — committed, aborted, and (under Stage-2)
+    // in-flight alike — to the heap; the CLOG hides the non-committed tuples and
+    // VACUUM (Milestone F) reclaims them. fsync ordering is preserved: WAL flush →
+    // flush dirty pages → store fsync → control record → Checkpoint marker → WAL
+    // truncation → mark clean.
     components.wal.flush()?;
-    components.buffer_pool.flush_committed_pages()?;
+    components.buffer_pool.flush_dirty_pages()?;
     components.store.sync_all()?;
 
     let checkpoint_lsn = components.wal.flushed_lsn();

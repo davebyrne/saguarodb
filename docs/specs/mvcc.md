@@ -278,7 +278,36 @@ because recovery rebuilds the CLOG from the WAL regardless. The `Clog` lives in
   Committed`, so the redo-committed-only flush/replay gate is behavior-identical.
 - Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as
   `Committed`/visible; an unrecorded normal id reads as `InProgress`.
+- An **implicit-committed floor**: an unrecorded normal id strictly below the
+  floor reads as `Committed`, covering a *committed* transaction whose `Commit`
+  record a checkpoint truncated. An explicit recorded status (e.g. `Aborted`) is
+  checked first and always wins over the floor.
 - Consulted by the visibility predicate (B3) and the flush policy at runtime.
+
+**Conservative truncation / floor (Milestone D, the critical guard).** Once the
+relaxed flush gate (§8) lets an aborted/in-flight transaction's pages reach the
+heap, the floor rule "unrecorded-below-floor ⇒ committed" is only sound if such a
+transaction is never *below* the floor. So:
+
+- WAL truncation (`WalManager::truncate_before`) advances only across a **prefix
+  of committed transactions**: it clamps the truncation LSN to the earliest record
+  of the *oldest* transaction below the requested boundary whose CLOG status is not
+  `Committed` (aborted or, under Stage 2, in-flight). That transaction "pins"
+  truncation — its records (notably its `Abort`) are retained so its status stays
+  reconstructible at the next recovery. Under Stage-1 serialized writers no write
+  transaction is in-flight during a checkpoint, so in practice the pin is an
+  *aborted* transaction.
+- The floor is advanced (at truncation, and re-established at recovery) only up to
+  — never across — that oldest non-committed transaction: at recovery the floor is
+  `min(allocation_boundary, oldest_non_committed_retained_xid)`. Because truncation
+  guarantees everything dropped below the oldest retained non-committed transaction
+  was committed, ids below the floor are all genuinely committed.
+- **F dependency / cost.** Aborted transactions therefore *pin* WAL truncation
+  (bounded extra WAL retained), until VACUUM (Milestone F) reclaims their on-disk
+  versions; only then is it safe to truncate past an aborted transaction and let
+  the floor cover it (a transaction with no surviving versions is trivially
+  implicit-committed). Aggressive truncation past aborted transactions is enabled
+  in Milestone F.
 - **(Deferred to F)** A durable CLOG file, truncatable below the GC horizon (§9)
   and coordinated with checkpoint/WAL truncation. Transactions older than the
   horizon are implicitly committed (their versions are either reclaimed or frozen).
@@ -371,17 +400,46 @@ same status check on the conflicting index entry's tuple.
 
 ## 8. Recovery and durability
 
-- **Flush policy** (`crates/server/src/recovery.rs`, `WalFlushPolicy`): drop the
-  `is_committed` gate; keep the WAL-durability gate (`page_lsn ≤ flushed_lsn`).
-  Uncommitted versions may be evicted — they are invisible.
-- **Recovery**: redo via `replay_from` (not `replay_committed_from`), applying all
-  heap/index/header records under PageLSN gating; build the CLOG from
-  `Commit`/`Abort` records as replay proceeds. Any transaction with neither a
-  durable `Commit` nor `Abort` at crash is recorded `Aborted`. No undo pass.
+*(Implemented in Milestone D — D1 + D2 combined; §10.)*
+
+- **Flush policy** (`crates/server/src/recovery.rs`, `WalFlushPolicy`): the
+  `is_committed`/`dirty_txn_id` committedness gate is **dropped**; only the
+  WAL-durability gate (`page_lsn ≤ flushed_lsn`) remains. A heap page holds
+  versions from several transactions, so page-level committedness is incoherent.
+  Uncommitted and aborted dirty pages may now be evicted/flushed — they are
+  invisible via the CLOG and reclaimed by VACUUM (§9).
+- **Write-ahead on steal**: because the relaxed gate admits *uncommitted* pages,
+  whose WAL records are not yet flushed, the buffer pool's eviction (steal) path
+  forces the WAL durable (`FlushPolicy::ensure_durable` → `wal.flush`) **before**
+  writing a stolen dirty page to its home. The pre-D1 committed-only steal needed
+  no such force (a committed page's WAL — including its `Commit` — was already
+  durable).
+- **Recovery — redo-all**: redo via `replay_from` (not the retired
+  `replay_committed_from`), applying every PHYSICAL redo record
+  (heap/index/header/full-page-image) under PageLSN gating, regardless of the
+  dirtying transaction's outcome. The CLOG — rebuilt from the durable
+  `Commit`/`Abort` records as the WAL opens — decides visibility afterwards. Any
+  transaction with neither a durable `Commit` nor `Abort` at crash (in-flight at
+  crash) is treated as **Aborted**. There is **no undo pass**.
+  - **Logical catalog records** (`CreateTable`/`DropTable`/`CreateIndex`/
+    `DropIndex`) are the one exception: they mutate the durable catalog directly
+    (not idempotent PageLSN-gated page bytes), so redo gates them by the rebuilt
+    CLOG — only a *committed* DDL replays. DDL is non-transactional and commits
+    immediately (§4 Decision 6), so an aborted/in-flight DDL is skipped; its
+    index/heap pages may still replay harmlessly as unreferenced, invisible orphan
+    pages.
 - **Checkpoint** ordering is unchanged in shape (`crates/server/src/checkpoint.rs`):
-  `wal.flush` → `flush_committed_pages` → `store.sync_all` → control record →
-  `Checkpoint` marker → `truncate_before` → `mark_all_clean`. CLOG is persisted/
-  truncated in coordination with the control record and WAL truncation.
+  `wal.flush` → `flush_dirty_pages` → `store.sync_all` → control record →
+  `Checkpoint` marker → `truncate_before` → `mark_all_clean`. (`flush_committed_pages`
+  is renamed `flush_dirty_pages`: it now spills committed, aborted, and — under
+  Stage 2 — in-flight dirty pages alike, since all are WAL-durable once `wal.flush`
+  has run and the CLOG hides the non-committed ones.)
+- **Conservative WAL truncation / `committed_floor`** (the critical D guard; see
+  §5.4): truncation never drops a transaction that is not durably committed
+  (aborted or in-flight), and the implicit-committed floor never crosses one.
+  Otherwise an aborted transaction's flushed-but-now-orphan versions, with its
+  `Abort` record truncated and the floor floated above it, would read as
+  *committed* after restart — corruption, since no VACUUM yet reclaims them.
 - **Consequence**: after a crash the heap may contain flushed-then-aborted/dead
   versions. This is correct (CLOG hides them; VACUUM reclaims them). Heap
   cleanliness is a VACUUM responsibility, not a recovery responsibility.
@@ -500,19 +558,34 @@ reference current files.
     /abort still uses `buffer_pool.rollback(txn)` plus the `Abort` record +
     `CLOG=Aborted`. Retiring it requires the relaxed flush gate, so it moves to D1.
 
-### Milestone D — Recovery & durability rework
+### Milestone D — Recovery & durability rework *(implemented; D1 + D2 in one commit)*
+
+D1 and D2 are **entailed together** (§4 Decision 4) and were landed as a single
+commit: relaxing the flush gate (D1) lets uncommitted/aborted pages reach disk,
+and only redo-all + CLOG-visibility recovery (D2) can correctly hide them after a
+crash; before-image undo cannot coexist with the relaxed gate (it cannot un-flush
+an already-evicted page).
 
 - **D1 — Relax flush policy** (§8), **and retire the buffer-pool before-image
-  undo** (abort becomes pure invisibility). These two belong together (§4 Decision
-  4): the flush gate is relaxed to WAL-durability only, which lets aborted dirty
-  pages be flushed/evicted; before-image undo can then be removed, because an
-  aborted version is hidden by the CLOG and reclaimed by VACUUM rather than undone.
-  Retiring before-image undo *before* relaxing the gate would leave aborted dirty
-  pages unflushable (the gate still requires `is_committed`) and pin the buffer
-  pool — a liveness bug — so C3 keeps before-image undo and D1 owns its removal.
-  **D2 — Redo-all recovery** + CLOG visibility; in-flight-at-crash = aborted; build
-  CLOG during replay. Crash tests across checkpoint boundaries, torn pages,
-  eviction of uncommitted pages.
+  undo** (abort becomes pure invisibility). The flush gate is relaxed to
+  WAL-durability only, which lets aborted/uncommitted dirty pages be
+  flushed/evicted (the steal path forces the WAL first — §8). Before-image undo is
+  removed: `record_before_image`/`rollback`-restore and their `BeforeImage` storage
+  are gone from `crates/buffer`; `ROLLBACK`/statement-error-abort is now `Abort`
+  record + `CLOG = Aborted` + deregister, with **no page undo**. A rolled-back
+  transaction's pages (modified or freshly allocated) stay resident as
+  dirty-but-evictable frames, hidden by the CLOG, and match what redo-all replays.
+- **D2 — Redo-all recovery** + CLOG visibility: `replay_from` applies every
+  physical record under PageLSN gating; the CLOG (built from `Commit`/`Abort` at
+  WAL open) decides visibility; in-flight-at-crash = aborted. Logical catalog
+  records are CLOG-gated (§8).
+- **Conservative truncation / floor** (§5.4): truncation never crosses an
+  aborted/in-flight transaction and the floor never marks one implicitly committed
+  (the critical correctness guard). Aggressive truncation past aborted
+  transactions is **deferred to Milestone F**, once VACUUM reclaims aborted
+  versions. Crash tests cover checkpoint boundaries, the committed-via-floor path,
+  torn pages, eviction of uncommitted/aborted pages, and the aborted-across-
+  checkpoint invisibility guarantee.
 
 *A–D = MVCC MVP: snapshot reads + multi-statement transactions + serial writers +
 correct recovery. Correct, but bloats heap and indexes until F.*
@@ -567,17 +640,21 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
   secondary→heap-TID and re-specs the merged secondary-index feature.
 - **Executor identity.** `RowId` becomes `(page, line-pointer)`, stable across
   intra-page compaction; UPDATE/DELETE target by TID.
-- **Before-image retirement.** **D1** removes the buffer-pool before-image
-  rollback; abort becomes status-based. (Originally sequenced in C3, but retiring
-  it requires the relaxed flush gate — otherwise aborted dirty pages stay
-  unflushable under the `is_committed` gate and pin the buffer pool, a liveness
-  bug. §4 Decision 4 entails the flush-gate relaxation and abort-as-invisibility
-  together, so retirement belongs with D1. Through C3, abort keeps before-image
-  undo *and* records the `Abort`/`CLOG=Aborted`; this is correct for Stage-1
-  serialized writers, where one writer at a time means a single before-image per
-  page never has to serve two concurrent writers.) Before-image retirement is a
-  hard prerequisite for E (one before-image per page cannot serve concurrent
-  writers).
+- **Before-image retirement.** **D1 (implemented)** removed the buffer-pool
+  before-image rollback; abort is now status-based. `record_before_image`, the
+  before-image `rollback` restore, the `BeforeImage` storage, and
+  `restore_dirty_state` are gone from `crates/buffer/src/pool.rs`; the buffer
+  pool's `rollback` is now a bookkeeping clear that reclaims nothing (a rolled-back
+  transaction's pages stay dirty-but-evictable, hidden by the CLOG, matching
+  redo-all). The server abort path (`crates/server/src/query.rs`) appends `Abort` +
+  sets `CLOG = Aborted` + deregisters; the `storage.rollback_txn` it still calls is
+  DDL *metadata* restoration (table/index schema shadow state for a failed
+  in-unit CREATE/DROP), not page undo. (Originally sequenced in C3, but retiring it
+  required the relaxed flush gate — otherwise aborted dirty pages stay unflushable
+  under the `is_committed` gate and pin the buffer pool, a liveness bug. §4
+  Decision 4 entails the flush-gate relaxation and abort-as-invisibility together,
+  so retirement belonged with D1.) Before-image retirement is a hard prerequisite
+  for E (one before-image per page cannot serve concurrent writers).
 - **Error codes.** C3 adds `SqlState::InFailedSqlTransaction` (`25P02`): the `'E'`
   transaction state rejects all but `COMMIT`/`ROLLBACK` with it. Milestone E adds
   `SqlState::SerializationFailure` (`40001`).
@@ -609,6 +686,14 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
   `Commit`/`Abort` WAL records — see §5.4. A durable CLOG file and its truncation
   are deferred to Milestone F, when GC needs them to bound recovery scans; until
   then this question is open only for F.)*
+  *(D resolution — WAL/CLOG truncation vs aborted transactions: the MVP truncates
+  the WAL only across a prefix of committed transactions; an aborted (or in-flight)
+  transaction pins truncation and keeps its `Abort` record, and the recovery floor
+  never crosses it (§5.4, §8). This keeps aborted-but-flushed versions invisible
+  across restart without a durable CLOG or an undo pass. The remaining open part is
+  purely for F: once VACUUM reclaims an aborted transaction's versions, truncation
+  may advance past it — its versions are gone, so it is trivially
+  implicit-committed — bounding the WAL retained for long-lived aborted ids.)*
 - Snapshot representation cost (`xip` as `Vec` vs a more compact structure) — fine
   at the target concurrency; revisit only if measured.
 - Frozen-xid / wraparound handling for very old `xmin` values (far off; the

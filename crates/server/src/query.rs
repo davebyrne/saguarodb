@@ -434,8 +434,10 @@ impl QueryService {
             Err(err) => {
                 // Any statement error poisons the transaction: it enters 'E' and
                 // must be ended with COMMIT/ROLLBACK. No partial-statement undo is
-                // needed (the failed version stays invisible via the CLOG, and a
-                // later ROLLBACK does the before-image undo).
+                // needed — the failed statement's versions stay invisible via the
+                // CLOG (the transaction will be marked Aborted on ROLLBACK), and
+                // abort is status-based, not before-image undo (`docs/specs/mvcc.md`
+                // §4 Decision 3, Milestone D1).
                 txn.failed = true;
                 (Some(txn), Err(err))
             }
@@ -583,8 +585,11 @@ impl QueryService {
         }
 
         if let Err(err) = self.append_and_flush_commit(txn_id) {
-            // The commit is not durable: abort instead (before-image undo +
-            // CLOG=Aborted) so the transaction's effects are discarded cleanly.
+            // The commit is not durable: abort instead (append `Abort` +
+            // CLOG=Aborted, clear per-txn bookkeeping, restore DDL metadata)
+            // so the transaction's effects are hidden by the CLOG. Abort is
+            // status-based — no page-content undo (`docs/specs/mvcc.md` §4
+            // Decision 3, Milestone D1).
             self.rollback_pre_durable_or_die(txn_id, None);
             // `txn` (and its write guard) drops here, releasing the guard.
             return Err(err);
@@ -603,15 +608,18 @@ impl QueryService {
         Ok(())
     }
 
-    /// Abort an explicit transaction: append an `Abort` record, set
-    /// `CLOG=Aborted`, undo via the buffer-pool before-images, and deregister.
+    /// Abort an explicit transaction: append an `Abort` record, set `CLOG=Aborted`,
+    /// clear per-txn bookkeeping, restore DDL metadata, and deregister. Abort is
+    /// status-based (`docs/specs/mvcc.md` §4 Decision 3,
+    /// Milestone D1): the transaction's modified tuples stay in the heap, hidden by
+    /// the CLOG and reclaimed by VACUUM — there is NO before-image page undo.
     /// Dropping `txn` releases the write guard. A pre-durable rollback failure is
     /// fatal (the engine cannot guarantee consistency), matching the autocommit
     /// path.
     fn abort_transaction(&self, txn: Transaction) {
         let txn_id = txn.txn_id;
         if txn.write_guard.is_none() {
-            // A read-only transaction wrote nothing: no Abort record, no undo,
+            // A read-only transaction wrote nothing: no Abort record, no cleanup,
             // just deregister.
             self.components.active_txns.deregister(txn_id);
             return;
@@ -738,13 +746,14 @@ impl QueryService {
         catalog_before: Option<catalog::CatalogSnapshot>,
     ) -> Result<()> {
         // Record the abort: append an `Abort` record (which sets the CLOG to
-        // `Aborted`) and drop the transaction from the active set. The abort is
-        // not flushed — abort durability is not critical, since a transaction with
-        // no durable `Commit` is recovered as aborted regardless. A failure to
-        // append it is logged but not fatal: the in-memory rollback below (the
-        // before-image undo retained through C3 — retirement is deferred to D1
-        // with the flush-gate relaxation, see `docs/specs/mvcc.md` §10 D1) still
-        // restores correctness.
+        // `Aborted`) and drop the transaction from the active set. The abort is not
+        // fsynced here — a transaction with no durable `Commit` is recovered as
+        // aborted regardless (redo-all + in-flight = aborted, `docs/specs/mvcc.md`
+        // §8). The unflushed `Abort` is still durable by the next checkpoint, whose
+        // `wal.flush` makes it so before truncation, where it pins conservative WAL
+        // truncation (an aborted txn's flushed pages must stay hidden across a
+        // checkpoint, §5.4). A failure to append it is logged but not fatal: the
+        // txn is still recovered as aborted.
         if let Err(err) = self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
@@ -754,6 +763,16 @@ impl QueryService {
         }
         self.components.active_txns.deregister(txn_id);
 
+        // Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1):
+        // there is NO before-image page undo. The transaction's modified tuples
+        // stay in the heap, hidden by the CLOG (Aborted) and reclaimed by VACUUM.
+        // The two cleanups below are not undo: `storage.rollback_txn` restores the
+        // engine's own DDL metadata (table/index schema shadow state, for a failed
+        // CREATE/DROP inside the unit), and `buffer_pool.rollback` only clears any
+        // per-txn bookkeeping. It does NOT undo or reclaim pages: tuples and pages
+        // this transaction modified or freshly allocated stay resident as
+        // dirty-but-evictable frames (and page numbers are not reused), matching
+        // what redo-all recovery replays and the CLOG then hides.
         if let Err(err) = self.components.storage.rollback_txn(txn_id) {
             return Err(DbError::internal(format!(
                 "storage rollback failed for txn {txn_id}: {err}",

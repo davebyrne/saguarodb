@@ -259,51 +259,67 @@ impl WalManager for FileWalManager {
         Ok(Box::new(records.into_iter()))
     }
 
-    fn replay_committed_from(
-        &self,
-        lsn: Lsn,
-    ) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
-        let state = self.lock_state()?;
-        let committed_after: HashSet<_> = state
-            .records
-            .iter()
-            .filter(|stored| stored.record.lsn > lsn)
-            .filter(|stored| matches!(stored.record.kind, WalRecordKind::Commit))
-            .filter(|stored| state.clog.is_committed(stored.record.txn_id))
-            .map(|stored| stored.record.txn_id)
-            .collect();
-        let records: Vec<_> = state
-            .records
-            .iter()
-            .filter(|stored| stored.record.lsn > lsn)
-            .filter(|stored| committed_after.contains(&stored.record.txn_id))
-            .filter(|stored| is_redo_operation(&stored.record.kind))
-            .map(|stored| Ok(stored.record.clone()))
-            .collect();
-        Ok(Box::new(records.into_iter()))
-    }
-
     fn truncate_before(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.lock_state()?;
-        let retained: Vec<_> = state
-            .records
-            .iter()
-            .filter(|stored| stored.record.lsn >= lsn)
-            .cloned()
-            .collect();
-        // Transactions whose records are being truncated are settled and durable
-        // (the checkpoint flushed their committed pages; aborted transactions left
-        // no flushed tuples). Advance the implicit-committed floor past them so a
-        // post-truncation read still treats their surviving tuples as committed,
-        // even though their `Commit` records are gone (`docs/specs/mvcc.md` §5.4).
-        let truncated_floor = state
+
+        // CONSERVATIVE TRUNCATION (`docs/specs/mvcc.md` §5.4, §8, Milestone D).
+        // The relaxed flush gate (D1) lets an aborted/in-flight transaction's pages
+        // reach the heap, and recovery rebuilds the CLOG from the retained WAL. So
+        // truncation must never drop a non-committed transaction's records: if it
+        // did, its `Abort` record (or absence of a `Commit`) would be gone, the
+        // implicit-committed floor would float above it, and its on-disk versions
+        // would wrongly read as committed (corruption — VACUUM, Milestone F, is what
+        // will reclaim aborted data and re-enable aggressive truncation).
+        //
+        // Find the oldest transaction with a record below the requested boundary
+        // that is NOT durably committed (aborted or in-flight). It "pins"
+        // truncation: clamp the effective boundary to its earliest record so that
+        // record, and everything after it, is retained. Under Stage-1 serialized
+        // writers no write transaction is in-flight during a checkpoint, so in
+        // practice this pin is an *aborted* transaction; the active case is covered
+        // for safety/Stage-2.
+        let pin = state
             .records
             .iter()
             .filter(|stored| stored.record.lsn < lsn)
+            .filter(|stored| represents_transaction(&stored.record))
+            .filter(|stored| !state.clog.is_committed(stored.record.txn_id))
+            .min_by_key(|stored| stored.record.lsn)
+            .map(|stored| (stored.record.lsn, stored.record.txn_id));
+        let effective_lsn = match pin {
+            Some((pin_lsn, _)) => lsn.min(pin_lsn),
+            None => lsn,
+        };
+
+        let retained: Vec<_> = state
+            .records
+            .iter()
+            .filter(|stored| stored.record.lsn >= effective_lsn)
+            .cloned()
+            .collect();
+        // Every transaction dropped below `effective_lsn` is committed (the pin
+        // above retained the oldest non-committed one), so advancing the
+        // implicit-committed floor past them keeps their surviving tuples readable
+        // as committed even though their `Commit` records are gone. Crucially the
+        // floor never crosses the pinned (non-committed) transaction: its records
+        // are retained, so it is not among the dropped set, and the max below is the
+        // greatest *dropped* (committed) id. A retained `Abort` keeps its explicit
+        // status regardless (recorded status wins over the floor).
+        let truncated_floor = state
+            .records
+            .iter()
+            .filter(|stored| stored.record.lsn < effective_lsn)
+            .filter(|stored| represents_transaction(&stored.record))
             .map(|stored| stored.record.txn_id)
-            .filter(|&txn_id| txn_id != 0)
             .max()
-            .map(|max_truncated| max_truncated + 1);
+            .map(|max_truncated| max_truncated + 1)
+            // Defensive clamp: never advance the floor to or past the pinned
+            // (non-committed) transaction, even if id/LSN order were ever not
+            // strictly aligned (it is under Stage-1 serialized writers).
+            .map(|floor| match pin {
+                Some((_, pin_txn)) => floor.min(pin_txn),
+                None => floor,
+            });
         let temp_path = self.path.with_extension("tmp");
         {
             let mut temp_file = OpenOptions::new()
@@ -408,8 +424,28 @@ impl WalManager for FileWalManager {
             .sum())
     }
 
-    fn set_committed_floor(&self, floor: u64) -> Result<()> {
-        self.lock_state()?.clog.set_committed_floor(floor);
+    fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()> {
+        let mut state = self.lock_state()?;
+        // The floor must not cross any retained transaction that is not durably
+        // committed (aborted or in-flight): such a transaction's versions may be on
+        // disk (relaxed flush gate), and flooring past it would mark it implicitly
+        // committed (`docs/specs/mvcc.md` §5.4, §8). So the floor is the oldest
+        // non-committed retained transaction id, or the allocation boundary if every
+        // retained transaction is committed. Conservative truncation already
+        // guarantees every transaction dropped below the oldest retained
+        // non-committed one was committed, so ids below this floor are all committed.
+        let oldest_non_committed = state
+            .records
+            .iter()
+            .filter(|stored| represents_transaction(&stored.record))
+            .map(|stored| stored.record.txn_id)
+            .filter(|&txn_id| !state.clog.is_committed(txn_id))
+            .min();
+        let floor = match oldest_non_committed {
+            Some(oldest) => allocation_boundary.min(oldest),
+            None => allocation_boundary,
+        };
+        state.clog.set_committed_floor(floor);
         Ok(())
     }
 }
@@ -465,6 +501,20 @@ impl FileWalManager {
     }
 }
 
+/// Whether `record` represents a real transaction whose CLOG outcome the
+/// conservative-truncation guard must protect (`docs/specs/mvcc.md` §5.4). True
+/// for operation/`Commit`/`Abort` records; FALSE for `txn_id == 0` system metadata
+/// and for the `Checkpoint` marker. The marker carries the transaction-id
+/// allocation high-water in its `txn_id` field (so `next_txn_id` survives
+/// truncation), but that id is an already-settled transaction's, not a transaction
+/// that still needs its records retained or the floor held below it — counting it
+/// here would (e.g. after two checkpoints with no write between, when the second
+/// checkpoint's boundary lands on the first's marker) clamp the floor at the last
+/// committed transaction and hide its committed rows.
+fn represents_transaction(record: &WalRecord) -> bool {
+    record.txn_id != 0 && !matches!(record.kind, WalRecordKind::Checkpoint { .. })
+}
+
 /// Rebuild the CLOG from the durable records (`lsn <= flushed_lsn`): each
 /// `Commit` marks its txn committed, each `Abort` marks its txn aborted. This is
 /// the recovery-time CLOG reconstruction described in `docs/specs/mvcc.md` §8 —
@@ -493,15 +543,6 @@ fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
         .filter(|stored| matches!(stored.record.kind, WalRecordKind::Commit))
         .map(|stored| stored.record.txn_id)
         .collect()
-}
-
-/// A replayable operation record (anything that recovery applies), i.e. every
-/// record except the `Commit` / `Abort` / `Checkpoint` metadata markers.
-fn is_redo_operation(kind: &WalRecordKind) -> bool {
-    !matches!(
-        kind,
-        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. }
-    )
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {

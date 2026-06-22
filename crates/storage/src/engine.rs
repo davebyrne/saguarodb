@@ -825,8 +825,12 @@ impl StorageEngine for PageBackedStorageEngine {
     }
 
     fn rollback_txn(&self, txn_id: u64) -> Result<()> {
-        // Index and heap page changes are rolled back by the buffer pool's
-        // before-images; storage only restores its own table metadata.
+        // Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1):
+        // index and heap PAGE changes are NOT undone — an aborted transaction's
+        // versions stay in the heap, hidden by the CLOG and reclaimed by VACUUM.
+        // This restores only the engine's own DDL metadata (table/index schema
+        // shadow state), so a failed in-unit CREATE/DROP leaves no phantom catalog
+        // entry.
         let mut state = self.lock_state()?;
         let Some(rollback) = state.rollback.remove(&txn_id) else {
             return Ok(());

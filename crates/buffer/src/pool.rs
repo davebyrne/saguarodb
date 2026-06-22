@@ -103,13 +103,19 @@ pub trait BufferPool: Send + Sync {
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
     fn iter_pages(&self) -> Result<Box<dyn Iterator<Item = PageInfo>>>;
     fn mark_all_clean(&self) -> Result<()>;
+    /// Release the pages an aborting transaction freshly *allocated* but never
+    /// durably committed (drop their frames, restore the allocation counter). Abort
+    /// is status-based (`docs/specs/mvcc.md` §4 Decision 3): pages the transaction
+    /// merely modified are NOT undone — they stay dirty-but-evictable and the CLOG
+    /// hides their tuples. Clears the transaction's dirty bookkeeping.
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
 
     /// Write every flushable dirty page (per the flush policy) to its home in the
-    /// `PageStore`. Does not fsync or mark frames clean; the caller fsyncs via the
-    /// store and then calls `mark_all_clean`. Used by checkpoint.
-    fn flush_committed_pages(&self) -> Result<()>;
+    /// `PageStore`, regardless of whether its dirtying transaction committed. Does
+    /// not fsync or mark frames clean; the caller fsyncs via the store and then
+    /// calls `mark_all_clean`. Used by checkpoint (`docs/specs/mvcc.md` §8).
+    fn flush_dirty_pages(&self) -> Result<()>;
 
     /// Obtain a writable frame for recovery redo, creating a zeroed frame when the
     /// page is absent from the store (a new page being re-established). The frame
@@ -181,7 +187,7 @@ impl MemoryBufferPool {
     }
 
     /// Free one frame. A clean unpinned frame is dropped under the lock; a
-    /// committed dirty victim (stealing enabled and the flush policy admits it)
+    /// WAL-durable dirty victim (stealing enabled and the flush policy admits it)
     /// is flushed to its home outside the lock, then evicted.
     fn make_room(&self) -> Result<()> {
         loop {
@@ -214,9 +220,21 @@ impl MemoryBufferPool {
             // *different* frame cannot tear this copy. The reservation pin keeps
             // another eviction from racing this one; a reader that pins the victim
             // during the flush is detected below.
-            let data = victim.data.read().clone();
-            self.store
-                .write_page(victim.file_id, victim.page_num, &data)?;
+            //
+            // Either fallible step (`ensure_durable` — write-ahead logging, forcing
+            // the WAL so the possibly-uncommitted victim's records are durable before
+            // its page reaches the heap, Milestone D1 — or the page write) must
+            // release the reservation pin on error, or the victim frame leaks
+            // (stays pinned, never evictable).
+            let flush_result = self.flush_policy.ensure_durable().and_then(|()| {
+                let data = victim.data.read().clone();
+                self.store
+                    .write_page(victim.file_id, victim.page_num, &data)
+            });
+            if let Err(err) = flush_result {
+                victim.unpin(); // release the flush reservation before propagating
+                return Err(err);
+            }
 
             let mut state = self.state.lock();
             victim.unpin(); // release the flush reservation
@@ -281,7 +299,6 @@ impl MemoryBufferPool {
                 return Ok(None);
             };
             state.advance_next_page_num(file_id, page_num);
-            state.record_before_image(txn_id, file_id, page_num, &frame);
             frame.mark_dirty(txn_id);
             frame.pin();
             Ok(Some(frame))
@@ -312,9 +329,8 @@ impl MemoryBufferPool {
         page_num: PageNum,
         txn_id: u64,
     ) -> Option<Arc<Frame>> {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         let frame = state.frames.get(&(file_id, page_num)).cloned()?;
-        state.record_before_image(txn_id, file_id, page_num, &frame);
         frame.mark_dirty(txn_id);
         frame.pin();
         Some(frame)
@@ -370,11 +386,13 @@ impl BufferPool for MemoryBufferPool {
             let frame = state.insert_fresh_frame(file_id, page_num)?;
             frame.mark_dirty(txn_id);
             state.advance_next_page_num(file_id, page_num);
-            let txn = state.txns.entry(txn_id).or_default();
-            txn.new_pages.push((file_id, page_num));
-            // `page_num` of the txn's first allocation in this file is its
-            // pre-txn allocation counter; remember it once for rollback.
-            txn.next_page_before.entry(file_id).or_insert(page_num);
+            // Under status-based abort (`docs/specs/mvcc.md` §4 Decision 3) a
+            // freshly allocated page is NOT reclaimed on rollback: it carries the
+            // aborting transaction's (now-invisible) tuples and matching WAL records
+            // that redo-all recovery replays, so dropping it at runtime would
+            // diverge from the recovered state and dangle the index entries that
+            // point at it. The page stays a normal dirty-but-evictable frame, hidden
+            // by the CLOG. No per-transaction page bookkeeping is needed.
             frame.pin();
             Ok(Some((page_num, frame)))
         })?;
@@ -408,57 +426,33 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn mark_all_clean(&self) -> Result<()> {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         for frame in state.frames.values() {
             frame.mark_clean();
         }
-        state.txns.clear();
         Ok(())
     }
 
-    fn rollback(&self, txn_id: u64) -> Result<()> {
-        let dirty_state = {
-            let mut state = self.state.lock();
-            state.txns.remove(&txn_id)
-        };
-
-        let Some(dirty_state) = dirty_state else {
-            return Ok(());
-        };
-
-        let new_pages: HashSet<_> = dirty_state.new_pages.into_iter().collect();
-
-        {
-            let mut state = self.state.lock();
-            for key in &new_pages {
-                state.remove_frame(*key);
-            }
-            // Restore each file's allocation counter so the rolled-back pages are
-            // re-allocatable (single writer in v1, so no other txn raised it).
-            for (file_id, before) in dirty_state.next_page_before {
-                state.next_page_num_by_file.insert(file_id, before);
-            }
-        }
-
-        for ((file_id, page_num), before_image) in dirty_state.before_images {
-            if new_pages.contains(&(file_id, page_num)) {
-                continue;
-            }
-
-            if let Some(frame) = {
-                let state = self.state.lock();
-                state.frames.get(&(file_id, page_num)).cloned()
-            } {
-                *frame.data.write() = before_image.data;
-                frame.restore_dirty_state(before_image.was_dirty, before_image.dirty_txn_id);
-            }
-        }
-
+    fn rollback(&self, _txn_id: u64) -> Result<()> {
+        // Status-based abort (`docs/specs/mvcc.md` §4 Decision 3, §11, Milestone
+        // D1): there is NO page undo and NO page reclamation. An aborting
+        // transaction's pages — both ones it modified in place and ones it freshly
+        // allocated — stay resident as dirty-but-evictable frames. Their tuples are
+        // hidden by the CLOG (`CLOG[txn] = Aborted`) and reclaimed by VACUUM
+        // (Milestone F); redo-all recovery replays the same pages, so keeping them
+        // at runtime matches the recovered state (and avoids dangling the index
+        // entries that point at a freshly allocated page). No pins are leaked: the
+        // statement's `PageWriteGuard`s were already dropped (unpinning their
+        // frames) before this runs. The before-image mechanism earlier milestones
+        // used is retired — it could not un-flush an already-evicted page and is
+        // incompatible with the concurrent writers of Milestone E.
         Ok(())
     }
 
-    fn commit(&self, txn_id: u64) -> Result<()> {
-        self.state.lock().txns.remove(&txn_id);
+    fn commit(&self, _txn_id: u64) -> Result<()> {
+        // Commit keeps the transaction's dirty pages resident for the next
+        // checkpoint to flush; there is no per-transaction page bookkeeping to
+        // clear (abort no longer reclaims pages, so none is tracked).
         Ok(())
     }
 
@@ -466,7 +460,7 @@ impl BufferPool for MemoryBufferPool {
         self.stealing.store(true, Ordering::Release);
     }
 
-    fn flush_committed_pages(&self) -> Result<()> {
+    fn flush_dirty_pages(&self) -> Result<()> {
         // Collect dirty frames under the lock, then do I/O without holding it.
         let dirty: Vec<Arc<Frame>> = {
             let state = self.state.lock();
@@ -482,10 +476,13 @@ impl BufferPool for MemoryBufferPool {
                 dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
                 page_lsn: None,
             };
-            // Checkpoint runs under the exclusive write guard, so every dirty
-            // page belongs to a committed (or recovery, txn 0) transaction and is
-            // flushable. An unflushable dirty page would be silently dropped by
-            // the subsequent `mark_all_clean`, so fail loudly instead.
+            // Checkpoint runs under the exclusive write guard, after the WAL is
+            // flushed, so every dirty page is WAL-durable and the relaxed policy
+            // (`docs/specs/mvcc.md` §8, Milestone D1) admits it whether or not its
+            // dirtying transaction committed — committed, aborted, and in-flight
+            // pages all spill to the heap (the CLOG hides the non-committed ones).
+            // An unflushable dirty page would be silently dropped by the subsequent
+            // `mark_all_clean`, so fail loudly instead.
             if !self.flush_policy.can_flush(&info) {
                 return Err(Self::storage_internal_error(
                     "checkpoint encountered an unflushable dirty page",
@@ -517,7 +514,6 @@ struct PoolState {
     next_page_num_by_file: HashMap<FileId, PageNum>,
     /// Files whose allocation counter has been seeded from the on-disk extent.
     extent_seeded: HashSet<FileId>,
-    txns: HashMap<u64, TxnDirtyState>,
 }
 
 impl PoolState {
@@ -609,27 +605,8 @@ impl PoolState {
         }
     }
 
-    fn record_before_image(
-        &mut self,
-        txn_id: u64,
-        file_id: FileId,
-        page_num: PageNum,
-        frame: &Frame,
-    ) {
-        self.txns
-            .entry(txn_id)
-            .or_default()
-            .before_images
-            .entry((file_id, page_num))
-            .or_insert_with(|| BeforeImage {
-                data: frame.data.read().clone(),
-                was_dirty: frame.is_dirty(),
-                dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
-            });
-    }
-
     /// Clock-sweep for an eviction victim. A clean unpinned frame is removed
-    /// immediately (`FreedClean`). When stealing is enabled, a committed dirty
+    /// immediately (`FreedClean`). When stealing is enabled, a WAL-durable dirty
     /// unpinned frame is pinned and returned (`ReservedDirty`) so the caller can
     /// flush it outside the lock before evicting. `NoVictim` means every frame is
     /// pinned or holds dirty data the flush policy refuses.
@@ -687,23 +664,6 @@ enum ReclaimOutcome {
     NoVictim,
 }
 
-#[derive(Default)]
-struct TxnDirtyState {
-    before_images: HashMap<PageKey, BeforeImage>,
-    new_pages: Vec<PageKey>,
-    /// Each file's allocation counter just before this txn first allocated into
-    /// it, so rollback can restore it and fully undo the allocation. Without this
-    /// a rolled-back B-tree build would leave the counter advanced, and a rebuild
-    /// in the same (reused) file would not place its metapage at page 0.
-    next_page_before: HashMap<FileId, PageNum>,
-}
-
-struct BeforeImage {
-    data: PageData,
-    was_dirty: bool,
-    dirty_txn_id: u64,
-}
-
 struct Frame {
     file_id: FileId,
     page_num: PageNum,
@@ -754,14 +714,6 @@ impl Frame {
         self.dirty_txn_id.store(0, Ordering::Release);
         // A clean page is on disk; its next modification must log a full-page
         // image so a torn write can be repaired during redo.
-        self.needs_fpi.store(true, Ordering::Release);
-    }
-
-    fn restore_dirty_state(&self, was_dirty: bool, dirty_txn_id: u64) {
-        self.dirty.store(was_dirty, Ordering::Release);
-        self.dirty_txn_id.store(dirty_txn_id, Ordering::Release);
-        // Conservatively require a full-page image on the next modification after
-        // a rollback, since the rolled-back statement's FPI (if any) is discarded.
         self.needs_fpi.store(true, Ordering::Release);
     }
 
@@ -830,7 +782,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rollback_restores_original_before_image_even_after_multiple_writes() {
+    fn rollback_does_not_undo_in_place_modifications_and_leaves_them_dirty() {
+        // Status-based abort (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1):
+        // rollback no longer restores a before-image. A page the aborted txn merely
+        // MODIFIED keeps its modified bytes and stays dirty-but-evictable; its
+        // tuples are hidden by the CLOG (Aborted), not physically undone. (Before
+        // D1 this test asserted the page was restored to the committed value 10;
+        // updated to assert no-undo, which is the new abort contract.)
         let pool = MemoryBufferPool::empty(8);
         let txn = 11;
 
@@ -851,17 +809,25 @@ mod tests {
 
         pool.rollback(12).unwrap();
 
+        // The last modification survives the rollback (no before-image undo).
         let page = pool.read_page(1, 0).unwrap();
-        assert_eq!(page.data()[0], 10);
+        assert_eq!(page.data()[0], 30);
         drop(page);
 
+        // The page is still resident and dirty, so it is evictable/flushable.
         let pages: Vec<_> = pool.iter_pages().unwrap().collect();
         assert_eq!(pages.len(), 1);
         assert!(pages[0].is_dirty);
     }
 
     #[test]
-    fn rollback_removes_new_pages_from_failed_transaction() {
+    fn rollback_keeps_a_freshly_allocated_page_resident_and_dirty() {
+        // Status-based abort no longer reclaims pages (`docs/specs/mvcc.md` §4
+        // Decision 3, Milestone D1): a page the aborting txn freshly allocated stays
+        // resident (its tuples hidden by the CLOG, its WAL records replayed by
+        // recovery), as a dirty-but-evictable frame. (Before D1 this asserted the
+        // page was removed; keeping it matches the recovered state and avoids
+        // dangling index entries.)
         let pool = MemoryBufferPool::empty(8);
 
         {
@@ -871,24 +837,32 @@ mod tests {
 
         pool.rollback(77).unwrap();
 
-        assert!(pool.read_page(1, 0).is_err());
+        // The page is still present, still dirty, and keeps its content (no undo).
+        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 99);
+        let pages: Vec<_> = pool.iter_pages().unwrap().collect();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].is_dirty);
     }
 
     #[test]
-    fn rollback_resets_allocation_so_new_pages_reuse_numbers() {
+    fn rollback_does_not_reuse_allocated_page_numbers() {
+        // The allocation counter is NOT reset on rollback (`docs/specs/mvcc.md` §4
+        // Decision 3, Milestone D1): the freshly allocated pages survive (invisible
+        // via the CLOG), so a later allocation must NOT reuse their page numbers and
+        // overwrite them. (Before D1, rollback reclaimed the pages and reset the
+        // counter so the numbers were reused; with no reclamation the counter only
+        // advances.)
         let pool = MemoryBufferPool::empty(8);
 
-        // A transaction allocates two pages in a fresh file, then rolls back.
         {
             let _meta = pool.new_page(1, 7).unwrap();
             let _root = pool.new_page(1, 7).unwrap();
         }
         pool.rollback(7).unwrap();
 
-        // The next transaction's first allocation reuses page 0, so a rebuilt
-        // B-tree in the same file places its metapage at page 0 again.
+        // The next allocation gets a fresh page number (2), not a reused 0/1.
         let page = pool.new_page(1, 8).unwrap();
-        assert_eq!(page.page_num(), 0);
+        assert_eq!(page.page_num(), 2);
     }
 
     #[test]
@@ -928,8 +902,14 @@ mod tests {
     }
 
     #[test]
-    fn rollback_of_clean_page_leaves_it_evictable() {
-        let pool = MemoryBufferPool::empty(1);
+    fn rollback_of_modified_page_leaves_it_dirty_without_undo() {
+        // A modified (previously-loaded) page is NOT restored by rollback under the
+        // status-based abort (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1): the
+        // modified bytes remain and the page stays dirty. (Before D1 this asserted
+        // the rollback cleaned the page so it became evictable; updated to the
+        // no-undo contract — an aborted-but-flushable dirty page is the new normal,
+        // hidden by the CLOG rather than physically reverted.)
+        let pool = MemoryBufferPool::empty(2);
         pool.load_page(1, 0, data_with_first_byte(1)).unwrap();
         {
             let mut page = pool.write_page(1, 0, 1).unwrap();
@@ -937,10 +917,12 @@ mod tests {
         }
 
         pool.rollback(1).unwrap();
-        pool.load_page(1, 1, data_with_first_byte(2)).unwrap();
 
-        assert!(pool.read_page(1, 0).is_err());
-        assert_eq!(pool.read_page(1, 1).unwrap().data()[0], 2);
+        // No before-image undo: the modified value 9 survives, and the page is dirty.
+        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 9);
+        let pages: Vec<_> = pool.iter_pages().unwrap().collect();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].is_dirty);
     }
 
     #[test]
@@ -966,8 +948,11 @@ mod tests {
         pool.load_page(1, 0, data_with_first_byte(2)).unwrap();
 
         assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 9);
+        // Status-based abort does no before-image undo (`docs/specs/mvcc.md` §4
+        // Decision 3, Milestone D1): the modified value 9 survives the rollback.
+        // (Before D1 the page was restored to its loaded value 1.)
         pool.rollback(77).unwrap();
-        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 1);
+        assert_eq!(pool.read_page(1, 0).unwrap().data()[0], 9);
     }
 
     #[test]
@@ -1055,9 +1040,13 @@ mod tests {
         assert!(pages[0].is_dirty);
         assert_eq!(pages[0].data.0[0], 99);
 
+        // The loaded-then-modified page was not freshly allocated by this txn, so a
+        // status-based rollback leaves its (modified) content in place — no
+        // before-image undo (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1).
+        // (Before D1 the rollback restored the loader value 88.)
         pool.rollback(99).unwrap();
         let page = pool.read_page(2, 5).unwrap();
-        assert_eq!(page.data()[0], 88);
+        assert_eq!(page.data()[0], 99);
     }
 
     #[test]
@@ -1195,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_committed_pages_writes_dirty_pages_to_store() {
+    fn flush_dirty_pages_writes_dirty_pages_to_store() {
         let store = Arc::new(CapturingStore::default());
         let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
         {
@@ -1204,7 +1193,7 @@ mod tests {
         }
         pool.commit(5).unwrap();
 
-        pool.flush_committed_pages().unwrap();
+        pool.flush_dirty_pages().unwrap();
 
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
@@ -1214,7 +1203,35 @@ mod tests {
     }
 
     #[test]
-    fn flush_committed_pages_errors_on_unflushable_dirty_page() {
+    fn flush_dirty_pages_writes_an_aborted_txns_dirty_page() {
+        // The relaxed flush gate (`docs/specs/mvcc.md` §8, Milestone D1) admits a
+        // page dirtied by an aborted transaction: checkpoint spills it to the heap
+        // (the CLOG hides its tuples). `FlushAll` models the WAL-durable policy.
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
+        {
+            let mut page = pool.new_page(1, 7).unwrap();
+            page.data_mut()[0] = 9;
+        }
+        // The txn aborts (status-based: its allocated page is dropped on rollback),
+        // so instead model an in-place modification of a committed page that then
+        // aborts: it stays dirty and must still be flushed by a checkpoint.
+        pool.commit(7).unwrap();
+        {
+            let mut page = pool.write_page(1, 0, 8).unwrap();
+            page.data_mut()[0] = 99;
+        }
+        pool.rollback(8).unwrap();
+
+        pool.flush_dirty_pages().unwrap();
+
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].2.0[0], 99, "aborted txn's modified page spills");
+    }
+
+    #[test]
+    fn flush_dirty_pages_errors_on_unflushable_dirty_page() {
         let store = Arc::new(CapturingStore::default());
         let pool = MemoryBufferPool::new(8, Box::new(NeverFlush), store.clone());
         {
@@ -1223,9 +1240,10 @@ mod tests {
         }
         pool.commit(5).unwrap();
 
-        // A dirty page that the policy refuses must fail loudly, never be silently
-        // dropped (it would be lost by the subsequent mark_all_clean).
-        let err = pool.flush_committed_pages().unwrap_err();
+        // A dirty page that the policy refuses (not WAL-durable) must fail loudly,
+        // never be silently dropped (it would be lost by the subsequent
+        // mark_all_clean).
+        let err = pool.flush_dirty_pages().unwrap_err();
         assert_eq!(err.kind, ErrorKind::Storage);
         assert!(store.writes.lock().unwrap().is_empty());
     }

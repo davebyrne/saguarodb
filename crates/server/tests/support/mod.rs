@@ -258,6 +258,12 @@ fn ready_for_query_status(bytes: &[u8]) -> Result<u8> {
     ))
 }
 
+/// Append a durable but never-committed transaction's heap records to a fresh
+/// WAL, on a standalone file id (`7`) that no table claims. Under redo-all
+/// recovery (`docs/specs/mvcc.md` §8) these ARE replayed (reconstructing an orphan
+/// page), but the transaction has no `Commit`, so it is recovered as aborted and
+/// its tuple is invisible — and, being on file id 7, it never collides with a
+/// table created after recovery (which starts at file id 1).
 pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|err| {
         common::DbError::io(format!(
@@ -269,8 +275,16 @@ pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
     wal.append(WalRecord {
         lsn: 0,
         txn_id: 1,
+        kind: WalRecordKind::HeapInit {
+            file_id: 7,
+            page_num: 0,
+        },
+    })?;
+    wal.append(WalRecord {
+        lsn: 0,
+        txn_id: 1,
         kind: WalRecordKind::HeapInsert {
-            file_id: 1,
+            file_id: 7,
             page_num: 0,
             slot: 0,
             row_bytes: vec![1, 2, 3],

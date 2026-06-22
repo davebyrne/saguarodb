@@ -7,7 +7,7 @@ use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
 use common::{DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController};
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
-use wal::{FileWalManager, WalManager, WalRecordKind};
+use wal::{FileWalManager, WalManager, WalRecordKind, is_redo_operation};
 
 use crate::app::{AppState, ServerComponents};
 use crate::checkpoint::{CheckpointState, run_checkpoint};
@@ -58,13 +58,39 @@ pub fn open_app(config: Config) -> Result<AppState> {
     storage.install_schemas(tables)?;
     storage.install_index_schemas(indexes)?;
 
-    // Redo: replay committed records after the checkpoint LSN onto the heap and
-    // index pages. PageLSN gating makes this idempotent; torn/missing pages are
-    // zeroed so a FullPageImage/HeapInit re-establishes them. The durable B-tree
-    // is recovered the same way (its mutations are full-page-image records).
+    // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
+    // record after the checkpoint LSN onto the heap and index pages, regardless of
+    // the dirtying transaction's outcome. PageLSN gating makes this idempotent;
+    // torn/missing pages are zeroed so a FullPageImage/HeapInit re-establishes
+    // them. The durable B-tree is recovered the same way (its mutations are
+    // full-page-image records). Visibility is decided afterwards by the CLOG, which
+    // the WAL manager rebuilt from the durable `Commit`/`Abort` records at open: an
+    // aborted or in-flight transaction's replayed versions are present in the heap
+    // but invisible (and reclaimed by VACUUM in Milestone F). This replaces the old
+    // redo-committed-only filter (`replay_committed_from`), which could not handle
+    // the flushed-but-uncommitted pages the relaxed flush gate (D1) now admits.
+    //
+    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`)
+    // are the exception: they mutate the durable catalog directly (not idempotent
+    // PageLSN-gated page bytes), so an aborted DDL's catalog record must NOT take
+    // effect. DDL is non-transactional and commits immediately (§4 Decision 6), so
+    // a committed DDL replays and an aborted/in-flight one is skipped — gated by the
+    // rebuilt CLOG. Its index/heap pages (physical records) may still replay
+    // harmlessly as orphan pages; they are unreferenced and invisible.
     let mut replay_applied = false;
-    for record in wal.replay_committed_from(checkpoint_lsn)? {
+    for record in wal.replay_from(checkpoint_lsn)? {
         let record = record?;
+        if !is_redo_operation(&record.kind) {
+            // `Commit`/`Abort`/`Checkpoint` are metadata markers, not page
+            // mutations; the CLOG already absorbed them at WAL open.
+            continue;
+        }
+        if is_logical_catalog_record(&record.kind) && !wal.is_committed(record.txn_id) {
+            // An aborted/in-flight DDL's catalog mutation must not be applied
+            // (redo-all does not hide a non-idempotent catalog change behind the
+            // CLOG the way it hides per-tuple versions).
+            continue;
+        }
         apply_redo(
             catalog.as_ref(),
             storage.as_ref(),
@@ -76,14 +102,18 @@ pub fn open_app(config: Config) -> Result<AppState> {
     }
 
     let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
-    // Establish the CLOG implicit-committed floor at the allocation boundary: every
-    // transaction id below `next_txn_id` was allocated in a prior run, and under
-    // Milestone B the flush gate never flushes uncommitted pages, so any surviving
-    // tuple from such a transaction is committed even if a checkpoint truncated its
-    // `Commit` record (`docs/specs/mvcc.md` §5.4). Without this, a checkpointed-then-
-    // recovered committed row would read as in-progress and be hidden by the
-    // visibility predicate.
-    wal.set_committed_floor(next_txn_id)?;
+    // Establish the CLOG implicit-committed floor (`docs/specs/mvcc.md` §5.4, §8).
+    // The floor lets an unrecorded normal id below it read as committed, covering a
+    // committed transaction whose `Commit` record a checkpoint truncated. With the
+    // relaxed flush gate (D1) an aborted/in-flight transaction's pages may also be
+    // on disk, so the floor must NOT cross such a transaction or its replayed
+    // versions would wrongly become visible. The WAL manager therefore computes the
+    // floor conservatively: the oldest transaction in the retained WAL whose CLOG
+    // status is not `Committed` (aborted or in-flight), or — if every retained
+    // transaction is committed — the allocation boundary. Conservative truncation
+    // (`truncate_before`) guarantees every transaction the WAL dropped below that
+    // oldest non-committed one was committed, so flooring just under it is safe.
+    wal.establish_recovery_committed_floor(next_txn_id)?;
     let tls = match config.tls_files().map_err(DbError::io)? {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
         None => None,
@@ -130,20 +160,49 @@ pub fn data_dir_for_test(path: &Path) -> Config {
 }
 
 /// Flush policy for in-place dirty-page flushing: a page is flushable once its
-/// dirtying transaction is committed (or it is recovery-written, txn 0) and its
-/// page-LSN is WAL-durable.
+/// page-LSN is WAL-durable, regardless of whether its dirtying transaction has
+/// committed (`docs/specs/mvcc.md` §8, Milestone D1).
+///
+/// The committedness gate that earlier milestones used (refuse to flush a page
+/// dirtied by an uncommitted transaction) is retired here: a heap page now holds
+/// versions from several transactions (per-version `xmin`/`xmax`), so page-level
+/// committedness is incoherent. Uncommitted and aborted dirty pages may now be
+/// evicted/flushed — they are hidden by the CLOG (`common::is_visible`) and
+/// reclaimed by VACUUM (Milestone F), and redo-all recovery reinstates them under
+/// PageLSN gating. The single remaining requirement is WAL-durability: a page may
+/// reach the heap only once every WAL record that describes it is fsynced, so a
+/// crash can always redo it (write-ahead logging).
 struct WalFlushPolicy {
     wal: Arc<dyn WalManager>,
 }
 
 impl FlushPolicy for WalFlushPolicy {
     fn can_flush(&self, info: &PageFlushInfo) -> bool {
-        let committed = info.dirty_txn_id == 0 || self.wal.is_committed(info.dirty_txn_id);
-        let durable = info
-            .page_lsn
-            .is_none_or(|lsn| lsn <= self.wal.flushed_lsn());
-        committed && durable
+        info.page_lsn
+            .is_none_or(|lsn| lsn <= self.wal.flushed_lsn())
     }
+
+    fn ensure_durable(&self) -> Result<()> {
+        // Write-ahead logging for the relaxed steal path: force the WAL so a stolen
+        // (possibly uncommitted) page's records are durable before the page reaches
+        // the heap. Idempotent — a no-op when the WAL is already flushed.
+        self.wal.flush().map(|_| ())
+    }
+}
+
+/// Whether `kind` is a logical catalog mutation (`CreateTable`/`DropTable`/
+/// `CreateIndex`/`DropIndex`). These directly mutate the durable catalog rather
+/// than being idempotent PageLSN-gated page writes, so redo-all gates them by
+/// transaction outcome (only a committed DDL replays); the physical heap/index
+/// page records are not gated.
+fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
+    matches!(
+        kind,
+        WalRecordKind::CreateTable { .. }
+            | WalRecordKind::DropTable { .. }
+            | WalRecordKind::CreateIndex { .. }
+            | WalRecordKind::DropIndex { .. }
+    )
 }
 
 fn apply_redo(

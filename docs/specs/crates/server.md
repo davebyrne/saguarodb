@@ -73,13 +73,13 @@ V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--po
 1. Load configuration.
 2. Initialize the control store (`FileControlStore`) and the heap page store (`HeapPageStore` over `<data>/heap`).
 3. Initialize the WAL manager.
-4. Initialize the buffer pool with the configured frame count, the `WalFlushPolicy`, and the heap page store as its `PageStore`.
+4. Initialize the buffer pool with the configured frame count, the `WalFlushPolicy`, and the heap page store as its `PageStore`. `WalFlushPolicy::can_flush` admits a dirty page iff it is **WAL-durable** (`page_lsn ≤ wal.flushed_lsn()`); the earlier committedness gate is dropped (Milestone D1, `mvcc.md` §8), so uncommitted/aborted dirty pages may be flushed/evicted (hidden by the CLOG). `WalFlushPolicy::ensure_durable` (called by the buffer pool's steal path before writing a stolen page) flushes the WAL, giving write-ahead logging for the now-possibly-uncommitted stolen page.
 5. Enable eviction-flush-on-steal (`buffer_pool.enable_stealing()`), immediately after constructing the pool and before loading the control record. The durable on-disk index means recovery rebuilds nothing in memory, so redo may spill and the recovery working set is not bounded by the pool size.
 6. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
 7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
 8. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
 9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.install_index_schemas(indexes)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain the secondary indexes.
-10. Redo: replay committed records with `LSN > checkpoint_lsn` (`WalManager::replay_committed_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them). Heap, primary-key-index, and secondary-index pages replay the same way; DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) replay through `RecoveryOperations`.
+10. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them), regardless of the dirtying transaction's outcome — the CLOG (rebuilt at WAL open) decides visibility afterward, and an aborted/in-flight transaction's replayed versions are invisible (`mvcc.md` §8). Heap, primary-key-index, and secondary-index pages replay the same way. The `Commit`/`Abort`/`Checkpoint` markers are skipped (they are not page mutations). DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) replay through `RecoveryOperations` **only when their transaction is committed** (they mutate the durable catalog directly, not idempotent PageLSN-gated pages, so an aborted DDL's catalog change must not take effect).
 11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`, and an empty `active_txns` registry (the WAL manager rebuilt its CLOG from the retained `Commit`/`Abort` records on `open`).
 12. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
 13. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
@@ -105,13 +105,18 @@ reusing an old uncommitted `txn_id` and accidentally making pre-crash records lo
 committed.
 
 After computing `next_txn_id`, recovery calls
-`WalManager::set_committed_floor(next_txn_id)`: every transaction id below the
-allocation boundary was allocated in a prior run, and under Milestone B the flush
-gate never flushes uncommitted pages, so any surviving tuple from such a
-transaction is committed even if a checkpoint truncated its `Commit` record (see
-`wal.md` "Implicit-committed floor" and `mvcc.md` §5.4). Without this, a
-checkpointed-then-recovered committed row would read as in-progress and be hidden
-by the visibility predicate.
+`WalManager::establish_recovery_committed_floor(next_txn_id)`. The
+implicit-committed floor lets an unrecorded normal id below it read as committed,
+covering a *committed* transaction whose `Commit` record a checkpoint truncated
+(see `wal.md` "Implicit-committed floor" and `mvcc.md` §5.4). Because the relaxed
+flush gate (Milestone D) lets an aborted/in-flight transaction's pages reach the
+heap, the floor is set **conservatively**: to the oldest transaction in the
+retained WAL whose CLOG status is not `Committed` (aborted or in-flight), or to the
+allocation boundary if every retained transaction is committed — never crossing a
+non-committed transaction, or its replayed versions would wrongly become visible.
+Conservative WAL truncation (`wal.md`, `mvcc.md` §5.4/§8) guarantees every
+transaction dropped below that oldest non-committed one was committed, so ids below
+the floor are all genuinely committed.
 
 ## Query Service Wiring
 
@@ -134,10 +139,10 @@ The query path is a real transaction lifecycle; autocommit is an implicit single
 - **BEGIN**: allocate a `txn_id` (and register it active) atomically under the registry latch, set the slot to an open `InTransaction` (`'T'`). `BEGIN` inside an open block is a no-op warning that stays `'T'` (Postgres-compatible). DDL inside a block is rejected (`FeatureNotSupported`); DDL is non-transactional.
 - **Statements inside the block** share the transaction's `txn_id`; writes are stamped with it; reads use the transaction's snapshot (per isolation, below).
 - **COMMIT**: append `Commit` → `flush` (fsync) → `CLOG=Committed` (set inside `flush`) → `storage.commit_txn`/`buffer_pool.commit` cleanup → deregister → release the write guard → `record_commit_and_maybe_checkpoint`. The slot returns to `Idle` (`'I'`). A read-only explicit transaction (no write guard, no writes) commits with no WAL record.
-- **ROLLBACK** (or any statement error): append `Abort` → `CLOG=Aborted` → `storage.rollback_txn`/`buffer_pool.rollback` before-image undo → deregister → release the write guard → `Idle`. Abort is not fsync-gated (a transaction with no durable `Commit` is recovered as aborted).
+- **ROLLBACK** (or any statement error): append `Abort` → `CLOG=Aborted` → deregister → release the write guard → `Idle`. Abort is **status-based** (Milestone D1, `mvcc.md` §4 Decision 3): there is no page undo. The transaction's modified tuples stay in the heap, hidden by the CLOG and reclaimed by VACUUM. The `storage.rollback_txn`/`buffer_pool.rollback` calls still run, but `storage.rollback_txn` only restores engine-owned DDL metadata (table/index schema shadow state) and `buffer_pool.rollback` is now a bookkeeping clear that reclaims no pages. Abort is not fsync-gated (a transaction with no durable `Commit` is recovered as aborted regardless).
 - **Failed (`'E'`) state**: any statement error inside an explicit block poisons it to `'E'` and does **not** end it. While `'E'`, every statement except `COMMIT`/`ROLLBACK` is rejected with `SqlState::InFailedSqlTransaction` (SQLSTATE `25P02`). `COMMIT` of an `'E'` block issues `ROLLBACK` (returns `Idle`). `COMMIT`/`ROLLBACK` with no open block are no-op warnings that stay `Idle`.
 - **Autocommit**: a data/DDL statement with no open block runs as an implicit `BEGIN…COMMIT` around the one statement (allocate, snapshot, execute, commit-or-abort), preserving the prior external behavior exactly.
-- **Disconnect**: an open transaction held on a dropped `Session` is aborted (before-image undo + `Abort` record + write-guard release + deregister), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry.
+- **Disconnect**: an open transaction held on a dropped `Session` is aborted (status-based: `Abort` record + `CLOG=Aborted` + write-guard release + deregister, no page undo), so a client that disconnects mid-transaction leaks neither the guard nor a registry entry.
 
 ### Concurrency — Stage 1 (concurrent readers, serialized writers)
 
@@ -165,7 +170,7 @@ Write statement protocol (autocommit; an explicit write transaction is the same 
 1. Acquire the exclusive write guard (lazily, on the first write in an explicit transaction).
 2. Allocate `txn_id` and register it active (atomically under the registry latch).
 3. Execute storage/catalog operations.
-4. If execution fails, call `storage.rollback_txn(txn_id)`, `buffer_pool.rollback(txn_id)`, and catalog `restore` when needed, then return error. In an explicit transaction the statement error instead poisons the block to `'E'` and the undo runs at ROLLBACK.
+4. If execution fails, append `Abort` (`CLOG=Aborted`), call `storage.rollback_txn(txn_id)` (DDL-metadata restore only), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog `restore` when needed, then return error. Abort is status-based — the failed statement's heap versions stay invisible via the CLOG, not undone. In an explicit transaction the statement error instead poisons the block to `'E'` and the abort runs at ROLLBACK.
 5. Append WAL `Commit`.
 6. Flush WAL.
 7. The statement/transaction is now durable and must not be rolled back or reported as a normal SQL failure.
@@ -238,11 +243,11 @@ server under the exclusive write guard:
 
 1. Acquire write guard.
 2. `wal.flush()` (a page's redo must be durable before the page is written).
-3. `buffer_pool.flush_committed_pages()` — write flushable dirty pages to the heap `PageStore`.
+3. `buffer_pool.flush_dirty_pages()` — write every flushable dirty page to the heap `PageStore`. With the relaxed flush gate (Milestone D1, `mvcc.md` §8) this spills committed, aborted, and — under Stage 2 — in-flight dirty pages alike; all are WAL-durable after (2), and the CLOG hides the non-committed tuples.
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
-7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`.
+7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`. Truncation is **conservative**: it never drops an aborted/in-flight transaction's records (it pins on the oldest non-committed one), so aborted-but-flushed versions stay invisible across restart (`wal.md`, `mvcc.md` §5.4/§8).
 8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
 9. Release write guard.
 

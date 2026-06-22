@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`buffer` manages in-memory page frames, page latches, dirty tracking, statement rollback, and in-place dirty-page flushing to a `PageStore`. Eviction can steal (flush, then evict) committed dirty pages once stealing is enabled, so the committed working set is not bound by the pool size during normal operation.
+`buffer` manages in-memory page frames, page latches, dirty tracking, and in-place dirty-page flushing to a `PageStore`. Eviction can steal (flush, then evict) any WAL-durable dirty page once stealing is enabled, so the working set is not bound by the pool size during normal operation. Abort is status-based (Milestone D1, `mvcc.md` §4 Decision 3): the buffer pool does **no** page-content undo and no page reclamation on rollback — a rolled-back transaction's pages stay dirty-but-evictable, hidden by the CLOG (the before-image mechanism earlier milestones used is retired).
 
 ## Depends On
 
@@ -17,7 +17,7 @@
 - Page size: 8192 bytes.
 - Frames are addressed by `(FileId, PageNum)`.
 - The buffer pool reads pages from the heap files through an injected `PageStore`.
-- Dirty pages remain in memory until a checkpoint flushes them to the heap, an eviction steals them, or rollback discards them.
+- Dirty pages remain in memory until a checkpoint flushes them to the heap or an eviction steals them; rollback does **not** discard them (status-based abort — they stay dirty-but-evictable, hidden by the CLOG).
 
 ## Public API
 
@@ -50,7 +50,7 @@ pub trait BufferPool: Send + Sync {
     fn mark_all_clean(&self) -> Result<()>;
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
-    fn flush_committed_pages(&self) -> Result<()>;
+    fn flush_dirty_pages(&self) -> Result<()>;
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
     fn enable_stealing(&self);
 }
@@ -58,7 +58,7 @@ pub trait BufferPool: Send + Sync {
 pub struct MemoryBufferPool { /* the concrete BufferPool implementation */ }
 ```
 
-`flush_committed_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`. It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
+`flush_dirty_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`, regardless of whether its dirtying transaction committed (the CLOG hides the non-committed tuples). It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
 
 `MemoryBufferPool::new(frame_count, flush_policy, store)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageStore>`. `read_page` first checks resident frames; on a miss it calls `store.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with a message of the form `page not found: file_id=…, page_num=…`. A loader error from `store.load_page` is propagated unchanged, so its `ErrorKind` is whatever the injected `PageStore` returns (a file-backed store yields `ErrorKind::Io`).
 
@@ -68,9 +68,9 @@ In production, the server supplies a `HeapPageStore` (a `PageStore`) backed by p
 
 `MemoryBufferPool::empty(frame_count)` is a test helper that uses a never-flush policy and a `NoopPageStore` returning `Ok(None)` from `load_page` and discarding writes.
 
-`load_page(file_id, page_num, data)` inserts `data` as a clean frame if the page is not resident. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty or create rollback metadata. `iter_pages` returns pages currently known to the buffer pool (used by checkpoint flushing and the storage page scan).
+`load_page(file_id, page_num, data)` inserts `data` as a clean frame if the page is not resident. If `(file_id, page_num)` is already resident, it must leave resident bytes, dirty state, and dirty transaction ID unchanged, then still advance `next_page_num_by_file` to at least `page_num + 1` and return `Ok(())`. It must not mark the page dirty. `iter_pages` returns pages currently known to the buffer pool (used by checkpoint flushing and the storage page scan).
 
-`commit(txn_id)` is cleanup-only: it discards before-images and new-page tracking after WAL flush succeeds. It must not perform I/O and should not fail for a valid `txn_id`. If it fails after a durable WAL commit, server treats that as fatal and does not roll back.
+`rollback(txn_id)` and `commit(txn_id)` are both no-op bookkeeping clears: under status-based abort (`mvcc.md` §4 Decision 3) the buffer pool tracks no per-transaction page state, undoes nothing, and reclaims nothing. A rolled-back transaction's pages — both ones it modified and ones it freshly allocated (`new_page`) — stay resident as dirty-but-evictable frames; the CLOG hides their tuples and VACUUM (Milestone F) reclaims them. They must not be I/O and should not fail for a valid `txn_id`; if `commit` fails after a durable WAL commit, the server treats that as fatal and does not roll back.
 
 ## Page Guards
 
@@ -95,7 +95,7 @@ impl PageWriteGuard {
 
 Read guards hold a read latch and unpin on drop. Write guards hold a write latch, set dirty state for `txn_id`, and unpin on drop.
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a `PageWriteGuard` whose `page_num()` identifies the new page. The fresh-page insertion path must reject an already resident `(file_id, page_num)` with an internal error rather than overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, ...)` advances this counter to at least `page_num + 1`. Rollback removes a transaction's new pages and restores each affected file's allocation counter to its pre-transaction value, so the rolled-back page numbers are reusable — this is required because a rebuilt B-tree in a reused file (an index id freed by a rolled-back create) must place its metapage at page 0. Restoring the counter is safe under the v1 single-writer model, where no other transaction raised it; the rolled-back pages were never flushed, so they do not exist on disk.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a `PageWriteGuard` whose `page_num()` identifies the new page. The fresh-page insertion path must reject an already resident `(file_id, page_num)` with an internal error rather than overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, ...)` advances this counter to at least `page_num + 1`. The allocation counter only ever advances: rollback does **not** reclaim a transaction's freshly allocated pages or reset the counter (status-based abort, Milestone D1). Those pages stay resident (their tuples invisible via the CLOG) and are replayed by redo-all recovery, so reusing their numbers would diverge from the recovered state and dangle the index entries that point at them. Under the v1 monotonic table/index id allocator, a file id freed by a rolled-back create is never reused, so not resetting the counter is harmless.
 
 Guards are owned and object-safe. They may internally hold `Arc<Frame>`.
 
@@ -109,30 +109,19 @@ Each frame tracks:
 - `dirty`
 - `dirty_txn_id`
 - `reference_bit`
-- `needs_fpi` (true when the next modification must log a full-page image: set on load and after `mark_clean`/rollback-restore, cleared by `PageWriteGuard::take_needs_fpi`; false for freshly allocated pages, whose `HeapInit` is their own redo base)
+- `needs_fpi` (true when the next modification must log a full-page image: set on load and after `mark_clean`, cleared by `PageWriteGuard::take_needs_fpi`; false for freshly allocated pages, whose `HeapInit` is their own redo base)
 - latch state
 
-`dirty_txn_id` is the last transaction that modified the page. It is not enough for rollback by itself; before-images and new-page tracking handle rollback.
+`dirty_txn_id` is the last transaction that modified the page (informational; the relaxed flush policy no longer gates on it).
 
-## Rollback Tracking
+## Abort is status-based (no rollback tracking)
 
-The buffer pool tracks active write transactions:
-
-```rust
-pub struct TxnDirtyState {
-    pub before_images: HashMap<(FileId, PageNum), PageData>,
-    pub new_pages: Vec<(FileId, PageNum)>,
-    pub next_page_before: HashMap<FileId, PageNum>,
-}
-```
+The buffer pool keeps **no** per-transaction rollback state. Abort is status-based (Milestone D1, `mvcc.md` §4 Decision 3, §8): there is no before-image undo and no page reclamation. The before-image mechanism (`record_before_image`, the `BeforeImage` store, `restore_dirty_state`) and the new-page/allocation-counter rollback tracking that earlier milestones used are retired.
 
 Rules:
 
-- On first `write_page(file, page, txn_id)` for an existing page by that `txn_id`, copy the current in-memory page into `before_images`.
-- On repeated writes to the same page by the same `txn_id`, do not replace the original before-image.
-- On `new_page(file, txn_id)`, record the allocated page in `new_pages`, and the first time the txn allocates into a file record that file's pre-allocation counter in `next_page_before`.
-- On `rollback(txn_id)`, restore all before-images, invalidate/free all newly allocated pages for that transaction, and restore each affected file's allocation counter from `next_page_before`.
-- On `commit(txn_id)`, discard before-images and new-page tracking. Pages remain dirty until a checkpoint flushes them in place to the heap.
+- `write_page`/`new_page` mark the frame dirty under `txn_id` and track nothing extra.
+- `rollback(txn_id)` and `commit(txn_id)` do nothing to pages: a rolled-back (or committed) transaction's pages stay resident and dirty until a checkpoint flushes them or an eviction steals them. A rolled-back transaction's tuples are hidden by the CLOG (`CLOG[txn] = Aborted`) and reclaimed by VACUUM (Milestone F); keeping them resident matches what redo-all recovery replays. No pins are leaked — the statement's `PageWriteGuard`s are dropped (unpinning their frames) before rollback/commit runs.
 
 This preserves committed in-memory changes from earlier transactions that have not yet been flushed.
 
@@ -141,7 +130,7 @@ This preserves committed in-memory changes from earlier transactions that have n
 V1 uses clock eviction:
 
 - Clean, unpinned pages may be evicted (re-read from the heap on demand).
-- When stealing is enabled (`enable_stealing`), a committed dirty unpinned page that the `FlushPolicy` admits is *stolen*: flushed to its heap home, then evicted. The flush write happens outside the pool lock — the victim is pinned as a reservation, written, then evicted on re-lock if no reader pinned it meanwhile (otherwise another victim is tried). This removes the in-RAM working-set ceiling during normal operation. Because a committed page's WAL is already flushed through its commit record, a committed page is always WAL-durable, so the policy needs only the committed check.
+- When stealing is enabled (`enable_stealing`), a dirty unpinned page that the `FlushPolicy` admits is *stolen*: the steal path first calls `FlushPolicy::ensure_durable` (forces the WAL) so the page's records are durable before the page is, then flushes it to its heap home and evicts it. The flush write happens outside the pool lock — the victim is pinned as a reservation, written, then evicted on re-lock if no reader pinned it meanwhile (otherwise another victim is tried). This removes the in-RAM working-set ceiling during normal operation. With the relaxed flush gate (Milestone D1), the stolen page need not be committed — `ensure_durable` provides the write-ahead guarantee the pre-D1 committed-only steal got for free (a committed page's WAL was already flushed through its `Commit`).
 - A dirty page the policy refuses (uncommitted), or any pinned page, is skipped.
 - If no frame can be freed (all pinned, or all dirty and unflushable), return a storage/buffer error.
 
@@ -149,25 +138,24 @@ Stealing is off until `enable_stealing`. The server enables it during startup be
 
 ## Checkpoint Interaction
 
-Checkpoint holds the global write guard, so no statement mutates pages concurrently. It calls `flush_committed_pages` (writes flushable dirty pages to the `PageStore`), then `PageStore::sync_all`, then `mark_all_clean` (clears dirty flags and re-arms `needs_fpi`). At quiesce every dirty page is committed, so `FlushPolicy` admits them all.
+Checkpoint holds the global write guard, so no statement mutates pages concurrently. It calls `flush_dirty_pages` (writes flushable dirty pages to the `PageStore`), then `PageStore::sync_all`, then `mark_all_clean` (clears dirty flags and re-arms `needs_fpi`). After `wal.flush()` (which checkpoint runs first) every dirty page is WAL-durable, so `FlushPolicy` admits them all — committed, aborted, and (under Stage 2) in-flight alike.
 
 ## Invariants
 
-- Uncommitted dirty pages are never written to the heap; only committed (hence WAL-durable) dirty pages are stolen.
-- A page is never written to the heap before its redo records are WAL-durable: checkpoint flushes after `wal.flush()`, and eviction-steal only flushes committed pages.
-- Rollback restores page state to exactly what it was before the failed transaction first touched each page, and re-arms `needs_fpi`.
-- New pages from failed transactions are not visible after rollback, and their page numbers become re-allocatable (the allocation counter is restored).
-- Commit does not flush pages; it only discards rollback metadata.
-- A committed dirty page is marked clean only when it is flushed to the heap — in place by checkpoint, or immediately before eviction by a steal.
+- A page is never written to the heap before its redo records are WAL-durable: checkpoint flushes after `wal.flush()`, and eviction-steal forces the WAL (`ensure_durable`) before writing a stolen page.
+- Uncommitted/aborted dirty pages MAY be written to the heap (relaxed flush gate, Milestone D1); they are hidden by the CLOG and reclaimed by VACUUM. The flush gate's only requirement is WAL-durability.
+- Rollback does no page undo and reclaims no pages: a rolled-back transaction's pages (modified or freshly allocated) stay resident as dirty-but-evictable frames.
+- The allocation counter only advances; rolled-back page numbers are not reused.
+- Commit does not flush pages; pages stay dirty until a checkpoint flushes them in place to the heap.
+- A dirty page is marked clean only when it is flushed to the heap — in place by checkpoint, or immediately before eviction by a steal.
 
 ## Acceptance Tests
 
-- First write stores a before-image; second write by same txn does not replace it.
-- Rollback restores a page that was already dirty from a prior committed txn.
-- Rollback invalidates pages allocated by the failed txn and resets the allocation counter so the next transaction reuses those page numbers.
-- Commit discards before-images but leaves pages dirty.
-- A committed dirty page is stolen (flushed then evicted) when stealing is enabled.
-- A dirty page the policy refuses, or any dirty page when stealing is disabled, is not evicted (error when no other victim).
-- A committed working set larger than the pool spills to the heap and reads back correctly.
+- Rollback does NOT undo an in-place modification: the modified bytes remain and the page stays dirty (status-based abort).
+- Rollback keeps a freshly allocated page resident and dirty, and does not reuse its page number.
+- Commit leaves pages dirty (it discards no rollback metadata — there is none).
+- A WAL-durable dirty page is stolen (flushed then evicted) when stealing is enabled, including one dirtied by an aborted transaction.
+- A dirty page the policy refuses (not WAL-durable), or any dirty page when stealing is disabled, is not evicted (error when no other victim).
+- A working set larger than the pool spills to the heap and reads back correctly.
 - `mark_all_clean` makes previously dirty pages evictable.
 - `iter_pages` returns in-memory page data for checkpoint flushing and the storage page scan.

@@ -74,20 +74,22 @@ pub trait WalManager: Send + Sync + common::TxnStatusView {
     fn append(&self, record: WalRecord) -> Result<Lsn>;
     fn flush(&self) -> Result<Lsn>;
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
-    fn replay_committed_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
-    // Raise the CLOG implicit-committed floor (recovery seed). See Invariants.
-    fn set_committed_floor(&self, floor: u64) -> Result<()>;
+    // Establish the CLOG implicit-committed floor at recovery, conservatively
+    // (never crossing an aborted/in-flight transaction). See Invariants.
+    fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
 }
 ```
 
+The redo-committed-only `replay_committed_from` is **retired** (Milestone D2): recovery uses `replay_from` + the CLOG (redo-all). `is_redo_operation(kind)` (a free function, also re-exported) classifies a record as a replayable page mutation (everything except the `Commit`/`Abort`/`Checkpoint` markers); redo-all applies those and skips the markers.
+
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `decode_record` decodes exactly one record from a buffer: it returns an error on a partial buffer (`"incomplete WAL record"`) and on a buffer with bytes left over after the record (`"WAL buffer contains trailing bytes"`). `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` and `replay_committed_from(lsn)` are strictly exclusive: both inspect only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. `replay_committed_from` returns committed operation records — every record except the `Commit`, `Abort`, and `Checkpoint` metadata markers — which recovery applies as physiological redo (`HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`) and DDL replay (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`).
+`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. Recovery (redo-all, Milestone D2) iterates `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation` — `HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`), skipping the `Commit`/`Abort`/`Checkpoint` markers, and applying DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) only for committed transactions (the server gates those by the rebuilt CLOG; see `server.md`). The CLOG decides visibility afterward.
 
-`truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`.
+`truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Conservative truncation (Milestone D):** truncation never drops a transaction that is not durably committed — it clamps the effective boundary to the earliest record of the oldest such transaction below `lsn` (`effective_lsn = min(lsn, that record's lsn)`), so an aborted/in-flight transaction's records (notably its `Abort`) are retained. This keeps its on-disk (relaxed-flush) versions hidden across restart (see the implicit-committed floor below and `mvcc.md` §5.4/§8). The extra WAL this retains is bounded and freed once VACUUM (Milestone F) reclaims the aborted versions.
 
 `truncate_before` writes retained records to a temporary WAL file, fsyncs the temporary file, renames it over the live WAL, and immediately fsyncs the parent directory. If the parent-directory fsync — or the subsequent WAL reopen or seek — fails, the WAL manager is poisoned and returns the error before mutating retained-record in-memory state. Only after the rename is directory-durable may the manager reopen, seek, and replace in-memory WAL state.
 
@@ -126,16 +128,15 @@ After heap pages are flushed + fsynced and the control record is stored:
 2. Flush WAL.
 3. Call `truncate_before(checkpoint_lsn)`.
 
-`truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records. It also advances the CLOG implicit-committed floor (see Invariants) past the transactions it removes, since their `Commit` records are now gone but their flushed tuples survive.
+`truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records. It also advances the CLOG implicit-committed floor (see Invariants) past the (committed) transactions it removes, since their `Commit` records are now gone but their flushed tuples survive — and, per conservative truncation, it never advances past the oldest non-committed transaction it pinned.
 
 ## Replay
 
-Recovery:
+Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
-- Calls `replay_from(checkpoint_lsn)`.
-- Rebuilds the CLOG from durable `Commit`/`Abort` records, then replays only operation records whose txn ID committed. `replay_committed_from(checkpoint_lsn)` provides this filtered committed-record stream through the `WalManager` abstraction.
-- Ignores uncommitted records (in-flight, or aborted via an `Abort` record).
+- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`Abort`/`Checkpoint` markers are skipped. DDL records replay only for committed transactions (server-gated by the CLOG).
+- Rebuilds the CLOG from durable `Commit`/`Abort` records (done at `open`). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
 
 The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`. On `open`, an incomplete trailing record is not merely ignored in memory — the WAL file is physically truncated to the last complete record's end and fsynced, so the torn tail is removed on disk. After such a truncation (and after `truncate_before`), `next_lsn` is derived from the maximum LSN among the retained records, so newly appended records continue monotonically past the highest retained LSN.
 
@@ -164,26 +165,39 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
   normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and
   rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F
   (see `docs/specs/mvcc.md` §5.4).
-- **Implicit-committed floor.** The CLOG carries a monotonic `committed_floor`:
-  an unrecorded normal id strictly below it reads as `Committed` instead of
-  `InProgress`. This covers transactions whose `Commit` records were truncated by
-  a checkpoint while their flushed tuples survive in the heap — per
-  `docs/specs/mvcc.md` §5.4 ("transactions older than the horizon are implicitly
-  committed") and the Milestone B flush-gate invariant (uncommitted pages are
-  never flushed, so a surviving tuple is committed). An explicitly recorded status
+- **Implicit-committed floor (conservative, Milestone D).** The CLOG carries a
+  monotonic `committed_floor`: an unrecorded normal id strictly below it reads as
+  `Committed` instead of `InProgress`. This covers transactions whose `Commit`
+  records were truncated by a checkpoint while their flushed tuples survive in the
+  heap (`docs/specs/mvcc.md` §5.4). An explicitly recorded status
   (`Committed`/`Aborted`) always takes precedence over the floor, so a recorded
-  abort below the floor is never falsely shown. The floor is set at recovery to the
-  transaction-id allocation boundary (`set_committed_floor(next_txn_id)`) and
-  advanced past each checkpoint's truncated transactions inside `truncate_before`.
-  At runtime, before any truncation, it stays at `FIRST_NORMAL_XID`, so live
-  behavior is unchanged.
+  abort below the floor is never falsely shown.
+
+  Because the relaxed flush gate (Milestone D1) now lets an aborted/in-flight
+  transaction's pages reach the heap, the floor must never cross such a
+  transaction (or its on-disk versions would wrongly read as committed —
+  corruption). Two coordinated rules enforce this:
+  - At recovery, `establish_recovery_committed_floor(allocation_boundary)` sets the
+    floor to `min(allocation_boundary, oldest_non_committed_retained_xid)` — never
+    above the oldest retained transaction whose CLOG status is not `Committed`.
+  - At runtime, `truncate_before` advances the floor only past the (committed)
+    transactions it actually removed (it pins the oldest non-committed one, so that
+    one is retained, not removed). Before any truncation the floor stays at
+    `FIRST_NORMAL_XID`, so live behavior is unchanged.
+
+  Together with conservative truncation (which keeps the pinned transaction's
+  `Abort` record), this guarantees an aborted-but-flushed transaction stays
+  invisible across a checkpoint and restart. Truncating past an aborted transaction
+  (and letting the floor cover it) is safe only once VACUUM (Milestone F) has
+  reclaimed its versions.
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests
 
 - Append and replay records in LSN order.
 - Flush advances durable LSN.
-- Recovery ignores uncommitted operation records.
+- Recovery rebuilds the CLOG from `Commit`/`Abort` records and `replay_from` yields every record (redo-all); visibility is decided by the CLOG, not a replay filter.
+- Conservative truncation pins an aborted transaction: a checkpoint that asks to truncate past it retains its `Abort` record, and the recovery floor never marks it committed.
 - Truncated WAL still replays from manifest checkpoint LSN.
 - CRC detects corrupted record.
 - Incomplete trailing record after crash is ignored.

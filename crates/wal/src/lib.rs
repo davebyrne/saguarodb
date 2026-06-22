@@ -6,7 +6,7 @@ mod record;
 pub use clog::Clog;
 pub use codec::{decode_record, encode_record};
 pub use file::FileWalManager;
-pub use record::{WalRecord, WalRecordKind};
+pub use record::{WalRecord, WalRecordKind, is_redo_operation};
 
 use common::{Lsn, Result, TxnStatusView};
 
@@ -18,22 +18,29 @@ use common::{Lsn, Result, TxnStatusView};
 pub trait WalManager: Send + Sync + TxnStatusView {
     fn append(&self, record: WalRecord) -> Result<Lsn>;
     fn flush(&self) -> Result<Lsn>;
+    /// Replay every retained record after `lsn`, in LSN order. Redo-all recovery
+    /// (`docs/specs/mvcc.md` §8) iterates this and applies the page-mutation
+    /// records ([`is_redo_operation`]); the CLOG (rebuilt at open) decides
+    /// visibility afterwards.
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
-    fn replay_committed_from(
-        &self,
-        lsn: Lsn,
-    ) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 
-    /// Raise the CLOG implicit-committed floor to the transaction-id allocation
-    /// boundary established at recovery: any unrecorded normal id below it is
-    /// treated as committed because its `Commit` record was truncated by a prior
-    /// checkpoint while its tuples survive (`docs/specs/mvcc.md` §5.4). Called once
-    /// after recovery seeds the allocator; monotonic, so it never un-settles a
-    /// transaction.
-    fn set_committed_floor(&self, floor: u64) -> Result<()>;
+    /// Establish the CLOG implicit-committed floor at recovery, given the
+    /// transaction-id `allocation_boundary` (the next id to be handed out).
+    ///
+    /// Any unrecorded normal id below the floor reads as committed (its `Commit`
+    /// record was truncated by a prior checkpoint while its tuples survive,
+    /// `docs/specs/mvcc.md` §5.4). The floor is therefore set CONSERVATIVELY: to
+    /// the oldest transaction in the retained WAL whose rebuilt CLOG status is not
+    /// `Committed` (aborted or still in-flight), or to `allocation_boundary` if
+    /// every retained transaction is committed. Conservative truncation
+    /// ([`WalManager::truncate_before`]) guarantees every transaction dropped below
+    /// that oldest non-committed one was committed, so flooring just under it never
+    /// marks an aborted/in-flight transaction implicitly committed. The floor is
+    /// monotonic; this is called once after recovery seeds the allocator.
+    fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -45,6 +52,7 @@ mod tests {
 
     use super::{
         FileWalManager, WalManager, WalRecord, WalRecordKind, decode_record, encode_record,
+        is_redo_operation,
     };
 
     #[test]
@@ -77,7 +85,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_discovers_committed_transactions_and_ignores_uncommitted_records() {
+    fn recovery_rebuilds_clog_and_replays_all_records() {
+        // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): `replay_from` yields
+        // EVERY record; the rebuilt CLOG — not a replay filter — distinguishes
+        // committed from uncommitted. (Before D2 this used the redo-committed-only
+        // `replay_committed_from`, which is retired with the relaxed flush gate.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.dat");
         let wal = FileWalManager::open(&path).unwrap();
@@ -95,17 +107,23 @@ mod tests {
         drop(wal);
         let recovered = FileWalManager::open(&path).unwrap();
         assert_eq!(recovered.flushed_lsn(), 3);
+        // The CLOG carries the outcome: txn 10 committed, txn 11 not (in-flight).
         assert!(recovered.is_committed(10));
         assert!(!recovered.is_committed(11));
 
-        let committed: Vec<_> = recovered
-            .replay_committed_from(0)
+        // Redo-all replays every operation record (both txns'); the Commit marker
+        // is metadata, not a redo operation.
+        let replayed: Vec<_> = recovered
+            .replay_from(0)
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].txn_id, 10);
+        let operations: Vec<u64> = replayed
+            .iter()
+            .filter(|record| is_redo_operation(&record.kind))
+            .map(|record| record.txn_id)
+            .collect();
+        assert_eq!(operations, vec![10, 11]);
         assert_eq!(
             recovered.append(WalRecord::insert_for_test(12, 3)).unwrap(),
             4
@@ -151,18 +169,24 @@ mod tests {
         let recovered = FileWalManager::open(&path).unwrap();
         // The committed txn is committed; the aborted and in-flight txns are not.
         assert!(recovered.is_committed(10));
-        assert!(!recovered.is_committed(11));
+        assert!(recovered.is_aborted(11));
         assert!(!recovered.is_committed(12));
+        assert!(!recovered.is_aborted(12));
 
-        // Redo replays only the committed txn's operation record; the aborted
-        // txn's records (and the Commit/Abort markers themselves) are excluded.
-        let committed: Vec<_> = recovered
-            .replay_committed_from(0)
+        // Redo-all replays every operation record (committed, aborted, and
+        // in-flight alike); visibility is decided afterwards by the CLOG, not by a
+        // replay filter (`docs/specs/mvcc.md` §8, Milestone D2). The Commit/Abort
+        // markers are metadata, not redo operations.
+        let operations: Vec<u64> = recovered
+            .replay_from(0)
             .unwrap()
             .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].txn_id, 10);
+            .unwrap()
+            .into_iter()
+            .filter(|record| is_redo_operation(&record.kind))
+            .map(|record| record.txn_id)
+            .collect();
+        assert_eq!(operations, vec![10, 11, 12]);
     }
 
     #[test]
@@ -263,15 +287,20 @@ mod tests {
 
         drop(wal);
         let recovered = FileWalManager::open(&path).unwrap();
+        // txn 12's commit was rolled back with the failed flush, so its bytes are
+        // gone; only txn 13's committed insert survives in the WAL.
         assert!(!recovered.is_committed(12));
         assert!(recovered.is_committed(13));
-        let committed: Vec<_> = recovered
-            .replay_committed_from(0)
+        let operations: Vec<u64> = recovered
+            .replay_from(0)
             .unwrap()
             .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].txn_id, 13);
+            .unwrap()
+            .into_iter()
+            .filter(|record| is_redo_operation(&record.kind))
+            .map(|record| record.txn_id)
+            .collect();
+        assert_eq!(operations, vec![13]);
     }
 
     #[test]
@@ -309,12 +338,30 @@ mod tests {
         let path = dir.path().join("wal.dat");
         let wal = FileWalManager::open(&path).unwrap();
 
+        // Conservative truncation (`docs/specs/mvcc.md` §5.4, §8) only drops a
+        // prefix of COMMITTED transactions, so commit each insert's txn here. (Bare
+        // uncommitted inserts would now PIN truncation — exercised separately in
+        // `conservative_truncation_pins_an_aborted_transaction`.)
         wal.append(WalRecord::insert_for_test(1, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 1,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
         wal.append(WalRecord::insert_for_test(2, 2)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 2,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
         wal.append(WalRecord::insert_for_test(3, 3)).unwrap();
         wal.flush().unwrap();
 
-        wal.truncate_before(2).unwrap();
+        // Truncate below the third insert (lsn 5); txns 1 and 2 are committed, so
+        // their records (lsn 1-4) are dropped.
+        wal.truncate_before(5).unwrap();
 
         let records: Vec<_> = wal
             .replay_from(0)
@@ -324,7 +371,7 @@ mod tests {
 
         assert_eq!(
             records.iter().map(|record| record.lsn).collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![5]
         );
 
         let expected_bytes: u64 = records
@@ -336,21 +383,90 @@ mod tests {
         drop(wal);
         let reopened = FileWalManager::open(&path).unwrap();
         let replay_after_checkpoint: Vec<_> = reopened
-            .replay_from(2)
+            .replay_from(5)
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(
-            replay_after_checkpoint
-                .iter()
-                .map(|record| record.lsn)
-                .collect::<Vec<_>>(),
-            vec![3]
-        );
+        assert!(replay_after_checkpoint.is_empty());
     }
 
     #[test]
-    fn committed_replay_after_checkpoint_excludes_boundary_and_metadata() {
+    fn conservative_truncation_pins_an_aborted_transaction() {
+        // The conservative-truncation guard (`docs/specs/mvcc.md` §5.4, §8,
+        // Milestone D): a checkpoint must never truncate past an aborted (or
+        // in-flight) transaction, even when later transactions committed — its
+        // `Abort` record must survive so its on-disk (relaxed-flush) versions stay
+        // hidden after restart. Layout: txn 10 committed, txn 11 aborted, txn 12
+        // committed; a checkpoint then asks to truncate everything below txn 12's
+        // commit. Truncation must clamp at txn 11's first record (the pin).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+
+        wal.append(WalRecord::insert_for_test(10, 1)).unwrap(); // lsn 1
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 10,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap(); // lsn 2
+        let pin_lsn = wal.append(WalRecord::insert_for_test(11, 2)).unwrap(); // lsn 3
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 11,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap(); // lsn 4
+        wal.append(WalRecord::insert_for_test(12, 3)).unwrap(); // lsn 5
+        let commit_12 = wal
+            .append(WalRecord {
+                lsn: 0,
+                txn_id: 12,
+                kind: WalRecordKind::Commit,
+            })
+            .unwrap(); // lsn 6
+        wal.flush().unwrap();
+
+        // Ask to truncate everything below txn 12's commit (lsn 6); the aborted
+        // txn 11 (lsn 3) pins truncation, so nothing below lsn 3 is dropped either
+        // (its committed predecessor txn 10 stays too — bounded cost).
+        wal.truncate_before(commit_12).unwrap();
+
+        let retained: Vec<_> = wal
+            .replay_from(0)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            retained.iter().all(|record| record.lsn >= pin_lsn),
+            "truncation clamped at the aborted txn's first record"
+        );
+        // The aborted txn's `Abort` record survives, so its status is reconstructible.
+        assert!(
+            retained
+                .iter()
+                .any(|record| record.txn_id == 11 && matches!(record.kind, WalRecordKind::Abort)),
+            "the pinned aborted txn's Abort record is retained"
+        );
+
+        // After reopen, the aborted txn is still aborted (never implicitly
+        // committed), the committed ones are committed, and the floor never crossed
+        // the aborted txn.
+        drop(wal);
+        let reopened = FileWalManager::open(&path).unwrap();
+        reopened.establish_recovery_committed_floor(13).unwrap();
+        assert!(reopened.is_committed(10));
+        assert!(reopened.is_aborted(11));
+        assert!(reopened.is_committed(12));
+    }
+
+    #[test]
+    fn redo_all_after_checkpoint_excludes_boundary_and_metadata() {
+        // Redo-all replay after a checkpoint (`docs/specs/mvcc.md` §8): `replay_from`
+        // yields the post-checkpoint records, and recovery applies the page-mutation
+        // ones — skipping the retained boundary `Commit` and the `Checkpoint`
+        // marker, which are metadata, not redo operations. (Before D2 this used the
+        // redo-committed-only `replay_committed_from`.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.dat");
         let wal = FileWalManager::open(&path).unwrap();
@@ -379,19 +495,23 @@ mod tests {
         })
         .unwrap();
         wal.flush().unwrap();
+        // txn 10 is committed, so its insert (below checkpoint_lsn) is truncatable.
         wal.truncate_before(checkpoint_lsn).unwrap();
 
         drop(wal);
         let reopened = FileWalManager::open(&path).unwrap();
-        let committed: Vec<_> = reopened
-            .replay_committed_from(checkpoint_lsn)
+        let operations: Vec<_> = reopened
+            .replay_from(checkpoint_lsn)
             .unwrap()
             .collect::<Result<Vec<_>>>()
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .filter(|record| is_redo_operation(&record.kind))
+            .collect();
 
-        assert_eq!(committed.len(), 1);
-        assert_eq!(committed[0].txn_id, 20);
-        assert_eq!(committed[0].lsn, checkpoint_lsn + 2);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].txn_id, 20);
+        assert_eq!(operations[0].lsn, checkpoint_lsn + 2);
     }
 
     #[test]

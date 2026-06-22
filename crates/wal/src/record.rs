@@ -72,6 +72,17 @@ pub enum WalRecordKind {
     },
 }
 
+/// Whether `kind` is a replayable page-mutation record (anything recovery
+/// applies), i.e. every record except the `Commit` / `Abort` / `Checkpoint`
+/// metadata markers. Redo-all recovery (`docs/specs/mvcc.md` §8) replays these and
+/// skips the markers (the markers feed the CLOG, not the heap).
+pub fn is_redo_operation(kind: &WalRecordKind) -> bool {
+    !matches!(
+        kind,
+        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. }
+    )
+}
+
 impl WalRecord {
     /// A committed-operation record for WAL tests (LSN assignment, commit
     /// tracking, replay, truncation). `value` only distinguishes records.

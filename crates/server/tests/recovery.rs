@@ -44,8 +44,9 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
 #[tokio::test]
 async fn committed_multi_statement_transaction_survives_restart() {
     // A committed explicit transaction's statements all share one txn_id with a
-    // single durable Commit, so redo-committed-only replays them together: every
-    // row of `BEGIN; INSERT; INSERT; COMMIT` is visible after restart.
+    // single durable Commit. Redo-all replays every record and the CLOG marks the
+    // txn committed, so every row of `BEGIN; INSERT; INSERT; COMMIT` is visible
+    // after restart.
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -78,11 +79,10 @@ async fn committed_multi_statement_transaction_survives_restart() {
 
 #[tokio::test]
 async fn in_flight_transaction_rows_are_not_visible_after_restart() {
-    // A transaction that never commits before the "crash" leaves uncommitted
-    // HeapInsert records with no durable Commit. Under redo-committed-only those
-    // records are not replayed and the flush gate never wrote their pages, so the
-    // rows are absent after restart. (Full redo-all is Milestone D2; this stays
-    // within what redo-committed-only supports.)
+    // A transaction that never commits before the "crash" leaves heap records with
+    // no durable Commit. Redo-all replays those records (Milestone D2), but the
+    // txn has no `Commit`, so recovery records it Aborted (in-flight-at-crash =
+    // aborted) and the visibility predicate hides its rows after restart.
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -248,10 +248,11 @@ async fn committed_update_new_version_survives_restart() {
 
 #[tokio::test]
 async fn aborted_update_leaves_old_value_after_restart() {
-    // A UPDATE that violates a unique secondary constraint errors; the autocommit
-    // transaction aborts (before-image undo restores the page, and the Abort
-    // record marks the txn aborted). After restart no orphan new version is
-    // visible and the old value survives.
+    // An UPDATE that violates a unique secondary constraint errors; the autocommit
+    // transaction aborts. Abort is status-based (Milestone D1): the new version
+    // stays in the heap but the `Abort` record marks the txn aborted, so redo-all
+    // replays it yet the CLOG hides it. After restart no orphan new version is
+    // visible and the old value (created by the committed insert) survives.
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -300,7 +301,13 @@ async fn aborted_update_leaves_old_value_after_restart() {
 }
 
 #[tokio::test]
-async fn uncommitted_wal_record_is_ignored_on_restart() {
+async fn uncommitted_wal_record_is_invisible_after_restart() {
+    // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2) REPLAYS an uncommitted
+    // transaction's flushed heap records (reconstructing the page), rather than
+    // ignoring them — but with no durable `Commit` the txn is recovered as aborted,
+    // so its tuple is invisible. The synthetic record is on a standalone file id,
+    // so it does not collide with the table created after recovery. (Before D2,
+    // redo-committed-only simply skipped the record.)
     let dir = tempfile::tempdir().unwrap();
     write_uncommitted_record_for_test(dir.path()).unwrap();
 
@@ -615,6 +622,305 @@ async fn split_index_survives_restart_and_post_restart_growth() {
         .execute_sql("select id from t order by id")
         .unwrap();
     assert_eq!(result.row_count(), 800);
+}
+
+#[tokio::test]
+async fn committed_then_truncated_transaction_stays_visible_via_floor() {
+    // A committed transaction whose `Commit` record is later truncated by a
+    // checkpoint must stay visible after restart, via the implicit-committed floor
+    // (`docs/specs/mvcc.md` §5.4). Sequence: commit a row, checkpoint (truncates
+    // that txn's records), commit a second row, checkpoint, then crash. After
+    // restart the first row — whose Commit is long gone — is still visible.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("insert into users (id, name) values (2, 'Grace')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("2".to_string()), Some("Grace".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn committed_row_survives_back_to_back_checkpoints_with_no_write_between() {
+    // Regression for the Checkpoint-marker/floor interaction (`docs/specs/mvcc.md`
+    // §5.4): two checkpoints with NO committed write between them. The second
+    // checkpoint's truncation boundary lands on the FIRST checkpoint's `Checkpoint`
+    // marker (the highest retained LSN), dropping the last committed transaction's
+    // real `Commit` record. The marker carries that transaction's id as its
+    // high-water `txn_id`, but the marker is metadata, not a transaction needing
+    // protection — so the recovery floor scan must EXCLUDE it. If it counted the
+    // marker as a "retained non-committed transaction", the floor would clamp at
+    // that id and the committed row would read in-progress (invisible) after
+    // restart — silent committed-data loss. (This is the idle-then-shutdown-
+    // checkpoint sequence in production.)
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        // Two checkpoints back-to-back, no write in between.
+        server.force_checkpoint().await.unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]],
+        "the committed row must survive two checkpoints with no write between them"
+    );
+}
+
+#[tokio::test]
+async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
+    // THE CRITICAL Milestone-D correctness test (change 4). An explicit transaction
+    // writes rows, ROLLBACKs (status-based abort: no undo), its pages are flushed to
+    // the heap by a checkpoint, and a LATER committed row pushes the aborted txn
+    // below the next checkpoint's truncation boundary. The conservative-truncation
+    // guard (`docs/specs/mvcc.md` §5.4, §8) must keep the aborted txn's `Abort`
+    // record (and the floor below it) so its on-disk rows stay invisible after a
+    // crash. WITHOUT the guard, truncation would drop the `Abort` and the floor
+    // would float above the aborted txn, marking it implicitly committed and making
+    // its rows wrongly appear — corruption. (Manually verified: replacing the
+    // conservative `effective_lsn` clamp in `WalManager::truncate_before` with the
+    // raw `lsn`, and the conservative recovery floor with the allocation boundary,
+    // makes this test fail with 'Ghost' visible.)
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        // A committed base row.
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+
+        // An explicit transaction inserts a row, then ROLLBACKs. Its heap+index
+        // pages stay dirty (no before-image undo); the Abort record is appended.
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("insert into users (id, name) values (2, 'Ghost')")
+            .await;
+        let rolled_back = conn.ok("rollback").await;
+        assert_eq!(rolled_back.status, b'I');
+        conn.close().await;
+
+        // Checkpoint: flushes the aborted txn's dirty pages to the heap (relaxed
+        // flush gate) and truncates committed WAL history — but must PIN the aborted
+        // txn so its Abort survives.
+        server.force_checkpoint().await.unwrap();
+
+        // A later committed row, then another checkpoint, so the aborted txn sits
+        // below the truncation boundary (the scenario the guard must survive).
+        server
+            .simple_query("insert into users (id, name) values (3, 'Bea')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // Crash + restart: redo-all replays the aborted txn's flushed rows, but the
+    // retained Abort (and the conservative floor) keep them invisible.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("3".to_string()), Some("Bea".to_string())],
+        ],
+        "the rolled-back 'Ghost' row must never be visible after restart"
+    );
+}
+
+#[tokio::test]
+async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
+    // With a small buffer pool, a large transaction's uncommitted pages are stolen
+    // (flushed to the heap) under buffer pressure — the relaxed flush gate
+    // (Milestone D1) admits them. After COMMIT and restart, redo-all + the committed
+    // CLOG make every row visible.
+    let dir = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(7000);
+    {
+        let app = saguarodb_server::recovery::open_app(small_pool_config(dir.path())).unwrap();
+        app.query_service
+            .execute_sql("create table big (id integer primary key, payload text)")
+            .unwrap();
+        // One big transaction far larger than the 4-frame pool: its uncommitted
+        // pages must spill to the heap mid-transaction. The autocommit `execute_sql`
+        // cannot hold a transaction across calls, so drive the explicit transaction
+        // through the session-carrying simple path.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (mut slot, res) = app.query_service.execute_simple("begin", None, &cancel);
+        res.unwrap();
+        for id in 1..=10 {
+            let (next, res) = app.query_service.execute_simple(
+                &format!("insert into big (id, payload) values ({id}, '{payload}')"),
+                slot,
+                &cancel,
+            );
+            res.unwrap();
+            slot = next;
+        }
+        let (slot, res) = app.query_service.execute_simple("commit", slot, &cancel);
+        res.unwrap();
+        assert!(slot.is_none());
+    }
+
+    let app = saguarodb_server::recovery::open_app(small_pool_config(dir.path())).unwrap();
+    let result = app
+        .query_service
+        .execute_sql("select id from big order by id")
+        .unwrap();
+    assert_eq!(result.row_count(), 10);
+}
+
+#[tokio::test]
+async fn uncommitted_pages_evicted_under_pressure_then_aborted_are_invisible() {
+    // The mirror of the previous test: a large transaction's uncommitted pages are
+    // stolen to the heap under buffer pressure, then the transaction ROLLBACKs
+    // (status-based abort) and a checkpoint makes everything durable. After restart,
+    // redo-all replays the flushed pages but the CLOG (Aborted) hides every row.
+    let dir = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(7000);
+    {
+        let app = saguarodb_server::recovery::open_app(small_pool_config(dir.path())).unwrap();
+        app.query_service
+            .execute_sql("create table big (id integer primary key, payload text)")
+            .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (mut slot, res) = app.query_service.execute_simple("begin", None, &cancel);
+        res.unwrap();
+        for id in 1..=10 {
+            let (next, res) = app.query_service.execute_simple(
+                &format!("insert into big (id, payload) values ({id}, '{payload}')"),
+                slot,
+                &cancel,
+            );
+            res.unwrap();
+            slot = next;
+        }
+        let (slot, res) = app.query_service.execute_simple("rollback", slot, &cancel);
+        res.unwrap();
+        assert!(slot.is_none());
+        // Make the flushed-then-aborted pages durable, exercising the conservative
+        // truncation guard for the eviction path too.
+        saguarodb_server::checkpoint::run_checkpoint(&app.components).unwrap();
+    }
+
+    let app = saguarodb_server::recovery::open_app(small_pool_config(dir.path())).unwrap();
+    let result = app.query_service.execute_sql("select id from big").unwrap();
+    assert_eq!(
+        result.row_count(),
+        0,
+        "a rolled-back transaction's evicted rows are invisible after restart"
+    );
+}
+
+#[tokio::test]
+async fn aborted_autocommit_statement_stays_invisible_after_restart() {
+    // An autocommit write that errors mid-statement aborts (status-based). Its
+    // partial heap writes may have been flushed; after restart they are invisible.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, val integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, val) values (1, 1)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, val) values (2, 9223372036854775807)")
+            .await
+            .unwrap();
+        // An UPDATE that overflows on the second row aborts the whole statement
+        // after mutating the first row's version.
+        let err = server
+            .simple_query("update users set val = val + 1")
+            .await
+            .err()
+            .expect("overflow aborts the update");
+        assert!(err.message.to_lowercase().contains("range"));
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, val from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    // Both original values survive; the aborted UPDATE's new versions are invisible.
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("1".to_string())],
+            vec![
+                Some("2".to_string()),
+                Some("9223372036854775807".to_string()),
+            ],
+        ]
+    );
+}
+
+/// A 4-frame pool with checkpoints effectively disabled, so a transaction's
+/// working set must exceed the pool and spill (steal) to the heap mid-flight.
+fn small_pool_config(dir: &Path) -> saguarodb_server::config::Config {
+    saguarodb_server::config::Config {
+        data_dir: dir.to_path_buf(),
+        port: 0,
+        buffer_pool_frames: 4,
+        checkpoint_every_n_commits: 1_000_000,
+        checkpoint_wal_bytes: 1 << 30,
+        shutdown_timeout_ms: 1_000,
+        ..Default::default()
+    }
 }
 
 /// Overwrite the first page of every heap (`.heap`) file with garbage, simulating

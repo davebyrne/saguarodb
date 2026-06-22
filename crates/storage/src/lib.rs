@@ -274,7 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn rollback_txn_restores_storage_owned_directory_metadata() {
+    fn aborted_insert_is_invisible_after_rollback() {
+        // Status-based abort (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1): the
+        // inserted row is NOT physically removed by rollback; it is hidden by the
+        // CLOG (here modelled via `mark_aborted`). A later reader (own writes
+        // excluded — query under txn 0) does not see it. (Before D1 this test
+        // asserted physical absence via buffer before-image undo; updated to assert
+        // VISIBILITY, the new abort contract.)
         let harness = StorageHarness::new();
         harness
             .create_users_table(&StatementContext::new(0))
@@ -287,18 +293,30 @@ mod tests {
 
         harness.storage.rollback_txn(ctx.txn_id).unwrap();
         harness.buffer.rollback(ctx.txn_id).unwrap();
+        harness.wal.mark_aborted(ctx.txn_id);
 
+        // A reader other than the aborted txn sees nothing (the row is invisible).
         assert_eq!(
             harness
                 .storage
-                .get(&ctx, 1, &Key(vec![Value::Integer(1)]))
+                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
                 .unwrap(),
             None
         );
     }
 
     #[test]
-    fn rollback_txn_restores_update_and_drop_metadata() {
+    fn aborted_update_leaves_old_version_visible_and_rollback_restores_drop_metadata() {
+        // An aborted UPDATE writes a new version (xmin = aborter) and stamps the old
+        // version's xmax = aborter. Under status-based abort (`docs/specs/mvcc.md`
+        // §4 Decision 3) neither is undone; with the aborter hidden by the CLOG, the
+        // new version is invisible and the old version's xmax does not hide it, so a
+        // reader still sees the OLD value. (Before D1 the buffer before-image
+        // physically restored the page; updated to assert VISIBILITY.)
+        //
+        // DROP metadata rollback is unchanged: `drop_table` only flips the engine's
+        // shadow `dropped` flag, which `rollback_txn` restores (this is engine DDL
+        // metadata, not before-image page undo, so it survives D1).
         let harness = StorageHarness::new();
         harness
             .create_users_table(&StatementContext::new(0))
@@ -323,11 +341,13 @@ mod tests {
             .unwrap();
         harness.storage.rollback_txn(update_ctx.txn_id).unwrap();
         harness.buffer.rollback(update_ctx.txn_id).unwrap();
+        harness.wal.mark_aborted(update_ctx.txn_id);
 
+        // A reader other than the aborter sees the original committed value.
         assert_eq!(
             harness
                 .storage
-                .get(&update_ctx, 1, &Key(vec![Value::Integer(1)]))
+                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
                 .unwrap(),
             Some(user_row(1, "Ada", true))
         );
@@ -339,14 +359,20 @@ mod tests {
         assert_eq!(
             harness
                 .storage
-                .get(&drop_ctx, 1, &Key(vec![Value::Integer(1)]))
+                .get(&StatementContext::new(0), 1, &Key(vec![Value::Integer(1)]))
                 .unwrap(),
             Some(user_row(1, "Ada", true))
         );
     }
 
     #[test]
-    fn rollback_after_insert_on_new_page_removes_directory_and_buffer_page() {
+    fn aborted_insert_on_new_page_keeps_the_page_and_hides_the_row() {
+        // An INSERT that needs a fresh heap page, then aborts: under status-based
+        // abort (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1) the freshly
+        // allocated page is NOT reclaimed — it stays resident (and would be replayed
+        // by redo-all recovery), with its tuple hidden by the CLOG. (Before D1 the
+        // buffer pool removed the new page on rollback; updated to assert the page
+        // REMAINS and the row is invisible, matching the recovered state.)
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
         let schema = big_text_schema();
@@ -363,26 +389,32 @@ mod tests {
         harness.buffer.commit(ctx.txn_id).unwrap();
 
         let failed_ctx = StatementContext::new(2);
+        // This row needs a second heap page (page 1 of file 2): the first page is
+        // full of the committed large row.
         harness
             .storage
             .insert(&failed_ctx, 2, small_big_text_row(2))
             .unwrap();
         harness.storage.rollback_txn(failed_ctx.txn_id).unwrap();
         harness.buffer.rollback(failed_ctx.txn_id).unwrap();
+        harness.wal.mark_aborted(failed_ctx.txn_id);
 
+        // The aborted row is invisible to a reader other than the aborter.
         assert_eq!(
             harness
                 .storage
-                .get(&failed_ctx, 2, &Key(vec![Value::Integer(2)]))
+                .get(&StatementContext::new(0), 2, &Key(vec![Value::Integer(2)]))
                 .unwrap(),
             None
         );
+        // The freshly allocated page (file 2, page 1) is still resident, not
+        // reclaimed.
         assert!(
             harness
                 .buffer
                 .iter_pages()
                 .unwrap()
-                .all(|page| page.file_id != 2 || page.page_num != 1)
+                .any(|page| page.file_id == 2 && page.page_num == 1)
         );
     }
 
@@ -952,11 +984,22 @@ mod tests {
     #[derive(Default)]
     struct CountingWal {
         count: AtomicUsize,
+        /// Transactions the test has explicitly aborted. Status-based abort
+        /// (`docs/specs/mvcc.md` §4 Decision 3) hides a rolled-back txn's rows via
+        /// the CLOG rather than by physical undo, so a test that rolls a txn back
+        /// marks it here to model `CLOG[txn] = Aborted` and assert invisibility.
+        aborted: std::sync::Mutex<std::collections::HashSet<TxnId>>,
     }
 
     impl CountingWal {
         fn record_count(&self) -> usize {
             self.count.load(Ordering::SeqCst)
+        }
+
+        /// Model `CLOG[txn] = Aborted` so the visibility predicate hides the txn's
+        /// (physically retained, no-undo) rows.
+        fn mark_aborted(&self, txn_id: TxnId) {
+            self.aborted.lock().unwrap().insert(txn_id);
         }
     }
 
@@ -973,13 +1016,6 @@ mod tests {
             Ok(Box::new(std::iter::empty()))
         }
 
-        fn replay_committed_from(
-            &self,
-            _lsn: Lsn,
-        ) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
         fn truncate_before(&self, _lsn: Lsn) -> Result<()> {
             Ok(())
         }
@@ -992,19 +1028,24 @@ mod tests {
             Ok(0)
         }
 
-        fn set_committed_floor(&self, _floor: u64) -> Result<()> {
+        fn establish_recovery_committed_floor(&self, _allocation_boundary: u64) -> Result<()> {
             Ok(())
         }
     }
 
     impl TxnStatusView for CountingWal {
         // The harness models committed autocommit units: every statement here
-        // commits (via `commit_txn`/`buffer.commit`) and is read back as committed.
-        // Rolled-back rows are removed physically by the buffer before-image, so
-        // their invisibility does not depend on this status. Reporting `Committed`
-        // lets cross-transaction reads observe committed rows under the snapshot.
-        fn status(&self, _txn_id: TxnId) -> TxnStatus {
-            TxnStatus::Committed
+        // commits (via `commit_txn`/`buffer.commit`) and is read back as committed,
+        // EXCEPT txns the test explicitly aborted. Under status-based abort
+        // (`docs/specs/mvcc.md` §4 Decision 3) a rolled-back txn's rows are retained
+        // physically (no before-image undo) and hidden by this `Aborted` status, so
+        // the harness must report it to make rollback tests assert invisibility.
+        fn status(&self, txn_id: TxnId) -> TxnStatus {
+            if self.aborted.lock().unwrap().contains(&txn_id) {
+                TxnStatus::Aborted
+            } else {
+                TxnStatus::Committed
+            }
         }
     }
 
