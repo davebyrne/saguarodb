@@ -952,18 +952,26 @@ async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
         // cannot hold a transaction across calls, so drive the explicit transaction
         // through the session-carrying simple path.
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let (mut slot, res) = app.query_service.execute_simple("begin", None, &cancel);
+        // The session default isolation is irrelevant here (these are plain explicit
+        // transactions); thread the built-in default and ignore the returned one.
+        let iso = common::IsolationLevel::default();
+        let (mut slot, _iso, res) = app
+            .query_service
+            .execute_simple("begin", None, iso, &cancel);
         res.unwrap();
         for id in 1..=10 {
-            let (next, res) = app.query_service.execute_simple(
+            let (next, _iso, res) = app.query_service.execute_simple(
                 &format!("insert into big (id, payload) values ({id}, '{payload}')"),
                 slot,
+                iso,
                 &cancel,
             );
             res.unwrap();
             slot = next;
         }
-        let (slot, res) = app.query_service.execute_simple("commit", slot, &cancel);
+        let (slot, _iso, res) = app
+            .query_service
+            .execute_simple("commit", slot, iso, &cancel);
         res.unwrap();
         assert!(slot.is_none());
     }
@@ -990,18 +998,26 @@ async fn uncommitted_pages_evicted_under_pressure_then_aborted_are_invisible() {
             .execute_sql("create table big (id integer primary key, payload text)")
             .unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let (mut slot, res) = app.query_service.execute_simple("begin", None, &cancel);
+        // The session default isolation is irrelevant here (these are plain explicit
+        // transactions); thread the built-in default and ignore the returned one.
+        let iso = common::IsolationLevel::default();
+        let (mut slot, _iso, res) = app
+            .query_service
+            .execute_simple("begin", None, iso, &cancel);
         res.unwrap();
         for id in 1..=10 {
-            let (next, res) = app.query_service.execute_simple(
+            let (next, _iso, res) = app.query_service.execute_simple(
                 &format!("insert into big (id, payload) values ({id}, '{payload}')"),
                 slot,
+                iso,
                 &cancel,
             );
             res.unwrap();
             slot = next;
         }
-        let (slot, res) = app.query_service.execute_simple("rollback", slot, &cancel);
+        let (slot, _iso, res) = app
+            .query_service
+            .execute_simple("rollback", slot, iso, &cancel);
         res.unwrap();
         assert!(slot.is_none());
         // Make the flushed-then-aborted pages durable, exercising the conservative

@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{ColumnInfo, DataType, DbError, Result, Row, SqlState, Value};
+use common::{ColumnInfo, DataType, DbError, IsolationLevel, Result, Row, SqlState, Value};
 use executor::ExecutionResult;
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -201,6 +201,14 @@ struct Session {
     /// autocommit. Aborted on disconnect (`Drop`) so a client that disconnects
     /// mid-transaction does not leak the write guard or a registry entry.
     txn: Option<Transaction>,
+    /// This connection's default isolation level for new transactions
+    /// (`docs/specs/mvcc.md` §10 Milestone G2). Starts at `ReadCommitted` and is
+    /// updated by `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL
+    /// <level>`. Threaded in/out of the query path alongside `txn`: a `BEGIN` with no
+    /// explicit `ISOLATION LEVEL` inherits it, while `SET SESSION CHARACTERISTICS`
+    /// updates it. It persists across transactions on this connection and resets to
+    /// `ReadCommitted` for each new connection (this field is per-`Session`).
+    default_isolation: IsolationLevel,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -285,6 +293,10 @@ impl Session {
             failed: false,
             tx: TransactionState::Idle,
             txn: None,
+            // A fresh connection defaults to Read Committed (Postgres' default),
+            // regardless of any other connection's session setting (`docs/specs/mvcc.md`
+            // §10 Milestone G2).
+            default_isolation: IsolationLevel::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
         }
@@ -431,26 +443,30 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
-        // Move the session's transaction slot into the blocking task so the whole
-        // statement (including any owned write guard) runs on one thread, then
-        // take it back along with the result.
+        // Move the session's transaction slot AND default isolation into the blocking
+        // task so the whole statement (including any owned write guard) runs on one
+        // thread, then take them both back along with the result. The default is
+        // threaded in/out like the slot so `SET SESSION CHARACTERISTICS` persists it
+        // and a new `BEGIN` inherits it (`docs/specs/mvcc.md` §10 Milestone G2).
         let txn = self.txn.take();
+        let default_isolation = self.default_isolation;
         let task = tokio::task::spawn_blocking(move || {
-            let (txn, result) = service.execute_simple(&sql, txn, &cancel);
-            (txn, result)
+            service.execute_simple(&sql, txn, default_isolation, &cancel)
         })
         .await;
         drop(guard);
         let result = match task {
-            Ok((txn, result)) => {
+            Ok((txn, default_isolation, result)) => {
                 self.txn = txn;
+                self.default_isolation = default_isolation;
                 result
             }
             Err(join_err) => {
                 // The blocking task panicked and lost the transaction slot. Treat
                 // the connection as having no open transaction (the panic firewall
                 // surfaces an internal error); the guard/registry entry for a lost
-                // txn cannot be recovered here, so this is best-effort.
+                // txn cannot be recovered here, so this is best-effort. The session
+                // default is left as-is (it never moved into a committed effect).
                 self.txn = None;
                 Err(DbError::internal(format!("query task failed: {join_err}")))
             }
@@ -514,18 +530,28 @@ impl Session {
         let route_through_session =
             self.txn.is_some() || statement.is_transaction_control() || statement.is_maintenance();
         let result = if route_through_session {
-            // Move the transaction slot into the blocking task (like the simple-
-            // query path) so the whole statement, including any owned write guard,
-            // runs on one thread; take it back with the result.
+            // Move the transaction slot AND default isolation into the blocking task
+            // (like the simple-query path) so the whole statement, including any owned
+            // write guard, runs on one thread; take them both back with the result. A
+            // transaction-control `Execute` (e.g. BEGIN, or SET SESSION CHARACTERISTICS
+            // routed via the session path) reads/updates the default here.
             let txn = self.txn.take();
+            let default_isolation = self.default_isolation;
             let task = tokio::task::spawn_blocking(move || {
-                service.execute_prepared_in_session(&statement, &params, txn, &cancel)
+                service.execute_prepared_in_session(
+                    &statement,
+                    &params,
+                    txn,
+                    default_isolation,
+                    &cancel,
+                )
             })
             .await;
             drop(guard);
             match task {
-                Ok((txn, result)) => {
+                Ok((txn, default_isolation, result)) => {
                     self.txn = txn;
+                    self.default_isolation = default_isolation;
                     result
                 }
                 Err(join_err) => {
@@ -995,6 +1021,119 @@ mod tests {
 
         client.write_all(&terminate_bytes()).await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_characteristics_default_is_per_connection_over_the_wire() {
+        // End-to-end (Milestone G2): `SET SESSION CHARACTERISTICS ... REPEATABLE READ`
+        // on one connection makes a later plain `BEGIN` on THAT connection default to
+        // Repeatable Read (its second SELECT does not see a row committed in between).
+        // A fresh connection resets to Read Committed and DOES see such a row.
+        let dir = tempfile::tempdir().unwrap();
+        let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept connections for the duration of the test on a background task.
+        let accept_app = app.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let app = accept_app.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(socket, app).await;
+                });
+            }
+        });
+
+        // Setup connection: create the table and seed nothing.
+        let mut setup = TcpStream::connect(addr).await.unwrap();
+        setup.write_all(&startup_bytes("dave")).await.unwrap();
+        read_until_ready(&mut setup).await;
+        setup
+            .write_all(&query_bytes("create table t (id integer primary key)"))
+            .await
+            .unwrap();
+        read_until_ready(&mut setup).await;
+
+        // Connection A: set the session default to Repeatable Read, then open a txn.
+        let mut conn_a = TcpStream::connect(addr).await.unwrap();
+        conn_a.write_all(&startup_bytes("dave")).await.unwrap();
+        read_until_ready(&mut conn_a).await;
+        conn_a
+            .write_all(&query_bytes(
+                "set session characteristics as transaction isolation level repeatable read",
+            ))
+            .await
+            .unwrap();
+        let response = read_until_ready(&mut conn_a).await;
+        assert!(
+            response.windows(4).any(|w| w == b"SET\0"),
+            "SET SESSION CHARACTERISTICS completes with a SET tag"
+        );
+
+        conn_a.write_all(&query_bytes("begin")).await.unwrap();
+        read_until_ready_any(&mut conn_a).await;
+        conn_a
+            .write_all(&query_bytes("select id from t"))
+            .await
+            .unwrap();
+        let response = read_until_ready_any(&mut conn_a).await;
+        assert!(response.windows(9).any(|w| w == b"SELECT 0\0"));
+
+        // The setup connection commits a row while conn A's RR txn is open.
+        setup
+            .write_all(&query_bytes("insert into t (id) values (1)"))
+            .await
+            .unwrap();
+        read_until_ready(&mut setup).await;
+
+        // Conn A's second SELECT does NOT see the new row (it defaulted to RR).
+        conn_a
+            .write_all(&query_bytes("select id from t"))
+            .await
+            .unwrap();
+        let response = read_until_ready_any(&mut conn_a).await;
+        assert!(
+            response.windows(9).any(|w| w == b"SELECT 0\0"),
+            "the inherited RR transaction does not see the concurrently-committed row"
+        );
+        conn_a.write_all(&query_bytes("commit")).await.unwrap();
+        read_until_ready(&mut conn_a).await;
+        conn_a.write_all(&terminate_bytes()).await.unwrap();
+
+        // Connection B (fresh): resets to Read Committed regardless of conn A's
+        // setting. Its open transaction's second SELECT DOES see a new committed row.
+        let mut conn_b = TcpStream::connect(addr).await.unwrap();
+        conn_b.write_all(&startup_bytes("dave")).await.unwrap();
+        read_until_ready(&mut conn_b).await;
+        conn_b.write_all(&query_bytes("begin")).await.unwrap();
+        read_until_ready_any(&mut conn_b).await;
+        conn_b
+            .write_all(&query_bytes("select id from t"))
+            .await
+            .unwrap();
+        let response = read_until_ready_any(&mut conn_b).await;
+        assert!(response.windows(9).any(|w| w == b"SELECT 1\0"));
+        setup
+            .write_all(&query_bytes("insert into t (id) values (2)"))
+            .await
+            .unwrap();
+        read_until_ready(&mut setup).await;
+        conn_b
+            .write_all(&query_bytes("select id from t"))
+            .await
+            .unwrap();
+        let response = read_until_ready_any(&mut conn_b).await;
+        assert!(
+            response.windows(9).any(|w| w == b"SELECT 2\0"),
+            "a fresh connection resets to Read Committed and sees the new row"
+        );
+        conn_b.write_all(&query_bytes("commit")).await.unwrap();
+        read_until_ready(&mut conn_b).await;
+        conn_b.write_all(&terminate_bytes()).await.unwrap();
+        setup.write_all(&terminate_bytes()).await.unwrap();
+
+        server.abort();
     }
 
     fn startup_bytes(user: &str) -> Vec<u8> {
@@ -1599,6 +1738,30 @@ mod tests {
                 assert_ne!(read, 0, "connection closed before ReadyForQuery");
                 response.extend_from_slice(&buf[..read]);
                 if response.windows(6).any(|window| window == b"Z\0\0\0\x05I") {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        response
+    }
+
+    /// Like [`read_until_ready`] but breaks on a `ReadyForQuery` carrying ANY
+    /// transaction-status byte (`I`/`T`/`E`), so it can drain a reply sent while a
+    /// transaction block is open (status `'T'`), not just an idle one.
+    async fn read_until_ready_any<S: AsyncRead + Unpin>(client: &mut S) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut buf = [0; 1024];
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let read = client.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0, "connection closed before ReadyForQuery");
+                response.extend_from_slice(&buf[..read]);
+                let ready = response.windows(6).any(|window| {
+                    window[..5] == [b'Z', 0, 0, 0, 5] && matches!(window[5], b'I' | b'T' | b'E')
+                });
+                if ready {
                     break;
                 }
             }

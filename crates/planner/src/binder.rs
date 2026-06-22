@@ -151,7 +151,8 @@ fn bind_inner(
         Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
-        | Statement::SetTransaction { .. } => Err(plan_error(
+        | Statement::SetTransaction { .. }
+        | Statement::SetSessionCharacteristics { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
             "transaction control statements do not bind",
         )),

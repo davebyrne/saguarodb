@@ -52,11 +52,20 @@ pub enum Statement {
     Rollback,
     /// `SET TRANSACTION ISOLATION LEVEL <level>` (transaction-scoped). Sets the
     /// CURRENT transaction's isolation level; valid only before the transaction
-    /// has run its first query (`docs/specs/mvcc.md` §10 Milestone G). `isolation`
+    /// has run its first query (`docs/specs/mvcc.md` §10 Milestone G1). `isolation`
     /// is `None` for a `SET TRANSACTION` with no isolation-level mode (e.g.
-    /// `READ WRITE` only). `SET SESSION CHARACTERISTICS` (session default) is a
-    /// later milestone and is rejected here.
+    /// `READ WRITE` only).
     SetTransaction {
+        isolation: Option<IsolationLevel>,
+    },
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
+    /// (session-scoped default). Sets the per-connection default isolation used by
+    /// FUTURE transactions; it does not change an already-open transaction
+    /// (`docs/specs/mvcc.md` §10 Milestone G2). `isolation` carries the mapped level
+    /// (the same four-to-two mapping as `Begin`/`SetTransaction`), or `None` for a
+    /// `SET SESSION CHARACTERISTICS` with no isolation-level mode (e.g. `READ WRITE`
+    /// only), which the server treats as a no-op success.
+    SetSessionCharacteristics {
         isolation: Option<IsolationLevel>,
     },
     /// `VACUUM` (all user tables) or `VACUUM <table>` (one table). A maintenance

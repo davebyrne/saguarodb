@@ -392,7 +392,12 @@ the first visitor after a transaction settles sets the hint.
 Snapshot acquisition timing is the isolation knob: **Read Committed** captures a
 fresh snapshot per statement; **Repeatable Read** captures one snapshot at the
 first statement of the transaction and reuses it. The level is selected per
-transaction by `BEGIN`/`SET TRANSACTION ISOLATION LEVEL` (Milestone G1, §10).
+transaction by `BEGIN`/`SET TRANSACTION ISOLATION LEVEL` (Milestone G1, §10), and
+a per-connection default is set by `SET SESSION CHARACTERISTICS AS TRANSACTION
+ISOLATION LEVEL <level>` (Milestone G2, §10). The precedence for a new
+transaction is: **explicit `BEGIN`/`START TRANSACTION ISOLATION LEVEL` > `SET
+TRANSACTION` (current txn, before its first query) > session default > Read
+Committed**.
 
 ---
 
@@ -930,9 +935,10 @@ savepoints via sub-transaction xids (optional, deferred).
     The non-standard `SNAPSHOT` level also maps to Repeatable Read.
   - **`BEGIN`/`START TRANSACTION` isolation** is read at BEGIN: an explicit
     `ISOLATION LEVEL` mode sets `Transaction.isolation`; with no mode the
-    transaction uses the default (Read Committed — a session/global default is
-    deferred to G2). An explicit level on a `BEGIN` issued **inside** an already-open
-    block is ignored (Postgres: there is already a transaction in progress).
+    transaction inherits the **session default** (`Session.default_isolation`, Read
+    Committed unless raised by `SET SESSION CHARACTERISTICS` — see G2). An explicit
+    level on a `BEGIN` issued **inside** an already-open block is ignored (Postgres:
+    there is already a transaction in progress).
   - **`SET TRANSACTION ISOLATION LEVEL`** sets the **current** transaction's level
     and is valid **only before the transaction's first query** (i.e. before its
     snapshot was captured). After the first statement it errors with
@@ -955,8 +961,34 @@ savepoints via sub-transaction xids (optional, deferred).
     that writes a row another transaction changed and committed **after** its
     snapshot hits the existing first-updater-wins detection and surfaces `40001`
     (`SerializationFailure`), exactly as a concurrent autocommit conflict does.
-- **G2 — session-default isolation** (`SET SESSION CHARACTERISTICS AS TRANSACTION
-  ISOLATION LEVEL <level>`) is deferred; it is rejected at parse time for now.
+- **G2 — session-default isolation.** *(implemented.)*
+  `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` sets a
+  **per-connection default** isolation (`Session.default_isolation`, default Read
+  Committed) used by FUTURE transactions. It reuses G1's four-to-two level mapping
+  (`READ UNCOMMITTED`/`READ COMMITTED` → Read Committed; `REPEATABLE READ`/
+  `SERIALIZABLE`/`SNAPSHOT` → Repeatable Read) and the same access-mode handling
+  (`READ WRITE` accepted-and-ignored, `READ ONLY` rejected at parse time).
+  - **Inheritance precedence** for a new transaction: explicit
+    `BEGIN`/`START TRANSACTION ISOLATION LEVEL` > `SET TRANSACTION` (current txn,
+    before its first query) > **session default** > Read Committed. A plain `BEGIN`
+    with no explicit level reads `Session.default_isolation`
+    (`begin_transaction(isolation.unwrap_or(session_default))`); an explicit level
+    overrides it for that one transaction.
+  - **Does not change the current open transaction.** Unlike `SET TRANSACTION`,
+    `SET SESSION CHARACTERISTICS` has no before-first-query rule and is allowed
+    inside a transaction block; it updates the session default for FUTURE
+    transactions only and leaves an already-open transaction's `isolation`
+    unchanged (Postgres-compatible). With no isolation-level mode (e.g. `READ WRITE`
+    only) it is a no-op success. Inside an already-failed (`'E'`) block it is
+    rejected with `25P02` (`InFailedSqlTransaction`) like any non-COMMIT/ROLLBACK
+    statement, leaving the default unchanged.
+  - **Persistence and reset.** The default persists across transactions on the
+    connection (it is threaded in/out of the query path beside the transaction
+    slot) and resets to Read Committed for each new connection (the field is
+    per-`Session`).
+  - **Autocommit.** A single autocommit statement has exactly one snapshot, so
+    Read Committed vs Repeatable Read is functionally moot for it; the session
+    default is not threaded into the autocommit single-statement snapshot path.
 
 ### Milestone H — HOT *(deferred, purely additive)*
 

@@ -109,20 +109,29 @@ impl QueryService {
     /// `slot`, returning the (possibly mutated) slot alongside the result. The
     /// slot carries the open explicit transaction across statements; autocommit
     /// statements run with `slot == None`.
+    ///
+    /// `default_isolation` is the session's current default isolation level
+    /// (`docs/specs/mvcc.md` §10 G2), threaded in/out by value like `slot`: a
+    /// `BEGIN` with no explicit `ISOLATION LEVEL` inherits it, and `SET SESSION
+    /// CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` updates it. The
+    /// (possibly updated) default is returned so the connection persists it across
+    /// statements.
     pub fn execute_simple(
         &self,
         sql: &str,
         slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
         cancel: &AtomicBool,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let parsed = match parser::parse(sql) {
             Ok(parsed) => parsed,
             // A syntax error inside an open transaction poisons the block to the
             // failed state, matching PostgreSQL (the block must be ended before any
-            // further command is accepted). Autocommit (`None`) is unaffected.
-            Err(err) => return (mark_failed_on_error(slot), Err(err)),
+            // further command is accepted). Autocommit (`None`) is unaffected. The
+            // session default is unchanged by a failed parse.
+            Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
         };
-        self.dispatch(parsed, slot, cancel)
+        self.dispatch(parsed, slot, default_isolation, cancel)
     }
 
     /// Backwards-compatible autocommit entry point: run one SQL string with no
@@ -139,7 +148,11 @@ impl QueryService {
         sql: &str,
         cancel: &AtomicBool,
     ) -> Result<ExecutionResult> {
-        let (_slot, result) = self.execute_simple(sql, None, cancel);
+        // The autocommit helper has no persistent session: pass the built-in default
+        // and discard the returned (possibly updated) default. A bare `SET SESSION
+        // CHARACTERISTICS` here is therefore a no-op success with no lasting effect.
+        let (_slot, _default, result) =
+            self.execute_simple(sql, None, IsolationLevel::default(), cancel);
         result
     }
 
@@ -254,10 +267,11 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
         slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
         cancel: &AtomicBool,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
-            return self.handle_transaction_control(kind, slot, cancel);
+            return self.handle_transaction_control(kind, slot, default_isolation, cancel);
         }
 
         // VACUUM does not bind/plan: dispatch it before parameter substitution.
@@ -268,25 +282,32 @@ impl QueryService {
                 txn.failed = true;
                 return (
                     Some(txn),
+                    default_isolation,
                     Err(DbError::plan(
                         SqlState::FeatureNotSupported,
                         "VACUUM cannot run inside a transaction block",
                     )),
                 );
             }
-            return (None, self.run_prepared_vacuum(prepared));
+            return (None, default_isolation, self.run_prepared_vacuum(prepared));
         }
 
         let bound = match self.substitute_prepared_params(prepared, params) {
             Ok(bound) => bound,
             // A parameter-count/substitution error inside an open transaction
             // poisons it to the failed state, matching the simple-query path.
-            Err(err) => return (mark_failed_on_error(slot), Err(err)),
+            Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
         };
 
         match slot {
             Some(txn) => {
-                self.run_bound_in_transaction(txn, prepared.class, BindSource::Bound(bound), cancel)
+                let (slot, result) = self.run_bound_in_transaction(
+                    txn,
+                    prepared.class,
+                    BindSource::Bound(bound),
+                    cancel,
+                );
+                (slot, default_isolation, result)
             }
             // No open transaction: fall back to an autocommit unit (the connection
             // routes here only when a transaction is open, but keep this total so
@@ -304,7 +325,7 @@ impl QueryService {
                         unreachable!("transaction control is dispatched above before substitution")
                     }
                 };
-                (None, result)
+                (None, default_isolation, result)
             }
         }
     }
@@ -336,24 +357,28 @@ impl QueryService {
 
 impl QueryService {
     /// Route a parsed simple-query statement through the transaction lifecycle.
+    /// `default_isolation` is the session default (in/out, like `slot`); only
+    /// transaction-control statements read or update it, so the data and maintenance
+    /// arms pass it back unchanged.
     fn dispatch(
         &self,
         statement: Statement,
         slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
         cancel: &AtomicBool,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let class = match statement_class(&statement) {
             Ok(class) => class,
             Err(err) => {
                 // A parse/classification error inside an open transaction still
                 // poisons it to the failed state (matching Postgres).
                 let slot = mark_failed_on_error(slot);
-                return (slot, Err(err));
+                return (slot, default_isolation, Err(err));
             }
         };
 
         if let StatementClass::TransactionControl(kind) = class {
-            return self.handle_transaction_control(kind, slot, cancel);
+            return self.handle_transaction_control(kind, slot, default_isolation, cancel);
         }
 
         // VACUUM is a maintenance command: it does not bind/plan, and like DDL it is
@@ -365,75 +390,130 @@ impl QueryService {
                 txn.failed = true;
                 return (
                     Some(txn),
+                    default_isolation,
                     Err(DbError::plan(
                         SqlState::FeatureNotSupported,
                         "VACUUM cannot run inside a transaction block",
                     )),
                 );
             }
-            return (None, self.run_vacuum(statement));
+            return (None, default_isolation, self.run_vacuum(statement));
         }
 
         match slot {
             // A data statement with an open explicit transaction runs inside it.
-            Some(txn) => self.run_in_transaction(txn, class, statement, cancel),
+            Some(txn) => {
+                let (slot, result) = self.run_in_transaction(txn, class, statement, cancel);
+                (slot, default_isolation, result)
+            }
             // No open transaction: this is an autocommit unit.
             None => {
                 let result = self.run_autocommit(class, statement, cancel);
-                (None, result)
+                (None, default_isolation, result)
             }
         }
     }
 
-    /// Handle BEGIN/COMMIT/ROLLBACK against the session's transaction `slot`.
+    /// Handle BEGIN/COMMIT/ROLLBACK/SET TRANSACTION/SET SESSION CHARACTERISTICS
+    /// against the session's transaction `slot` and `default_isolation` (the session
+    /// default, in/out). Only `Begin` reads the default and only
+    /// `SetSessionCharacteristics` updates it; every other arm returns it unchanged.
     fn handle_transaction_control(
         &self,
         kind: TransactionControl,
         slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
         _cancel: &AtomicBool,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         match kind {
             TransactionControl::Begin(isolation) => match slot {
                 // Postgres: BEGIN inside a transaction is a warning + no-op that
                 // stays 'T'. We keep the open transaction (and its existing
                 // isolation) and report success; the requested level is ignored,
                 // matching Postgres' "there is already a transaction in progress".
-                Some(txn) => (Some(txn), Ok(begin_complete())),
-                // No explicit level uses the transaction default (Read Committed
-                // until session defaults land in a later milestone).
-                None => match self.begin_transaction(isolation.unwrap_or_default()) {
-                    Ok(txn) => (Some(txn), Ok(begin_complete())),
-                    Err(err) => (None, Err(err)),
+                Some(txn) => (Some(txn), default_isolation, Ok(begin_complete())),
+                // No explicit level INHERITS the session default (`docs/specs/mvcc.md`
+                // §10 G2: explicit BEGIN level > SET TRANSACTION > session default >
+                // Read Committed). An explicit `ISOLATION LEVEL` overrides it for this
+                // one transaction.
+                None => match self.begin_transaction(isolation.unwrap_or(default_isolation)) {
+                    Ok(txn) => (Some(txn), default_isolation, Ok(begin_complete())),
+                    Err(err) => (None, default_isolation, Err(err)),
                 },
             },
             TransactionControl::SetTransaction(isolation) => {
-                self.handle_set_transaction(isolation, slot)
+                let (slot, result) = self.handle_set_transaction(isolation, slot);
+                (slot, default_isolation, result)
+            }
+            TransactionControl::SetSessionCharacteristics(isolation) => {
+                self.handle_set_session_characteristics(isolation, slot, default_isolation)
             }
             TransactionControl::Commit => match slot {
                 // COMMIT of a healthy transaction commits durably.
                 Some(txn) if !txn.failed => {
                     let result = self.commit_transaction(txn).map(|()| commit_complete());
-                    (None, result)
+                    (None, default_isolation, result)
                 }
                 // COMMIT of a failed transaction issues ROLLBACK (Postgres
                 // behavior), returning to Idle.
                 Some(txn) => {
                     self.abort_transaction(txn);
                     // Postgres tags this `ROLLBACK`, the actual action taken.
-                    (None, Ok(rollback_complete()))
+                    (None, default_isolation, Ok(rollback_complete()))
                 }
                 // COMMIT with no open transaction is a no-op warning, stays Idle.
-                None => (None, Ok(commit_complete())),
+                None => (None, default_isolation, Ok(commit_complete())),
             },
             TransactionControl::Rollback => match slot {
                 Some(txn) => {
                     self.abort_transaction(txn);
-                    (None, Ok(rollback_complete()))
+                    (None, default_isolation, Ok(rollback_complete()))
                 }
                 // ROLLBACK with no open transaction is a no-op warning, stays Idle.
-                None => (None, Ok(rollback_complete())),
+                None => (None, default_isolation, Ok(rollback_complete())),
             },
         }
+    }
+
+    /// Handle `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
+    /// (`docs/specs/mvcc.md` §10 Milestone G2). Postgres semantics: it sets the
+    /// per-connection DEFAULT isolation for FUTURE transactions and does NOT change
+    /// an already-open transaction's level; it is allowed inside a transaction block
+    /// (unlike `SET TRANSACTION`, it has no before-first-query rule) and persists
+    /// across transactions on this connection.
+    ///
+    /// - With an isolation-level mode, update `default_isolation` to the mapped level
+    ///   and leave the open transaction (if any) untouched.
+    /// - With no isolation-level mode (e.g. `READ WRITE` only) it is a no-op success
+    ///   that leaves the default unchanged.
+    /// - Inside an already-failed (`'E'`) block it is rejected with `25P02` like any
+    ///   other non-COMMIT/ROLLBACK statement, leaving the default unchanged.
+    fn handle_set_session_characteristics(
+        &self,
+        isolation: Option<IsolationLevel>,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        if let Some(txn) = &slot
+            && txn.failed
+        {
+            // A failed block rejects everything but COMMIT/ROLLBACK with `25P02` and
+            // stays 'E'; the session default is unchanged.
+            return (
+                slot,
+                default_isolation,
+                Err(DbError::execute(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )),
+            );
+        }
+        // Update the session default only when a level was given; otherwise it is a
+        // no-op success. The open transaction (if any) is returned UNCHANGED — this
+        // statement never mutates the current transaction's isolation, matching
+        // Postgres (it affects only future transactions).
+        let updated = isolation.unwrap_or(default_isolation);
+        (slot, updated, Ok(set_complete()))
     }
 
     /// Handle `SET TRANSACTION ISOLATION LEVEL <level>` against the session's
@@ -484,10 +564,10 @@ impl QueryService {
                 if let Some(level) = isolation {
                     txn.isolation = level;
                 }
-                (Some(txn), Ok(set_transaction_complete()))
+                (Some(txn), Ok(set_complete()))
             }
             // No open transaction: a no-op success (autocommit).
-            None => (None, Ok(set_transaction_complete())),
+            None => (None, Ok(set_complete())),
         }
     }
 
@@ -1307,8 +1387,9 @@ fn rollback_complete() -> ExecutionResult {
     }
 }
 
-fn set_transaction_complete() -> ExecutionResult {
-    // Postgres tags `SET TRANSACTION` (and a no-op `SET`) with the `SET` command tag.
+/// The `SET` command tag, shared by `SET TRANSACTION` and `SET SESSION
+/// CHARACTERISTICS` (and a no-op `SET`) — Postgres tags all of them `SET`.
+fn set_complete() -> ExecutionResult {
     ExecutionResult::Modified {
         command: "SET".to_string(),
         count: 0,
@@ -1327,8 +1408,8 @@ enum BindSource {
 #[derive(Clone, Copy)]
 enum TransactionControl {
     /// `BEGIN`/`START TRANSACTION`, carrying an optional explicit
-    /// `ISOLATION LEVEL` (`None` uses the transaction default, Read Committed
-    /// until session defaults land in a later milestone).
+    /// `ISOLATION LEVEL` (`None` inherits the session default — Read Committed
+    /// unless `SET SESSION CHARACTERISTICS` raised it, `docs/specs/mvcc.md` §10 G2).
     Begin(Option<IsolationLevel>),
     Commit,
     Rollback,
@@ -1336,6 +1417,11 @@ enum TransactionControl {
     /// isolation level, valid only before its first query. `None` isolation is a
     /// `SET TRANSACTION` with no level mode (a no-op for v1).
     SetTransaction(Option<IsolationLevel>),
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`: set the
+    /// per-connection DEFAULT isolation for future transactions, without changing an
+    /// already-open transaction (`docs/specs/mvcc.md` §10 G2). `None` is a
+    /// `SET SESSION CHARACTERISTICS` with no level mode (a no-op success).
+    SetSessionCharacteristics(Option<IsolationLevel>),
 }
 
 #[derive(Clone, Copy)]
@@ -1433,7 +1519,32 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::SetTransaction { isolation } => Ok(StatementClass::TransactionControl(
             TransactionControl::SetTransaction(*isolation),
         )),
+        Statement::SetSessionCharacteristics { isolation } => {
+            Ok(StatementClass::TransactionControl(
+                TransactionControl::SetSessionCharacteristics(*isolation),
+            ))
+        }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
+    }
+}
+
+#[cfg(test)]
+impl QueryService {
+    /// Test-only thin wrapper over [`QueryService::execute_simple`] that supplies the
+    /// built-in default isolation (`ReadCommitted`) and discards the returned
+    /// (possibly updated) session default, recovering the pre-G2 `(slot, result)`
+    /// shape. Used by transaction-control tests where the session default is
+    /// irrelevant; the G2 inheritance tests call `execute_simple` directly to drive
+    /// and observe the default.
+    fn execute_simple_default(
+        &self,
+        sql: &str,
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        let (slot, _default, result) =
+            self.execute_simple(sql, slot, IsolationLevel::default(), cancel);
+        (slot, result)
     }
 }
 
@@ -1443,7 +1554,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use catalog::CatalogSnapshot;
-    use common::{DataType, SqlState, Value};
+    use common::{DataType, IsolationLevel, Result, SqlState, Value};
+    use executor::ExecutionResult;
 
     use super::SessionTxnStatus;
     use crate::app::AppState;
@@ -1477,11 +1589,13 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         // BEGIN; INSERT; SELECT (sees own insert); COMMIT;
-        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
         result.unwrap();
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
 
-        let (slot, result) = app.query_service.execute_simple(
+        let (slot, result) = app.query_service.execute_simple_default(
             "insert into users (id, name) values (1, 'Ada')",
             slot,
             &cancel,
@@ -1491,14 +1605,16 @@ mod tests {
 
         let (slot, result) =
             app.query_service
-                .execute_simple("select id from users", slot, &cancel);
+                .execute_simple_default("select id from users", slot, &cancel);
         let rows = match result.unwrap() {
             executor::ExecutionResult::Query { rows, .. } => rows,
             other => panic!("expected query, got {other:?}"),
         };
         assert_eq!(rows.len(), 1, "the open transaction sees its own insert");
 
-        let (slot, result) = app.query_service.execute_simple("commit", slot, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
         result.unwrap();
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Idle);
         assert!(slot.is_none());
@@ -1521,15 +1637,19 @@ mod tests {
             .unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
         result.unwrap();
-        let (slot, result) = app.query_service.execute_simple(
+        let (slot, result) = app.query_service.execute_simple_default(
             "insert into users (id, name) values (1, 'Ada')",
             slot,
             &cancel,
         );
         result.unwrap();
-        let (slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
         result.unwrap();
         assert!(slot.is_none());
 
@@ -1550,27 +1670,31 @@ mod tests {
             .unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, result) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
         result.unwrap();
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
 
         // A statement against a missing table errors and poisons the txn to 'E'.
         let (slot, result) =
             app.query_service
-                .execute_simple("select id from ghosts", slot, &cancel);
+                .execute_simple_default("select id from ghosts", slot, &cancel);
         assert!(result.is_err());
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
 
         // While 'E', every statement but COMMIT/ROLLBACK is rejected with 25P02.
         let (slot, result) =
             app.query_service
-                .execute_simple("select id from users", slot, &cancel);
+                .execute_simple_default("select id from users", slot, &cancel);
         let err = result.unwrap_err();
         assert_eq!(err.code, SqlState::InFailedSqlTransaction);
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
 
         // ROLLBACK returns to Idle.
-        let (slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
         result.unwrap();
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Idle);
         assert!(app.components.active_txns.active_ids().is_empty());
@@ -1585,18 +1709,24 @@ mod tests {
             .unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
-        let (slot, _) =
-            app.query_service
-                .execute_simple("insert into users (id) values (1)", slot, &cancel);
+        let (slot, _) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        let (slot, _) = app.query_service.execute_simple_default(
+            "insert into users (id) values (1)",
+            slot,
+            &cancel,
+        );
         let (slot, result) =
             app.query_service
-                .execute_simple("select id from ghosts", slot, &cancel);
+                .execute_simple_default("select id from ghosts", slot, &cancel);
         assert!(result.is_err());
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
 
         // COMMIT of an aborted transaction issues ROLLBACK (Postgres behavior).
-        let (slot, result) = app.query_service.execute_simple("commit", slot, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
         result.unwrap();
         assert!(slot.is_none());
 
@@ -1614,8 +1744,10 @@ mod tests {
         let app = AppState::open_for_test(dir.path()).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
-        let (slot, result) = app.query_service.execute_simple(
+        let (slot, _) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        let (slot, result) = app.query_service.execute_simple_default(
             "create table users (id integer primary key)",
             slot,
             &cancel,
@@ -1623,7 +1755,9 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
-        let (_slot, result) = app.query_service.execute_simple("rollback", slot, &cancel);
+        let (_slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
         result.unwrap();
     }
 
@@ -1633,10 +1767,14 @@ mod tests {
         let app = AppState::open_for_test(dir.path()).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, result) = app.query_service.execute_simple("commit", None, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("commit", None, &cancel);
         result.unwrap();
         assert!(slot.is_none());
-        let (slot, result) = app.query_service.execute_simple("rollback", None, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("rollback", None, &cancel);
         result.unwrap();
         assert!(slot.is_none());
     }
@@ -1647,14 +1785,396 @@ mod tests {
         let app = AppState::open_for_test(dir.path()).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let (slot, _) = app.query_service.execute_simple("begin", None, &cancel);
+        let (slot, _) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
         let txn_id_before = app.components.active_txns.active_ids();
-        let (slot, result) = app.query_service.execute_simple("begin", slot, &cancel);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", slot, &cancel);
         result.unwrap();
         assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
         // The second BEGIN did not allocate a new transaction.
         assert_eq!(app.components.active_txns.active_ids(), txn_id_before);
-        let (_slot, _) = app.query_service.execute_simple("rollback", slot, &cancel);
+        let (_slot, _) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
+    }
+
+    // -- Milestone G2: session-default isolation (SET SESSION CHARACTERISTICS) --
+
+    /// Count the rows a SELECT returns, asserting it succeeded.
+    fn row_count(result: Result<ExecutionResult>) -> usize {
+        match result.unwrap() {
+            ExecutionResult::Query { rows, .. } => rows.len(),
+            other => panic!("expected query result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_default_repeatable_read_is_inherited_by_a_new_begin() {
+        // The payoff test. After `SET SESSION CHARACTERISTICS ... REPEATABLE READ`, a
+        // plain `BEGIN` (no explicit level) defaults to Repeatable Read, so its second
+        // SELECT does NOT see a row another connection committed between the two
+        // SELECTs. The default (Read Committed) WOULD see it (the contrast case below).
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+
+        // Contrast: with the session default Read Committed, the second SELECT in an
+        // open transaction sees the concurrently-committed row.
+        let (slot, _iso, res) =
+            app.query_service
+                .execute_simple("begin", None, IsolationLevel::default(), &cancel);
+        res.unwrap();
+        let (slot, _iso, res) = app.query_service.execute_simple(
+            "select id from t",
+            slot,
+            IsolationLevel::ReadCommitted,
+            &cancel,
+        );
+        assert_eq!(row_count(res), 0);
+        // Another connection commits a new row (autocommit = its own implicit txn).
+        app.query_service
+            .execute_sql("insert into t (id) values (1)")
+            .unwrap();
+        let (slot, _iso, res) = app.query_service.execute_simple(
+            "select id from t",
+            slot,
+            IsolationLevel::ReadCommitted,
+            &cancel,
+        );
+        assert_eq!(
+            row_count(res),
+            1,
+            "Read Committed sees the concurrently-committed row"
+        );
+        let (_slot, _iso, res) = app.query_service.execute_simple(
+            "commit",
+            slot,
+            IsolationLevel::ReadCommitted,
+            &cancel,
+        );
+        res.unwrap();
+        app.query_service.execute_sql("delete from t").unwrap();
+
+        // Now SET SESSION CHARACTERISTICS ... REPEATABLE READ, then a plain BEGIN
+        // inherits Repeatable Read: its second SELECT does NOT see the new row.
+        let (slot, default_isolation, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction isolation level repeatable read",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+        );
+        res.unwrap();
+        assert_eq!(default_isolation, IsolationLevel::RepeatableRead);
+        assert!(slot.is_none(), "SET SESSION CHARACTERISTICS opens no txn");
+
+        let (slot, default_isolation, res) =
+            app.query_service
+                .execute_simple("begin", None, default_isolation, &cancel);
+        res.unwrap();
+        let (slot, default_isolation, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, default_isolation, &cancel);
+        assert_eq!(row_count(res), 0);
+        app.query_service
+            .execute_sql("insert into t (id) values (2)")
+            .unwrap();
+        let (slot, default_isolation, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, default_isolation, &cancel);
+        assert_eq!(
+            row_count(res),
+            0,
+            "the inherited Repeatable Read txn does NOT see the new row"
+        );
+        let (_slot, _iso, res) =
+            app.query_service
+                .execute_simple("commit", slot, default_isolation, &cancel);
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_begin_level_overrides_session_default() {
+        // Precedence: an explicit BEGIN level overrides the session default; a plain
+        // BEGIN inherits it. After SET SESSION CHARACTERISTICS ... REPEATABLE READ:
+        // `BEGIN ISOLATION LEVEL READ COMMITTED` behaves as Read Committed, while a
+        // plain `BEGIN` behaves as Repeatable Read.
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (_slot, session_default, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction isolation level repeatable read",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+        );
+        res.unwrap();
+        assert_eq!(session_default, IsolationLevel::RepeatableRead);
+
+        // Explicit READ COMMITTED on BEGIN overrides the RR session default: the
+        // second SELECT sees the concurrently-committed row.
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "begin isolation level read committed",
+            None,
+            session_default,
+            &cancel,
+        );
+        res.unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(row_count(res), 0);
+        app.query_service
+            .execute_sql("insert into t (id) values (1)")
+            .unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(
+            row_count(res),
+            1,
+            "explicit READ COMMITTED overrides the RR session default"
+        );
+        let (_slot, sd, res) = app
+            .query_service
+            .execute_simple("commit", slot, sd, &cancel);
+        res.unwrap();
+        app.query_service.execute_sql("delete from t").unwrap();
+
+        // A plain BEGIN still inherits the RR session default: it does not see the
+        // concurrently-committed row.
+        let (slot, sd, res) = app.query_service.execute_simple("begin", None, sd, &cancel);
+        res.unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(row_count(res), 0);
+        app.query_service
+            .execute_sql("insert into t (id) values (2)")
+            .unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(
+            row_count(res),
+            0,
+            "a plain BEGIN inherits the RR session default"
+        );
+        let (_slot, _sd, res) = app
+            .query_service
+            .execute_simple("commit", slot, sd, &cancel);
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_default_persists_across_transactions() {
+        // One SET SESSION CHARACTERISTICS ... REPEATABLE READ makes both of two
+        // sequential plain BEGIN…COMMIT transactions on the same connection behave as
+        // Repeatable Read (the default persists on the threaded session value).
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (_slot, sd, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction isolation level repeatable read",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+        );
+        res.unwrap();
+        assert_eq!(sd, IsolationLevel::RepeatableRead);
+
+        // Run two transactions in sequence; each must behave as Repeatable Read.
+        let mut session_default = sd;
+        for round in 0..2 {
+            let (slot, sd, res) =
+                app.query_service
+                    .execute_simple("begin", None, session_default, &cancel);
+            res.unwrap();
+            let (slot, sd, res) =
+                app.query_service
+                    .execute_simple("select id from t", slot, sd, &cancel);
+            let before = row_count(res);
+            // Another connection commits a fresh row.
+            app.query_service
+                .execute_sql(&format!("insert into t (id) values ({})", round + 1))
+                .unwrap();
+            let (slot, sd, res) =
+                app.query_service
+                    .execute_simple("select id from t", slot, sd, &cancel);
+            assert_eq!(
+                row_count(res),
+                before,
+                "round {round}: each transaction stays Repeatable Read"
+            );
+            let (slot, sd, res) = app
+                .query_service
+                .execute_simple("commit", slot, sd, &cancel);
+            res.unwrap();
+            assert!(slot.is_none());
+            session_default = sd;
+            assert_eq!(session_default, IsolationLevel::RepeatableRead);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_session_characteristics_does_not_change_the_open_transaction() {
+        // `SET SESSION CHARACTERISTICS` is allowed inside a transaction block but does
+        // NOT change the CURRENT transaction's isolation; it only affects FUTURE
+        // transactions. An open Read Committed transaction stays Read Committed after
+        // the SET, while the NEXT transaction is Repeatable Read.
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        // Open an explicit Read Committed transaction and capture its first snapshot.
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "begin isolation level read committed",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+        );
+        res.unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(row_count(res), 0);
+
+        // SET SESSION CHARACTERISTICS ... REPEATABLE READ inside the open block:
+        // updates the session default but leaves THIS transaction Read Committed.
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction isolation level repeatable read",
+            slot,
+            sd,
+            &cancel,
+        );
+        res.unwrap();
+        assert_eq!(sd, IsolationLevel::RepeatableRead);
+        assert_eq!(
+            super::slot_status(&slot),
+            SessionTxnStatus::InTransaction,
+            "SET SESSION CHARACTERISTICS does not end or fail the open block"
+        );
+
+        // Another connection commits a row; this still-Read-Committed transaction
+        // sees it on its next SELECT (proving its isolation was not raised to RR).
+        app.query_service
+            .execute_sql("insert into t (id) values (1)")
+            .unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(
+            row_count(res),
+            1,
+            "the open txn stayed Read Committed; SET SESSION CHARACTERISTICS did not change it"
+        );
+        let (_slot, sd, res) = app
+            .query_service
+            .execute_simple("commit", slot, sd, &cancel);
+        res.unwrap();
+
+        // The NEXT transaction is Repeatable Read (it inherited the updated default).
+        app.query_service.execute_sql("delete from t").unwrap();
+        let (slot, sd, res) = app.query_service.execute_simple("begin", None, sd, &cancel);
+        res.unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(row_count(res), 0);
+        app.query_service
+            .execute_sql("insert into t (id) values (2)")
+            .unwrap();
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from t", slot, sd, &cancel);
+        assert_eq!(
+            row_count(res),
+            0,
+            "the next transaction inherited Repeatable Read"
+        );
+        let (_slot, _sd, res) = app
+            .query_service
+            .execute_simple("commit", slot, sd, &cancel);
+        res.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_session_characteristics_no_level_is_a_noop_success() {
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE` (no isolation-level
+        // mode) is a no-op success that leaves the session default unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction read write",
+            None,
+            IsolationLevel::RepeatableRead,
+            &cancel,
+        );
+        res.unwrap();
+        assert!(slot.is_none());
+        assert_eq!(
+            sd,
+            IsolationLevel::RepeatableRead,
+            "a no-level SET SESSION CHARACTERISTICS leaves the default unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_characteristics_in_failed_block_is_rejected() {
+        // Inside an already-failed ('E') block, SET SESSION CHARACTERISTICS is rejected
+        // with 25P02 like any non-COMMIT/ROLLBACK statement, and the session default is
+        // unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("begin", None, IsolationLevel::default(), &cancel);
+        res.unwrap();
+        // Poison the block to 'E'.
+        let (slot, sd, res) =
+            app.query_service
+                .execute_simple("select id from ghosts", slot, sd, &cancel);
+        assert!(res.is_err());
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction isolation level repeatable read",
+            slot,
+            sd,
+            &cancel,
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.code, SqlState::InFailedSqlTransaction);
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+        assert_eq!(
+            sd,
+            IsolationLevel::ReadCommitted,
+            "a rejected SET SESSION CHARACTERISTICS leaves the default unchanged"
+        );
+        let (_slot, _sd, _res) = app
+            .query_service
+            .execute_simple("rollback", slot, sd, &cancel);
     }
 
     #[tokio::test]

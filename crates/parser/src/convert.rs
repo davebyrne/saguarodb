@@ -155,10 +155,13 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     }
 }
 
-/// Convert a `SET ...` statement. v1 supports only transaction-scoped
-/// `SET TRANSACTION ISOLATION LEVEL <level>` (`session == false`); `SET SESSION
-/// CHARACTERISTICS AS TRANSACTION ...` (`session == true`, the session default) is
-/// a later milestone, and every other `SET` form is unsupported.
+/// Convert a `SET ...` statement. v1 supports the transaction-scoped
+/// `SET TRANSACTION ISOLATION LEVEL <level>` (`session == false`) and the
+/// session-scoped `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL
+/// <level>` (`session == true`, the per-connection default). Both share the same
+/// mode parsing (so the four SQL levels map onto our two identically, and access
+/// modes follow the same accept-`READ WRITE`/reject-`READ ONLY` convention);
+/// `SET TRANSACTION SNAPSHOT` and every other `SET` form are unsupported.
 fn convert_set(set: sql::Set) -> Result<Statement> {
     let sql::Set::SetTransaction {
         modes,
@@ -171,14 +174,16 @@ fn convert_set(set: sql::Set) -> Result<Statement> {
     if snapshot.is_some() {
         return unsupported("SET TRANSACTION SNAPSHOT is not supported in v1");
     }
-    if session {
-        // `SET SESSION CHARACTERISTICS AS TRANSACTION ...` sets the session-default
-        // isolation, which is a later milestone (G2). Reject it cleanly rather than
-        // silently treating it as a transaction-scoped set.
-        return unsupported("SET SESSION CHARACTERISTICS is not supported in v1");
-    }
     let isolation = transaction_isolation_mode(&modes)?;
-    Ok(Statement::SetTransaction { isolation })
+    if session {
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` sets
+        // the per-connection default isolation for FUTURE transactions (G2). It
+        // reuses the same level mapping and access-mode handling as the
+        // transaction-scoped form above.
+        Ok(Statement::SetSessionCharacteristics { isolation })
+    } else {
+        Ok(Statement::SetTransaction { isolation })
+    }
 }
 
 /// Extract an optional `ISOLATION LEVEL <level>` from a list of transaction modes,

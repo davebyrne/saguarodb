@@ -758,6 +758,128 @@ async fn repeatable_read_holds_a_stable_snapshot_unlike_read_committed() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
+/// The payoff of Milestone G2: a per-connection default isolation set by
+/// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ`.
+/// After the SET, a plain `BEGIN` (no explicit level) inherits Repeatable Read, so
+/// its second SELECT does NOT see a row another connection committed in between.
+/// Override precedence (`BEGIN ISOLATION LEVEL READ COMMITTED` is RC even with the
+/// RR default) and per-connection reset (a fresh connection defaults to RC) are
+/// checked too.
+#[tokio::test]
+async fn session_characteristics_sets_a_per_connection_default_isolation() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    // Connection A raises its default to Repeatable Read. The SET completes with a
+    // `SET` command tag and stays idle (it opens no transaction).
+    let mut a = Connection::connect(&server).await.unwrap();
+    let set = a
+        .ok("set session characteristics as transaction isolation level repeatable read")
+        .await;
+    assert_eq!(set.status, b'I', "SET SESSION CHARACTERISTICS stays idle");
+
+    // A plain BEGIN on connection A inherits Repeatable Read: its snapshot is frozen
+    // at the first statement, so a row committed afterward by another connection is
+    // invisible to its second read.
+    a.ok("begin").await;
+    let first = a.ok("select id from users order by id").await.rows();
+    assert_eq!(first, vec![vec![Some("1".to_string())]]);
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("insert into users (id) values (2)").await;
+    assert_eq!(
+        a.ok("select id from users order by id").await.rows(),
+        first,
+        "the inherited Repeatable Read default freezes the snapshot"
+    );
+    a.ok("commit").await;
+
+    // Override precedence: an explicit BEGIN level beats the session default. On the
+    // SAME connection A (default still RR), `BEGIN ISOLATION LEVEL READ COMMITTED`
+    // behaves as Read Committed — its second read sees a concurrent commit.
+    a.ok("begin isolation level read committed").await;
+    let before = a.ok("select id from users order by id").await.rows();
+    writer.ok("insert into users (id) values (3)").await;
+    let after = a.ok("select id from users order by id").await.rows();
+    assert_eq!(
+        after.len(),
+        before.len() + 1,
+        "explicit READ COMMITTED overrides the RR session default"
+    );
+    a.ok("commit").await;
+
+    // Per-connection reset: a brand-new connection defaults to Read Committed,
+    // regardless of connection A's session setting.
+    let mut b = Connection::connect(&server).await.unwrap();
+    b.ok("begin").await;
+    let b_first = b.ok("select id from users order by id").await.rows();
+    writer.ok("insert into users (id) values (4)").await;
+    let b_second = b.ok("select id from users order by id").await.rows();
+    assert_eq!(
+        b_second.len(),
+        b_first.len() + 1,
+        "a fresh connection resets to Read Committed and sees the concurrent commit"
+    );
+    b.ok("commit").await;
+
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// `SET SESSION CHARACTERISTICS` is allowed inside a transaction block but does NOT
+/// change the CURRENT transaction's isolation — it only sets the default for FUTURE
+/// transactions. An open Read Committed transaction stays RC after the SET (its next
+/// read sees a concurrent commit), while the NEXT transaction inherits RR.
+#[tokio::test]
+async fn session_characteristics_does_not_change_the_open_transaction() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    let mut conn = Connection::connect(&server).await.unwrap();
+    // Open an explicit Read Committed transaction and fix its first snapshot.
+    conn.ok("begin isolation level read committed").await;
+    let first = conn.ok("select id from users order by id").await.rows();
+    assert_eq!(first, vec![vec![Some("1".to_string())]]);
+
+    // SET SESSION CHARACTERISTICS ... REPEATABLE READ inside the open RC block: it
+    // succeeds and leaves the block open ('T'), but does not raise THIS txn to RR.
+    let set = conn
+        .ok("set session characteristics as transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        set.status, b'T',
+        "SET SESSION CHARACTERISTICS is allowed inside a block and keeps it open"
+    );
+
+    // A concurrent commit IS visible to this still-Read-Committed transaction.
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("insert into users (id) values (2)").await;
+    assert_eq!(
+        conn.ok("select id from users order by id").await.rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+        "the open transaction stayed Read Committed; SET SESSION CHARACTERISTICS did not change it"
+    );
+    conn.ok("commit").await;
+
+    // The NEXT transaction on the same connection inherits the updated RR default.
+    conn.ok("begin").await;
+    let next_first = conn.ok("select id from users order by id").await.rows();
+    writer.ok("insert into users (id) values (3)").await;
+    assert_eq!(
+        conn.ok("select id from users order by id").await.rows(),
+        next_first,
+        "the next transaction inherited Repeatable Read and froze its snapshot"
+    );
+    conn.ok("commit").await;
+    assert_eq!(server.active_txn_count(), 0);
+}
+
 /// `SERIALIZABLE` aliases Repeatable Read (we do not implement SSI): a
 /// `START TRANSACTION ISOLATION LEVEL SERIALIZABLE` transaction behaves as RR — its
 /// snapshot is stable across a concurrent commit.

@@ -263,11 +263,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_session_characteristics_isolation_levels() {
+        use common::IsolationLevel;
+
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` parses
+        // to the session-default variant with the SAME four-to-two level mapping as
+        // BEGIN / SET TRANSACTION (G2 reuses G1's `map_isolation_level`).
+        for (sql, level) in [
+            (
+                "set session characteristics as transaction isolation level read uncommitted",
+                IsolationLevel::ReadCommitted,
+            ),
+            (
+                "set session characteristics as transaction isolation level read committed",
+                IsolationLevel::ReadCommitted,
+            ),
+            (
+                "set session characteristics as transaction isolation level repeatable read",
+                IsolationLevel::RepeatableRead,
+            ),
+            (
+                "set session characteristics as transaction isolation level serializable",
+                IsolationLevel::RepeatableRead,
+            ),
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::SetSessionCharacteristics {
+                    isolation: Some(level)
+                },
+                "for `{sql}`"
+            );
+        }
+
+        // `READ WRITE` (the default access mode) is accepted and ignored, yielding a
+        // no-isolation-level session-default set (a no-op success at the server).
+        assert_eq!(
+            parse("set session characteristics as transaction read write").unwrap(),
+            Statement::SetSessionCharacteristics { isolation: None }
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_transaction_control_forms() {
         // sqlparser 0.56's PostgreSQL dialect does not recognize `ABORT`, so it
         // is a syntax error rather than mapping to ROLLBACK; v1 does not add it.
-        // READ ONLY (we don't enforce read-only), chaining, savepoints, and the
-        // session-default `SET SESSION CHARACTERISTICS` are rejected at parse time.
+        // READ ONLY (we don't enforce read-only), chaining, and savepoints are
+        // rejected at parse time. (`SET SESSION CHARACTERISTICS` IS supported as of
+        // G2 — see `parses_session_characteristics_isolation_levels`.)
         for sql in [
             "abort",
             "start transaction read only",
@@ -275,7 +318,7 @@ mod tests {
             "commit and chain",
             "rollback and chain",
             "rollback to savepoint s1",
-            "set session characteristics as transaction isolation level serializable",
+            "set session characteristics as transaction read only",
         ] {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
