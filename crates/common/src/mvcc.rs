@@ -213,6 +213,88 @@ pub fn version_conflicts(
     true
 }
 
+/// The outcome of the write-write conflict check of `docs/specs/mvcc.md` §7.3:
+/// whether a writer may claim a target version's row lock (its `xmax`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteConflict {
+    /// No live lock stands in the way; the writer may stamp `xmax = my_txn` and
+    /// supersede this version (it is the first updater, or it already owns the
+    /// lock, or the prior lock evaporated when its holder aborted).
+    Proceed,
+    /// Another transaction beat this writer to the version's `xmax` and has not
+    /// aborted (it is committed, or another live writer holds the lock). E1b maps
+    /// this to [`SqlState::SerializationFailure`](crate::SqlState::SerializationFailure)
+    /// (`40001`) under the fail-fast first-updater-wins policy.
+    Conflict,
+}
+
+/// The pure **write-write conflict** predicate of `docs/specs/mvcc.md` §7.3:
+/// given the deleter `xmax` already stamped on a target version's *physical*
+/// tuple header, may `current_txn` claim that version's row lock (stamp
+/// `xmax = current_txn` to update/delete it)?
+///
+/// `xmax` doubles as the row lock. The engine (E1b) re-reads the version's
+/// physical header immediately before stamping and feeds that just-read `xmax`
+/// here; this predicate is pure (no [`Snapshot`]) because the row lock is an
+/// **actual-status** check against the live CLOG, not a snapshot-relative read.
+///
+/// Rule (fail-fast, first-updater-wins — §4, §7.3):
+/// - `xmax == INVALID_XID` ⇒ [`WriteConflict::Proceed`]: no one has locked the
+///   row; this writer is the first updater.
+/// - `xmax == current_txn` ⇒ [`WriteConflict::Proceed`]: this writer already
+///   locked/deleted the row itself earlier in the same transaction.
+/// - the deleter **aborted** (`XMAX_ABORTED` hint, or `status(xmax) == Aborted`)
+///   ⇒ [`WriteConflict::Proceed`]: the other lock evaporated — its delete never
+///   happened — so the row is free to claim.
+/// - otherwise the deleter is **committed** (`XMAX_COMMITTED` hint, or
+///   `status == Committed`) or **in-progress** (another live writer holds the
+///   lock) ⇒ [`WriteConflict::Conflict`]: another transaction beat this writer to
+///   the row. There is no blocking or deadlock detection; E1b fails fast with
+///   `40001`.
+///
+/// **Hint bits** short-circuit the CLOG probe exactly as in [`is_visible`] and
+/// [`version_conflicts`]: a settled `XMAX_ABORTED`/`XMAX_COMMITTED` bit decides
+/// the deleter's fate without calling [`TxnStatusView::status`].
+///
+/// **Relationship to [`version_conflicts`].** They are siblings, not duplicates:
+/// [`version_conflicts`] answers "is *some* version with this key alive?"
+/// (uniqueness enforcement, keyed off the candidate's *creator*); `write_conflict`
+/// answers "may I lock *this* version, or did another txn beat me to its `xmax`?"
+/// (first-updater-wins, keyed off the candidate's *deleter*).
+pub fn write_conflict(
+    xmax: u64,
+    infomask: u16,
+    current_txn: u64,
+    status: &dyn TxnStatusView,
+) -> WriteConflict {
+    // No deleter: the row is unlocked ⇒ I am the first updater.
+    if xmax == INVALID_XID {
+        return WriteConflict::Proceed;
+    }
+    // I already hold the lock (locked/deleted it earlier in my own txn).
+    if xmax == current_txn {
+        return WriteConflict::Proceed;
+    }
+    // Settled hint bits decide the deleter's fate without a CLOG probe (mirrors
+    // `txn_effect_visible`): an aborted delete frees the row, a committed delete
+    // means another txn beat me. At most one hint is ever set for a given xid.
+    if infomask & XMAX_ABORTED != 0 {
+        return WriteConflict::Proceed;
+    }
+    if infomask & XMAX_COMMITTED != 0 {
+        return WriteConflict::Conflict;
+    }
+    // No hint: probe the CLOG. An aborted lock holder evaporated ⇒ the row is
+    // free; otherwise (committed or in-progress) another txn beat me ⇒ conflict.
+    // (Reserved/frozen xids never appear here: a real `xmax` is 0 or a normal
+    // xid, so the status view's "< FIRST_NORMAL_XID ⇒ Committed" rule would push
+    // such a value to Conflict.)
+    if status.status(xmax) == TxnStatus::Aborted {
+        return WriteConflict::Proceed;
+    }
+    WriteConflict::Conflict
+}
+
 /// A point-in-time view of which transactions are visible, in the Postgres
 /// `{xmin, xmax, xip}` style (see `docs/specs/mvcc.md` §5.5, §6).
 ///
@@ -305,8 +387,9 @@ mod tests {
     use crate::ids::{FIRST_NORMAL_XID, FROZEN_XID, INVALID_XID, TxnId};
 
     use super::{
-        IsolationLevel, Snapshot, TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED,
-        XMIN_ABORTED, XMIN_COMMITTED, is_visible, version_conflicts,
+        IsolationLevel, Snapshot, TxnStatus, TxnStatusView, WriteConflict, XMAX_ABORTED,
+        XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, is_visible, version_conflicts,
+        write_conflict,
     };
 
     #[test]
@@ -699,5 +782,96 @@ mod tests {
         // snapshot argument to pass; this documents the contract.)
         let view = MockStatus::new(&[(50, TxnStatus::Committed)]);
         assert!(version_conflicts(50, INVALID_XID, 0, CURRENT_TXN, &view));
+    }
+
+    // --- write_conflict (write-write row-lock check, first-updater-wins) ---
+
+    #[test]
+    fn write_conflict_invalid_xmax_proceeds() {
+        // No deleter stamped ⇒ the row is unlocked ⇒ I am the first updater.
+        let view = MockStatus::new(&[]);
+        assert_eq!(
+            write_conflict(INVALID_XID, 0, CURRENT_TXN, &view),
+            WriteConflict::Proceed
+        );
+    }
+
+    #[test]
+    fn write_conflict_self_lock_proceeds() {
+        // I already locked/deleted it earlier in my own txn ⇒ proceed. The view
+        // would report InProgress for me, so PanicStatus proves it is not probed.
+        assert_eq!(
+            write_conflict(CURRENT_TXN, 0, CURRENT_TXN, &PanicStatus),
+            WriteConflict::Proceed
+        );
+    }
+
+    #[test]
+    fn write_conflict_deleter_aborted_proceeds() {
+        // The lock holder aborted ⇒ its delete never happened ⇒ the row is free.
+        let view = MockStatus::new(&[(9, TxnStatus::Aborted)]);
+        assert_eq!(
+            write_conflict(9, 0, CURRENT_TXN, &view),
+            WriteConflict::Proceed
+        );
+    }
+
+    #[test]
+    fn write_conflict_deleter_committed_conflicts() {
+        // The lock holder committed its delete ⇒ another txn beat me ⇒ conflict.
+        let view = MockStatus::new(&[(9, TxnStatus::Committed)]);
+        assert_eq!(
+            write_conflict(9, 0, CURRENT_TXN, &view),
+            WriteConflict::Conflict
+        );
+    }
+
+    #[test]
+    fn write_conflict_deleter_in_progress_conflicts() {
+        // Another live writer holds the row lock (delete not yet committed) ⇒
+        // fail-fast conflict (no blocking).
+        let view = MockStatus::new(&[(9, TxnStatus::InProgress)]);
+        assert_eq!(
+            write_conflict(9, 0, CURRENT_TXN, &view),
+            WriteConflict::Conflict
+        );
+    }
+
+    #[test]
+    fn write_conflict_aborted_hint_short_circuits_clog_probe() {
+        // XMAX_ABORTED hint ⇒ Proceed without probing the deleter. PanicStatus
+        // proves status() is never consulted.
+        assert_eq!(
+            write_conflict(9, XMAX_ABORTED, CURRENT_TXN, &PanicStatus),
+            WriteConflict::Proceed
+        );
+    }
+
+    #[test]
+    fn write_conflict_committed_hint_short_circuits_clog_probe() {
+        // XMAX_COMMITTED hint ⇒ Conflict without probing the deleter. The aborted
+        // check is `XMAX_ABORTED` (unset) OR `status == Aborted`; the committed
+        // hint means status would return Committed, so the predicate must reach
+        // its fall-through Conflict WITHOUT a probe. PanicStatus proves it.
+        assert_eq!(
+            write_conflict(9, XMAX_COMMITTED, CURRENT_TXN, &PanicStatus),
+            WriteConflict::Conflict
+        );
+    }
+
+    #[test]
+    fn write_conflict_reserved_frozen_xmax_conflicts() {
+        // Edge case, not a real runtime value (a real `xmax` is 0 or a normal
+        // xid): a reserved/frozen `xmax` reads Committed via the status rule, so
+        // it classifies as Conflict. Documents the fall-through is correct.
+        let view = MockStatus::new(&[]);
+        assert_eq!(
+            write_conflict(FROZEN_XID, 0, CURRENT_TXN, &view),
+            WriteConflict::Conflict
+        );
+        assert_eq!(
+            write_conflict(FIRST_NORMAL_XID - 1, 0, CURRENT_TXN, &view),
+            WriteConflict::Conflict
+        );
     }
 }

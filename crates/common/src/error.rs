@@ -40,6 +40,12 @@ pub enum SqlState {
     /// transaction block that has already failed. The block must be ended before
     /// any further command is accepted.
     InFailedSqlTransaction,
+    /// `40001`: a write-write conflict was detected — another transaction has
+    /// locked or committed-superseded the target version since this writer's
+    /// snapshot. SaguaroDB's policy is fail-fast first-updater-wins (no blocking,
+    /// no deadlock detection): the losing writer aborts with this code. See
+    /// `docs/specs/mvcc.md` §7.3 and `crate::mvcc::write_conflict`.
+    SerializationFailure,
     IoError,
     InternalError,
 }

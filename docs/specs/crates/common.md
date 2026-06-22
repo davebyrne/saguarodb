@@ -162,6 +162,7 @@ pub enum SqlState {
     QueryCanceled,
     FeatureNotSupported,
     InFailedSqlTransaction,
+    SerializationFailure,
     IoError,
     InternalError,
 }
@@ -175,6 +176,12 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction block.
 The server raises it while gating an aborted transaction block (see
 `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7.2).
+
+`SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write-write conflict
+under MVCC's fail-fast, first-updater-wins policy. The losing writer aborts when it
+finds the target version's `xmax` row-lock already held by a committed or
+in-progress transaction (no blocking, no deadlock detection). The pure classifier
+is `common::mvcc::write_conflict` (see `docs/specs/mvcc.md` §7.3, Milestone E).
 
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 

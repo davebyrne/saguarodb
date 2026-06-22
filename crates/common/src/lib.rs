@@ -17,8 +17,8 @@ pub use ids::{
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, TableId, TxnId,
 };
 pub use mvcc::{
-    IsolationLevel, Snapshot, TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED,
-    XMIN_COMMITTED, is_visible, version_conflicts,
+    IsolationLevel, Snapshot, TxnStatus, TxnStatusView, WriteConflict, XMAX_ABORTED,
+    XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, is_visible, version_conflicts, write_conflict,
 };
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};

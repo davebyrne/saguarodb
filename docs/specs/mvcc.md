@@ -386,15 +386,34 @@ first statement of the transaction and reuses it (see Milestone G).
 
 ### 7.3 Write-write conflicts (Stage 2)
 
-`xmax` doubles as a row lock. A writer tentatively stamps `xmax = my_txn`. Another
-writer encountering a live `xmax` consults the other transaction's CLOG status:
+`xmax` doubles as a row lock. A writer re-reads the target version's physical
+tuple header immediately before stamping and tentatively stamps `xmax = my_txn`.
+Another writer encountering a non-invalid `xmax` it did not stamp itself consults
+the other transaction's status:
 
-- in-progress → block (or fail per policy);
-- committed *after my snapshot* → **serialization failure** (`SqlState::SerializationFailure`, `40001`);
-- aborted → proceed.
+- **aborted** (`XMAX_ABORTED` hint, or CLOG `Aborted`) → **proceed**: the prior
+  lock evaporated, its delete never happened;
+- **committed** (`XMAX_COMMITTED` hint, or CLOG `Committed`) → **serialization
+  failure**;
+- **in-progress** (another live writer holds the lock) → **serialization
+  failure** as well.
 
-First-updater-wins. Concurrent inserts of the same unique key are resolved by the
-same status check on the conflicting index entry's tuple.
+**Policy decision (fail-fast, first-updater-wins):** SaguaroDB does **not** block
+on an in-progress conflict and runs **no deadlock detection**. The first writer to
+stamp `xmax` wins; every later writer that finds a committed-or-in-progress lock
+aborts immediately with `SqlState::SerializationFailure` (`40001`). (Blocking +
+deadlock detection is deferred — §10 Milestone E, §12.) Treating in-progress as a
+hard conflict, rather than blocking, is what makes the check pure and lock-free.
+
+The pure classifier is `common::mvcc::write_conflict(xmax, infomask, current_txn,
+status) -> WriteConflict` (`Proceed`/`Conflict`); it takes **no snapshot** because
+the row lock is an actual-status check, not a snapshot-relative read. It is a
+sibling of `version_conflicts`, not a duplicate: `version_conflicts` answers "is
+*some* version with this key alive?" (uniqueness, keyed on a candidate's creator);
+`write_conflict` answers "may I lock *this* version, or did another txn beat me to
+its `xmax`?" (first-updater-wins, keyed on the candidate's deleter). Concurrent
+inserts of the same unique key are resolved by the same fail-fast policy on the
+conflicting index entry's tuple.
 
 ---
 
@@ -592,9 +611,39 @@ correct recovery. Correct, but bloats heap and indexes until F.*
 
 ### Milestone E — Concurrent writers + conflict detection
 
-- **E1 — Conflicts** (§7.3): `xmax`-as-lock, first-updater-wins, `40001`;
-  concurrent-inserter unique conflicts. **E2 — Replace the writer lock** with a
-  transaction manager on the buffer pool's frame latches.
+Commit breakdown (confirmed). E1 introduces fail-fast write-write conflict
+detection (§7.3); E2 replaces the global writer lock with finer structural latches
+plus a checkpoint-coordination guard.
+
+- **E1a — SQLSTATE + pure predicate.** Add `SqlState::SerializationFailure`
+  (`40001`, wire-mapped in `crates/server/src/connection.rs`) and the pure
+  `common::mvcc::write_conflict(xmax, infomask, current_txn, status) ->
+  WriteConflict` classifier (`Proceed`/`Conflict`) with table-driven tests. No
+  engine wiring yet.
+- **E1b — UPDATE/DELETE conflict checks.** Wire `write_conflict` into the
+  update/delete locating path: re-read the target version's physical header,
+  classify, and on `Conflict` abort the statement with `40001` (fail-fast,
+  first-updater-wins; §7.3).
+- **E1c — Concurrent-inserter unique conflicts.** Apply the same fail-fast policy
+  to two transactions racing to claim the same unique key, surfacing `40001`
+  (rather than blocking) on the conflicting index entry's tuple.
+- **E2a — Structural write latches.** Replace the single global writer lock with
+  **per-index and per-heap-file** structural write latches. A fully-concurrent
+  B-tree is **deferred**: the current B-tree split protocol has no latch coupling
+  (no B-link/right-link hand-over-hand), so a per-index latch is the correct
+  granularity for now.
+- **E2b — Shared-writer / exclusive-checkpoint guard (the lock inversion).**
+  Invert the existing exclusive writer lock into a shared-writer / exclusive-
+  checkpoint guard: many writers share it, the checkpointer takes it exclusively.
+  This **preserves the "no in-flight writer at checkpoint" invariant** that
+  Milestone-D recovery/truncation relies on (conservative truncation never crosses
+  an in-flight writer — §8, §5.4), so recovery stays correct without a fuzzy
+  checkpoint.
+
+**Deferred from Milestone E** (§12): the true concurrent / B-link writer protocol
+(latch-coupled, fully-concurrent B-tree); blocking + deadlock detection (instead
+of fail-fast `40001`); fuzzy checkpoint (checkpointing with writers in flight);
+and per-tuple CLOG-probe contention reduction.
 
 ### Milestone F — VACUUM / GC *(near-MVP in this model)*
 
@@ -664,6 +713,17 @@ serialization-failure surfacing; savepoints via sub-transaction xids (optional).
 
 ## 12. Deferred / future work
 
+- **Concurrent / B-link writer protocol** — a latch-coupled, fully-concurrent
+  B-tree; deferred from Milestone E (E2a takes per-index structural latches
+  instead, because the current split protocol has no latch coupling).
+- **Blocking + deadlock detection** — wait-for-lock with cycle detection, instead
+  of Milestone E's fail-fast first-updater-wins `40001` (§7.3).
+- **Fuzzy checkpoint** — checkpointing with writers in flight; Milestone E keeps
+  the "no in-flight writer at checkpoint" invariant via the shared-writer /
+  exclusive-checkpoint guard (E2b), so Milestone-D recovery/truncation stays
+  correct.
+- **Per-tuple CLOG-probe contention** — reducing repeated CLOG probes on hot
+  tuples (beyond the `infomask` hint bits) under concurrent writers.
 - **HOT** — Milestone H (above); the baseline is built for it.
 - **Transactional DDL** — requires catalog MVCC + transactional file lifecycle;
   additive later, does not invalidate data MVCC.

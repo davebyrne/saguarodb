@@ -234,6 +234,7 @@ pub enum SqlState {
     QueryCanceled,              // 57014
     FeatureNotSupported,        // 0A000
     InFailedSqlTransaction,     // 25P02
+    SerializationFailure,       // 40001
     IoError,                    // 58030
     InternalError,              // XX000
     // ... extensible
