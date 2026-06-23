@@ -328,8 +328,14 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
   `vacuum_heap` walks each HOT chain rooted at an index-referenced slot — a `NORMAL`
   non-`HEAP_ONLY` slot (a non-HOT row or a chain head) or an existing `REDIRECT` — and
   collapses it. A `HEAP_ONLY` `NORMAL` slot is a chain MEMBER reached only via its root's
-  `t_ctid` (the H1 segment rule), never a root; a non-HOT row is a one-member chain, so
-  the same logic subsumes the pre-HOT case. Deadness is re-derived per member via
+  `t_ctid` (the H1 segment rule), never a root; **a `REDIRECT` root's target slot is also
+  a chain MEMBER, not an independent root** — `classify_page_for_prune` marks it a member
+  up front (it is reached only through the redirect, never via a readable
+  `HOT_UPDATED → t_ctid` step). This makes a re-collapse (more HOT updates grew the chain
+  from a prior collapse's redirect target, then VACUUM again) plan that chain EXACTLY ONCE
+  via the REDIRECT root, so the plan never frees a slot twice or both frees and redirects a
+  slot. A non-HOT row is a one-member chain, so the same logic subsumes the pre-HOT case.
+  Deadness is re-derived per member via
   `common::is_dead_to_all(xmin, xmax, infomask, horizon, txn_status_view())` against the
   live CLOG.
 - **Per chain (in order):**
@@ -367,7 +373,11 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
   (a compaction relocates survivors and is not expressible as a delta; the in-place
   header resets fold into the same image; never gated on `take_needs_fpi`, mirroring
   `btree::log_full_page`). The FPI's LSN becomes the page's new PageLSN. A page with no
-  work is skipped entirely: no WAL record and no mutation.
+  work is skipped entirely: no WAL record and no mutation. **`apply_prune_plan` is
+  atomic:** it builds the post-prune image on a SCRATCH copy of the page and writes it
+  back into the live frame only after every mutation plus the `FullPageImage` append
+  succeeds; on any error the frame is left byte-identical (a valid, stale checksum), so a
+  malformed plan can never corrupt the page.
 - **Return.** Only **DEAD-root TIDs** are returned for index/line-pointer reclaim; a
   `REDIRECT` root keeps a LIVE index entry (NOT returned, so F3a skips it) and heap-only
   members freed to `UNUSED` never had an entry (`freed_member_count` only).

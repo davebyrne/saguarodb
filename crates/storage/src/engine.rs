@@ -1247,6 +1247,16 @@ impl PageBackedStorageEngine {
     ///
     /// A crash mid-apply leaves the page either pre-apply or exactly this image
     /// (PageLSN-gated idempotent redo), never torn.
+    ///
+    /// **Atomicity (durability defense-in-depth).** Every mutation is applied to a
+    /// SCRATCH copy of the page bytes; the finished, checksum-stamped image is written
+    /// back into the frame only after EVERY step (resets, frees, redirects, mark-dead,
+    /// compact) and the WAL FullPageImage append succeed. On any error the frame is
+    /// left byte-identical to its pre-apply image (a stale, valid checksum), so a
+    /// malformed plan — e.g. a slot listed twice in `free_to_unused`, or a slot both
+    /// freed and redirected — can NEVER leave the page half-mutated with a mismatched
+    /// checksum. The Part 1 fix makes such a plan unreachable; this guarantees the page
+    /// stays intact even against a future planning bug.
     fn apply_prune_plan(
         &self,
         guard: &mut PageWriteGuard,
@@ -1255,15 +1265,18 @@ impl PageBackedStorageEngine {
         page_num: PageNum,
         txn_id: u64,
     ) -> Result<()> {
-        let provisional_lsn = page::page_lsn(guard.data());
+        // Build the post-prune image on a scratch copy first; the live frame is touched
+        // only after the whole sequence (incl. the WAL append) has succeeded.
+        let mut scratch = *guard.data();
+        let provisional_lsn = page::page_lsn(&scratch);
         for &slot in &plan.reset_slots {
             let cleared_bits =
                 crate::codec::HOT_UPDATED | common::XMAX_ABORTED | common::XMAX_COMMITTED;
-            let tuple = page::read_row(guard.data(), slot)?
+            let tuple = page::read_row(&scratch, slot)?
                 .ok_or_else(|| storage_internal("abort-cleanup slot is not live"))?;
             let (_xmin, _xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
             page::set_tuple_header(
-                guard.data_mut(),
+                &mut scratch,
                 slot,
                 common::INVALID_XID,
                 crate::codec::INVALID_TID,
@@ -1272,25 +1285,29 @@ impl PageBackedStorageEngine {
             )?;
         }
         if !plan.free_to_unused.is_empty() {
-            page::free_slots_to_unused(guard.data_mut(), &plan.free_to_unused)?;
+            page::free_slots_to_unused(&mut scratch, &plan.free_to_unused)?;
         }
         for &(root_slot, target_slot) in &plan.redirect_roots {
-            page::set_redirect(guard.data_mut(), root_slot, target_slot)?;
+            page::set_redirect(&mut scratch, root_slot, target_slot)?;
         }
         if !plan.dead_roots.is_empty() {
-            page::mark_slots_dead(guard.data_mut(), &plan.dead_roots)?;
+            page::mark_slots_dead(&mut scratch, &plan.dead_roots)?;
         }
-        page::compact(guard.data_mut(), provisional_lsn)?;
+        page::compact(&mut scratch, provisional_lsn)?;
         let fpi_lsn = self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::FullPageImage {
                 file_id,
                 page_num,
-                image: guard.data().to_vec(),
+                image: scratch.to_vec(),
             },
         })?;
-        page::set_page_lsn(guard.data_mut(), fpi_lsn);
+        page::set_page_lsn(&mut scratch, fpi_lsn);
+        // All steps succeeded: publish the finished image into the live frame in one
+        // shot. The frame was never touched before this point, so an earlier error left
+        // it intact.
+        *guard.data_mut() = scratch;
         Ok(())
     }
 
@@ -1343,12 +1360,29 @@ impl PageBackedStorageEngine {
         let status = self.txn_status_view();
         let slot_count = page::next_slot(data)?;
 
-        // First pass: which NORMAL slots are HEAP_ONLY chain MEMBERS (reached as the
-        // `t_ctid` target of a same-page `HOT_UPDATED` tuple)? Everything else that is
-        // NORMAL-non-HEAP_ONLY or REDIRECT is a chain ROOT. A HEAP_ONLY slot has no
-        // index entry, so it is never a root.
+        // First pass: which NORMAL slots are chain MEMBERS reached only via a root, NOT
+        // independent chain ROOTS? Two ways a slot is a member: (a) it is the same-page
+        // `HEAP_ONLY` `t_ctid` target of a `HOT_UPDATED` tuple (the H1 segment rule), or
+        // (b) it is the target of a `REDIRECT` line pointer (a previously-collapsed
+        // root's live head). Everything else that is NORMAL-non-member or REDIRECT is a
+        // chain ROOT. A HEAP_ONLY slot has no index entry, so it is never a root.
+        //
+        // Marking the REDIRECT target as a member is essential: it is a `NORMAL`
+        // (often non-`HEAP_ONLY`) slot reached only through the redirect line pointer,
+        // never through a readable `HOT_UPDATED → t_ctid` step. Without this, a
+        // re-collapse (more HOT updates grow the chain from the redirect target, then
+        // VACUUM runs again) would treat that target as its OWN independent root in the
+        // second pass — planning the same physical chain twice (once via the REDIRECT
+        // root, once via the target). The duplicated plan frees a slot to `UNUSED` more
+        // than once / frees a redirected slot, which `apply_prune_plan` then rejects
+        // mid-page (`docs/specs/mvcc.md` §9/§10 H3).
         let mut is_member: HashSet<u16> = HashSet::new();
         for slot in 0..slot_count {
+            // (b) A REDIRECT's target is a member (reached via the redirect, not a root).
+            if let page::LinePointer::Redirect(target) = page::slot_state(data, slot)? {
+                is_member.insert(target);
+                continue;
+            }
             let Some(bytes) = page::read_row(data, slot)? else {
                 continue;
             };
@@ -1360,6 +1394,7 @@ impl PageBackedStorageEngine {
             if succ_page != page::page_id(data) {
                 continue;
             }
+            // (a) A same-page HEAP_ONLY `t_ctid` successor of a HOT_UPDATED tuple.
             if let page::LinePointer::Normal = page::slot_state(data, succ_slot)? {
                 let succ = page::read_row(data, succ_slot)?
                     .ok_or_else(|| storage_internal("HOT successor is not a live tuple"))?;
@@ -5295,6 +5330,372 @@ mod visibility_tests {
                 .unwrap(),
             Some(hot_row(1, "Ada", "v4"))
         );
+    }
+
+    #[test]
+    fn vacuum_recollapses_a_redirect_rooted_chain_grown_by_two_versions() {
+        // Regression for the H3 re-collapse corruption (`docs/specs/mvcc.md` §9/§10).
+        // First VACUUM collapses the chain to `root = REDIRECT → L`. Then the chain
+        // GROWS by TWO HOT versions from the redirect target (L → L1 → L2). A second
+        // VACUUM (with L and L1 dead-to-all) must re-collapse the chain EXACTLY ONCE —
+        // re-pointing the REDIRECT at the newest live tail L2 and freeing the now-dead
+        // intermediates (incl. the old redirect target L) to UNUSED without error or
+        // corruption. Before the fix, the redirect target was treated as an independent
+        // root in the second pass, planning the chain twice → a slot freed twice →
+        // `apply_prune_plan` errored mid-page → permanent `page checksum mismatch`.
+        let (fixture, root) = hot_fixture();
+        let schema = hot_schema();
+
+        // root -> v2 -> v3, then collapse: root REDIRECT → v3 (the live tail L).
+        for (txn, note) in [(20u64, "v2"), (21, "v3")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", note),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        fixture.engine.vacuum(&schema, 100).unwrap();
+        let l = fixture
+            .locate_hot(&key(1), snapshot(120, vec![]), 0)
+            .expect("L visible")
+            .0;
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(l.slot_num),
+            "first collapse points the root at the live tail L",
+        );
+
+        // Grow the chain by TWO from the redirect target: L (v3) -> L1 (v4) -> L2 (v5).
+        for (txn, note) in [(120u64, "v4"), (121, "v5")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", note),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        let l2 = fixture
+            .locate_hot(&key(1), snapshot(220, vec![]), 0)
+            .expect("L2 visible")
+            .0;
+        assert_ne!(l2.slot_num, l.slot_num, "L2 is a later heap-only slot");
+
+        // Second VACUUM (horizon 200): L (xmax 120) and L1 (xmax 121) are dead-to-all,
+        // L2 is the live tail. Must NOT error and must NOT corrupt the page.
+        let reclaimed = fixture
+            .engine
+            .vacuum(&schema, 200)
+            .expect("re-collapse must not error");
+        assert!(reclaimed >= 2, "L and L1 were freed: {reclaimed}");
+
+        // The root is now a REDIRECT to the NEWEST live tail L2 (not the stale L).
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(l2.slot_num),
+            "re-collapse re-points the REDIRECT at the newest live version",
+        );
+        // The old redirect target L and the intermediate L1 are freed to UNUSED.
+        assert_eq!(
+            fixture.slot_state_hot(l.page_num, l.slot_num),
+            crate::page::LinePointer::Unused,
+            "the old redirect target is freed to UNUSED",
+        );
+        // L2 stays NORMAL.
+        assert_eq!(
+            fixture.slot_state_hot(l2.page_num, l2.slot_num),
+            crate::page::LinePointer::Normal,
+        );
+
+        // The page validates (a corrupt checksum would make this read error) and the
+        // live row reads back correctly on both index paths and a seq scan.
+        let reader = ctx(0, snapshot(220, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", "v5")),
+        );
+        let by_seq = collect_names(
+            fixture
+                .engine
+                .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                .unwrap(),
+        );
+        assert_eq!(by_seq, vec![hot_row(1, "Ada", "v5")]);
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", "v5")]);
+        // Index counts stayed stable: still the single root entry on both indexes.
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada"),
+            vec![root],
+        );
+    }
+
+    #[test]
+    fn update_path_prunes_a_redirect_rooted_chain_to_make_room() {
+        // The update-path variant of the re-collapse: after a VACUUM has made the root a
+        // REDIRECT, drive enough same-page HOT updates that a later update must run the
+        // update-path prune OVER the REDIRECT-rooted chain to make room. It must collapse
+        // the chain once (no corruption) and reads must resolve to the latest value.
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture.engine.create_table(&setup, &hot_schema()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
+        fixture.commit(100);
+
+        // ~1900-byte notes: a few versions nearly fill the 8192B page.
+        let big = |tag: &str| format!("{tag}{}", "x".repeat(1900));
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                hot_row(1, "Ada", &big("v1")),
+            )
+            .unwrap();
+        fixture.commit(10);
+        let root = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+
+        // root -> v2 -> v3, then VACUUM collapses to root REDIRECT → v3.
+        for (txn, tag) in [(20u64, "v2"), (21, "v3")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", &big(tag)),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        let schema = hot_schema();
+        fixture.engine.vacuum(&schema, 100).unwrap();
+        assert!(matches!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(_)
+        ));
+
+        // Grow the REDIRECT-rooted chain with more big HOT updates until the page is too
+        // full for the next one, forcing the update-path prune over the redirect chain.
+        // The horizon (200) makes the just-superseded versions prunable, so the prune
+        // re-collapses the REDIRECT-rooted chain to reclaim room — staying on the HOT
+        // path (no new index entry).
+        for (txn, tag) in [(120u64, "v4"), (121, "v5"), (122, "v6"), (123, "v7")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx_h(txn, snapshot(txn + 1, vec![]), 200),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", &big(tag)),
+                    )
+                    .unwrap(),
+                "HOT update {tag} must succeed without corruption",
+            );
+            fixture.commit(txn);
+        }
+
+        // The root is still a REDIRECT, no extra index entries appeared, and reads
+        // resolve to the latest value through both index paths.
+        assert!(matches!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(_)
+        ));
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada").len(),
+            1
+        );
+        let reader = ctx(0, snapshot(230, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", &big("v7"))),
+        );
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", &big("v7"))]);
+    }
+
+    #[test]
+    fn classify_marks_a_redirect_target_as_a_member_not_a_root() {
+        // Unit-level assertion of the Part 1 fix: build a page whose root REDIRECTs to a
+        // live tail that has itself been HOT-extended (REDIRECT(root) → L → L1 → L2 with
+        // L,L1 dead-to-all). `classify_page_for_prune` must mark the redirect target L as
+        // a chain MEMBER, so the chain is planned EXACTLY ONCE via the REDIRECT root: no
+        // slot appears twice in `free_to_unused`, and no slot is both freed and
+        // redirected.
+        let (fixture, root) = hot_fixture();
+        let schema = hot_schema();
+        for (txn, note) in [(20u64, "v2"), (21, "v3")] {
+            fixture
+                .engine
+                .update(
+                    &ctx(txn, snapshot(txn + 1, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", note),
+                )
+                .unwrap();
+            fixture.commit(txn);
+        }
+        fixture.engine.vacuum(&schema, 100).unwrap();
+        for (txn, note) in [(120u64, "v4"), (121, "v5")] {
+            fixture
+                .engine
+                .update(
+                    &ctx(txn, snapshot(txn + 1, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", note),
+                )
+                .unwrap();
+            fixture.commit(txn);
+        }
+
+        // Classify the page directly (horizon 200: L and L1 dead-to-all, L2 live).
+        let data = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, root.page_num)
+                .unwrap();
+            *readable.data()
+        };
+        let plan = fixture
+            .engine
+            .classify_page_for_prune(&data, 200, true)
+            .expect("classify must not error");
+
+        // No slot is freed to UNUSED more than once.
+        let mut freed = plan.free_to_unused.clone();
+        freed.sort_unstable();
+        let mut deduped = freed.clone();
+        deduped.dedup();
+        assert_eq!(
+            freed, deduped,
+            "no slot may appear twice in free_to_unused: {:?}",
+            plan.free_to_unused,
+        );
+        // No slot is both freed AND redirected.
+        let freed_set: std::collections::HashSet<u16> =
+            plan.free_to_unused.iter().copied().collect();
+        for &(redir_root, _target) in &plan.redirect_roots {
+            assert!(
+                !freed_set.contains(&redir_root),
+                "slot {redir_root} is both freed and used as a REDIRECT root",
+            );
+        }
+        // Exactly one chain was planned: a single REDIRECT root (the indexed root), not
+        // an extra one rooted at the redirect target.
+        assert_eq!(
+            plan.redirect_roots.len(),
+            1,
+            "the chain is planned once via the REDIRECT root: {:?}",
+            plan.redirect_roots,
+        );
+        assert_eq!(plan.redirect_roots[0].0, root.slot_num);
+    }
+
+    #[test]
+    fn apply_prune_plan_leaves_the_page_intact_on_a_malformed_plan() {
+        // Part 2 atomicity: a deliberately malformed plan (a slot listed TWICE in
+        // free_to_unused) must return an Err AND leave the page byte-identical with a
+        // valid checksum — never a half-mutated page with a stale checksum.
+        let (fixture, root) = hot_fixture();
+        // The freshly inserted root is a live NORMAL slot to (mis)free.
+        let succ = root.slot_num;
+
+        // Snapshot the exact page bytes before the malformed apply.
+        let before = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, root.page_num)
+                .unwrap();
+            *readable.data()
+        };
+        assert!(
+            crate::page::validate(&before).is_ok(),
+            "page is valid before the malformed apply",
+        );
+
+        // A plan that frees the SAME NORMAL slot twice — `free_slots_to_unused` rejects
+        // the second free (the slot is already UNUSED on the scratch copy).
+        let bad_plan = super::PagePrunePlan {
+            redirect_roots: Vec::new(),
+            dead_roots: Vec::new(),
+            free_to_unused: vec![succ, succ],
+            reset_slots: Vec::new(),
+        };
+        let mut guard = fixture
+            .engine
+            .buffer_pool
+            .write_page(TABLE_ID, root.page_num, super::VACUUM_TXN)
+            .unwrap();
+        let result = fixture.engine.apply_prune_plan(
+            &mut guard,
+            &bad_plan,
+            TABLE_ID,
+            root.page_num,
+            super::VACUUM_TXN,
+        );
+        assert!(result.is_err(), "a malformed plan must error");
+
+        // The frame is byte-identical to its pre-apply image (no partial mutation) and
+        // still passes checksum validation.
+        assert_eq!(
+            guard.data(),
+            &before,
+            "the frame is unchanged after a rejected plan",
+        );
+        assert!(
+            crate::page::validate(guard.data()).is_ok(),
+            "the frame still validates (no stale checksum)",
+        );
+        drop(guard);
+
+        // And a fresh read of the page still succeeds (no permanent corruption).
+        let reread = {
+            let readable = fixture
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, root.page_num)
+                .unwrap();
+            *readable.data()
+        };
+        assert_eq!(reread, before);
     }
 
     #[test]

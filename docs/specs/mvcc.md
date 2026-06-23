@@ -660,7 +660,16 @@ design, because index entries accumulate per version as well as heap tuples.
     (`classify_page_for_prune` / `plan_chain`). A `HEAP_ONLY` `NORMAL` slot is a chain
     MEMBER reached only via its root's `t_ctid` (the H1 segment rule), so it is never a
     root; a non-HOT row is a one-member chain, so the same logic subsumes the
-    pre-HOT case. Per chain, in order:
+    pre-HOT case. **A `REDIRECT` root's target slot is also a chain MEMBER, not an
+    independent root** — it is the redirect's live head, reached only through the
+    redirect line pointer (never via a readable `HOT_UPDATED → t_ctid` step), so
+    `classify_page_for_prune` marks it a member up front. This matters when a chain is
+    re-collapsed: after an earlier collapse left `root = REDIRECT → L`, further HOT
+    updates grow the chain from `L`, and the next VACUUM must process that chain EXACTLY
+    ONCE via the REDIRECT root `R`. Were `L` treated as its own root, the same physical
+    chain would be planned twice — freeing a slot to `UNUSED` more than once / freeing a
+    redirected slot — which is malformed and would be rejected mid-apply. Per chain, in
+    order:
     - **Abort truncation (F4c, chain-aware).** A HOT update that aborted appended a
       `HEAP_ONLY` successor whose creator (`xmin`) aborted; an aborted UPDATE never
       committed, so that successor is always the chain TAIL. Where a `HOT_UPDATED`
@@ -702,6 +711,13 @@ design, because index entries accumulate per version as well as heap tuples.
     The resets are applied **before** `prune_and_compact`; a page that had any reset OR
     any dead slot is logged as the same single unconditional `FullPageImage` (a page with
     neither is skipped), so recovery reinstalls the cleaned image by PageLSN gating.
+    **`apply_prune_plan` applies a plan atomically**: every mutation (resets, frees,
+    redirects, mark-dead, compact) is computed on a SCRATCH copy of the page bytes, and
+    the finished, checksum-stamped image is published into the live frame only after the
+    whole sequence and the `FullPageImage` append succeed. On any error the frame is left
+    byte-identical to its pre-apply image, so a malformed plan can never leave a
+    half-mutated page with a stale checksum (a durability defense-in-depth backing the
+    "process each chain once" invariant above).
 - **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
   dangling index entries `vacuum_heap` left behind — for the table's primary-key
   index **and every live secondary index**, delete every entry whose value (the heap
@@ -1220,13 +1236,22 @@ savepoints via sub-transaction xids (optional, deferred).
     that set. (3) `HEAP_ONLY` members have no index entry, so freeing them straight to
     `UNUSED` is sound (no dangling entry); a `REDIRECT` always targets a `NORMAL` slot on
     the same page (H1 enforces this on read, H3 keeps it true on write). (4) Deadness is
-    monotonic from the root to `L`; no member at/after `L` is freed.
+    monotonic from the root to `L`; no member at/after `L` is freed. (5) **A `REDIRECT`
+    root's target is a chain MEMBER, not an independent root** — `classify_page_for_prune`
+    marks it a member up front, so a re-collapse (more HOT updates grew the chain from the
+    redirect target, then VACUUM runs again) plans the chain EXACTLY ONCE via the REDIRECT
+    root, never twice; this is what keeps a re-collapse plan well-formed (no slot freed
+    twice, no slot both freed and redirected).
   - **VACUUM integration.** The H2 skip for committed-dead HOT members is replaced by
     the collapse primitive; F3a/F3b handle `REDIRECT` (skip — entry stays live) vs
     `DEAD` (remove entry + reclaim slot) correctly, and heap-only members freed to
     `UNUSED` never reach F3a. The unconditional-`FullPageImage`-per-mutated-page logging
     (VACUUM_TXN = 0, PageLSN-gated idempotent redo) and the fsync-before-truncate
-    ordering are preserved verbatim.
+    ordering are preserved verbatim. `apply_prune_plan` applies the plan **atomically**:
+    it mutates a scratch copy of the page and publishes the finished, checksum-stamped
+    image into the live frame only if every step plus the `FullPageImage` append
+    succeeds, so a malformed plan errors without ever leaving a half-mutated page with a
+    stale checksum.
   - **Update-path pruning** (`update` → `try_hot_update`). When a HOT update finds no
     same-page room, it runs the collapse primitive on the predecessor's page (under the
     heap latch it already holds), then retries the same-page HOT insert; if there is

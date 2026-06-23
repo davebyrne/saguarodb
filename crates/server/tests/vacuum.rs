@@ -233,6 +233,82 @@ async fn vacuum_reclaims_dead_update_versions() {
     assert_eq!(count, vec![vec![Some("1".to_string())]]);
 }
 
+/// Regression for the H3 HOT re-collapse corruption (`docs/specs/mvcc.md` §9/§10).
+/// Over the wire: create a table with a secondary index + a row, do several HOT
+/// updates of a NON-indexed column, VACUUM (the chain collapses, the root becomes a
+/// REDIRECT to the live tail), do several MORE HOT updates (the chain grows from the
+/// redirect target), VACUUM again, then SELECT. Before the fix the second VACUUM
+/// planned the redirect-rooted chain twice, freeing a slot to UNUSED more than once;
+/// `apply_prune_plan` errored mid-page and left a stale checksum, so every later read
+/// of that page failed with `page checksum mismatch`. The final SELECT must return the
+/// correct latest value, not an error.
+#[tokio::test]
+async fn vacuum_recollapse_of_a_hot_chain_does_not_corrupt_the_page() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    // A table with a secondary index on the NON-updated column `name`; `note` is the
+    // non-indexed column the HOT updates churn.
+    conn.ok("create table docs (id integer primary key, name text, note text)")
+        .await;
+    conn.ok("create index docs_name on docs (name)").await;
+    conn.ok("insert into docs (id, name, note) values (1, 'Ada', 'v0')")
+        .await;
+
+    // Several HOT updates of the non-indexed `note` (each keeps the same `name`, so it
+    // stays on the HOT path: same page, no new index entry).
+    for v in 1..=4 {
+        conn.ok(&format!("update docs set note = 'v{v}' where id = 1"))
+            .await;
+    }
+    // First VACUUM: the chain collapses, the root becomes a REDIRECT to the live tail.
+    assert!(conn.ok("vacuum docs").await.result.is_ok());
+
+    // Several MORE HOT updates: the chain now grows from the redirect target.
+    for v in 5..=8 {
+        conn.ok(&format!("update docs set note = 'v{v}' where id = 1"))
+            .await;
+    }
+    // Second VACUUM: re-collapses the now redirect-rooted chain. Must not error/corrupt.
+    let second = conn.query("vacuum docs").await.unwrap();
+    if let Err(err) = &second.result {
+        panic!("the second VACUUM must not error: {}", err.message);
+    }
+
+    // The final read returns the correct latest value (not a checksum-mismatch error),
+    // on the PK path, a seq scan, and the secondary-index path.
+    let by_pk = conn
+        .query("select note from docs where id = 1")
+        .await
+        .unwrap();
+    if let Err(err) = &by_pk.result {
+        panic!(
+            "the read after re-collapse must succeed (no page corruption): {}",
+            err.message
+        );
+    }
+    assert_eq!(by_pk.rows(), vec![vec![Some("v8".to_string())]]);
+
+    let by_seq = conn
+        .ok("select id, note from docs order by id")
+        .await
+        .rows();
+    assert_eq!(
+        by_seq,
+        vec![vec![Some("1".to_string()), Some("v8".to_string())]]
+    );
+
+    let by_name = conn
+        .ok("select note from docs where name = 'Ada'")
+        .await
+        .rows();
+    assert_eq!(by_name, vec![vec![Some("v8".to_string())]]);
+
+    // Exactly one live row remains.
+    let count = conn.ok("select count(*) from docs").await.rows();
+    assert_eq!(count, vec![vec![Some("1".to_string())]]);
+}
+
 /// The horizon-safety invariant at the server level. While a snapshot advertises an
 /// old `xmin`, the GC horizon is pinned at or below that `xmin` even after a delete
 /// commits and the id allocator advances well past it — so VACUUM (which captures
