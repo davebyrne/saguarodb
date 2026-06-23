@@ -78,6 +78,51 @@ pub(crate) struct RowLocation {
     pub slot_num: u16,
 }
 
+/// One physical member of a HOT chain, gathered by the H3 prune walk
+/// (`docs/specs/mvcc.md` §9/§10 H3): its slot id and the MVCC header fields the
+/// collapse decision needs. The `t_ctid` itself is not retained — the walk already
+/// followed it to the next member.
+#[derive(Clone, Copy, Debug)]
+struct ChainMember {
+    slot: u16,
+    xmin: u64,
+    xmax: u64,
+    infomask: u16,
+}
+
+/// The HOT prune plan for ONE heap page (`docs/specs/mvcc.md` §9/§10 H3): the
+/// line-pointer rewrites and in-place header resets `vacuum_heap` applies under the
+/// frame latch, computed by [`PageBackedStorageEngine::classify_page_for_prune`].
+///
+/// Application order on the page is: header resets (in place) → free heap-only
+/// members to `UNUSED` → redirect collapsed roots → mark fully-dead roots `DEAD` →
+/// `compact`. Only `dead_roots` carry index entries that index vacuum (F3a) must
+/// strip and line-pointer reclaim (F3b) must free; REDIRECT roots keep a LIVE entry
+/// (F3a skips them) and heap-only members freed to `UNUSED` never had an entry.
+#[derive(Default, Debug)]
+struct PagePrunePlan {
+    /// `(root_slot, live_tail_slot)`: a HOT root whose dead head is replaced by a
+    /// REDIRECT to the surviving live tail. Its index entry stays live.
+    redirect_roots: Vec<(u16, u16)>,
+    /// Index-referenced roots (NORMAL or already-REDIRECT) of a fully-dead chain →
+    /// `DEAD` (then F3a strips the entry, F3b reclaims the slot).
+    dead_roots: Vec<u16>,
+    /// `HEAP_ONLY` chain members (no index entry of their own) → `UNUSED` directly.
+    free_to_unused: Vec<u16>,
+    /// Slots whose header is reset in place (abort-cleanup: un-HOT a HOT predecessor
+    /// of an aborted successor, or clear a non-HOT aborted-deleter stamp — F4c).
+    reset_slots: Vec<u16>,
+}
+
+impl PagePrunePlan {
+    fn is_empty(&self) -> bool {
+        self.redirect_roots.is_empty()
+            && self.dead_roots.is_empty()
+            && self.free_to_unused.is_empty()
+            && self.reset_slots.is_empty()
+    }
+}
+
 #[derive(Clone)]
 struct TableState {
     schema: TableSchema,
@@ -1096,13 +1141,17 @@ impl PageBackedStorageEngine {
         &self,
         schema: &TableSchema,
         horizon: u64,
-    ) -> Result<Vec<RowLocation>> {
+    ) -> Result<(Vec<RowLocation>, usize)> {
         // A table's heap file id is its table id (no high bit; see `heap::index_file_id`).
         let file_id = schema.id;
         let page_count = self.buffer_pool.page_count(file_id)?;
         let latch = self.structural_latch(file_id);
 
+        // `reclaimed` are the DEAD-root TIDs (need F3a + F3b); `freed_count` additionally
+        // counts the heap-only chain members freed straight to UNUSED (no index entry),
+        // for the VACUUM command tag.
         let mut reclaimed: Vec<RowLocation> = Vec::new();
+        let mut freed_count: usize = 0;
         for page_num in 0..page_count {
             // Lock order: structural latch → frame write latch → (WAL mutex inside the
             // append). Both are released at the end of each iteration so no latch is
@@ -1117,81 +1166,24 @@ impl PageBackedStorageEngine {
                 continue;
             }
 
-            // Classify every NORMAL slot. `page::read_row` returns `Some` only for a
-            // NORMAL line pointer (a DEAD/UNUSED slot reads as `None`), so the slot ids
-            // it yields are exactly the live candidates; `next_slot` is the slot count.
-            // A slot is either RECLAIMED (`dead_slots`, pruned to DEAD) or KEPT; a kept
-            // slot whose deleter definitively ABORTED is additionally collected into
-            // `reset_slots` for in-place abort-cleanup (F4c root-cause, below).
-            let slot_count = page::next_slot(guard.data())?;
-            let mut dead_slots: Vec<u16> = Vec::new();
-            let mut reset_slots: Vec<u16> = Vec::new();
-            for slot in 0..slot_count {
-                let Some(tuple) = page::read_row(guard.data(), slot)? else {
-                    continue;
-                };
-                let (xmin, xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
-                if common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
-                    // The tuple is dead-to-all. HOT-chain safety (H2/H3,
-                    // `docs/specs/mvcc.md` §10 Milestone H2/H3): a HOT-chain member
-                    // (`HEAP_ONLY` successor or `HOT_UPDATED` root) is reclaimable ONLY
-                    // when its creator aborted. An aborted-creator HOT tuple is a
-                    // dead-end orphan — an aborted UPDATE never sits in the MIDDLE of a
-                    // live chain (its xmin is the chain's youngest id and no later version
-                    // was committed onto it), so reclaiming it cannot sever a still-live
-                    // successor; leaving it would both leak space and (per F4c) keep a
-                    // surviving on-disk reference to an aborted txn. A HOT tuple
-                    // dead-to-all via a COMMITTED delete is the genuine "could be a live
-                    // committed chain's middle" case — reclaiming it would sever the
-                    // `t_ctid` walk to a still-live successor — so it is deferred to H3's
-                    // chain-aware pruning (redirect the root, splice the chain). Non-HOT
-                    // tuples are reclaimed unconditionally on dead-to-all.
-                    let is_hot =
-                        infomask & (crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED) != 0;
-                    let creator_aborted = infomask & common::XMIN_ABORTED != 0
-                        || self.txn_status_view().is_aborted(xmin);
-                    if is_hot && !creator_aborted {
-                        continue;
-                    }
-                    dead_slots.push(slot);
-                    continue;
-                }
-
-                // KEPT slot. **Abort-cleanup (F4c root-cause, `docs/specs/mvcc.md` §5.4 /
-                // §9 F4c).** An aborted UPDATE/DELETE stamps `xmax = T` (and, for a HOT
-                // root, `HOT_UPDATED` + `t_ctid`) on its surviving predecessor, which
-                // stays live because the delete/update rolled back. VACUUM does not
-                // reclaim that live row and nothing else resets the stamp, so once the
-                // vacuum floor floats past `T` and its `Abort` is truncated, recovery
-                // rebuilds the CLOG and reads `xmax = T` as implicitly Committed —
-                // wrongly DELETING the row after a crash. Reset the stamp in place so a
-                // full pass leaves NO surviving on-disk reference to an aborted txn (as
-                // deleter, mirroring the aborted-creator reclaim above): clear `xmax` to
-                // INVALID, drop the dangling `t_ctid`, and un-HOT an aborted root. Only on
-                // a DEFINITIVE abort — VACUUM holds the exclusive guard so no writer is in
-                // flight and `xmax`'s status is settled; never reset an in-progress xmax.
-                let deleter_aborted = xmax != common::INVALID_XID
-                    && (infomask & common::XMAX_ABORTED != 0
-                        || self.txn_status_view().is_aborted(xmax));
-                if deleter_aborted {
-                    reset_slots.push(slot);
-                }
-            }
-
-            if dead_slots.is_empty() && reset_slots.is_empty() {
+            // Chain-aware classification (H3): compute, for THIS page, the line-pointer
+            // rewrites (root → REDIRECT / DEAD, heap-only member → UNUSED) and the
+            // in-place header resets (abort-cleanup). Pure read over the page bytes.
+            let plan = self.classify_page_for_prune(guard.data(), horizon)?;
+            if plan.is_empty() {
                 continue;
             }
 
-            // Apply the in-place abort-cleanup header resets FIRST (before the compaction
-            // relocates survivors), then prune+compact the dead slots, then log the whole
-            // result as a SINGLE unconditional FullPageImage. A header reset clears
-            // `xmax → INVALID`, `t_ctid → INVALID`, and the `HOT_UPDATED` / settled-`XMAX_*`
-            // hint bits (giving the tuple the exact live, never-deleted header shape),
-            // preserving every other bit (e.g. `XMIN_COMMITTED`, `HEAP_ONLY`). The reset
-            // keeps the tuple at its stable slot id and does not change its length, so no
-            // index entry is touched.
+            // Apply the in-place header resets FIRST (before compaction relocates
+            // survivors): the abort-cleanup of an aborted-deleter stamp, and the un-HOT
+            // of a HOT predecessor whose successor's creator aborted. A reset clears
+            // `xmax → INVALID`, `t_ctid → INVALID`, and the `HOT_UPDATED` /
+            // settled-`XMAX_*` hint bits (the exact live, never-deleted header shape),
+            // preserving every other bit (`xmin`/`XMIN_*`/`HEAP_ONLY`). The reset keeps
+            // the tuple at its stable slot id and length, so no index entry is touched.
+            // The provisional LSN is overwritten by the FPI's LSN below.
             let provisional_lsn = page::page_lsn(guard.data());
-            for &slot in &reset_slots {
+            for &slot in &plan.reset_slots {
                 let cleared_bits =
                     crate::codec::HOT_UPDATED | common::XMAX_ABORTED | common::XMAX_COMMITTED;
                 let tuple = page::read_row(guard.data(), slot)?
@@ -1207,17 +1199,35 @@ impl PageBackedStorageEngine {
                 )?;
             }
 
-            // Prune + compact, then log the compacted page as a single unconditional
-            // FullPageImage (a compaction relocates survivors and is not a delta; the
-            // header resets above further mutate it in place), and stamp the FPI's LSN as
-            // the new page-LSN — the `btree::log_full_page` pattern. `prune_and_compact`
-            // restamps the provisional LSN; the FPI append below overwrites it with the
-            // record's LSN so redo gating is exact. Recovery's redo arm reinstalls this
-            // image purely by PageLSN gating, independent of txn id, so a crash mid-VACUUM
-            // leaves the page either pre-pass or exactly this image — never torn — and the
-            // abort-cleanup is durable before any later `truncate_before` consults the
-            // floor (a checkpoint flushes+fsyncs every dirty page before that).
-            page::prune_and_compact(guard.data_mut(), &dead_slots, provisional_lsn)?;
+            // Rewrite line pointers, then compact the survivors' bytes, then log the
+            // whole result as a SINGLE unconditional FullPageImage and stamp the FPI's
+            // LSN as the new page-LSN (the `vacuum_heap` / `btree::log_full_page`
+            // pattern). Order within the page:
+            //   1. heap-only chain members (no index entry) → UNUSED directly (the key
+            //      HOT win: freed straight to reusable, no index vacuum).
+            //   2. a HOT root whose original tuple died but whose tail is still live →
+            //      REDIRECT to that live tail (its index entry now resolves via the
+            //      redirect; the target stays NORMAL through compaction).
+            //   3. a fully-dead chain's root (NORMAL or already-REDIRECT) → DEAD, so
+            //      F3a strips its index entry and F3b reclaims the slot DEAD → UNUSED.
+            //   4. compact: relocate the NORMAL survivors' bytes contiguously, reclaiming
+            //      the bytes freed by every slot now non-NORMAL. Survivors keep their
+            //      stable slot ids (index-referenced slots are NEVER renumbered — only
+            //      tuple BYTES move), so no index entry is touched.
+            // A crash mid-pass leaves the page either pre-pass or exactly this image
+            // (PageLSN-gated idempotent redo), never torn; the rewrite is durable before
+            // any later `truncate_before` consults the vacuum floor (a checkpoint
+            // flushes+fsyncs every dirty page before that).
+            if !plan.free_to_unused.is_empty() {
+                page::free_slots_to_unused(guard.data_mut(), &plan.free_to_unused)?;
+            }
+            for &(root_slot, target_slot) in &plan.redirect_roots {
+                page::set_redirect(guard.data_mut(), root_slot, target_slot)?;
+            }
+            if !plan.dead_roots.is_empty() {
+                page::mark_slots_dead(guard.data_mut(), &plan.dead_roots)?;
+            }
+            page::compact(guard.data_mut(), provisional_lsn)?;
             let fpi_lsn = self.wal.append(WalRecord {
                 lsn: 0,
                 txn_id: VACUUM_TXN,
@@ -1229,7 +1239,11 @@ impl PageBackedStorageEngine {
             })?;
             page::set_page_lsn(guard.data_mut(), fpi_lsn);
 
-            for slot in dead_slots {
+            // Only the DEAD roots carry index entries that F3a must remove and F3b must
+            // reclaim DEAD → UNUSED. REDIRECT roots keep a LIVE index entry (F3a skips
+            // them) and heap-only members freed to UNUSED never had an entry.
+            freed_count += plan.free_to_unused.len();
+            for slot in plan.dead_roots {
                 reclaimed.push(RowLocation {
                     file_id,
                     page_num,
@@ -1238,7 +1252,270 @@ impl PageBackedStorageEngine {
             }
         }
 
-        Ok(reclaimed)
+        Ok((reclaimed, freed_count))
+    }
+
+    /// Chain-aware HOT prune plan for ONE heap page (`docs/specs/mvcc.md` §9 / §10
+    /// Milestone H3). Reads the page's slots (no mutation) and classifies every HOT
+    /// chain rooted on the page, returning the line-pointer rewrites and in-place
+    /// header resets `vacuum_heap` then applies under the frame latch.
+    ///
+    /// **What a chain is here.** Every index entry points at a chain ROOT — a stable
+    /// indexed slot that is either `NORMAL` and NOT `HEAP_ONLY` (an independently
+    /// indexed version: a non-HOT row, or the HOT-chain head) or a `REDIRECT` (a
+    /// previously-collapsed root). A `HEAP_ONLY` `NORMAL` slot is a chain MEMBER with
+    /// NO index entry of its own, reached only by walking `t_ctid` from its root
+    /// (`HOT_UPDATED → HEAP_ONLY`, same page) — the H1 segment rule. A non-HOT row is
+    /// a one-member chain, so the same collapse logic subsumes it.
+    ///
+    /// **Per chain, in order:**
+    /// 1. **Abort truncation.** A HOT update that ABORTED appended a `HEAP_ONLY`
+    ///    successor whose creator (`xmin`) aborted; an aborted UPDATE never committed,
+    ///    so such a successor is always the chain TAIL. Where a `HOT_UPDATED` member's
+    ///    successor has an aborted creator, the update rolled back: reset that member
+    ///    in place (un-HOT — drop `xmax`/`t_ctid`/`HOT_UPDATED`) and free the aborted
+    ///    successor (and anything past it) directly to `UNUSED`. This is the chain-aware
+    ///    form of the F4c abort-cleanup (it leaves NO on-disk reference to the aborted
+    ///    txn, as deleter or creator), and it truncates the chain before step 2.
+    /// 2. **Committed-dead prefix collapse.** On the truncated chain, find `L` = the
+    ///    first member that is NOT `is_dead_to_all(horizon)` — the live tail's head.
+    ///    - **No `L` (whole chain dead-to-all):** the root slot → `DEAD` (F3a strips its
+    ///      index entry, F3b reclaims it `DEAD → UNUSED`); every `HEAP_ONLY` member →
+    ///      `UNUSED` directly.
+    ///    - **`L` is a later member (the head died, a live tail survives):** the root
+    ///      slot → `REDIRECT` to `L`'s slot (its index entry now resolves via the
+    ///      redirect — H1 follows it); every dead `HEAP_ONLY` member strictly before `L`
+    ///      → `UNUSED` directly; for a `NORMAL` root, the dead head IS the root slot, so
+    ///      it simply becomes the `REDIRECT` (its bytes reclaimed by compaction).
+    ///    - **`L` is the head (already live):** nothing to collapse.
+    /// 3. **Abort-cleanup of a kept root.** A live chain head/root whose own `xmax` is a
+    ///    DEFINITIVELY aborted deleter (a non-HOT aborted UPDATE/DELETE's surviving
+    ///    predecessor) is reset in place (F4c), exactly as before H3.
+    ///
+    /// Deadness is re-derived per member here under the frame latch via
+    /// [`common::is_dead_to_all`]; VACUUM holds the exclusive guard, so every `xmin`/
+    /// `xmax` status is settled (never reset/redirect against an in-flight txn).
+    fn classify_page_for_prune(
+        &self,
+        data: &[u8; buffer::PAGE_SIZE],
+        horizon: u64,
+    ) -> Result<PagePrunePlan> {
+        let status = self.txn_status_view();
+        let slot_count = page::next_slot(data)?;
+
+        // First pass: which NORMAL slots are HEAP_ONLY chain MEMBERS (reached as the
+        // `t_ctid` target of a same-page `HOT_UPDATED` tuple)? Everything else that is
+        // NORMAL-non-HEAP_ONLY or REDIRECT is a chain ROOT. A HEAP_ONLY slot has no
+        // index entry, so it is never a root.
+        let mut is_member: HashSet<u16> = HashSet::new();
+        for slot in 0..slot_count {
+            let Some(bytes) = page::read_row(data, slot)? else {
+                continue;
+            };
+            let (_xmin, _xmax, t_ctid, infomask) = crate::codec::decode_mvcc_header(&bytes)?;
+            if infomask & crate::codec::HOT_UPDATED == 0 {
+                continue;
+            }
+            let (succ_page, succ_slot) = t_ctid;
+            if succ_page != page::page_id(data) {
+                continue;
+            }
+            if let page::LinePointer::Normal = page::slot_state(data, succ_slot)? {
+                let succ = page::read_row(data, succ_slot)?
+                    .ok_or_else(|| storage_internal("HOT successor is not a live tuple"))?;
+                let (_x, _xm, _t, succ_infomask) = crate::codec::decode_mvcc_header(&succ)?;
+                if succ_infomask & crate::codec::HEAP_ONLY != 0 {
+                    is_member.insert(succ_slot);
+                }
+            }
+        }
+
+        let mut plan = PagePrunePlan::default();
+        // Second pass: process each ROOT's chain.
+        for root_slot in 0..slot_count {
+            let state = page::slot_state(data, root_slot)?;
+            let head_slot = match state {
+                // A NORMAL non-member slot is a chain root (the head tuple lives in the
+                // root slot itself). A NORMAL member is reached via its root — skip.
+                page::LinePointer::Normal => {
+                    if is_member.contains(&root_slot) {
+                        continue;
+                    }
+                    root_slot
+                }
+                // A REDIRECT root's head tuple lives at the redirect's target slot.
+                page::LinePointer::Redirect(target) => match page::slot_state(data, target)? {
+                    page::LinePointer::Normal => target,
+                    _ => {
+                        return Err(storage_internal(
+                            "redirect line pointer target is not a NORMAL tuple",
+                        ));
+                    }
+                },
+                page::LinePointer::Dead | page::LinePointer::Unused => continue,
+            };
+
+            // Walk the chain from `head_slot`, collecting (slot, xmin, xmax, infomask).
+            let chain = self.collect_prune_chain(data, head_slot)?;
+            self.plan_chain(root_slot, &chain, horizon, status, &mut plan)?;
+        }
+        Ok(plan)
+    }
+
+    /// Walk a HOT chain from `head_slot` (already resolved through any REDIRECT),
+    /// returning each member as `(slot, xmin, xmax, infomask)` in chain order. Follows
+    /// the H1 segment rule (a same-page `HEAP_ONLY` successor of a `HOT_UPDATED`
+    /// tuple); a cyclic `t_ctid` (corruption) is a structured error, not a spin.
+    fn collect_prune_chain(
+        &self,
+        data: &[u8; buffer::PAGE_SIZE],
+        head_slot: u16,
+    ) -> Result<Vec<ChainMember>> {
+        let slot_count = page::next_slot(data)?;
+        let mut visited: HashSet<u16> = HashSet::with_capacity(slot_count as usize);
+        let mut chain = Vec::new();
+        let mut current = head_slot;
+        loop {
+            if !visited.insert(current) {
+                return Err(storage_internal("cyclic HOT chain detected"));
+            }
+            let bytes = page::read_row(data, current)?
+                .ok_or_else(|| storage_internal("HOT chain member is not a live tuple"))?;
+            let (xmin, xmax, t_ctid, infomask) = crate::codec::decode_mvcc_header(&bytes)?;
+            chain.push(ChainMember {
+                slot: current,
+                xmin,
+                xmax,
+                infomask,
+            });
+            if infomask & crate::codec::HOT_UPDATED == 0 {
+                break;
+            }
+            let (succ_page, succ_slot) = t_ctid;
+            if succ_page != page::page_id(data) {
+                break;
+            }
+            match page::slot_state(data, succ_slot)? {
+                page::LinePointer::Normal => {}
+                _ => break,
+            }
+            let succ = page::read_row(data, succ_slot)?
+                .ok_or_else(|| storage_internal("HOT successor is not a live tuple"))?;
+            let (_x, _xm, _t, succ_infomask) = crate::codec::decode_mvcc_header(&succ)?;
+            if succ_infomask & crate::codec::HEAP_ONLY == 0 {
+                break;
+            }
+            current = succ_slot;
+        }
+        Ok(chain)
+    }
+
+    /// Plan one chain's collapse into `plan` (see [`Self::classify_page_for_prune`]'s
+    /// per-chain rules). `root_slot` is the index-referenced slot; `chain` is the
+    /// physical members from the head down.
+    fn plan_chain(
+        &self,
+        root_slot: u16,
+        chain: &[ChainMember],
+        horizon: u64,
+        status: &dyn TxnStatusView,
+        plan: &mut PagePrunePlan,
+    ) -> Result<()> {
+        if chain.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1 — abort truncation. Find the first member whose successor's creator
+        // aborted (an aborted HOT update's rolled-back successor); reset that member
+        // in place (un-HOT) and free the aborted suffix to UNUSED. An aborted UPDATE
+        // never committed, so the aborted successor is always the chain TAIL — the
+        // truncation removes a suffix and leaves a clean live-or-dead prefix.
+        let mut live_len = chain.len();
+        for i in 0..chain.len() {
+            if chain[i].infomask & crate::codec::HOT_UPDATED == 0 {
+                break;
+            }
+            let Some(succ) = chain.get(i + 1) else { break };
+            let succ_aborted =
+                succ.infomask & common::XMIN_ABORTED != 0 || status.is_aborted(succ.xmin);
+            if succ_aborted {
+                // Reset member `i` (the surviving predecessor): un-HOT it.
+                plan.reset_slots.push(chain[i].slot);
+                // Free the aborted successor and everything past it (all HEAP_ONLY)
+                // straight to UNUSED — no index entry, dead-end orphans.
+                for member in &chain[i + 1..] {
+                    plan.free_to_unused.push(member.slot);
+                }
+                live_len = i + 1;
+                break;
+            }
+        }
+        let chain = &chain[..live_len];
+
+        // Step 2 — committed-dead prefix collapse on the (truncated) chain. After a
+        // reset above, member `live_len-1` has xmax INVALID, so it is not dead-to-all
+        // and becomes the live tail head `L`.
+        let l_index = chain
+            .iter()
+            .position(|m| !common::is_dead_to_all(m.xmin, m.xmax, m.infomask, horizon, status));
+
+        match l_index {
+            None => {
+                // Whole (truncated) chain is dead-to-all → reclaim the entire chain.
+                // The root slot → DEAD (F3a strips its entry, F3b reclaims it). For a
+                // NORMAL root, the head tuple IS the root slot. Every other (HEAP_ONLY)
+                // member → UNUSED directly.
+                plan.dead_roots.push(root_slot);
+                for member in chain {
+                    if member.slot != root_slot {
+                        plan.free_to_unused.push(member.slot);
+                    }
+                }
+            }
+            Some(0) => {
+                // The head is already live (`L` == head). Nothing to collapse. A
+                // non-HOT aborted-deleter on this kept head is abort-cleaned in step 3.
+                let head = &chain[0];
+                self.maybe_abort_cleanup_kept(head, status, plan);
+            }
+            Some(l) => {
+                // The head (and the committed-dead prefix before `L`) died, but a live
+                // tail survives at `chain[l]`. Re-point the root slot to `L` (REDIRECT),
+                // and free every dead member strictly before `L` to UNUSED. For a NORMAL
+                // root, the dead head IS the root slot and simply becomes the REDIRECT
+                // (its bytes reclaimed by compaction), so it is NOT freed separately.
+                plan.redirect_roots.push((root_slot, chain[l].slot));
+                for member in &chain[..l] {
+                    if member.slot != root_slot {
+                        plan.free_to_unused.push(member.slot);
+                    }
+                }
+                // The live tail's head may itself carry a non-HOT aborted-deleter stamp.
+                self.maybe_abort_cleanup_kept(&chain[l], status, plan);
+            }
+        }
+        Ok(())
+    }
+
+    /// If a KEPT (live) chain member's own `xmax` is a DEFINITIVELY aborted deleter —
+    /// the surviving predecessor of a non-HOT aborted UPDATE/DELETE — schedule its
+    /// in-place abort-cleanup (F4c). Skips a member already scheduled for a reset by
+    /// step 1's abort truncation (its `xmax` would be reset to INVALID). VACUUM holds
+    /// the exclusive guard, so `xmax`'s status is settled.
+    fn maybe_abort_cleanup_kept(
+        &self,
+        member: &ChainMember,
+        status: &dyn TxnStatusView,
+        plan: &mut PagePrunePlan,
+    ) {
+        if plan.reset_slots.contains(&member.slot) {
+            return;
+        }
+        let deleter_aborted = member.xmax != common::INVALID_XID
+            && (member.infomask & common::XMAX_ABORTED != 0 || status.is_aborted(member.xmax));
+        if deleter_aborted {
+            plan.reset_slots.push(member.slot);
+        }
     }
 
     /// Index VACUUM (`docs/specs/mvcc.md` §9, Milestone F3a): remove every index
@@ -1418,12 +1695,18 @@ impl PageBackedStorageEngine {
     /// reader that starts mid-pass freezes `xmin >= horizon` (the deleter is in its
     /// settled past). VACUUM therefore never reclaims a version a snapshot needs.
     pub fn vacuum(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
-        // Phase F2b — heap-prune dead-to-all tuples to DEAD, collecting their TIDs.
-        let dead = self.vacuum_heap(schema, horizon)?;
-        let reclaimed = dead.len();
+        // Phase F2b — heap-prune dead-to-all tuples + collapse HOT chains, collecting
+        // the DEAD-root TIDs (the slots whose index entries F3a must strip and F3b must
+        // reclaim) and the total count of reclaimed slots (DEAD roots + heap-only
+        // members freed straight to UNUSED, which carry no index entry — the HOT win).
+        let (dead, freed_in_chains) = self.vacuum_heap(schema, horizon)?;
+        let reclaimed = dead.len() + freed_in_chains;
         if !dead.is_empty() {
             let dead: HashSet<RowLocation> = dead.into_iter().collect();
-            // Phase F3a — strip every PK + secondary index entry for those TIDs.
+            // Phase F3a — strip every PK + secondary index entry for the DEAD-root TIDs.
+            // REDIRECT roots are NOT in this set (their index entry stays live), and
+            // heap-only members freed to UNUSED never had an entry, so neither reaches
+            // F3a/F3b — exactly the H3 invariant (`docs/specs/mvcc.md` §9/§10 H3).
             self.vacuum_indexes(schema, &dead)?;
             // Phase F3b — reclaim the now entry-free line pointers DEAD → UNUSED.
             // MUST follow F3a (above): see this method's ordering invariant.
@@ -2444,6 +2727,46 @@ mod visibility_tests {
             self.engine
                 .locate_visible_version(&schema, &btree, key, &snapshot, current_txn)
                 .unwrap()
+        }
+
+        /// Like [`Self::locate`] but for the 3-column HOT schema (`hot_schema`).
+        fn locate_hot(
+            &self,
+            key: &Key,
+            snapshot: Snapshot,
+            current_txn: u64,
+        ) -> Option<(super::RowLocation, u16)> {
+            let schema = hot_schema();
+            let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
+            self.engine
+                .locate_visible_version(&schema, &btree, key, &snapshot, current_txn)
+                .unwrap()
+        }
+
+        /// The line-pointer state of `(page_num, slot)` (NORMAL/DEAD/UNUSED/REDIRECT),
+        /// so an H3 collapse test can assert the root became a REDIRECT and dead
+        /// members became UNUSED.
+        fn slot_state_hot(&self, page_num: u32, slot: u16) -> crate::page::LinePointer {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, page_num)
+                .unwrap();
+            crate::page::slot_state(readable.data(), slot).unwrap()
+        }
+
+        /// The page's current free byte count, to assert HOT-collapse reclaimed space.
+        fn free_bytes_hot(&self, page_num: u32) -> usize {
+            let readable = self
+                .engine
+                .buffer_pool
+                .read_page(TABLE_ID, page_num)
+                .unwrap();
+            let data = readable.data();
+            let num_slots = crate::page::read_u16(data, crate::page::NUM_SLOTS_OFFSET);
+            let free_start = crate::page::read_u16(data, crate::page::FREE_SPACE_OFFSET) as usize;
+            let slot_array = buffer::PAGE_SIZE - (num_slots as usize) * crate::page::SLOT_LEN;
+            slot_array.saturating_sub(free_start)
         }
     }
 
@@ -4515,10 +4838,12 @@ mod visibility_tests {
     }
 
     #[test]
-    fn vacuum_does_not_sever_a_hot_chain() {
-        // Build a multi-version HOT chain, advance the horizon so the middle/root
-        // versions are dead_to_all, run VACUUM, then read: the chain is intact and the
-        // latest version is still visible (the vacuum skip-guard, H2 part 3).
+    fn vacuum_collapses_a_committed_dead_hot_chain_to_a_redirect() {
+        // Build a multi-version HOT chain root -> v2 -> v3 -> v4, advance the horizon so
+        // the dead prefix (root, v2, v3) is dead-to-all, run VACUUM: H3 COLLAPSES the
+        // chain — the root slot becomes a REDIRECT to the live tail v4, the dead
+        // heap-only members v2/v3 are freed to UNUSED, the index entry still resolves to
+        // v4 (PK + secondary), and freed page space is reclaimed.
         let (fixture, root) = hot_fixture();
 
         // Three successive HOT updates of the non-indexed note (txns 20, 21, 22),
@@ -4537,29 +4862,74 @@ mod visibility_tests {
             );
             fixture.commit(txn);
         }
-        // Still exactly one PK + one secondary entry (HOT added none).
+        // Still exactly one PK + one secondary entry (HOT added none). Capture the live
+        // tail (v4) slot and the page's free space before the collapse.
         assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
         assert_eq!(
             fixture.secondary_index_tids(name_index().id, "Ada"),
             vec![root]
         );
+        let v4 = fixture
+            .locate_hot(&key(1), snapshot(120, vec![]), 0)
+            .expect("v4 visible")
+            .0;
+        assert_ne!(
+            v4.slot_num, root.slot_num,
+            "v4 is a heap-only successor slot"
+        );
+        let free_before = fixture.free_bytes_hot(root.page_num);
 
-        // Horizon 100: every superseded version (xmax in {20,21,22}, all < 100 and
-        // committed) is dead_to_all — but they are HOT-chain members, so VACUUM must
-        // SKIP them rather than sever the chain.
+        // Horizon 100: root/v2/v3 (xmax in {20,21,22}, all < 100 and committed) are
+        // dead-to-all; v4 (xmax INVALID) is the live tail.
         let schema = hot_schema();
         let reclaimed = fixture.engine.vacuum(&schema, 100).unwrap();
-        assert_eq!(reclaimed, 0, "HOT-chain tuples are not reclaimed in H2");
+        assert!(reclaimed >= 2, "v2 and v3 were freed: {reclaimed}");
 
-        // The chain survives: the latest version is still resolvable, and the entries
-        // still point at the (intact) root.
+        // The root slot is now a REDIRECT to the live tail v4.
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(v4.slot_num),
+            "the dead root collapsed to a REDIRECT pointing at the live tail",
+        );
+
+        // The chain's dead heap-only members are now UNUSED (freed directly, no index
+        // entry — the key HOT win), and v4 stays NORMAL.
+        assert_eq!(
+            fixture.slot_state_hot(v4.page_num, v4.slot_num),
+            crate::page::LinePointer::Normal
+        );
+
+        // The index entries still point at the (stable) root slot, which resolves via
+        // the REDIRECT to v4 — exactly once, on BOTH index paths.
         assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
         assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada"),
+            vec![root]
+        );
+        let reader = ctx(0, snapshot(120, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", "v4"))
+        );
+        let by_seq = collect_names(
             fixture
                 .engine
-                .get(&ctx(0, snapshot(120, vec![])), TABLE_ID, &key(1))
+                .scan_range(&reader, TABLE_ID, &KeyRange::All)
                 .unwrap(),
-            Some(hot_row(1, "Ada", "v4"))
+        );
+        assert_eq!(by_seq, vec![hot_row(1, "Ada", "v4")]);
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", "v4")]);
+
+        // Freed page space was reclaimed (the dead v2/v3/root tuples' bytes).
+        assert!(
+            fixture.free_bytes_hot(root.page_num) > free_before,
+            "collapsing the dead prefix reclaimed page free space",
         );
     }
 
@@ -4604,13 +4974,29 @@ mod visibility_tests {
         assert_ne!(succ.infomask & crate::codec::HEAP_ONLY, 0);
 
         // VACUUM at any horizon reclaims the aborted-creator successor (aborted-creator
-        // reclaim has NO age requirement).
+        // reclaim has NO age requirement). H3 frees the heap-only successor straight to
+        // UNUSED (no index entry) and un-HOTs the surviving root (the chain-aware
+        // abort-cleanup).
         let schema = hot_schema();
         let reclaimed = fixture.engine.vacuum(&schema, 100).unwrap();
         assert!(
             reclaimed >= 1,
             "the aborted-creator HOT heap-only successor must be reclaimed"
         );
+
+        // The successor slot is now UNUSED (freed directly, no DEAD intermediary, since
+        // a HEAP_ONLY tuple has no index entry).
+        assert_eq!(
+            fixture.slot_state_hot(succ_page, succ_slot),
+            crate::page::LinePointer::Unused
+        );
+        // The root was un-HOTed in place: xmax cleared to INVALID, HOT_UPDATED dropped,
+        // t_ctid reset — the exact live, never-updated header shape.
+        let root_after = decode_hot(&fixture, root);
+        assert_eq!(root_after.xmax, common::INVALID_XID);
+        assert_eq!(root_after.infomask & crate::codec::HOT_UPDATED, 0);
+        assert_eq!(root_after.t_ctid, crate::codec::INVALID_TID);
+        assert_eq!(root_after.row, hot_row(1, "Ada", "v1"));
 
         // The root still reads its ORIGINAL value: the aborted update's successor is
         // gone (no resurrection), and the root's own xmax = 20 is an aborted deleter, so
@@ -4624,6 +5010,178 @@ mod visibility_tests {
         );
         // The index still points at the (intact) root.
         assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+    }
+
+    #[test]
+    fn vacuum_marks_a_fully_dead_hot_chain_root_dead_and_reclaims_it() {
+        // Build a HOT chain, then DELETE the row and advance the horizon so the WHOLE
+        // chain (root + every heap-only successor + the deleted tail) is dead-to-all.
+        // H3 marks the root DEAD (F3a strips its index entry, F3b reclaims it
+        // DEAD → UNUSED), frees the heap-only members to UNUSED, reads return nothing,
+        // and the slot is reusable by a later insert.
+        let (fixture, root) = hot_fixture();
+        for (txn, note) in [(20u64, "v2"), (21, "v3")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", note),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        // DELETE the row (stamps xmax on the live tail v3).
+        assert!(
+            fixture
+                .engine
+                .delete(&ctx(30, snapshot(31, vec![])), TABLE_ID, &key(1))
+                .unwrap()
+        );
+        fixture.commit(30);
+
+        // Horizon 100: root/v2/v3 all dead-to-all (committed deletes < 100). VACUUM
+        // marks the root DEAD, strips its index entries, then reclaims it to UNUSED.
+        let schema = hot_schema();
+        let reclaimed = fixture.engine.vacuum(&schema, 100).unwrap();
+        assert!(reclaimed >= 3, "the whole 3-version chain was reclaimed");
+
+        // The root slot is now UNUSED (DEAD → index-vacuum → reclaimed UNUSED).
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Unused
+        );
+        // The index entry was removed (no dangling PK or secondary entry).
+        assert!(fixture.pk_index_tids(&key(1)).is_empty());
+        assert!(
+            fixture
+                .secondary_index_tids(name_index().id, "Ada")
+                .is_empty()
+        );
+        // Reads return nothing.
+        let reader = ctx(0, snapshot(120, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            None
+        );
+        let seq = collect_names(
+            fixture
+                .engine
+                .scan_range(&reader, TABLE_ID, &KeyRange::All)
+                .unwrap(),
+        );
+        assert!(seq.is_empty());
+
+        // The reclaimed UNUSED slot is reusable by a later insert (it may reuse the
+        // root slot id on the same page).
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(40, snapshot(41, vec![])),
+                TABLE_ID,
+                hot_row(2, "Bea", "n"),
+            )
+            .unwrap();
+        fixture.commit(40);
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(50, vec![])), TABLE_ID, &key(2))
+                .unwrap(),
+            Some(hot_row(2, "Bea", "n"))
+        );
+        let _ = rid;
+    }
+
+    #[test]
+    fn vacuum_collapse_then_further_hot_update_extends_a_multi_segment_chain() {
+        // After a collapse leaves root = REDIRECT → L (a heap-only tail), a further HOT
+        // update of the (now redirected) row must extend the chain: REDIRECT → L →
+        // L2. Reads on BOTH index paths resolve to the latest version, proving the
+        // resolver walks REDIRECT → heap-only → heap-only correctly.
+        let (fixture, root) = hot_fixture();
+        for (txn, note) in [(20u64, "v2"), (21, "v3")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", note),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        // Collapse: root/v2 dead-to-all, v3 live ⇒ root REDIRECT → v3.
+        let schema = hot_schema();
+        fixture.engine.vacuum(&schema, 100).unwrap();
+        let v3 = fixture
+            .locate_hot(&key(1), snapshot(120, vec![]), 0)
+            .expect("v3 visible")
+            .0;
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(v3.slot_num)
+        );
+
+        // A further HOT update of the now-redirected row (note v3 -> v4). It targets v3
+        // (the live tail under the REDIRECT) and chains it to a new heap-only v4.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx(120, snapshot(121, vec![])),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", "v4"),
+                )
+                .unwrap()
+        );
+        fixture.commit(120);
+
+        // The chain is now REDIRECT(root) → v3 (HOT_UPDATED) → v4 (heap-only tail). No
+        // new index entry was added (still the single root entry).
+        assert_eq!(fixture.pk_index_tids(&key(1)), vec![root]);
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada"),
+            vec![root]
+        );
+        // Both index paths resolve through REDIRECT → v3 → v4 to the latest version.
+        let reader = ctx(0, snapshot(130, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", "v4"))
+        );
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", "v4")]);
+
+        // A second collapse (horizon past v3's xmax = 120) re-points the REDIRECT at v4.
+        fixture.engine.vacuum(&schema, 200).unwrap();
+        let v4 = fixture
+            .locate_hot(&key(1), snapshot(220, vec![]), 0)
+            .expect("v4 visible")
+            .0;
+        assert_eq!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(v4.slot_num)
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(220, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", "v4"))
+        );
     }
 
     #[test]
@@ -5821,7 +6379,7 @@ mod vacuum_tests {
         fixture.commit(20);
         fixture.delete(21, 3);
         fixture.commit(21);
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 30).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 30).unwrap();
         let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
         assert_eq!(dead, HashSet::from([gone, also_gone]));
 
@@ -5873,7 +6431,7 @@ mod vacuum_tests {
             }
         }
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
         assert_eq!(
             reclaimed.iter().copied().collect::<HashSet<_>>(),
             dead,
@@ -5937,7 +6495,7 @@ mod vacuum_tests {
         fixture.delete(20, 2);
         fixture.commit(20);
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
         let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
         assert_eq!(dead, HashSet::from([gone]));
 
@@ -6009,7 +6567,7 @@ mod vacuum_tests {
                 live.insert(loc);
             }
         }
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
         assert_eq!(reclaimed.iter().copied().collect::<HashSet<_>>(), dead);
 
         let pk_file_id = index_file_id(TABLE_ID);
@@ -6106,7 +6664,7 @@ mod vacuum_tests {
         let keep_bytes = fixture.physical_bytes(keep).expect("survivor is NORMAL");
         let free_before = fixture.free_bytes(keep.page_num);
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
 
         // The deleted slot is the only reclaimed TID; its line pointer is now DEAD
         // (read_row -> None) while the survivor stays NORMAL and byte-identical.
@@ -6157,7 +6715,7 @@ mod vacuum_tests {
             .map(|&loc| fixture.physical_bytes(loc))
             .collect();
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 40).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 40).unwrap();
 
         // Nothing is reclaimed: the only candidate at horizon 40 would be a committed
         // delete strictly below 40, and there is none.
@@ -6214,7 +6772,7 @@ mod vacuum_tests {
         let bytes_a = fixture.physical_bytes(a);
         let bytes_b = fixture.physical_bytes(b);
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 100).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 100).unwrap();
 
         assert!(reclaimed.is_empty(), "no reclaimable tuples");
         assert_eq!(
@@ -6234,7 +6792,7 @@ mod vacuum_tests {
         fixture.delete(20, 2);
         fixture.commit(20);
 
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
         assert_eq!(reclaimed, vec![gone]);
 
         // The runtime page after pruning, captured from the buffer pool.
@@ -6315,7 +6873,7 @@ mod vacuum_tests {
             fixture.commit(deleter);
         }
 
-        let mut reclaimed = fixture.engine.vacuum_heap(&users_schema(), 200).unwrap();
+        let (mut reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 200).unwrap();
         reclaimed.sort_by_key(|loc| (loc.page_num, loc.slot_num));
         let mut expected = dead.clone();
         expected.sort_by_key(|loc| (loc.page_num, loc.slot_num));
@@ -6354,7 +6912,7 @@ mod vacuum_tests {
         /// Run the full F2b → F3a → F3b VACUUM sequence at `horizon` and return the
         /// reclaimed (now `UNUSED`) TIDs — the canonical ordering for slot reuse.
         fn vacuum_full(&self, horizon: u64) -> HashSet<RowLocation> {
-            let reclaimed = self.engine.vacuum_heap(&users_schema(), horizon).unwrap();
+            let (reclaimed, _freed) = self.engine.vacuum_heap(&users_schema(), horizon).unwrap();
             let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
             self.engine.vacuum_indexes(&users_schema(), &dead).unwrap();
             self.engine
@@ -6373,7 +6931,7 @@ mod vacuum_tests {
         fixture.commit(20);
 
         // F2b: prune to DEAD; F3a: strip index entries; F3b: reclaim DEAD -> UNUSED.
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
         let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
         fixture
             .engine
@@ -6493,7 +7051,7 @@ mod vacuum_tests {
         fixture.delete(20, 2);
         fixture.commit(20);
         // ONLY the heap prune: the slot is DEAD, not yet UNUSED.
-        let reclaimed = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
+        let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 21).unwrap();
         assert_eq!(reclaimed, vec![gone]);
         assert!(fixture.physical_bytes(gone).is_none());
 

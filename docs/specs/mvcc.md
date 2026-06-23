@@ -240,10 +240,12 @@ will ever need:
   tuple.
 - `REDIRECT` — points at another slot **on the same page** (its target slot id is
   held in the line pointer's `offset` field). Produced by HOT pruning (Milestone
-  H3) when a HOT root's original tuple is reclaimed but its stable, indexed root
-  slot must keep resolving to the surviving root version. **H1 implements reading
-  it** (the read-side resolution below); the read path follows a `REDIRECT` to its
-  target, which **must be a `NORMAL` slot** — a redirect-to-redirect or
+  H3) when a HOT chain's dead prefix (including the original root tuple) is reclaimed
+  but its stable, indexed root slot must keep resolving to the **surviving live
+  tail** (the first not-dead-to-all member, which may itself be a `HEAP_ONLY`
+  successor — the read walk then continues from it via `t_ctid`). **H1 implements
+  reading it** (the read-side resolution below); the read path follows a `REDIRECT`
+  to its target, which **must be a `NORMAL` slot** — a redirect-to-redirect or
   redirect-to-dead is corruption and surfaces as a structured `DbError`, never a
   loop. (`page.rs` validates a `REDIRECT`'s target slot id is in-bounds on every
   page read; the NORMAL-target check is the resolver's.)
@@ -632,30 +634,62 @@ design, because index entries accumulate per version as well as heap tuples.
 - **Heap prune** (intra-page, `storage::vacuum_heap`, F2b): for every heap page of
   a table — scanning the **full extent** `0..page_count` (resident *and* evicted
   pages, via `BufferPool::page_count`, so an evicted dead tuple is never missed),
-  not just resident pages — classify each `NORMAL` tuple with
-  `is_dead_to_all(horizon)` (decoding its `xmin`/`xmax`/`infomask` and settling
-  against the live CLOG), mark the dead-to-all line pointers `DEAD`, and compact the
-  surviving tuples (`page::prune_and_compact`; this finally adds the page compaction
-  that `page.rs` lacks today — `DELETE` is currently a non-reclaiming tombstone). Per
+  not just resident pages — classify each chain rooted on the page with
+  `is_dead_to_all(horizon)` per member (decoding its `xmin`/`xmax`/`infomask` and
+  settling against the live CLOG), collapse the committed-dead prefix (the HOT-chain
+  collapse below), and compact the surviving tuples' bytes. The page primitives are
+  `page::{free_slots_to_unused, set_redirect, mark_slots_dead, compact}` (line-pointer
+  rewrites then a single byte-reclaiming `compact`); `page::prune_and_compact` (mark
+  dead + compact in one call) remains for the non-chain case it already served. Per
   page the pass takes the per-heap structural latch then the frame write latch (lock
-  order structural → frame → WAL), released before the next page. Each pruned page is
+  order structural → frame → WAL), released before the next page. Each mutated page is
   logged as a **single unconditional `FullPageImage`** (a compaction relocates
-  survivors and is not expressible as a delta), so recovery reinstalls the compacted
-  page byte-for-byte by PageLSN gating; a page with no dead tuples is skipped (no WAL,
-  no mutation). Survivors stay byte-identical at their stable slot ids, so no index
-  entry is touched. The pass runs under the maintenance txn id (`0`) so its
-  reclamation is never undone by an abort, and returns the reclaimed dead TIDs (fed to
-  index vacuum). It does **not** reclaim line pointers `DEAD → UNUSED` (that is the
-  separate step below). Called by the live VACUUM orchestration (F4a, below) as its
-  first phase.
-  - **HOT skip-guard (H2/H3).** Among the dead-to-all slots, a HOT-chain member
-    (`HEAP_ONLY` or `HOT_UPDATED`) is reclaimed **only when its creator aborted** — an
-    aborted-creator HOT tuple is a dead-end orphan (an aborted UPDATE never sits in the
-    middle of a live chain), so reclaiming it cannot sever a still-live successor, and
-    leaving it would keep a surviving on-disk reference to the aborted txn (F4c). A HOT
-    member dead-to-all via a *committed* delete may be the middle of a live committed
-    chain, so reclaiming it would sever the `t_ctid` walk — that case is deferred to H3's
-    chain-aware pruning. Non-HOT tuples reclaim unconditionally on dead-to-all.
+  survivors and is not expressible as a delta; the in-place header resets fold into the
+  same image), so recovery reinstalls the page byte-for-byte by PageLSN gating; a page
+  with no collapse/reset/dead work is skipped (no WAL, no mutation). NORMAL survivors
+  stay byte-identical at their stable slot ids, so no index entry is touched. The pass
+  runs under the maintenance txn id (`0`) so its reclamation is never undone by an
+  abort, and returns the DEAD-root TIDs (fed to index vacuum). It does **not** reclaim
+  line pointers `DEAD → UNUSED` (that is the separate step below). Called by the live
+  VACUUM orchestration (F4a, below) as its first phase.
+  - **HOT-chain collapse (H3).** `vacuum_heap` is **chain-aware**: rather than
+    classifying isolated slots, it walks each HOT chain rooted at an index-referenced
+    slot (a `NORMAL` non-`HEAP_ONLY` slot — a non-HOT row or a chain head — or an
+    already-`REDIRECT` slot) and collapses the **committed-dead-to-all prefix** while
+    keeping the stable, indexed root slot resolving to the surviving live tail
+    (`classify_page_for_prune` / `plan_chain`). A `HEAP_ONLY` `NORMAL` slot is a chain
+    MEMBER reached only via its root's `t_ctid` (the H1 segment rule), so it is never a
+    root; a non-HOT row is a one-member chain, so the same logic subsumes the
+    pre-HOT case. Per chain, in order:
+    - **Abort truncation (F4c, chain-aware).** A HOT update that aborted appended a
+      `HEAP_ONLY` successor whose creator (`xmin`) aborted; an aborted UPDATE never
+      committed, so that successor is always the chain TAIL. Where a `HOT_UPDATED`
+      member's successor has an aborted creator, reset that member **in place** (un-HOT:
+      `xmax → INVALID`, `t_ctid → INVALID`, clear `HOT_UPDATED` + settled `XMAX_*`) and
+      free the aborted successor (and anything past it, all `HEAP_ONLY`) straight to
+      `UNUSED`. This leaves NO on-disk reference to the aborted txn (as creator OR
+      deleter) and truncates the chain before the prefix collapse.
+    - **Committed-dead prefix collapse.** On the truncated chain, find `L` = the first
+      member that is **not** `is_dead_to_all(horizon)` — the live tail's head (deadness
+      re-derived per member under the frame latch).
+      - **If the root is dead-to-all and an `L` exists** (a live heap-only successor):
+        the root line pointer becomes `REDIRECT → L`'s slot (its index entry now
+        resolves via the REDIRECT — H1's reader follows it), and every dead `HEAP_ONLY`
+        member strictly **before** `L` is freed **directly to `UNUSED`** — they have NO
+        index entry of their own (the H1/H2 invariant), so no index vacuum is needed
+        (the key HOT win). For a `NORMAL` root, the dead head IS the root slot and simply
+        becomes the `REDIRECT` (its bytes reclaimed by the compaction below).
+      - **If the whole chain is dead-to-all** (no live `L`): the root → `DEAD` (so F3a
+        index-vacuum removes its index entry and F3b reclaims it `DEAD → UNUSED`); every
+        `HEAP_ONLY` member → `UNUSED` directly.
+      - **If `L` is the head** (already live): nothing to collapse.
+    The compaction relocates only the survivors' BYTES; **index-referenced slot ids
+    (NORMAL roots, REDIRECT roots, DEAD-pending-index-vacuum roots) stay stable** —
+    indexes address them — so no index entry is touched by the byte move. `vacuum_heap`
+    returns only the **DEAD root TIDs** (fully-dead chains, plus non-HOT/aborted dead
+    rows as one-member chains) for F3a + F3b; a `REDIRECT` root keeps a LIVE index entry
+    (NOT returned, so F3a skips it) and heap-only members freed to `UNUSED` never had an
+    entry. A stale/smaller horizon only collapses less, never unsafely.
   - **Abort-cleanup (F4c root-cause).** For each KEPT (not-reclaimed) `NORMAL` slot whose
     deleter is **definitively aborted** (`xmax != 0` AND `XMAX_ABORTED` hint or
     `status(xmax) == Aborted`), reset its header **in place**: `xmax → INVALID`,
@@ -671,7 +705,11 @@ design, because index entries accumulate per version as well as heap tuples.
 - **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
   dangling index entries `vacuum_heap` left behind — for the table's primary-key
   index **and every live secondary index**, delete every entry whose value (the heap
-  TID) is in `dead_tids`. Entries are matched by **dead-TID membership, not by key**:
+  TID) is in `dead_tids`. `dead_tids` are exactly the **DEAD-root TIDs** `vacuum_heap`
+  returns; a **REDIRECT root keeps a LIVE index entry** and is therefore NEVER in
+  `dead_tids`, so F3a removes only fully-dead roots and a collapsed (redirected) root's
+  entry is preserved — the H3 invariant that an index entry over a REDIRECT root must
+  survive. Entries are matched by **dead-TID membership, not by key**:
   the heap prune already compacted the page, so the dead tuple's key bytes are gone
   and the key cannot be recomputed; the leaf's stored TID is the only handle left.
   Each index is vacuumed in a single leaf-chain walk (`BTree::remove_values_in`),
@@ -1044,8 +1082,8 @@ savepoints via sub-transaction xids (optional, deferred).
   machinery; implemented)**. **H2** HOT-update fast path (same-page + no
   indexed-column change ⇒ heap-only tuple, no new index entries; index points at
   the root) **plus the two safety guards introducing HOT updates requires
-  (implemented)**. **H3** HOT pruning folded into page access and VACUUM. Reuses
-  A–G unchanged.
+  (implemented)**. **H3** HOT pruning folded into the UPDATE path and VACUUM
+  **(implemented)**. Reuses A–G unchanged.
 
   **H1 — read-side resolution (implemented).** H1 installs the read machinery HOT
   needs *without* producing any heap-only tuples or `REDIRECT`s (H2/H3), so it is
@@ -1138,12 +1176,66 @@ savepoints via sub-transaction xids (optional, deferred).
     is nothing to index. A non-HOT (single-version) root indexes its physical row
     exactly as before — unchanged backfill behavior for pre-HOT data.
 
-  - **Guard 2 — VACUUM skips HOT-chain tuples.** The existing (F) heap-prune reclaims
-    any `is_dead_to_all` version; with HOT chains present that could reclaim a
-    dead-to-all MIDDLE member while a later member is still live, severing the `t_ctid`
-    chain. Until H3 adds proper HOT-aware pruning, `vacuum_heap` treats any tuple with
-    `HEAP_ONLY` OR `HOT_UPDATED` set as **non-reclaimable** (skipped), deferring all
-    HOT-chain reclamation to H3.
+  - **Guard 2 — VACUUM skips committed-dead HOT-chain tuples (superseded by H3).**
+    The H2 heap-prune reclaims a dead-to-all HOT member only when its creator aborted
+    (a dead-end orphan), and SKIPS a HOT member dead-to-all via a *committed* delete
+    (which could be the middle of a live committed chain, so reclaiming it isolated
+    would sever the `t_ctid` walk), deferring that case to H3. **H3 replaces this
+    skip** with chain-aware collapse (below): `vacuum_heap` now collapses
+    committed-dead HOT prefixes into a `REDIRECT` rather than skipping them.
+
+  **H3 — HOT pruning (collapse) folded into VACUUM and the UPDATE path
+  (implemented).** H3 reclaims committed-dead HOT-chain prefixes — the case H2's
+  Guard 2 deferred — by **collapsing** a chain rather than reclaiming members in
+  isolation, on two triggers: **(a) VACUUM** and **(b) the UPDATE path** when a
+  same-page HOT update needs room. It does NOT prune on the lock-free reader path
+  (reads stay pure — pruning lives on the write/VACUUM paths, §10 H1). There is **no
+  fillfactor**: pages pack 100%, and steady-state room comes from update-path pruning.
+
+  - **The collapse primitive** (`vacuum_heap` → `classify_page_for_prune` /
+    `plan_chain`; page primitives `page::{free_slots_to_unused, set_redirect,
+    mark_slots_dead, compact}`). For each HOT chain rooted at an index-referenced slot
+    `R` (a `NORMAL` non-`HEAP_ONLY` root, or an existing `REDIRECT`), walk `t_ctid`
+    through `HEAP_ONLY` successors (the H1 segment rule) and find `L` = the first member
+    that is **not** `is_dead_to_all` (the live tail's head; deadness re-derived per
+    member under the frame latch):
+    - **`R` dead-to-all and an `L` exists** → `R`'s line pointer becomes `REDIRECT → L`
+      (its index entry resolves via the redirect — H1's reader follows it then walks
+      from the target). Every dead `HEAP_ONLY` member strictly before `L` is freed
+      **directly to `UNUSED`** (they have NO index entry of their own — the H1/H2
+      invariant — so no index vacuum is needed; the key HOT win).
+    - **Whole chain dead-to-all** (no `L`) → `R` → `DEAD` (F3a index-vacuum removes
+      `R`'s entry, F3b reclaims `R` `DEAD → UNUSED`); every `HEAP_ONLY` member →
+      `UNUSED` directly.
+    - **`L` is the head** → nothing to collapse.
+    Compaction reclaims the freed bytes; **index-referenced slot ids stay stable** (only
+    tuple BYTES move). An aborted-creator HOT successor (an aborted UPDATE's rolled-back
+    tail) is handled by a chain-aware **abort truncation** that un-HOTs its predecessor
+    in place and frees the aborted suffix to `UNUSED` (the F4c abort-cleanup, chain-aware).
+  - **CRITICAL INVARIANTS.** (1) An index-referenced root is NEVER freed to `UNUSED`
+    while its index entry exists — it is `NORMAL`, `REDIRECT` (live pointer), or `DEAD`
+    (pending index vacuum); only F3a-then-F3b takes a `DEAD` root → `UNUSED`. (2) A
+    `REDIRECT` root's index entry is **live** — F3a (`vacuum_indexes`) never removes it,
+    because `vacuum_heap` returns only DEAD-root TIDs and a `REDIRECT` root is never in
+    that set. (3) `HEAP_ONLY` members have no index entry, so freeing them straight to
+    `UNUSED` is sound (no dangling entry); a `REDIRECT` always targets a `NORMAL` slot on
+    the same page (H1 enforces this on read, H3 keeps it true on write). (4) Deadness is
+    monotonic from the root to `L`; no member at/after `L` is freed.
+  - **VACUUM integration.** The H2 skip for committed-dead HOT members is replaced by
+    the collapse primitive; F3a/F3b handle `REDIRECT` (skip — entry stays live) vs
+    `DEAD` (remove entry + reclaim slot) correctly, and heap-only members freed to
+    `UNUSED` never reach F3a. The unconditional-`FullPageImage`-per-mutated-page logging
+    (VACUUM_TXN = 0, PageLSN-gated idempotent redo) and the fsync-before-truncate
+    ordering are preserved verbatim.
+  - **Update-path pruning** (`update` → `try_hot_update`). When a HOT update finds no
+    same-page room, it runs the collapse primitive on the predecessor's page (under the
+    heap latch it already holds), then retries the same-page HOT insert; if there is
+    still no room, it falls back to the existing non-HOT update. This needs the GC
+    horizon, threaded into the update path (a stale/smaller horizon is safe — it only
+    prunes less). Update-path pruning runs under the **shared** writer guard (NOT the
+    exclusive guard — an UPDATE never takes it); it mutates only the single latched
+    page, so lock-free readers (which re-resolve through line pointers, incl. `REDIRECT`)
+    stay correct.
 
 ### Unlocks summary
 

@@ -307,6 +307,88 @@ async fn hot_update_and_its_chain_survive_restart() {
 }
 
 #[tokio::test]
+async fn vacuum_collapsed_hot_chain_redirect_survives_restart() {
+    // H3 collapse: build a HOT chain (several HOT updates of the non-indexed `note`),
+    // VACUUM so the dead prefix collapses to a REDIRECT pointing at the live tail (the
+    // dead heap-only members freed to UNUSED, compacted away), then crash + restart.
+    // The collapse is logged as an unconditional FullPageImage, so PageLSN-gated redo
+    // reinstalls the REDIRECT + freed/compacted slots byte-for-byte. After restart the
+    // PK scan and the secondary index on the unchanged `name` (entry still at the root,
+    // resolving via the REDIRECT) both return the latest version exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text, note text)")
+            .await
+            .unwrap();
+        // Index only `name`, NOT `note`, so updating `note` stays HOT-eligible.
+        server
+            .simple_query("create index users_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name, note) values (1, 'Ada', 'v1')")
+            .await
+            .unwrap();
+        // Several HOT updates build root -> v2 -> v3 -> v4 on one page, no new entries.
+        for note in ["v2", "v3", "v4"] {
+            server
+                .simple_query(&format!("update users set note = '{note}' where id = 1"))
+                .await
+                .unwrap();
+        }
+        // FULL VACUUM: the committed-dead prefix (root, v2, v3) collapses — the root
+        // becomes a REDIRECT to the live tail v4; the dead heap-only members are freed.
+        server.simple_query("vacuum").await.unwrap();
+        // Checkpoint so the collapse's FullPageImage is flushed+fsynced to the heap.
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // Restart: recovery replays the VACUUM's FullPageImage (the collapsed page), so the
+    // REDIRECT root and the freed/compacted slots survive.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    // PK scan: the root entry resolves via the REDIRECT to v4.
+    let rows = server
+        .simple_query("select id, name, note from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some("Ada".to_string()),
+            Some("v4".to_string())
+        ]]
+    );
+    // Secondary index on the unchanged `name` (entry at the root) resolves to v4 too,
+    // exactly once.
+    let rows = server
+        .simple_query("select id, note from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("v4".to_string())]]
+    );
+
+    // A further HOT update after restart extends the (REDIRECT) chain and still reads
+    // back — proving the recovered REDIRECT root is fully usable.
+    server
+        .simple_query("update users set note = 'v5' where id = 1")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select note from users where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("v5".to_string())]]);
+}
+
+#[tokio::test]
 async fn aborted_update_leaves_old_value_after_restart() {
     // An UPDATE that violates a unique secondary constraint errors; the autocommit
     // transaction aborts. Abort is status-based (Milestone D1): the new version

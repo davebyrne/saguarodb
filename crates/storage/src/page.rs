@@ -137,6 +137,12 @@ pub fn page_lsn(data: &[u8; PAGE_SIZE]) -> Lsn {
     read_u64(data, PAGE_LSN_OFFSET)
 }
 
+/// The page's own id (stored in its header), used by HOT pruning to test whether a
+/// tuple's `t_ctid` successor is on THIS page (a same-page HOT-chain member).
+pub fn page_id(data: &[u8; PAGE_SIZE]) -> PageNum {
+    read_u32(data, PAGE_ID_OFFSET)
+}
+
 /// The slot number a subsequent `insert_row` will assign (the current slot count).
 pub fn next_slot(data: &[u8; PAGE_SIZE]) -> Result<u16> {
     Ok(validate(data)?.num_slots)
@@ -385,6 +391,42 @@ pub fn prune_and_compact(data: &mut [u8; PAGE_SIZE], dead_slots: &[u16], lsn: Ls
         write_slot(data, slot_num, slot);
     }
 
+    compact_survivors_and_stamp(data, header, lsn)
+}
+
+/// Compact a heap page's live tuples in place: relocate every `NORMAL` tuple's
+/// bytes contiguously from `HEADER_LEN` upward, reclaiming the bytes freed by any
+/// `DEAD`/`UNUSED`/`REDIRECT` line pointer (and any prior gaps), without touching
+/// the slot-id array order/ids — only each survivor's line-pointer `offset` is
+/// rewritten. The PageLSN is stamped with `lsn` and the checksum refreshed.
+///
+/// This is the byte-reclaim half of HOT pruning (`mvcc.md` §9 / Milestone H3):
+/// the engine first rewrites line pointers (a HOT root → `REDIRECT`, a fully-dead
+/// root → `DEAD`, a heap-only dead member → `UNUSED`, a non-HOT/aborted dead slot
+/// → `DEAD`) and then calls this to reclaim the bytes those non-`NORMAL` slots no
+/// longer name. Unlike [`prune_and_compact`] it marks nothing dead itself — it
+/// takes the page's slot states as given and only relocates survivor bytes — so an
+/// index-referenced slot's id stays stable (indexes address it) while its tuple
+/// bytes may move. A `REDIRECT` slot's `offset` field holds its target slot id
+/// (not a byte offset) and is left untouched; only `NORMAL` survivors are
+/// relocated.
+#[allow(dead_code, reason = "consumed by VACUUM HOT pruning in H3")]
+pub fn compact(data: &mut [u8; PAGE_SIZE], lsn: Lsn) -> Result<()> {
+    let header = validate(data)?;
+    compact_survivors_and_stamp(data, header, lsn)
+}
+
+/// Relocate every `NORMAL` survivor's bytes contiguously from `HEADER_LEN`,
+/// rewriting each survivor's line-pointer `offset`, recompute `free_start`, stamp
+/// `lsn`, and revalidate. Shared by [`prune_and_compact`] (after it marks the dead
+/// slots) and [`compact`] (which marks nothing). Survivors are copied through a
+/// scratch buffer first so overlapping source/destination ranges never corrupt a
+/// tuple regardless of the survivors' original on-page order.
+fn compact_survivors_and_stamp(
+    data: &mut [u8; PAGE_SIZE],
+    header: PageHeader,
+    lsn: Lsn,
+) -> Result<()> {
     // Snapshot every surviving NORMAL tuple's bytes into a scratch buffer so the
     // copy-back never reads a region a prior survivor has already overwritten.
     let mut survivors: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -456,18 +498,20 @@ pub fn reclaim_line_pointers(data: &mut [u8; PAGE_SIZE], slots: &[u16], lsn: Lsn
 }
 
 /// Overwrite the line pointer at `slot_num` with a `REDIRECT` to `target_slot`
-/// (on the same page) and refresh the checksum — the synthetic constructor the
-/// HOT read-side resolution tests (Milestone H1) use to build a `REDIRECT` slot
-/// without the production pruning path (H3) existing yet. The target is stored in
-/// the line pointer's `offset` field. Both ids must be in-bounds; this does not
-/// validate that the target is `NORMAL` (a test may deliberately build a corrupt
-/// redirect-to-redirect to exercise the resolver's guard).
-#[cfg(test)]
-pub(crate) fn set_redirect(
-    data: &mut [u8; PAGE_SIZE],
-    slot_num: u16,
-    target_slot: u16,
-) -> Result<()> {
+/// (on the same page) and refresh the checksum — the HOT-prune result that keeps a
+/// stable, indexed root slot resolving to the surviving live tail after its
+/// original tuple bytes are reclaimed (`mvcc.md` §5.2 / Milestone H3). The target
+/// is stored in the line pointer's `offset` field; `len`/`flags` are overwritten.
+///
+/// Both ids must be in-bounds. This does **not** validate that the target is
+/// currently `NORMAL` — the engine guarantees it (the redirect target is the first
+/// not-dead-to-all chain member, always a live `NORMAL` tuple), and the read-side
+/// resolver re-checks NORMAL on every resolution (`resolve_visible_in_chain`); a
+/// test may also build a deliberately corrupt redirect-to-redirect to exercise
+/// that guard. Does NOT stamp the PageLSN (a HOT prune stamps it once, after all
+/// the page's line-pointer rewrites + the [`compact`] that follows).
+#[allow(dead_code, reason = "consumed by VACUUM HOT pruning in H3")]
+pub fn set_redirect(data: &mut [u8; PAGE_SIZE], slot_num: u16, target_slot: u16) -> Result<()> {
     let header = validate(data)?;
     if slot_num >= header.num_slots || target_slot >= header.num_slots {
         return Err(corrupt_page("slot number is out of bounds"));
@@ -481,6 +525,73 @@ pub(crate) fn set_redirect(
             flags: line_pointer::REDIRECT,
         },
     );
+    write_checksum(data);
+    Ok(())
+}
+
+/// Flip the listed line pointers directly to `UNUSED`, freeing their slot ids for
+/// reuse without the `DEAD` intermediate state. This is the HOT-prune primitive
+/// (`mvcc.md` §9 / Milestone H3) for reclaiming a chain's **heap-only** members:
+/// a `HEAP_ONLY` tuple has **no index entry of its own** (the H1/H2 invariant), so
+/// — unlike a non-HOT or root slot — there is no dangling index entry to strip
+/// first, and the slot is safe to free straight to `UNUSED` (the key HOT win, no
+/// index vacuum needed). Each slot must currently be `NORMAL`; a non-`NORMAL` slot
+/// (already `DEAD`/`UNUSED`/`REDIRECT`, or out of bounds) is a misuse and returns a
+/// structured `DbError`. Does NOT stamp the PageLSN (the HOT prune stamps it once,
+/// via the trailing [`compact`]); the freed tuple bytes are reclaimed by that
+/// compaction. The checksum is refreshed so the page stays valid for the next
+/// rewrite.
+#[allow(dead_code, reason = "consumed by VACUUM HOT pruning in H3")]
+pub fn free_slots_to_unused(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result<()> {
+    let header = validate(data)?;
+    for &slot_num in slots {
+        if slot_num >= header.num_slots {
+            return Err(corrupt_page("slot number is out of bounds"));
+        }
+        let mut slot = read_slot(data, slot_num);
+        if slot.flags != line_pointer::NORMAL {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "cannot free a non-NORMAL slot directly to UNUSED",
+            ));
+        }
+        slot.flags = line_pointer::UNUSED;
+        write_slot(data, slot_num, slot);
+    }
+    write_checksum(data);
+    Ok(())
+}
+
+/// Flip the listed line pointers to `DEAD` (retaining their slot ids so an index
+/// entry still pointing here resolves to "no version" until index vacuum removes
+/// it). The HOT-prune counterpart of [`prune_and_compact`]'s dead-marking, split
+/// out so the engine can mark dead the index-referenced root of a fully-dead chain
+/// — whether that root is currently `NORMAL` (a non-HOT/aborted dead tuple, or a
+/// HOT root whose whole chain died) or `REDIRECT` (a previously-collapsed HOT root
+/// whose surviving tail has since died) — and then run a single [`compact`] over
+/// the whole page. Only `NORMAL`/`REDIRECT` slots may be marked: both are
+/// index-referenced, so marking them `DEAD` schedules their entries for index
+/// vacuum (F3a) then line-pointer reclaim (F3b). An already-`DEAD`/`UNUSED` or
+/// out-of-bounds slot is a misuse and returns a structured `DbError`. Does NOT
+/// stamp the PageLSN (the HOT prune stamps it once, via the trailing [`compact`]);
+/// the checksum is refreshed so the page stays valid for the next rewrite.
+#[allow(dead_code, reason = "consumed by VACUUM HOT pruning in H3")]
+pub fn mark_slots_dead(data: &mut [u8; PAGE_SIZE], slots: &[u16]) -> Result<()> {
+    let header = validate(data)?;
+    for &slot_num in slots {
+        if slot_num >= header.num_slots {
+            return Err(corrupt_page("slot number is out of bounds"));
+        }
+        let mut slot = read_slot(data, slot_num);
+        if slot.flags != line_pointer::NORMAL && slot.flags != line_pointer::REDIRECT {
+            return Err(DbError::storage(
+                SqlState::InternalError,
+                "cannot mark a non-NORMAL/REDIRECT slot DEAD",
+            ));
+        }
+        slot.flags = line_pointer::DEAD;
+        write_slot(data, slot_num, slot);
+    }
     write_checksum(data);
     Ok(())
 }
@@ -615,10 +726,10 @@ pub(crate) fn corrupt_page(message: impl Into<String>) -> common::DbError {
 mod tests {
     use super::{
         FREE_SPACE_OFFSET, HEADER_LEN, LinePointer, NUM_SLOTS_OFFSET, PAGE_LSN_OFFSET,
-        PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, delete_row, init_page,
-        insert_row, line_pointer, prune_and_compact, read_row, read_slot, read_u16,
-        reclaim_line_pointers, set_page_lsn, set_redirect, set_tuple_header, slot_state, validate,
-        write_checksum, write_slot,
+        PAGE_TYPE_DATA, PAGE_TYPE_OFFSET, PAGE_VERSION, PAGE_VERSION_OFFSET, compact, delete_row,
+        free_slots_to_unused, init_page, insert_row, line_pointer, mark_slots_dead,
+        prune_and_compact, read_row, read_slot, read_u16, reclaim_line_pointers, set_page_lsn,
+        set_redirect, set_tuple_header, slot_state, validate, write_checksum, write_slot,
     };
     use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
@@ -1184,5 +1295,98 @@ mod tests {
         );
         write_checksum(&mut data.0);
         assert!(validate(&data.0).is_err());
+    }
+
+    // --- H3: HOT-prune line-pointer rewrites + compaction ---
+
+    #[test]
+    fn compact_reclaims_bytes_of_non_normal_slots_keeping_ids_stable() {
+        // A page with a NORMAL survivor, a slot redirected away, a slot freed to
+        // UNUSED, and a slot marked DEAD. `compact` repacks ONLY the NORMAL survivors,
+        // reclaims the others' bytes, and keeps every slot id stable.
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let keep = insert_blob(&mut data, 0xA0, 10);
+        let redirected = insert_blob(&mut data, 0xB0, 30); // its bytes will be reclaimed
+        let heap_only = insert_blob(&mut data, 0xC0, 20); // freed straight to UNUSED
+        let dead_root = insert_blob(&mut data, 0xD0, 15); // marked DEAD
+        let tail = insert_blob(&mut data, 0xE0, 8); // NORMAL survivor (redirect target)
+        let free_before = read_u16(&data.0, FREE_SPACE_OFFSET);
+
+        free_slots_to_unused(&mut data.0, &[heap_only]).unwrap();
+        set_redirect(&mut data.0, redirected, tail).unwrap();
+        mark_slots_dead(&mut data.0, &[dead_root]).unwrap();
+        compact(&mut data.0, 0xFEED).unwrap();
+
+        // Slot ids stayed stable; states are as set; the NORMAL survivors keep bytes.
+        assert_eq!(slot_state(&data.0, keep).unwrap(), LinePointer::Normal);
+        assert_eq!(read_row(&data.0, keep).unwrap(), Some(blob(0xA0, 10)));
+        assert_eq!(
+            slot_state(&data.0, redirected).unwrap(),
+            LinePointer::Redirect(tail)
+        );
+        assert_eq!(slot_state(&data.0, heap_only).unwrap(), LinePointer::Unused);
+        assert_eq!(slot_state(&data.0, dead_root).unwrap(), LinePointer::Dead);
+        assert_eq!(slot_state(&data.0, tail).unwrap(), LinePointer::Normal);
+        assert_eq!(read_row(&data.0, tail).unwrap(), Some(blob(0xE0, 8)));
+
+        // Only the two NORMAL survivors (keep=10 + tail=8) remain in the live region;
+        // the redirected(30)/heap_only(20)/dead(15) bytes were all reclaimed.
+        validate(&data.0).unwrap();
+        assert_eq!(super::page_lsn(&data.0), 0xFEED);
+        let free_after = read_u16(&data.0, FREE_SPACE_OFFSET);
+        assert_eq!(free_after as usize, HEADER_LEN + 10 + 8);
+        assert!(free_after < free_before);
+    }
+
+    #[test]
+    fn free_slots_to_unused_rejects_non_normal_slots() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let a = insert_blob(&mut data, 0x11, 8);
+        assert!(delete_row(&mut data.0, a).unwrap()); // now DEAD
+        // A DEAD/UNUSED/REDIRECT slot is not a valid NORMAL target.
+        assert!(free_slots_to_unused(&mut data.0, &[a]).is_err());
+        assert!(free_slots_to_unused(&mut data.0, &[99]).is_err());
+    }
+
+    #[test]
+    fn mark_slots_dead_accepts_normal_and_redirect_but_not_dead() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let normal = insert_blob(&mut data, 0x22, 8);
+        let redirect_root = insert_blob(&mut data, 0x33, 8);
+        let target = insert_blob(&mut data, 0x44, 8);
+        set_redirect(&mut data.0, redirect_root, target).unwrap();
+
+        // A NORMAL root and a REDIRECT root can both be marked DEAD (both index-ref'd).
+        mark_slots_dead(&mut data.0, &[normal, redirect_root]).unwrap();
+        assert_eq!(slot_state(&data.0, normal).unwrap(), LinePointer::Dead);
+        assert_eq!(
+            slot_state(&data.0, redirect_root).unwrap(),
+            LinePointer::Dead
+        );
+        validate(&data.0).unwrap();
+
+        // A slot already DEAD is not a valid target.
+        assert!(mark_slots_dead(&mut data.0, &[normal]).is_err());
+    }
+
+    #[test]
+    fn set_redirect_then_resolve_reads_no_bytes_at_the_root() {
+        let mut data = PageData::default();
+        init_page(&mut data.0, 1);
+        let root = insert_blob(&mut data, 0x55, 8);
+        let target = insert_blob(&mut data, 0x66, 8);
+        set_redirect(&mut data.0, root, target).unwrap();
+        assert_eq!(
+            slot_state(&data.0, root).unwrap(),
+            LinePointer::Redirect(target)
+        );
+        assert_eq!(read_row(&data.0, root).unwrap(), None);
+        // Redirect to an out-of-bounds slot is rejected.
+        let n = read_u16(&data.0, NUM_SLOTS_OFFSET);
+        assert!(set_redirect(&mut data.0, root, n).is_err());
+        validate(&data.0).unwrap();
     }
 }

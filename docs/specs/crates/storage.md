@@ -172,8 +172,10 @@ A heap slot is a 6-byte `[offset: u16][len: u16][flags: u16]` **line pointer
   entry, while a `DEAD` slot may still have one.
 - `REDIRECT` (`3`) — points at another slot **on the same page**; the target slot
   id is stored in the line pointer's `offset` field. Produced by HOT pruning
-  (Milestone H3) so a pruned HOT root's stable, indexed slot keeps resolving to the
-  surviving root version. **Read-side resolution is implemented (H1):**
+  (Milestone H3, `page::set_redirect`) so a collapsed HOT root's stable, indexed
+  slot keeps resolving to the surviving live tail (the first not-dead-to-all chain
+  member, which may itself be a `HEAP_ONLY` successor). A `REDIRECT` root's index
+  entry is **live** — index vacuum never removes it. **Read-side resolution (H1):**
   `page::slot_state(data, slot)` classifies a slot (`Normal`/`Dead`/`Unused`/
   `Redirect(target)`) without reading the tuple, and the engine follows a
   `Redirect` to its target (which must be `NORMAL`).
@@ -183,10 +185,11 @@ former "live" slot and `DEAD` is the former tombstoned slot. Neither MVCC `delet
 nor MVCC `update` tombstones any more — both keep the superseded version on a
 still-`NORMAL` line pointer and hide it by visibility (see MVCC Delete / MVCC
 Update below), so dead tuples linger physically until VACUUM (Milestone F), the
-only producer of `DEAD` (via `page::prune_and_compact`, F2b) and `UNUSED` (via
-`page::reclaim_line_pointers`, F3b). The live VACUUM orchestration
-`PageBackedStorageEngine::vacuum` (F4a) drives both, so `VACUUM` now stamps heap
-slots `DEAD` (heap prune) then `UNUSED` (line-pointer reclaim).
+producer of `DEAD` (via `page::{prune_and_compact, mark_slots_dead}`, F2b/H3),
+`UNUSED` (via `page::reclaim_line_pointers`, F3b, for a DEAD root **and**
+`page::free_slots_to_unused`, H3, for a chain's heap-only members), and `REDIRECT`
+(via `page::set_redirect`, H3, collapsing a HOT chain's dead prefix). The live
+VACUUM orchestration `PageBackedStorageEngine::vacuum` (F4a) drives all of these.
 `validate` accepts `NORMAL`, `DEAD`, `UNUSED`, and `REDIRECT` flags on a data page
 (so both a VACUUM-compacted and a HOT-pruned page are valid); any other value is
 corruption. A `REDIRECT`'s `offset` field is a same-page **target slot id**, so
@@ -268,59 +271,90 @@ existing insert behavior is unchanged until VACUUM produces an `UNUSED` slot. Th
 produced (the reused or appended one), so its redo — which re-runs `insert_row` —
 reproduces the same slot id under LSN-ordered replay.
 
-`prune_and_compact` is consumed by the heap-prune VACUUM pass (`vacuum_heap`,
-F2b, below); `page::reclaim_line_pointers` is consumed by the engine's
-`reclaim_line_pointers` pass (F3b, below). Both are reached from the live VACUUM
-orchestration `PageBackedStorageEngine::vacuum` (F4a, below).
+**HOT-prune primitives (Milestone H3).** `vacuum_heap`'s chain-aware collapse
+rewrites line pointers individually and then compacts once, via:
+
+- `page::free_slots_to_unused(data, slots)` — flips listed `NORMAL` slots **directly
+  to `UNUSED`** (no `DEAD` intermediary), for a chain's `HEAP_ONLY` members, which
+  have no index entry of their own (so there is no dangling entry to strip first — the
+  key HOT win). A non-`NORMAL` target is a misuse (`DbError`). Refreshes the checksum
+  but does NOT stamp the PageLSN — the trailing `compact` does.
+- `page::set_redirect(data, slot, target)` — overwrites a slot's line pointer with a
+  `REDIRECT` to `target` (a same-page slot id, stored in the `offset` field), the
+  collapse result that keeps a stable indexed root resolving to the surviving live
+  tail. The engine guarantees `target` is `NORMAL`; the read resolver re-checks it.
+- `page::mark_slots_dead(data, slots)` — flips listed `NORMAL` **or `REDIRECT`** slots
+  to `DEAD` (both are index-referenced roots of a fully-dead chain, so F3a strips their
+  entries and F3b reclaims them); an already-`DEAD`/`UNUSED` slot is a misuse.
+- `page::compact(data, lsn)` — relocates ONLY the `NORMAL` survivors' bytes contiguously
+  (rewriting each survivor's line-pointer `offset`), reclaiming the bytes freed by every
+  now-non-`NORMAL` slot, then stamps `lsn` and revalidates. It marks nothing dead itself
+  (the engine set the slot states); it shares its relocation body with `prune_and_compact`.
+
+`prune_and_compact` is consumed by the non-chain heap-prune case; the H3 primitives
+above by `vacuum_heap`'s chain collapse (`classify_page_for_prune` / `plan_chain`,
+F2b, below); `page::reclaim_line_pointers` by the engine's `reclaim_line_pointers`
+pass (F3b, below). All are reached from the live VACUUM orchestration
+`PageBackedStorageEngine::vacuum` (F4a, below).
 
 ### Heap-Prune VACUUM Pass (`vacuum_heap`, F2b)
 
-`vacuum_heap(schema, horizon) -> Vec<RowLocation>` is the engine heap-prune pass
-(`mvcc.md` §9 / Milestone F2b). It physically reclaims the tuples that are
-dead-to-everyone at `horizon` from every heap page of `schema`'s table and returns
-their TIDs. It is the first phase of the live VACUUM orchestration `vacuum` (F4a,
-below).
+`vacuum_heap(schema, horizon) -> (Vec<RowLocation>, usize)` is the engine heap-prune
+pass (`mvcc.md` §9 / Milestone F2b + H3). It reclaims the tuples that are
+dead-to-everyone at `horizon` from every heap page of `schema`'s table, collapsing HOT
+chains, and returns `(dead_root_tids, freed_member_count)`: the DEAD-root TIDs feed
+F3a/F3b, and `freed_member_count` (heap-only members freed straight to `UNUSED`, which
+carry no index entry) is folded into the VACUUM command tag's reclaimed count. It is
+the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
 
-- **Classify.** For each `NORMAL` slot on a page it decodes the tuple's MVCC header
-  (`codec::decode_mvcc_header` ⇒ `xmin`/`xmax`/`infomask`) and calls
-  `common::is_dead_to_all(xmin, xmax, infomask, horizon, txn_status_view())` against
-  the live CLOG. Only dead-to-all slots are pruned: a live version (`xmax ==
-  INVALID_XID`), an in-flight or aborted deleter, and a committed delete at or above
-  the horizon are all left `NORMAL` and untouched (the predicate's
-  aborted-creator-any-age / committed-delete-strictly-below-horizon asymmetry).
-- **HOT-chain skip (Milestone H2).** Among the dead-to-all slots, a HOT-chain member
-  (`HEAP_ONLY` OR `HOT_UPDATED` set) is reclaimed **only when its creator aborted**
-  (`XMIN_ABORTED` hint or `status(xmin) == Aborted`); a HOT tuple dead-to-all via a
-  COMMITTED delete is left untouched (skipped). The split is by hazard: an
-  aborted-creator HOT tuple is a dead-end orphan — an aborted UPDATE never sits in the
-  middle of a live chain (its `xmin` is the chain's youngest id and no later version
-  was committed onto it), so reclaiming it cannot sever a still-live successor, and
-  leaving it would leak space and (per `mvcc.md` §5.4 / §9 F4c) keep a surviving on-disk
-  reference to the aborted txn. A committed-deleted HOT member, by contrast, may be the
-  middle of a live committed chain, so reclaiming it would sever the `t_ctid` walk to a
-  still-live successor — that case is deferred to H3's chain-aware pruning (redirect the
-  root, splice the chain). Non-HOT tuples are reclaimed unconditionally on dead-to-all.
-- **Abort-cleanup of an aborted deleter (F4c root-cause, `mvcc.md` §5.4 / §9 F4c).** For
-  each KEPT (not-reclaimed) `NORMAL` slot whose deleter is **definitively aborted**
-  (`xmax != INVALID_XID` AND `XMAX_ABORTED` hint or `status(xmax) == Aborted`), the
-  header is reset **in place**: `xmax → INVALID_XID`, `t_ctid → INVALID_TID`, clear the
-  `HOT_UPDATED` bit and the settled `XMAX_*` hint (preserving `xmin`/`XMIN_*`/`HEAP_ONLY`),
-  via `codec::set_mvcc_header_fields` (the `stamp_xmax_logged` header-write path). This is
-  the surviving predecessor of an aborted UPDATE/DELETE (it stays live because the
-  delete/update rolled back, so it is NOT reclaimed); the stamp is the only on-disk
-  reference to that aborted txn as a *deleter*, and resetting it lets a full pass advance
-  the vacuum floor past the txn without a later crash reading the stamp as an
-  implicit-committed delete (which would wrongly drop the row). VACUUM holds the exclusive
-  guard, so `xmax`'s status is settled — the reset fires only on a definitive abort, never
-  on an in-progress xmax.
-- **Prune + log.** A page that had any dead slot OR any abort-cleanup header reset is
-  rewritten (the resets applied **first**, then `page::prune_and_compact` — survivors stay
-  byte-identical at their stable slot ids, so no index entry is touched) and logged as a
-  **single unconditional** `FullPageImage` — a prune+compact relocates survivors and is
-  not expressible as a delta, so it is never gated on `take_needs_fpi` (mirrors
-  `btree::log_full_page`); the in-place header resets are folded into the same image. The
-  FPI's LSN becomes the page's new PageLSN. A page with neither a dead slot nor a reset is
-  skipped entirely: no WAL record and no mutation.
+- **Chain-aware classification (Milestone H3, `classify_page_for_prune` /
+  `collect_prune_chain` / `plan_chain`).** Rather than classifying isolated slots,
+  `vacuum_heap` walks each HOT chain rooted at an index-referenced slot — a `NORMAL`
+  non-`HEAP_ONLY` slot (a non-HOT row or a chain head) or an existing `REDIRECT` — and
+  collapses it. A `HEAP_ONLY` `NORMAL` slot is a chain MEMBER reached only via its root's
+  `t_ctid` (the H1 segment rule), never a root; a non-HOT row is a one-member chain, so
+  the same logic subsumes the pre-HOT case. Deadness is re-derived per member via
+  `common::is_dead_to_all(xmin, xmax, infomask, horizon, txn_status_view())` against the
+  live CLOG.
+- **Per chain (in order):**
+  - **Abort truncation (F4c, chain-aware).** Where a `HOT_UPDATED` member's successor
+    has an aborted creator (`XMIN_ABORTED` hint or `status(xmin) == Aborted`) — the
+    rolled-back tail of an aborted HOT UPDATE, always the chain TAIL — reset that member
+    **in place** (un-HOT: `xmax → INVALID_XID`, `t_ctid → INVALID_TID`, clear
+    `HOT_UPDATED` + settled `XMAX_*`, preserving `xmin`/`XMIN_*`/`HEAP_ONLY`, via
+    `codec::set_mvcc_header_fields`) and free the aborted successor (and anything past it,
+    all `HEAP_ONLY`) straight to `UNUSED`. Leaves NO on-disk reference to the aborted txn
+    (creator OR deleter) and truncates the chain before the prefix collapse.
+  - **Committed-dead prefix collapse.** On the truncated chain, find `L` = the first
+    member that is **not** `is_dead_to_all`:
+    - **Root dead-to-all and an `L` exists** → root → `REDIRECT → L` (its index entry
+      resolves via the redirect); every dead `HEAP_ONLY` member strictly before `L` →
+      `UNUSED` directly (no index entry). For a `NORMAL` root, the dead head IS the root
+      slot and simply becomes the `REDIRECT`.
+    - **Whole chain dead-to-all** (no `L`) → root → `DEAD` (returned for F3a/F3b); every
+      `HEAP_ONLY` member → `UNUSED`.
+    - **`L` is the head** → nothing to collapse.
+  - **Abort-cleanup of a kept root (non-HOT, F4c root-cause).** A live chain head/root
+    whose own `xmax` is a **definitively aborted** deleter (`xmax != INVALID_XID` AND
+    `XMAX_ABORTED` hint or `status(xmax) == Aborted`) — the surviving predecessor of a
+    non-HOT aborted UPDATE/DELETE — is reset **in place** exactly as before (un-HOT shape),
+    so the stamp (the only on-disk reference to the aborted txn as a deleter) does not
+    survive to be misread as an implicit-committed delete after truncation (`mvcc.md`
+    §5.4). VACUUM holds the exclusive guard, so `xmax`'s status is settled — the reset
+    fires only on a definitive abort, never on an in-progress xmax.
+- **Apply + log.** A page with any collapse/free/dead/reset work is rewritten — the
+  header resets applied **first** (before compaction relocates survivors), then the
+  line-pointer rewrites (`free_slots_to_unused` → `set_redirect` → `mark_slots_dead`),
+  then `page::compact` (NORMAL survivors stay byte-identical at their **stable** slot
+  ids, so no index entry is touched — index-referenced slot ids are never renumbered,
+  only tuple BYTES move) — and logged as a **single unconditional** `FullPageImage`
+  (a compaction relocates survivors and is not expressible as a delta; the in-place
+  header resets fold into the same image; never gated on `take_needs_fpi`, mirroring
+  `btree::log_full_page`). The FPI's LSN becomes the page's new PageLSN. A page with no
+  work is skipped entirely: no WAL record and no mutation.
+- **Return.** Only **DEAD-root TIDs** are returned for index/line-pointer reclaim; a
+  `REDIRECT` root keeps a LIVE index entry (NOT returned, so F3a skips it) and heap-only
+  members freed to `UNUSED` never had an entry (`freed_member_count` only).
 - **Full-extent scan.** It iterates `0..BufferPool::page_count(heap_file_id)`,
   faulting each page in (resident or from disk), rather than only the resident pages
   `iter_pages` reports — an evicted page holding dead tuples must still be vacuumed,
@@ -347,7 +381,10 @@ the heap prune marks a dead tuple's line pointer `DEAD`, every index entry point
 at that TID still lingers (it would resolve to a DEAD slot); this pass deletes those
 entries from the table's **primary-key index and every live secondary index**, so no
 index entry resolves to a dead slot before the line pointers are reclaimed
-`DEAD → UNUSED` (F3b). It is the middle phase of the live VACUUM orchestration
+`DEAD → UNUSED` (F3b). `dead_tids` are exactly `vacuum_heap`'s returned DEAD-root
+TIDs, so a **`REDIRECT` root is never in the set** (it keeps a LIVE index entry that
+resolves via the redirect — H1) and is therefore inherently skipped; the H3 collapse
+relies on this. It is the middle phase of the live VACUUM orchestration
 `vacuum` (F4a, below).
 
 - **Remove by dead-TID membership, not by key.** The heap prune already compacted the
