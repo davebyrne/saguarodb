@@ -318,15 +318,28 @@ transaction is never *below* the floor. So:
   guarantees everything dropped below the oldest retained non-committed transaction
   was committed, ids below the floor are all genuinely committed.
 - **F4c relaxation (live) — the vacuum floor.** An aborted transaction pins WAL
-  truncation only *until VACUUM reclaims its on-disk versions*. The WAL manager
+  truncation only *until VACUUM removes its on-disk references*. The WAL manager
   tracks a **vacuum floor** `B`: the boundary below which a FULL VACUUM pass (every
-  user table, under the exclusive guard) has reclaimed every aborted-creator tuple
-  (heap + index; aborted-creator reclaim has **no age requirement** — §9 F1, so one
-  pass reclaims every such tuple it scans). `truncate_before` then stops pinning an
-  aborted transaction with id `< B` and lets the floor float past it:
+  user table, under the exclusive guard) has removed **every on-disk reference** to
+  every aborted transaction `< B` — both as a **creator** and as a **deleter**:
+  - **As creator** (`xmin = T`), the tuple is **reclaimed** (heap + index;
+    aborted-creator reclaim has **no age requirement** — §9 F1, so one pass reclaims
+    every such tuple it scans). This includes an aborted HOT heap-only successor, which
+    the §9 skip-guard reclaims precisely because its creator aborted.
+  - **As deleter** (`xmax = T`), the tuple is the **surviving predecessor** of an
+    aborted UPDATE/DELETE: it stays live because the delete/update rolled back, so it is
+    NOT reclaimed. The pass instead performs **abort-cleanup**, resetting that stamp
+    in place — `xmax → INVALID`, `t_ctid → INVALID`, un-HOTing an aborted root (clearing
+    `HOT_UPDATED` and the settled `XMAX_*` hint) — so no reference to `T` survives.
+    Without this, after the floor floats past `T` and its `Abort` is truncated, recovery
+    rebuilds the CLOG and reads `xmax = T` as implicitly Committed, wrongly DELETING the
+    surviving row after a crash (the hazard for ALL aborted UPDATE/DELETE, HOT or not).
+
+  `truncate_before` then stops pinning an aborted transaction with id `< B` and lets the
+  floor float past it:
   `pin = represents_transaction(rec) && !is_committed(txn) && !(is_aborted(txn) && txn < B)`.
-  This is safe because the transaction has **no surviving on-disk version**, so
-  "implicit-committed below floor" is vacuously correct for it. The relaxation is
+  This is safe because the transaction has **no surviving on-disk reference** — neither
+  creator nor deleter — so "implicit-committed below floor" is vacuously correct for it. The relaxation is
   gated STRICTLY on a CLOG-recorded `Aborted` status: an in-flight / not-yet-settled
   id below `B` (which cannot occur under the exclusive guard, but is handled
   defensively) is **not** provably reclaimed and still pins. An aborted transaction
@@ -337,7 +350,7 @@ transaction is never *below* the floor. So:
     it (on-demand `VACUUM` with no table, and the checkpoint auto-prune over all
     tables — F4b); a single-table `VACUUM t` does **not** (other tables' aborted
     tuples survive). The catalog is not MVCC-versioned, so user-table tuples are the
-    only place aborted-creator versions live.
+    only place an aborted transaction's on-disk reference (creator OR deleter) lives.
   - **Durability ordering (the critical invariant).** The vacuum floor is only ever
     *consulted* by `truncate_before`, which a checkpoint runs **after**
     `flush_dirty_pages` + `store.sync_all`. So by the time any `Abort` is dropped, the
@@ -538,9 +551,10 @@ becomes load-bearing once writers run concurrently (E2b).
   aborted transaction's flushed-but-now-orphan versions, with its `Abort` record
   truncated and the floor floated above it, would read as *committed* after restart
   — corruption. **F4c relaxation (live):** an aborted transaction below the **vacuum
-  floor** `B` (a full VACUUM pass reclaimed every aborted-creator tuple `< B`, made
-  durable before the truncation that consults `B`) no longer pins, because it has no
-  surviving version to resurrect; see §5.4.
+  floor** `B` (a full VACUUM pass removed every on-disk reference `< B` — reclaiming
+  aborted-creator tuples and abort-cleaning aborted-deleter stamps — made durable before
+  the truncation that consults `B`) no longer pins, because it has no surviving on-disk
+  reference to resurrect or to misread as a committed delete; see §5.4.
 - **Consequence**: after a crash the heap may contain flushed-then-aborted/dead
   versions. This is correct (CLOG hides them; VACUUM reclaims them). Heap
   cleanliness is a VACUUM responsibility, not a recovery responsibility.
@@ -634,6 +648,26 @@ design, because index entries accumulate per version as well as heap tuples.
   index vacuum). It does **not** reclaim line pointers `DEAD → UNUSED` (that is the
   separate step below). Called by the live VACUUM orchestration (F4a, below) as its
   first phase.
+  - **HOT skip-guard (H2/H3).** Among the dead-to-all slots, a HOT-chain member
+    (`HEAP_ONLY` or `HOT_UPDATED`) is reclaimed **only when its creator aborted** — an
+    aborted-creator HOT tuple is a dead-end orphan (an aborted UPDATE never sits in the
+    middle of a live chain), so reclaiming it cannot sever a still-live successor, and
+    leaving it would keep a surviving on-disk reference to the aborted txn (F4c). A HOT
+    member dead-to-all via a *committed* delete may be the middle of a live committed
+    chain, so reclaiming it would sever the `t_ctid` walk — that case is deferred to H3's
+    chain-aware pruning. Non-HOT tuples reclaim unconditionally on dead-to-all.
+  - **Abort-cleanup (F4c root-cause).** For each KEPT (not-reclaimed) `NORMAL` slot whose
+    deleter is **definitively aborted** (`xmax != 0` AND `XMAX_ABORTED` hint or
+    `status(xmax) == Aborted`), reset its header **in place**: `xmax → INVALID`,
+    `t_ctid → INVALID`, clear `HOT_UPDATED` and the settled `XMAX_*` hint (preserving
+    `xmin`/`XMIN_*`/`HEAP_ONLY`). This is the surviving predecessor of an aborted
+    UPDATE/DELETE; the stamp is the only on-disk reference to that aborted txn as a
+    deleter, and resetting it is what lets the vacuum floor float past the txn without
+    a crash later reading the stamp as an implicit-committed delete (§5.4). VACUUM holds
+    the exclusive guard, so `xmax`'s status is settled (never reset an in-progress xmax).
+    The resets are applied **before** `prune_and_compact`; a page that had any reset OR
+    any dead slot is logged as the same single unconditional `FullPageImage` (a page with
+    neither is skipped), so recovery reinstalls the cleaned image by PageLSN gating.
 - **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
   dangling index entries `vacuum_heap` left behind — for the table's primary-key
   index **and every live secondary index**, delete every entry whose value (the heap
@@ -710,15 +744,22 @@ design, because index entries accumulate per version as well as heap tuples.
 - **F4c — WAL-truncation relaxation for reclaimed aborts (live).** A FULL VACUUM pass
   (on-demand `VACUUM` with no table, or the auto-prune over all tables) advances the WAL
   **vacuum floor** `B = next_txn_id` captured under the guard at the start of the pass.
-  Because aborted-creator reclaim has no age requirement, the pass reclaims every
-  aborted-creator tuple (heap + index) below `B`, so `truncate_before` may then drop
-  those aborted transactions' `Abort` records and float the implicit-committed floor
-  past them — they have no surviving on-disk version, so it is vacuously committed-
-  below-floor (§5.4). The floor is in-memory (reset-at-restart, conservative again until
-  the first post-restart full VACUUM) and consulted only after the reclamation is durable
-  (the checkpoint flushes+fsyncs dirty pages before `truncate_before`). A single-table
-  `VACUUM t` does NOT advance it. A *durable CLOG file* (which would carry the floor
-  across restart) remains deferred (§5.4).
+  A full pass leaves **no surviving on-disk reference** to any aborted txn below `B`,
+  as creator OR deleter: it **reclaims** every aborted-**creator** tuple (heap + index;
+  no age requirement) and **abort-cleans** every aborted-**deleter** stamp (resetting
+  `xmax → INVALID`, `t_ctid → INVALID`, un-HOTing an aborted root — the surviving
+  predecessor of an aborted UPDATE/DELETE, which is NOT reclaimed). So `truncate_before`
+  may then drop those aborted transactions' `Abort` records and float the
+  implicit-committed floor past them — they have no surviving on-disk reference, so it is
+  vacuously committed-below-floor (§5.4). This closes the hazard for ALL aborted
+  UPDATE/DELETE (HOT or non-HOT), not just aborted inserts: an aborted UPDATE/DELETE's
+  surviving predecessor would otherwise carry an `xmax = T` that reads as an
+  implicit-committed delete once `T`'s `Abort` is truncated, wrongly removing the row
+  after a crash. The floor is in-memory (reset-at-restart, conservative again until the
+  first post-restart full VACUUM) and consulted only after the reclamation+cleanup is
+  durable (the checkpoint flushes+fsyncs dirty pages before `truncate_before`). A
+  single-table `VACUUM t` does NOT advance it. A *durable CLOG file* (which would carry
+  the floor across restart) remains deferred (§5.4).
 
 ---
 

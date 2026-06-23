@@ -300,13 +300,27 @@ below).
   middle of a live committed chain, so reclaiming it would sever the `t_ctid` walk to a
   still-live successor — that case is deferred to H3's chain-aware pruning (redirect the
   root, splice the chain). Non-HOT tuples are reclaimed unconditionally on dead-to-all.
-- **Prune + log.** A page with at least one dead slot is rewritten by
-  `page::prune_and_compact` (survivors stay byte-identical at their stable slot ids,
-  so no index entry is touched) and logged as a **single unconditional**
-  `FullPageImage` — a prune+compact relocates survivors and is not expressible as a
-  delta, so it is never gated on `take_needs_fpi` (mirrors `btree::log_full_page`).
-  The FPI's LSN becomes the page's new PageLSN. A page with no dead slots is skipped
-  entirely: no WAL record and no mutation.
+- **Abort-cleanup of an aborted deleter (F4c root-cause, `mvcc.md` §5.4 / §9 F4c).** For
+  each KEPT (not-reclaimed) `NORMAL` slot whose deleter is **definitively aborted**
+  (`xmax != INVALID_XID` AND `XMAX_ABORTED` hint or `status(xmax) == Aborted`), the
+  header is reset **in place**: `xmax → INVALID_XID`, `t_ctid → INVALID_TID`, clear the
+  `HOT_UPDATED` bit and the settled `XMAX_*` hint (preserving `xmin`/`XMIN_*`/`HEAP_ONLY`),
+  via `codec::set_mvcc_header_fields` (the `stamp_xmax_logged` header-write path). This is
+  the surviving predecessor of an aborted UPDATE/DELETE (it stays live because the
+  delete/update rolled back, so it is NOT reclaimed); the stamp is the only on-disk
+  reference to that aborted txn as a *deleter*, and resetting it lets a full pass advance
+  the vacuum floor past the txn without a later crash reading the stamp as an
+  implicit-committed delete (which would wrongly drop the row). VACUUM holds the exclusive
+  guard, so `xmax`'s status is settled — the reset fires only on a definitive abort, never
+  on an in-progress xmax.
+- **Prune + log.** A page that had any dead slot OR any abort-cleanup header reset is
+  rewritten (the resets applied **first**, then `page::prune_and_compact` — survivors stay
+  byte-identical at their stable slot ids, so no index entry is touched) and logged as a
+  **single unconditional** `FullPageImage` — a prune+compact relocates survivors and is
+  not expressible as a delta, so it is never gated on `take_needs_fpi` (mirrors
+  `btree::log_full_page`); the in-place header resets are folded into the same image. The
+  FPI's LSN becomes the page's new PageLSN. A page with neither a dead slot nor a reset is
+  skipped entirely: no WAL record and no mutation.
 - **Full-extent scan.** It iterates `0..BufferPool::page_count(heap_file_id)`,
   faulting each page in (resident or from disk), rather than only the resident pages
   `iter_pages` reports — an evicted page holding dead tuples must still be vacuumed,

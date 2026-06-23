@@ -1042,18 +1042,33 @@ impl PageBackedStorageEngine {
     /// [`common::is_dead_to_all`] (its `xmin`/`xmax`/`infomask` from
     /// [`crate::codec::decode_mvcc_header`], settled against the live CLOG via
     /// [`Self::txn_status_view`]). Only dead-to-all slots are pruned: a live version
-    /// (`xmax == INVALID_XID`), an in-flight or aborted deleter, and a committed delete
-    /// at or above the horizon are all left untouched (the predicate's
-    /// aborted-creator-any-age / committed-delete-below-horizon asymmetry — §9). A page
-    /// with at least one dead slot is rewritten by [`page::prune_and_compact`] (dead
-    /// slots → `DEAD`, survivors compacted, offsets/`free_start`/PageLSN/checksum
-    /// rewritten) and logged as a single **unconditional** `FullPageImage`: a
-    /// prune+compact relocates survivors and is not expressible as a delta, so it is
-    /// never gated on `take_needs_fpi` (mirrors `btree::log_full_page`). A page with no
-    /// dead slots is skipped entirely — no WAL record, no mutation. Survivors are
-    /// byte-identical at their stable slot ids (`prune_and_compact`'s contract), so no
-    /// index entry is touched (the line pointer stays addressable; `DEAD → UNUSED`
-    /// reclaim and index vacuum are F3, not done here).
+    /// (`xmax == INVALID_XID`), an in-flight deleter, and a committed delete at or above
+    /// the horizon are all left `NORMAL` (the predicate's aborted-creator-any-age /
+    /// committed-delete-below-horizon asymmetry — §9).
+    ///
+    /// **Abort-cleanup (F4c root-cause, `docs/specs/mvcc.md` §5.4 / §9 F4c).** A KEPT
+    /// slot whose deleter is *definitively aborted* (`xmax != INVALID_XID` and the
+    /// `XMAX_ABORTED` hint or `status(xmax) == Aborted`) is the surviving predecessor of
+    /// an aborted UPDATE/DELETE — it stays live (the delete rolled back) and is NOT
+    /// reclaimed, but its `xmax = T` is the only on-disk reference to the aborted `T` as a
+    /// *deleter*. Its header is reset IN PLACE — `xmax → INVALID_XID`, `t_ctid → INVALID`,
+    /// `HOT_UPDATED` + settled `XMAX_*` cleared (preserving `xmin`/`XMIN_*`/`HEAP_ONLY`) —
+    /// so a full pass leaves no surviving reference to `T` (as deleter, mirroring the
+    /// aborted-creator reclaim), licensing the F4c floor-advance for ALL aborted
+    /// UPDATE/DELETE, not just inserts. VACUUM holds the exclusive guard, so `xmax`'s
+    /// status is settled (never reset an in-progress xmax).
+    ///
+    /// A page that had any dead slot OR any abort-cleanup reset is rewritten — the resets
+    /// applied FIRST, then [`page::prune_and_compact`] (dead slots → `DEAD`, survivors
+    /// compacted, offsets/`free_start`/PageLSN/checksum rewritten) — and logged as a
+    /// single **unconditional** `FullPageImage`: a prune+compact relocates survivors and
+    /// is not expressible as a delta, so it is never gated on `take_needs_fpi` (mirrors
+    /// `btree::log_full_page`); the in-place header resets fold into the same image. A
+    /// page with neither is skipped entirely — no WAL record, no mutation. Survivors are
+    /// byte-identical at their stable slot ids (`prune_and_compact`'s contract), and the
+    /// resets keep the tuple at its slot id and length, so no index entry is touched (the
+    /// line pointer stays addressable; `DEAD → UNUSED` reclaim and index vacuum are F3,
+    /// not done here).
     ///
     /// **Full-extent scan.** Iterates `0..page_count` of the heap file via
     /// [`BufferPool::page_count`], faulting each page in (resident or from disk), rather
@@ -1105,48 +1120,103 @@ impl PageBackedStorageEngine {
             // Classify every NORMAL slot. `page::read_row` returns `Some` only for a
             // NORMAL line pointer (a DEAD/UNUSED slot reads as `None`), so the slot ids
             // it yields are exactly the live candidates; `next_slot` is the slot count.
+            // A slot is either RECLAIMED (`dead_slots`, pruned to DEAD) or KEPT; a kept
+            // slot whose deleter definitively ABORTED is additionally collected into
+            // `reset_slots` for in-place abort-cleanup (F4c root-cause, below).
             let slot_count = page::next_slot(guard.data())?;
             let mut dead_slots: Vec<u16> = Vec::new();
+            let mut reset_slots: Vec<u16> = Vec::new();
             for slot in 0..slot_count {
                 let Some(tuple) = page::read_row(guard.data(), slot)? else {
                     continue;
                 };
                 let (xmin, xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
-                if !common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
+                if common::is_dead_to_all(xmin, xmax, infomask, horizon, self.txn_status_view()) {
+                    // The tuple is dead-to-all. HOT-chain safety (H2/H3,
+                    // `docs/specs/mvcc.md` §10 Milestone H2/H3): a HOT-chain member
+                    // (`HEAP_ONLY` successor or `HOT_UPDATED` root) is reclaimable ONLY
+                    // when its creator aborted. An aborted-creator HOT tuple is a
+                    // dead-end orphan — an aborted UPDATE never sits in the MIDDLE of a
+                    // live chain (its xmin is the chain's youngest id and no later version
+                    // was committed onto it), so reclaiming it cannot sever a still-live
+                    // successor; leaving it would both leak space and (per F4c) keep a
+                    // surviving on-disk reference to an aborted txn. A HOT tuple
+                    // dead-to-all via a COMMITTED delete is the genuine "could be a live
+                    // committed chain's middle" case — reclaiming it would sever the
+                    // `t_ctid` walk to a still-live successor — so it is deferred to H3's
+                    // chain-aware pruning (redirect the root, splice the chain). Non-HOT
+                    // tuples are reclaimed unconditionally on dead-to-all.
+                    let is_hot =
+                        infomask & (crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED) != 0;
+                    let creator_aborted = infomask & common::XMIN_ABORTED != 0
+                        || self.txn_status_view().is_aborted(xmin);
+                    if is_hot && !creator_aborted {
+                        continue;
+                    }
+                    dead_slots.push(slot);
                     continue;
                 }
-                // The tuple is dead-to-all. HOT-chain safety (H2/H3, `docs/specs/mvcc.md`
-                // §10 Milestone H2/H3): a HOT-chain member (`HEAP_ONLY` successor or
-                // `HOT_UPDATED` root) is reclaimable ONLY when its creator aborted. An
-                // aborted-creator HOT tuple is a dead-end orphan — an aborted UPDATE never
-                // sits in the MIDDLE of a live chain (its xmin is the chain's youngest id
-                // and no later version was committed onto it), so reclaiming it cannot
-                // sever a still-live successor; leaving it would both leak space and
-                // (per F4c) keep a surviving on-disk reference to an aborted txn. A HOT
-                // tuple dead-to-all via a COMMITTED delete is the genuine "could be a live
-                // committed chain's middle" case — reclaiming it would sever the `t_ctid`
-                // walk to a still-live successor — so it is deferred to H3's chain-aware
-                // pruning (redirect the root, splice the chain). Non-HOT tuples are
-                // reclaimed unconditionally on dead-to-all.
-                let is_hot = infomask & (crate::codec::HEAP_ONLY | crate::codec::HOT_UPDATED) != 0;
-                let creator_aborted =
-                    infomask & common::XMIN_ABORTED != 0 || self.txn_status_view().is_aborted(xmin);
-                if is_hot && !creator_aborted {
-                    continue;
+
+                // KEPT slot. **Abort-cleanup (F4c root-cause, `docs/specs/mvcc.md` §5.4 /
+                // §9 F4c).** An aborted UPDATE/DELETE stamps `xmax = T` (and, for a HOT
+                // root, `HOT_UPDATED` + `t_ctid`) on its surviving predecessor, which
+                // stays live because the delete/update rolled back. VACUUM does not
+                // reclaim that live row and nothing else resets the stamp, so once the
+                // vacuum floor floats past `T` and its `Abort` is truncated, recovery
+                // rebuilds the CLOG and reads `xmax = T` as implicitly Committed —
+                // wrongly DELETING the row after a crash. Reset the stamp in place so a
+                // full pass leaves NO surviving on-disk reference to an aborted txn (as
+                // deleter, mirroring the aborted-creator reclaim above): clear `xmax` to
+                // INVALID, drop the dangling `t_ctid`, and un-HOT an aborted root. Only on
+                // a DEFINITIVE abort — VACUUM holds the exclusive guard so no writer is in
+                // flight and `xmax`'s status is settled; never reset an in-progress xmax.
+                let deleter_aborted = xmax != common::INVALID_XID
+                    && (infomask & common::XMAX_ABORTED != 0
+                        || self.txn_status_view().is_aborted(xmax));
+                if deleter_aborted {
+                    reset_slots.push(slot);
                 }
-                dead_slots.push(slot);
             }
 
-            if dead_slots.is_empty() {
+            if dead_slots.is_empty() && reset_slots.is_empty() {
                 continue;
             }
 
-            // Prune + compact, then log the compacted page as a single unconditional
-            // FullPageImage (a compaction relocates survivors and is not a delta), and
-            // stamp the FPI's LSN as the new page-LSN — the `btree::log_full_page`
-            // pattern. `prune_and_compact` stamps a provisional LSN; the FPI append
-            // below overwrites it with the record's LSN so redo gating is exact.
+            // Apply the in-place abort-cleanup header resets FIRST (before the compaction
+            // relocates survivors), then prune+compact the dead slots, then log the whole
+            // result as a SINGLE unconditional FullPageImage. A header reset clears
+            // `xmax → INVALID`, `t_ctid → INVALID`, and the `HOT_UPDATED` / settled-`XMAX_*`
+            // hint bits (giving the tuple the exact live, never-deleted header shape),
+            // preserving every other bit (e.g. `XMIN_COMMITTED`, `HEAP_ONLY`). The reset
+            // keeps the tuple at its stable slot id and does not change its length, so no
+            // index entry is touched.
             let provisional_lsn = page::page_lsn(guard.data());
+            for &slot in &reset_slots {
+                let cleared_bits =
+                    crate::codec::HOT_UPDATED | common::XMAX_ABORTED | common::XMAX_COMMITTED;
+                let tuple = page::read_row(guard.data(), slot)?
+                    .ok_or_else(|| storage_internal("abort-cleanup slot is not live"))?;
+                let (_xmin, _xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
+                page::set_tuple_header(
+                    guard.data_mut(),
+                    slot,
+                    common::INVALID_XID,
+                    crate::codec::INVALID_TID,
+                    infomask & !cleared_bits,
+                    provisional_lsn,
+                )?;
+            }
+
+            // Prune + compact, then log the compacted page as a single unconditional
+            // FullPageImage (a compaction relocates survivors and is not a delta; the
+            // header resets above further mutate it in place), and stamp the FPI's LSN as
+            // the new page-LSN — the `btree::log_full_page` pattern. `prune_and_compact`
+            // restamps the provisional LSN; the FPI append below overwrites it with the
+            // record's LSN so redo gating is exact. Recovery's redo arm reinstalls this
+            // image purely by PageLSN gating, independent of txn id, so a crash mid-VACUUM
+            // leaves the page either pre-pass or exactly this image — never torn — and the
+            // abort-cleanup is durable before any later `truncate_before` consults the
+            // floor (a checkpoint flushes+fsyncs every dirty page before that).
             page::prune_and_compact(guard.data_mut(), &dead_slots, provisional_lsn)?;
             let fpi_lsn = self.wal.append(WalRecord {
                 lsn: 0,
@@ -6054,16 +6124,18 @@ mod vacuum_tests {
     }
 
     #[test]
-    fn leaves_non_dead_versions_untouched() {
+    fn leaves_non_dead_versions_untouched_but_resets_an_aborted_deleter() {
         let fixture = Fixture::new();
-        // A live committed row (xmax == INVALID): never reclaimable.
+        // A live committed row (xmax == INVALID): never reclaimable, never reset.
         let live = fixture.insert_committed(10, row(1, "live"));
         // A committed delete AT the horizon (xmax == horizon): not yet reclaimable
-        // (a snapshot at the boundary may still see the row live).
+        // (a snapshot at the boundary may still see the row live), not reset.
         let at_horizon = fixture.insert_committed(11, row(2, "at_horizon"));
-        // An aborted-deleter row: the delete rolled back, the row is still live.
+        // An aborted-deleter row: the delete rolled back, the row is still live —
+        // VACUUM's abort-cleanup (F4c root-cause) RESETS its stamped xmax in place.
         let aborted_delete = fixture.insert_committed(12, row(3, "aborted_delete"));
-        // An in-flight deleter row: the deleter never committed/aborted.
+        // An in-flight deleter row: the deleter never committed/aborted, so its xmax
+        // is NOT definitively settled and must NOT be reset.
         let in_flight_delete = fixture.insert_committed(13, row(4, "in_flight_delete"));
 
         // Stamp the deletes. xmax = horizon (40) for the boundary row; an aborted
@@ -6074,7 +6146,13 @@ mod vacuum_tests {
         fixture.abort(41);
         fixture.delete(42, 4); // txn 42 left in-flight (no commit, no abort)
 
-        let before: Vec<_> = [live, at_horizon, aborted_delete, in_flight_delete]
+        // The aborted-deleter row carries xmax = 41 before VACUUM.
+        let aborted_before =
+            crate::codec::decode_mvcc_header(&fixture.physical_bytes(aborted_delete).unwrap())
+                .unwrap();
+        assert_eq!(aborted_before.1, 41, "aborted-deleter xmax is stamped");
+
+        let untouched_before: Vec<_> = [live, at_horizon, in_flight_delete]
             .iter()
             .map(|&loc| fixture.physical_bytes(loc))
             .collect();
@@ -6087,9 +6165,11 @@ mod vacuum_tests {
             reclaimed.is_empty(),
             "no version is dead-to-all at horizon 40: {reclaimed:?}"
         );
-        for (loc, was) in [live, at_horizon, aborted_delete, in_flight_delete]
+
+        // The live, at-horizon, and in-flight-deleter rows are byte-untouched.
+        for (loc, was) in [live, at_horizon, in_flight_delete]
             .iter()
-            .zip(before)
+            .zip(untouched_before)
         {
             assert!(fixture.is_normal(*loc), "{loc:?} must stay NORMAL");
             assert_eq!(
@@ -6098,6 +6178,31 @@ mod vacuum_tests {
                 "{loc:?} bytes must be untouched"
             );
         }
+
+        // The aborted-deleter row stays NORMAL but its xmax was reset to INVALID (the
+        // rolled-back delete did not happen; the row is live again with no dangling
+        // deleter), leaving NO on-disk reference to the aborted txn 41.
+        assert!(fixture.is_normal(aborted_delete), "the row stays live");
+        let aborted_after =
+            crate::codec::decode_mvcc_header(&fixture.physical_bytes(aborted_delete).unwrap())
+                .unwrap();
+        assert_eq!(
+            aborted_after.1,
+            common::INVALID_XID,
+            "the aborted deleter's xmax is reset to INVALID"
+        );
+        assert_eq!(
+            aborted_after.2,
+            crate::codec::INVALID_TID,
+            "t_ctid is reset to the no-successor sentinel"
+        );
+        assert_eq!(
+            aborted_after.3 & (crate::codec::HOT_UPDATED | common::XMAX_ABORTED),
+            0,
+            "HOT_UPDATED and the settled XMAX hint are cleared"
+        );
+        // xmin is preserved (the creator is unchanged).
+        assert_eq!(aborted_after.0, aborted_before.0, "xmin is preserved");
     }
 
     #[test]

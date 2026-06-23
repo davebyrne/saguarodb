@@ -995,6 +995,206 @@ async fn single_table_vacuum_does_not_relax_truncation_for_other_tables() {
 }
 
 #[tokio::test]
+async fn nonhot_update_rollback_row_survives_vacuum_truncate_and_restart() {
+    // F4c root-cause proof (non-HOT). A committed row is UPDATEd inside an explicit
+    // transaction that ROLLBACKs; the update changes the INDEXED `name` column, forcing
+    // the non-HOT path, which stamps `xmax = T` on the surviving predecessor (the row
+    // stays live because the update rolled back). A full VACUUM's abort-cleanup must
+    // RESET that aborted-deleter `xmax` in place, so that after the vacuum floor floats
+    // past T, truncation drops T's `Abort`, and a crash+restart rebuilds the CLOG, the
+    // row is NOT wrongly deleted (it has no surviving on-disk reference to T as a
+    // deleter). Without the fix, the row is LOST after the crash.
+    let dir = tempfile::tempdir().unwrap();
+    let wal_bytes_before_truncation;
+    let wal_bytes_after_truncation;
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        // A secondary index on `name`: changing `name` is an INDEXED-column change, so
+        // the UPDATE takes the non-HOT path.
+        server
+            .simple_query("create index by_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+
+        // BEGIN; UPDATE (indexed column) ; ROLLBACK -> non-HOT: stamps xmax = T on the
+        // surviving 'Ada' predecessor (which stays live because the update rolled back).
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("update users set name = 'Zed' where id = 1").await;
+        assert_eq!(conn.ok("rollback").await.status, b'I');
+        conn.close().await;
+
+        // Checkpoint pins the abort (no VACUUM yet); record the retained WAL size.
+        server.force_checkpoint().await.unwrap();
+        wal_bytes_before_truncation = server.app().components.wal.bytes_after(0).unwrap();
+
+        // FULL VACUUM: abort-cleanup resets the predecessor's aborted-deleter xmax and
+        // the pass advances the vacuum floor past T.
+        server.simple_query("vacuum").await.unwrap();
+
+        // A later committed row, then a checkpoint: T is now below the floor, so
+        // truncation drops its Abort. The abort-cleanup is fsynced by THIS checkpoint
+        // before its truncate_before consults the floor (the durability invariant).
+        server
+            .simple_query("insert into users (id, name) values (3, 'Bea')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        wal_bytes_after_truncation = server.app().components.wal.bytes_after(0).unwrap();
+    }
+
+    // The relaxation had effect: truncation reached past the previously-pinning abort.
+    assert!(
+        wal_bytes_after_truncation <= wal_bytes_before_truncation,
+        "after VACUUM the checkpoint truncated past the cleaned-up aborted txn \
+         (before={wal_bytes_before_truncation}, after={wal_bytes_after_truncation})"
+    );
+
+    // Crash + restart: the rolled-back row STILL EXISTS with its original value.
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("3".to_string()), Some("Bea".to_string())],
+        ],
+        "the rolled-back UPDATE's aborted xmax must not delete the row after a crash"
+    );
+}
+
+#[tokio::test]
+async fn delete_rollback_row_survives_vacuum_truncate_and_restart() {
+    // F4c root-cause proof (DELETE). A committed row is DELETEd inside an explicit
+    // transaction that ROLLBACKs: the delete stamps `xmax = T` (t_ctid = INVALID) on the
+    // row, which stays live because the delete rolled back. VACUUM's abort-cleanup must
+    // reset that aborted-deleter xmax so the row is not wrongly deleted after the abort's
+    // `Abort` is truncated and the CLOG is rebuilt on restart.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("delete from users where id = 1").await;
+        assert_eq!(conn.ok("rollback").await.status, b'I');
+        conn.close().await;
+
+        server.force_checkpoint().await.unwrap();
+        server.simple_query("vacuum").await.unwrap();
+        server
+            .simple_query("insert into users (id, name) values (3, 'Bea')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("3".to_string()), Some("Bea".to_string())],
+        ],
+        "the rolled-back DELETE's aborted xmax must not delete the row after a crash"
+    );
+}
+
+#[tokio::test]
+async fn hot_update_rollback_reads_original_value_after_vacuum_truncate_and_restart() {
+    // F4c root-cause proof (HOT). A table with a secondary index; an UPDATE of only the
+    // NON-indexed `note` column inside an explicit transaction that ROLLBACKs takes the
+    // HOT path: it writes a HEAP_ONLY successor (creator T) and stamps the root
+    // `xmax = T` + HOT_UPDATED + t_ctid -> successor. On rollback both belong to the
+    // aborted txn T. A full VACUUM must (1) RECLAIM the aborted-creator heap-only
+    // successor (the corrected H2 skip-guard) and (2) abort-clean the root's
+    // aborted-deleter xmax (resetting it and un-HOTing the dangling t_ctid). After the
+    // floor floats past T, truncation drops its Abort and a crash+restart must read the
+    // ORIGINAL value — no resurrection of the rolled-back `note`, no loss of the row.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text, note text)")
+            .await
+            .unwrap();
+        // Index `name` only (NOT `note`), so updating `note` is HOT-eligible.
+        server
+            .simple_query("create index by_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name, note) values (1, 'Ada', 'v1')")
+            .await
+            .unwrap();
+
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        // Change ONLY the non-indexed `note` -> HOT update.
+        conn.ok("update users set note = 'v2' where id = 1").await;
+        assert_eq!(conn.ok("rollback").await.status, b'I');
+        conn.close().await;
+
+        server.force_checkpoint().await.unwrap();
+        server.simple_query("vacuum").await.unwrap();
+        server
+            .simple_query("insert into users (id, name, note) values (3, 'Bea', 'w1')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name, note from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("Ada".to_string()),
+                Some("v1".to_string()),
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("Bea".to_string()),
+                Some("w1".to_string()),
+            ],
+        ],
+        "the rolled-back HOT update must read its ORIGINAL value after a crash \
+         (no resurrection, no loss)"
+    );
+}
+
+#[tokio::test]
 async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
     // With a small buffer pool, a large transaction's uncommitted pages are stolen
     // (flushed to the heap) under buffer pressure — the relaxed flush gate

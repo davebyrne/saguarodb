@@ -1370,14 +1370,20 @@ fn vacuum_tables(
 /// The boundary `B = next_txn_id` is captured BEFORE the pass and the floor is
 /// advanced to `B` AFTER it. Both reads happen under the exclusive guard the caller
 /// holds (same contract as [`vacuum_tables`]: `horizon` was captured under it), so no
-/// id is allocated mid-pass and `B` is the exact id high-water at scan time. Because
-/// the aborted-creator reclaim has NO age requirement, a full pass reclaims EVERY
-/// aborted-creator tuple (heap + index) that exists at scan time across every user
-/// table, so every aborted transaction with id `< B` now has no surviving on-disk
-/// version. Advancing the floor to `B` is therefore safe: `truncate_before` may drop
-/// those aborted txns' `Abort` records and float the implicit-committed floor past
-/// them (the catalog is NOT MVCC-versioned, so user-table tuples are the only place
-/// aborted-creator versions live).
+/// id is allocated mid-pass and `B` is the exact id high-water at scan time. A full
+/// pass leaves EVERY aborted transaction with id `< B` with NO surviving on-disk
+/// reference, as creator OR deleter: `vacuum_heap` RECLAIMS every aborted-creator tuple
+/// (heap + index; aborted-creator reclaim has NO age requirement) and ABORT-CLEANS every
+/// aborted-deleter stamp in place (resetting `xmax → INVALID`, `t_ctid → INVALID`, and
+/// un-HOTing an aborted root — the surviving predecessor of an aborted UPDATE/DELETE,
+/// which stays live and is NOT reclaimed). Advancing the floor to `B` is therefore safe:
+/// `truncate_before` may drop those aborted txns' `Abort` records and float the
+/// implicit-committed floor past them (the catalog is NOT MVCC-versioned, so user-table
+/// tuples are the only place an aborted txn's on-disk reference lives). Without the
+/// abort-cleanup, an aborted UPDATE/DELETE's surviving predecessor would keep an
+/// `xmax = T` that reads as an implicit-committed delete once `T`'s `Abort` is truncated,
+/// wrongly removing the row after a crash — the hazard for ALL aborted UPDATE/DELETE,
+/// HOT or non-HOT.
 ///
 /// **Durability ordering.** The floor is only ever CONSULTED by `truncate_before`,
 /// which a checkpoint runs AFTER `flush_dirty_pages` + `store.sync_all` — so by the
