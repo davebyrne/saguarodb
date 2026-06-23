@@ -12,6 +12,11 @@ pub trait StorageEngine: Send + Sync {
     fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId>;
     fn get(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>>;
     fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool>;
+    /// Update the visible version of `key` to `row`. The HOT update-path prune
+    /// (`docs/specs/mvcc.md` §10 Milestone H3) reads the GC horizon from
+    /// `ctx.gc_horizon`: when a same-page HOT update finds no room, the engine collapses
+    /// that page's committed-dead HOT prefixes (under the heap latch) to reclaim space
+    /// before falling back to a normal update. A stale/smaller horizon only prunes less.
     fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool>;
     fn scan(&self, ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>>;
     fn scan_range(

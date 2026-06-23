@@ -23,6 +23,15 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    /// The GC horizon (minimum advertised snapshot `xmin`) the server captured for
+    /// this statement. Consumed ONLY by the storage engine's HOT update-path prune
+    /// (`docs/specs/mvcc.md` §10 Milestone H3): when a same-page HOT update has no
+    /// room, the engine collapses that page's committed-dead HOT prefixes to reclaim
+    /// space before falling back. A stale/smaller horizon only prunes less, never
+    /// unsafely, so it is captured before execution under the shared writer guard.
+    /// Defaults to `0` (prune nothing committed-dead) for pre-capture / read / test
+    /// contexts; the server sets it on write paths via [`StatementContext::with_gc_horizon`].
+    pub gc_horizon: u64,
 }
 
 impl StatementContext {
@@ -36,6 +45,7 @@ impl StatementContext {
             txn_id,
             snapshot: Arc::new(Snapshot::sees_all_committed()),
             isolation: IsolationLevel::default(),
+            gc_horizon: 0,
         }
     }
 
@@ -48,6 +58,7 @@ impl StatementContext {
             txn_id,
             snapshot,
             isolation: IsolationLevel::default(),
+            gc_horizon: 0,
         }
     }
 
@@ -62,7 +73,16 @@ impl StatementContext {
             txn_id,
             snapshot,
             isolation,
+            gc_horizon: 0,
         }
+    }
+
+    /// Set the GC horizon for this statement (the H3 update-path prune; see the field
+    /// doc). Builder-style so the server threads it after constructing the context.
+    #[must_use]
+    pub fn with_gc_horizon(mut self, gc_horizon: u64) -> Self {
+        self.gc_horizon = gc_horizon;
+        self
     }
 }
 

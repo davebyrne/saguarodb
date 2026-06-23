@@ -551,12 +551,22 @@ impl PageBackedStorageEngine {
     /// for `page_num` (lock order structural → frame → WAL), both released on return.
     /// The space peek is done **before** consuming the page's first-touch FPI flag,
     /// so a no-room fall-back does not perturb the page's WAL state.
+    /// `prune_horizon`: when `Some(horizon)` and the page has no room, run the H3
+    /// update-path prune on this page (under the latch already held) to reclaim space
+    /// from this row's committed-dead HOT prefix (and any other prunable chain on the
+    /// page), then retry the same-page insert once. The prune mutates only this single
+    /// latched page and never marks a root `DEAD` (so it needs no index vacuum —
+    /// `classify_page_for_prune(.., allow_dead_roots = false)`); a fully-dead chain is
+    /// left for VACUUM. Lock-free readers re-resolve through line pointers (incl. any
+    /// new `REDIRECT`), so they stay correct. A stale/smaller `horizon` only reclaims
+    /// less. `None` disables the prune (the non-HOT-update callers).
     fn try_hot_insert_on_page(
         &self,
         schema: &TableSchema,
         page_num: PageNum,
         row: &Row,
         txn_id: u64,
+        prune_horizon: Option<u64>,
     ) -> Result<Option<RowLocation>> {
         let file_id = schema.id;
         let row_bytes =
@@ -569,7 +579,24 @@ impl PageBackedStorageEngine {
         // Peek whether the new tuple fits on THIS page before touching any WAL state
         // (so a fall-back leaves the page's first-touch FPI flag intact).
         if !page::has_space_for(guard.data(), row_bytes.len())? {
-            return Ok(None);
+            // Update-path pruning (H3): try to reclaim same-page room by collapsing
+            // this page's committed-dead HOT prefixes, then retry once. The prune logs
+            // its own FullPageImage under `txn_id` (idempotent PageLSN-gated redo); it
+            // only reclaims dead-to-all versions, so it is correct regardless of this
+            // txn's outcome.
+            let Some(horizon) = prune_horizon else {
+                return Ok(None);
+            };
+            let plan = self.classify_page_for_prune(guard.data(), horizon, false)?;
+            if plan.is_empty() {
+                return Ok(None);
+            }
+            self.apply_prune_plan(&mut guard, &plan, file_id, page_num, txn_id)?;
+            if !page::has_space_for(guard.data(), row_bytes.len())? {
+                // Still no room after pruning ⇒ fall back to a normal update. The prune
+                // already happened and is logged; the page is just denser now.
+                return Ok(None);
+            }
         }
 
         let slot_num = self.log_insert(&mut guard, txn_id, file_id, page_num, &row_bytes)?;
@@ -1169,75 +1196,17 @@ impl PageBackedStorageEngine {
             // Chain-aware classification (H3): compute, for THIS page, the line-pointer
             // rewrites (root → REDIRECT / DEAD, heap-only member → UNUSED) and the
             // in-place header resets (abort-cleanup). Pure read over the page bytes.
-            let plan = self.classify_page_for_prune(guard.data(), horizon)?;
+            // `allow_dead_roots = true`: VACUUM may mark a fully-dead chain's root DEAD
+            // (it then runs F3a/F3b on the returned TIDs).
+            let plan = self.classify_page_for_prune(guard.data(), horizon, true)?;
             if plan.is_empty() {
                 continue;
             }
 
-            // Apply the in-place header resets FIRST (before compaction relocates
-            // survivors): the abort-cleanup of an aborted-deleter stamp, and the un-HOT
-            // of a HOT predecessor whose successor's creator aborted. A reset clears
-            // `xmax → INVALID`, `t_ctid → INVALID`, and the `HOT_UPDATED` /
-            // settled-`XMAX_*` hint bits (the exact live, never-deleted header shape),
-            // preserving every other bit (`xmin`/`XMIN_*`/`HEAP_ONLY`). The reset keeps
-            // the tuple at its stable slot id and length, so no index entry is touched.
-            // The provisional LSN is overwritten by the FPI's LSN below.
-            let provisional_lsn = page::page_lsn(guard.data());
-            for &slot in &plan.reset_slots {
-                let cleared_bits =
-                    crate::codec::HOT_UPDATED | common::XMAX_ABORTED | common::XMAX_COMMITTED;
-                let tuple = page::read_row(guard.data(), slot)?
-                    .ok_or_else(|| storage_internal("abort-cleanup slot is not live"))?;
-                let (_xmin, _xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
-                page::set_tuple_header(
-                    guard.data_mut(),
-                    slot,
-                    common::INVALID_XID,
-                    crate::codec::INVALID_TID,
-                    infomask & !cleared_bits,
-                    provisional_lsn,
-                )?;
-            }
-
-            // Rewrite line pointers, then compact the survivors' bytes, then log the
-            // whole result as a SINGLE unconditional FullPageImage and stamp the FPI's
-            // LSN as the new page-LSN (the `vacuum_heap` / `btree::log_full_page`
-            // pattern). Order within the page:
-            //   1. heap-only chain members (no index entry) → UNUSED directly (the key
-            //      HOT win: freed straight to reusable, no index vacuum).
-            //   2. a HOT root whose original tuple died but whose tail is still live →
-            //      REDIRECT to that live tail (its index entry now resolves via the
-            //      redirect; the target stays NORMAL through compaction).
-            //   3. a fully-dead chain's root (NORMAL or already-REDIRECT) → DEAD, so
-            //      F3a strips its index entry and F3b reclaims the slot DEAD → UNUSED.
-            //   4. compact: relocate the NORMAL survivors' bytes contiguously, reclaiming
-            //      the bytes freed by every slot now non-NORMAL. Survivors keep their
-            //      stable slot ids (index-referenced slots are NEVER renumbered — only
-            //      tuple BYTES move), so no index entry is touched.
-            // A crash mid-pass leaves the page either pre-pass or exactly this image
-            // (PageLSN-gated idempotent redo), never torn; the rewrite is durable before
-            // any later `truncate_before` consults the vacuum floor (a checkpoint
-            // flushes+fsyncs every dirty page before that).
-            if !plan.free_to_unused.is_empty() {
-                page::free_slots_to_unused(guard.data_mut(), &plan.free_to_unused)?;
-            }
-            for &(root_slot, target_slot) in &plan.redirect_roots {
-                page::set_redirect(guard.data_mut(), root_slot, target_slot)?;
-            }
-            if !plan.dead_roots.is_empty() {
-                page::mark_slots_dead(guard.data_mut(), &plan.dead_roots)?;
-            }
-            page::compact(guard.data_mut(), provisional_lsn)?;
-            let fpi_lsn = self.wal.append(WalRecord {
-                lsn: 0,
-                txn_id: VACUUM_TXN,
-                kind: WalRecordKind::FullPageImage {
-                    file_id,
-                    page_num,
-                    image: guard.data().to_vec(),
-                },
-            })?;
-            page::set_page_lsn(guard.data_mut(), fpi_lsn);
+            // Apply the plan to this page (resets → free → redirect → dead → compact)
+            // and log the result as a single unconditional FullPageImage under
+            // VACUUM_TXN (see `apply_prune_plan`).
+            self.apply_prune_plan(&mut guard, &plan, file_id, page_num, VACUUM_TXN)?;
 
             // Only the DEAD roots carry index entries that F3a must remove and F3b must
             // reclaim DEAD → UNUSED. REDIRECT roots keep a LIVE index entry (F3a skips
@@ -1253,6 +1222,76 @@ impl PageBackedStorageEngine {
         }
 
         Ok((reclaimed, freed_count))
+    }
+
+    /// Apply a [`PagePrunePlan`] to one already-write-latched heap page and log the
+    /// result as a SINGLE unconditional `FullPageImage` under `txn_id`, stamping the
+    /// FPI's LSN as the new PageLSN (the `vacuum_heap` / `btree::log_full_page`
+    /// pattern). Shared by VACUUM (`vacuum_heap`, `txn_id = VACUUM_TXN`) and the
+    /// update-path prune (`try_hot_update`, the writer's own `txn_id`). Order on the
+    /// page:
+    /// 1. **Header resets** (abort-cleanup) — in place, BEFORE compaction relocates
+    ///    survivors: clear `xmax → INVALID`, `t_ctid → INVALID`, the `HOT_UPDATED` /
+    ///    settled-`XMAX_*` hint bits (the exact live, never-deleted header shape),
+    ///    preserving every other bit (`xmin`/`XMIN_*`/`HEAP_ONLY`). Keeps the tuple at
+    ///    its stable slot id and length, so no index entry is touched.
+    /// 2. **Free heap-only members** (`free_to_unused`) → `UNUSED` directly (no index
+    ///    entry — the key HOT win).
+    /// 3. **Redirect collapsed roots** (`redirect_roots`) → `REDIRECT` to the live tail
+    ///    (its index entry now resolves via the redirect; the target stays `NORMAL`).
+    /// 4. **Mark fully-dead roots** (`dead_roots`) → `DEAD` (F3a strips the entry, F3b
+    ///    reclaims the slot). Empty on the update path (`allow_dead_roots = false`).
+    /// 5. **Compact** — relocate NORMAL survivors' bytes contiguously, reclaiming the
+    ///    bytes freed by every now-non-`NORMAL` slot. Survivors keep their stable slot
+    ///    ids (index-referenced slots are NEVER renumbered — only tuple BYTES move).
+    ///
+    /// A crash mid-apply leaves the page either pre-apply or exactly this image
+    /// (PageLSN-gated idempotent redo), never torn.
+    fn apply_prune_plan(
+        &self,
+        guard: &mut PageWriteGuard,
+        plan: &PagePrunePlan,
+        file_id: FileId,
+        page_num: PageNum,
+        txn_id: u64,
+    ) -> Result<()> {
+        let provisional_lsn = page::page_lsn(guard.data());
+        for &slot in &plan.reset_slots {
+            let cleared_bits =
+                crate::codec::HOT_UPDATED | common::XMAX_ABORTED | common::XMAX_COMMITTED;
+            let tuple = page::read_row(guard.data(), slot)?
+                .ok_or_else(|| storage_internal("abort-cleanup slot is not live"))?;
+            let (_xmin, _xmax, _t_ctid, infomask) = crate::codec::decode_mvcc_header(&tuple)?;
+            page::set_tuple_header(
+                guard.data_mut(),
+                slot,
+                common::INVALID_XID,
+                crate::codec::INVALID_TID,
+                infomask & !cleared_bits,
+                provisional_lsn,
+            )?;
+        }
+        if !plan.free_to_unused.is_empty() {
+            page::free_slots_to_unused(guard.data_mut(), &plan.free_to_unused)?;
+        }
+        for &(root_slot, target_slot) in &plan.redirect_roots {
+            page::set_redirect(guard.data_mut(), root_slot, target_slot)?;
+        }
+        if !plan.dead_roots.is_empty() {
+            page::mark_slots_dead(guard.data_mut(), &plan.dead_roots)?;
+        }
+        page::compact(guard.data_mut(), provisional_lsn)?;
+        let fpi_lsn = self.wal.append(WalRecord {
+            lsn: 0,
+            txn_id,
+            kind: WalRecordKind::FullPageImage {
+                file_id,
+                page_num,
+                image: guard.data().to_vec(),
+            },
+        })?;
+        page::set_page_lsn(guard.data_mut(), fpi_lsn);
+        Ok(())
     }
 
     /// Chain-aware HOT prune plan for ONE heap page (`docs/specs/mvcc.md` §9 / §10
@@ -1299,6 +1338,7 @@ impl PageBackedStorageEngine {
         &self,
         data: &[u8; buffer::PAGE_SIZE],
         horizon: u64,
+        allow_dead_roots: bool,
     ) -> Result<PagePrunePlan> {
         let status = self.txn_status_view();
         let slot_count = page::next_slot(data)?;
@@ -1357,7 +1397,14 @@ impl PageBackedStorageEngine {
 
             // Walk the chain from `head_slot`, collecting (slot, xmin, xmax, infomask).
             let chain = self.collect_prune_chain(data, head_slot)?;
-            self.plan_chain(root_slot, &chain, horizon, status, &mut plan)?;
+            self.plan_chain(
+                root_slot,
+                &chain,
+                horizon,
+                status,
+                allow_dead_roots,
+                &mut plan,
+            )?;
         }
         Ok(plan)
     }
@@ -1412,8 +1459,55 @@ impl PageBackedStorageEngine {
 
     /// Plan one chain's collapse into `plan` (see [`Self::classify_page_for_prune`]'s
     /// per-chain rules). `root_slot` is the index-referenced slot; `chain` is the
-    /// physical members from the head down.
+    /// physical members from the head down. When `allow_dead_roots` is false (the
+    /// update path, which cannot run index vacuum), a chain whose collapse would mark
+    /// the root `DEAD` is left entirely untouched for VACUUM instead.
     fn plan_chain(
+        &self,
+        root_slot: u16,
+        chain: &[ChainMember],
+        horizon: u64,
+        status: &dyn TxnStatusView,
+        allow_dead_roots: bool,
+        plan: &mut PagePrunePlan,
+    ) -> Result<()> {
+        if chain.is_empty() {
+            return Ok(());
+        }
+
+        // The update path (`allow_dead_roots = false`) MUST NOT mark a root DEAD: that
+        // needs index vacuum (F3a) + line-pointer reclaim (F3b), which run under other
+        // structural latches it does not hold. So a chain whose collapse would mark the
+        // root DEAD is staged into a scratch plan and applied ONLY if no DEAD root
+        // resulted; otherwise the chain is left entirely untouched for VACUUM. (The
+        // chain being updated always has a live member, so this only ever skips OTHER
+        // fully-dead chains on the same page.)
+        let mut staged = std::mem::take(plan);
+        let before = (
+            staged.reset_slots.len(),
+            staged.free_to_unused.len(),
+            staged.redirect_roots.len(),
+            staged.dead_roots.len(),
+        );
+
+        let result = self.plan_chain_inner(root_slot, chain, horizon, status, &mut staged);
+
+        if !allow_dead_roots && (result.is_err() || staged.dead_roots.len() != before.3) {
+            // Roll back this chain's staged actions and leave it for VACUUM.
+            staged.reset_slots.truncate(before.0);
+            staged.free_to_unused.truncate(before.1);
+            staged.redirect_roots.truncate(before.2);
+            staged.dead_roots.truncate(before.3);
+            *plan = staged;
+            return Ok(());
+        }
+        *plan = staged;
+        result
+    }
+
+    /// The collapse body for one chain (see [`Self::plan_chain`]); always allowed to
+    /// schedule a DEAD root. [`Self::plan_chain`] wraps it to honor `allow_dead_roots`.
+    fn plan_chain_inner(
         &self,
         root_slot: u16,
         chain: &[ChainMember],
@@ -1421,10 +1515,6 @@ impl PageBackedStorageEngine {
         status: &dyn TxnStatusView,
         plan: &mut PagePrunePlan,
     ) -> Result<()> {
-        if chain.is_empty() {
-            return Ok(());
-        }
-
         // Step 1 — abort truncation. Find the first member whose successor's creator
         // aborted (an aborted HOT update's rolled-back successor); reset that member
         // in place (un-HOT) and free the aborted suffix to UNUSED. An aborted UPDATE
@@ -1730,8 +1820,15 @@ impl PageBackedStorageEngine {
     ///    index keys match, only non-indexed columns differ.
     /// 2. **Same-page room.** The new heap-only tuple, encoded, fits in the free space
     ///    of the predecessor's own page ([`Self::try_hot_insert_on_page`] returns
-    ///    `Some`). Reusing an `UNUSED` slot or appending both count; if it does not
-    ///    fit, fall back (H3 will prune-to-make-room — not done here).
+    ///    `Some`). Reusing an `UNUSED` slot or appending both count. **Update-path
+    ///    pruning (H3):** if there is no same-page room, the engine first runs the H3
+    ///    prune on that page (collapsing its committed-dead HOT prefixes under the heap
+    ///    latch it already holds, `gc_horizon` threaded in) and retries the same-page
+    ///    insert; only if there is STILL no room does it fall back to a normal update.
+    ///    The prune mutates only the single latched page and never marks a root `DEAD`
+    ///    (no index vacuum), so lock-free readers — which re-resolve through line
+    ///    pointers, incl. `REDIRECT` — stay correct, and the writer never takes the
+    ///    exclusive guard. A stale/smaller `gc_horizon` only prunes less.
     ///
     /// When eligible: write the heap-only successor on the predecessor's page, then
     /// stamp the predecessor `xmax = txn`, `t_ctid → new`, and `HOT_UPDATED` via
@@ -1772,11 +1869,19 @@ impl PageBackedStorageEngine {
             }
         }
 
-        // Eligibility (2): the new heap-only tuple fits on the predecessor's page.
-        // `try_hot_insert_on_page` returns `None` (no room) ⇒ fall back (H3 pruning is
-        // out of scope for H2).
-        let Some(new_location) =
-            self.try_hot_insert_on_page(schema, previous_location.page_num, row, ctx.txn_id)?
+        // Eligibility (2): the new heap-only tuple fits on the predecessor's page —
+        // possibly after the H3 update-path prune reclaims same-page room from this
+        // page's committed-dead HOT prefixes (`Some(ctx.gc_horizon)`). The prune keeps
+        // the visible predecessor (the live tail `L`) NORMAL at its stable slot id, so
+        // `previous_location` is still valid for the stamp below. `None` (no room even
+        // after pruning) ⇒ fall back to a normal update.
+        let Some(new_location) = self.try_hot_insert_on_page(
+            schema,
+            previous_location.page_num,
+            row,
+            ctx.txn_id,
+            Some(ctx.gc_horizon),
+        )?
         else {
             return Ok(None);
         };
@@ -1919,8 +2024,10 @@ impl StorageEngine for PageBackedStorageEngine {
         // predecessor to it, and insert NO index entries — the index keeps pointing at
         // the chain root, and H1's bounded `t_ctid` walk reaches the new version via
         // the `HOT_UPDATED → HEAP_ONLY` segment. Falls through to the normal
-        // fully-indexed path when ineligible. Pruning-to-make-room on a full page is
-        // H3; here a full page simply falls back.
+        // fully-indexed path when ineligible. When the predecessor's page is full, the
+        // H3 update-path prune (under the heap latch, `ctx.gc_horizon` threaded in)
+        // tries to reclaim same-page room first; only if it still cannot fit does it
+        // fall back.
         if let Some(result) =
             self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
         {
@@ -2772,6 +2879,12 @@ mod visibility_tests {
 
     fn ctx(txn_id: u64, snapshot: Snapshot) -> StatementContext {
         StatementContext::with_snapshot(txn_id, std::sync::Arc::new(snapshot))
+    }
+
+    /// Like [`ctx`] but carries an explicit GC horizon (for the H3 update-path prune).
+    fn ctx_h(txn_id: u64, snapshot: Snapshot, gc_horizon: u64) -> StatementContext {
+        StatementContext::with_snapshot(txn_id, std::sync::Arc::new(snapshot))
+            .with_gc_horizon(gc_horizon)
     }
 
     /// A snapshot that sees every settled (committed) id below `xmax` except the
@@ -5181,6 +5294,200 @@ mod visibility_tests {
                 .get(&ctx(0, snapshot(220, vec![])), TABLE_ID, &key(1))
                 .unwrap(),
             Some(hot_row(1, "Ada", "v4"))
+        );
+    }
+
+    #[test]
+    fn update_path_prunes_to_make_room_and_stays_on_the_hot_path() {
+        // Pack a page with several big committed-dead HOT versions of one row, so a
+        // further HOT update would have no same-page room. With the GC horizon advanced
+        // past the dead prefix, the H3 update-path prune collapses it (REDIRECT to the
+        // live tail, dead members freed) to make room, so the update STILL takes the HOT
+        // path: no new PK/secondary index entries appear.
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture.engine.create_table(&setup, &hot_schema()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
+        fixture.commit(100);
+
+        // ~1900-byte notes: 4 versions (~7600B) leave the 8192B page too full for a 5th.
+        let big = |tag: &str| format!("{tag}{}", "x".repeat(1900));
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                hot_row(1, "Ada", &big("v1")),
+            )
+            .unwrap();
+        fixture.commit(10);
+        let root = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+        // HOT-update the non-indexed note three times (txns 20,21,22): root -> v2 -> v3
+        // -> v4, all on the one page, no new index entries. (No horizon needed yet — the
+        // page still has room for each.)
+        for (txn, tag) in [(20u64, "v2"), (21, "v3"), (22, "v4")] {
+            assert!(
+                fixture
+                    .engine
+                    .update(
+                        &ctx(txn, snapshot(txn + 1, vec![])),
+                        TABLE_ID,
+                        &key(1),
+                        hot_row(1, "Ada", &big(tag)),
+                    )
+                    .unwrap()
+            );
+            fixture.commit(txn);
+        }
+        assert_eq!(
+            fixture.pk_index_tids(&key(1)),
+            vec![root],
+            "still one PK entry"
+        );
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada").len(),
+            1
+        );
+
+        // A 5th HOT update with horizon 100 (root/v2/v3/v4 deleters all < 100 except v4
+        // which is the live tail): with no same-page room, the update-path prune
+        // collapses the dead prefix (root,v2,v3) to reclaim space, then the HOT insert
+        // succeeds on the same page — NO new index entries.
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx_h(40, snapshot(41, vec![]), 100),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", &big("v5")),
+                )
+                .unwrap()
+        );
+        fixture.commit(40);
+
+        // STILL exactly one PK + one secondary entry: the update stayed on the HOT path
+        // (pruning made room), so no fully-indexed fallback version was written.
+        assert_eq!(
+            fixture.pk_index_tids(&key(1)),
+            vec![root],
+            "update stayed HOT — no new PK entry",
+        );
+        assert_eq!(
+            fixture.secondary_index_tids(name_index().id, "Ada").len(),
+            1,
+            "no new secondary entry",
+        );
+        // The root collapsed to a REDIRECT (its original tuple was in the dead prefix).
+        assert!(matches!(
+            fixture.slot_state_hot(root.page_num, root.slot_num),
+            crate::page::LinePointer::Redirect(_)
+        ));
+        // The latest value reads back through both index paths.
+        let reader = ctx(0, snapshot(120, vec![]));
+        assert_eq!(
+            fixture.engine.get(&reader, TABLE_ID, &key(1)).unwrap(),
+            Some(hot_row(1, "Ada", &big("v5")))
+        );
+        let by_name = collect_names(
+            fixture
+                .engine
+                .index_scan(&reader, TABLE_ID, name_index().id, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(by_name, vec![hot_row(1, "Ada", &big("v5"))]);
+    }
+
+    #[test]
+    fn update_path_falls_back_when_pruning_cannot_free_enough() {
+        // When the predecessor's page is full of LIVE (non-prunable) data, the
+        // update-path prune frees nothing, so the HOT update falls back to a normal
+        // fully-indexed update (a new tuple on another page + a new PK entry).
+        let fixture = Fixture::new();
+        let setup = ctx(100, snapshot(101, vec![]));
+        fixture.engine.create_table(&setup, &hot_schema()).unwrap();
+        fixture
+            .engine
+            .create_index(&setup, &name_index(), 0)
+            .unwrap();
+        fixture.commit(100);
+
+        let big = "x".repeat(3000);
+        // Row 1 (the update target) + a big LIVE filler row 2 share the page, leaving
+        // < 3000 bytes free. Both creators commit, so neither is dead-to-all → pruning
+        // reclaims nothing.
+        let rid = fixture
+            .engine
+            .insert(
+                &ctx(10, snapshot(11, vec![])),
+                TABLE_ID,
+                hot_row(1, "Ada", &big),
+            )
+            .unwrap();
+        let root = super::RowLocation {
+            file_id: TABLE_ID,
+            page_num: rid.page_num,
+            slot_num: rid.slot_num,
+        };
+        fixture
+            .engine
+            .insert(
+                &ctx(12, snapshot(13, vec![])),
+                TABLE_ID,
+                hot_row(2, "filler", &big),
+            )
+            .unwrap();
+        fixture.commit(12);
+        fixture.commit(10);
+        assert_eq!(
+            fixture.pk_index_tids(&key(2))[0].page_num,
+            root.page_num,
+            "filler shares row 1's page",
+        );
+
+        // HOT-update row 1's note with another big value at a high horizon: pruning
+        // finds nothing dead-to-all (everything live), so it cannot free room ⇒ fall
+        // back to a normal update (new tuple on a fresh page, new PK entry).
+        assert!(
+            fixture
+                .engine
+                .update(
+                    &ctx_h(40, snapshot(41, vec![]), 100),
+                    TABLE_ID,
+                    &key(1),
+                    hot_row(1, "Ada", &"y".repeat(3000)),
+                )
+                .unwrap()
+        );
+        fixture.commit(40);
+
+        let pk = fixture.pk_index_tids(&key(1));
+        assert_eq!(pk.len(), 2, "fell back to a fully-indexed update");
+        let new_loc = *pk.iter().find(|loc| **loc != root).unwrap();
+        assert_ne!(
+            new_loc.page_num, root.page_num,
+            "the fallback version is on another page",
+        );
+        let new_dec = decode_hot(&fixture, new_loc);
+        assert_eq!(
+            new_dec.infomask & crate::codec::HEAP_ONLY,
+            0,
+            "not heap-only"
+        );
+        // The updated row still reads back.
+        assert_eq!(
+            fixture
+                .engine
+                .get(&ctx(0, snapshot(120, vec![])), TABLE_ID, &key(1))
+                .unwrap(),
+            Some(hot_row(1, "Ada", &"y".repeat(3000)))
         );
     }
 

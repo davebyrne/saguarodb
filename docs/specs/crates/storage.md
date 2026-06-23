@@ -108,8 +108,24 @@ results are unchanged from the pre-MVCC engine.
   check), and inserts **no index entries** — the H1 walk reaches the new version via
   the root. Logged with existing `HeapInsert` (`HEAP_ONLY` carried in the row bytes) +
   `HeapUpdateHeader` records; recovery redoes both. When ineligible (indexed column
-  changed OR no same-page room) it falls back to the normal fully-indexed update
-  (update-path pruning-to-make-room is H3).
+  changed) it falls back to the normal fully-indexed update.
+- **Update-path pruning (Milestone H3).** When a HOT update has no same-page room,
+  `try_hot_insert_on_page(.., prune_horizon = Some(ctx.gc_horizon))` first runs the H3
+  prune on that page — `classify_page_for_prune(.., allow_dead_roots = false)` then
+  `apply_prune_plan` (shared with `vacuum_heap`) — to collapse its committed-dead HOT
+  prefixes (REDIRECT the dead root to the live tail, free dead heap-only members to
+  `UNUSED`, compact), then retries the same-page insert; only if there is STILL no room
+  does it fall back to a normal update. The prune runs under the heap structural latch
+  the insert already holds and the frame write latch — mutating ONLY that single page —
+  and **never marks a root `DEAD`** (`allow_dead_roots = false`), so it needs no index
+  vacuum/line-pointer reclaim under another latch (a fully-dead chain is left for
+  VACUUM). It logs its own unconditional `FullPageImage` under the writer's `txn_id`
+  (idempotent PageLSN-gated redo; it only reclaims dead-to-all versions, so it is
+  correct regardless of the txn's outcome). Lock-free readers re-resolve through line
+  pointers (incl. any new `REDIRECT`), so they stay correct; the writer never takes the
+  exclusive guard. The GC horizon is read from `StatementContext::gc_horizon` (the
+  server captures `gc_horizon()` for the write); a stale/smaller horizon only prunes
+  less, never unsafely.
 - **Index backfill; DML locates the visible version; HOT broken-chain guard.**
   `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
   the chain view is stable) with the GC horizon threaded in. A non-HOT single-version

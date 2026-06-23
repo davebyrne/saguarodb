@@ -692,10 +692,13 @@ impl QueryService {
         // returns above with `failed = true` and never reaches here; a following
         // `SET TRANSACTION` is then gated by the 'E' state instead.)
         txn.first_statement_ran = true;
-        // The GC horizon is consumed only by CREATE INDEX, which is non-transactional
-        // and rejected inside an explicit block (above), so it never reaches here; pass
-        // `0` (unused on this path).
-        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, 0, cancel);
+        // The GC horizon is used by the H3 UPDATE update-path prune (`docs/specs/mvcc.md`
+        // §10 H3); CREATE INDEX (the other consumer) is non-transactional and rejected
+        // inside an explicit block (above), so only UPDATE reads it here. A stale/smaller
+        // horizon only prunes less, never unsafely (the prune reclaims only dead-to-all
+        // versions and mutates one latched page).
+        let gc_horizon = self.components.gc_horizon();
+        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, gc_horizon, cancel);
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
         // The snapshot can no longer be used to read once `run_plan` has returned;
@@ -853,14 +856,14 @@ impl QueryService {
         // function returns on every path (success, statement error, panic), exactly
         // bracketing when the snapshot can still be used to read.
         let (snapshot, _advertised) = self.capture_snapshot(txn_id);
-        // Capture the GC horizon for CREATE INDEX's broken-chain check AFTER the
-        // exclusive guard is held (so no writer can advance it), exactly as
-        // `run_vacuum` does. For non-CREATE-INDEX statements the horizon is unused.
-        let gc_horizon = if needs_exclusive {
-            self.components.gc_horizon()
-        } else {
-            0
-        };
+        // Capture the GC horizon. CREATE INDEX needs it for its broken-chain check
+        // (captured AFTER the exclusive guard, so no writer can advance it, exactly as
+        // `run_vacuum` does); an UPDATE needs it for the H3 update-path prune
+        // (`docs/specs/mvcc.md` §10 H3). For an UPDATE under the SHARED writer guard a
+        // concurrent writer/commit could advance the true horizon after this read, but
+        // a stale/smaller horizon only prunes LESS — never unsafely — so capturing it
+        // here (before execution) is sound. Other statements ignore it.
+        let gc_horizon = self.components.gc_horizon();
         let ctx = self.execution_context(
             txn_id,
             snapshot,
@@ -1129,7 +1132,8 @@ impl QueryService {
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
-            statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation),
+            statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
+                .with_gc_horizon(gc_horizon),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),

@@ -208,6 +208,7 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    pub gc_horizon: u64,
 }
 ```
 
@@ -227,7 +228,12 @@ visible, so pre-capture call sites — tests, recovery scaffolding — filter no
 and `isolation` with the default (`IsolationLevel::ReadCommitted`). `isolation`
 selects the server's snapshot-capture timing (Read Committed = fresh per statement,
 Repeatable Read = captured once per transaction); the storage engine does not
-consult it. `StatementContext` is `Clone` but not `Copy`.
+consult it. `gc_horizon` carries the GC horizon (minimum advertised snapshot `xmin`)
+the server captured for the statement; it is consumed ONLY by the storage engine's
+HOT update-path prune (`docs/specs/mvcc.md` §10 Milestone H3) and defaults to `0`
+(prune nothing committed-dead) for read/pre-capture/test contexts, set on write paths
+via `StatementContext::with_gc_horizon(gc_horizon)`. A stale/smaller horizon only
+prunes less, never unsafely. `StatementContext` is `Clone` but not `Copy`.
 
 ## MVCC Types
 
