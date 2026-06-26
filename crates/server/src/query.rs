@@ -3,16 +3,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    CheckpointGuard, ColumnInfo, DataType, DbError, IsolationLevel, Result, Snapshot, SqlState,
-    StatementContext, Value, WriteGuard,
+    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, Result,
+    Snapshot, SqlState, StatementContext, Value, WriteGuard,
 };
-use executor::{ExecutionContext, ExecutionResult, QueryEngine};
+use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
 use planner::{
     BoundStatement, bind, bind_parameterized, format_explain, logical_plan, physical_plan,
     substitute_params,
 };
 use storage::StorageEngine;
+use tokio::sync::mpsc;
 use wal::{WalRecord, WalRecordKind};
 
 use crate::app::ServerComponents;
@@ -179,6 +180,14 @@ impl QueryService {
     ) -> Result<PreparedStatement> {
         let statement = parser::parse(sql)?;
         let class = statement_class(&statement)?;
+        if let StatementClass::Copy(_) = class {
+            // COPY needs the simple-query COPY sub-protocol; PostgreSQL likewise
+            // rejects it through Parse/Bind/Execute.
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "COPY is not supported in the extended query protocol",
+            ));
+        }
         if let StatementClass::TransactionControl(_) = class {
             // BEGIN/COMMIT/ROLLBACK take no parameters and produce no rows; they do
             // not bind. Carry the prepared statement with a no-op bound payload so
@@ -259,6 +268,12 @@ impl QueryService {
                 SqlState::FeatureNotSupported,
                 "transaction control statements require the simple query protocol",
             )),
+            // COPY is rejected at prepare time for the extended protocol, so an
+            // already-prepared statement is never COPY; keep the match total.
+            StatementClass::Copy(_) => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "COPY is not supported in the extended query protocol",
+            )),
         }
     }
 
@@ -337,6 +352,9 @@ impl QueryService {
                     StatementClass::TransactionControl(_) => {
                         unreachable!("transaction control is dispatched above before substitution")
                     }
+                    StatementClass::Copy(_) => {
+                        unreachable!("COPY is rejected at prepare time for the extended protocol")
+                    }
                 };
                 (None, default_isolation, result)
             }
@@ -413,6 +431,14 @@ impl QueryService {
             return (None, default_isolation, self.run_vacuum(statement));
         }
 
+        // COPY is bound here (resolve table/columns) but not executed: it returns a
+        // `BeginCopyIn`/`BeginCopyOut` request that the connection loop drives over
+        // the COPY sub-protocol. The transaction slot passes through unchanged; the
+        // COPY's own transaction work happens in the streaming driver.
+        if let StatementClass::Copy(direction) = class {
+            return self.dispatch_copy(direction, statement, slot, default_isolation);
+        }
+
         match slot {
             // A data statement with an open explicit transaction runs inside it.
             Some(txn) => {
@@ -425,6 +451,57 @@ impl QueryService {
                 (None, default_isolation, result)
             }
         }
+    }
+
+    /// Bind a COPY statement and return the request the connection loop will drive.
+    /// Like other statements, a bind error (unknown table/column) poisons an open
+    /// transaction; the slot is otherwise returned unchanged.
+    fn dispatch_copy(
+        &self,
+        direction: CopyDirection,
+        statement: Statement,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        if let Some(txn) = &slot
+            && txn.failed
+        {
+            return (
+                slot,
+                default_isolation,
+                Err(DbError::execute(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                )),
+            );
+        }
+        let bound = match bind(&statement, self.components.catalog.as_ref()) {
+            Ok(bound) => bound,
+            Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
+        };
+        let BoundStatement::Copy {
+            table,
+            columns,
+            options,
+            ..
+        } = bound
+        else {
+            return (
+                slot,
+                default_isolation,
+                Err(DbError::internal("COPY bound to a non-COPY statement")),
+            );
+        };
+        let job = CopyJob {
+            table,
+            columns,
+            options,
+        };
+        let result = match direction {
+            CopyDirection::From => Ok(ExecutionResult::BeginCopyIn(job)),
+            CopyDirection::To => Ok(ExecutionResult::BeginCopyOut(job)),
+        };
+        (slot, default_isolation, result)
     }
 
     /// Handle BEGIN/COMMIT/ROLLBACK/SET TRANSACTION/SET SESSION CHARACTERISTICS
@@ -781,6 +858,11 @@ impl QueryService {
             StatementClass::TransactionControl(_) => Err(DbError::internal(
                 "transaction control reached the autocommit data path",
             )),
+            // COPY is intercepted by `dispatch` (→ `dispatch_copy`) and driven by the
+            // connection loop, never the autocommit data path.
+            StatementClass::Copy(_) => {
+                Err(DbError::internal("COPY reached the autocommit data path"))
+            }
         }
     }
 
@@ -1277,6 +1359,234 @@ impl QueryService {
     }
 }
 
+/// One inbound COPY-from-stdin event, sent by the connection loop to the blocking
+/// COPY transaction task. `Done` (clean end-of-input) commits; `Fail` (client
+/// `CopyFail`) and a dropped channel (client disconnect) both abort.
+pub enum CopyInChunk {
+    Chunk(Vec<u8>),
+    Done,
+    Fail,
+}
+
+/// Target size for an outbound `COPY ... TO STDOUT` `CopyData` frame; rows are
+/// batched up to this before being sent, well under the protocol frame cap.
+const COPY_OUT_FRAME_BYTES: usize = 64 * 1024;
+
+impl QueryService {
+    /// Run a `COPY ... FROM STDIN` to completion, owning the transaction. The
+    /// connection loop feeds `rx` from `CopyData`/`CopyDone`/`CopyFail`. Returns
+    /// the (possibly still-open, in-transaction) slot and the rows inserted.
+    pub fn run_copy_in_stream(
+        &self,
+        job: CopyJob,
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+        rx: mpsc::Receiver<CopyInChunk>,
+    ) -> (Option<Transaction>, Result<u64>) {
+        match slot {
+            None => (None, self.copy_in_autocommit(job, cancel, rx)),
+            Some(txn) => self.copy_in_transaction(txn, job, cancel, rx),
+        }
+    }
+
+    /// Autocommit COPY FROM: its own transaction, all-or-nothing (mirrors
+    /// `autocommit_write`, but the execute step is the streaming insert loop and
+    /// COPY FROM produces no committed dead versions).
+    fn copy_in_autocommit(
+        &self,
+        job: CopyJob,
+        cancel: &AtomicBool,
+        rx: mpsc::Receiver<CopyInChunk>,
+    ) -> Result<u64> {
+        let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
+        let txn_id = self.register_active_txn();
+        let (snapshot, _advertised) = self.capture_snapshot(txn_id);
+        let gc_horizon = self.components.gc_horizon();
+        let ctx = self.execution_context(
+            txn_id,
+            snapshot,
+            IsolationLevel::default(),
+            gc_horizon,
+            cancel,
+        );
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
+        let count = match outcome {
+            Ok(Ok(count)) => count,
+            Ok(Err(err)) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            Err(_) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(DbError::internal("COPY FROM execution panicked"));
+            }
+        };
+
+        if let Err(err) = self.append_and_flush_commit(txn_id) {
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
+        if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+            self.fatal_after_durable_commit(err);
+        }
+        self.components.active_txns.deregister(txn_id);
+        drop(guard);
+        // COPY FROM only inserts, so it produces no committed dead versions; still
+        // count the commit toward the checkpoint trigger.
+        if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
+            eprintln!("checkpoint failed after committed COPY: {err}");
+        }
+        Ok(count)
+    }
+
+    /// COPY FROM inside an explicit transaction: fold into the open transaction
+    /// (lazy write guard, the transaction's snapshot, no commit). Mirrors
+    /// `run_bound_in_transaction`'s write handling.
+    fn copy_in_transaction(
+        &self,
+        mut txn: Transaction,
+        job: CopyJob,
+        cancel: &AtomicBool,
+        rx: mpsc::Receiver<CopyInChunk>,
+    ) -> (Option<Transaction>, Result<u64>) {
+        if txn.write_guard.is_none()
+            && let Err(err) = self.acquire_write_guard(&mut txn)
+        {
+            txn.failed = true;
+            return (Some(txn), Err(err));
+        }
+        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        txn.first_statement_ran = true;
+        let gc_horizon = self.components.gc_horizon();
+        let result = {
+            let ctx =
+                self.execution_context(txn.txn_id, snapshot, txn.isolation, gc_horizon, cancel);
+            let result = drive_copy_in(&ctx, job, rx);
+            drop(ctx);
+            result
+        };
+        drop(advertised);
+        match result {
+            // COPY FROM inserts produce no committed dead versions (dead_versions += 0).
+            Ok(count) => (Some(txn), Ok(count)),
+            Err(err) => {
+                txn.failed = true;
+                (Some(txn), Err(err))
+            }
+        }
+    }
+
+    /// Run a `COPY ... TO STDOUT` to completion, pushing rendered frames into
+    /// `frame_tx`. Returns the (possibly still-open) slot and the rows exported.
+    pub fn run_copy_out_stream(
+        &self,
+        job: CopyJob,
+        slot: Option<Transaction>,
+        cancel: &AtomicBool,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+    ) -> (Option<Transaction>, Result<u64>) {
+        match slot {
+            None => (None, self.copy_out_autocommit(job, cancel, frame_tx)),
+            Some(txn) => self.copy_out_transaction(txn, job, cancel, frame_tx),
+        }
+    }
+
+    /// Autocommit COPY TO: a lock-free read with its own snapshot (mirrors
+    /// `autocommit_read`); the advertisement is held for the whole scan.
+    fn copy_out_autocommit(
+        &self,
+        job: CopyJob,
+        cancel: &AtomicBool,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<u64> {
+        let (snapshot, _advertised) = self.capture_snapshot(0);
+        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), 0, cancel);
+        drive_copy_out(&ctx, job, frame_tx)
+    }
+
+    /// COPY TO inside an explicit transaction: read with the transaction's
+    /// snapshot. A read error poisons the block, matching other statements.
+    fn copy_out_transaction(
+        &self,
+        mut txn: Transaction,
+        job: CopyJob,
+        cancel: &AtomicBool,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+    ) -> (Option<Transaction>, Result<u64>) {
+        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        txn.first_statement_ran = true;
+        let result = {
+            let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, 0, cancel);
+            let result = drive_copy_out(&ctx, job, frame_tx);
+            drop(ctx);
+            result
+        };
+        drop(advertised);
+        match result {
+            Ok(count) => (Some(txn), Ok(count)),
+            Err(err) => {
+                txn.failed = true;
+                (Some(txn), Err(err))
+            }
+        }
+    }
+}
+
+/// Pull COPY-from-stdin chunks until a clean `Done` (returns the rows inserted)
+/// or an abort (`Fail`/dropped channel → error, which the caller rolls back).
+fn drive_copy_in(
+    ctx: &ExecutionContext<'_>,
+    job: CopyJob,
+    mut rx: mpsc::Receiver<CopyInChunk>,
+) -> Result<u64> {
+    let mut copy_in = CopyIn::new(ctx, job.table, job.columns, job.options)?;
+    loop {
+        match rx.blocking_recv() {
+            Some(CopyInChunk::Chunk(bytes)) => copy_in.push_chunk(&bytes)?,
+            Some(CopyInChunk::Done) => return copy_in.finish(),
+            // `Fail` (client CopyFail) or a dropped sender (disconnect): abort. The
+            // connection loop substitutes the client's message for a CopyFail.
+            Some(CopyInChunk::Fail) | None => {
+                return Err(DbError::execute(
+                    SqlState::QueryCanceled,
+                    "COPY from stdin aborted",
+                ));
+            }
+        }
+    }
+}
+
+/// Scan + project + render COPY-to-stdout rows, batching into frames pushed to
+/// `frame_tx`. Returns the rows exported. A dropped receiver (client gone) ends
+/// the scan with an error.
+fn drive_copy_out(
+    ctx: &ExecutionContext<'_>,
+    job: CopyJob,
+    frame_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<u64> {
+    let mut out = CopyOut::new(ctx, job.table, &job.columns, job.options)?;
+    let mut frame = Vec::new();
+    if let Some(header) = out.header_line() {
+        frame.extend_from_slice(&header);
+    }
+    let mut count = 0u64;
+    while let Some(row) = out.next_row()? {
+        frame.extend_from_slice(&row);
+        count += 1;
+        if frame.len() >= COPY_OUT_FRAME_BYTES {
+            let full = std::mem::take(&mut frame);
+            if frame_tx.blocking_send(full).is_err() {
+                return Err(DbError::io("COPY to stdout client disconnected"));
+            }
+        }
+    }
+    if !frame.is_empty() && frame_tx.blocking_send(frame).is_err() {
+        return Err(DbError::io("COPY to stdout client disconnected"));
+    }
+    Ok(count)
+}
+
 /// Abort and discard a transaction held on the session, e.g. when a client
 /// disconnects mid-transaction. Releases the write guard and clears the registry
 /// entry so neither is leaked. Standalone so the connection layer can call it on
@@ -1488,6 +1798,10 @@ enum StatementClass {
     /// A maintenance command (`VACUUM`) — not relational, so it never binds or
     /// plans, and like DDL it is forbidden inside an explicit transaction block.
     Maintenance,
+    /// `COPY ... FROM STDIN | TO STDOUT` — a bulk-transfer command driven by the
+    /// connection loop's COPY sub-protocol, not the normal execute path
+    /// (`docs/specs/copy.md`). It binds (resolve table/columns) but is not lowered.
+    Copy(CopyDirection),
     TransactionControl(TransactionControl),
 }
 
@@ -1581,12 +1895,7 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
             ))
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
-        // Staged: COPY routing into the connection-loop sub-protocol lands in the
-        // server COPY task; until then it parses but is not yet executable.
-        Statement::Copy { .. } => Err(DbError::plan(
-            SqlState::FeatureNotSupported,
-            "COPY is not yet implemented",
-        )),
+        Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
     }
 }
 

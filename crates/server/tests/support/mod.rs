@@ -267,6 +267,90 @@ impl Connection {
     pub async fn close(self) {
         drop(self.stream);
     }
+
+    /// Run `COPY ... FROM STDIN`: send the query, expect `CopyInResponse`, stream
+    /// `chunks` as `CopyData`, then `CopyDone`. Returns the completion.
+    pub async fn copy_from(&mut self, sql: &str, chunks: &[&[u8]]) -> Result<CopyCompletion> {
+        self.copy_in(sql, chunks, None).await
+    }
+
+    /// Send `COPY ... FROM STDIN` and read the `CopyInResponse`, then return —
+    /// leaving the COPY open (no `CopyDone`). The server holds its in-flight and
+    /// writer guards until this connection sends a terminator or disconnects.
+    pub async fn begin_copy_from(&mut self, sql: &str) -> Result<()> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY query: {err}")))?;
+        read_until_tag(&mut self.stream, b'G').await?;
+        Ok(())
+    }
+
+    /// Like [`copy_from`](Self::copy_from) but aborts with `CopyFail(message)`
+    /// instead of `CopyDone`.
+    pub async fn copy_fail(
+        &mut self,
+        sql: &str,
+        chunks: &[&[u8]],
+        message: &str,
+    ) -> Result<CopyCompletion> {
+        self.copy_in(sql, chunks, Some(message)).await
+    }
+
+    async fn copy_in(
+        &mut self,
+        sql: &str,
+        chunks: &[&[u8]],
+        fail_message: Option<&str>,
+    ) -> Result<CopyCompletion> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY query: {err}")))?;
+        // The server replies CopyInResponse ('G') before any ReadyForQuery.
+        read_until_tag(&mut self.stream, b'G').await?;
+
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&tagged(b'd', chunk));
+        }
+        match fail_message {
+            None => out.extend_from_slice(&tagged(b'c', &[])), // CopyDone
+            Some(message) => {
+                let mut body = message.as_bytes().to_vec();
+                body.push(0);
+                out.extend_from_slice(&tagged(b'f', &body)); // CopyFail
+            }
+        }
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY data: {err}")))?;
+
+        let response = read_until_ready(&mut self.stream).await?;
+        parse_copy_completion(&response)
+    }
+
+    /// Run `COPY ... TO STDOUT`: returns the concatenated `CopyData` payload bytes
+    /// and the completion (command tag / error / status).
+    pub async fn copy_to(&mut self, sql: &str) -> Result<(Vec<u8>, CopyCompletion)> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY query: {err}")))?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let data = extract_copy_data(&response);
+        let completion = parse_copy_completion(&response)?;
+        Ok((data, completion))
+    }
+}
+
+/// The outcome of a COPY: the `CommandComplete` tag (e.g. `"COPY 2"`) on success,
+/// or the error SQLSTATE on failure, plus the trailing transaction-status byte.
+pub struct CopyCompletion {
+    pub command_tag: Option<String>,
+    pub error_code: Option<String>,
+    pub status: u8,
 }
 
 /// The result of one query on a persistent [`Connection`]: the decoded rows (or
@@ -429,6 +513,104 @@ async fn read_until_ready_unbounded(stream: &mut TcpStream) -> Result<Vec<u8>> {
             return Ok(response);
         }
     }
+}
+
+/// Read from `stream` until a complete message with tag `tag` is present (used to
+/// wait for `CopyInResponse` (`G`), which precedes any `ReadyForQuery`).
+async fn read_until_tag(stream: &mut TcpStream, tag: u8) -> Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buf = [0; 8192];
+    let read_loop = async {
+        loop {
+            let read = stream.read(&mut buf).await.map_err(|err| {
+                common::DbError::io(format!("failed to read COPY response: {err}"))
+            })?;
+            if read == 0 {
+                return Err(common::DbError::protocol(
+                    common::SqlState::InternalError,
+                    "connection closed before expected COPY message",
+                ));
+            }
+            response.extend_from_slice(&buf[..read]);
+            if for_each_message(&response, |t, _| t == tag)? {
+                return Ok(response);
+            }
+        }
+    };
+    tokio::time::timeout(READY_FOR_QUERY_TIMEOUT, read_loop)
+        .await
+        .map_err(|_| common::DbError::internal("timed out waiting for COPY message"))?
+}
+
+/// Visit each complete tagged message `(tag, body)` in `bytes`; returns `true` if
+/// `visit` returns `true` for any, ignoring a trailing incomplete frame.
+fn for_each_message(bytes: &[u8], mut visit: impl FnMut(u8, &[u8]) -> bool) -> Result<bool> {
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let tag = bytes[offset];
+        let len = read_i32(&bytes[offset + 1..offset + 5])? as usize;
+        let end = offset + 1 + len;
+        if len < 4 || end > bytes.len() {
+            break; // incomplete trailing frame
+        }
+        if visit(tag, &bytes[offset + 5..end]) {
+            return Ok(true);
+        }
+        offset = end;
+    }
+    Ok(false)
+}
+
+/// Concatenate every `CopyData` (`d`) message body in a COPY-to-stdout response.
+fn extract_copy_data(bytes: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    let _ = for_each_message(bytes, |tag, body| {
+        if tag == b'd' {
+            data.extend_from_slice(body);
+        }
+        false
+    });
+    data
+}
+
+/// Pull the `CommandComplete` tag and/or `ErrorResponse` SQLSTATE out of a COPY
+/// response, with the trailing `ReadyForQuery` status byte.
+fn parse_copy_completion(bytes: &[u8]) -> Result<CopyCompletion> {
+    let mut command_tag = None;
+    let mut error_code = None;
+    let _ = for_each_message(bytes, |tag, body| {
+        match tag {
+            b'C' => {
+                command_tag = Some(
+                    String::from_utf8_lossy(body.split(|&b| b == 0).next().unwrap_or(&[]))
+                        .into_owned(),
+                );
+            }
+            b'E' => error_code = error_sqlstate(body),
+            _ => {}
+        }
+        false
+    });
+    Ok(CopyCompletion {
+        command_tag,
+        error_code,
+        status: ready_for_query_status(bytes)?,
+    })
+}
+
+/// Extract the SQLSTATE (`C`) field from an `ErrorResponse` body.
+fn error_sqlstate(body: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    while offset < body.len() && body[offset] != 0 {
+        let field_type = body[offset];
+        let start = offset + 1;
+        let nul = start + body[start..].iter().position(|&b| b == 0)?;
+        if field_type == b'C' {
+            return Some(String::from_utf8_lossy(&body[start..nul]).into_owned());
+        }
+        offset = nul + 1;
+    }
+    None
 }
 
 fn response_contains_ready(bytes: &[u8]) -> Result<bool> {

@@ -4,17 +4,38 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{ColumnInfo, DataType, DbError, IsolationLevel, Result, Row, SqlState, Value};
-use executor::ExecutionResult;
+use executor::{CopyJob, ExecutionResult};
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
     ServerMessage, StatementKind,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::app::AppState;
 use crate::cancel::BackendKey;
-use crate::query::{PreparedStatement, SessionTxnStatus, Transaction, abort_session_transaction};
+use crate::query::{
+    CopyInChunk, PreparedStatement, SessionTxnStatus, Transaction, abort_session_transaction,
+};
+use crate::shutdown::InFlightQueryGuard;
+
+/// State for an in-progress `COPY ... FROM STDIN`. The blocking task owns the
+/// transaction and inserts rows pulled from `sender`; the connection loop forwards
+/// `CopyData` into it and finalizes on `CopyDone`/`CopyFail`/disconnect.
+struct CopyInSession {
+    sender: mpsc::Sender<CopyInChunk>,
+    task: JoinHandle<(Option<Transaction>, Result<u64>)>,
+    /// Set once the insert task has exited early on a row error: we then discard
+    /// further `CopyData` and report the task's error on the terminator.
+    insert_failed: bool,
+    /// Keeps the COPY counted as an in-flight query for its whole streaming
+    /// lifetime, so graceful shutdown's `wait_for_idle` accounts for it (the insert
+    /// task holds the shared writer guard, which the final checkpoint must drain).
+    /// Held until the task is awaited in `finish_copy_in` / dropped on disconnect.
+    _guard: InFlightQueryGuard,
+}
 
 /// Accept a connection, run optional SSL/GSS negotiation, then serve the
 /// protocol over the resulting (plaintext or TLS) stream.
@@ -215,6 +236,10 @@ struct Session {
     /// This connection's cancellation key, registered at startup and removed on
     /// disconnect.
     backend_key: Option<BackendKey>,
+    /// Set while a `COPY ... FROM STDIN` is streaming: subsequent client messages
+    /// are routed as copy-in data until `CopyDone`/`CopyFail`. On disconnect this
+    /// drops, closing the channel so the blocking task aborts the COPY.
+    copy_in: Option<CopyInSession>,
 }
 
 impl Drop for Session {
@@ -299,6 +324,7 @@ impl Session {
             default_isolation: IsolationLevel::default(),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
+            copy_in: None,
         }
     }
 
@@ -327,6 +353,25 @@ impl Session {
     where
         S: AsyncWrite + Unpin,
     {
+        // While a COPY FROM is streaming, only copy-in messages are valid; anything
+        // else is a protocol violation.
+        if self.copy_in.is_some() {
+            match message {
+                ClientMessage::CopyData(bytes) => self.handle_copy_data(bytes).await?,
+                ClientMessage::CopyDone => self.finish_copy_in(stream, codec, None).await?,
+                ClientMessage::CopyFail(message) => {
+                    self.finish_copy_in(stream, codec, Some(message)).await?
+                }
+                // The client disconnected mid-COPY; the session drop aborts it.
+                ClientMessage::Terminate => return Ok(ControlFlow::Break(())),
+                _ => {
+                    return Err(protocol_error(
+                        "expected COPY data while a COPY FROM STDIN is in progress",
+                    ));
+                }
+            }
+            return Ok(ControlFlow::Continue(()));
+        }
         match message {
             ClientMessage::Query(sql) => return self.run_query(stream, codec, sql).await,
             ClientMessage::Sync => {
@@ -454,7 +499,10 @@ impl Session {
             service.execute_simple(&sql, txn, default_isolation, &cancel)
         })
         .await;
-        drop(guard);
+        // `guard` (the in-flight-query guard) is dropped per result arm below: the
+        // normal arms drop it before writing the response (the query work is done);
+        // the COPY arms hand it to the streaming driver so the COPY keeps counting
+        // as in-flight for its whole lifetime (graceful-shutdown coordination).
         let result = match task {
             Ok((txn, default_isolation, result)) => {
                 self.txn = txn;
@@ -474,8 +522,22 @@ impl Session {
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
         match result {
-            Ok(result) => write_execution_result(stream, codec, result, status).await?,
+            // COPY enters its sub-protocol instead of returning a finished result:
+            // `BeginCopyIn` spawns the streaming insert and routes subsequent
+            // CopyData; `BeginCopyOut` streams the table out inline. Both recompute
+            // the transaction status themselves, so the `status` above is unused here.
+            Ok(ExecutionResult::BeginCopyIn(job)) => {
+                self.begin_copy_in(stream, codec, job, guard).await?
+            }
+            Ok(ExecutionResult::BeginCopyOut(job)) => {
+                self.run_copy_out(stream, codec, job, guard).await?
+            }
+            Ok(result) => {
+                drop(guard);
+                write_execution_result(stream, codec, result, status).await?
+            }
             Err(err) => {
+                drop(guard);
                 write_messages(
                     stream,
                     codec,
@@ -485,6 +547,220 @@ impl Session {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    /// Begin `COPY ... FROM STDIN`: send `CopyInResponse`, spawn the blocking
+    /// insert task (which owns the transaction, moved out of the session), and
+    /// record the copy-in state so subsequent `CopyData` is routed to it. Returns
+    /// without waiting — finalization happens on `CopyDone`/`CopyFail`.
+    async fn begin_copy_in<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        job: CopyJob,
+        guard: InFlightQueryGuard,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let column_formats = vec![0i16; job.columns.len()];
+        write_messages(
+            stream,
+            codec,
+            &[ServerMessage::CopyInResponse {
+                overall_format: 0,
+                column_formats,
+            }],
+        )
+        .await?;
+
+        // A bounded channel gives TCP backpressure: when the insert task lags, the
+        // forwarder's `send` awaits and the socket read stalls.
+        let (sender, receiver) = mpsc::channel::<CopyInChunk>(64);
+        let service = self.app.query_service.clone();
+        let txn = self.txn.take();
+        let cancel = self.begin_cancelable();
+        let task = tokio::task::spawn_blocking(move || {
+            service.run_copy_in_stream(job, txn, &cancel, receiver)
+        });
+        self.copy_in = Some(CopyInSession {
+            sender,
+            task,
+            insert_failed: false,
+            _guard: guard,
+        });
+        Ok(())
+    }
+
+    /// Forward one `CopyData` payload to the insert task. If the task has exited
+    /// early (a row failed), discard further data until the terminator.
+    async fn handle_copy_data(&mut self, bytes: Vec<u8>) -> Result<()> {
+        let Some(copy) = self.copy_in.as_mut() else {
+            return Err(protocol_error(
+                "CopyData received outside of an active COPY",
+            ));
+        };
+        if !copy.insert_failed && copy.sender.send(CopyInChunk::Chunk(bytes)).await.is_err() {
+            // The receiver was dropped because the insert task exited on a row error.
+            copy.insert_failed = true;
+        }
+        Ok(())
+    }
+
+    /// Finalize a `COPY ... FROM STDIN` on `CopyDone` (`fail_message` `None`) or
+    /// `CopyFail` (`Some(message)`): signal the task, await it, restore the session
+    /// transaction, and reply. On any failure the inbound stream has already been
+    /// drained to the terminator, so `ReadyForQuery` is emitted last.
+    async fn finish_copy_in<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        fail_message: Option<String>,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let copy = self
+            .copy_in
+            .take()
+            .expect("finish_copy_in called with no active COPY");
+        let insert_failed = copy.insert_failed;
+        if !insert_failed {
+            // Signal a clean end (`Done` → commit) or a client abort (`Fail`).
+            let signal = if fail_message.is_some() {
+                CopyInChunk::Fail
+            } else {
+                CopyInChunk::Done
+            };
+            let _ = copy.sender.send(signal).await;
+        }
+        drop(copy.sender);
+        let (txn, result) = match copy.task.await {
+            Ok(pair) => pair,
+            Err(join_err) => (
+                None,
+                Err(DbError::internal(format!("COPY task failed: {join_err}"))),
+            ),
+        };
+        self.txn = txn;
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        let status = self.status_byte();
+
+        match result {
+            Ok(count) => {
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        ServerMessage::CommandComplete(format!("COPY {count}")),
+                        ServerMessage::ReadyForQuery(status),
+                    ],
+                )
+                .await
+            }
+            Err(task_err) => {
+                // A client CopyFail (with no prior insert error) reports the client's
+                // message; otherwise the insert/row error.
+                let err = match fail_message {
+                    Some(message) if !insert_failed => DbError::execute(
+                        SqlState::QueryCanceled,
+                        format!("COPY from stdin failed: {message}"),
+                    ),
+                    _ => task_err,
+                };
+                write_messages(
+                    stream,
+                    codec,
+                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
+                )
+                .await
+            }
+        }
+    }
+
+    /// Run `COPY ... TO STDOUT` inline: send `CopyOutResponse`, stream rendered
+    /// frames from the blocking producer to the socket, then `CopyDone` +
+    /// `CommandComplete` (or `ErrorResponse` on failure, with no `CopyDone`).
+    async fn run_copy_out<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        job: CopyJob,
+        // Held for the COPY's lifetime so it counts as an in-flight query during the
+        // streaming scan; dropped when this returns.
+        _guard: InFlightQueryGuard,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let column_formats = vec![0i16; job.columns.len()];
+        write_messages(
+            stream,
+            codec,
+            &[ServerMessage::CopyOutResponse {
+                overall_format: 0,
+                column_formats,
+            }],
+        )
+        .await?;
+
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(8);
+        let service = self.app.query_service.clone();
+        let txn = self.txn.take();
+        let cancel = self.begin_cancelable();
+        let task = tokio::task::spawn_blocking(move || {
+            service.run_copy_out_stream(job, txn, &cancel, frame_tx)
+        });
+
+        let mut write_err = None;
+        while let Some(frame) = frame_rx.recv().await {
+            if let Err(err) = write_messages(stream, codec, &[ServerMessage::CopyData(frame)]).await
+            {
+                write_err = Some(err);
+                break;
+            }
+        }
+        // Drop the receiver so the producer's next `blocking_send` fails fast if we
+        // broke out early on a socket error.
+        drop(frame_rx);
+
+        let (txn, result) = match task.await {
+            Ok(pair) => pair,
+            Err(join_err) => (
+                None,
+                Err(DbError::internal(format!("COPY task failed: {join_err}"))),
+            ),
+        };
+        self.txn = txn;
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        let status = self.status_byte();
+
+        if let Some(err) = write_err {
+            return Err(err);
+        }
+        match result {
+            Ok(count) => {
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        ServerMessage::CopyDone,
+                        ServerMessage::CommandComplete(format!("COPY {count}")),
+                        ServerMessage::ReadyForQuery(status),
+                    ],
+                )
+                .await
+            }
+            // A producer error after CopyOutResponse: ErrorResponse, no CopyDone.
+            Err(err) => {
+                write_messages(
+                    stream,
+                    codec,
+                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
+                )
+                .await
+            }
+        }
     }
 
     async fn run_execute<S>(
@@ -824,6 +1100,11 @@ where
             )
             .await
         }
+        // COPY requests are intercepted by `run_query` and driven by the COPY
+        // sub-protocol; they never reach the generic result writer.
+        ExecutionResult::BeginCopyIn(_) | ExecutionResult::BeginCopyOut(_) => Err(
+            DbError::internal("COPY result must be handled by the connection loop"),
+        ),
     }
 }
 
@@ -902,6 +1183,11 @@ where
             )
             .await
         }
+        // COPY is rejected in the extended query protocol before execution, so a
+        // portal never yields a COPY request.
+        ExecutionResult::BeginCopyIn(_) | ExecutionResult::BeginCopyOut(_) => Err(
+            DbError::internal("COPY is not valid in the extended query protocol"),
+        ),
     }
 }
 
