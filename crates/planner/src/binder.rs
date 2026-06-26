@@ -885,14 +885,13 @@ fn bind_aggregate(
     args: &[FunctionArg],
     distinct: bool,
 ) -> Result<BoundExpr> {
-    if distinct {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            "aggregate DISTINCT is not supported in v1",
-        ));
-    }
-
     let arg = match args {
+        [FunctionArg::Wildcard] if distinct => {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                "DISTINCT is not supported with a wildcard aggregate argument",
+            ));
+        }
         [FunctionArg::Wildcard] if func == AggregateFunc::Count => None,
         [FunctionArg::Wildcard] => {
             return Err(plan_error(
@@ -939,7 +938,7 @@ fn bind_aggregate(
     Ok(BoundExpr::AggregateCall {
         func,
         arg,
-        distinct: false,
+        distinct,
         data_type,
         nullable,
     })

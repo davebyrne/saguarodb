@@ -510,3 +510,127 @@ async fn read_until_ready_times_out_when_connection_stays_open() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn e2e_aggregate_distinct_deduplicates_arguments() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table sales (id integer primary key, region text, amount integer)")
+        .await
+        .unwrap();
+    for (id, region, amount) in [
+        (1, "west", "10"),
+        (2, "west", "10"),
+        (3, "west", "20"),
+        (4, "east", "30"),
+        (5, "east", "30"),
+        (6, "east", "null"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into sales (id, region, amount) values ({id}, '{region}', {amount})"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // count(distinct amount) dedups {10,20,30} and ignores the NULL => 3.
+    let rows = server
+        .simple_query("select count(distinct amount) from sales")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // sum(distinct amount) = 10 + 20 + 30 = 60.
+    let rows = server
+        .simple_query("select sum(distinct amount) from sales")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("60".to_string())]]);
+
+    // avg(distinct amount) = 60 / 3 = 20.
+    let rows = server
+        .simple_query("select avg(distinct amount) from sales")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("20".to_string())]]);
+
+    // min/max are unaffected by DISTINCT but must still be accepted.
+    let rows = server
+        .simple_query("select min(distinct amount), max(distinct amount) from sales")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("10".to_string()), Some("30".to_string())]]
+    );
+
+    // DISTINCT applies per group.
+    let rows = server
+        .simple_query(
+            "select region, count(distinct amount) from sales group by region order by region",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("east".to_string()), Some("1".to_string())],
+            vec![Some("west".to_string()), Some("2".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_count_distinct_wildcard_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table sales (id integer primary key, amount integer)")
+        .await
+        .unwrap();
+
+    // COUNT(DISTINCT *) is not valid SQL; DISTINCT requires an explicit argument.
+    let err = server
+        .simple_query("select count(distinct *) from sales")
+        .await
+        .err()
+        .expect("expected count(distinct *) to be rejected");
+    assert!(
+        err.message.contains("42601"),
+        "expected a syntax error, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, v integer)")
+        .await
+        .unwrap();
+    for (id, v) in [(1, "10"), (2, "10"), (3, "20")] {
+        server
+            .simple_query(&format!("insert into t (id, v) values ({id}, {v})"))
+            .await
+            .unwrap();
+    }
+
+    // count(v) and count(distinct v) over the same argument must not collapse
+    // into one aggregate: 3 non-null values, 2 distinct values.
+    let rows = server
+        .simple_query("select count(v), count(distinct v) from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".to_string()), Some("2".to_string())]]
+    );
+}
