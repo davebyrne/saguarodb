@@ -181,6 +181,10 @@ Client messages:
 - `Close`: tag `b'C'`, length, `byte kind` (`b'S'`/`b'P'`), `name\0`.
 - `Sync`: tag `b'S'`, length `4`.
 - `Flush`: tag `b'H'`, length `4`.
+- `CopyData` (copy-in): tag `b'd'`, length, raw payload bytes (a stream chunk,
+  not necessarily row-aligned).
+- `CopyDone` (copy-in): tag `b'c'`, length `4`.
+- `CopyFail`: tag `b'f'`, length, `message\0`.
 - `Terminate`: tag `b'X'`, length `4`.
 
 Server messages:
@@ -191,13 +195,20 @@ Server messages:
 - `ReadyForQuery(status)`: tag `b'Z'`, length `5`, transaction-status byte supplied by the caller. The protocol encodes whatever byte it is handed; the server sources it from the session's transaction state (`b'I'` idle, `b'T'` in a transaction block, `b'E'` failed transaction block). Outside an explicit transaction (autocommit) the byte is `b'I'`; inside an open `BEGIN` block it is `b'T'`, and `b'E'` once a statement in that block fails (see `docs/specs/crates/server.md`).
 - `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
 - `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus its wire bytes (text or binary per the `RowDescription` format codes), or `int32 -1` for `NULL`.
-- `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. Tags include `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, and `VACUUM`.
+- `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. Tags include `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `VACUUM`, and `COPY n`.
 - `ParseComplete`: tag `b'1'`, length `4`.
 - `BindComplete`: tag `b'2'`, length `4`.
 - `CloseComplete`: tag `b'3'`, length `4`.
 - `ParameterDescription`: tag `b't'`, length, `int16 param_count`, then that many `int32` parameter type OIDs.
 - `NoData`: tag `b'n'`, length `4`.
+- `CopyInResponse`: tag `b'G'`, length, `int8 overall_format`, `int16 column_count`, then one `int16 format_code` per column (`0` = text). Used for `COPY ... FROM STDIN`.
+- `CopyOutResponse`: tag `b'H'`, same body shape as `CopyInResponse`. Used for `COPY ... TO STDOUT`.
+- `CopyData` (copy-out): tag `b'd'`, length, payload bytes.
+- `CopyDone` (copy-out): tag `b'c'`, length `4`.
 - `ErrorResponse`: tag `b'E'`, length, fields `b'S' severity\0`, `b'C' sqlstate\0`, `b'M' message\0`, then final `\0`.
+
+The COPY messages are codec-level framing only; the COPY sub-protocol flow,
+formats, and error recovery live in `docs/specs/copy.md` §4/§5.
 
 Text value encoding:
 
@@ -248,3 +259,5 @@ unsupported format codes.
 - Encodes ReadyForQuery as `b'Z'`, length `5`, status byte equal to the supplied `status` (the server passes `b'I'`/`b'T'`/`b'E'` from the session's transaction state).
 - Encodes ErrorResponse with SQLSTATE code.
 - Handles Terminate by marking connection terminated.
+- Round-trips the COPY messages: decodes `CopyData`/`CopyDone`/`CopyFail` (and an empty `CopyData`), rejects a `CopyDone` with a non-empty body, and encodes `CopyInResponse`/`CopyOutResponse`/`CopyData`/`CopyDone` with the body shapes above.
+- A COPY data message reaching the connection state machine (out of an active COPY) is a protocol error.

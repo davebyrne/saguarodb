@@ -131,6 +131,18 @@ impl PostgresCodec {
                 }
                 messages.push(ClientMessage::Flush);
             }
+            b'd' => messages.push(ClientMessage::CopyData(body.to_vec())),
+            b'c' => {
+                if length != 4 {
+                    return Err(protocol_error("CopyDone message has invalid length"));
+                }
+                messages.push(ClientMessage::CopyDone);
+            }
+            b'f' => {
+                let message =
+                    decode_nul_terminated_text(body, "CopyFail message is not nul terminated")?;
+                messages.push(ClientMessage::CopyFail(message.to_string()));
+            }
             _ => return Err(protocol_error("unsupported frontend message tag")),
         }
 
@@ -155,9 +167,8 @@ impl ProtocolCodec for PostgresCodec {
             }
 
             let decoded = match self.buffer[0] {
-                b'Q' | b'X' | b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' => {
-                    self.decode_tagged(&mut messages)?
-                }
+                b'Q' | b'X' | b'P' | b'B' | b'D' | b'E' | b'C' | b'H' | b'S' | b'd' | b'c'
+                | b'f' => self.decode_tagged(&mut messages)?,
                 0 => self.decode_startup_style(&mut messages)?,
                 _ => return Err(protocol_error("unsupported frontend message tag")),
             };
@@ -246,6 +257,16 @@ impl ProtocolCodec for PostgresCodec {
                 encode_server_message(b't', body)
             }
             ServerMessage::NoData => encode_server_message(b'n', Vec::new()),
+            ServerMessage::CopyInResponse {
+                overall_format,
+                column_formats,
+            } => encode_server_message(b'G', encode_copy_response(*overall_format, column_formats)),
+            ServerMessage::CopyOutResponse {
+                overall_format,
+                column_formats,
+            } => encode_server_message(b'H', encode_copy_response(*overall_format, column_formats)),
+            ServerMessage::CopyData(bytes) => encode_server_message(b'd', bytes.clone()),
+            ServerMessage::CopyDone => encode_server_message(b'c', Vec::new()),
             ServerMessage::ErrorResponse {
                 severity,
                 code,
@@ -452,6 +473,21 @@ fn encode_server_message(tag: u8, body: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Body shared by `CopyInResponse`/`CopyOutResponse`: `int8 overall_format`,
+/// `int16 column_count`, then one `int16 format_code` per column.
+fn encode_copy_response(overall_format: i8, column_formats: &[i16]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(3 + column_formats.len() * 2);
+    body.push(overall_format as u8);
+    put_i16(
+        &mut body,
+        checked_i16(column_formats.len(), "too many copy columns"),
+    );
+    for format in column_formats {
+        put_i16(&mut body, *format);
+    }
+    body
+}
+
 fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo, format: i16) {
     let (type_oid, type_size) = postgres_type(&column.data_type);
     put_cstr(body, &column.name);
@@ -548,11 +584,9 @@ fn decode_utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str> {
 }
 
 fn parse_bool_text(text: &str) -> Result<Value> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Value::Boolean(true)),
-        "f" | "false" | "n" | "no" | "off" | "0" => Ok(Value::Boolean(false)),
-        _ => Err(protocol_error("invalid boolean parameter")),
-    }
+    common::parse_bool_text(text)
+        .map(Value::Boolean)
+        .ok_or_else(|| protocol_error("invalid boolean parameter"))
 }
 
 fn postgres_type(data_type: &DataType) -> (i32, i16) {

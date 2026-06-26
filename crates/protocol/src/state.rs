@@ -1,4 +1,4 @@
-use common::{DbError, Result};
+use common::{DbError, Result, SqlState};
 
 use crate::{ClientMessage, ServerMessage};
 
@@ -94,6 +94,15 @@ impl ConnectionState for PostgresConnectionState {
             ClientMessage::CancelRequest { .. } => Err(DbError::internal(
                 "CancelRequest must be handled by the server during connection startup",
             )),
+            // COPY data messages are only valid while an active COPY operation is
+            // streaming; the server's COPY loop consumes them directly. Reaching
+            // the state machine means the client sent copy-in data out of band.
+            ClientMessage::CopyData(_) | ClientMessage::CopyDone | ClientMessage::CopyFail(_) => {
+                Err(DbError::protocol(
+                    SqlState::SyntaxError,
+                    "COPY data message received outside of an active COPY operation",
+                ))
+            }
             ClientMessage::Terminate => {
                 self.terminated = true;
                 Ok(Vec::new())

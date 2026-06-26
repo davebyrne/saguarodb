@@ -61,6 +61,13 @@ pub enum ClientMessage {
     Sync,
     /// Extended protocol: request the server flush its output buffer.
     Flush,
+    /// COPY sub-protocol: a chunk of `COPY ... FROM STDIN` data. Not necessarily
+    /// aligned to row boundaries. See `docs/specs/copy.md` §4.
+    CopyData(Vec<u8>),
+    /// COPY sub-protocol: the client has finished sending copy-in data.
+    CopyDone,
+    /// COPY sub-protocol: the client aborts the copy-in with this message text.
+    CopyFail(String),
     Terminate,
 }
 
@@ -106,6 +113,24 @@ pub enum ServerMessage {
     ParameterDescription(Vec<i32>),
     /// Extended protocol: a described statement/portal returns no rows.
     NoData,
+    /// COPY sub-protocol: the server is ready to receive `COPY ... FROM STDIN`
+    /// data. `overall_format` is `0` (text/CSV) or `1` (binary; unused here), and
+    /// `column_formats` carries one format code per column. See
+    /// `docs/specs/copy.md` §4.
+    CopyInResponse {
+        overall_format: i8,
+        column_formats: Vec<i16>,
+    },
+    /// COPY sub-protocol: the server is about to send `COPY ... TO STDOUT` data.
+    /// Same body shape as `CopyInResponse`.
+    CopyOutResponse {
+        overall_format: i8,
+        column_formats: Vec<i16>,
+    },
+    /// COPY sub-protocol: a chunk of `COPY ... TO STDOUT` data.
+    CopyData(Vec<u8>),
+    /// COPY sub-protocol: the server has finished sending copy-out data.
+    CopyDone,
     ErrorResponse {
         severity: String,
         code: String,

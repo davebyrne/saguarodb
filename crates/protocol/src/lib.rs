@@ -676,4 +676,96 @@ mod tests {
         );
         assert!(!state.is_terminated());
     }
+
+    #[test]
+    fn decodes_copy_data_done_and_fail() {
+        let mut codec = PostgresCodec::new();
+        let mut bytes = tagged(b'd', b"row1\trow2\n");
+        bytes.extend_from_slice(&tagged(b'c', &[]));
+        bytes.extend_from_slice(&tagged(b'f', b"client aborted\0"));
+
+        assert_eq!(
+            codec.decode(&bytes).unwrap(),
+            vec![
+                ClientMessage::CopyData(b"row1\trow2\n".to_vec()),
+                ClientMessage::CopyDone,
+                ClientMessage::CopyFail("client aborted".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_empty_copy_data_frame() {
+        let mut codec = PostgresCodec::new();
+        assert_eq!(
+            codec.decode(&tagged(b'd', &[])).unwrap(),
+            vec![ClientMessage::CopyData(Vec::new())]
+        );
+    }
+
+    #[test]
+    fn copy_done_with_nonempty_body_is_protocol_error() {
+        let mut codec = PostgresCodec::new();
+        let err = codec.decode(&tagged(b'c', b"x")).unwrap_err();
+        assert_eq!(err.code, common::SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn encodes_copy_in_and_out_response() {
+        let codec = PostgresCodec::new();
+        for (message, tag) in [
+            (
+                ServerMessage::CopyInResponse {
+                    overall_format: 0,
+                    column_formats: vec![0, 0],
+                },
+                b'G',
+            ),
+            (
+                ServerMessage::CopyOutResponse {
+                    overall_format: 0,
+                    column_formats: vec![0, 0],
+                },
+                b'H',
+            ),
+        ] {
+            let bytes = codec.encode(&message);
+            assert_eq!(bytes[0], tag);
+            let mut offset = 1;
+            let length = read_i32(&bytes, &mut offset);
+            assert_eq!(usize::try_from(length).unwrap(), bytes.len() - 1);
+            assert_eq!(bytes[offset], 0); // overall_format = text
+            offset += 1;
+            assert_eq!(read_i16(&bytes, &mut offset), 2); // column count
+            assert_eq!(read_i16(&bytes, &mut offset), 0);
+            assert_eq!(read_i16(&bytes, &mut offset), 0);
+        }
+    }
+
+    #[test]
+    fn encodes_copy_data_and_done() {
+        let codec = PostgresCodec::new();
+
+        let mut expected = vec![b'd'];
+        expected.extend_from_slice(&8i32.to_be_bytes()); // length = 4 + 4-byte payload
+        expected.extend_from_slice(b"a,b\n");
+        assert_eq!(
+            codec.encode(&ServerMessage::CopyData(b"a,b\n".to_vec())),
+            expected
+        );
+
+        assert_eq!(
+            codec.encode(&ServerMessage::CopyDone),
+            vec![b'c', 0, 0, 0, 4]
+        );
+    }
+
+    #[test]
+    fn copy_message_outside_copy_mode_is_protocol_error() {
+        let mut state = PostgresConnectionState::new();
+        let err = state
+            .handle_message(ClientMessage::CopyData(vec![1, 2, 3]))
+            .unwrap_err();
+        assert_eq!(err.code, common::SqlState::SyntaxError);
+    }
 }
