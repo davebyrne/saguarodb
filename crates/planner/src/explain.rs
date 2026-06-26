@@ -110,6 +110,10 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!("{padding}Sort keys={}\n", order_by.len()));
             format_node(source, indent + 1, output);
         }
+        PhysicalPlan::Distinct { source, on_keys } => {
+            output.push_str(&format!("{padding}Distinct keys={}\n", on_keys.len()));
+            format_node(source, indent + 1, output);
+        }
         PhysicalPlan::Limit {
             source,
             count,

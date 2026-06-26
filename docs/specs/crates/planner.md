@@ -92,6 +92,7 @@ pub enum BoundInsertSource {
 }
 
 pub struct BoundSelect {
+    pub distinct: bool,
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,
@@ -320,6 +321,7 @@ pub enum LogicalPlan {
     Filter { source: Box<LogicalPlan>, predicate: BoundExpr },
     Projection { source: Box<LogicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<LogicalPlan>, order_by: Vec<BoundOrderByItem> },
+    Distinct { source: Box<LogicalPlan>, on_keys: Vec<BoundExpr> },
     Limit { source: Box<LogicalPlan>, count: u64, offset: Option<u64> },
     Aggregate {
         source: Box<LogicalPlan>,
@@ -332,6 +334,17 @@ pub enum LogicalPlan {
 ```
 
 Logical plan contains no access method choices.
+
+For a plain `SELECT DISTINCT` (`BoundSelect.distinct`), logical planning inserts
+a `Distinct` node between any `Sort` and the `Projection`. Its `on_keys` are the
+projection expressions, so whole output rows are de-duplicated; placing it after
+the `Sort` means keeping the first row of each distinct key preserves the
+requested ordering, and the later `Limit` applies to the distinct rows. The
+binder enforces PostgreSQL's rule that every `ORDER BY` expression of a
+`SELECT DISTINCT` also appear in the select list, otherwise rejecting it with
+`ErrorKind::Plan` / `SqlState::InvalidColumnReference` (`42P10`).
+`SELECT DISTINCT ON (...)` is parsed but currently rejected with
+`SqlState::FeatureNotSupported`.
 
 ## Plan-Time Simplification
 
@@ -387,6 +400,7 @@ pub enum PhysicalPlan {
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
     Projection { source: Box<PhysicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<PhysicalPlan>, order_by: Vec<BoundOrderByItem> },
+    Distinct { source: Box<PhysicalPlan>, on_keys: Vec<BoundExpr> },
     Limit { source: Box<PhysicalPlan>, count: u64, offset: Option<u64> },
     Aggregate {
         source: Box<PhysicalPlan>,
@@ -425,7 +439,7 @@ pub enum PhysicalPlan {
 
 The executor crate is not called for `EXPLAIN`.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 

@@ -12,8 +12,8 @@ use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
 use crate::ops::{
-    AggregateOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp, ProjectionOp,
-    SeqScanOp, SortOp, ValuesOp,
+    AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
+    ProjectionOp, SeqScanOp, SortOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -168,6 +168,10 @@ pub(crate) fn build_executor<'a>(
             build_executor(ctx, source)?,
             expressions.clone(),
             output_schema.clone(),
+        ))),
+        PhysicalPlan::Distinct { source, on_keys } => Ok(Box::new(DistinctOp::new(
+            build_executor(ctx, source)?,
+            on_keys.clone(),
         ))),
         PhysicalPlan::Sort { source, order_by } => Ok(Box::new(SortOp::new(
             build_executor(ctx, source)?,

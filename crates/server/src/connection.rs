@@ -1213,6 +1213,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::SyntaxError => "42601",
         SqlState::UndefinedTable => "42P01",
         SqlState::UndefinedColumn => "42703",
+        SqlState::InvalidColumnReference => "42P10",
         SqlState::DuplicateTable => "42P07",
         SqlState::DatatypeMismatch => "42804",
         SqlState::DivisionByZero => "22012",

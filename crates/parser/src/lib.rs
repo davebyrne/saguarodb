@@ -2,7 +2,7 @@ mod ast;
 mod convert;
 
 pub use ast::{
-    Assignment, BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, OrderByItem,
+    Assignment, BinOp, Distinct, Expr, FromItem, FunctionArg, InsertSource, JoinType, OrderByItem,
     SelectItem, SelectStatement, Statement, UnaryOp,
 };
 

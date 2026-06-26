@@ -61,6 +61,13 @@ pub enum LogicalPlan {
         source: Box<LogicalPlan>,
         order_by: Vec<BoundOrderByItem>,
     },
+    /// De-duplicate rows by `on_keys`, keeping the first row of each distinct
+    /// key in input order. For plain `SELECT DISTINCT`, `on_keys` are the output
+    /// (projection) expressions, so whole rows are de-duplicated.
+    Distinct {
+        source: Box<LogicalPlan>,
+        on_keys: Vec<BoundExpr>,
+    },
     Limit {
         source: Box<LogicalPlan>,
         count: u64,
@@ -217,15 +224,12 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             };
         }
 
-        plan = LogicalPlan::Projection {
-            source: Box::new(plan),
-            expressions: select
-                .columns
-                .iter()
-                .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
-                .collect::<Result<Vec<_>>>()?,
-            output_schema: select.output_schema.clone(),
-        };
+        let expressions = select
+            .columns
+            .iter()
+            .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
+            .collect::<Result<Vec<_>>>()?;
+        plan = apply_distinct_and_projection(plan, select, expressions);
     } else {
         if !select.order_by.is_empty() {
             plan = LogicalPlan::Sort {
@@ -234,15 +238,12 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             };
         }
 
-        plan = LogicalPlan::Projection {
-            source: Box::new(plan),
-            expressions: select
-                .columns
-                .iter()
-                .map(|item| item.expr.clone())
-                .collect(),
-            output_schema: select.output_schema.clone(),
-        };
+        let expressions = select
+            .columns
+            .iter()
+            .map(|item| item.expr.clone())
+            .collect();
+        plan = apply_distinct_and_projection(plan, select, expressions);
     }
 
     if let Some(limit) = select.limit {
@@ -260,6 +261,29 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
     }
 
     Ok(plan)
+}
+
+/// Stack the optional `Distinct` node below the `Projection`. `Distinct` sits
+/// between any `Sort` and the `Projection`, so that after sorting, keeping the
+/// first row per distinct key yields correctly ordered distinct output. For
+/// plain `SELECT DISTINCT` the dedup keys are the projection expressions, so
+/// whole output rows are compared.
+fn apply_distinct_and_projection(
+    mut plan: LogicalPlan,
+    select: &BoundSelect,
+    expressions: Vec<BoundExpr>,
+) -> LogicalPlan {
+    if select.distinct {
+        plan = LogicalPlan::Distinct {
+            source: Box::new(plan),
+            on_keys: expressions.clone(),
+        };
+    }
+    LogicalPlan::Projection {
+        source: Box::new(plan),
+        expressions,
+        output_schema: select.output_schema.clone(),
+    }
 }
 
 fn plan_select_source(select: &BoundSelect) -> Result<LogicalPlan> {

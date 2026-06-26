@@ -56,6 +56,10 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 })
                 .collect(),
         },
+        LogicalPlan::Distinct { source, on_keys } => LogicalPlan::Distinct {
+            source: Box::new(simplify_logical(*source)),
+            on_keys: on_keys.into_iter().map(fold_expr).collect(),
+        },
         LogicalPlan::Limit {
             source,
             count,

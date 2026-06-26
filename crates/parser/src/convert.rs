@@ -7,7 +7,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::{
-    Assignment, BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, OrderByItem,
+    Assignment, BinOp, Distinct, Expr, FromItem, FunctionArg, InsertSource, JoinType, OrderByItem,
     SelectItem, SelectStatement, Statement, UnaryOp,
 };
 
@@ -875,8 +875,7 @@ fn convert_select(
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> Result<SelectStatement> {
-    if select.distinct.is_some()
-        || select.top.is_some()
+    if select.top.is_some()
         || select.into.is_some()
         || !select.lateral_views.is_empty()
         || select.prewhere.is_some()
@@ -900,7 +899,16 @@ fn convert_select(
         }
     };
 
+    let distinct = match &select.distinct {
+        None => None,
+        Some(sql::Distinct::Distinct) => Some(Distinct::All),
+        Some(sql::Distinct::On(exprs)) => Some(Distinct::On(
+            exprs.iter().map(convert_expr).collect::<Result<Vec<_>>>()?,
+        )),
+    };
+
     Ok(SelectStatement {
+        distinct,
         columns: select
             .projection
             .iter()

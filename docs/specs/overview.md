@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms
+- SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -228,6 +228,7 @@ pub enum SqlState {
     SyntaxError,                // 42601
     UndefinedTable,             // 42P01
     UndefinedColumn,            // 42703
+    InvalidColumnReference,     // 42P10
     DuplicateTable,             // 42P07
     DatatypeMismatch,           // 42804
     DivisionByZero,             // 22012
@@ -569,6 +570,7 @@ pub struct Assignment {
 }
 
 pub struct SelectStatement {
+    pub distinct: Option<Distinct>,
     pub columns: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub filter: Option<Expr>,
@@ -577,6 +579,11 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+pub enum Distinct {
+    All,             // SELECT DISTINCT
+    On(Vec<Expr>),   // SELECT DISTINCT ON (expr, ...)
 }
 
 pub enum SelectItem {
@@ -652,7 +659,7 @@ pub enum UnaryOp {
 
 `FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 
-Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can reject it.
+Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can carry it through (e.g. `COUNT(DISTINCT x)`). `SelectStatement.distinct` records the optional `SELECT DISTINCT` / `DISTINCT ON (...)` modifier.
 
 ### Public API
 
@@ -711,6 +718,7 @@ pub enum BoundInsertSource {
 
 /// A fully bound SELECT — all names resolved, types checked, slots assigned.
 pub struct BoundSelect {
+    pub distinct: bool,  // plain SELECT DISTINCT
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,
@@ -879,6 +887,7 @@ pub enum LogicalPlan {
     Filter { source: Box<LogicalPlan>, predicate: BoundExpr },
     Projection { source: Box<LogicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<LogicalPlan>, order_by: Vec<BoundOrderByItem> },
+    Distinct { source: Box<LogicalPlan>, on_keys: Vec<BoundExpr> },
     Limit { source: Box<LogicalPlan>, count: u64, offset: Option<u64> },
     Aggregate {
         source: Box<LogicalPlan>,
@@ -914,7 +923,9 @@ pub struct BoundOrderByItem {
 
 Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls into `AggregateExpr` values and rewrites expressions above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values, so aggregate slot `i` is read as `LocalRef { slot: group_by.len() + i, ... }`. `AggregateCall` must not reach executor scalar evaluation.
 
-Aggregate `DISTINCT` is rejected with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
+Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
+
+Plain `SELECT DISTINCT` sets `BoundSelect.distinct`, and logical planning inserts a `Distinct` node between any `Sort` and the `Projection` whose `on_keys` are the projection expressions, so whole output rows are de-duplicated after ordering. For `SELECT DISTINCT`, every `ORDER BY` expression must also appear in the select list, otherwise the binder rejects it with `SqlState::InvalidColumnReference` (`42P10`). `SELECT DISTINCT ON (...)` is parsed but not yet supported.
 
 ### Phase 3: Physical Planner
 
@@ -956,6 +967,7 @@ pub enum PhysicalPlan {
     Filter { source: Box<PhysicalPlan>, predicate: BoundExpr },
     Projection { source: Box<PhysicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
     Sort { source: Box<PhysicalPlan>, order_by: Vec<BoundOrderByItem> },
+    Distinct { source: Box<PhysicalPlan>, on_keys: Vec<BoundExpr> },
     Limit { source: Box<PhysicalPlan>, count: u64, offset: Option<u64> },
     Aggregate {
         source: Box<PhysicalPlan>,
@@ -1071,6 +1083,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
 | `SortOp` | Materializes all input, sorts in memory, emits in order. Blocking operator. |
+| `DistinctOp` | Streams input, emitting the first row of each distinct `on_keys` tuple (tracked in a `BTreeSet`) and dropping the rest; NULL keys collapse together. Clears row identity. |
 | `LimitOp` | Stops pulling after N rows |
 | `AggregateOp` | Groups rows by key in a hash map, computes aggregates, emits results. Blocking operator. |
 

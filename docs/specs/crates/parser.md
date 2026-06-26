@@ -71,6 +71,7 @@ pub struct Assignment {
 }
 
 pub struct SelectStatement {
+    pub distinct: Option<Distinct>,
     pub columns: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub filter: Option<Expr>,
@@ -80,7 +81,16 @@ pub struct SelectStatement {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
+
+pub enum Distinct {
+    All,             // SELECT DISTINCT
+    On(Vec<Expr>),   // SELECT DISTINCT ON (expr, ...)
+}
 ```
+
+`distinct` records the optional `DISTINCT` modifier: `All` for plain
+`SELECT DISTINCT`, `On(exprs)` for `SELECT DISTINCT ON (exprs)`. The convert
+layer translates both; the binder handles `All` and currently rejects `On`.
 
 Identifiers remain strings in parser output. Name resolution is not a parser responsibility.
 
@@ -184,7 +194,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (SaguaroDB does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
 - `DROP INDEX name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
-- `SELECT` with projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
+- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but only a `SELECT` inner statement is accepted; any other inner statement is rejected as unsupported.

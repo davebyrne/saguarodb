@@ -102,6 +102,7 @@ pub struct Assignment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectStatement {
+    pub distinct: Option<Distinct>,
     pub columns: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub filter: Option<Expr>,
@@ -110,6 +111,15 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// The `DISTINCT` modifier on a `SELECT`. `All` is plain `SELECT DISTINCT`
+/// (de-duplicate whole output rows); `On` is the PostgreSQL `SELECT DISTINCT ON
+/// (expr, ...)` extension (keep the first row per key expression list).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Distinct {
+    All,
+    On(Vec<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

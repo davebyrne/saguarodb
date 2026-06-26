@@ -6,7 +6,7 @@ use common::{
     Result, SqlState, TableId, TableSchema, Value,
 };
 use parser::{
-    Assignment, Expr, FromItem, FunctionArg, InsertSource, OrderByItem, SelectItem,
+    Assignment, Distinct, Expr, FromItem, FunctionArg, InsertSource, OrderByItem, SelectItem,
     SelectStatement, Statement,
 };
 
@@ -328,6 +328,7 @@ fn bind_update(
         table: table.id,
         assignments: bound_assignments,
         source: BoundSelect {
+            distinct: false,
             columns: table_select_items(&table, &ctx.bindings[0]),
             from,
             filter: source_filter,
@@ -360,6 +361,7 @@ fn bind_delete(
     Ok(BoundStatement::Delete {
         table: table.id,
         source: BoundSelect {
+            distinct: false,
             columns: table_select_items(&table, &ctx.bindings[0]),
             from,
             filter: source_filter,
@@ -417,6 +419,7 @@ fn bind_select(
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     let order_by = bind_order_by(&mut ctx, &select.order_by, &columns)?;
+    let distinct = bind_distinct(select.distinct.as_ref(), &columns, &order_by)?;
 
     validate_aggregate_usage(&columns, &group_by, having.as_ref(), &order_by)?;
 
@@ -431,6 +434,7 @@ fn bind_select(
         .collect();
 
     Ok(BoundSelect {
+        distinct,
         columns,
         from,
         filter,
@@ -601,6 +605,36 @@ fn bind_order_by(
             })
         })
         .collect()
+}
+
+/// Resolve the `DISTINCT` modifier into a plain-distinct flag, enforcing
+/// PostgreSQL's `SELECT DISTINCT` / `ORDER BY` rule. `DISTINCT ON` is not
+/// supported yet.
+fn bind_distinct(
+    distinct: Option<&Distinct>,
+    columns: &[BoundSelectItem],
+    order_by: &[BoundOrderByItem],
+) -> Result<bool> {
+    match distinct {
+        None => Ok(false),
+        Some(Distinct::All) => {
+            // Every ORDER BY expression must also appear in the select list;
+            // otherwise the sort key is not part of the de-duplicated output.
+            for item in order_by {
+                if !columns.iter().any(|column| column.expr == item.expr) {
+                    return Err(plan_error(
+                        SqlState::InvalidColumnReference,
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in the select list",
+                    ));
+                }
+            }
+            Ok(true)
+        }
+        Some(Distinct::On(_)) => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "SELECT DISTINCT ON is not supported yet",
+        )),
+    }
 }
 
 /// Resolve a 1-based `ORDER BY` position into a zero-based output-column index.

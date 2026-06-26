@@ -75,6 +75,7 @@ impl QueryEngine {
 | `FilterOp` | Evaluates predicate, preserves identity |
 | `ProjectionOp` | Rewrites row values, preserves identity |
 | `SortOp` | Materializes all input, sorts in memory, preserves identity |
+| `DistinctOp` | Streams input, emitting the first row of each distinct `on_keys` tuple (tracked in a `BTreeSet`) and dropping later duplicates; NULL keys collapse together; clears identity |
 | `LimitOp` | Skips offset, emits count rows, preserves identity |
 | `AggregateOp` | Groups input by the `GROUP BY` expressions (a single group when there is none), emits one row per group, de-duplicates `DISTINCT` aggregate arguments, clears identity |
 | `ValuesOp` | Emits literal rows, identity is `None` |
@@ -83,7 +84,7 @@ impl QueryEngine {
 
 - Scans set `identity = Some(RowIdentity { row_id, key })`.
 - Filter, sort, limit, and projection preserve identity.
-- Join and aggregate clear identity.
+- Join, aggregate, and distinct clear identity.
 - `UPDATE` and `DELETE` require identity on each source row. If a plan produces a row without identity for DML, executor returns `ErrorKind::Internal`.
 
 ## Expression Evaluation

@@ -166,6 +166,7 @@ pub enum SqlState {
     SyntaxError,
     UndefinedTable,
     UndefinedColumn,
+    InvalidColumnReference,
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,

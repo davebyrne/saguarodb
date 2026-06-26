@@ -63,6 +63,8 @@ pub enum BoundInsertSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundSelect {
+    /// `true` for a plain `SELECT DISTINCT` (de-duplicate whole output rows).
+    pub distinct: bool,
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,

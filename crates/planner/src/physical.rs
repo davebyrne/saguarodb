@@ -80,6 +80,12 @@ pub enum PhysicalPlan {
         source: Box<PhysicalPlan>,
         order_by: Vec<BoundOrderByItem>,
     },
+    /// De-duplicate rows by `on_keys`, keeping the first row of each distinct
+    /// key in input order.
+    Distinct {
+        source: Box<PhysicalPlan>,
+        on_keys: Vec<BoundExpr>,
+    },
     Limit {
         source: Box<PhysicalPlan>,
         count: u64,
@@ -169,6 +175,10 @@ pub fn physical_plan(
         LogicalPlan::Sort { source, order_by } => Ok(PhysicalPlan::Sort {
             source: Box::new(physical_plan(source, catalog)?),
             order_by: order_by.clone(),
+        }),
+        LogicalPlan::Distinct { source, on_keys } => Ok(PhysicalPlan::Distinct {
+            source: Box::new(physical_plan(source, catalog)?),
+            on_keys: on_keys.clone(),
         }),
         LogicalPlan::Limit {
             source,
@@ -349,6 +359,7 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         }
         PhysicalPlan::Filter { source, .. }
         | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. } => output_width(source, catalog),
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }

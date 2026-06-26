@@ -609,6 +609,160 @@ async fn e2e_count_distinct_wildcard_is_rejected() {
 }
 
 #[tokio::test]
+async fn e2e_select_distinct_deduplicates_rows() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, region text, tier integer)")
+        .await
+        .unwrap();
+    for (id, region, tier) in [
+        (1, "west", "1"),
+        (2, "west", "1"),
+        (3, "west", "2"),
+        (4, "east", "1"),
+        (5, "east", "1"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, region, tier) values ({id}, '{region}', {tier})"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT over (region, tier) collapses the duplicate (west,1) and (east,1).
+    let rows = server
+        .simple_query("select distinct region, tier from t order by region, tier")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("east".to_string()), Some("1".to_string())],
+            vec![Some("west".to_string()), Some("1".to_string())],
+            vec![Some("west".to_string()), Some("2".to_string())],
+        ]
+    );
+
+    // DISTINCT over a single column.
+    let rows = server
+        .simple_query("select distinct region from t order by region")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("east".to_string())],
+            vec![Some("west".to_string())]
+        ]
+    );
+
+    // LIMIT applies to the distinct rows, not the pre-dedup rows.
+    let rows = server
+        .simple_query("select distinct region from t order by region limit 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("east".to_string())]]);
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_over_grouped_aggregate() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer)")
+        .await
+        .unwrap();
+    // Groups a=1 -> 2 rows, a=2 -> 2 rows, a=3 -> 1 row, so the per-group counts
+    // are {2, 2, 1}. This exercises DISTINCT over rewritten aggregate LocalRefs:
+    // the Distinct node sits above Aggregate/Sort and dedups the count outputs.
+    for (id, a) in [(1, "1"), (2, "1"), (3, "2"), (4, "2"), (5, "3")] {
+        server
+            .simple_query(&format!("insert into t (id, a) values ({id}, {a})"))
+            .await
+            .unwrap();
+    }
+
+    let rows = server
+        .simple_query("select distinct count(*) from t group by a order by count(*)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn e2e_explain_select_distinct_shows_distinct_node() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, region text)")
+        .await
+        .unwrap();
+
+    let explain = server
+        .simple_query("explain select distinct region from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("Distinct"),
+        "EXPLAIN output missing Distinct node: {:?}",
+        explain[0][0]
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_collapses_nulls() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table n (id integer primary key, v integer)")
+        .await
+        .unwrap();
+    for (id, v) in [(1, "null"), (2, "null"), (3, "5"), (4, "5")] {
+        server
+            .simple_query(&format!("insert into n (id, v) values ({id}, {v})"))
+            .await
+            .unwrap();
+    }
+
+    // Two NULLs are not distinct from each other: {NULL, 5}.
+    let mut rows = server
+        .simple_query("select distinct v from n")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    rows.sort();
+    assert_eq!(rows, vec![vec![None], vec![Some("5".to_string())]]);
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_rejects_order_by_outside_select_list() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer, b integer)")
+        .await
+        .unwrap();
+
+    // For SELECT DISTINCT, ORDER BY must reference the select list. `b` is not
+    // projected, so this is an invalid_column_reference (42P10).
+    let err = server
+        .simple_query("select distinct a from t order by b")
+        .await
+        .err()
+        .expect("expected ORDER BY outside select list to be rejected");
+    assert!(
+        err.message.contains("42P10"),
+        "expected invalid_column_reference, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
     let server = TestServer::start().await.unwrap();
     server

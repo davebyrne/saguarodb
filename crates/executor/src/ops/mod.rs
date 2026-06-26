@@ -1,4 +1,5 @@
 mod aggregate;
+mod distinct;
 mod dml;
 mod filter;
 mod join;
@@ -9,6 +10,7 @@ mod sort;
 mod values;
 
 pub use aggregate::AggregateOp;
+pub use distinct::DistinctOp;
 pub use filter::FilterOp;
 pub use join::HashJoinOp;
 pub use join::NestedLoopJoinOp;
