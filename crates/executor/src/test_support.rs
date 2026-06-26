@@ -1,7 +1,8 @@
 use catalog::{CatalogManager, MemoryCatalog};
 use common::{
-    ColumnInfo, DataType, DbError, IndexId, IndexSchema, Key, KeyRange, ParsedColumnDef, Result,
-    Row, RowId, SqlState, StatementContext, StoredRow, TableId, TableSchema, Value,
+    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexId, IndexSchema, Key, KeyRange,
+    ParsedColumnDef, Result, Row, RowId, SqlState, StatementContext, StoredRow, TableId,
+    TableSchema, Value,
 };
 use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
 use std::collections::BTreeMap;
@@ -10,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
-use crate::{ExecutionContext, ExecutionResult, QueryEngine};
+use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine};
 
 pub struct ExecutorHarness {
     catalog: MemoryCatalog,
@@ -92,6 +93,82 @@ impl ExecutorHarness {
             ExecutionResult::Query { rows, .. } => Ok(rows),
             _ => Err(common::DbError::internal("expected query result")),
         }
+    }
+
+    fn resolve_columns(&self, table: &str, columns: &[&str]) -> (TableId, Vec<ColumnId>) {
+        let schema = self.catalog.get_table_by_name(table).unwrap().unwrap();
+        let ids = if columns.is_empty() {
+            schema.columns.iter().map(|c| c.id).collect()
+        } else {
+            columns
+                .iter()
+                .map(|name| schema.columns.iter().find(|c| c.name == *name).unwrap().id)
+                .collect()
+        };
+        (schema.id, ids)
+    }
+
+    /// Run a `COPY FROM` over the given chunks in one (committed) transaction,
+    /// returning the rows inserted. `columns` empty means all columns.
+    pub fn copy_in(
+        &self,
+        table: &str,
+        columns: &[&str],
+        options: CopyOptions,
+        chunks: &[&[u8]],
+    ) -> Result<u64> {
+        let (table_id, column_ids) = self.resolve_columns(table, columns);
+        let cancel = AtomicBool::new(false);
+        let statement = StatementContext::new(1);
+        let txn_id = statement.txn_id;
+        let ctx = ExecutionContext {
+            statement,
+            catalog: &self.catalog,
+            storage: &self.storage,
+            schema_ops: &self.storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
+            cancel: &cancel,
+        };
+        let result = (|| {
+            let mut copy_in = CopyIn::new(&ctx, table_id, column_ids, options)?;
+            for chunk in chunks {
+                copy_in.push_chunk(chunk)?;
+            }
+            copy_in.finish()
+        })();
+        match result {
+            Ok(count) => {
+                self.storage.commit_txn(txn_id)?;
+                Ok(count)
+            }
+            Err(err) => {
+                let _ = self.storage.rollback_txn(txn_id);
+                Err(err)
+            }
+        }
+    }
+
+    /// Run a `COPY TO`, returning the full wire byte stream (header + rows).
+    pub fn copy_out(&self, table: &str, columns: &[&str], options: CopyOptions) -> Result<Vec<u8>> {
+        let (table_id, column_ids) = self.resolve_columns(table, columns);
+        let cancel = AtomicBool::new(false);
+        let ctx = ExecutionContext {
+            statement: StatementContext::new(0),
+            catalog: &self.catalog,
+            storage: &self.storage,
+            schema_ops: &self.storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
+            cancel: &cancel,
+        };
+        let mut out = CopyOut::new(&ctx, table_id, &column_ids, options)?;
+        let mut bytes = Vec::new();
+        if let Some(header) = out.header_line() {
+            bytes.extend(header);
+        }
+        while let Some(row) = out.next_row()? {
+            bytes.extend(row);
+        }
+        Ok(bytes)
     }
 }
 

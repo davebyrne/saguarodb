@@ -302,10 +302,11 @@ transferred, matching PostgreSQL.
   carrying `direction`/`options`). `COPY` is not lowered by `logical_plan`
   (which rejects it); the server drives both directions directly over the
   storage scan/insert paths.
-- `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), the COPY FROM
-  row-insert routine, and the COPY TO row-producer; reuses
-  `validate_value_type`/`validate_not_null`, `storage.insert`, and the scan/
-  projection operators.
+- `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), plus the
+  `CopyIn` row-insert driver and the `CopyOut` row-producer. `CopyIn` reuses the
+  shared INSERT row mapping (`validate_value_type`/`validate_not_null` →
+  `storage.insert`); `CopyOut` scans via `storage.scan` and projects the COPY
+  columns by slot.
 - `server`: the COPY connection state machine, channels, transaction
   integration, command tag, and rejection of unsupported forms / extended-protocol
   COPY.

@@ -2,13 +2,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    ColumnId, ColumnInfo, DataType, DbError, ExecRow, IndexId, ParsedColumnDef, Result, Row,
-    SqlState, StatementContext, TableId, TableSchema, Value,
+    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, ParsedColumnDef,
+    Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
 };
 use planner::PhysicalPlan;
-use storage::{SchemaOperations, StorageEngine};
+use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
+use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
 use crate::ops::{
     AggregateOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp, ProjectionOp,
@@ -246,14 +247,7 @@ fn execute_insert(
                 "INSERT source produced the wrong number of values",
             ));
         }
-        let mut values = vec![Value::Null; schema.columns.len()];
-        for (column, value) in columns.iter().zip(source_row.row.values) {
-            let slot = column_slot(&schema, *column)?;
-            validate_value_type(&schema.columns[slot], &value)?;
-            values[slot] = value;
-        }
-        validate_not_null(&schema, &values)?;
-        ctx.storage.insert(&ctx.statement, table, Row { values })?;
+        map_and_insert_row(ctx, table, &schema, columns, source_row.row.values)?;
         count += 1;
     }
 
@@ -261,6 +255,148 @@ fn execute_insert(
         command: "INSERT".to_string(),
         count,
     })
+}
+
+/// Map a row's `columns`-ordered values onto a full table row (NULL for omitted
+/// columns), validate types and NOT NULL, and insert. Shared by INSERT and the
+/// COPY FROM path. Callers guarantee `values.len() == columns.len()`.
+pub(crate) fn map_and_insert_row(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    schema: &TableSchema,
+    columns: &[ColumnId],
+    values: Vec<Value>,
+) -> Result<()> {
+    debug_assert_eq!(values.len(), columns.len());
+    let mut full = vec![Value::Null; schema.columns.len()];
+    for (column, value) in columns.iter().zip(values) {
+        let slot = column_slot(schema, *column)?;
+        validate_value_type(&schema.columns[slot], &value)?;
+        full[slot] = value;
+    }
+    validate_not_null(schema, &full)?;
+    ctx.storage
+        .insert(&ctx.statement, table, Row { values: full })?;
+    Ok(())
+}
+
+/// Drives `COPY <table> [(cols)] FROM STDIN`: parses streamed bytes into rows and
+/// inserts them through the shared insert path. The server feeds chunks as
+/// `CopyData` arrives and calls [`CopyIn::finish`] on `CopyDone`; the whole COPY
+/// runs in one transaction (the server owns the txn/guard and commit).
+pub struct CopyIn<'a> {
+    ctx: &'a ExecutionContext<'a>,
+    table: TableId,
+    schema: TableSchema,
+    columns: Vec<ColumnId>,
+    parser: CopyParser,
+    count: u64,
+}
+
+impl<'a> CopyIn<'a> {
+    pub fn new(
+        ctx: &'a ExecutionContext<'a>,
+        table: TableId,
+        columns: Vec<ColumnId>,
+        options: CopyOptions,
+    ) -> Result<Self> {
+        let schema = require_table(ctx.catalog, table)?;
+        let column_types = columns
+            .iter()
+            .map(|column| {
+                Ok(schema.columns[column_slot(&schema, *column)?]
+                    .data_type
+                    .clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            ctx,
+            table,
+            schema,
+            columns,
+            parser: CopyParser::new(column_types, options),
+            count: 0,
+        })
+    }
+
+    /// Parse and insert every row completed by `chunk`.
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        check_canceled(self.ctx)?;
+        for row in self.parser.push(chunk)? {
+            map_and_insert_row(self.ctx, self.table, &self.schema, &self.columns, row)?;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    /// Flush the trailing record (if any) and return the total rows inserted.
+    pub fn finish(mut self) -> Result<u64> {
+        for row in self.parser.finish()? {
+            map_and_insert_row(self.ctx, self.table, &self.schema, &self.columns, row)?;
+            self.count += 1;
+        }
+        Ok(self.count)
+    }
+}
+
+/// Drives `COPY <table> [(cols)] TO STDOUT`: scans the table and projects the COPY
+/// columns, rendering each row to wire bytes. Owns its scan iterator, so the
+/// server can move it into the producer task; the server batches the rows into
+/// `CopyData` frames.
+pub struct CopyOut {
+    iter: Box<dyn RowIterator>,
+    slots: Vec<usize>,
+    options: CopyOptions,
+    column_names: Vec<String>,
+}
+
+impl CopyOut {
+    pub fn new(
+        ctx: &ExecutionContext<'_>,
+        table: TableId,
+        columns: &[ColumnId],
+        options: CopyOptions,
+    ) -> Result<Self> {
+        let schema = require_table(ctx.catalog, table)?;
+        let mut slots = Vec::with_capacity(columns.len());
+        let mut column_names = Vec::with_capacity(columns.len());
+        for column in columns {
+            let slot = column_slot(&schema, *column)?;
+            slots.push(slot);
+            column_names.push(schema.columns[slot].name.clone());
+        }
+        let iter = ctx.storage.scan(&ctx.statement, table)?;
+        Ok(Self {
+            iter,
+            slots,
+            options,
+            column_names,
+        })
+    }
+
+    /// The `HEADER` line, or `None` when `HEADER` is off.
+    pub fn header_line(&self) -> Option<Vec<u8>> {
+        if !self.options.header {
+            return None;
+        }
+        let names: Vec<&str> = self.column_names.iter().map(String::as_str).collect();
+        Some(format_header(&names, &self.options))
+    }
+
+    /// Render the next row's wire bytes, or `None` at end of scan.
+    pub fn next_row(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.iter.next()? {
+            Some(stored) => {
+                let values: Vec<Value> = self
+                    .slots
+                    .iter()
+                    .map(|&slot| stored.row.values[slot].clone())
+                    .collect();
+                Ok(Some(format_row(&values, &self.options)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 fn execute_update(

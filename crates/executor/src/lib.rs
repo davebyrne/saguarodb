@@ -10,15 +10,15 @@ pub mod test_support;
 
 pub use common::{ExecRow, RowIdentity};
 pub use expr::eval_expr;
-pub use query::{ExecutionContext, PlanExecutor, QueryEngine};
+pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine};
 pub use result::ExecutionResult;
 
 #[cfg(test)]
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
-        ColumnInfo, DataType, ExecRow, Key, ParsedColumnDef, Row, RowId, RowIdentity, SqlState,
-        StatementContext, Value,
+        ColumnInfo, CopyFormat, CopyOptions, DataType, ExecRow, Key, ParsedColumnDef, Row, RowId,
+        RowIdentity, SqlState, StatementContext, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -939,5 +939,98 @@ mod tests {
         harness
             .execute("insert into accounts (id, owner) values (20, 'Linus')")
             .unwrap();
+    }
+
+    fn text_opts() -> CopyOptions {
+        CopyOptions::defaults_for(CopyFormat::Text)
+    }
+
+    fn csv_opts() -> CopyOptions {
+        CopyOptions::defaults_for(CopyFormat::Csv)
+    }
+
+    #[test]
+    fn copy_in_inserts_rows_through_the_insert_path() {
+        let harness = ExecutorHarness::with_users();
+        let count = harness
+            .copy_in("users", &[], text_opts(), &[b"3\tcarol\n4\t\\N\n"])
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            harness
+                .select_rows("select id, name from users order by id")
+                .unwrap(),
+            vec![
+                Row {
+                    values: vec![Value::Integer(3), Value::Text("carol".to_string())]
+                },
+                Row {
+                    values: vec![Value::Integer(4), Value::Null]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_in_csv_skips_header_and_streams_across_chunks() {
+        let harness = ExecutorHarness::with_users();
+        let mut options = csv_opts();
+        options.header = true;
+        // The single data row is split across two chunks; the header is dropped.
+        let count = harness
+            .copy_in("users", &[], options, &[b"id,name\n5,da", b"ve\n"])
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            harness
+                .select_rows("select name from users where id = 5")
+                .unwrap(),
+            vec![Row {
+                values: vec![Value::Text("dave".to_string())]
+            }]
+        );
+    }
+
+    #[test]
+    fn copy_in_aborts_and_rolls_back_on_bad_value() {
+        let harness = ExecutorHarness::with_users();
+        let err = harness
+            .copy_in("users", &[], text_opts(), &[b"1\tann\nnope\tbob\n"])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidTextRepresentation);
+        // The whole COPY aborted: the first row was rolled back too.
+        assert!(
+            harness
+                .select_rows("select id from users")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn copy_out_projects_columns_and_round_trips() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'ann'), (2, 'bob')")
+            .unwrap();
+
+        // Whole table, CSV with header, in primary-key order.
+        assert_eq!(
+            harness.copy_out("users", &[], csv_opts()).unwrap(),
+            b"1,ann\n2,bob\n"
+        );
+        let mut with_header = csv_opts();
+        with_header.header = true;
+        assert_eq!(
+            harness.copy_out("users", &[], with_header).unwrap(),
+            b"id,name\n1,ann\n2,bob\n"
+        );
+        // Column subset / reorder.
+        assert_eq!(
+            harness
+                .copy_out("users", &["name", "id"], text_opts())
+                .unwrap(),
+            b"ann\t1\nbob\t2\n"
+        );
     }
 }
