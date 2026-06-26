@@ -90,7 +90,7 @@ pub enum Distinct {
 
 `distinct` records the optional `DISTINCT` modifier: `All` for plain
 `SELECT DISTINCT`, `On(exprs)` for `SELECT DISTINCT ON (exprs)`. The convert
-layer translates both; the binder handles `All` and currently rejects `On`.
+layer translates both forms; the binder binds and validates each.
 
 Identifiers remain strings in parser output. Name resolution is not a parser responsibility.
 

@@ -11,8 +11,8 @@ use parser::{
 };
 
 use crate::{
-    AggregateFunc, BinOp, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem, BoundSelect,
-    BoundSelectItem, BoundStatement, JoinType, UnaryOp,
+    AggregateFunc, BinOp, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem,
+    BoundSelect, BoundSelectItem, BoundStatement, JoinType, UnaryOp,
 };
 
 #[derive(Clone, Debug)]
@@ -328,7 +328,7 @@ fn bind_update(
         table: table.id,
         assignments: bound_assignments,
         source: BoundSelect {
-            distinct: false,
+            distinct: None,
             columns: table_select_items(&table, &ctx.bindings[0]),
             from,
             filter: source_filter,
@@ -361,7 +361,7 @@ fn bind_delete(
     Ok(BoundStatement::Delete {
         table: table.id,
         source: BoundSelect {
-            distinct: false,
+            distinct: None,
             columns: table_select_items(&table, &ctx.bindings[0]),
             from,
             filter: source_filter,
@@ -419,9 +419,19 @@ fn bind_select(
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
     let order_by = bind_order_by(&mut ctx, &select.order_by, &columns)?;
-    let distinct = bind_distinct(select.distinct.as_ref(), &columns, &order_by)?;
+    let distinct = bind_distinct(&mut ctx, select.distinct.as_ref(), &columns, &order_by)?;
 
-    validate_aggregate_usage(&columns, &group_by, having.as_ref(), &order_by)?;
+    let distinct_on_keys = match &distinct {
+        Some(BoundDistinct::On(keys)) => keys.as_slice(),
+        _ => &[],
+    };
+    validate_aggregate_usage(
+        &columns,
+        &group_by,
+        having.as_ref(),
+        &order_by,
+        distinct_on_keys,
+    )?;
 
     let output_schema = columns
         .iter()
@@ -607,16 +617,18 @@ fn bind_order_by(
         .collect()
 }
 
-/// Resolve the `DISTINCT` modifier into a plain-distinct flag, enforcing
-/// PostgreSQL's `SELECT DISTINCT` / `ORDER BY` rule. `DISTINCT ON` is not
-/// supported yet.
+/// Resolve and validate the `DISTINCT` modifier. Plain `SELECT DISTINCT`
+/// requires each `ORDER BY` expression to be in the select list; `DISTINCT ON`
+/// binds its key expressions and requires them to match the leading `ORDER BY`
+/// expressions.
 fn bind_distinct(
+    ctx: &mut BindContext,
     distinct: Option<&Distinct>,
     columns: &[BoundSelectItem],
     order_by: &[BoundOrderByItem],
-) -> Result<bool> {
+) -> Result<Option<BoundDistinct>> {
     match distinct {
-        None => Ok(false),
+        None => Ok(None),
         Some(Distinct::All) => {
             // Every ORDER BY expression must also appear in the select list;
             // otherwise the sort key is not part of the de-duplicated output.
@@ -628,13 +640,60 @@ fn bind_distinct(
                     ));
                 }
             }
-            Ok(true)
+            Ok(Some(BoundDistinct::All))
         }
-        Some(Distinct::On(_)) => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "SELECT DISTINCT ON is not supported yet",
-        )),
+        Some(Distinct::On(exprs)) => {
+            let on = exprs
+                .iter()
+                .map(|expr| {
+                    let bound = bind_expr(ctx, expr, None)?;
+                    reject_aggregate(&bound)?;
+                    Ok(bound)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_distinct_on_order_by(&on, order_by)?;
+            Ok(Some(BoundDistinct::On(on)))
+        }
     }
+}
+
+/// PostgreSQL requires every `ORDER BY` expression that precedes a non-key sort
+/// expression to be a `DISTINCT ON` key, so the ordering does not split a key's
+/// group before de-duplication. Scanning `ORDER BY` left to right, once a sort
+/// expression is not a `DISTINCT ON` key, all *distinct* keys must already have
+/// been seen. Keys absent from `ORDER BY` are allowed (their intra-key order is
+/// then unspecified, as in PostgreSQL). PostgreSQL de-duplicates both the key
+/// list and the sort list first, so a repeated `DISTINCT ON` key or `ORDER BY`
+/// column counts once. With no `ORDER BY` the kept row per key is unspecified,
+/// so no constraint applies.
+fn validate_distinct_on_order_by(on: &[BoundExpr], order_by: &[BoundOrderByItem]) -> Result<()> {
+    let mut distinct_keys: Vec<&BoundExpr> = Vec::new();
+    for key in on {
+        if !distinct_keys.contains(&key) {
+            distinct_keys.push(key);
+        }
+    }
+
+    let mut matched_keys: Vec<&BoundExpr> = Vec::new();
+    for item in order_by {
+        match on.iter().find(|key| **key == item.expr) {
+            Some(key) => {
+                if !matched_keys.contains(&key) {
+                    matched_keys.push(key);
+                }
+            }
+            None => {
+                if matched_keys.len() < distinct_keys.len() {
+                    return Err(plan_error(
+                        SqlState::InvalidColumnReference,
+                        "SELECT DISTINCT ON expressions must match the leading ORDER BY expressions",
+                    ));
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a 1-based `ORDER BY` position into a zero-based output-column index.
@@ -1302,7 +1361,11 @@ fn validate_aggregate_usage(
     group_by: &[BoundExpr],
     having: Option<&BoundExpr>,
     order_by: &[BoundOrderByItem],
+    distinct_on: &[BoundExpr],
 ) -> Result<()> {
+    // `DISTINCT ON` keys do not themselves induce aggregation (matching
+    // PostgreSQL), but in an aggregate query they are subject to the same
+    // grouped-expression rule as the select list and ORDER BY.
     let aggregate_context = !group_by.is_empty()
         || columns.iter().any(|item| contains_aggregate(&item.expr))
         || having.is_some()
@@ -1320,6 +1383,9 @@ fn validate_aggregate_usage(
     }
     for item in order_by {
         validate_grouped_expr(&item.expr, group_by)?;
+    }
+    for expr in distinct_on {
+        validate_grouped_expr(expr, group_by)?;
     }
     Ok(())
 }

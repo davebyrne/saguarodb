@@ -1,8 +1,8 @@
 use common::{ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, TableId};
 
 use crate::{
-    AggregateExpr, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem, BoundSelect,
-    BoundStatement, JoinType,
+    AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem,
+    BoundSelect, BoundStatement, JoinType,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,7 +229,19 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             .iter()
             .map(|item| rewrite_aggregate_expr(&item.expr, &select.group_by, &aggregates))
             .collect::<Result<Vec<_>>>()?;
-        plan = apply_distinct_and_projection(plan, select, expressions);
+        // DISTINCT ON keys may reference grouped columns (the binder rejects
+        // aggregates in them), so they get the same grouped-expression rewrite
+        // as the projection expressions.
+        let distinct_keys = match &select.distinct {
+            None => None,
+            Some(BoundDistinct::All) => Some(expressions.clone()),
+            Some(BoundDistinct::On(on)) => Some(
+                on.iter()
+                    .map(|expr| rewrite_aggregate_expr(expr, &select.group_by, &aggregates))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
+        plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     } else {
         if !select.order_by.is_empty() {
             plan = LogicalPlan::Sort {
@@ -238,12 +250,17 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             };
         }
 
-        let expressions = select
+        let expressions: Vec<BoundExpr> = select
             .columns
             .iter()
             .map(|item| item.expr.clone())
             .collect();
-        plan = apply_distinct_and_projection(plan, select, expressions);
+        let distinct_keys = match &select.distinct {
+            None => None,
+            Some(BoundDistinct::All) => Some(expressions.clone()),
+            Some(BoundDistinct::On(on)) => Some(on.clone()),
+        };
+        plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     }
 
     if let Some(limit) = select.limit {
@@ -266,17 +283,18 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
 /// Stack the optional `Distinct` node below the `Projection`. `Distinct` sits
 /// between any `Sort` and the `Projection`, so that after sorting, keeping the
 /// first row per distinct key yields correctly ordered distinct output. For
-/// plain `SELECT DISTINCT` the dedup keys are the projection expressions, so
-/// whole output rows are compared.
+/// plain `SELECT DISTINCT` the dedup keys are the projection expressions (whole
+/// output rows); for `DISTINCT ON` they are the `ON` key expressions.
 fn apply_distinct_and_projection(
     mut plan: LogicalPlan,
     select: &BoundSelect,
+    distinct_keys: Option<Vec<BoundExpr>>,
     expressions: Vec<BoundExpr>,
 ) -> LogicalPlan {
-    if select.distinct {
+    if let Some(on_keys) = distinct_keys {
         plan = LogicalPlan::Distinct {
             source: Box::new(plan),
-            on_keys: expressions.clone(),
+            on_keys,
         };
     }
     LogicalPlan::Projection {

@@ -92,7 +92,7 @@ pub enum BoundInsertSource {
 }
 
 pub struct BoundSelect {
-    pub distinct: bool,
+    pub distinct: Option<BoundDistinct>,  // All | On(keys)
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,
@@ -102,6 +102,11 @@ pub struct BoundSelect {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub output_schema: Vec<ColumnInfo>,
+}
+
+pub enum BoundDistinct {
+    All,                  // SELECT DISTINCT
+    On(Vec<BoundExpr>),   // SELECT DISTINCT ON (exprs)
 }
 
 pub struct BoundSelectItem {
@@ -335,16 +340,27 @@ pub enum LogicalPlan {
 
 Logical plan contains no access method choices.
 
-For a plain `SELECT DISTINCT` (`BoundSelect.distinct`), logical planning inserts
-a `Distinct` node between any `Sort` and the `Projection`. Its `on_keys` are the
-projection expressions, so whole output rows are de-duplicated; placing it after
-the `Sort` means keeping the first row of each distinct key preserves the
-requested ordering, and the later `Limit` applies to the distinct rows. The
-binder enforces PostgreSQL's rule that every `ORDER BY` expression of a
-`SELECT DISTINCT` also appear in the select list, otherwise rejecting it with
-`ErrorKind::Plan` / `SqlState::InvalidColumnReference` (`42P10`).
-`SELECT DISTINCT ON (...)` is parsed but currently rejected with
-`SqlState::FeatureNotSupported`.
+For a `SELECT DISTINCT` (`BoundSelect.distinct`), logical planning inserts a
+`Distinct` node between any `Sort` and the `Projection`, so keeping the first
+row of each distinct key preserves the requested ordering and the later `Limit`
+applies to the distinct rows. The `on_keys` depend on the form:
+
+- `All` (plain `SELECT DISTINCT`): the projection expressions, so whole output
+  rows are de-duplicated. The binder enforces PostgreSQL's rule that every
+  `ORDER BY` expression also appears in the select list, otherwise rejecting it
+  with `ErrorKind::Plan` / `SqlState::InvalidColumnReference` (`42P10`).
+- `On(keys)` (`SELECT DISTINCT ON (keys)`): the bound `keys`, so the first row
+  per key is kept. The binder rejects aggregates inside the keys, and requires
+  each leading `ORDER BY` expression (up to the number of keys) to be one of the
+  keys — keys absent from `ORDER BY` are allowed — otherwise
+  `InvalidColumnReference` (`42P10`). With no `ORDER BY` the kept row per key is
+  unspecified.
+
+In an aggregate query the `DISTINCT ON` keys are subject to the same
+grouped-expression rule as the select list and `ORDER BY` (a non-grouped,
+non-aggregate key is rejected with `SqlState::DatatypeMismatch`), and the
+`on_keys` receive the same group rewrite as the projection expressions so they
+read the `Aggregate` output.
 
 ## Plan-Time Simplification
 

@@ -717,8 +717,13 @@ pub enum BoundInsertSource {
 }
 
 /// A fully bound SELECT — all names resolved, types checked, slots assigned.
+pub enum BoundDistinct {
+    All,                  // SELECT DISTINCT
+    On(Vec<BoundExpr>),   // SELECT DISTINCT ON (exprs)
+}
+
 pub struct BoundSelect {
-    pub distinct: bool,  // plain SELECT DISTINCT
+    pub distinct: Option<BoundDistinct>,
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,
@@ -925,7 +930,7 @@ Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, 
 
 Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
 
-Plain `SELECT DISTINCT` sets `BoundSelect.distinct`, and logical planning inserts a `Distinct` node between any `Sort` and the `Projection` whose `on_keys` are the projection expressions, so whole output rows are de-duplicated after ordering. For `SELECT DISTINCT`, every `ORDER BY` expression must also appear in the select list, otherwise the binder rejects it with `SqlState::InvalidColumnReference` (`42P10`). `SELECT DISTINCT ON (...)` is parsed but not yet supported.
+`SELECT DISTINCT` sets `BoundSelect.distinct`, and logical planning inserts a `Distinct` node between any `Sort` and the `Projection`, so whole output rows (plain `DISTINCT`) or the first row per key (`DISTINCT ON`) survive after ordering. For plain `SELECT DISTINCT`, every `ORDER BY` expression must also appear in the select list. For `SELECT DISTINCT ON (keys)`, the `Distinct` node's `on_keys` are the bound key expressions, the binder rejects aggregates in the keys, and each leading `ORDER BY` expression (up to the number of keys) must be one of the keys (keys absent from `ORDER BY` are allowed). Both violations are rejected with `SqlState::InvalidColumnReference` (`42P10`).
 
 ### Phase 3: Physical Planner
 

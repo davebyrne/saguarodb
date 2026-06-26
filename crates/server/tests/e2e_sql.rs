@@ -669,6 +669,255 @@ async fn e2e_select_distinct_deduplicates_rows() {
 }
 
 #[tokio::test]
+async fn e2e_select_distinct_on_keeps_first_row_per_key() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table orders (id integer primary key, customer text, amount integer)")
+        .await
+        .unwrap();
+    for (id, customer, amount) in [
+        (1, "ada", "10"),
+        (2, "ada", "30"),
+        (3, "ada", "20"),
+        (4, "bob", "5"),
+        (5, "bob", "15"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into orders (id, customer, amount) values ({id}, '{customer}', {amount})"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON (customer) keeps the first row per customer in ORDER BY order,
+    // which (amount DESC) is the highest amount per customer.
+    let rows = server
+        .simple_query(
+            "select distinct on (customer) customer, amount from orders \
+             order by customer, amount desc",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("ada".to_string()), Some("30".to_string())],
+            vec![Some("bob".to_string()), Some("15".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_without_order_by_yields_one_row_per_key() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table orders (id integer primary key, customer text)")
+        .await
+        .unwrap();
+    for (id, customer) in [(1, "ada"), (2, "ada"), (3, "bob")] {
+        server
+            .simple_query(&format!(
+                "insert into orders (id, customer) values ({id}, '{customer}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON without ORDER BY keeps an arbitrary row per key: one per customer.
+    let mut rows = server
+        .simple_query("select distinct on (customer) customer from orders")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![vec![Some("ada".to_string())], vec![Some("bob".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_requires_matching_leading_order_by() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table orders (id integer primary key, customer text, amount integer)")
+        .await
+        .unwrap();
+
+    // ORDER BY must lead with the DISTINCT ON expressions; ordering by amount
+    // first does not match DISTINCT ON (customer) => 42P10.
+    let err = server
+        .simple_query("select distinct on (customer) customer, amount from orders order by amount")
+        .await
+        .err()
+        .expect("expected DISTINCT ON not matching leading ORDER BY to be rejected");
+    assert!(
+        err.message.contains("42P10"),
+        "expected invalid_column_reference, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_non_grouped_key_in_aggregate_query_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table sales (id integer primary key, customer text, region text, amount integer)",
+        )
+        .await
+        .unwrap();
+    for (id, customer, region, amount) in [
+        (1, "ada", "east", "10"),
+        (2, "ada", "west", "20"),
+        (3, "bob", "east", "5"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into sales (id, customer, region, amount) \
+                 values ({id}, '{customer}', '{region}', {amount})"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON (id) in a GROUP BY query references a column that is neither
+    // grouped nor aggregated. This must be a clean GROUP BY error, never a
+    // silently wrong (row-dropping) result.
+    let err = server
+        .simple_query(
+            "select distinct on (id) customer, region, count(*) from sales \
+             group by customer, region",
+        )
+        .await
+        .err()
+        .expect("DISTINCT ON of a non-grouped column in an aggregate query must be rejected");
+    assert!(
+        err.message.to_lowercase().contains("group by"),
+        "expected a GROUP BY error, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_grouped_key_in_aggregate_query() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer)")
+        .await
+        .unwrap();
+    for (id, a) in [(1, "1"), (2, "1"), (3, "2")] {
+        server
+            .simple_query(&format!("insert into t (id, a) values ({id}, {a})"))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON a grouped column is valid: each group already has a unique a,
+    // so all groups survive (a=1 -> count 2, a=2 -> count 1).
+    let rows = server
+        .simple_query("select distinct on (a) a, count(*) from t group by a order by a")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("2".to_string())],
+            vec![Some("2".to_string()), Some("1".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_duplicate_key_is_accepted() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer, c integer)")
+        .await
+        .unwrap();
+    for (id, a, c) in [(1, "1", "10"), (2, "1", "20"), (3, "2", "30")] {
+        server
+            .simple_query(&format!("insert into t (id, a, c) values ({id}, {a}, {c})"))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON (a, a) is degenerate but valid: PostgreSQL de-duplicates the
+    // key list, so it is DISTINCT ON (a). ORDER BY a, c is accepted (the single
+    // distinct key a leads), keeping the lowest c per a.
+    let rows = server
+        .simple_query("select distinct on (a, a) a, c from t order by a, c")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("10".to_string())],
+            vec![Some("2".to_string()), Some("30".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_rejects_non_key_before_all_keys_even_with_duplicate() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer, b integer, c integer)")
+        .await
+        .unwrap();
+
+    // ORDER BY a, a, c: the repeated `a` counts once, so the non-key `c` appears
+    // before the key `b` is ordered. PostgreSQL rejects this; so must we (42P10).
+    let err = server
+        .simple_query("select distinct on (a, b) a, b, c from t order by a, a, c")
+        .await
+        .err()
+        .expect("a non-key ORDER BY expr before all DISTINCT ON keys must be rejected");
+    assert!(
+        err.message.contains("42P10"),
+        "expected invalid_column_reference, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_select_distinct_on_more_keys_than_order_by_is_accepted() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a integer, b integer)")
+        .await
+        .unwrap();
+    for (id, a, b) in [(1, "1", "1"), (2, "1", "2"), (3, "2", "1"), (4, "1", "1")] {
+        server
+            .simple_query(&format!("insert into t (id, a, b) values ({id}, {a}, {b})"))
+            .await
+            .unwrap();
+    }
+
+    // DISTINCT ON (a, b) with ORDER BY a alone is accepted (matches PostgreSQL):
+    // a leading ORDER BY expression that is a DISTINCT ON key is enough; ON keys
+    // absent from ORDER BY are allowed. One row survives per distinct (a, b).
+    let mut rows = server
+        .simple_query("select distinct on (a, b) a, b from t order by a")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("1".to_string())],
+            vec![Some("1".to_string()), Some("2".to_string())],
+            vec![Some("2".to_string()), Some("1".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn e2e_select_distinct_over_grouped_aggregate() {
     let server = TestServer::start().await.unwrap();
     server

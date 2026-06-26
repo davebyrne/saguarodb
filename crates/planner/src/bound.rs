@@ -63,8 +63,8 @@ pub enum BoundInsertSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundSelect {
-    /// `true` for a plain `SELECT DISTINCT` (de-duplicate whole output rows).
-    pub distinct: bool,
+    /// The `DISTINCT` modifier, or `None` for no de-duplication.
+    pub distinct: Option<BoundDistinct>,
     pub columns: Vec<BoundSelectItem>,
     pub from: BoundFrom,
     pub filter: Option<BoundExpr>,
@@ -74,6 +74,14 @@ pub struct BoundSelect {
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub output_schema: Vec<ColumnInfo>,
+}
+
+/// The bound `DISTINCT` modifier. `All` de-duplicates whole output rows;
+/// `On(exprs)` keeps the first row per `exprs` key (`SELECT DISTINCT ON`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundDistinct {
+    All,
+    On(Vec<BoundExpr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -8,7 +8,9 @@ mod physical;
 mod simplify;
 
 pub use binder::{bind, bind_parameterized};
-pub use bound::{BoundFrom, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement};
+pub use bound::{
+    BoundDistinct, BoundFrom, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement,
+};
 pub use explain::format_explain;
 pub use expr::{
     AggregateExpr, AggregateFunc, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
