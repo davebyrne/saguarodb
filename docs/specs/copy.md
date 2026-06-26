@@ -40,9 +40,10 @@ protocol. It reuses the normal MVCC write path (`COPY FROM`) and scan path
 - COPY through the extended query protocol (`Parse`/`Bind`/`Execute`)
   (`FeatureNotSupported`) — matches PostgreSQL, which only allows COPY via a
   simple `Query`.
-- Unknown table (`UndefinedTable`, `42P01`), unknown / duplicate columns
-  (`UndefinedColumn`, `42703`), unknown options or option type errors
-  (`SyntaxError`/`FeatureNotSupported`).
+- Unknown table (`UndefinedTable`, `42P01`), unknown columns
+  (`UndefinedColumn`, `42703`), a duplicate column in the list
+  (`DatatypeMismatch`, `42804`, matching the INSERT column resolver), unknown
+  options or option type errors (`SyntaxError`/`FeatureNotSupported`).
 
 ## 2. Grammar
 
@@ -297,10 +298,10 @@ transferred, matching PostgreSQL.
 - `protocol`: COPY client/server messages and their codec encode/decode.
 - `parser`: `Statement::Copy` AST and translation from `sqlparser::Statement::Copy`,
   including option normalization and rejection of unsupported forms.
-- `planner`: `BoundStatement::Copy` (binding: resolve table + columns, validate
-  options); `COPY TO` carries a bound projection-scan reused by the existing
-  logical/physical planner. `COPY` is not lowered by `logical_plan` — the server
-  drives it.
+- `planner`: `BoundStatement::Copy` (binding: resolve table + columns to ids,
+  carrying `direction`/`options`). `COPY` is not lowered by `logical_plan`
+  (which rejects it); the server drives both directions directly over the
+  storage scan/insert paths.
 - `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), the COPY FROM
   row-insert routine, and the COPY TO row-producer; reuses
   `validate_value_type`/`validate_not_null`, `storage.insert`, and the scan/
@@ -313,7 +314,9 @@ transferred, matching PostgreSQL.
 
 - `protocol`: encode/decode round-trips for all seven COPY messages.
 - `parser`: COPY parsing, both option syntaxes, every rejection path.
-- `planner`: column defaulting/reordering/validation and option-validation errors.
+- `planner`: column defaulting/reordering and the table/column resolution errors
+  (unknown table/column, duplicate column). Option validation is the parser's
+  (above).
 - `executor`: text/CSV parse↔format round-trips, NULL handling, escaping/quoting,
   `HEADER`, and field type errors.
 - `server` integration (simple query, via `psql` or the protocol harness):

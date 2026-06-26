@@ -47,10 +47,12 @@ pub fn substitute_params(statement: &BoundStatement, params: &[Value]) -> Result
 
 fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>>) -> Result<()> {
     match statement {
+        // COPY carries no expressions/parameters.
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
         | BoundStatement::CreateIndex { .. }
-        | BoundStatement::DropIndex { .. } => Ok(()),
+        | BoundStatement::DropIndex { .. }
+        | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert { source, .. } => match source {
             BoundInsertSource::Values { rows, .. } => {
                 for row in rows {
@@ -155,7 +157,8 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
         | BoundStatement::CreateIndex { .. }
-        | BoundStatement::DropIndex { .. } => Ok(()),
+        | BoundStatement::DropIndex { .. }
+        | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert { source, .. } => match source {
             BoundInsertSource::Values { rows, .. } => {
                 for row in rows {

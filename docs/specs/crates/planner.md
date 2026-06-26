@@ -64,6 +64,7 @@ Binder responsibilities:
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
+- Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
 - Reject unsupported forms. Concretely, the binder rejects: a composite or empty primary key (`SqlState::DatatypeMismatch`) and duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE`; an `UPDATE` assigning the primary-key column (`SqlState::DatatypeMismatch`); and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
@@ -79,6 +80,10 @@ pub enum BoundStatement {
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
     Delete { table: TableId, source: BoundSelect },
     Explain(Box<BoundStatement>),
+    // COPY <table> [(cols)] FROM STDIN | TO STDOUT. Resolved table + column ids
+    // (COPY order; defaulted to all columns in catalog order). Not lowered to a
+    // LogicalPlan — the server drives COPY directly (docs/specs/copy.md).
+    Copy { table: TableId, columns: Vec<ColumnId>, direction: CopyDirection, options: CopyOptions },
 }
 
 pub enum BoundInsertSource {

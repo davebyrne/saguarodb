@@ -146,6 +146,12 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             common::SqlState::SyntaxError,
             "logical_plan does not accept EXPLAIN; plan the inner statement",
         )),
+        // COPY is not lowered to a logical plan; the server drives it over the
+        // COPY sub-protocol, reusing the storage insert/scan paths. Reaching here
+        // is a routing bug.
+        BoundStatement::Copy { .. } => Err(DbError::internal(
+            "logical_plan does not accept COPY; the server drives it directly",
+        )),
     }
 }
 

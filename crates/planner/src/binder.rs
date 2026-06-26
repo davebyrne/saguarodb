@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use catalog::CatalogManager;
 use common::{
-    BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, DbError, Result, SqlState, TableId,
-    TableSchema, Value,
+    BindingId, ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError,
+    Result, SqlState, TableId, TableSchema, Value,
 };
 use parser::{
     Assignment, Expr, FromItem, FunctionArg, InsertSource, OrderByItem, SelectItem,
@@ -163,13 +163,36 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "VACUUM is a maintenance command and does not bind",
         )),
-        // Staged: the real `bind_copy` (and `BoundStatement::Copy`) land in the
-        // binder/planner task; COPY parses here but is not yet executable.
-        Statement::Copy { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "COPY is not yet implemented",
-        )),
+        Statement::Copy {
+            table,
+            columns,
+            direction,
+            options,
+        } => bind_copy(catalog, table, columns, *direction, options),
     }
+}
+
+/// Bind `COPY <table> [(cols)] FROM STDIN | TO STDOUT`: resolve the table and the
+/// (possibly defaulted) column list to ids, reusing the INSERT column resolver.
+/// COPY is driven by the server, so this performs only name resolution; the
+/// executor's COPY routines reuse the storage insert/scan paths. Unlike INSERT,
+/// COPY FROM does not reject an omitted NOT NULL column up front — that surfaces
+/// per row (matching PostgreSQL) when the row's NULL fails `validate_not_null`.
+fn bind_copy(
+    catalog: &dyn CatalogManager,
+    table_name: &str,
+    column_names: &[String],
+    direction: CopyDirection,
+    options: &CopyOptions,
+) -> Result<BoundStatement> {
+    let table = require_table(catalog, table_name)?;
+    let columns = insert_columns(&table, column_names)?;
+    Ok(BoundStatement::Copy {
+        table: table.id,
+        columns,
+        direction,
+        options: options.clone(),
+    })
 }
 
 fn bind_insert(

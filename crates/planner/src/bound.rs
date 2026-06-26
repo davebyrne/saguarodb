@@ -1,4 +1,6 @@
-use common::{ColumnDef, ColumnId, ColumnInfo, IndexId, ParsedColumnDef, TableId};
+use common::{
+    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, IndexId, ParsedColumnDef, TableId,
+};
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
 
@@ -37,6 +39,17 @@ pub enum BoundStatement {
         source: BoundSelect,
     },
     Explain(Box<BoundStatement>),
+    /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. Resolved table
+    /// and column ids (in COPY order; defaulted to all columns in catalog order).
+    /// COPY is not lowered to a `LogicalPlan` — the server drives it over the COPY
+    /// sub-protocol, reusing the storage insert path (FROM) and scan path (TO).
+    /// See `docs/specs/copy.md`.
+    Copy {
+        table: TableId,
+        columns: Vec<ColumnId>,
+        direction: CopyDirection,
+        options: CopyOptions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

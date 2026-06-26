@@ -20,7 +20,10 @@ pub use physical::{PhysicalPlan, physical_plan};
 #[cfg(test)]
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
-    use common::{DataType, ErrorKind, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, SqlState, Value};
+    use common::{
+        CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, PRIMARY_KEY_INDEX_ID,
+        ParsedColumnDef, SqlState, Value,
+    };
     use parser::parse;
 
     use super::*;
@@ -1173,5 +1176,74 @@ mod tests {
             ),
             "expected no residual filter, got {source:?}"
         );
+    }
+
+    #[test]
+    fn binder_binds_copy_from_stdin_all_columns() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let all_columns: Vec<_> = table.columns.iter().map(|column| column.id).collect();
+
+        assert_eq!(
+            bind(&parse("copy users from stdin").unwrap(), &catalog).unwrap(),
+            BoundStatement::Copy {
+                table: table.id,
+                columns: all_columns,
+                direction: CopyDirection::From,
+                options: CopyOptions::defaults_for(CopyFormat::Text),
+            }
+        );
+    }
+
+    #[test]
+    fn binder_binds_copy_to_stdout_subset_csv() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let name_id = table
+            .columns
+            .iter()
+            .find(|column| column.name == "name")
+            .unwrap()
+            .id;
+
+        let BoundStatement::Copy {
+            table: table_id,
+            columns,
+            direction,
+            options,
+        } = bind(
+            &parse("copy users (name) to stdout with (format csv, header true)").unwrap(),
+            &catalog,
+        )
+        .unwrap()
+        else {
+            panic!("expected COPY");
+        };
+        assert_eq!(table_id, table.id);
+        assert_eq!(columns, vec![name_id]);
+        assert_eq!(direction, CopyDirection::To);
+        assert_eq!(options.format, CopyFormat::Csv);
+        assert!(options.header);
+    }
+
+    #[test]
+    fn binder_rejects_copy_unknown_table() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("copy nope from stdin").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn binder_rejects_copy_unknown_column() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("copy users (bogus) to stdout").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn binder_rejects_copy_duplicate_column() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("copy users (id, id) from stdin").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 }
