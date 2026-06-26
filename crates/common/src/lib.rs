@@ -1,5 +1,6 @@
 pub mod concurrency;
 pub mod context;
+pub mod copy;
 pub mod error;
 pub mod flush;
 pub mod ids;
@@ -12,6 +13,7 @@ pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };
 pub use context::StatementContext;
+pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use flush::{FlushPolicy, PageFlushInfo};
 pub use ids::{

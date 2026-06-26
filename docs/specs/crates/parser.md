@@ -48,6 +48,16 @@ pub enum Statement {
     // `VACUUM` (all user tables) or `VACUUM <table>` (one table). `table` is the
     // lowercase-normalized identifier, `None` for the whole database.
     Vacuum { table: Option<String> },
+    // `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. Bulk transfer
+    // (text/CSV, simple-query only); see `docs/specs/copy.md`. `columns` empty
+    // means all columns in catalog order; `options` is the normalized result of
+    // the modern and legacy WITH syntaxes (`common::CopyOptions`).
+    Copy {
+        table: String,
+        columns: Vec<String>,
+        direction: CopyDirection,
+        options: CopyOptions,
+    },
 }
 
 pub enum InsertSource {
@@ -182,6 +192,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - Set transaction: `SET TRANSACTION ISOLATION LEVEL <level>` (sqlparser's `Set(SetTransaction { session: false, .. })`) parses to `Statement::SetTransaction { isolation }`, and `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` (the session default, `session: true`) parses to `Statement::SetSessionCharacteristics { isolation }`. Both share the same level mapping (as above) and access-mode handling (`READ WRITE` accepted-and-ignored, `READ ONLY` rejected); only the `session` flag distinguishes them. `SET TRANSACTION SNAPSHOT` and every other `SET` form are rejected at parse time (`SyntaxError`). The transaction-scoped `SET TRANSACTION` is honored only before the transaction's first query, while `SET SESSION CHARACTERISTICS` sets the per-connection default for future transactions (both enforced by the server, `mvcc.md` §10 Milestone G).
 
 - Maintenance: `VACUUM` parses to `Statement::Vacuum { table: None }` and `VACUUM <table>` to `Statement::Vacuum { table: Some(<lowercased name>) }`. **sqlparser 0.56 cannot parse `VACUUM`** (it errors), so `parse_statement` intercepts it *before* handing the string to sqlparser: it strips an optional trailing `;`, matches the leading `vacuum` keyword case-insensitively (a glued word like `vacuumfoo` is not a VACUUM and falls through to sqlparser), and accepts at most one bare-identifier argument (lowercase-normalized, the unquoted-identifier rule). Parenthesized options, multiple tables, qualified (`schema.table`) or quoted names, and Postgres option keywords (`FULL`/`FREEZE`/`ANALYZE`/`VERBOSE`/…) are rejected with `ErrorKind::Parse` / `SqlState::SyntaxError`; none are supported. `VACUUM` does not bind/plan — it is a maintenance command the server dispatches separately (`docs/specs/crates/server.md`, `docs/specs/mvcc.md` §9/§10 Milestone F).
+- COPY: `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` parses to `Statement::Copy { table, columns, direction, options }` (see `docs/specs/copy.md`). The translator normalizes both the modern (`WITH (FORMAT csv, HEADER true, ...)`) and legacy (`WITH CSV HEADER ...`) option syntaxes into one `common::CopyOptions`, applying per-format defaults and PostgreSQL's "ESCAPE defaults to QUOTE" rule. It rejects, with structured errors, server-side files / `PROGRAM` and `COPY (query) TO` and `FORMAT binary` and the unsupported options (`FREEZE`/`FORCE_*`/`ENCODING`) as `FeatureNotSupported` (`0A000`); an unrecognized `FORMAT`, a backslash `DELIMITER`, a CR/LF delimiter or quote, and `DELIMITER`=`QUOTE` (CSV) as `SyntaxError`; `QUOTE`/`ESCAPE` with `FORMAT text` as `FeatureNotSupported`. Because sqlparser reads inline data after `FROM STDIN` and then demands a terminator, `parse_statement` first normalizes the input to be `;`-terminated (a no-op for other statements and never a second statement); copy-in data arrives over the wire, never inline.
 
 Binder rejects parsed forms that exceed the semantic subset, such as composite primary keys and unknown functions.
 
@@ -210,3 +221,4 @@ Unquoted identifiers are normalized to lowercase before AST construction. Quoted
 - Parses `SELECT *` and `table.*` distinctly.
 - Parses `EXPLAIN SELECT ...` into `Statement::Explain`.
 - Parses `INSERT ... SELECT` into `InsertSource::Query`, which the binder binds.
+- Parses `COPY ... FROM STDIN` / `TO STDOUT` (with and without a trailing `;`), an explicit column list, and both modern and legacy CSV option syntaxes; rejects server-side files, `COPY (query)`, `FORMAT binary`, `QUOTE` with text format, and `DELIMITER`=`QUOTE` with the documented SQLSTATEs.

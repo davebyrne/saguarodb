@@ -163,6 +163,12 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "VACUUM is a maintenance command and does not bind",
         )),
+        // Staged: the real `bind_copy` (and `BoundStatement::Copy`) land in the
+        // binder/planner task; COPY parses here but is not yet executable.
+        Statement::Copy { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "COPY is not yet implemented",
+        )),
     }
 }
 

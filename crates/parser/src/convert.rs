@@ -1,4 +1,7 @@
-use common::{DataType, DbError, IsolationLevel, ParsedColumnDef, Result, SqlState, Value};
+use common::{
+    CopyDirection, CopyFormat, CopyOptions, DataType, DbError, IsolationLevel, ParsedColumnDef,
+    Result, SqlState, Value,
+};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -16,8 +19,19 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
         return Ok(statement);
     }
 
+    // sqlparser reads inline data after `COPY ... FROM STDIN` and then requires a
+    // statement terminator. We stream copy-in over the wire and never carry
+    // inline data, so ensure the statement is terminated. A trailing `;` is a
+    // no-op for every other statement and never introduces a second one.
+    let trimmed = sql.trim_end();
+    let normalized = if trimmed.ends_with(';') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed};")
+    };
+
     let dialect = PostgreSqlDialect {};
-    let mut statements = Parser::parse_sql(&dialect, sql)
+    let mut statements = Parser::parse_sql(&dialect, &normalized)
         .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?;
 
     if statements.len() != 1 {
@@ -151,6 +165,14 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             }
             Ok(Statement::Rollback)
         }
+        sql::Statement::Copy {
+            source,
+            to,
+            target,
+            options,
+            legacy_options,
+            values,
+        } => convert_copy(source, to, target, options, legacy_options, values),
         _ => unsupported("unsupported SQL statement"),
     }
 }
@@ -570,6 +592,219 @@ fn convert_insert(insert: sql::Insert) -> Result<Statement> {
         columns: columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
         source,
     })
+}
+
+fn convert_copy(
+    source: sql::CopySource,
+    to: bool,
+    target: sql::CopyTarget,
+    options: Vec<sql::CopyOption>,
+    legacy_options: Vec<sql::CopyLegacyOption>,
+    values: Vec<Option<String>>,
+) -> Result<Statement> {
+    // Inline COPY data (the `\.`-terminated block some parse paths attach to the
+    // statement) is not part of the STDIN wire streaming we support.
+    if !values.is_empty() {
+        return unsupported("inline COPY data is not supported; use FROM STDIN");
+    }
+
+    // The table and column list always come from `source` (the data source for
+    // COPY TO, the target table for COPY FROM); `COPY (query) TO` is rejected.
+    let (table_name, columns) = match source {
+        sql::CopySource::Table {
+            table_name,
+            columns,
+        } => (table_name, columns),
+        sql::CopySource::Query(_) => {
+            return feature_not_supported("COPY (query) TO STDOUT is not supported");
+        }
+    };
+    let table = object_name(&table_name)?;
+    let columns = columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?;
+
+    let direction = if to {
+        CopyDirection::To
+    } else {
+        CopyDirection::From
+    };
+
+    // Only STDIN (FROM) and STDOUT (TO) are supported; server-side files and
+    // PROGRAM expose the server host and are rejected.
+    match (direction, &target) {
+        (CopyDirection::To, sql::CopyTarget::Stdout)
+        | (CopyDirection::From, sql::CopyTarget::Stdin) => {}
+        (_, sql::CopyTarget::File { .. } | sql::CopyTarget::Program { .. }) => {
+            return feature_not_supported(
+                "server-side file COPY is not supported; use COPY ... FROM STDIN / TO STDOUT",
+            );
+        }
+        (CopyDirection::To, _) => return unsupported("COPY ... TO requires STDOUT"),
+        (CopyDirection::From, _) => return unsupported("COPY ... FROM requires STDIN"),
+    }
+
+    let options = convert_copy_options(options, legacy_options)?;
+    Ok(Statement::Copy {
+        table,
+        columns,
+        direction,
+        options,
+    })
+}
+
+/// Normalize the modern (`WITH (FORMAT csv, ...)`) and legacy (`WITH CSV ...`)
+/// option syntaxes into a single resolved `CopyOptions`, rejecting unsupported
+/// options. The format is resolved first so per-format defaults and the
+/// CSV-only checks for `QUOTE`/`ESCAPE` apply correctly.
+fn convert_copy_options(
+    options: Vec<sql::CopyOption>,
+    legacy_options: Vec<sql::CopyLegacyOption>,
+) -> Result<CopyOptions> {
+    let format = copy_format(&options, &legacy_options)?;
+    let mut resolved = CopyOptions::defaults_for(format);
+    let mut escape_set = false;
+
+    for option in options {
+        apply_copy_option(&mut resolved, &mut escape_set, option)?;
+    }
+    for option in legacy_options {
+        apply_legacy_copy_option(&mut resolved, &mut escape_set, option)?;
+    }
+
+    // PostgreSQL: ESCAPE defaults to the (possibly customized) QUOTE value.
+    if !escape_set {
+        resolved.escape = resolved.quote;
+    }
+
+    validate_copy_options(&resolved)?;
+    Ok(resolved)
+}
+
+fn copy_format(
+    options: &[sql::CopyOption],
+    legacy_options: &[sql::CopyLegacyOption],
+) -> Result<CopyFormat> {
+    for option in options {
+        if let sql::CopyOption::Format(ident) = option {
+            return match ident.value.to_ascii_lowercase().as_str() {
+                "text" => Ok(CopyFormat::Text),
+                "csv" => Ok(CopyFormat::Csv),
+                "binary" => feature_not_supported("COPY FORMAT binary is not supported"),
+                other => unsupported(format!("unrecognized COPY format \"{other}\"")),
+            };
+        }
+    }
+    for option in legacy_options {
+        match option {
+            sql::CopyLegacyOption::Binary => {
+                return feature_not_supported("COPY BINARY is not supported");
+            }
+            sql::CopyLegacyOption::Csv(_) => return Ok(CopyFormat::Csv),
+            _ => {}
+        }
+    }
+    Ok(CopyFormat::Text)
+}
+
+fn apply_copy_option(
+    resolved: &mut CopyOptions,
+    escape_set: &mut bool,
+    option: sql::CopyOption,
+) -> Result<()> {
+    match option {
+        // Format is resolved up front by `copy_format`.
+        sql::CopyOption::Format(_) => {}
+        sql::CopyOption::Delimiter(delimiter) => resolved.delimiter = delimiter,
+        sql::CopyOption::Null(null_string) => resolved.null_string = null_string,
+        sql::CopyOption::Header(header) => resolved.header = header,
+        sql::CopyOption::Quote(quote) => {
+            require_csv(resolved, "QUOTE")?;
+            resolved.quote = quote;
+        }
+        sql::CopyOption::Escape(escape) => {
+            require_csv(resolved, "ESCAPE")?;
+            resolved.escape = escape;
+            *escape_set = true;
+        }
+        sql::CopyOption::Freeze(_) => return feature_not_supported("COPY FREEZE is not supported"),
+        sql::CopyOption::ForceQuote(_) => {
+            return feature_not_supported("COPY FORCE_QUOTE is not supported");
+        }
+        sql::CopyOption::ForceNotNull(_) => {
+            return feature_not_supported("COPY FORCE_NOT_NULL is not supported");
+        }
+        sql::CopyOption::ForceNull(_) => {
+            return feature_not_supported("COPY FORCE_NULL is not supported");
+        }
+        sql::CopyOption::Encoding(_) => {
+            return feature_not_supported("COPY ENCODING is not supported");
+        }
+    }
+    Ok(())
+}
+
+fn apply_legacy_copy_option(
+    resolved: &mut CopyOptions,
+    escape_set: &mut bool,
+    option: sql::CopyLegacyOption,
+) -> Result<()> {
+    match option {
+        // Already rejected by `copy_format`; keep the arm exhaustive/defensive.
+        sql::CopyLegacyOption::Binary => {
+            return feature_not_supported("COPY BINARY is not supported");
+        }
+        sql::CopyLegacyOption::Delimiter(delimiter) => resolved.delimiter = delimiter,
+        sql::CopyLegacyOption::Null(null_string) => resolved.null_string = null_string,
+        // `CSV (...)` already set the format; its sub-options are CSV-valid.
+        sql::CopyLegacyOption::Csv(csv_options) => {
+            for csv_option in csv_options {
+                match csv_option {
+                    sql::CopyLegacyCsvOption::Header => resolved.header = true,
+                    sql::CopyLegacyCsvOption::Quote(quote) => resolved.quote = quote,
+                    sql::CopyLegacyCsvOption::Escape(escape) => {
+                        resolved.escape = escape;
+                        *escape_set = true;
+                    }
+                    sql::CopyLegacyCsvOption::ForceQuote(_) => {
+                        return feature_not_supported("COPY FORCE QUOTE is not supported");
+                    }
+                    sql::CopyLegacyCsvOption::ForceNotNull(_) => {
+                        return feature_not_supported("COPY FORCE NOT NULL is not supported");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_csv(resolved: &CopyOptions, option: &str) -> Result<()> {
+    if resolved.format != CopyFormat::Csv {
+        return feature_not_supported(format!(
+            "COPY option {option} is only valid with FORMAT csv"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_copy_options(options: &CopyOptions) -> Result<()> {
+    let is_eol = |ch: char| ch == '\r' || ch == '\n';
+    if is_eol(options.delimiter) {
+        return unsupported("COPY DELIMITER may not be a carriage return or newline");
+    }
+    // In text format `\` introduces escapes, so a backslash delimiter would make
+    // field parsing ambiguous; PostgreSQL rejects it in every format.
+    if options.delimiter == '\\' {
+        return unsupported("COPY DELIMITER may not be a backslash");
+    }
+    if options.format == CopyFormat::Csv {
+        if is_eol(options.quote) {
+            return unsupported("COPY QUOTE may not be a carriage return or newline");
+        }
+        if options.delimiter == options.quote {
+            return unsupported("COPY DELIMITER and QUOTE must be different");
+        }
+    }
+    Ok(())
 }
 
 fn query_has_modifiers(query: &sql::Query) -> bool {
@@ -1272,4 +1507,10 @@ fn parse_error(message: impl Into<String>) -> DbError {
 
 fn unsupported<T>(message: impl Into<String>) -> Result<T> {
     Err(parse_error(message))
+}
+
+/// A syntactically valid but intentionally unsupported form (e.g. server-side
+/// file COPY, binary format) → SQLSTATE `0A000` rather than a syntax error.
+fn feature_not_supported<T>(message: impl Into<String>) -> Result<T> {
+    Err(DbError::parse(SqlState::FeatureNotSupported, message))
 }

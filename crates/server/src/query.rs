@@ -1581,6 +1581,12 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
             ))
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
+        // Staged: COPY routing into the connection-loop sub-protocol lands in the
+        // server COPY task; until then it parses but is not yet executable.
+        Statement::Copy { .. } => Err(DbError::plan(
+            SqlState::FeatureNotSupported,
+            "COPY is not yet implemented",
+        )),
     }
 }
 

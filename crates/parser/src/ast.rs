@@ -1,4 +1,4 @@
-use common::{DataType, IsolationLevel, ParsedColumnDef, Value};
+use common::{CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
@@ -74,6 +74,17 @@ pub enum Statement {
     /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
     Vacuum {
         table: Option<String>,
+    },
+    /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
+    /// non-relational bulk-transfer command (text/CSV, simple-query only). The
+    /// parser rejects server-side files, `COPY (query)`, binary format, and
+    /// unsupported options; `options` is the normalized result. `columns` empty
+    /// means all table columns in catalog order. See `docs/specs/copy.md`.
+    Copy {
+        table: String,
+        columns: Vec<String>,
+        direction: CopyDirection,
+        options: CopyOptions,
     },
 }
 

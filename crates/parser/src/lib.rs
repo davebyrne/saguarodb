@@ -14,7 +14,7 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
 #[cfg(test)]
 mod tests {
-    use common::{DataType, ErrorKind, SqlState, Value};
+    use common::{CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, SqlState, Value};
 
     use crate::{
         BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, SelectItem, Statement, UnaryOp,
@@ -697,5 +697,126 @@ mod tests {
         let err = parse("create table users (id integer primary key deferrable)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn parses_copy_from_stdin_text_defaults() {
+        assert_eq!(
+            parse("copy users from stdin").unwrap(),
+            Statement::Copy {
+                table: "users".to_string(),
+                columns: vec![],
+                direction: CopyDirection::From,
+                options: CopyOptions::defaults_for(CopyFormat::Text),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_copy_to_stdout_with_column_list() {
+        let Statement::Copy {
+            table,
+            columns,
+            direction,
+            options,
+        } = parse("copy users (id, name) to stdout").unwrap()
+        else {
+            panic!("expected COPY");
+        };
+        assert_eq!(table, "users");
+        assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+        assert_eq!(direction, CopyDirection::To);
+        assert_eq!(options.format, CopyFormat::Text);
+    }
+
+    #[test]
+    fn parses_copy_csv_with_modern_options() {
+        let Statement::Copy { options, .. } =
+            parse("copy users from stdin with (format csv, header true, delimiter ';', null 'NA')")
+                .unwrap()
+        else {
+            panic!("expected COPY");
+        };
+        assert_eq!(options.format, CopyFormat::Csv);
+        assert!(options.header);
+        assert_eq!(options.delimiter, ';');
+        assert_eq!(options.null_string, "NA");
+        assert_eq!(options.quote, '"');
+    }
+
+    #[test]
+    fn parses_copy_legacy_csv_header() {
+        let Statement::Copy { options, .. } =
+            parse("copy users from stdin with csv header").unwrap()
+        else {
+            panic!("expected COPY");
+        };
+        assert_eq!(options.format, CopyFormat::Csv);
+        assert!(options.header);
+    }
+
+    #[test]
+    fn copy_escape_defaults_to_customized_quote() {
+        let Statement::Copy { options, .. } =
+            parse("copy users from stdin with (format csv, quote '|')").unwrap()
+        else {
+            panic!("expected COPY");
+        };
+        assert_eq!(options.quote, '|');
+        assert_eq!(options.escape, '|');
+    }
+
+    #[test]
+    fn rejects_copy_binary_format() {
+        let err = parse("copy users from stdin with (format binary)").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn rejects_copy_server_side_file() {
+        let err = parse("copy users from '/tmp/data.csv'").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn rejects_copy_query_source() {
+        let err = parse("copy (select id from users) to stdout").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn rejects_quote_option_with_text_format() {
+        let err = parse("copy users from stdin with (quote '|')").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn rejects_csv_delimiter_equal_to_quote() {
+        let err = parse("copy users from stdin with (format csv, delimiter '\"')").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn rejects_newline_delimiter() {
+        let err = parse(r"copy users from stdin with (format csv, delimiter E'\n')").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn rejects_backslash_delimiter() {
+        let err = parse(r"copy users from stdin with (delimiter '\')").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn rejects_newline_quote_in_csv() {
+        let err = parse(r"copy users from stdin with (format csv, quote E'\n')").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn rejects_escape_option_with_text_format() {
+        let err = parse("copy users from stdin with (escape '|')").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 }
