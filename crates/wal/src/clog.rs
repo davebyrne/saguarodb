@@ -100,10 +100,9 @@ impl Clog {
     }
 
     /// Whether `txn_id` is recorded as `Aborted`. Equivalent to
-    /// `self.status(txn_id) == TxnStatus::Aborted`. Used by the F4c truncation
-    /// relaxation, which floors past an aborted transaction only when it is BELOW
-    /// the vacuum floor — never an unrecorded/in-progress id (which is not
-    /// `Aborted` here).
+    /// `self.status(txn_id) == TxnStatus::Aborted`. Note an unrecorded/in-progress id
+    /// is NOT `Aborted` here, so the F4c snapshot pruning (which drops only *recorded*
+    /// aborts below the vacuum floor) never mistakes one for a reclaimed abort.
     pub fn is_aborted(&self, txn_id: TxnId) -> bool {
         self.status(txn_id) == TxnStatus::Aborted
     }
@@ -161,8 +160,7 @@ impl Clog {
     /// `Aborted` ids (the CLOG holds no entry for an unresolved transaction); were a
     /// writer in flight below a later aborted id, the floor could advance past it and
     /// its still-uncommitted on-disk versions would wrongly read as committed. The
-    /// sibling [`crate::WalManager::truncate_before`] defends the same invariant by
-    /// pinning every non-committed record, in-flight included.
+    /// exclusive checkpoint guard is what guarantees this cannot happen.
     pub fn live_snapshot(&self, clog_lsn: Lsn, vacuum_floor: TxnId) -> ClogSnapshot {
         let smallest_unreclaimed_abort = self
             .statuses

@@ -1412,7 +1412,7 @@ Table data lives in mutable per-table heap files; pages are mutated in the buffe
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
-- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the WAL prefix is truncated. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM. WAL truncation is conservative: it never drops an aborted/in-flight transaction's records (`docs/specs/mvcc.md` §5.4/§8).
+- **Flush-based checkpoint**: dirty pages are flushed in place to the heap and fsynced, then the control record advances the redo boundary, then the durable CLOG snapshot (`clog.dat`) is written, then the WAL prefix is truncated. With MVCC the flush gate requires only WAL-durability (not committedness), so uncommitted/aborted dirty pages may be flushed too — they are hidden by the CLOG and reclaimed by VACUUM. WAL truncation is unconditional: it drops every record below the boundary, relying on the CLOG snapshot (written first) to remember aborted outcomes (`docs/specs/mvcc.md` §5.4/§8).
 
 This gives the invariants:
 1. After a crash, recovery loads the heap as of the last control record and replays redo records with `LSN > checkpoint_lsn`; PageLSN gating plus full-page images make this idempotent and torn-page-safe. (With MVCC this is redo-all + CLOG visibility.)
@@ -1476,8 +1476,9 @@ pub trait WalManager: Send + Sync {
     /// fallible — a corrupt record mid-replay returns an error.
     fn replay_from(&self, lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>>;
 
-    /// Truncate WAL records before the given LSN (after checkpoint). Conservative:
-    /// never drops a non-committed transaction's records (see below).
+    /// Truncate WAL records before the given LSN (after checkpoint). Unconditional:
+    /// drops every record with `record.lsn < lsn`; the caller must persist the CLOG
+    /// snapshot covering `lsn` first (see below / §5.4).
     fn truncate_before(&self, lsn: Lsn) -> Result<()>;
 
     /// Last LSN known to be durable after fsync.
@@ -1486,18 +1487,25 @@ pub trait WalManager: Send + Sync {
     /// Total encoded bytes of retained records whose stored LSN is > lsn.
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 
-    /// Establish the CLOG implicit-committed floor at recovery, conservatively.
+    /// Persist the durable CLOG snapshot (`clog.dat`) through `clog_lsn`; the
+    /// checkpoint calls this after the control record and before `truncate_before`.
+    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
+    /// Advance the vacuum floor (Milestone F4c); bounds `clog.dat` pruning.
+    fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
+    /// Establish the CLOG implicit-committed floor at recovery (no-op when a durable
+    /// `clog.dat` snapshot was loaded; conservative re-derivation otherwise).
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
 }
 // `WalManager: TxnStatusView`, so `status`/`is_committed`/`is_aborted` come from the
-// rebuilt CLOG. The redo-committed-only `replay_committed_from` is retired with MVCC.
+// CLOG (seeded from `clog.dat`, else rebuilt from `Commit`/`Abort`). The
+// redo-committed-only `replay_committed_from` is retired with MVCC.
 ```
 
 `append(record)` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. Replay preserves the stored LSN from disk.
 
 `replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last record whose effects are already reflected in the heap, and (redo-all) applies every page-mutation record, deciding visibility via the CLOG.
 
-`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Conservative truncation (MVCC):** it never drops an aborted/in-flight transaction's records — it pins on the oldest non-committed transaction below `lsn` — so an aborted-but-flushed transaction stays invisible across restart (`docs/specs/mvcc.md` §5.4/§8). Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
+`truncate_before(lsn)` may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Unconditional truncation (MVCC):** it drops every record below `lsn`, including aborted transactions' records. It is safe because the checkpoint calls `persist_clog` — which durably records every aborted outcome in the CLOG snapshot `clog.dat` — *before* truncating, and under the exclusive checkpoint guard no write transaction is in flight (`docs/specs/mvcc.md` §5.4/§8). Truncation writes retained records to a temporary WAL, fsyncs it, renames it over the live WAL, and immediately fsyncs the parent directory. If that directory fsync fails, the WAL manager is poisoned and returns the error before reopening the WAL or mutating retained-record in-memory state.
 
 `bytes_after(lsn)` is server checkpoint accounting only. It counts encoded bytes for retained WAL records with stored `LSN > lsn`; if `lsn` predates the retained WAL after truncation, it returns the encoded byte size of all retained records.
 
@@ -1574,7 +1582,8 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point (atomic temp + fsync + rename + directory fsync).
-7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)` (conservative — never drops an aborted/in-flight transaction's records, `mvcc.md` §5.4).
+6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` (every transaction outcome plus both floors) before truncating, so it remembers every outcome the truncation drops (`mvcc.md` §5.4).
+7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)` (unconditional — `persist_clog` ran in step 6b, so every dropped outcome is durable in `clog.dat`; `mvcc.md` §5.4).
 8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
 9. Drop write guard.
 
@@ -1799,7 +1808,6 @@ Loaded from command-line args only. There is no environment-variable or config-f
 - **Serializable Isolation (SSI):** Snapshot isolation and Read Committed are implemented; true serializable isolation with predicate-based conflict detection is not. `SERIALIZABLE` is accepted as an alias for Repeatable Read.
 - **Savepoints / Sub-transactions:** The model accommodates sub-transaction xids without undo, but `SAVEPOINT`/`ROLLBACK TO` are not implemented.
 - **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
-- **Durable CLOG File:** The commit-status map is held in memory and rebuilt from `Commit`/`Abort` WAL records at recovery; a standalone durable CLOG file is future work.
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol (with blocking + deadlock detection and fuzzy checkpointing) is future work.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among the primary-key and secondary indexes; a cost model would replace that heuristic.

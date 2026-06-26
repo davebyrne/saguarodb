@@ -902,18 +902,18 @@ async fn committed_row_survives_back_to_back_checkpoints_with_no_write_between()
 
 #[tokio::test]
 async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
-    // THE CRITICAL Milestone-D correctness test (change 4). An explicit transaction
-    // writes rows, ROLLBACKs (status-based abort: no undo), its pages are flushed to
-    // the heap by a checkpoint, and a LATER committed row pushes the aborted txn
-    // below the next checkpoint's truncation boundary. The conservative-truncation
-    // guard (`docs/specs/mvcc.md` §5.4, §8) must keep the aborted txn's `Abort`
-    // record (and the floor below it) so its on-disk rows stay invisible after a
-    // crash. WITHOUT the guard, truncation would drop the `Abort` and the floor
-    // would float above the aborted txn, marking it implicitly committed and making
-    // its rows wrongly appear — corruption. (Manually verified: replacing the
-    // conservative `effective_lsn` clamp in `WalManager::truncate_before` with the
-    // raw `lsn`, and the conservative recovery floor with the allocation boundary,
-    // makes this test fail with 'Ghost' visible.)
+    // THE CRITICAL correctness test for a flushed-then-aborted transaction across
+    // restart (`docs/specs/mvcc.md` §5.4, §8). An explicit transaction writes rows,
+    // ROLLBACKs (status-based abort: no undo), its pages are flushed to the heap by a
+    // checkpoint, and a LATER committed row pushes the aborted txn below the next
+    // checkpoint's truncation boundary. Truncation is unconditional, so the aborted
+    // txn's `Abort` record is dropped — but the checkpoint first records the abort in
+    // the durable CLOG snapshot (`clog.dat`), and because the txn was never VACUUMed its
+    // explicit `Aborted` entry is kept. So after a crash, redo-all replays its rows yet
+    // the durable CLOG keeps them invisible. (If the snapshot dropped the un-vacuumed
+    // abort — or the recovery floor floated past it — 'Ghost' would wrongly appear; the
+    // wal-crate `repeated_checkpoint_keeps_an_unvacuumed_abort_aborted_across_recovery`
+    // test guards that path directly.)
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -938,12 +938,11 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
         conn.close().await;
 
         // Checkpoint: flushes the aborted txn's dirty pages to the heap (relaxed
-        // flush gate) and truncates committed WAL history — but must PIN the aborted
-        // txn so its Abort survives.
+        // flush gate), records the abort in `clog.dat`, and truncates the WAL.
         server.force_checkpoint().await.unwrap();
 
         // A later committed row, then another checkpoint, so the aborted txn sits
-        // below the truncation boundary (the scenario the guard must survive).
+        // below the truncation boundary (the scenario the durable CLOG must survive).
         server
             .simple_query("insert into users (id, name) values (3, 'Bea')")
             .await
@@ -951,8 +950,8 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
         server.force_checkpoint().await.unwrap();
     }
 
-    // Crash + restart: redo-all replays the aborted txn's flushed rows, but the
-    // retained Abort (and the conservative floor) keep them invisible.
+    // Crash + restart: redo-all replays the aborted txn's flushed rows, but the durable
+    // CLOG snapshot (which kept the un-vacuumed abort) keeps them invisible.
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
     let rows = server
         .simple_query("select id, name from users order by id")
@@ -971,32 +970,27 @@ async fn aborted_transaction_stays_invisible_across_checkpoint_and_restart() {
 
 #[tokio::test]
 async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_restart() {
-    // THE critical Milestone-F4c test (`docs/specs/mvcc.md` §5.4, §9). This is the
-    // relaxation of the conservative-truncation guard, and the place where a mistake
-    // reintroduces the aborted-data-visible-after-crash hole. Sequence:
+    // THE critical Milestone-F4c test under the durable CLOG (`docs/specs/mvcc.md`
+    // §5.4, §9). Sequence:
     //   1. A committed base row 'Ada'.
     //   2. An explicit transaction inserts 'Ghost', then ROLLBACKs (status-based abort,
     //      no undo); its heap+index pages stay dirty.
-    //   3. A checkpoint FLUSHES the aborted txn's pages to the heap and PINS its WAL
-    //      records (Abort retained) — the conservative guard, still in force here.
+    //   3. A checkpoint flushes the aborted txn's pages to the heap, records the abort
+    //      in `clog.dat`, and truncates the WAL unconditionally — so 'Ghost' stays
+    //      invisible after a restart even though its `Abort` record is dropped (the
+    //      durable CLOG snapshot remembers the abort).
     //   4. A FULL `VACUUM` reclaims the aborted-creator 'Ghost' tuple (heap + index;
     //      aborted-creator reclaim has NO age requirement) and advances the vacuum
     //      floor past the aborted txn.
-    //   5. A later committed row 'Bea', then another checkpoint: now the aborted txn is
-    //      BELOW the vacuum floor, so truncation DROPS its `Abort` and floats the
-    //      implicit-committed floor past it — safe, because the VACUUM already made the
-    //      'Ghost' reclamation durable (the checkpoint flush+fsync the VACUUM's pages
-    //      before this checkpoint's `truncate_before` consults the floor).
-    //   6. Crash + restart: 'Ghost' must be ABSENT — no committed ghost. There is no
-    //      surviving on-disk version to resurrect, so flooring past the aborted txn is
-    //      vacuously correct.
-    // Without the F4c gating, blindly flooring past a NON-vacuumed abort (the
-    // counter-test `aborted_transaction_stays_invisible_across_checkpoint_and_restart`)
-    // WOULD resurrect 'Ghost'; here the relaxation is licensed only because VACUUM
-    // reclaimed its tuples first.
+    //   5. A later committed row 'Bea', then another checkpoint: the aborted txn is now
+    //      below the vacuum floor, so the new snapshot DROPS its explicit entry (it now
+    //      reads implicit-committed) — safe, because the VACUUM already made the 'Ghost'
+    //      reclamation durable (flushed+fsynced before this checkpoint's snapshot).
+    //   6. Crash + restart: 'Ghost' must be ABSENT — its tuple was reclaimed, so reading
+    //      the aborted txn implicit-committed is vacuous (nothing to resurrect).
+    // The counter-test `aborted_transaction_stays_invisible_across_checkpoint_and_restart`
+    // covers the NON-vacuumed case, where the snapshot keeps the explicit abort.
     let dir = tempfile::tempdir().unwrap();
-    let wal_bytes_before_truncation;
-    let wal_bytes_after_truncation;
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
         server
@@ -1016,10 +1010,9 @@ async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_resta
         assert_eq!(conn.ok("rollback").await.status, b'I');
         conn.close().await;
 
-        // Checkpoint: flush the aborted txn's pages; its Abort is still PINNED here
-        // (no VACUUM yet), so truncation retains it. Record the retained WAL size.
+        // Checkpoint: flush the aborted txn's pages and record the abort in `clog.dat`;
+        // the WAL is truncated unconditionally (the Abort record is dropped).
         server.force_checkpoint().await.unwrap();
-        wal_bytes_before_truncation = server.app().components.wal.bytes_after(0).unwrap();
 
         // FULL VACUUM: reclaim the aborted-creator 'Ghost' tuple (heap + index) and
         // advance the vacuum floor past the aborted txn. `VACUUM` with no table is a
@@ -1028,26 +1021,15 @@ async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_resta
         assert!(vacuum.is_ok(), "full VACUUM should succeed");
 
         // A later committed row, then a checkpoint: the aborted txn is now below the
-        // vacuum floor, so truncation drops its Abort and floats the floor past it. The
-        // VACUUM's reclamation is flushed+fsynced by THIS checkpoint before its
-        // truncate_before consults the floor (the durability-ordering invariant).
+        // vacuum floor, so the new snapshot drops its explicit entry. The VACUUM's
+        // reclamation is flushed+fsynced by THIS checkpoint before its snapshot is
+        // written (the durability-ordering invariant).
         server
             .simple_query("insert into users (id, name) values (3, 'Bea')")
             .await
             .unwrap();
         server.force_checkpoint().await.unwrap();
-        wal_bytes_after_truncation = server.app().components.wal.bytes_after(0).unwrap();
     }
-
-    // The relaxation had EFFECT: after VACUUM, the second checkpoint truncated past the
-    // previously-pinning aborted txn, so the retained WAL did not just grow by the new
-    // committed row — it dropped the pinned prefix. (A weaker but robust check that the
-    // truncation reached past the abort: the retained size did not balloon.)
-    assert!(
-        wal_bytes_after_truncation <= wal_bytes_before_truncation,
-        "after VACUUM the checkpoint truncated past the reclaimed aborted txn \
-         (before={wal_bytes_before_truncation}, after={wal_bytes_after_truncation})"
-    );
 
     // Crash + restart: 'Ghost' is gone — no committed-ghost resurrection.
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -1069,11 +1051,12 @@ async fn vacuumed_aborted_txn_is_truncated_past_with_no_resurrection_after_resta
 #[tokio::test]
 async fn single_table_vacuum_does_not_relax_truncation_for_other_tables() {
     // A single-table `VACUUM t` must NOT advance the vacuum floor (`docs/specs/mvcc.md`
-    // §9, F4c): it leaves OTHER tables' aborted-creator tuples on disk, so flooring
-    // past those aborts would resurrect them. Here an aborted txn writes to `other`,
-    // then `VACUUM users` (a DIFFERENT table) runs — which must NOT reclaim `other`'s
-    // ghost nor advance the floor — and after a checkpoint + restart the ghost stays
-    // invisible (the abort still pins, exactly as in the no-VACUUM counter-test).
+    // §9, F4c): it leaves OTHER tables' aborted-creator tuples on disk, so dropping
+    // those aborts' explicit CLOG entries would resurrect them. Here an aborted txn
+    // writes to `other`, then `VACUUM users` (a DIFFERENT table) runs — which must NOT
+    // reclaim `other`'s ghost nor advance the floor — and after a checkpoint + restart
+    // the ghost stays invisible (the snapshot keeps the abort, as in the no-VACUUM
+    // counter-test).
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -1101,7 +1084,8 @@ async fn single_table_vacuum_does_not_relax_truncation_for_other_tables() {
         server.force_checkpoint().await.unwrap();
 
         // VACUUM a DIFFERENT table: does not reclaim `other`'s ghost and does not
-        // advance the vacuum floor, so `other`'s aborted txn must still pin truncation.
+        // advance the vacuum floor, so the snapshot must keep `other`'s aborted txn
+        // explicit (its entry is not dropped).
         assert!(server.simple_query("vacuum users").await.is_ok());
 
         server
@@ -1123,23 +1107,22 @@ async fn single_table_vacuum_does_not_relax_truncation_for_other_tables() {
             vec![Some("1".to_string()), Some("Keep".to_string())],
             vec![Some("3".to_string()), Some("Also".to_string())],
         ],
-        "a single-table VACUUM must not relax truncation for another table's abort"
+        "a single-table VACUUM must not drop another table's abort from the snapshot"
     );
 }
 
 #[tokio::test]
 async fn nonhot_update_rollback_row_survives_vacuum_truncate_and_restart() {
-    // F4c root-cause proof (non-HOT). A committed row is UPDATEd inside an explicit
-    // transaction that ROLLBACKs; the update changes the INDEXED `name` column, forcing
-    // the non-HOT path, which stamps `xmax = T` on the surviving predecessor (the row
-    // stays live because the update rolled back). A full VACUUM's abort-cleanup must
-    // RESET that aborted-deleter `xmax` in place, so that after the vacuum floor floats
-    // past T, truncation drops T's `Abort`, and a crash+restart rebuilds the CLOG, the
-    // row is NOT wrongly deleted (it has no surviving on-disk reference to T as a
-    // deleter). Without the fix, the row is LOST after the crash.
+    // F4c root-cause proof (non-HOT) under the durable CLOG. A committed row is UPDATEd
+    // inside an explicit transaction that ROLLBACKs; the update changes the INDEXED
+    // `name` column, forcing the non-HOT path, which stamps `xmax = T` on the surviving
+    // predecessor (the row stays live because the update rolled back). A full VACUUM's
+    // abort-cleanup must RESET that aborted-deleter `xmax` in place, so that after the
+    // vacuum floor floats past T and the next snapshot drops T's explicit `Aborted`
+    // entry, a crash+restart that reads T implicit-committed does NOT wrongly delete the
+    // row (it has no surviving on-disk reference to T as a deleter). Without the fix,
+    // the row is LOST after the crash.
     let dir = tempfile::tempdir().unwrap();
-    let wal_bytes_before_truncation;
-    let wal_bytes_after_truncation;
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
         server
@@ -1165,31 +1148,23 @@ async fn nonhot_update_rollback_row_survives_vacuum_truncate_and_restart() {
         assert_eq!(conn.ok("rollback").await.status, b'I');
         conn.close().await;
 
-        // Checkpoint pins the abort (no VACUUM yet); record the retained WAL size.
+        // Checkpoint records the abort in `clog.dat` (no VACUUM yet, so T's explicit
+        // entry is kept) and truncates the WAL unconditionally.
         server.force_checkpoint().await.unwrap();
-        wal_bytes_before_truncation = server.app().components.wal.bytes_after(0).unwrap();
 
         // FULL VACUUM: abort-cleanup resets the predecessor's aborted-deleter xmax and
         // the pass advances the vacuum floor past T.
         server.simple_query("vacuum").await.unwrap();
 
-        // A later committed row, then a checkpoint: T is now below the floor, so
-        // truncation drops its Abort. The abort-cleanup is fsynced by THIS checkpoint
-        // before its truncate_before consults the floor (the durability invariant).
+        // A later committed row, then a checkpoint: T is now below the vacuum floor, so
+        // the new snapshot drops its explicit entry. The abort-cleanup is fsynced by THIS
+        // checkpoint before its snapshot is written (the durability invariant).
         server
             .simple_query("insert into users (id, name) values (3, 'Bea')")
             .await
             .unwrap();
         server.force_checkpoint().await.unwrap();
-        wal_bytes_after_truncation = server.app().components.wal.bytes_after(0).unwrap();
     }
-
-    // The relaxation had effect: truncation reached past the previously-pinning abort.
-    assert!(
-        wal_bytes_after_truncation <= wal_bytes_before_truncation,
-        "after VACUUM the checkpoint truncated past the cleaned-up aborted txn \
-         (before={wal_bytes_before_truncation}, after={wal_bytes_after_truncation})"
-    );
 
     // Crash + restart: the rolled-back row STILL EXISTS with its original value.
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -1413,8 +1388,8 @@ async fn uncommitted_pages_evicted_under_pressure_then_aborted_are_invisible() {
             .execute_simple("rollback", slot, iso, &cancel);
         res.unwrap();
         assert!(slot.is_none());
-        // Make the flushed-then-aborted pages durable, exercising the conservative
-        // truncation guard for the eviction path too.
+        // Make the flushed-then-aborted pages durable, exercising the durable-CLOG
+        // path (the abort is recorded in `clog.dat`) for the eviction path too.
         saguarodb_server::checkpoint::run_checkpoint(&app.components).unwrap();
     }
 

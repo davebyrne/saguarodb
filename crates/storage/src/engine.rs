@@ -1658,7 +1658,7 @@ impl PageBackedStorageEngine {
     /// logging a `FullPageImage` of every changed leaf — the `vacuum_heap` /
     /// `btree::log_full_page` crash-safety pattern, redone by PageLSN gating regardless
     /// of txn id. The pass runs under the maintenance txn id (`0`, [`VACUUM_TXN`]) so
-    /// its removals are never undone by an abort and do not pin WAL truncation.
+    /// its removals are never undone by an abort.
     ///
     /// **Latching.** Each index is vacuumed under *its own* per-index structural latch,
     /// acquired and released around that index's whole walk and never held while

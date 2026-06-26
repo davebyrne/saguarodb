@@ -1065,8 +1065,8 @@ impl QueryService {
                 // Full pass: capture the boundary BEFORE the pass and advance the vacuum
                 // floor AFTER it (the F4c contract — see `full_vacuum_pass`). The
                 // reclamation becomes durable in the NEXT checkpoint, which flushes all
-                // dirty pages before its `truncate_before` consults the floor, so no
-                // `Abort` is ever dropped while its tuples remain on disk.
+                // dirty pages before its `persist_clog` consults the floor, so no
+                // aborted entry is dropped from the snapshot while its tuples remain on disk.
                 full_vacuum_pass(&self.components, horizon)?;
             }
         }
@@ -1298,11 +1298,10 @@ impl QueryService {
         // `Aborted`) and drop the transaction from the active set. The abort is not
         // fsynced here — a transaction with no durable `Commit` is recovered as
         // aborted regardless (redo-all + in-flight = aborted, `docs/specs/mvcc.md`
-        // §8). The unflushed `Abort` is still durable by the next checkpoint, whose
-        // `wal.flush` makes it so before truncation, where it pins conservative WAL
-        // truncation (an aborted txn's flushed pages must stay hidden across a
-        // checkpoint, §5.4). A failure to append it is logged but not fatal: the
-        // txn is still recovered as aborted.
+        // §8). The next checkpoint's `persist_clog` durably records the `Aborted`
+        // status in `clog.dat`, so the aborted txn's flushed pages stay hidden across a
+        // checkpoint even though truncation drops the `Abort` record (§5.4). A failure
+        // to append it is logged but not fatal: the txn is still recovered as aborted.
         if let Err(err) = self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
@@ -1691,19 +1690,19 @@ fn vacuum_tables(
 /// aborted-deleter stamp in place (resetting `xmax → INVALID`, `t_ctid → INVALID`, and
 /// un-HOTing an aborted root — the surviving predecessor of an aborted UPDATE/DELETE,
 /// which stays live and is NOT reclaimed). Advancing the floor to `B` is therefore safe:
-/// `truncate_before` may drop those aborted txns' `Abort` records and float the
-/// implicit-committed floor past them (the catalog is NOT MVCC-versioned, so user-table
-/// tuples are the only place an aborted txn's on-disk reference lives). Without the
-/// abort-cleanup, an aborted UPDATE/DELETE's surviving predecessor would keep an
-/// `xmax = T` that reads as an implicit-committed delete once `T`'s `Abort` is truncated,
-/// wrongly removing the row after a crash — the hazard for ALL aborted UPDATE/DELETE,
-/// HOT or non-HOT.
+/// the next checkpoint's `persist_clog` may drop those aborted txns' explicit `Aborted`
+/// entries from `clog.dat` and let the implicit-committed floor cover them (the catalog
+/// is NOT MVCC-versioned, so user-table tuples are the only place an aborted txn's
+/// on-disk reference lives). Without the abort-cleanup, an aborted UPDATE/DELETE's
+/// surviving predecessor would keep an `xmax = T` that reads as an implicit-committed
+/// delete once `T`'s entry is dropped from the snapshot, wrongly removing the row after a
+/// crash — the hazard for ALL aborted UPDATE/DELETE, HOT or non-HOT.
 ///
-/// **Durability ordering.** The floor is only ever CONSULTED by `truncate_before`,
+/// **Durability ordering.** The floor is only ever CONSULTED by `persist_clog`,
 /// which a checkpoint runs AFTER `flush_dirty_pages` + `store.sync_all` — so by the
 /// time the floor is used, every dirty page this pass produced (auto-prune: this same
-/// checkpoint; on-demand: a later checkpoint) is fsynced to the heap. No `Abort` is
-/// dropped while its reclaimed tuples are still only in memory.
+/// checkpoint; on-demand: a later checkpoint) is fsynced to the heap. No aborted entry
+/// is dropped from the snapshot while its reclaimed tuples are still only in memory.
 pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> Result<()> {
     // Capture B BEFORE the pass, under the guard (no concurrent allocation).
     let boundary = components.next_txn_id.load(Ordering::Acquire);

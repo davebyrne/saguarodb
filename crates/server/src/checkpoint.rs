@@ -26,10 +26,11 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // guard) this blocks until every in-flight writer has drained, then holds off
     // any new writer until the checkpoint returns — so the checkpoint body runs with
     // **no in-flight writer**, exactly as under Stage 1's single exclusive writer.
-    // That preserves the Milestone-D recovery / conservative-truncation invariant
-    // (no in-flight writer is ever below the truncation boundary — §5.4, §8) without
-    // a fuzzy checkpoint, and keeps the `txn_high_water` stamping below correct (no
-    // concurrent writer advances `next_txn_id` while we hold the exclusive guard).
+    // That preserves the recovery / truncation invariant (no in-flight writer is ever
+    // below the truncation boundary, so every transaction `persist_clog` snapshots is
+    // settled — §5.4, §8) without a fuzzy checkpoint, and keeps the `txn_high_water`
+    // stamping below correct (no concurrent writer advances `next_txn_id` while we hold
+    // the exclusive guard).
     let _guard = components.concurrency.begin_checkpoint()?;
 
     // Auto-prune (Milestone F4b, `docs/specs/mvcc.md` §9/§10 F): when enough dead
@@ -63,8 +64,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     // records below `checkpoint_lsn` is therefore safe (their effect is already on
     // disk). A crash BEFORE the control record falls back to the previous redo
     // boundary, where the prior cycle's images repair any torn write and the vacuum
-    // simply did not happen. The conservative-truncation guard is unchanged (F4c
-    // relaxes it later).
+    // simply did not happen.
     let threshold = components.config.auto_vacuum_dead_rows;
     if threshold != 0 && components.dead_rows_since_vacuum.load(Ordering::Acquire) >= threshold {
         let horizon = components.gc_horizon();
@@ -72,9 +72,10 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         // `docs/specs/mvcc.md` §9): this captures `B = next_txn_id` under the guard,
         // reclaims every aborted-creator tuple below `B`, then sets the floor to `B`.
         // It runs BEFORE `flush_dirty_pages`/`store.sync_all`, so this pass's
-        // reclamation is fsynced by THIS checkpoint *before* the `truncate_before`
-        // below consults the floor — so an `Abort` is only dropped after its reclaimed
-        // tuples are durable (the F4c durability-ordering invariant).
+        // reclamation is fsynced by THIS checkpoint *before* the `persist_clog` below
+        // consults the floor — so a reclaimed abort's explicit `Aborted` entry is only
+        // dropped from the snapshot after its tuples are durable (the F4c
+        // durability-ordering invariant).
         crate::query::full_vacuum_pass(components, horizon)?;
         // Reset the accumulator: churn from here on counts toward the next auto-prune.
         components

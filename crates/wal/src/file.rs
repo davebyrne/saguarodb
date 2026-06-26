@@ -31,13 +31,20 @@ struct WalState {
     pending_commits: HashSet<u64>,
     /// The vacuum floor (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c): the boundary
     /// below which a FULL VACUUM pass has reclaimed every aborted-creator tuple, so
-    /// `truncate_before` may drop those aborted transactions' `Abort` records and
-    /// float the implicit-committed floor past them. Loaded from the durable CLOG
-    /// snapshot (`clog.dat`) at open when one is present — so it survives restart —
-    /// else seeded to `FIRST_NORMAL_XID` (no aborted txn is below it ⇒ the pin is
-    /// fully conservative). See [`WalManager::set_vacuum_floor`] for why the
-    /// conservative no-snapshot fallback is safe.
+    /// the durable CLOG snapshot may drop those aborted transactions' explicit entries
+    /// (they read implicit-committed below the floor, vacuously). Consulted by
+    /// `persist_clog`'s `live_snapshot` to bound the snapshot; WAL truncation no longer
+    /// consults it (it is unconditional). Loaded from `clog.dat` at open when one is
+    /// present — so it survives restart — else seeded to `FIRST_NORMAL_XID`. See
+    /// [`WalManager::set_vacuum_floor`].
     vacuum_floor: TxnId,
+    /// Whether the CLOG and floors were seeded from a durable `clog.dat` snapshot at
+    /// open (vs. rebuilt from the WAL). When true, the loaded `committed_floor` is
+    /// authoritative and durable, so `establish_recovery_committed_floor` is a no-op:
+    /// with unconditional truncation the WAL no longer retains un-vacuumed aborts, so
+    /// re-deriving the floor from the (truncated) WAL could float it past an aborted
+    /// transaction whose tuples survive — corruption. See that method.
+    clog_loaded_from_snapshot: bool,
     poisoned: Option<String>,
     #[cfg(test)]
     fail_next_flush: Option<String>,
@@ -119,13 +126,14 @@ impl FileWalManager {
         // (atomic temp+rename means a torn write never occurs, so a CRC/version
         // mismatch is real corruption, surfaced like a bad `manifest.dat`).
         let clog_path = clog_path_for(&path);
-        let (clog, vacuum_floor) = match load_clog_snapshot(&clog_path)? {
+        let (clog, vacuum_floor, clog_loaded_from_snapshot) = match load_clog_snapshot(&clog_path)?
+        {
             Some(snapshot) => {
                 let mut clog = Clog::from_snapshot(&snapshot);
                 fold_commit_abort_after(&mut clog, &records, snapshot.clog_lsn, flushed_lsn);
-                (clog, snapshot.vacuum_floor)
+                (clog, snapshot.vacuum_floor, true)
             }
-            None => (rebuild_clog(&records, flushed_lsn), FIRST_NORMAL_XID),
+            None => (rebuild_clog(&records, flushed_lsn), FIRST_NORMAL_XID, false),
         };
         let last_lsn = flushed_lsn;
         let last_offset = flushed_offset;
@@ -146,6 +154,7 @@ impl FileWalManager {
                 // VACUUM's reclamation horizon survives restart), else the
                 // fully-conservative boundary (`docs/specs/mvcc.md` §5.4).
                 vacuum_floor,
+                clog_loaded_from_snapshot,
                 poisoned: None,
                 #[cfg(test)]
                 fail_next_flush: None,
@@ -293,89 +302,24 @@ impl WalManager for FileWalManager {
     fn truncate_before(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.lock_state()?;
 
-        // CONSERVATIVE TRUNCATION (`docs/specs/mvcc.md` §5.4, §8, Milestone D) with
-        // the Milestone-F4c relaxation for vacuumed aborts (§9).
-        // The relaxed flush gate (D1) lets an aborted/in-flight transaction's pages
-        // reach the heap, and recovery rebuilds the CLOG from the retained WAL. So
-        // truncation must never drop a non-committed transaction's records UNLESS its
-        // on-disk versions are provably gone: if it did, its `Abort` record (or absence
-        // of a `Commit`) would be gone, the implicit-committed floor would float above
-        // it, and its on-disk versions would wrongly read as committed (corruption).
-        //
-        // Find the oldest transaction with a record below the requested boundary that
-        // "pins" truncation: a NON-committed transaction whose on-disk versions are NOT
-        // provably reclaimed. The clamp retains its earliest record and everything
-        // after it. Under Stage-1 serialized writers — and under Stage-2's exclusive
-        // checkpoint/VACUUM guard — no write transaction is in-flight during a
-        // checkpoint, so in practice a pin is an *aborted* transaction; the in-flight
-        // case is covered for safety.
-        //
-        // F4c relaxation: an aborted transaction whose id is `< vacuum_floor` does NOT
-        // pin. A FULL VACUUM pass reclaimed every aborted-creator tuple with creator id
-        // below that boundary (heap + index), so dropping its `Abort` and flooring the
-        // implicit-committed boundary past it cannot resurrect anything ("implicit-
-        // committed below floor" is vacuously correct — there is no surviving version
-        // to read). This relaxation is gated STRICTLY on a CLOG-recorded `Aborted`
-        // status (`is_aborted`): an in-flight / not-yet-settled id below `vacuum_floor`
-        // (which should not exist under the exclusive guard, but we are defensive) is
-        // NOT provably reclaimed and therefore still pins. The reclamation is durable
-        // before this runs — the checkpoint flushes+fsyncs all dirty pages
-        // (`flush_dirty_pages` + `store.sync_all`) before `truncate_before` consults the
-        // floor — so no `Abort` is ever dropped while its tuples remain on disk.
-        let vacuum_floor = state.vacuum_floor;
-        let pin = state
-            .records
-            .iter()
-            .filter(|stored| stored.record.lsn < lsn)
-            .filter(|stored| represents_transaction(&stored.record))
-            .filter(|stored| {
-                let txn_id = stored.record.txn_id;
-                // A transaction pins truncation when it is not durably committed AND
-                // its on-disk versions are not provably reclaimed. The F4c relaxation
-                // is the second clause: a CLOG-recorded `Aborted` txn below the vacuum
-                // floor has no surviving version, so it stops pinning.
-                let reclaimed_abort = state.clog.is_aborted(txn_id) && txn_id < vacuum_floor;
-                !state.clog.is_committed(txn_id) && !reclaimed_abort
-            })
-            .min_by_key(|stored| stored.record.lsn)
-            .map(|stored| (stored.record.lsn, stored.record.txn_id));
-        let effective_lsn = match pin {
-            Some((pin_lsn, _)) => lsn.min(pin_lsn),
-            None => lsn,
-        };
-
+        // UNCONDITIONAL TRUNCATION (`docs/specs/mvcc.md` §5.4, §8). The durable CLOG
+        // snapshot (`clog.dat`), persisted by `persist_clog` *before* this runs in the
+        // checkpoint, records every transaction's outcome — committed AND aborted — and
+        // both floors. So the WAL no longer has to retain `Abort` records to keep an
+        // aborted-but-flushed transaction invisible across restart: the snapshot
+        // remembers it, and the vacuum floor (also in the snapshot) bounds how long.
+        // Under the exclusive checkpoint guard no writer is in flight, so every
+        // transaction below `lsn` is settled and captured by the snapshot the checkpoint
+        // just wrote. We therefore retain `record.lsn >= lsn` and drop the rest
+        // unconditionally. The in-memory CLOG and both floors are owned by `persist_clog`
+        // (which pruned them to the live window) and are NOT touched here — re-deriving
+        // them from the truncated WAL would lose the dropped aborts' statuses.
         let retained: Vec<_> = state
             .records
             .iter()
-            .filter(|stored| stored.record.lsn >= effective_lsn)
+            .filter(|stored| stored.record.lsn >= lsn)
             .cloned()
             .collect();
-        // Every transaction dropped below `effective_lsn` is either committed or a
-        // VACUUM-reclaimed abort below `vacuum_floor` (the pin above retained the
-        // oldest non-committed, not-yet-reclaimed one). Advancing the
-        // implicit-committed floor past them is safe: a committed txn's surviving
-        // tuples stay readable as committed even though its `Commit` is gone, and a
-        // reclaimed-aborted txn has NO surviving tuple, so reading it
-        // implicitly-committed is vacuous (nothing references it). Crucially the
-        // floor never crosses a still-pinned (non-committed, un-reclaimed)
-        // transaction: its records are retained, so it is not among the dropped set,
-        // and the max below is the greatest *dropped* id. A retained `Abort` keeps
-        // its explicit status regardless (recorded status wins over the floor).
-        let truncated_floor = state
-            .records
-            .iter()
-            .filter(|stored| stored.record.lsn < effective_lsn)
-            .filter(|stored| represents_transaction(&stored.record))
-            .map(|stored| stored.record.txn_id)
-            .max()
-            .map(|max_truncated| max_truncated + 1)
-            // Defensive clamp: never advance the floor to or past the pinned
-            // (non-committed) transaction, even if id/LSN order were ever not
-            // strictly aligned (it is under Stage-1 serialized writers).
-            .map(|floor| match pin {
-                Some((_, pin_txn)) => floor.min(pin_txn),
-                None => floor,
-            });
         let temp_path = self.path.with_extension("tmp");
         {
             let mut temp_file = OpenOptions::new()
@@ -450,14 +394,9 @@ impl WalManager for FileWalManager {
             .filter(|stored| stored.record.lsn <= state.flushed_lsn)
             .map(|stored| stored.encoded_len)
             .sum();
-        let previous_floor = state.clog.committed_floor();
-        state.clog = rebuild_clog(&state.records, state.flushed_lsn);
-        // Preserve the monotonic floor across the rebuild, then advance it past the
-        // transactions this truncation removed.
-        state.clog.set_committed_floor(previous_floor);
-        if let Some(floor) = truncated_floor {
-            state.clog.set_committed_floor(floor);
-        }
+        // The CLOG and floors are NOT rebuilt here: `persist_clog` already pruned them
+        // to the live window, and the dropped records' statuses live only in `clog.dat`
+        // now. Rebuilding from the truncated WAL would lose the dropped aborts.
         state.pending_commits = pending_commits(&state.records, state.flushed_lsn);
 
         Ok(())
@@ -482,14 +421,26 @@ impl WalManager for FileWalManager {
 
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()> {
         let mut state = self.lock_state()?;
-        // The floor must not cross any retained transaction that is not durably
-        // committed (aborted or in-flight): such a transaction's versions may be on
-        // disk (relaxed flush gate), and flooring past it would mark it implicitly
-        // committed (`docs/specs/mvcc.md` §5.4, §8). So the floor is the oldest
-        // non-committed retained transaction id, or the allocation boundary if every
-        // retained transaction is committed. Conservative truncation already
-        // guarantees every transaction dropped below the oldest retained
-        // non-committed one was committed, so ids below this floor are all committed.
+        // When the CLOG was seeded from a durable `clog.dat` snapshot, its
+        // `committed_floor` is authoritative and durable — do NOT touch it. This is
+        // load-bearing under unconditional truncation: the WAL no longer retains
+        // un-vacuumed aborts, so the conservative re-derivation below would see no
+        // pinning record for an aborted-but-unreclaimed transaction and could float the
+        // floor past it, after which the next checkpoint's snapshot would drop its
+        // explicit `Aborted` entry and its surviving tuples would read as committed —
+        // corruption (`docs/specs/mvcc.md` §5.4, §8).
+        if state.clog_loaded_from_snapshot {
+            return Ok(());
+        }
+        // No-snapshot fallback (fresh database, or a pre-durable-CLOG data directory
+        // whose WAL was conservatively truncated): re-establish the floor from the
+        // retained WAL. The floor must not cross any retained transaction that is not
+        // durably committed (aborted or in-flight): such a transaction's versions may
+        // be on disk (relaxed flush gate), and flooring past it would mark it implicitly
+        // committed. So the floor is the oldest non-committed retained transaction id,
+        // or the allocation boundary if every retained transaction is committed — and a
+        // conservatively-truncated WAL guarantees every transaction dropped below that
+        // oldest non-committed one was committed.
         let oldest_non_committed = state
             .records
             .iter()
@@ -508,9 +459,9 @@ impl WalManager for FileWalManager {
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
         // Monotonic; runtime-resident but persisted to `clog.dat` (see the trait doc):
         // a full VACUUM pass under the exclusive guard reclaimed every aborted-creator
-        // tuple below `boundary`, so `truncate_before` may now drop those aborted
-        // transactions' `Abort` records and float the implicit-committed floor past
-        // them. Never lowered.
+        // tuple below `boundary`, so `persist_clog`'s `live_snapshot` may now drop those
+        // aborted transactions' explicit entries (they read implicit-committed below the
+        // floor, vacuously). Never lowered.
         let mut state = self.lock_state()?;
         state.vacuum_floor = state.vacuum_floor.max(boundary);
         Ok(())
@@ -599,16 +550,16 @@ impl FileWalManager {
     }
 }
 
-/// Whether `record` represents a real transaction whose CLOG outcome the
-/// conservative-truncation guard must protect (`docs/specs/mvcc.md` §5.4). True
-/// for operation/`Commit`/`Abort` records; FALSE for `txn_id == 0` system metadata
-/// and for the `Checkpoint` marker. The marker carries the transaction-id
-/// allocation high-water in its `txn_id` field (so `next_txn_id` survives
-/// truncation), but that id is an already-settled transaction's, not a transaction
-/// that still needs its records retained or the floor held below it — counting it
-/// here would (e.g. after two checkpoints with no write between, when the second
-/// checkpoint's boundary lands on the first's marker) clamp the floor at the last
-/// committed transaction and hide its committed rows.
+/// Whether `record` represents a real transaction whose CLOG outcome the no-snapshot
+/// recovery floor must respect (`establish_recovery_committed_floor`,
+/// `docs/specs/mvcc.md` §5.4). True for operation/`Commit`/`Abort` records; FALSE for
+/// `txn_id == 0` system metadata and for the `Checkpoint` marker. The marker carries the
+/// transaction-id allocation high-water in its `txn_id` field (so `next_txn_id` survives
+/// truncation), but that id is an already-settled transaction's, not a transaction that
+/// still needs the floor held below it — counting it here would (e.g. after two
+/// checkpoints with no write between, when the second checkpoint's boundary lands on the
+/// first's marker) clamp the floor at the last committed transaction and hide its
+/// committed rows.
 fn represents_transaction(record: &WalRecord) -> bool {
     record.txn_id != 0 && !matches!(record.kind, WalRecordKind::Checkpoint { .. })
 }

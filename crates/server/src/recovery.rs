@@ -103,16 +103,14 @@ pub fn open_app(config: Config) -> Result<AppState> {
 
     let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
     // Establish the CLOG implicit-committed floor (`docs/specs/mvcc.md` §5.4, §8).
-    // The floor lets an unrecorded normal id below it read as committed, covering a
-    // committed transaction whose `Commit` record a checkpoint truncated. With the
-    // relaxed flush gate (D1) an aborted/in-flight transaction's pages may also be
-    // on disk, so the floor must NOT cross such a transaction or its replayed
-    // versions would wrongly become visible. The WAL manager therefore computes the
-    // floor conservatively: the oldest transaction in the retained WAL whose CLOG
-    // status is not `Committed` (aborted or in-flight), or — if every retained
-    // transaction is committed — the allocation boundary. Conservative truncation
-    // (`truncate_before`) guarantees every transaction the WAL dropped below that
-    // oldest non-committed one was committed, so flooring just under it is safe.
+    // When the WAL loaded a durable `clog.dat` snapshot its floor is authoritative and
+    // this is a no-op. Otherwise (no snapshot — a fresh database, or a pre-durable-CLOG
+    // data directory whose WAL was conservatively truncated by the older build) the WAL
+    // re-derives the floor conservatively: the oldest transaction in the retained WAL
+    // whose CLOG status is not `Committed` (aborted or in-flight), or — if every retained
+    // transaction is committed — the allocation boundary. That conservatively-truncated
+    // WAL guarantees every transaction dropped below the oldest non-committed one was
+    // committed, so flooring just under it never marks an aborted/in-flight txn committed.
     wal.establish_recovery_committed_floor(next_txn_id)?;
     let tls = match config.tls_files().map_err(DbError::io)? {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),

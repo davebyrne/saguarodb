@@ -15,8 +15,9 @@ use crate::Result;
 /// - **The checkpoint takes the EXCLUSIVE guard**
 ///   ([`begin_checkpoint`](ConcurrencyController::begin_checkpoint)), which drains
 ///   every in-flight shared writer and then runs alone. This preserves the
-///   "no in-flight writer during a checkpoint" invariant verbatim, so Milestone-D
-///   recovery / conservative WAL truncation stays correct without a fuzzy
+///   "no in-flight writer during a checkpoint" invariant verbatim, so every
+///   transaction below the truncation boundary is settled and captured by
+///   `persist_clog`'s snapshot, keeping recovery correct without a fuzzy
 ///   checkpoint (`docs/specs/mvcc.md` §5.4, §8, §12).
 /// - **Readers take no guard at all** and run lock-free; they are unaffected by
 ///   this lock and never call into it.

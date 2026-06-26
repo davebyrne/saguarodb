@@ -46,37 +46,35 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// no id is allocated mid-pass) and calls this *after* the pass completes; the
     /// floor takes `max(current, boundary)`.
     ///
-    /// Effect: [`WalManager::truncate_before`] stops *pinning* an aborted
-    /// transaction whose id is `< vacuum_floor` (its on-disk versions are reclaimed,
-    /// so dropping its `Abort` record and flooring the implicit-committed boundary
-    /// past it cannot resurrect anything — "implicit-committed below floor" is
-    /// vacuously correct for it). An in-flight transaction, or an aborted one
-    /// `>= vacuum_floor`, still pins.
+    /// Effect: [`WalManager::persist_clog`]'s snapshot drops the explicit entry of an
+    /// aborted transaction whose id is `< vacuum_floor` (its on-disk versions are
+    /// reclaimed, so it reads implicit-committed below the floor — vacuously correct),
+    /// which bounds how long the durable CLOG must remember it. WAL truncation does not
+    /// consult the vacuum floor (it is unconditional); an aborted transaction
+    /// `>= vacuum_floor` keeps its explicit `Aborted` entry in the snapshot.
     ///
     /// **Durable across restart when a CLOG snapshot exists.** The vacuum floor is
     /// persisted in the durable CLOG snapshot (`clog.dat`, written by
     /// [`WalManager::persist_clog`]) and reloaded at open, so a full VACUUM's
     /// reclamation horizon survives restart. When NO snapshot is present (a fresh
     /// database, or a data directory from a pre-durable-CLOG build) the floor falls
-    /// back to its conservative initial value. That fallback is SAFE: without a
-    /// snapshot the WAL is un-truncated, so truncation is conservative once more (every
-    /// aborted txn pins) until the first post-restart full VACUUM — never less safe,
-    /// only less aggressive — and recovery rebuilds the CLOG from the surviving WAL.
+    /// back to its conservative initial value — safe, since the snapshot simply retains
+    /// more aborted entries until the first post-restart full VACUUM.
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
 
     /// Establish the CLOG implicit-committed floor at recovery, given the
     /// transaction-id `allocation_boundary` (the next id to be handed out).
     ///
-    /// Any unrecorded normal id below the floor reads as committed (its `Commit`
-    /// record was truncated by a prior checkpoint while its tuples survive,
-    /// `docs/specs/mvcc.md` §5.4). The floor is therefore set CONSERVATIVELY: to
-    /// the oldest transaction in the retained WAL whose rebuilt CLOG status is not
-    /// `Committed` (aborted or still in-flight), or to `allocation_boundary` if
-    /// every retained transaction is committed. Conservative truncation
-    /// ([`WalManager::truncate_before`]) guarantees every transaction dropped below
-    /// that oldest non-committed one was committed, so flooring just under it never
-    /// marks an aborted/in-flight transaction implicitly committed. The floor is
-    /// monotonic; this is called once after recovery seeds the allocator.
+    /// **No-op when the CLOG was seeded from a durable `clog.dat` snapshot** — that
+    /// snapshot's `committed_floor` is authoritative and durable. This is the
+    /// no-snapshot fallback only (fresh database, or a pre-durable-CLOG data directory
+    /// whose WAL was conservatively truncated): an unrecorded normal id below the floor
+    /// reads as committed (`docs/specs/mvcc.md` §5.4), so the floor is set
+    /// CONSERVATIVELY to the oldest transaction in the retained WAL whose rebuilt CLOG
+    /// status is not `Committed` (aborted or in-flight), or to `allocation_boundary` if
+    /// every retained transaction is committed — never marking an aborted/in-flight
+    /// transaction implicitly committed. The floor is monotonic; this is called once
+    /// after recovery seeds the allocator.
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
 }
 
@@ -375,10 +373,8 @@ mod tests {
         let path = dir.path().join("wal.dat");
         let wal = FileWalManager::open(&path).unwrap();
 
-        // Conservative truncation (`docs/specs/mvcc.md` §5.4, §8) only drops a
-        // prefix of COMMITTED transactions, so commit each insert's txn here. (Bare
-        // uncommitted inserts would now PIN truncation — exercised separately in
-        // `conservative_truncation_pins_an_aborted_transaction`.)
+        // `truncate_before` retains `record.lsn >= boundary` and drops the rest
+        // unconditionally (`docs/specs/mvcc.md` §5.4, §8).
         wal.append(WalRecord::insert_for_test(1, 1)).unwrap();
         wal.append(WalRecord {
             lsn: 0,
@@ -396,8 +392,7 @@ mod tests {
         wal.append(WalRecord::insert_for_test(3, 3)).unwrap();
         wal.flush().unwrap();
 
-        // Truncate below the third insert (lsn 5); txns 1 and 2 are committed, so
-        // their records (lsn 1-4) are dropped.
+        // Truncate below the third insert (lsn 5); records lsn 1-4 are dropped.
         wal.truncate_before(5).unwrap();
 
         let records: Vec<_> = wal
@@ -427,81 +422,10 @@ mod tests {
         assert!(replay_after_checkpoint.is_empty());
     }
 
-    #[test]
-    fn conservative_truncation_pins_an_aborted_transaction() {
-        // The conservative-truncation guard (`docs/specs/mvcc.md` §5.4, §8,
-        // Milestone D): a checkpoint must never truncate past an aborted (or
-        // in-flight) transaction, even when later transactions committed — its
-        // `Abort` record must survive so its on-disk (relaxed-flush) versions stay
-        // hidden after restart. Layout: txn 10 committed, txn 11 aborted, txn 12
-        // committed; a checkpoint then asks to truncate everything below txn 12's
-        // commit. Truncation must clamp at txn 11's first record (the pin).
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal.dat");
-        let wal = FileWalManager::open(&path).unwrap();
-
-        wal.append(WalRecord::insert_for_test(10, 1)).unwrap(); // lsn 1
-        wal.append(WalRecord {
-            lsn: 0,
-            txn_id: 10,
-            kind: WalRecordKind::Commit,
-        })
-        .unwrap(); // lsn 2
-        let pin_lsn = wal.append(WalRecord::insert_for_test(11, 2)).unwrap(); // lsn 3
-        wal.append(WalRecord {
-            lsn: 0,
-            txn_id: 11,
-            kind: WalRecordKind::Abort,
-        })
-        .unwrap(); // lsn 4
-        wal.append(WalRecord::insert_for_test(12, 3)).unwrap(); // lsn 5
-        let commit_12 = wal
-            .append(WalRecord {
-                lsn: 0,
-                txn_id: 12,
-                kind: WalRecordKind::Commit,
-            })
-            .unwrap(); // lsn 6
-        wal.flush().unwrap();
-
-        // Ask to truncate everything below txn 12's commit (lsn 6); the aborted
-        // txn 11 (lsn 3) pins truncation, so nothing below lsn 3 is dropped either
-        // (its committed predecessor txn 10 stays too — bounded cost).
-        wal.truncate_before(commit_12).unwrap();
-
-        let retained: Vec<_> = wal
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            retained.iter().all(|record| record.lsn >= pin_lsn),
-            "truncation clamped at the aborted txn's first record"
-        );
-        // The aborted txn's `Abort` record survives, so its status is reconstructible.
-        assert!(
-            retained
-                .iter()
-                .any(|record| record.txn_id == 11 && matches!(record.kind, WalRecordKind::Abort)),
-            "the pinned aborted txn's Abort record is retained"
-        );
-
-        // After reopen, the aborted txn is still aborted (never implicitly
-        // committed), the committed ones are committed, and the floor never crossed
-        // the aborted txn.
-        drop(wal);
-        let reopened = FileWalManager::open(&path).unwrap();
-        reopened.establish_recovery_committed_floor(13).unwrap();
-        assert!(reopened.is_committed(10));
-        assert!(reopened.is_aborted(11));
-        assert!(reopened.is_committed(12));
-    }
-
-    /// Build the canonical aborted-across-checkpoint layout used by the F4c tests:
-    /// txn 10 committed (lsn 1-2), txn 11 ABORTED (insert lsn 3, abort lsn 4), txn 12
-    /// committed (lsn 5-6). Returns `(wal, pin_lsn, truncate_at)` where `pin_lsn` (3)
-    /// is txn 11's first record and `truncate_at` (6) is txn 12's commit. Without the
-    /// F4c relaxation, truncating at `truncate_at` clamps at `pin_lsn` (txn 11 pins).
+    /// Build the canonical aborted-across-checkpoint layout: txn 10 committed
+    /// (lsn 1-2), txn 11 ABORTED (insert lsn 3, abort lsn 4), txn 12 committed
+    /// (lsn 5-6). Returns `(wal, abort_lsn, truncate_at)` where `abort_lsn` (3) is
+    /// txn 11's first record and `truncate_at` (6) is txn 12's commit.
     fn aborted_across_checkpoint_layout(path: &std::path::Path) -> (FileWalManager, Lsn, Lsn) {
         let wal = FileWalManager::open(path).unwrap();
         wal.append(WalRecord::insert_for_test(10, 1)).unwrap(); // lsn 1
@@ -511,7 +435,7 @@ mod tests {
             kind: WalRecordKind::Commit,
         })
         .unwrap(); // lsn 2
-        let pin_lsn = wal.append(WalRecord::insert_for_test(11, 2)).unwrap(); // lsn 3
+        let abort_lsn = wal.append(WalRecord::insert_for_test(11, 2)).unwrap(); // lsn 3
         wal.append(WalRecord {
             lsn: 0,
             txn_id: 11,
@@ -527,31 +451,29 @@ mod tests {
             })
             .unwrap(); // lsn 6
         wal.flush().unwrap();
-        (wal, pin_lsn, truncate_at)
+        (wal, abort_lsn, truncate_at)
     }
 
     #[test]
-    fn vacuum_floor_lets_truncation_drop_a_reclaimed_aborted_txn_no_resurrection() {
-        // THE critical F4c test (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c). After a
-        // FULL VACUUM pass has reclaimed an aborted txn's on-disk versions, the vacuum
-        // floor is advanced past it, and truncation may THEN drop its `Abort` record and
-        // float the implicit-committed floor past it — WITHOUT resurrecting anything,
-        // because nothing on disk references it. Here txn 11 (aborted) is BELOW the
-        // vacuum floor (set to 12), so it no longer pins: truncation drops everything
-        // below txn 12's commit, and after reopen no record of txn 11 survives. (Its id
-        // reads committed-via-floor, which is vacuously correct: VACUUM reclaimed every
-        // tuple it created, so there is nothing to read as a committed ghost.)
+    fn decoupled_truncation_drops_abort_record_but_clog_snapshot_keeps_it_aborted() {
+        // The keystone of the decoupling (`docs/specs/mvcc.md` §5.4, §8): with the
+        // durable CLOG snapshot, the checkpoint persists outcomes to `clog.dat` and then
+        // truncates the WAL UNCONDITIONALLY — an un-vacuumed aborted transaction's
+        // `Abort` record is dropped, yet it stays aborted (invisible) after restart
+        // because the snapshot remembers it. (Pre-decoupling this txn would have pinned
+        // truncation to keep its `Abort`.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.dat");
-        let (wal, _pin_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
+        let (wal, abort_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
 
-        // A full VACUUM pass that started at next_txn_id == 13 reclaimed every
-        // aborted-creator tuple with id < 13 — including txn 11's — so the floor is 13.
-        wal.set_vacuum_floor(13).unwrap();
+        // Checkpoint order: persist the snapshot (records txn 11 aborted) BEFORE
+        // truncating. No VACUUM ran, so the vacuum floor stays at its default and txn
+        // 11's explicit `Aborted` entry is kept in the snapshot.
+        wal.persist_clog(wal.flushed_lsn()).unwrap();
         wal.truncate_before(truncate_at).unwrap();
 
-        // The aborted txn 11 NO LONGER pins: its records (including its `Abort`) are
-        // dropped along with the committed prefix.
+        // Truncation is unconditional: txn 11's `Abort` (lsn 4) and insert (lsn 3) are
+        // gone from the WAL even though it was never vacuumed.
         let retained: Vec<_> = wal
             .replay_from(0)
             .unwrap()
@@ -559,173 +481,86 @@ mod tests {
             .unwrap();
         assert!(
             retained.iter().all(|record| record.lsn >= truncate_at),
-            "the vacuumed aborted txn no longer pins truncation"
+            "truncation is unconditional — nothing below the boundary is retained"
         );
         assert!(
-            !retained
-                .iter()
-                .any(|record| record.txn_id == 11 && matches!(record.kind, WalRecordKind::Abort)),
-            "the reclaimed aborted txn's Abort record is dropped"
+            !retained.iter().any(|record| record.txn_id == 11),
+            "the un-vacuumed aborted txn's records are dropped (no pinning)"
         );
+        let _ = abort_lsn;
 
-        // After reopen + recovery floor: txn 11 is gone from the WAL and below the floor,
-        // so nothing reads as a committed ghost — its tuples were reclaimed, so there is
-        // no on-disk version to resurrect. (This is the no-resurrection property.)
+        // After reopen the snapshot keeps txn 11 aborted, txn 12 committed, and txn 10
+        // implicit-committed below the floor — no orphan version is resurrected.
         drop(wal);
         let reopened = FileWalManager::open(&path).unwrap();
-        reopened.establish_recovery_committed_floor(13).unwrap();
-        let after_reopen: Vec<_> = reopened
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            !after_reopen
-                .iter()
-                .any(|record| record.txn_id == 11 && is_redo_operation(&record.kind)),
-            "no flushed version of the reclaimed aborted txn survives in the WAL"
-        );
-        assert!(reopened.is_committed(12));
-    }
-
-    #[test]
-    fn without_vacuum_floor_an_aborted_txn_still_pins_truncation() {
-        // Counter-test (the F4c relaxation is GATED, not blanket): the SAME layout with
-        // NO vacuum floor advanced (its tuples were never reclaimed) keeps the aborted
-        // txn 11 pinning — its `Abort` is retained and the floor never floats past it,
-        // so after restart it stays aborted (invisible). This proves the relaxation
-        // fires only for aborted txns BELOW the vacuum floor.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal.dat");
-        let (wal, pin_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
-
-        // No `set_vacuum_floor`: the floor stays at its conservative initial value, so
-        // txn 11 is NOT below it and still pins.
-        wal.truncate_before(truncate_at).unwrap();
-
-        let retained: Vec<_> = wal
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            retained.iter().all(|record| record.lsn >= pin_lsn),
-            "without a vacuum floor the aborted txn still pins truncation"
-        );
-        assert!(
-            retained
-                .iter()
-                .any(|record| record.txn_id == 11 && matches!(record.kind, WalRecordKind::Abort)),
-            "the un-vacuumed aborted txn's Abort record is retained"
-        );
-
-        drop(wal);
-        let reopened = FileWalManager::open(&path).unwrap();
-        reopened.establish_recovery_committed_floor(13).unwrap();
         assert!(
             reopened.is_aborted(11),
-            "the pinned aborted txn stays aborted"
+            "the snapshot keeps the abort across restart"
         );
         assert!(reopened.is_committed(12));
+        assert!(reopened.is_committed(10));
     }
 
     #[test]
-    fn vacuum_floor_only_relaxes_aborts_below_it() {
-        // The relaxation is bounded by the floor: an aborted txn AT/ABOVE the vacuum
-        // floor still pins (its tuples may not be reclaimed). Layout has txn 11 aborted;
-        // a floor of 11 does NOT cover id 11 (the boundary is exclusive: `id < floor`),
-        // so txn 11 still pins. A floor of 12 covers it and it stops pinning.
-        let dir = tempfile::tempdir().unwrap();
-
-        // Floor == 11: does not cover id 11 ⇒ still pins.
-        let path_a = dir.path().join("wal_a.dat");
-        let (wal_a, pin_lsn, truncate_at) = aborted_across_checkpoint_layout(&path_a);
-        wal_a.set_vacuum_floor(11).unwrap();
-        wal_a.truncate_before(truncate_at).unwrap();
-        let retained_a: Vec<_> = wal_a
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            retained_a.iter().all(|record| record.lsn >= pin_lsn),
-            "an aborted txn at the floor (id == floor) still pins"
-        );
-
-        // Floor == 12: covers id 11 ⇒ stops pinning, truncation reaches the boundary.
-        let path_b = dir.path().join("wal_b.dat");
-        let (wal_b, _pin_lsn, truncate_at_b) = aborted_across_checkpoint_layout(&path_b);
-        wal_b.set_vacuum_floor(12).unwrap();
-        wal_b.truncate_before(truncate_at_b).unwrap();
-        let retained_b: Vec<_> = wal_b
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            retained_b.iter().all(|record| record.lsn >= truncate_at_b),
-            "an aborted txn below the floor (id < floor) stops pinning"
-        );
-    }
-
-    #[test]
-    fn truncation_shrinks_the_wal_further_after_vacuum() {
-        // The relaxation has EFFECT: after the vacuum floor advances past a previously-
-        // pinning aborted txn, `truncate_before` retains strictly fewer bytes than the
-        // pinned case. Same layout in two WALs; one vacuumed, one not.
-        let dir = tempfile::tempdir().unwrap();
-
-        let pinned_path = dir.path().join("pinned.dat");
-        let (pinned, _pin, truncate_at) = aborted_across_checkpoint_layout(&pinned_path);
-        pinned.truncate_before(truncate_at).unwrap();
-        let pinned_bytes = pinned.bytes_after(0).unwrap();
-
-        let vacuumed_path = dir.path().join("vacuumed.dat");
-        let (vacuumed, _pin2, truncate_at2) = aborted_across_checkpoint_layout(&vacuumed_path);
-        vacuumed.set_vacuum_floor(13).unwrap();
-        vacuumed.truncate_before(truncate_at2).unwrap();
-        let vacuumed_bytes = vacuumed.bytes_after(0).unwrap();
-
-        assert!(
-            vacuumed_bytes < pinned_bytes,
-            "vacuumed WAL ({vacuumed_bytes} bytes) must be smaller than pinned ({pinned_bytes} bytes)"
-        );
-    }
-
-    #[test]
-    fn vacuum_floor_resets_on_reopen_without_a_clog_snapshot() {
-        // No-snapshot fallback safety (`docs/specs/mvcc.md` §5.4, F4c): with NO durable
-        // CLOG snapshot (`persist_clog` is never called here, so no `clog.dat` exists)
-        // the vacuum floor falls back to its conservative initial value at reopen, and
-        // truncation is conservative again until the first post-restart full VACUUM.
-        // Here the floor is advanced, then the WAL is reopened (NOT truncated first),
-        // and an aborted txn that WOULD have been relaxed now pins again — provably
-        // correct. (When a snapshot IS present the floor is instead loaded from it; see
-        // `file::tests::reopen_loads_vacuum_floor_from_snapshot`.)
+    fn repeated_checkpoint_keeps_an_unvacuumed_abort_aborted_across_recovery() {
+        // Regression guard for the recovery floor + repeated pruning. After
+        // decoupling, the recovery-time `establish_recovery_committed_floor` MUST be a
+        // no-op when a snapshot is loaded: the truncated WAL no longer retains the abort,
+        // so re-deriving the floor from it would float past txn 11, and the NEXT
+        // checkpoint's snapshot would then drop txn 11's explicit `Aborted` entry — its
+        // surviving tuples would read as committed (corruption). This exercises two full
+        // checkpoint+recovery cycles and asserts txn 11 stays aborted throughout.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.dat");
-        let (wal, pin_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
-        wal.set_vacuum_floor(13).unwrap();
+        let (wal, _abort_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
+        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        wal.truncate_before(truncate_at).unwrap();
         drop(wal);
 
-        // Reopen: with no snapshot the floor falls back to its conservative initial value.
+        // Recovery cycle 1: load the snapshot, then recovery calls the floor establisher
+        // (a no-op here) and the post-replay checkpoint re-persists the snapshot.
+        let r1 = FileWalManager::open(&path).unwrap();
+        r1.establish_recovery_committed_floor(13).unwrap();
+        assert!(
+            r1.is_aborted(11),
+            "the abort survives the recovery floor establisher"
+        );
+        r1.persist_clog(r1.flushed_lsn()).unwrap();
+        drop(r1);
+
+        // Recovery cycle 2: the re-persisted snapshot must STILL record txn 11 aborted.
+        let r2 = FileWalManager::open(&path).unwrap();
+        assert!(
+            r2.is_aborted(11),
+            "the un-vacuumed abort is not dropped by repeated checkpoint pruning"
+        );
+        assert!(r2.is_committed(12));
+    }
+
+    #[test]
+    fn vacuum_floor_drops_a_reclaimed_abort_from_the_next_snapshot() {
+        // The vacuum floor now bounds the durable CLOG, not WAL truncation: once a full
+        // VACUUM reclaims txn 11's tuples (floor advanced past 11), `persist_clog` drops
+        // its explicit `Aborted` entry and it reads implicit-committed (vacuously correct
+        // — its tuples are gone). Contrast with the un-vacuumed case above, where the
+        // entry is kept.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let (wal, _abort_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
+
+        // A full VACUUM starting at next_txn_id == 13 reclaimed every aborted-creator
+        // tuple < 13, including txn 11's.
+        wal.set_vacuum_floor(13).unwrap();
+        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        wal.truncate_before(truncate_at).unwrap();
+        drop(wal);
+
         let reopened = FileWalManager::open(&path).unwrap();
-        reopened.truncate_before(truncate_at).unwrap();
-        let retained: Vec<_> = reopened
-            .replay_from(0)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            retained.iter().all(|record| record.lsn >= pin_lsn),
-            "after reopen the vacuum floor is reset, so the aborted txn pins again"
-        );
-        assert!(
-            retained
-                .iter()
-                .any(|record| record.txn_id == 11 && matches!(record.kind, WalRecordKind::Abort)),
-            "the aborted txn's Abort record is retained again post-reopen"
-        );
+        // txn 11 is now implicit-committed below the floor (its entry was dropped), which
+        // is vacuous because VACUUM reclaimed its only on-disk versions.
+        assert!(!reopened.is_aborted(11));
+        assert!(reopened.is_committed(11));
+        assert!(reopened.is_committed(12));
     }
 
     #[test]
