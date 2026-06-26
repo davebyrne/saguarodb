@@ -106,7 +106,7 @@ pub trait ConnectionState: Send {
    negotiation reply the server selects: `SslAccepted` (`S` byte) when the
    server has TLS configured, otherwise `SslRejected` (`N` byte). The protocol
    layer does not perform the TLS handshake; `server` owns it. A client may also
-   send a `GSSENCRequest` first; v1 does not support GSSAPI transport encryption
+   send a `GSSENCRequest` first; GSSAPI transport encryption is not supported
    and declines it with the same `N` byte, after which the client continues.
 2. Client sends StartupMessage.
 3. Server sends:
@@ -114,7 +114,7 @@ pub trait ConnectionState: Send {
    - minimal `ParameterStatus` messages
    - `ReadyForQuery`
 
-V1 accepts all users/databases and performs no authentication.
+The server accepts all users/databases and performs no authentication.
 
 ## Query Flow
 
@@ -146,7 +146,7 @@ On error:
 2. Encode `ReadyForQuery`.
 3. Keep connection open unless protocol state is unrecoverable.
 
-The codec may return errors after buffering bytes. In v1 the server treats any decode error as connection-fatal: it encodes one `ErrorResponse`, encodes `ReadyForQuery`, and closes the TCP connection instead of attempting to reuse the codec state.
+The codec may return errors after buffering bytes. The server treats any decode error as connection-fatal: it encodes one `ErrorResponse`, encodes `ReadyForQuery`, and closes the TCP connection instead of attempting to reuse the codec state.
 
 ## Type Encoding
 
@@ -157,7 +157,7 @@ The codec may return errors after buffering bytes. In v1 the server treats any d
 - `Boolean` -> `BOOL` (`type_oid = 16`, `type_size = 1`)
 
 The public helper `type_oid(data_type: &DataType) -> i32` returns the OID for a
-v1 data type (used when building `RowDescription` and `ParameterDescription`).
+data type (used when building `RowDescription` and `ParameterDescription`).
 
 The simple query path sends text format for all columns. The extended protocol
 lets a client request binary format (code `1`) per column via `Bind`;
@@ -172,7 +172,7 @@ Client messages:
 - `SSLRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877103`.
 - `GSSENCRequest`: startup-style packet with `int32 length = 8`, `int32 code = 80877104`.
 - `CancelRequest`: startup-style packet with `int32 length = 16`, `int32 code = 80877102`, `int32 process_id`, `int32 secret_key`. Sent on its own connection; the server sends no reply.
-- `Startup`: startup-style packet with `int32 protocol = 196608` for protocol 3.0, followed by nul-terminated key/value strings and a final `\0`. V1 reads `user`, optional `database`, and optional `application_name`; other parameters are ignored.
+- `Startup`: startup-style packet with `int32 protocol = 196608` for protocol 3.0, followed by nul-terminated key/value strings and a final `\0`. The server reads `user`, optional `database`, and optional `application_name`; other parameters are ignored.
 - `Query`: tag `b'Q'`, length, SQL string terminated by `\0`.
 - `Parse`: tag `b'P'`, length, `statement_name\0`, `query\0`, `int16 param_type_count`, then that many `int32` parameter type OIDs (`0` = unspecified).
 - `Bind`: tag `b'B'`, length, `portal_name\0`, `statement_name\0`, `int16 param_format_count` + that many `int16` format codes, `int16 param_count` + that many parameters (each `int32 length` then `length` bytes, or `int32 -1` for NULL), `int16 result_format_count` + that many `int16` format codes. Format codes are `0` (text) or `1` (binary).
@@ -188,10 +188,10 @@ Server messages:
 - `AuthenticationOk`: tag `b'R'`, length `8`, `int32 auth_code = 0`.
 - `BackendKeyData`: tag `b'K'`, length `12`, `int32 process_id`, `int32 secret_key`. Sent at startup so the client can later cancel an in-flight query.
 - `ParameterStatus`: tag `b'S'`, length, `key\0value\0`. Startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
-- `ReadyForQuery(status)`: tag `b'Z'`, length `5`, transaction-status byte supplied by the caller. The protocol encodes whatever byte it is handed; the server sources it from the session's transaction state (`b'I'` idle, `b'T'` in a transaction block, `b'E'` failed transaction block). The session is always idle in v1's autocommit model, so the byte is `b'I'` in every interaction; the non-idle bytes are produced once transaction lifecycle transitions land.
+- `ReadyForQuery(status)`: tag `b'Z'`, length `5`, transaction-status byte supplied by the caller. The protocol encodes whatever byte it is handed; the server sources it from the session's transaction state (`b'I'` idle, `b'T'` in a transaction block, `b'E'` failed transaction block). Outside an explicit transaction (autocommit) the byte is `b'I'`; inside an open `BEGIN` block it is `b'T'`, and `b'E'` once a statement in that block fails (see `docs/specs/crates/server.md`).
 - `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
 - `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus its wire bytes (text or binary per the `RowDescription` format codes), or `int32 -1` for `NULL`.
-- `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. V1 tags are `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, and `EXPLAIN`.
+- `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. Tags include `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, and `VACUUM`.
 - `ParseComplete`: tag `b'1'`, length `4`.
 - `BindComplete`: tag `b'2'`, length `4`.
 - `CloseComplete`: tag `b'3'`, length `4`.
@@ -237,9 +237,9 @@ unsupported format codes.
 - Decodes StartupMessage (reading `user`, `database`, and `application_name`) and emits expected startup responses.
 - Startup echoes `application_name` in a `ParameterStatus`, reporting empty when the client omits it.
 - Decodes simple Query.
-- Encodes RowDescription for all v1 data types with PostgreSQL OIDs, the per-field format code, and `table_oid = 0`.
+- Encodes RowDescription for all supported data types with PostgreSQL OIDs, the per-field format code, and `table_oid = 0`.
 - Round-trips int8/bool/text values through `encode_value`/`decode_value` in both text and binary formats, and rejects malformed binary input and unsupported format codes.
 - Encodes DataRow with `NULL` represented as null field.
-- Encodes ReadyForQuery as `b'Z'`, length `5`, status byte equal to the supplied `status` (the server passes `b'I'`/`b'T'`/`b'E'` from the session's transaction state; always `b'I'` in v1).
+- Encodes ReadyForQuery as `b'Z'`, length `5`, status byte equal to the supplied `status` (the server passes `b'I'`/`b'T'`/`b'E'` from the session's transaction state).
 - Encodes ErrorResponse with SQLSTATE code.
 - Handles Terminate by marking connection terminated.

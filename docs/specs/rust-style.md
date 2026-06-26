@@ -34,7 +34,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 ## Unsafe, Panics, and Assertions
 
-- Do not use `unsafe` in v1 implementation. If a future change needs `unsafe`, isolate it in a small module, document the safety invariants, and add targeted tests.
+- Do not use `unsafe`. If a future change needs `unsafe`, isolate it in a small module, document the safety invariants, and add targeted tests.
 - Library crates must not panic for expected runtime errors. Return `common::Result<T>`.
 - Avoid `unwrap()` and `expect()` in production code. Use structured error conversion instead.
 - `panic!`, `unwrap()`, and `expect()` are acceptable in tests.
@@ -68,11 +68,11 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 
 ## Ownership and Data Shapes
 
-- Use owned `String`, `Vec<T>`, `Row`, `TableSchema`, and plan nodes across crate boundaries. Avoid lifetime-heavy public APIs in v1.
+- Use owned `String`, `Vec<T>`, `Row`, `TableSchema`, and plan nodes across crate boundaries. Avoid lifetime-heavy public APIs.
 - It is acceptable to clone schema and row metadata at crate boundaries for clarity.
 - Avoid cloning page data or row values inside hot loops unless it keeps ownership clear and tests remain fast enough.
 - Use `&str` for lookup inputs, such as catalog name lookup, when the callee does not need ownership.
-- Use the spec-defined ID aliases (`TableId`, `ColumnId`, `BindingId`, `FileId`, `PageNum`, `Lsn`) rather than introducing new ID wrappers in v1.
+- Use the spec-defined ID aliases (`TableId`, `ColumnId`, `BindingId`, `FileId`, `PageNum`, `Lsn`) rather than introducing new ID wrappers.
 - Normalize unquoted SQL identifiers to lowercase before catalog lookup or catalog creation.
 
 ## Concurrency and Async Boundaries
@@ -102,7 +102,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - `NULL` may be accepted where the target column or expression is nullable.
 - SQL three-valued logic belongs in executor expression evaluation, not in `Value` ordering.
 - `Value::Ord` is storage key ordering only: `Null < Boolean < Integer < Text`.
-- Composite primary key APIs stay in place, but v1 implementation may assume a single-column primary key unless a task explicitly expands scope.
+- Composite primary key APIs stay in place, but the implementation may assume a single-column primary key unless a task explicitly expands scope.
 
 ## Modules and File Size
 

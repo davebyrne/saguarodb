@@ -37,8 +37,6 @@ the same change (per `AGENTS.md`).
 - **Time-travel / as-of queries.**
 - **Savepoints / sub-transactions** — deferred (they fit the model via
   sub-transaction xids without undo; see §12).
-- **HOT (heap-only tuples)** — deferred to Milestone H. The baseline is built
-  HOT-ready so HOT adds, rather than reworks.
 
 ---
 
@@ -1054,10 +1052,10 @@ savepoints via sub-transaction xids (optional, deferred).
     `Idle`
     (the implicit single-statement transaction runs no query for the level to
     affect; Postgres warns and no-ops — we mirror the no-op).
-  - **Access modes.** `READ WRITE` (the default) is accepted and ignored — v1 is
-    always read-write. `READ ONLY` is **rejected** (`SyntaxError`) rather than
-    silently ignored, since v1 enforces no read-only restriction and accepting it
-    would be misleading. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this
+  - **Access modes.** `READ WRITE` (the default) is accepted and ignored —
+    SaguaroDB is always read-write. `READ ONLY` is **rejected** (`SyntaxError`)
+    rather than silently ignored, since SaguaroDB enforces no read-only
+    restriction and accepting it would be misleading. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this
     position and so is already an upstream parse error.
   - **Write conflicts under RR.** No new machinery: a Repeatable Read transaction
     that writes a row another transaction changed and committed **after** its
@@ -1322,7 +1320,6 @@ savepoints via sub-transaction xids (optional, deferred).
   correct.
 - **Per-tuple CLOG-probe contention** — reducing repeated CLOG probes on hot
   tuples (beyond the `infomask` hint bits) under concurrent writers.
-- **HOT** — Milestone H (above); the baseline is built for it.
 - **Transactional DDL** — requires catalog MVCC + transactional file lifecycle;
   additive later, does not invalidate data MVCC.
 - **Serializable (SSI)** — layer predicate/SIREAD tracking on snapshot isolation.

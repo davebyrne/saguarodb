@@ -11,7 +11,7 @@
 2. Logical plan: describe what to compute.
 3. Physical plan: choose access methods and algorithms.
 
-V1 physical planning is rule-based and naive, but the phase boundary is real.
+Physical planning is rule-based and naive, but the phase boundary is real.
 
 ## Depends On
 
@@ -66,7 +66,7 @@ Binder responsibilities:
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
-- Reject unsupported v1 forms. Concretely, the binder rejects: a composite or empty primary key (`SqlState::DatatypeMismatch`) and duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE`; an `UPDATE` assigning the primary-key column (`SqlState::DatatypeMismatch`); and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
+- Reject unsupported forms. Concretely, the binder rejects: a composite or empty primary key (`SqlState::DatatypeMismatch`) and duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE`; an `UPDATE` assigning the primary-key column (`SqlState::DatatypeMismatch`); and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
 
 ```rust
 pub enum BoundStatement {
@@ -123,7 +123,7 @@ pub enum BoundFrom {
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
-`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins; the parser rejects `ON`/`USING`/`NATURAL` on a `CROSS JOIN` at parse time in v1 (`SqlState::SyntaxError`). The executor treats a cross join's `None` condition as `TRUE`. A comma-separated `FROM a, b, ...` list desugars into a left-deep chain of `JoinType::Cross` joins, each with `condition: None`.
+`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins; the parser rejects `ON`/`USING`/`NATURAL` on a `CROSS JOIN` at parse time (`SqlState::SyntaxError`). The executor treats a cross join's `None` condition as `TRUE`. A comma-separated `FROM a, b, ...` list desugars into a left-deep chain of `JoinType::Cross` joins, each with `condition: None`.
 
 ## Bound Expressions
 
@@ -224,7 +224,7 @@ pub enum BoundExpr {
 }
 ```
 
-Every `BoundExpr` variant carries its resolved output `data_type` and `nullable` value. Binder assigns these fields before logical planning, and logical/physical planning preserves them when rewriting expressions. `slot` is the runtime access path for `InputRef` and `LocalRef`; `input` and `column` are for debugging, EXPLAIN, and future rebinding. A `Value::Null` literal is typed by context during binding; if no context can determine a valid V1 `DataType`, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression, and rejects the expression only when the list also provides no type context.
+Every `BoundExpr` variant carries its resolved output `data_type` and `nullable` value. Binder assigns these fields before logical planning, and logical/physical planning preserves them when rewriting expressions. `slot` is the runtime access path for `InputRef` and `LocalRef`; `input` and `column` are for debugging, EXPLAIN, and future rebinding. A `Value::Null` literal is typed by context during binding; if no context can determine a valid `DataType`, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression, and rejects the expression only when the list also provides no type context.
 
 Expression metadata rules:
 
@@ -295,7 +295,7 @@ pub struct BoundOrderByItem {
 
 Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls from SELECT, HAVING, and ORDER BY expressions into `AggregateExpr` values, then rewrites aggregate and grouped-expression references above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values. `BoundExpr::AggregateCall` is illegal in physical plans handed to executor scalar evaluation.
 
-Aggregate `DISTINCT` is rejected in v1 with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
+Aggregate `DISTINCT` is rejected with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
 
 Scalar functions remain `BoundExpr::Function`. Binder validates each call's arity and argument types and assigns its result type: `UPPER(text)`, `LOWER(text)`, `TRIM(text)` return `TEXT`; `LENGTH(text)` returns `INTEGER`; `ABS(integer)` returns `INTEGER`; `SUBSTRING(text, integer[, integer])` returns `TEXT`. All are NULL-propagating, so the result is nullable when any argument is. Unknown function names, wrong arity, and argument-type mismatches are rejected with `ErrorKind::Plan` (`SyntaxError` for unknown names and arity, `DatatypeMismatch` for argument types). Aggregates may appear as scalar-function arguments (e.g. `ABS(SUM(id))`); logical planning rewrites the nested aggregate as usual.
 
@@ -393,20 +393,20 @@ pub enum PhysicalPlan {
 }
 ```
 
-## V1 Physical Rules
+## Physical Rules
 
 - A scan with an equality or range predicate on the leading column of an index — the primary-key index or a secondary index — becomes an `IndexScan` over that index (`index = PRIMARY_KEY_INDEX_ID` for the primary key, else the secondary index id), with `range` an exact or bounded `KeyRange` over that column.
 - When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it is the canonical access path and reads no separate secondary file), and a lower index id breaks remaining ties.
 - `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
-- A lower-bound and an upper-bound comparison on the *same* index column fuse into one two-sided `KeyRange::Range`, consuming both conjuncts. For `WHERE id > 5 AND id < 10`, the range is `(5, 10)` (both bounds excluded) and the residual filter is `None`. This remains a single-column range; multi-column composite-index ranges are not produced in v1.
+- A lower-bound and an upper-bound comparison on the *same* index column fuse into one two-sided `KeyRange::Range`, consuming both conjuncts. For `WHERE id > 5 AND id < 10`, the range is `(5, 10)` (both bounds excluded) and the residual filter is `None`. This remains a single-column range; multi-column composite-index ranges are not produced.
 - Otherwise scans are `SeqScan`.
 - Only a literal comparand of type `Integer`, `Text`, or `Boolean` qualifies for an `IndexScan`; a parameter, expression, or other-typed comparand falls back to `SeqScan`.
-- The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one in v1.
+- The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
-- Joins are left-to-right nested loop joins. V1 supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
+- Joins are left-to-right nested loop joins. The planner supports `Inner`, `Cross`, `Left`, `Right`, and `Full` join types. Logical and physical join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
 - An `Inner` join whose `condition` contains at least one `left_column = right_column` equality conjunct becomes a `HashJoin` on those equality pairs. `left_keys` and `right_keys` are the paired key column slots, relative to each child row (right slots are rebased by the left child width; join inputs are left-deep, so a child row's column positions match its global slots). Any remaining (non-equi or expression) conjuncts are re-checked in a `Filter` above the `HashJoin`, using their global joined-row slots. An inner join with no column-equality conjunct, and every outer or cross join, stays a `NestedLoopJoin`.
 - Sort and aggregate are blocking operators.
-- V1 performs no projection pushdown: `LogicalPlan::Projection` maps straight to `PhysicalPlan::Projection`, and logical planning always wraps a top-level `Projection`.
+- The planner performs no projection pushdown: `LogicalPlan::Projection` maps straight to `PhysicalPlan::Projection`, and logical planning always wraps a top-level `Projection`.
 
 ## EXPLAIN
 

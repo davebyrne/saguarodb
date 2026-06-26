@@ -5,9 +5,10 @@ precedence.
 
 ## Project Context
 
-- SaguaroDB v1 is implemented as a Rust workspace with a PostgreSQL simple-query
-  server, SQL parse/bind/plan/execute pipeline, page-backed storage, logical
-  WAL, manifest snapshots, and crash recovery.
+- SaguaroDB is implemented as a Rust workspace with a PostgreSQL simple-query
+  server, SQL parse/bind/plan/execute pipeline, page-backed MVCC storage
+  (snapshot isolation, concurrent writers, VACUUM, HOT), logical WAL, manifest
+  snapshots, and crash recovery.
 - The old task-by-task implementation plan is historical and is not a source of
   truth. Do not depend on `docs/superpowers/**`; those files are not project
   documentation in git and may be absent.
@@ -60,9 +61,9 @@ precedence.
 
 ## SQL And Durability Rules
 
-- Preserve the v1 SQL subset unless the specs are intentionally updated:
+- Preserve the supported SQL subset unless the specs are intentionally updated:
   `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
-  `INSERT ... VALUES`, `SELECT` with v1 clauses and joins, `UPDATE`, `DELETE`,
+  `INSERT ... VALUES`, `SELECT` with the supported clauses and joins, `UPDATE`, `DELETE`,
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped
@@ -77,7 +78,7 @@ precedence.
   `SqlState::DatatypeMismatch`, except `NULL` is valid where the target
   expression or column is nullable.
 - Normalize unquoted SQL identifiers to lowercase. Quoted identifiers remain
-  unsupported in v1 unless the specs change.
+  unsupported unless the specs change.
 - Preserve autocommit semantics. The server owns statement guards, transaction
   ID allocation, WAL commit records, WAL flush, rollback before durable commit,
   cleanup after durable commit, and checkpoint triggering.

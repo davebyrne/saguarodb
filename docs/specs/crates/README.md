@@ -3,7 +3,7 @@
 **Date:** 2026-05-03
 **Status:** Draft
 
-This directory decomposes the overview spec into crate-level contracts for v1 implementation. The goal is to preserve the architecture while allowing naive v1 implementations behind stable boundaries.
+This directory decomposes the overview spec into crate-level contracts for the implementation. The goal is to preserve the architecture while allowing naive implementations behind stable boundaries.
 
 ## Project Guidelines
 
@@ -33,9 +33,9 @@ This directory decomposes the overview spec into crate-level contracts for v1 im
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.
 - Eviction can steal committed dirty pages (flush, then evict) once stealing is enabled (the server enables it at startup, before redo); checkpoint also flushes dirty pages in place to the heap.
-- V1 uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal. MVCC is future work behind existing traits.
+- SaguaroDB uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal, with PostgreSQL-style in-heap MVCC layered on top (snapshot isolation, concurrent readers and writers, VACUUM; see `../mvcc.md`).
 
-## V1 Test Strategy
+## Test Strategy
 
 Each crate owns focused unit tests for its public contract. Cross-crate behavior is covered by integration tests at the server/workspace level:
 

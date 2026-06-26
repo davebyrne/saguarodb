@@ -35,13 +35,14 @@ pub struct Config {
     pub buffer_pool_frames: usize,
     pub checkpoint_every_n_commits: u64,
     pub checkpoint_wal_bytes: u64,
+    pub auto_vacuum_dead_rows: u64,
     pub shutdown_timeout_ms: u64,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
 }
 ```
 
-V1 fsyncs WAL on every commit. There is no `wal_flush_interval_ms` in the server spec.
+The server fsyncs WAL on every commit. There is no `wal_flush_interval_ms` in the server spec.
 
 Defaults:
 
@@ -50,6 +51,7 @@ Defaults:
 - `buffer_pool_frames = 1024`
 - `checkpoint_every_n_commits = 100`
 - `checkpoint_wal_bytes = 64 * 1024 * 1024`
+- `auto_vacuum_dead_rows = 10000`
 - `shutdown_timeout_ms = 30000`
 - `tls_cert_file = None`
 - `tls_key_file = None`
@@ -67,7 +69,7 @@ Binary CLI flags:
 - `--tls-key-file <PATH>` sets `Config.tls_key_file`; PEM private key. Optional; defaults to disabled.
 - `--help` prints usage and exits with code `0`.
 
-V1 parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; all other numeric flags must be positive nonzero integers. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`. TLS is enabled only when both `--tls-cert-file` and `--tls-key-file` are supplied; supplying exactly one is an error that prints usage to stderr and exits with code `2`.
+The binary parses flags with `std::env::args`; do not add a CLI parser dependency. `--port` accepts `1..=65535`; all other numeric flags must be positive nonzero integers. Unknown flags, missing values, non-numeric numeric values, or out-of-range numeric values print usage to stderr and exit with code `2`. TLS is enabled only when both `--tls-cert-file` and `--tls-key-file` are supplied; supplying exactly one is an error that prints usage to stderr and exits with code `2`.
 
 ## Startup Sequence
 
@@ -197,11 +199,11 @@ If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails be
 
 Checkpoint may run after successful writes according to configured thresholds. It is called after the statement's shared writer guard is released because `run_checkpoint` acquires the exclusive checkpoint guard, which must drain all writers (including this connection's, were it still held).
 
-`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>` in v1. Startup uses it for `install_schemas` and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
+`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>`. Startup uses it for `install_schemas` and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
 ## Query Results
 
-V1 materializes SELECT rows in `spawn_blocking` as `ExecutionResult::Query` and then writes them to the socket from the async connection task. A future streaming bridge may use a bounded channel with capacity 64, where the blocking producer owns `PlanExecutor` and the async task owns socket writes. That future change must not alter protocol message encoding or physical operator semantics.
+The server materializes SELECT rows in `spawn_blocking` as `ExecutionResult::Query` and then writes them to the socket from the async connection task. A future streaming bridge may use a bounded channel with capacity 64, where the blocking producer owns `PlanExecutor` and the async task owns socket writes. That future change must not alter protocol message encoding or physical operator semantics.
 
 ## Checkpoint Orchestration
 
@@ -284,7 +286,7 @@ shared writers and runs alone:
 6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
 7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`. Truncation is **conservative**: it never drops an aborted/in-flight transaction's records (it pins on the oldest non-committed one), so aborted-but-flushed versions stay invisible across restart (`wal.md`, `mvcc.md` §5.4/§8). **F4c relaxation:** an aborted transaction below the WAL **vacuum floor** (a full VACUUM pass reclaimed its on-disk versions — durably, since this `truncate_before` runs after `flush_dirty_pages`/`store.sync_all` in (3)) no longer pins, and the implicit-committed floor floats past it.
 8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).
-9. Release the shared writer guard.
+9. Release the exclusive checkpoint guard.
 
 The durability-critical ordering is: heap fsync (4) before the control record (6) before WAL truncation (7). A crash before the control record falls back to the previous redo boundary, where this cycle's full-page images repair any torn heap writes.
 
@@ -395,7 +397,7 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 
 - Startup with no control record creates empty catalog and empty storage.
 - Startup with a control record loads the redo boundary and catalog.
-- Recovery replays only committed records after the control record's checkpoint LSN.
+- Recovery redoes every record after the control record's checkpoint LSN regardless of transaction outcome, and the CLOG (rebuilt from `Commit`/`Abort` records) decides visibility; a transaction in-flight at crash is recovered as aborted.
 - Failed write rolls back buffer pages and does not append commit.
 - Successful write appends commit, flushes WAL, commits buffer before returning.
 - Checkpoint flushes dirty pages to the heap and advances the control checkpoint LSN.

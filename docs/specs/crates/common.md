@@ -84,7 +84,7 @@ pub struct RowIdentity {
 }
 ```
 
-`Value` ordering is used for B-tree keys. V1 ordering is total and deterministic: `Null < Boolean < Integer < Text`, with natural ordering inside each variant. SQL comparison semantics still apply in expression evaluation; B-tree ordering is a storage ordering.
+`Value` ordering is used for B-tree keys. The ordering is total and deterministic: `Null < Boolean < Integer < Text`, with natural ordering inside each variant. SQL comparison semantics still apply in expression evaluation; B-tree ordering is a storage ordering.
 
 ## Column Lifecycle Types
 
@@ -364,7 +364,7 @@ pub struct WriteGuard { /* owned ArcRwLockReadGuard — the SHARED side */ }
 pub struct CheckpointGuard { /* owned ArcRwLockWriteGuard — the EXCLUSIVE side */ }
 ```
 
-V1 implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. **Writers** acquire the SHARED side (`begin_writer` → `read_arc()`): many run at once, relying on per-row conflict detection (E1) and the per-index / per-heap structural latches (E2a) — not this lock — for write-write safety. The **checkpoint** acquires the EXCLUSIVE side (`begin_checkpoint` → `write_arc()`): it blocks until every in-flight writer has drained, then holds off any new writer until it returns, so the checkpoint body runs with **no in-flight writer** (preserving the Milestone-D recovery / conservative-truncation invariant — `mvcc.md` §5.4, §8). The shared side is re-entrant (a connection re-acquiring it cannot self-deadlock), so the "at most one writer guard per transaction" rule is a correctness assertion at the transaction layer, not a deadlock guard. **Readers take no guard at all** and run lock-free. Guards are owned to keep the trait object-safe. (Pre-E2b the lock was the other way around — `begin_read`/`begin_write` with a single exclusive writer; the inversion is the only API/behavior change.)
+The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. **Writers** acquire the SHARED side (`begin_writer` → `read_arc()`): many run at once, relying on per-row conflict detection (E1) and the per-index / per-heap structural latches (E2a) — not this lock — for write-write safety. The **checkpoint** acquires the EXCLUSIVE side (`begin_checkpoint` → `write_arc()`): it blocks until every in-flight writer has drained, then holds off any new writer until it returns, so the checkpoint body runs with **no in-flight writer** (preserving the Milestone-D recovery / conservative-truncation invariant — `mvcc.md` §5.4, §8). The shared side is re-entrant (a connection re-acquiring it cannot self-deadlock), so the "at most one writer guard per transaction" rule is a correctness assertion at the transaction layer, not a deadlock guard. **Readers take no guard at all** and run lock-free. Guards are owned to keep the trait object-safe. (Pre-E2b the lock was the other way around — `begin_read`/`begin_write` with a single exclusive writer; the inversion is the only API/behavior change.)
 
 ## Invariants
 

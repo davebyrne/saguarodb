@@ -7,22 +7,25 @@
 
 SaguaroDB is a SQL-compatible relational database written in Rust. It is a standalone server that accepts client connections over a network, executes SQL queries against a page-oriented storage engine, and returns results over the PostgreSQL wire protocol.
 
-### V1 Goals
+### Goals
 
 - Standalone multi-client server
 - PostgreSQL simple query wire protocol (abstracted for future custom protocol)
-- Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future MVCC and clustered/on-disk-index work)
-- Autocommit only (no multi-statement transactions)
+- Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
+- PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- V1 SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI), and the maintenance command `VACUUM [table]`; binder rejects unsupported parsed forms
+- SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI), and the maintenance command `VACUUM [table]`; binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
 - Async networking (Tokio) with blocking thread pool for query execution
 
-### V1 Non-Goals
+### Non-Goals
 
-- Multi-statement transactions / MVCC (designed for, not implemented)
+- Serializable isolation / SSI (SERIALIZABLE is accepted as an alias for Repeatable Read)
+- Savepoints / sub-transactions
+- Transactional DDL (DDL takes the exclusive guard, commits immediately, and is rejected inside an explicit transaction block)
+- Time-travel / as-of queries
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
 - Replication
@@ -219,7 +222,7 @@ pub enum ErrorKind {
 }
 
 /// PostgreSQL-compatible SQLSTATE codes (5-char strings).
-/// V1 implements a small subset; the enum is extensible.
+/// SaguaroDB implements a small subset; the enum is extensible.
 pub enum SqlState {
     SuccessfulCompletion,       // 00000
     SyntaxError,                // 42601
@@ -247,11 +250,13 @@ pub type Result<T> = std::result::Result<T, DbError>;
 #### Statement Context
 
 ```rust
-/// Passed to every storage operation. V1 populates only txn_id (autocommit).
-/// Future MVCC adds snapshot_id, isolation_level, etc. without changing the API.
+/// Passed to every storage operation. Carries the transaction id, the MVCC
+/// snapshot used for visibility, the isolation level, and the GC horizon.
 pub struct StatementContext {
     pub txn_id: u64,
-    // Future: snapshot_id, isolation_level, write_set, etc.
+    pub snapshot: Snapshot,
+    pub isolation: IsolationLevel,
+    pub gc_horizon: u64,
 }
 ```
 
@@ -282,16 +287,21 @@ pub trait FlushPolicy: Send + Sync {
 
 ```rust
 /// Coarse concurrency control. Server query orchestration acquires a guard
-/// before executing any statement. V1 implementation: RwLock (shared for reads, exclusive for writes).
-/// Future MVCC replaces the implementation while preserving this boundary.
+/// before executing any statement. `begin_read()` yields a shared read guard
+/// (lock-free concurrent readers); `begin_writer()` yields a SHARED writer
+/// guard (concurrent writers run simultaneously); `begin_checkpoint()` yields
+/// an EXCLUSIVE guard used by both checkpoint and `VACUUM`, which drains
+/// in-flight writers while readers stay lock-free.
 ///
 /// Guards are owned types (no lifetime parameter) that hold Arc references
-/// internally and release the lock on Drop. This keeps the trait object-safe
+/// internally and release the guard on Drop. This keeps the trait object-safe
 /// (usable as Box<dyn ConcurrencyController>) and avoids GAT complexity.
-/// V1 uses parking_lot::ArcRwLockReadGuard / ArcRwLockWriteGuard internally.
+/// The concrete controller uses an RwLock internally: readers and writers
+/// share it; checkpoint/VACUUM take it exclusively.
 pub trait ConcurrencyController: Send + Sync {
     fn begin_read(&self) -> Result<ReadGuard>;
-    fn begin_write(&self) -> Result<WriteGuard>;
+    fn begin_writer(&self) -> Result<WriteGuard>;
+    fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
 }
 
 pub struct RwLockConcurrencyController { /* parking_lot::RwLock<()> */ }
@@ -304,9 +314,13 @@ impl RwLockConcurrencyController {
 /// Releases the shared lock on Drop. Send + Sync safe.
 pub struct ReadGuard { /* Arc<RwLock<...>> + guard state */ }
 
-/// Owned write guard. Holds an Arc to the lock internally.
-/// Releases the exclusive lock on Drop. Send safe.
+/// Owned shared writer guard. Holds an Arc to the lock internally.
+/// Concurrent writers hold it simultaneously; releases on Drop. Send safe.
 pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
+
+/// Owned exclusive guard for checkpoint and VACUUM. Drains in-flight writers
+/// (readers stay lock-free) and releases on Drop. Send safe.
+pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
 ```
 
 **Design rationale — owned guards over GATs:** All major traits in this system are used as trait objects (`Box<dyn BufferPool>`, `Box<dyn ConcurrencyController>`, etc.). GATs (`type ReadGuard<'a> where Self: 'a`) would make these traits non-object-safe, forcing generics throughout the crate dependency graph. Owned guards with Arc internals add negligible overhead (one Arc clone per statement) and keep the trait boundaries clean. This is the standard pattern in Rust database projects.
@@ -394,7 +408,7 @@ pub trait ConnectionState: Send {
 
 ### Query Result Architecture
 
-V1 materializes SELECT results inside `spawn_blocking`, returns them as an `ExecutionResult::Query`, and then the async connection task writes those rows to the socket. This keeps the first server implementation simple while preserving the executor's pull-based `PlanExecutor` boundary for a future streaming bridge.
+The server materializes SELECT results inside `spawn_blocking`, returns them as an `ExecutionResult::Query`, and then the async connection task writes those rows to the socket. This keeps the server implementation simple while preserving the executor's pull-based `PlanExecutor` boundary for a future streaming bridge.
 
 ```
 Async task (Tokio)                      Blocking thread (spawn_blocking)
@@ -415,11 +429,11 @@ Async task (Tokio)                      Blocking thread (spawn_blocking)
 
 **Future streaming:** A later implementation can replace materialized SELECT rows with a bounded channel of capacity 64. The producer would own `PlanExecutor` in a blocking task, and the async task would read rows from the receiver. That change does not affect the protocol crate or SQL semantics.
 
-All v1 results are fully computed in `spawn_blocking` and returned as a complete `ExecutionResult`.
+All results are fully computed in `spawn_blocking` and returned as a complete `ExecutionResult`.
 
 This keeps the protocol layer testable without IO and keeps blocking work off Tokio threads.
 
-### PostgreSQL Simple Query Flow (V1 Subset)
+### PostgreSQL Simple Query Flow
 
 1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The server detects this (8-byte message with code `80877103`). When TLS is configured (`--tls-cert-file`/`--tls-key-file`), it replies with a single `S` byte and performs the TLS handshake, after which the client sends its `StartupMessage` over the encrypted stream. When TLS is not configured, it replies with a single `N` byte and the client continues in plaintext (or retries with a plain `StartupMessage`). TLS is server-side only; no client certificate is requested. A `GSSENCRequest` (GSSAPI transport encryption) is likewise declined with a single `N` byte, after which the client continues with an `SSLRequest` or `StartupMessage`.
 2. **Startup:** Client sends `StartupMessage` (version 3.0, user, database). Server responds `AuthenticationOk` → `ParameterStatus` (server_version, etc.) → `ReadyForQuery`.
@@ -432,7 +446,7 @@ This keeps the protocol layer testable without IO and keeps blocking work off To
 5. **Protocol decode error handling:** If decoding client bytes fails, server sends `ErrorResponse` then `ReadyForQuery` and closes the connection because the codec buffer state may be unrecoverable.
 6. **Termination:** Client sends `Terminate`. Server closes connection.
 
-### PostgreSQL Extended Query Flow (V1)
+### PostgreSQL Extended Query Flow
 
 The extended protocol supports parameterized statements, prepared statements,
 portals, and binary parameter/result encoding:
@@ -457,7 +471,7 @@ portals, and binary parameter/result encoding:
    `Flush` flushes pending output. Named and unnamed statements/portals are
    supported.
 
-### V1 Protocol Scope — What We Skip
+### Protocol Scope — What We Skip
 
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported; see SSLRequest handling above)
 - GSSAPI transport encryption (GSSENCRequest declined with `N`)
@@ -470,12 +484,12 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 
 - Client `SSLRequest`: startup-style packet with length `8` and code `80877103`.
 - Client `GSSENCRequest`: startup-style packet with length `8` and code `80877104`; declined with a single `N` byte.
-- Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; V1 reads `user`, optional `database`, and optional `application_name`.
+- Client `Startup`: startup-style packet with protocol `196608` (3.0), nul-terminated key/value parameters, and final `\0`; the server reads `user`, optional `database`, and optional `application_name`.
 - Client `Query`: tag `Q`, length, nul-terminated SQL string.
 - Client `Terminate`: tag `X`, length `4`.
 - Server `AuthenticationOk`: tag `R`, length `8`, auth code `0`.
 - Server `ParameterStatus`: tag `S`, `key\0value\0`; startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
-- Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). The session is always idle in v1's autocommit model, so the byte is `I` in every interaction; the non-idle bytes arrive with transaction lifecycle support.
+- Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). Standalone statements run in autocommit and report `I`; inside a `BEGIN`/`COMMIT` block the byte is `T`, or `E` once a statement in the block has failed.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
 - Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, or `VACUUM`.
@@ -522,7 +536,7 @@ The protocol layer never touches storage directly. The `server` crate owns `Quer
 
 The `parser` crate wraps `sqlparser-rs` (PostgreSQL dialect) and translates its AST into our own internal representation. This keeps the external dependency contained and gives us a narrow, explicit definition of exactly what SaguaroDB supports. Unsupported syntax is rejected here, not deep in the executor.
 
-### Internal AST Types (V1)
+### Internal AST Types
 
 The AST uses strings for identifiers — name resolution to IDs happens in the planner.
 
@@ -631,9 +645,9 @@ pub enum UnaryOp {
 }
 ```
 
-`FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. V1 rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
+`FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 
-Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so binder can reject it in v1.
+Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can reject it.
 
 ### Public API
 
@@ -656,7 +670,7 @@ pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan>;
 pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Result<PhysicalPlan>;
 ```
 
-All three phases are separate modules within the `planner` crate. V1 implements all three — the physical planner is trivial (rule-based), but the boundary is real. A future cost-based optimizer replaces only `physical_plan` without touching binding or logical planning.
+All three phases are separate modules within the `planner` crate. All three are implemented — the physical planner is trivial (rule-based), but the boundary is real. A future cost-based optimizer replaces only `physical_plan` without touching binding or logical planning.
 
 ### Phase 1: Binder
 
@@ -835,7 +849,7 @@ pub enum BoundExpr {
 }
 ```
 
-Every `BoundExpr` variant carries its resolved output type and nullability. Binder fills these fields before logical planning, including typed `Value::Null` literals from context; if a V1 `NULL` literal has no valid typing context, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression. The detailed metadata rules live in `docs/specs/crates/planner.md` and are authoritative for implementation.
+Every `BoundExpr` variant carries its resolved output type and nullability. Binder fills these fields before logical planning, including typed `Value::Null` literals from context; if a `NULL` literal has no valid typing context, binder rejects it with `SqlState::DatatypeMismatch`. For `NULL IN (...)`, binder may infer the left-side `NULL` type from the first typed list expression. The detailed metadata rules live in `docs/specs/crates/planner.md` and are authoritative for implementation.
 
 ### Phase 2: Logical Planner
 
@@ -895,11 +909,11 @@ pub struct BoundOrderByItem {
 
 Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` into `BoundExpr::AggregateCall`; scalar functions remain `BoundExpr::Function`. Logical planning extracts unique aggregate calls into `AggregateExpr` values and rewrites expressions above the `Aggregate` node to `BoundExpr::LocalRef`. The `Aggregate` output row layout is group-by values first, then aggregate values, so aggregate slot `i` is read as `LocalRef { slot: group_by.len() + i, ... }`. `AggregateCall` must not reach executor scalar evaluation.
 
-Aggregate `DISTINCT` is rejected in v1 with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
+Aggregate `DISTINCT` is rejected with `ErrorKind::Plan`; `AggregateExpr.distinct` is always `false`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM(integer)` returns nullable `INTEGER`; `AVG(integer)` returns nullable `INTEGER` using integer division truncated toward zero; `MIN` and `MAX` return the argument type and are nullable. `SUM` and `AVG` reject non-integer arguments with `SqlState::DatatypeMismatch`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for `SUM`, `AVG`, `MIN`, and `MAX`.
 
 ### Phase 3: Physical Planner
 
-Translates a `LogicalPlan` into a `PhysicalPlan` — chooses access methods and join algorithms. V1's physical planner is trivial (rule-based), but the boundary is real from day one.
+Translates a `LogicalPlan` into a `PhysicalPlan` — chooses access methods and join algorithms. The physical planner is trivial (rule-based), but the boundary is real from day one.
 
 ```rust
 pub enum PhysicalPlan {
@@ -957,19 +971,19 @@ The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column a
 
 The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a future cost-based optimizer replaces only `physical_plan`, choosing among multiple physical alternatives per logical operator. The binder and logical planner are unchanged.
 
-### Planner Rules (V1 — Applied in Order)
+### Planner Rules (Applied in Order)
 
 1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of an index — the primary-key index (`index = PRIMARY_KEY_INDEX_ID`) or a secondary index (its own id) — emit `IndexScan` with that index, a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, and any residual predicate in `filter`.
 2. **Index choice:** When several indexes' leading columns are constrained, prefer an equality over a range, the primary key over a secondary index, then the lower index id.
 3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
 4. **Join ordering:** Process joins left to right as written. An inner join whose `ON` predicate is a conjunction of `left_column = right_column` equalities becomes a `HashJoin` (its `left_keys`/`right_keys` are the paired key slots); every other join (outer, cross, non-equi) is a `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
-5. **Projection pushdown:** Optional for initial v1. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
+5. **Projection pushdown:** Optional. If implemented, only read columns that are needed downstream and rebase expression slots against each child output schema.
 
 ### EXPLAIN
 
 `Statement::Explain` is handled by server `QueryService`, not by the executor. The server acquires a read guard, binds the inner statement to `BoundStatement::Explain(inner_bound)`, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
 
-### V1 Planner Non-Goals
+### Planner Non-Goals
 
 - Cost-based optimization
 - Join reordering
@@ -1010,7 +1024,7 @@ pub trait PlanExecutor {
     /// each operator's `next`.
     fn next(&mut self) -> Result<Option<ExecRow>>;
 
-    /// Pull up to max_rows at once. V1 implementation: calls next() in a loop.
+    /// Pull up to max_rows at once. The current implementation calls next() in a loop.
     /// Future vectorized execution can override with batch-native logic.
     fn next_batch(&mut self, max_rows: usize) -> Result<Vec<ExecRow>> {
         // default implementation
@@ -1029,9 +1043,9 @@ pub trait PlanExecutor {
 }
 ```
 
-V1 has a cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. A `CancelRequest` on a side connection sets that flag via the server's `CancelRegistry`. Operators themselves stay cancellation-free; the polling lives in the query engine, so a future statement-timeout can reuse the same token without changing operator semantics.
+A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. A `CancelRequest` on a side connection sets that flag via the server's `CancelRegistry`. Operators themselves stay cancellation-free; the polling lives in the query engine, so a future statement-timeout can reuse the same token without changing operator semantics.
 
-`next_batch` has a default implementation so V1 operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
+`next_batch` has a default implementation so operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
 
 **ExecRow identity flow:**
 - **Scan operators** (`SeqScanOp`, `IndexScanOp`): Construct `ExecRow` from `StoredRow`, populating `identity` from the `StoredRow`'s `row_id` and `key`.
@@ -1059,10 +1073,10 @@ V1 has a cooperative cancellation token: `ExecutionContext.cancel` is an `&Atomi
 
 A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ABS`, and `SUBSTRING`. Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
 
-V1 expression semantics:
+Expression semantics:
 
 - Comparisons with `NULL` return `NULL`; `WHERE` and `HAVING` keep only `TRUE`.
-- `LIKE` requires text operands, is case-sensitive, supports `%` and `_`, and uses backslash to escape `%`, `_`, or `\`. V1 does not support a SQL `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
+- `LIKE` requires text operands, is case-sensitive, supports `%` and `_`, and uses backslash to escape `%`, `_`, or `\`. A SQL `ESCAPE` clause is not supported. If the value or pattern is `NULL`, the result is `NULL`.
 - `IN` returns `TRUE` on the first non-null equal item, `FALSE` when no item matches and no list item is `NULL`, and `NULL` when the left side is `NULL` or no item matches but some list item is `NULL`. `NOT IN` applies SQL `NOT`.
 - `BETWEEN` evaluates as `(expr >= low) AND (expr <= high)`; `NOT BETWEEN` applies SQL `NOT`.
 - String concatenation `||` requires text operands and returns `NULL` if either side is `NULL`. The scalar functions `UPPER`/`LOWER`/`LENGTH`/`TRIM` (text) and `ABS` (integer) and `SUBSTRING(text, start[, length])` are NULL-propagating; `LENGTH` and `SUBSTRING` count Unicode characters, and `SUBSTRING` uses 1-based positions clamped to the string and rejects a negative length.
@@ -1084,7 +1098,7 @@ The `storage` crate owns the on-disk data format, page-backed row storage, and t
 ```rust
 /// Fallible iterator over rows from the storage engine. Returns StoredRow
 /// so that DML operations can target the physical row for modification.
-/// V1 copies rows out of the buffer pool. A future version may return
+/// Rows are copied out of the buffer pool. A future version may return
 /// zero-copy references into pinned pages.
 pub trait RowIterator: Send {
     fn next(&mut self) -> Result<Option<StoredRow>>;
@@ -1106,7 +1120,7 @@ The `ExecRow` then flows through the entire executor pipeline with identity pres
 
 ### Storage Engine Traits
 
-Data operations and DDL are separate traits — they have different concurrency semantics (DDL involves file creation and catalog updates, DML operates within existing table pages), and a future MVCC implementation may handle transactional DDL differently from DML.
+Data operations and DDL are separate traits — they have different concurrency semantics (DDL involves file creation and catalog updates and runs under the exclusive guard, while DML operates within existing table pages under concurrent writers). Keeping them split also leaves room for transactional DDL to handle the two differently in the future.
 
 ```rust
 pub trait StorageEngine: Send + Sync {
@@ -1150,7 +1164,7 @@ pub trait SchemaOperations: Send + Sync {
 }
 ```
 
-Every operation takes a `StatementContext`. In V1 this carries only the autocommit `txn_id`. When MVCC is added, the context gains snapshot visibility, isolation level, and write-set tracking — without changing any call sites.
+Every operation takes a `StatementContext`. It carries the `txn_id`, the MVCC `snapshot` used for visibility, the `isolation` level, and the `gc_horizon` — so each storage operation sees and stamps versions consistently without changing any call sites.
 
 `scan_range` serves primary-key `IndexScan` plan nodes. For `KeyRange::Exact`, it is a point lookup that returns an iterator (consistent interface). For `KeyRange::Range`, it walks the primary-key B-tree leaves from start to end. For `KeyRange::All`, it is equivalent to `scan`. Secondary-index `IndexScan` nodes use `index_scan(table, index, range)`, which walks the secondary B-tree and reads each entry's heap row directly at the stored TID (secondary indexes point at heap TIDs, uniform with the primary-key index — no primary-key indirection).
 
@@ -1175,7 +1189,7 @@ Slotted page design. Slot array at the top points to variable-length rows packed
 
 **PageVersion:** `2` for the current page format. Unknown versions (including the legacy `1`) are rejected as page corruption.
 
-V1 development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
+Development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
 
 **PageLSN:** The page header carries an 8-byte PageLSN — the LSN of the WAL record that last modified the page — stamped on every mutation. Redo replay is gated by it (a record is applied only if `page_lsn < record.lsn`), and it determines when a dirty page is safe to flush. See the Write-Ahead Log section.
 
@@ -1289,7 +1303,7 @@ impl PageWriteGuard {
 }
 ```
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The fresh-page insertion path rejects an already resident `(file_id, page_num)` with an internal error instead of overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number in v1.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The fresh-page insertion path rejects an already resident `(file_id, page_num)` with an internal error instead of overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number.
 
 Guards are owned types (no lifetime parameter) — same rationale as the concurrency controller guards. They hold `Arc` references to the buffer pool frame internally, which keeps `BufferPool` object-safe. The Arc overhead is one reference count per page access, negligible compared to the I/O it represents.
 
@@ -1299,7 +1313,7 @@ Guards eliminate manual pin/unpin errors: a page is pinned for exactly the lifet
 
 - **Frame:** A slot holding one 8KB page. Pool size is configurable (default: 1024 frames = 8MB).
 - **Page descriptor:** Tracks `(file_id, page_number)`, pin count, dirty flag, reference bit, `dirty_txn_id` (the txn that last dirtied it), and `needs_fpi` (whether the next modification must log a full-page image).
-- **No rollback tracking (MVCC):** the buffer pool keeps no per-transaction page state. Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3): `rollback(txn_id)` undoes nothing and reclaims nothing — a rolled-back transaction's pages (modified or freshly allocated) stay resident as dirty-but-evictable frames, hidden by the CLOG and reclaimed by VACUUM. (The before-image store and new-page rollback tracking that the pre-MVCC v1 model used are retired in Milestone D1.)
+- **No rollback tracking (MVCC):** the buffer pool keeps no per-transaction page state. Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3): `rollback(txn_id)` undoes nothing and reclaims nothing — a rolled-back transaction's pages (modified or freshly allocated) stay resident as dirty-but-evictable frames, hidden by the CLOG and reclaimed by VACUUM. (The before-image store and new-page rollback tracking that the pre-MVCC model used are retired in Milestone D1.)
 - **PageStore / PageLoader:** The buffer pool is constructed with an `Arc<dyn PageStore>`, which extends the read-only `PageLoader`:
 
 ```rust
@@ -1323,7 +1337,7 @@ On a `read_page` miss, the pool asks the loader for a clean page. `Some(data)` i
 
 ### Working Set and the Buffer Pool
 
-During normal operation the working set is not bound by the pool size: eviction-flush-on-steal writes dirty pages to the heap and evicts them, so a large dataset (or a large in-flight transaction) spills rather than erroring. With V1's single-writer autocommit:
+During normal operation the working set is not bound by the pool size: eviction-flush-on-steal writes dirty pages to the heap and evicts them, so a large dataset (or a large in-flight transaction) spills rather than erroring. With concurrent writers:
 - Each statement dirtys a modest number of pages
 - Pages stay dirty in memory until a checkpoint flushes them in place or an eviction steals them
 - The buffer pool default (1024 frames = 8MB) keeps a small-to-medium working set resident; larger sets spill to the heap
@@ -1367,11 +1381,11 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. With MVCC (`feat/mvcc`), recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records replay only for committed transactions. (See `docs/specs/mvcc.md` §8 for the full Milestone-D recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records replay only for committed transactions. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
-### V1 Durability Model: Heap Files + Redo WAL + Flush Checkpoint
+### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
-Table data lives in mutable per-table heap files; pages are mutated in the buffer pool and written back in place. In-place page writes with a logical-only WAL would be unrecoverable (a torn page has no consistent base), so v1 uses:
+Table data lives in mutable per-table heap files; pages are mutated in the buffer pool and written back in place. In-place page writes with a logical-only WAL would be unrecoverable (a torn page has no consistent base), so the engine uses:
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
@@ -1386,8 +1400,7 @@ This gives the invariants:
 - Normal operation and recovery both spill dirty pages to the heap via eviction-flush-on-steal; the working set is not bounded by the buffer pool size (the durable on-disk index means recovery rebuilds nothing in memory). The steal path forces the WAL durable before writing a stolen page (write-ahead), so a possibly-uncommitted stolen page is always recoverable.
 - Startup replays WAL from the last checkpoint — bounded by checkpoint frequency.
 
-**Future upgrade paths** (none change the `BufferPool` or `StorageEngine` traits):
-- **MVCC** — in progress on `feat/mvcc` (see `docs/specs/mvcc.md`). Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header; the redo WAL is the prerequisite. Visibility, version chains, and transactions land in later milestones.
+**MVCC** is implemented (see `docs/specs/mvcc.md`): snapshot isolation, multi-statement transactions, concurrent writers, VACUUM, and HOT, all built on this redo WAL. Row format v2 carries the per-version `xmin`/`xmax`/`t_ctid`/`infomask` tuple header that visibility and version chains rely on. (None of this changed the `BufferPool` or `StorageEngine` traits.)
 
 ### WAL Record Format
 
@@ -1402,7 +1415,7 @@ This gives the invariants:
 ```
 
 - **LSN:** Monotonically increasing identifier for each record.
-- **TxnID:** Unique per statement in V1. Essential for future multi-statement transactions.
+- **TxnID:** The per-transaction id used for MVCC visibility, write-write conflict detection, and WAL. Multi-statement transactions share one id across their statements; an autocommit statement gets its own.
 - **Type:** One of the logical operation types below.
 - **Payload:** Depends on type.
 - **CRC32:** Integrity check over the entire record.
@@ -1421,7 +1434,7 @@ This gives the invariants:
 | `HeapInit` | `FileId`, `PageNum` — initialize a fresh heap page |
 | `HeapInsert` | `FileId`, `PageNum`, `slot`, encoded row bytes |
 | `HeapDelete` | `FileId`, `PageNum`, `slot` |
-| `HeapUpdateHeader` | `FileId`, `PageNum`, `slot`, `xmax`, `t_ctid` (`PageNum`, `u16`), `infomask` — in-place mutation of a v2 tuple header (MVCC version stamping; redo via `page::set_tuple_header`, not yet emitted by the engine) |
+| `HeapUpdateHeader` | `FileId`, `PageNum`, `slot`, `xmax`, `t_ctid` (`PageNum`, `u16`), `infomask` — in-place mutation of a v2 tuple header (MVCC version stamping; redo via `page::set_tuple_header`, emitted by the update/delete path via `stamp_xmax_logged`) |
 | `FullPageImage` | `FileId`, `PageNum`, full page image (torn-page protection) |
 
 Transaction ids `0..FIRST_NORMAL_XID` (3) are reserved: `INVALID_XID = 0` (no/non-transactional record), `1`, and `FROZEN_XID = 2` (always-committed/visible). Real statement transaction ids are allocated at or above `FIRST_NORMAL_XID = 3`. The `Checkpoint` marker reuses the per-record `txn_id` header field to carry the transaction-id high-water mark at checkpoint time, so the allocator boundary survives WAL truncation (preventing id reuse after a truncating checkpoint + restart); the CLOG additionally treats unrecorded normal ids below the truncation floor as committed (see §5.4 of `docs/specs/mvcc.md`).
@@ -1465,7 +1478,7 @@ pub trait WalManager: Send + Sync {
 
 `bytes_after(lsn)` is server checkpoint accounting only. It counts encoded bytes for retained WAL records with stored `LSN > lsn`; if `lsn` predates the retained WAL after truncation, it returns the encoded byte size of all retained records.
 
-### V1 Durability Rules
+### Durability Rules
 
 One rule ensures redo recovery is correct:
 
@@ -1474,29 +1487,29 @@ One rule ensures redo recovery is correct:
 The WAL is the source of durability between checkpoints:
 - On commit, the WAL is flushed through the commit record (`fsync`). The data is durable in the WAL even though the dirty heap pages may still be in memory.
 - The buffer pool holds modified pages in memory until the next checkpoint flushes them to the heap.
-- Each heap page is recoverable from the last checkpoint plus the committed redo records after it.
+- Each heap page is recoverable from the last checkpoint plus the redo records after it.
 
-This gives a clean invariant: **after a crash, PageLSN-gated redo (with full-page images) restores every heap page to its last committed state.**
+This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full-page images) restores every heap page to its post-boundary on-disk state, and the CLOG (rebuilt from `Commit`/`Abort`) decides which versions are visible.**
 
-### V1 Write Protocol
+### Write Protocol
 
-All writes are serialized through the `ConcurrencyController`. The protocol for a single autocommit statement:
+Writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple writers run concurrently; write-write safety comes from first-updater-wins conflict detection (`SqlState::SerializationFailure`, `40001`) plus per-index and per-heap structural latches (lock order: structural → frame → WAL). The protocol for a single autocommit statement:
 
-1. Acquire exclusive write guard via `controller.begin_write()`
-2. Assign a statement-level `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
+1. Acquire a shared writer guard via `controller.begin_writer()` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers)
+2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
 4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the CLOG; not fsynced) and deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore when needed; return error to client and drop write guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If cleanup fails before the commit record is durable, log the failure, attempt to flush WAL, and exit.
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
 8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — cleanup-only (the buffer pool tracks no rollback metadata under status-based abort); deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
-9. Drop write guard (releases exclusive lock)
-10. Call `record_commit_and_maybe_checkpoint(&components)`; it may acquire its own write guard for a checkpoint
+9. Drop the shared writer guard
+10. Call `record_commit_and_maybe_checkpoint(&components)`; it may acquire the exclusive checkpoint guard for a checkpoint
 11. Return success to the client
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback. It logs the fatal internal error, flushes WAL, and terminates because recovery will replay the durable commit.
 
-Reads acquire a shared read guard via `controller.begin_read()` and proceed concurrently with each other. A write blocks until all read guards are released.
+Reads acquire a shared read guard via `controller.begin_read()` and proceed concurrently with each other and with writers (readers are lock-free and never block writers). Only the exclusive checkpoint/VACUUM guard drains in-flight writers; readers stay lock-free throughout.
 
 ### Failed Statement Rollback
 
@@ -1532,7 +1545,7 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 **Checkpoint protocol:**
 
-1. Acquire exclusive write guard (no statement in-flight).
+1. Acquire the exclusive checkpoint guard (`begin_checkpoint`), which drains in-flight writers (readers stay lock-free).
 2. `wal.flush()` — a page's redo must be durable before the page is written.
 3. `buffer_pool.flush_dirty_pages()` — write flushable dirty pages to the heap `PageStore` (committed, aborted, and — under Stage 2 — in-flight alike; all WAL-durable after step 2, and the CLOG hides the non-committed tuples).
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
@@ -1551,7 +1564,7 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 ### Crash Recovery (REDO)
 
-The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays committed redo records on top.
+The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records replay only for committed transactions.
 
 **Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
@@ -1695,7 +1708,7 @@ The `server` crate is the binary entry point.
 
 Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` records. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, and `30000`. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). V1 parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
+The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, and `30000`. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
 
 ### Connection Handling
 
@@ -1714,23 +1727,21 @@ Tokio listener (async)
 
 The production executor crate never owns SQL strings. It executes `PhysicalPlan` values through `QueryEngine::execute`; SQL parsing, binding, planning, and statement guard acquisition are owned by the server's `QueryService`.
 
-### Concurrency Control (V1)
+### Concurrency Control
 
-All concurrency is managed through the `ConcurrencyController` trait (defined in `common`):
+All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
-- **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Multiple readers proceed concurrently.
-- **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): server query orchestration parses SQL to classify the statement, calls `begin_write()`, receives a write guard, binds and plans, allocates the statement `txn_id`, then invokes `QueryEngine`. Blocks until all other guards are released. Writes are fully serialized.
-- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. See `docs/specs/mvcc.md` §9/§10 Milestone F for the orchestration (heap-prune → index-vacuum → line-pointer-reclaim) and the GC-horizon safety argument.
-- The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive write guard and `WalFlushPolicy` admits only committed pages, so uncommitted data never reaches the heap.
+- **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
+- **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. Writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
+- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. See `docs/specs/mvcc.md` §9/§10 Milestone F for the orchestration (heap-prune → index-vacuum → line-pointer-reclaim) and the GC-horizon safety argument.
+- The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
-**V1 implementation:** The concrete `ConcurrencyController` is an `RwLock`. `begin_read()` acquires a shared lock, `begin_write()` acquires an exclusive lock. This is the foundation for safe page mutation, DDL, concurrent scans, and redo-only recovery.
+The concrete `ConcurrencyController` is an `RwLock`: `begin_read()` and `begin_writer()` take it shared (readers and writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint and VACUUM. This boundary keeps lock-free readers, concurrent writers, DDL, and redo-all recovery correct.
 
 **Other latches:**
 - **Buffer pool:** Frame-level read/write latches managed by page guards.
-- **Catalog:** Internal `RwLock` (reads concurrent, DDL exclusive). The catalog's own lock is separate from the `ConcurrencyController` — the catalog lock protects metadata consistency, while the `ConcurrencyController` protects statement-level isolation.
-- **WAL appends:** Serialized by the write guard (no separate WAL mutex needed).
-
-This is intentionally simple. The exclusive write guard limits write throughput to one statement at a time, but it makes the durability and recovery model correct and safe for heap and index page modifications. Future MVCC replaces the `ConcurrencyController` implementation with row-level concurrency control while preserving the server-facing orchestration API.
+- **Catalog:** Internal `RwLock` (reads concurrent, DDL exclusive). The catalog's own lock is separate from the `ConcurrencyController` — the catalog lock protects metadata consistency, while the `ConcurrencyController` coordinates statement-level access.
+- **WAL appends:** Serialized internally; the structural-latch lock order (structural → frame → WAL) keeps concurrent writers consistent.
 
 ### Graceful Shutdown
 
@@ -1742,7 +1753,7 @@ On SIGINT/SIGTERM:
 3. If all in-flight queries finish before the timeout, run checkpoint, flush WAL, close files, and exit successfully
 4. If the timeout expires, skip checkpoint and skip the final WAL flush, return an internal timeout error, and let process shutdown proceed without running finalization concurrently with in-flight query execution. Successful write statements still flush their own commit records before returning.
 
-### Configuration (V1)
+### Configuration
 
 ```rust
 pub struct Config {
@@ -1751,17 +1762,23 @@ pub struct Config {
     pub buffer_pool_frames: usize,    // default: 1024 (8MB)
     pub checkpoint_every_n_commits: u64, // default: 100
     pub checkpoint_wal_bytes: u64,    // default: 64 * 1024 * 1024
+    pub auto_vacuum_dead_rows: u64,   // default: 10000 (0 disables auto-prune)
     pub shutdown_timeout_ms: u64,     // default: 30000
     pub tls_cert_file: Option<PathBuf>, // default: None (PEM cert chain)
     pub tls_key_file: Option<PathBuf>,  // default: None (PEM private key)
 }
 ```
 
-Loaded from command-line args only in V1. No environment-variable or config-file loading in V1.
+Loaded from command-line args only. There is no environment-variable or config-file loading.
 
 ## 12. Future Work (Designed For, Not Implemented)
 
-- **MVCC / Transactions:** `StatementContext` carries `txn_id` and is extensible for snapshot visibility. The `ConcurrencyController` trait returns owned guards so a simple `RwLock` implementation can later be swapped for a transaction manager. WAL record format includes `TxnID`.
+- **Serializable Isolation (SSI):** Snapshot isolation and Read Committed are implemented; true serializable isolation with predicate-based conflict detection is not. `SERIALIZABLE` is accepted as an alias for Repeatable Read.
+- **Savepoints / Sub-transactions:** The model accommodates sub-transaction xids without undo, but `SAVEPOINT`/`ROLLBACK TO` are not implemented.
+- **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
+- **Durable CLOG File:** The commit-status map is held in memory and rebuilt from `Commit`/`Abort` WAL records at recovery; a standalone durable CLOG file is future work.
+- **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
+- **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol (with blocking + deadlock detection and fuzzy checkpointing) is future work.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among the primary-key and secondary indexes; a cost model would replace that heuristic.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.

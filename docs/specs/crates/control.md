@@ -53,7 +53,7 @@ that precedes the payload.
 Decode must reject a file shorter than the 16-byte header, magic mismatch,
 unsupported versions (including the legacy full-snapshot manifest, version `1`),
 length mismatch, checksum mismatch, malformed payload JSON, unsorted table IDs,
-and duplicate table IDs. V1 development builds do not migrate older formats; an
+and duplicate table IDs. Development builds do not migrate older formats; an
 incompatible or corrupt control file surfaces as `SqlState::InternalError`
 (there is no dedicated corruption SQLSTATE) and the data directory must be
 rebuilt.

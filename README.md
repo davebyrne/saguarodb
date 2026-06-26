@@ -5,20 +5,37 @@ standalone server, accepts client connections over the PostgreSQL simple-query
 wire protocol, executes SQL through a parse/bind/plan/execute pipeline, and
 stores data in page-oriented per-table files with write-ahead-log recovery.
 
-The current implementation is SaguaroDB v1: a compact, trait-boundary database
-intended to keep the major subsystems clear while leaving room for future MVCC
-and richer SQL support.
+SaguaroDB is a compact, trait-boundary database with PostgreSQL-style
+multi-version concurrency control (MVCC) — snapshot-isolated reads, concurrent
+writers, multi-statement transactions, and `VACUUM` garbage collection — keeping
+the major subsystems clear behind trait seams.
 
 ## What Works
 
 - Standalone multi-client server using Tokio.
 - PostgreSQL simple query protocol, usable from `psql` with SSL disabled.
-- SQL support for `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`, `SELECT`,
-  `UPDATE`, `DELETE`, and `EXPLAIN`.
+- SQL support for `CREATE TABLE`, `DROP TABLE`, `INSERT ... VALUES`,
+  `INSERT ... SELECT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN`, transaction
+  control (`BEGIN`/`START TRANSACTION`, `COMMIT`, `ROLLBACK`,
+  `SET TRANSACTION`/`SET SESSION CHARACTERISTICS`), and the `VACUUM [table]`
+  maintenance command.
 - `SELECT` supports `WHERE`, inner/cross/left/right/full joins, `GROUP BY`,
   `HAVING`, `ORDER BY`, `LIMIT`, and `OFFSET`.
 - Data types: `INTEGER` (`i64`), `TEXT`, `BOOLEAN`, and `NULL`.
-- Autocommit statement execution.
+- Multi-statement transactions (`BEGIN`/`COMMIT`/`ROLLBACK`) plus autocommit for
+  standalone statements.
+- PostgreSQL-style MVCC: in-heap row versions with per-statement snapshot
+  visibility; lock-free concurrent readers run alongside concurrent writers.
+- Transaction isolation levels Read Committed (default) and Repeatable Read,
+  set per transaction or as a per-connection default; `SERIALIZABLE` is accepted
+  as an alias for Repeatable Read (no SSI).
+- First-updater-wins conflict detection: a conflicting concurrent write fails
+  fast with a serialization error (SQLSTATE `40001`).
+- Garbage collection of dead row versions via `VACUUM [table]` and automatic
+  pruning at checkpoint (`--auto-vacuum-dead-rows`).
+- HOT (heap-only tuples): an `UPDATE` that stays on the same page and changes no
+  indexed column skips secondary-index maintenance, and dead HOT chains are
+  pruned in place.
 - Rule-based planning with primary-key, secondary-index, and table-scan access
   paths.
 - Page-backed storage with an on-disk B-tree primary-key index.
@@ -29,8 +46,9 @@ and richer SQL support.
 - Physiological redo WAL with full-page-image torn-page protection,
   in-place checkpointing, and crash recovery.
 
-V1 deliberately does not implement authentication, multi-statement
-transactions, MVCC, replication, or a custom wire protocol.
+SaguaroDB deliberately does not implement authentication, replication, a custom
+wire protocol, serializable isolation (SSI), savepoints, transactional DDL, or
+time-travel queries. These are designed for but left to future work.
 
 ## Quick Start
 
@@ -102,6 +120,35 @@ ignored directory:
 cargo run -p saguarodb-server --bin saguarodb -- --data-dir /tmp/saguarodb-dev
 ```
 
+## Transactions & Concurrency
+
+SaguaroDB uses PostgreSQL-style MVCC: an `UPDATE`/`DELETE` writes a new in-heap
+row version instead of overwriting, and each statement reads against a snapshot
+that hides versions it should not see. Aborts are status-based — a rolled-back
+transaction's versions are left in place, made invisible through the commit-status
+map, and reclaimed later by VACUUM.
+
+- **Transactions.** `BEGIN`/`START TRANSACTION` … `COMMIT`/`ROLLBACK` group
+  statements into a unit; a standalone statement runs in its own autocommit
+  transaction. A statement that errors puts the transaction into a failed state
+  that accepts only `ROLLBACK` (or `COMMIT`, which rolls back).
+- **Isolation levels.** Read Committed (the default) takes a fresh snapshot per
+  statement; Repeatable Read takes one snapshot at the first statement and reuses
+  it. Choose the level per transaction (`BEGIN ISOLATION LEVEL …`,
+  `SET TRANSACTION ISOLATION LEVEL …`) or as the per-connection default
+  (`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL …`). `SERIALIZABLE`
+  is accepted as an alias for Repeatable Read; there is no SSI.
+- **Concurrency.** Readers are lock-free and never block. Writers run
+  concurrently, coordinated by per-index and per-heap structural latches; two
+  transactions that update the same row resolve by first-updater-wins — the loser
+  fails fast with serialization error `40001` and can retry. Checkpoint and
+  `VACUUM` briefly take an exclusive guard that drains in-flight writers while
+  readers continue.
+- **Garbage collection.** Dead row versions are reclaimed by `VACUUM [table]` and
+  by automatic pruning at checkpoint (`--auto-vacuum-dead-rows`). HOT (heap-only
+  tuples) lets a same-page `UPDATE` that changes no indexed column skip
+  secondary-index work and collapses dead version chains in place.
+
 ## Architecture
 
 SaguaroDB is organized as a Rust workspace. Each major subsystem owns a crate,
@@ -162,9 +209,9 @@ crates/
   catalog/   table metadata, stable IDs, schema snapshots
   planner/   binding, logical plans, physical plans, EXPLAIN formatting
   executor/  expression evaluation and volcano-style operators
-  storage/   page-backed table storage, on-disk B-tree index, recovery
-  buffer/    page cache, latches, dirty tracking, rollback, in-place flushing
-  wal/       physiological redo write-ahead log, commit records, replay iterators
+  storage/   page-backed MVCC storage, on-disk B-tree indexes, VACUUM, recovery
+  buffer/    page cache, frame latches, dirty tracking, in-place flushing
+  wal/       physiological redo WAL, commit/abort records, transaction-status (CLOG), replay
   control/   manifest.dat control record: redo boundary plus catalog snapshot
   protocol/  PostgreSQL wire codec (simple and extended query) and connection state
   server/    binary, startup/recovery, TCP listener, query orchestration
@@ -172,9 +219,11 @@ crates/
 
 ## Query Path
 
-Reads and writes flow through the same SQL pipeline, but write statements run
-under an exclusive statement guard and receive a transaction ID for WAL and
-rollback tracking.
+Reads and writes flow through the same SQL pipeline. Read statements take an MVCC
+snapshot and run lock-free; write statements run under a shared writer guard
+(concurrent with other writers) and receive a transaction ID plus a snapshot for
+visibility, WAL, and conflict detection. Checkpoint and `VACUUM` take an exclusive
+guard that drains in-flight writers.
 
 ```text
 client query
@@ -189,8 +238,9 @@ QueryService
     |
     +--> classify statement
     |       |
-    |       +-- SELECT / EXPLAIN: read guard
-    |       +-- DDL / DML:       write guard + txn_id
+    |       +-- SELECT / EXPLAIN: read guard + MVCC snapshot
+    |       +-- DDL / DML:       shared writer guard + txn_id + snapshot
+    |       +-- VACUUM:          exclusive guard (drains writers)
     |
     +--> bind names and types against catalog
     |
@@ -206,8 +256,11 @@ QueryService
 ```
 
 For successful writes, the server appends a WAL `Commit` record, fsyncs the WAL,
-then performs in-memory commit cleanup. If a write fails before durable commit,
-the server rolls back storage, buffer, and catalog state for that statement.
+then performs in-memory commit cleanup. A failed or rolled-back transaction is
+aborted by status: the server appends an `Abort` record and marks the transaction
+aborted in the commit-status map (CLOG). Its row versions are not undone in place
+— they are invisible under MVCC and reclaimed later by VACUUM; only catalog/DDL
+metadata for a failed in-unit `CREATE`/`DROP` is restored.
 
 ## Data Files
 
@@ -308,7 +361,9 @@ repair any torn page writes.
 ## Recovery
 
 Startup reads the control record for the redo boundary and catalog, then replays
-committed WAL records after `checkpoint_lsn` onto the heap and index pages.
+WAL records after `checkpoint_lsn` onto the heap and index pages (redo-all),
+rebuilding the commit-status map (CLOG) from `Commit`/`Abort` records so MVCC
+visibility is correct after restart.
 
 ```text
 server startup
@@ -322,7 +377,8 @@ server startup
     |
     +-- install table and secondary-index schemas into storage
     |
-    +-- replay committed WAL records with LSN > checkpoint_lsn
+    +-- replay WAL records with LSN > checkpoint_lsn (redo-all) and rebuild
+    |       the commit-status map (CLOG) from Commit/Abort records for visibility
     |       page-LSN gating makes redo idempotent; torn or missing pages are
     |       zeroed so a FullPageImage / HeapInit re-establishes them
     |

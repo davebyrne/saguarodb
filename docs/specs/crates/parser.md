@@ -155,37 +155,37 @@ pub enum UnaryOp {
 }
 ```
 
-`FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require `Some(condition)` from an `ON` predicate and the parser rejects those joins without `ON`. V1 rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
+`FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require `Some(condition)` from an `ON` predicate and the parser rejects those joins without `ON`. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 
 Parser `BinOp` and `UnaryOp` variants use the same names as planner expression operators. Binder may copy these operators into bound expressions after type validation.
 
 `Expr::Case.operand = None` represents searched `CASE WHEN condition THEN ...`. `operand = Some(expr)` represents simple `CASE expr WHEN value THEN ...`; binder/executor implement this by comparing the operand to each `WHEN` value with SQL equality semantics.
 
-Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`, and `COUNT(DISTINCT id)` is `Function { name: "count", args: vec![FunctionArg::Expr(...)] , distinct: true }`. Binder converts `COUNT(*)` to `BoundExpr::AggregateCall { arg: None, ... }`, rejects `distinct: true` aggregate calls in v1, and rejects `FunctionArg::Wildcard` for non-`COUNT` functions or mixed with other arguments.
+Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`, and `COUNT(DISTINCT id)` is `Function { name: "count", args: vec![FunctionArg::Expr(...)] , distinct: true }`. Binder converts `COUNT(*)` to `BoundExpr::AggregateCall { arg: None, ... }`, rejects `distinct: true` aggregate calls, and rejects `FunctionArg::Wildcard` for non-`COUNT` functions or mixed with other arguments.
 
-The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` grammar (and the comma form `SUBSTRING(expr, start[, length])`) is normalized into ordinary `Function { name: "trim" | "substring", ... }` calls so the binder treats them uniformly. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported in v1.
+The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` grammar (and the comma form `SUBSTRING(expr, start[, length])`) is normalized into ordinary `Function { name: "trim" | "substring", ... }` calls so the binder treats them uniformly. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported.
 
-## V1 SQL Scope
+## SQL Scope
 
-Parser may produce AST variants for syntax that binder rejects. V1 parser must parse:
+Parser may produce AST variants for syntax that binder rejects. The parser parses:
 
-- `CREATE TABLE` with column definitions and primary key. V1 parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys in v1.
+- `CREATE TABLE` with column definitions and primary key. The parser parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys.
 - `DROP TABLE`.
-- `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (v1 does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
+- `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (SaguaroDB does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
 - `DROP INDEX name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `SELECT` with projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
-- `EXPLAIN SELECT ...`. The AST node boxes any statement, but v1 only accepts a `SELECT` inner statement; any other inner statement is rejected as unsupported.
-- Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin { isolation }`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. An optional `ISOLATION LEVEL <level>` mode is carried on `Begin.isolation` (and on `SetTransaction.isolation`), with the four SQL levels mapped onto SaguaroDB's two: `READ UNCOMMITTED`/`READ COMMITTED` → `IsolationLevel::ReadCommitted`, `REPEATABLE READ`/`SERIALIZABLE`/`SNAPSHOT` → `IsolationLevel::RepeatableRead` (SERIALIZABLE is **aliased** to snapshot isolation; no SSI — see `mvcc.md` §10 Milestone G). The `READ WRITE` access mode is accepted and ignored (the default); `READ ONLY` is rejected (v1 enforces no read-only restriction, so silently ignoring it would mislead), as are MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this position and is an upstream syntax error. `ABORT` is not recognized by the dialect and is a syntax error (v1 does not add it).
+- `EXPLAIN SELECT ...`. The AST node boxes any statement, but only a `SELECT` inner statement is accepted; any other inner statement is rejected as unsupported.
+- Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin { isolation }`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. An optional `ISOLATION LEVEL <level>` mode is carried on `Begin.isolation` (and on `SetTransaction.isolation`), with the four SQL levels mapped onto SaguaroDB's two: `READ UNCOMMITTED`/`READ COMMITTED` → `IsolationLevel::ReadCommitted`, `REPEATABLE READ`/`SERIALIZABLE`/`SNAPSHOT` → `IsolationLevel::RepeatableRead` (SERIALIZABLE is **aliased** to snapshot isolation; no SSI — see `mvcc.md` §10 Milestone G). The `READ WRITE` access mode is accepted and ignored (the default); `READ ONLY` is rejected (SaguaroDB enforces no read-only restriction, so silently ignoring it would mislead), as are MySQL-style modifiers, `AND CHAIN`, atomic-block bodies, and savepoints. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this position and is an upstream syntax error. `ABORT` is not recognized by the dialect and is a syntax error (SaguaroDB does not add it).
 - Set transaction: `SET TRANSACTION ISOLATION LEVEL <level>` (sqlparser's `Set(SetTransaction { session: false, .. })`) parses to `Statement::SetTransaction { isolation }`, and `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` (the session default, `session: true`) parses to `Statement::SetSessionCharacteristics { isolation }`. Both share the same level mapping (as above) and access-mode handling (`READ WRITE` accepted-and-ignored, `READ ONLY` rejected); only the `session` flag distinguishes them. `SET TRANSACTION SNAPSHOT` and every other `SET` form are rejected at parse time (`SyntaxError`). The transaction-scoped `SET TRANSACTION` is honored only before the transaction's first query, while `SET SESSION CHARACTERISTICS` sets the per-connection default for future transactions (both enforced by the server, `mvcc.md` §10 Milestone G).
 
-- Maintenance: `VACUUM` parses to `Statement::Vacuum { table: None }` and `VACUUM <table>` to `Statement::Vacuum { table: Some(<lowercased name>) }`. **sqlparser 0.56 cannot parse `VACUUM`** (it errors), so `parse_statement` intercepts it *before* handing the string to sqlparser: it strips an optional trailing `;`, matches the leading `vacuum` keyword case-insensitively (a glued word like `vacuumfoo` is not a VACUUM and falls through to sqlparser), and accepts at most one bare-identifier argument (lowercase-normalized, the v1 unquoted-identifier rule). Parenthesized options, multiple tables, qualified (`schema.table`) or quoted names, and Postgres option keywords (`FULL`/`FREEZE`/`ANALYZE`/`VERBOSE`/…) are rejected with `ErrorKind::Parse` / `SqlState::SyntaxError`; none are supported in v1. `VACUUM` does not bind/plan — it is a maintenance command the server dispatches separately (`docs/specs/crates/server.md`, `docs/specs/mvcc.md` §9/§10 Milestone F).
+- Maintenance: `VACUUM` parses to `Statement::Vacuum { table: None }` and `VACUUM <table>` to `Statement::Vacuum { table: Some(<lowercased name>) }`. **sqlparser 0.56 cannot parse `VACUUM`** (it errors), so `parse_statement` intercepts it *before* handing the string to sqlparser: it strips an optional trailing `;`, matches the leading `vacuum` keyword case-insensitively (a glued word like `vacuumfoo` is not a VACUUM and falls through to sqlparser), and accepts at most one bare-identifier argument (lowercase-normalized, the unquoted-identifier rule). Parenthesized options, multiple tables, qualified (`schema.table`) or quoted names, and Postgres option keywords (`FULL`/`FREEZE`/`ANALYZE`/`VERBOSE`/…) are rejected with `ErrorKind::Parse` / `SqlState::SyntaxError`; none are supported. `VACUUM` does not bind/plan — it is a maintenance command the server dispatches separately (`docs/specs/crates/server.md`, `docs/specs/mvcc.md` §9/§10 Milestone F).
 
-Binder rejects parsed forms that exceed the v1 semantic subset, such as composite primary keys and unknown functions.
+Binder rejects parsed forms that exceed the semantic subset, such as composite primary keys and unknown functions.
 
-Unquoted identifiers are normalized to lowercase before AST construction. Quoted identifiers are rejected in v1 with `ErrorKind::Parse` and `SqlState::SyntaxError`.
+Unquoted identifiers are normalized to lowercase before AST construction. Quoted identifiers are rejected with `ErrorKind::Parse` and `SqlState::SyntaxError`.
 
 ## Non-Responsibilities
 
@@ -209,4 +209,4 @@ Unquoted identifiers are normalized to lowercase before AST construction. Quoted
 - Preserves aliases and qualified names without resolving them.
 - Parses `SELECT *` and `table.*` distinctly.
 - Parses `EXPLAIN SELECT ...` into `Statement::Explain`.
-- Parses `INSERT ... SELECT` into `InsertSource::Query`, which the binder binds in v1.
+- Parses `INSERT ... SELECT` into `InsertSource::Query`, which the binder binds.

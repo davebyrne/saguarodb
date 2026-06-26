@@ -16,7 +16,7 @@
 
 ## Execution Model
 
-V1 uses Volcano-style pull execution. Operators return `ExecRow`, not plain `Row`, so DML identity survives filters and projections.
+Execution is Volcano-style pull execution. Operators return `ExecRow`, not plain `Row`, so DML identity survives filters and projections.
 
 ```rust
 pub trait PlanExecutor {
@@ -38,7 +38,7 @@ The concrete server `QueryService` wires:
 parse -> bind -> logical_plan -> physical_plan -> execute
 ```
 
-For SELECT, it materializes plain `Row` values into `ExecutionResult::Query` in v1. For DML/DDL, it executes immediately and returns command metadata. A future server streaming bridge may drive `PlanExecutor` directly without changing physical operator semantics.
+For SELECT, it materializes plain `Row` values into `ExecutionResult::Query`. For DML/DDL, it executes immediately and returns command metadata. A future server streaming bridge may drive `PlanExecutor` directly without changing physical operator semantics.
 
 `ExecutionResult` has three variants: `Query` (SELECT rows and columns), `Modified { command, count }` (DML/DDL), and `Explanation { text }` (EXPLAIN). `QueryEngine::execute` produces only `Query` and `Modified`; `Explanation` is produced by the server's `QueryService` (EXPLAIN never calls the executor), but the variant lives in the executor crate's `ExecutionResult`.
 
@@ -92,7 +92,7 @@ impl QueryEngine {
 pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value>;
 ```
 
-V1 evaluator handles:
+The evaluator handles:
 
 - Literals and `InputRef`.
 - Arithmetic: `+`, `-`, `*`, `/`, `%`.
@@ -110,11 +110,11 @@ V1 evaluator handles:
 
 Division by zero returns `SqlState::DivisionByZero`. Integer overflow in scalar arithmetic or integer aggregate accumulation returns `SqlState::NumericValueOutOfRange`.
 
-V1 expression semantics:
+Expression semantics:
 
 - Comparisons with `NULL` return `Value::Null`; `WHERE` and `HAVING` keep only `Value::Boolean(true)`.
 - Boolean `AND`, `OR`, and `NOT` use SQL three-valued logic.
-- `LIKE` requires text operands, is case-sensitive, supports `%` for any sequence and `_` for one character, and uses backslash to escape `%`, `_`, or `\`. A backslash before any other character is treated as a literal backslash followed by that character, and a trailing lone backslash is a literal backslash. V1 does not support an `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
+- `LIKE` requires text operands, is case-sensitive, supports `%` for any sequence and `_` for one character, and uses backslash to escape `%`, `_`, or `\`. A backslash before any other character is treated as a literal backslash followed by that character, and a trailing lone backslash is a literal backslash. `LIKE` does not support an `ESCAPE` clause. If the value or pattern is `NULL`, the result is `NULL`.
 - `IN` returns `TRUE` on the first non-null equal item, `FALSE` when no item matches and no list item is `NULL`, and `NULL` when the left side is `NULL` or no item matches but some list item is `NULL`. `NOT IN` applies SQL `NOT` to that result.
 - `BETWEEN` evaluates as `(expr >= low) AND (expr <= high)` using the same comparison and boolean null semantics. `NOT BETWEEN` applies SQL `NOT`.
 - Searched `CASE WHEN condition THEN value ...` chooses the first `WHEN` whose condition evaluates to `TRUE`; `FALSE` and `NULL` conditions do not match. Simple `CASE operand WHEN value THEN result ...` compares `operand = value` with SQL comparison semantics and chooses the first comparison that evaluates to `TRUE`. If no branch matches, both forms return `ELSE` or `NULL`.
@@ -190,7 +190,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement, acquires `ConcurrencyController::begin_read` for SELECT and EXPLAIN or `begin_write` for INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, and checkpoint. SELECT runs bind, plan, and `QueryEngine::execute` while holding that guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. The guard lives for the full statement.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: SELECT and EXPLAIN are lock-free readers and take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX acquire the shared writer guard `ConcurrencyController::begin_writer` (many writers run concurrently); checkpoint and `VACUUM` take the exclusive `begin_checkpoint` guard. SELECT runs bind, plan, and `QueryEngine::execute` lock-free. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

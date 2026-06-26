@@ -158,7 +158,7 @@ Checksum:    4 bytes
 
 `PageLSN` is the LSN of the WAL record that last modified the page. It is stamped on every mutation by `page::set_page_lsn`. It is the basis for PageLSN-gated redo replay and for deciding when a dirty page is safe to flush (see `wal.md` and `buffer.md`).
 
-V1 development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
+Development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
 
 `PageType` is `1` for a heap data page and `2` for a B-tree index node. `validate`/`is_valid` accept both (the data-page slot-layout check runs only for type `1`); the index node body layout is described under Primary-Key Index.
 
@@ -883,9 +883,9 @@ impl PageBackedStorageEngine {
 
 `open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables) and `install_index_schemas` (secondary indexes) after loading the catalog snapshot, so DML maintains the indexes.
 
-`PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` for v1 so startup can call concrete recovery-mode methods and query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`.
+`PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods and query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`.
 
-`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter in v1; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`) defined on `PageBackedStorageEngine` in `engine.rs`.
+`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`) defined on `PageBackedStorageEngine` in `engine.rs`.
 
 ## Structural Write Latches (Milestone E2a)
 
@@ -948,18 +948,19 @@ under serialized writers only one writer runs at a time, so this commit installs
 substrate with zero runtime behavior change. Real contention/atomicity stress tests
 arrive in E2b once writers overlap.
 
-## Page-Backed V1 Simplifications
+## Page-Backed Simplifications
 
 - Structural mutations within one index or one heap file serialize on that file's
-  per-`FileId` structural write latch (above); under the still-global writer lock
-  (E2b removes it) the latches are uncontended, so heap and index page modifications
-  effectively run single-writer today.
+  per-`FileId` structural write latch (above). Concurrent writers (E2b) run under
+  the shared writer guard, so two writers touching the same heap or index file
+  serialize on that file's structural latch while writers on different files
+  proceed in parallel.
 - The primary-key index is durable on disk, so nothing is rebuilt after recovery.
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
 - New pages allocated during a statement must be tracked by buffer rollback through `new_page(file, txn_id)`.
 - Index and heap page changes (including B-tree splits) are rolled back by the buffer pool's before-images and new-page tracking, so `rollback_txn(txn_id)` only restores storage-owned table and index metadata.
-- `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. V1 does not physically delete heap or index pages; committed drops are reflected by omitting the table or index from later checkpoints.
+- `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. Storage does not physically delete heap or index pages; committed drops are reflected by omitting the table or index from later checkpoints.
 
 ## Error Handling
 
