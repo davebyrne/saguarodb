@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use common::{DbError, FIRST_NORMAL_XID, Lsn, Result, TxnId, TxnStatus, TxnStatusView};
 
+use crate::clog_file::{ClogSnapshot, decode_clog, encode_clog};
 use crate::codec::{max_lsn, read_records};
 use crate::{Clog, WalManager, WalRecord, WalRecordKind, encode_record};
 
@@ -22,18 +23,20 @@ struct WalState {
     flushed_offset: u64,
     last_lsn: Lsn,
     last_offset: u64,
-    /// Authoritative transaction-status map, rebuilt at open from the durable
-    /// `Commit`/`Abort` records and updated as records are flushed (see
-    /// [`Clog`]). Supersedes the old single-bit committed set.
+    /// Authoritative transaction-status map, reconstructed at open — seeded from the
+    /// durable `clog.dat` snapshot when present (then a post-snapshot `Commit`/`Abort`
+    /// fold), else rebuilt from those records — and updated as records are flushed
+    /// (see [`Clog`]). Supersedes the old single-bit committed set.
     clog: Clog,
     pending_commits: HashSet<u64>,
     /// The vacuum floor (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c): the boundary
     /// below which a FULL VACUUM pass has reclaimed every aborted-creator tuple, so
     /// `truncate_before` may drop those aborted transactions' `Abort` records and
-    /// float the implicit-committed floor past them. In-memory only; it starts at
-    /// `FIRST_NORMAL_XID` (no aborted txn is below it ⇒ the pin is fully conservative)
-    /// and resets there at every reopen — see [`WalManager::set_vacuum_floor`] for why
-    /// reset-at-restart is safe.
+    /// float the implicit-committed floor past them. Loaded from the durable CLOG
+    /// snapshot (`clog.dat`) at open when one is present — so it survives restart —
+    /// else seeded to `FIRST_NORMAL_XID` (no aborted txn is below it ⇒ the pin is
+    /// fully conservative). See [`WalManager::set_vacuum_floor`] for why the
+    /// conservative no-snapshot fallback is safe.
     vacuum_floor: TxnId,
     poisoned: Option<String>,
     #[cfg(test)]
@@ -107,7 +110,23 @@ impl FileWalManager {
         let retained: Vec<_> = records.iter().map(|stored| stored.record.clone()).collect();
         let flushed_lsn = max_lsn(&retained);
         let flushed_offset = records.iter().map(|stored| stored.encoded_len).sum();
-        let clog = rebuild_clog(&records, flushed_lsn);
+        // Prefer the durable CLOG snapshot (`docs/specs/mvcc.md` §5.4): seed the
+        // statuses + floors from `clog.dat` and fold only the post-snapshot
+        // `Commit`/`Abort` records, bounding the rebuild scan and carrying the
+        // vacuum floor across restart. An ABSENT snapshot (fresh database, or a data
+        // directory from a pre-durable-CLOG build) falls back to rebuilding the CLOG
+        // from the full retained WAL; a CORRUPT snapshot propagates its error
+        // (atomic temp+rename means a torn write never occurs, so a CRC/version
+        // mismatch is real corruption, surfaced like a bad `manifest.dat`).
+        let clog_path = clog_path_for(&path);
+        let (clog, vacuum_floor) = match load_clog_snapshot(&clog_path)? {
+            Some(snapshot) => {
+                let mut clog = Clog::from_snapshot(&snapshot);
+                fold_commit_abort_after(&mut clog, &records, snapshot.clog_lsn, flushed_lsn);
+                (clog, snapshot.vacuum_floor)
+            }
+            None => (rebuild_clog(&records, flushed_lsn), FIRST_NORMAL_XID),
+        };
         let last_lsn = flushed_lsn;
         let last_offset = flushed_offset;
 
@@ -123,9 +142,10 @@ impl FileWalManager {
                 last_offset,
                 clog,
                 pending_commits: HashSet::new(),
-                // In-memory; reset to the fully-conservative boundary at every open
-                // (reset-at-restart, see `WalManager::set_vacuum_floor`).
-                vacuum_floor: FIRST_NORMAL_XID,
+                // Loaded from the durable CLOG snapshot when present (so a full
+                // VACUUM's reclamation horizon survives restart), else the
+                // fully-conservative boundary (`docs/specs/mvcc.md` §5.4).
+                vacuum_floor,
                 poisoned: None,
                 #[cfg(test)]
                 fail_next_flush: None,
@@ -486,12 +506,38 @@ impl WalManager for FileWalManager {
     }
 
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
-        // Monotonic, in-memory only (see the trait doc): a full VACUUM pass under the
-        // exclusive guard reclaimed every aborted-creator tuple below `boundary`, so
-        // `truncate_before` may now drop those aborted transactions' `Abort` records
-        // and float the implicit-committed floor past them. Never lowered.
+        // Monotonic; runtime-resident but persisted to `clog.dat` (see the trait doc):
+        // a full VACUUM pass under the exclusive guard reclaimed every aborted-creator
+        // tuple below `boundary`, so `truncate_before` may now drop those aborted
+        // transactions' `Abort` records and float the implicit-committed floor past
+        // them. Never lowered.
         let mut state = self.lock_state()?;
         state.vacuum_floor = state.vacuum_floor.max(boundary);
+        Ok(())
+    }
+
+    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()> {
+        // Serialize the live-window snapshot (statuses + both floors) atomically, then
+        // prune the in-memory CLOG to match. Write-then-mutate: a failed durable write
+        // leaves the in-memory floor exactly where it was, so the next open still
+        // reconciles against the previous snapshot. The checkpoint calls this after
+        // the heap + control record are durable and before `truncate_before`, so the
+        // snapshot durably remembers every outcome truncation is about to drop
+        // (`docs/specs/mvcc.md` §5.4).
+        //
+        // The CLOG only records commits once they are flushed (`set_committed` runs in
+        // `flush`), so the snapshot can only attest to outcomes through `flushed_lsn`.
+        // Clamp `clog_lsn` to it: stamping a higher value would, on the next open,
+        // skip folding a `Commit` in `(flushed_lsn, clog_lsn]` (the fold replays only
+        // `lsn > clog_lsn`) and resurrect that durable transaction as in-progress.
+        // Clamping down is always safe — the fold is idempotent over the re-replayed
+        // range. The checkpoint passes `flushed_lsn`, so this is a guard, not a change.
+        let mut state = self.lock_state()?;
+        let clog_lsn = clog_lsn.min(state.flushed_lsn);
+        let vacuum_floor = state.vacuum_floor;
+        let snapshot = state.clog.live_snapshot(clog_lsn, vacuum_floor);
+        write_clog_file(&self.clog_path(), &snapshot)?;
+        state.clog.prune_to(snapshot.committed_floor);
         Ok(())
     }
 }
@@ -512,6 +558,12 @@ impl TxnStatusView for FileWalManager {
 }
 
 impl FileWalManager {
+    /// Path of the durable CLOG snapshot, a sibling of the WAL file
+    /// (`<data-dir>/clog.dat` next to `<data-dir>/wal.dat`).
+    fn clog_path(&self) -> PathBuf {
+        clog_path_for(&self.path)
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WalState>> {
         let state = self
             .state
@@ -563,10 +615,12 @@ fn represents_transaction(record: &WalRecord) -> bool {
 
 /// Rebuild the CLOG from the durable records (`lsn <= flushed_lsn`): each
 /// `Commit` marks its txn committed, each `Abort` marks its txn aborted. This is
-/// the recovery-time CLOG reconstruction described in `docs/specs/mvcc.md` §8 —
-/// the WAL `Commit`/`Abort` records are the durable source of truth; the CLOG
-/// itself is in-memory for the A–D MVP (a durable CLOG file is a Milestone F
-/// concern). A transaction with neither record is `InProgress` by default.
+/// the recovery-time CLOG reconstruction described in `docs/specs/mvcc.md` §8, used
+/// as the **no-snapshot fallback** — the WAL `Commit`/`Abort` records are the durable
+/// source of truth. When a durable CLOG snapshot (`clog.dat`) is present, `open`
+/// instead seeds from it and folds only the post-snapshot records (see
+/// [`load_clog_snapshot`]). A transaction with neither record is `InProgress` by
+/// default.
 fn rebuild_clog(records: &[StoredRecord], flushed_lsn: Lsn) -> Clog {
     let mut clog = Clog::new();
     for stored in records
@@ -580,6 +634,87 @@ fn rebuild_clog(records: &[StoredRecord], flushed_lsn: Lsn) -> Clog {
         }
     }
     clog
+}
+
+/// The durable CLOG snapshot path for a WAL at `wal_path` (its `clog.dat` sibling).
+fn clog_path_for(wal_path: &Path) -> PathBuf {
+    wal_path.with_file_name("clog.dat")
+}
+
+/// Load the durable CLOG snapshot, or `None` when none exists yet. An absent file
+/// is the fresh-database / pre-durable-CLOG-build case (the caller rebuilds from
+/// the WAL); a present-but-corrupt file propagates its error, exactly like a bad
+/// `manifest.dat` (atomic temp+rename means a torn write never occurs).
+fn load_clog_snapshot(path: &Path) -> Result<Option<ClogSnapshot>> {
+    match fs::read(path) {
+        Ok(bytes) => decode_clog(&bytes).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(DbError::io(format!(
+            "failed to read CLOG file {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+/// Fold the durable `Commit`/`Abort` records strictly after the snapshot's
+/// `clog_lsn` (and at or below `flushed_lsn`) onto a CLOG seeded from that
+/// snapshot, bringing it current with the WAL (`docs/specs/mvcc.md` §5.4).
+fn fold_commit_abort_after(
+    clog: &mut Clog,
+    records: &[StoredRecord],
+    clog_lsn: Lsn,
+    flushed_lsn: Lsn,
+) {
+    for stored in records
+        .iter()
+        .filter(|stored| stored.record.lsn > clog_lsn && stored.record.lsn <= flushed_lsn)
+    {
+        match stored.record.kind {
+            WalRecordKind::Commit => clog.set_committed(stored.record.txn_id),
+            WalRecordKind::Abort => clog.set_aborted(stored.record.txn_id),
+            _ => {}
+        }
+    }
+}
+
+/// Write the durable CLOG snapshot atomically: temp file + fsync + rename + parent
+/// directory fsync (mirrors the control-record store in `crates/control`).
+fn write_clog_file(path: &Path, snapshot: &ClogSnapshot) -> Result<()> {
+    let bytes = encode_clog(snapshot)?;
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|err| {
+                DbError::io(format!(
+                    "failed to open temporary CLOG file {}: {err}",
+                    tmp_path.display()
+                ))
+            })?;
+        file.write_all(&bytes).map_err(|err| {
+            DbError::io(format!(
+                "failed to write temporary CLOG file {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            DbError::io(format!(
+                "failed to fsync temporary CLOG file {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+    }
+    fs::rename(&tmp_path, path).map_err(|err| {
+        DbError::io(format!(
+            "failed to replace CLOG file {} with {}: {err}",
+            path.display(),
+            tmp_path.display()
+        ))
+    })?;
+    sync_parent_dir(path)
 }
 
 fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
@@ -671,9 +806,174 @@ fn rollback_unflushed(state: &mut WalState, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use common::TxnStatusView;
+
+    use crate::clog_file::decode_clog;
     use crate::{WalManager, WalRecord, WalRecordKind};
 
-    use super::FileWalManager;
+    use super::{FileWalManager, clog_path_for};
+
+    /// Append committed txn 10, aborted txn 11, committed txn 12, and flush.
+    fn commit_abort_commit(wal: &FileWalManager) {
+        wal.append(WalRecord::insert_for_test(10, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 10,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(11, 2)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 11,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(12, 3)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 12,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+    }
+
+    #[test]
+    fn persist_clog_then_reopen_restores_statuses_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+        commit_abort_commit(&wal);
+
+        // No vacuum yet, so the aborted txn 11 stays explicit in the snapshot.
+        let clog_lsn = wal.flushed_lsn();
+        wal.persist_clog(clog_lsn).unwrap();
+
+        // The on-disk snapshot records the outcomes and the absorbed LSN directly.
+        // The aborted txn 11 pins the floor at 11, so the committed txn 10 below it is
+        // implicit-committed (dropped) while txn 12 above it stays explicit.
+        let bytes = std::fs::read(clog_path_for(&path)).unwrap();
+        let snapshot = decode_clog(&bytes).unwrap();
+        assert_eq!(snapshot.clog_lsn, clog_lsn);
+        assert_eq!(snapshot.committed_floor, 11);
+        assert_eq!(snapshot.committed, vec![12]);
+        assert_eq!(snapshot.aborted, vec![11]);
+
+        // Reopen: the CLOG is seeded from the snapshot, so the statuses survive — txn
+        // 10 reads implicit-committed below the floor, 11 explicit-aborted, 12 committed.
+        drop(wal);
+        let reopened = FileWalManager::open(&path).unwrap();
+        assert!(reopened.is_committed(10));
+        assert!(reopened.is_aborted(11));
+        assert!(reopened.is_committed(12));
+    }
+
+    #[test]
+    fn reopen_folds_commit_abort_records_after_the_snapshot_lsn() {
+        // The heart of the feature: seed from the snapshot, then replay only the
+        // post-`clog_lsn` `Commit`/`Abort` records. Persist after txn 10 commits, then
+        // commit txn 20 and abort txn 21 (both beyond `clog_lsn`), reopen, and check
+        // the snapshot status (10) AND the folded statuses (20, 21) are all present.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+
+        wal.append(WalRecord::insert_for_test(10, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 10,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        let clog_lsn = wal.flushed_lsn();
+        wal.persist_clog(clog_lsn).unwrap();
+
+        // Records appended AFTER the snapshot — only reconstructible by the fold.
+        wal.append(WalRecord::insert_for_test(20, 2)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 20,
+            kind: WalRecordKind::Commit,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(21, 3)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 21,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap();
+        wal.flush().unwrap();
+
+        drop(wal);
+        let reopened = FileWalManager::open(&path).unwrap();
+        assert!(reopened.is_committed(10)); // from the snapshot
+        assert!(reopened.is_committed(20)); // folded from a post-snapshot Commit
+        assert!(reopened.is_aborted(21)); // folded from a post-snapshot Abort
+    }
+
+    #[test]
+    fn reopen_loads_vacuum_floor_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+        commit_abort_commit(&wal);
+
+        // A full VACUUM advanced the floor to 13 (every aborted-creator < 13 reclaimed).
+        wal.set_vacuum_floor(13).unwrap();
+        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        drop(wal);
+
+        // Reopen and re-persist: the snapshot still carries vacuum_floor 13, proving it
+        // was loaded (it is not reset to the conservative boundary as before).
+        let reopened = FileWalManager::open(&path).unwrap();
+        reopened.persist_clog(reopened.flushed_lsn()).unwrap();
+        let snapshot = decode_clog(&std::fs::read(clog_path_for(&path)).unwrap()).unwrap();
+        assert_eq!(snapshot.vacuum_floor, 13);
+        // The reclaimed abort 11 (< 13) is now implicit-committed, not explicit.
+        assert!(!snapshot.aborted.contains(&11));
+        assert_eq!(snapshot.committed_floor, 13);
+    }
+
+    #[test]
+    fn absent_clog_snapshot_rebuilds_statuses_from_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+        commit_abort_commit(&wal);
+        // No persist_clog: no clog.dat exists (the pre-durable-CLOG / fresh case).
+        drop(wal);
+
+        let reopened = FileWalManager::open(&path).unwrap();
+        assert!(reopened.is_committed(10));
+        assert!(reopened.is_aborted(11));
+        assert!(reopened.is_committed(12));
+    }
+
+    #[test]
+    fn corrupt_clog_snapshot_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+        commit_abort_commit(&wal);
+        wal.persist_clog(wal.flushed_lsn()).unwrap();
+        drop(wal);
+
+        // Corrupt the snapshot payload; an atomic temp+rename never tears a write, so
+        // a CRC mismatch is real corruption and must surface (like a bad manifest.dat).
+        let clog_path = clog_path_for(&path);
+        let mut bytes = std::fs::read(&clog_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&clog_path, &bytes).unwrap();
+
+        let Err(err) = FileWalManager::open(&path) else {
+            panic!("a corrupt CLOG snapshot must fail open");
+        };
+        assert!(err.message.contains("checksum mismatch"));
+    }
 
     #[test]
     fn truncate_before_parent_sync_failure_poisons_wal_before_state_update() {

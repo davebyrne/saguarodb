@@ -106,6 +106,14 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         .control
         .store(checkpoint_lsn, &tables, &catalog_bytes)?;
 
+    // Persist the durable CLOG snapshot (`docs/specs/mvcc.md` §5.4) covering through
+    // `checkpoint_lsn`, AFTER the heap + control record are durable and BEFORE the WAL
+    // is truncated. It durably records every transaction outcome (and both floors), so
+    // recovery seeds the CLOG from it and the implicit-committed / vacuum floors survive
+    // restart. The ordering is the load-bearing invariant: the snapshot must cover the
+    // truncation boundary before `truncate_before` drops any record below it.
+    components.wal.persist_clog(checkpoint_lsn)?;
+
     // The Checkpoint marker is optional metadata; recovery uses the control
     // record's LSN. Truncating below it reclaims the now-redundant WAL prefix.
     //

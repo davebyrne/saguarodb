@@ -40,7 +40,7 @@ pub enum WalRecordKind {
 
 `txn_id = 0` is reserved for non-transactional system metadata records. The `Checkpoint` marker is the exception that carries a non-zero `txn_id`: it stamps the transaction-id allocation high-water mark so the allocator boundary survives WAL truncation (see Checkpoint Interaction). No consumer treats the marker's `txn_id` as a real transaction (CLOG rebuild and redo key off the record *kind*); only the allocator seed reads it. User statement transaction IDs start at `FIRST_NORMAL_XID` (the allocator floors there so real transactions never stamp tuple headers with a reserved xid).
 
-`Commit` and `Abort` carry no payload; the `txn_id` is in the header. `Commit` marks a transaction durably committed; `Abort` marks it aborted. Together they are the durable source of truth for transaction outcome and the input to CLOG reconstruction during recovery (see the MVCC plan, `docs/specs/mvcc.md` §5.4, §8). Under MVCC the CLOG is kept in memory and rebuilt from these records; a durable CLOG file is deferred to Milestone F.
+`Commit` and `Abort` carry no payload; the `txn_id` is in the header. `Commit` marks a transaction durably committed; `Abort` marks it aborted. Together they are the durable source of truth for transaction outcome and the input to CLOG reconstruction during recovery (see the MVCC plan, `docs/specs/mvcc.md` §5.4, §8). The CLOG is reconstructed at recovery; a durable CLOG snapshot (`clog.dat`, Milestone F — see "Durable CLOG snapshot" below) now seeds it and lets recovery fold only the post-snapshot `Commit`/`Abort` records, with the full in-memory rebuild from these records as the no-snapshot fallback.
 
 The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) describe page-level changes. The storage mutation path produces them (stamping the page-LSN), and recovery replays them PageLSN-gated; `FullPageImage` provides torn-page recovery.
 
@@ -80,10 +80,14 @@ pub trait WalManager: Send + Sync + common::TxnStatusView {
     // Establish the CLOG implicit-committed floor at recovery, conservatively
     // (never crossing an aborted/in-flight transaction). See Invariants.
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
-    // Advance the in-memory vacuum floor (Milestone F4c): the boundary below which a
-    // full VACUUM pass reclaimed every aborted-creator tuple, so `truncate_before`
-    // may drop those aborts' records and float the floor past them. See Invariants.
+    // Advance the vacuum floor (Milestone F4c): the boundary below which a full VACUUM
+    // pass reclaimed every aborted-creator tuple, so `truncate_before` may drop those
+    // aborts' records and float the floor past them. Persisted in `clog.dat`. See Invariants.
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
+    // Persist the durable CLOG snapshot (`clog.dat`) covering records through `clog_lsn`.
+    // The checkpoint calls this after the control record is durable and before
+    // `truncate_before`. See "Durable CLOG snapshot".
+    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
 }
 ```
 
@@ -128,11 +132,20 @@ The control record (`manifest.dat`) contains the authoritative `checkpoint_lsn` 
 
 After heap pages are flushed + fsynced and the control record is stored:
 
-1. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn }, .. }`. The marker's `txn_id` carries the transaction-id allocation high-water mark (highest id allocated so far) rather than the usual `0`. The marker survives `truncate_before` (its LSN is the retained boundary), so recovery's allocator seed recovers the boundary even when every data record below the checkpoint was truncated — without it the allocator would restart low and reissue ids that already stamped committed tuples, corrupting MVCC visibility. Recovery still does not *replay* this metadata.
-2. Flush WAL.
-3. Call `truncate_before(checkpoint_lsn)`.
+1. Call `persist_clog(checkpoint_lsn)` to write the durable CLOG snapshot (see "Durable CLOG snapshot"). This MUST happen before step 3 so the snapshot covers every outcome the truncation is about to drop.
+2. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn }, .. }`. The marker's `txn_id` carries the transaction-id allocation high-water mark (highest id allocated so far) rather than the usual `0`. The marker survives `truncate_before` (its LSN is the retained boundary), so recovery's allocator seed recovers the boundary even when every data record below the checkpoint was truncated — without it the allocator would restart low and reissue ids that already stamped committed tuples, corrupting MVCC visibility. Recovery still does not *replay* this metadata.
+3. Flush WAL.
+4. Call `truncate_before(checkpoint_lsn)`.
 
 `truncate_before` must not remove records needed by the current control record. It must preserve the relative order and stored LSNs of retained records. It also advances the CLOG implicit-committed floor (see Invariants) past the (committed) transactions it removes, since their `Commit` records are now gone but their flushed tuples survive — and, per conservative truncation, it never advances past the oldest non-committed transaction it pinned.
+
+## Durable CLOG snapshot
+
+`clog.dat` is a sibling of `wal.dat` (`<data-dir>/clog.dat`) that persists the transaction-status map across restart (`docs/specs/mvcc.md` §5.4). It uses the same versioned + CRC-checked envelope as the control record (`crates/control/src/manifest.rs`): magic `SGCL` + `u32` version + `u32` payload length + `u32` CRC32 over a JSON payload. The payload is the **live window** — the explicit `Committed`/`Aborted` ids at or above the implicit-committed floor — plus `clog_lsn` (the WAL LSN through which the statuses are absorbed), the `committed_floor`, and the `vacuum_floor`. Everything below the floor is implicit-committed (genuinely committed, or a VACUUM-reclaimed abort) and omitted, so the file is `O(live window)`.
+
+- `persist_clog(clog_lsn)` computes the snapshot, writes it atomically (temp file + fsync + rename + parent-directory fsync), then prunes the in-memory CLOG to the same window. The write is **write-then-mutate**: a failed durable write leaves the in-memory floor unchanged, so the next open still reconciles against the previous snapshot. `clog_lsn` is clamped to `flushed_lsn` (the CLOG only records *flushed* commits, so the snapshot must never claim to cover beyond what is durable). A failed `clog.dat` write does **not** poison the WAL — the snapshot is auxiliary, and the durable WAL records remain the source of truth.
+- **At `open`**, when `clog.dat` is present the CLOG is seeded from it (statuses + both floors) and only the `Commit`/`Abort` records with `lsn > clog_lsn` are folded on top — bounding the status-rebuild scan to post-snapshot records. When it is **absent** (fresh database, or a pre-durable-CLOG data directory) the CLOG is fully rebuilt from the retained WAL (the historical behavior) — backward compatible, no migration. A **corrupt** `clog.dat` (CRC/version/structure mismatch) is surfaced as an error like a bad `manifest.dat`; the atomic temp+rename means a torn write never occurs, so a mismatch is real corruption.
+- Because the snapshot persists the `committed_floor` and `vacuum_floor`, both survive a clean restart (the no-snapshot fallback seeds them conservatively).
 
 ## Replay
 
@@ -140,7 +153,7 @@ Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
 - Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`Abort`/`Checkpoint` markers are skipped. DDL records replay only for committed transactions (server-gated by the CLOG).
-- Rebuilds the CLOG from durable `Commit`/`Abort` records (done at `open`). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
+- Reconstructs the CLOG at `open`: seeded from the durable CLOG snapshot (`clog.dat`) plus a fold of the post-`clog_lsn` `Commit`/`Abort` records, or fully rebuilt from those records when no snapshot exists (see "Durable CLOG snapshot"). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
 
 The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`. On `open`, an incomplete trailing record is not merely ignored in memory — the WAL file is physically truncated to the last complete record's end and fsynced, so the torn tail is removed on disk. After such a truncation (and after `truncate_before`), `next_lsn` is derived from the maximum LSN among the retained records, so newly appended records continue monotonically past the highest retained LSN.
 
@@ -157,25 +170,28 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
   `TxnStatusView` (so the storage engine can probe status per tuple in B3.6 via
   the WAL handle, which trait-upcasts to `&dyn TxnStatusView`). The CLOG (`Clog`,
   an in-memory `txn_id → TxnStatus` map; supersedes the old single-bit
-  `committed_txns` set) is populated at open by scanning records with
-  `lsn <= flushed_lsn` (`Commit` → `Committed`, `Abort` → `Aborted`) and updated on
-  `flush` (pending commits → `Committed`) and `append` (`Abort` → `Aborted`). A
-  commit that has been appended but not yet flushed is tracked separately as
-  pending and `is_committed` returns false for it until the flush makes it durable.
-  `status` takes the WAL state lock briefly per call; the visibility predicate may
-  probe it per tuple during scans (B3.6), and lock contention under heavy
-  concurrent scanning is a Milestone E concern. Reserved ids below
-  `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as `Committed`; an unrecorded
-  normal id reads as `InProgress`. The CLOG is in-memory for the MVCC A–D MVP and
-  rebuilt from the WAL at recovery; a durable CLOG file is deferred to Milestone F
-  (see `docs/specs/mvcc.md` §5.4).
+  `committed_txns` set) is populated at open from the durable CLOG snapshot when one
+  exists (seed + fold post-`clog_lsn` records) or, with no snapshot, by scanning
+  records with `lsn <= flushed_lsn` (`Commit` → `Committed`, `Abort` → `Aborted`); it
+  is updated at runtime on `flush` (pending commits → `Committed`) and `append`
+  (`Abort` → `Aborted`). A commit that has been appended but not yet flushed is
+  tracked separately as pending and `is_committed` returns false for it until the
+  flush makes it durable. `status` takes the WAL state lock briefly per call; the
+  visibility predicate may probe it per tuple during scans (B3.6), and lock
+  contention under heavy concurrent scanning is a Milestone E concern. Reserved ids
+  below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as `Committed`; an unrecorded
+  normal id reads as `InProgress`. The in-memory CLOG is reconstructed at recovery;
+  the durable CLOG snapshot (`clog.dat`, Milestone F) seeds and bounds that
+  reconstruction (see "Durable CLOG snapshot" and `docs/specs/mvcc.md` §5.4).
 - **Implicit-committed floor (conservative, Milestone D).** The CLOG carries a
   monotonic `committed_floor`: an unrecorded normal id strictly below it reads as
   `Committed` instead of `InProgress`. This covers transactions whose `Commit`
   records were truncated by a checkpoint while their flushed tuples survive in the
   heap (`docs/specs/mvcc.md` §5.4). An explicitly recorded status
   (`Committed`/`Aborted`) always takes precedence over the floor, so a recorded
-  abort below the floor is never falsely shown.
+  abort below the floor is never falsely shown. The floor is persisted in the durable
+  CLOG snapshot (`clog.dat`) and reloaded at open; when no snapshot is present it is
+  re-established conservatively from the retained WAL as below.
 
   Because the relaxed flush gate (Milestone D1) now lets an aborted/in-flight
   transaction's pages reach the heap, the floor must never cross such a
@@ -194,20 +210,20 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
   invisible across a checkpoint and restart. Truncating past an aborted transaction
   (and letting the floor cover it) is safe only once VACUUM has reclaimed its
   versions — which Milestone F4c now tracks via the vacuum floor.
-- **Vacuum floor (`set_vacuum_floor`, Milestone F4c).** An in-memory `vacuum_floor`
-  (initialized to `FIRST_NORMAL_XID`, monotonic) records the boundary below which a
-  FULL VACUUM pass reclaimed every aborted-creator tuple. The server captures
-  `B = next_txn_id` at the start of a full pass under the exclusive guard and calls
-  `set_vacuum_floor(B)` after it. `truncate_before` then stops pinning — and floats
-  the implicit-committed floor past — an aborted transaction with id `< vacuum_floor`,
-  because its on-disk versions are reclaimed (so "implicit-committed below floor" is
-  vacuously correct). **Durability:** the floor is only consulted by `truncate_before`,
-  which a checkpoint runs after `flush_dirty_pages` + `store.sync_all`, so the
-  reclamation is fsynced before any `Abort` is dropped. **Reset-at-restart:** the
-  floor is NOT durable; it resets to `FIRST_NORMAL_XID` at `open`, so after a crash
-  truncation is conservative again until the first post-restart full VACUUM — safe,
-  never less correct. A durable CLOG file that would carry the floor across restart
-  remains deferred (`docs/specs/mvcc.md` §5.4).
+- **Vacuum floor (`set_vacuum_floor`, Milestone F4c).** A `vacuum_floor`
+  (monotonic) records the boundary below which a FULL VACUUM pass reclaimed every
+  aborted-creator tuple. The server captures `B = next_txn_id` at the start of a full
+  pass under the exclusive guard and calls `set_vacuum_floor(B)` after it.
+  `truncate_before` then stops pinning — and floats the implicit-committed floor
+  past — an aborted transaction with id `< vacuum_floor`, because its on-disk versions
+  are reclaimed (so "implicit-committed below floor" is vacuously correct).
+  **Durability:** the floor is only consulted by `truncate_before`, which a checkpoint
+  runs after `flush_dirty_pages` + `store.sync_all`, so the reclamation is fsynced
+  before any `Abort` is dropped. **Persisted across restart:** the floor is written to
+  the durable CLOG snapshot (`clog.dat`) by `persist_clog` and reloaded at `open`, so
+  it survives a clean restart; when no snapshot is present it falls back to
+  `FIRST_NORMAL_XID`, so truncation is conservative again until the first post-restart
+  full VACUUM — safe, never less correct (`docs/specs/mvcc.md` §5.4).
 - WAL does not know B-tree/page format.
 
 ## Acceptance Tests
@@ -216,7 +232,8 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
 - Flush advances durable LSN.
 - Recovery rebuilds the CLOG from `Commit`/`Abort` records and `replay_from` yields every record (redo-all); visibility is decided by the CLOG, not a replay filter.
 - Conservative truncation pins an aborted transaction: a checkpoint that asks to truncate past it retains its `Abort` record, and the recovery floor never marks it committed.
-- Vacuum floor (F4c): after `set_vacuum_floor(B)`, truncation drops a reclaimed aborted transaction `< B` (its `Abort` is removed, the WAL shrinks further than the pinned case, and the implicit-committed floor floats past it) — while an aborted transaction `>= B`, or one with no vacuum floor advanced, still pins; the floor resets at reopen (conservative again).
+- Vacuum floor (F4c): after `set_vacuum_floor(B)`, truncation drops a reclaimed aborted transaction `< B` (its `Abort` is removed, the WAL shrinks further than the pinned case, and the implicit-committed floor floats past it) — while an aborted transaction `>= B`, or one with no vacuum floor advanced, still pins; with no durable CLOG snapshot the floor falls back to its conservative value at reopen.
+- Durable CLOG snapshot: `persist_clog` writes `clog.dat`; reopen seeds the CLOG and both floors from it and folds only the post-`clog_lsn` `Commit`/`Abort` records; an absent snapshot rebuilds from the WAL; a corrupt snapshot (CRC/version/structure) fails open. The snapshot envelope round-trips and rejects tamper/version/length/unsorted/overlapping payloads.
 - Truncated WAL still replays from manifest checkpoint LSN.
 - CRC detects corrupted record.
 - Incomplete trailing record after crash is ignored.

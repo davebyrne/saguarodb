@@ -1035,6 +1035,10 @@ mod tests {
         fn set_vacuum_floor(&self, _boundary: TxnId) -> Result<()> {
             Ok(())
         }
+
+        fn persist_clog(&self, _clog_lsn: Lsn) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl TxnStatusView for CountingWal {

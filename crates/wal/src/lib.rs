@@ -1,9 +1,11 @@
 mod clog;
+mod clog_file;
 mod codec;
 mod file;
 mod record;
 
 pub use clog::Clog;
+pub use clog_file::ClogSnapshot;
 pub use codec::{decode_record, encode_record};
 pub use file::FileWalManager;
 pub use record::{WalRecord, WalRecordKind, is_redo_operation};
@@ -27,6 +29,16 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     fn flushed_lsn(&self) -> Lsn;
     fn bytes_after(&self, lsn: Lsn) -> Result<u64>;
 
+    /// Persist a durable CLOG snapshot (`clog.dat`) covering WAL records through
+    /// `clog_lsn` (`docs/specs/mvcc.md` §5.4). The checkpoint calls this after the
+    /// heap and control record are durable and **before** truncating the WAL, so
+    /// the snapshot remembers every transaction's outcome that truncation is about
+    /// to drop. It prunes the in-memory CLOG to its live window, then writes the
+    /// envelope atomically (temp file + rename + directory fsync). Recovery loads
+    /// it at the next open and replays only the post-`clog_lsn` `Commit`/`Abort`
+    /// records on top.
+    fn persist_clog(&self, clog_lsn: Lsn) -> Result<()>;
+
     /// Advance the **vacuum floor** (`docs/specs/mvcc.md` §5.4, §9, Milestone F4c):
     /// the boundary `B` below which a FULL VACUUM pass (every user table, under the
     /// exclusive guard) has reclaimed every aborted-creator tuple. The caller
@@ -41,14 +53,15 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// vacuously correct for it). An in-flight transaction, or an aborted one
     /// `>= vacuum_floor`, still pins.
     ///
-    /// **In-memory, reset-at-restart.** The vacuum floor is NOT durable; it resets to
-    /// its initial conservative value when the WAL is reopened. That is SAFE: after a
-    /// crash the WAL is un-truncated again (the reclaimed-aborts' `Abort` records were
-    /// only droppable *because* a checkpoint truncated past them, and recovery rebuilds
-    /// the CLOG from whatever WAL survives), so until the first post-restart full
-    /// VACUUM truncation is conservative once more — never less safe, only less
-    /// aggressive. A durable CLOG file (which would make this boundary survive restart)
-    /// remains deferred (§5.4).
+    /// **Durable across restart when a CLOG snapshot exists.** The vacuum floor is
+    /// persisted in the durable CLOG snapshot (`clog.dat`, written by
+    /// [`WalManager::persist_clog`]) and reloaded at open, so a full VACUUM's
+    /// reclamation horizon survives restart. When NO snapshot is present (a fresh
+    /// database, or a data directory from a pre-durable-CLOG build) the floor falls
+    /// back to its conservative initial value. That fallback is SAFE: without a
+    /// snapshot the WAL is un-truncated, so truncation is conservative once more (every
+    /// aborted txn pins) until the first post-restart full VACUUM — never less safe,
+    /// only less aggressive — and recovery rebuilds the CLOG from the surviving WAL.
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()>;
 
     /// Establish the CLOG implicit-committed floor at recovery, given the
@@ -680,19 +693,22 @@ mod tests {
     }
 
     #[test]
-    fn vacuum_floor_resets_on_reopen() {
-        // Reset-at-restart safety (`docs/specs/mvcc.md` §5.4, F4c): the vacuum floor is
-        // in-memory and resets at reopen, so truncation is conservative again until the
-        // first post-restart full VACUUM. Here the floor is advanced, then the WAL is
-        // reopened (NOT truncated first), and an aborted txn that WOULD have been
-        // relaxed now pins again — provably correct (conservative).
+    fn vacuum_floor_resets_on_reopen_without_a_clog_snapshot() {
+        // No-snapshot fallback safety (`docs/specs/mvcc.md` §5.4, F4c): with NO durable
+        // CLOG snapshot (`persist_clog` is never called here, so no `clog.dat` exists)
+        // the vacuum floor falls back to its conservative initial value at reopen, and
+        // truncation is conservative again until the first post-restart full VACUUM.
+        // Here the floor is advanced, then the WAL is reopened (NOT truncated first),
+        // and an aborted txn that WOULD have been relaxed now pins again — provably
+        // correct. (When a snapshot IS present the floor is instead loaded from it; see
+        // `file::tests::reopen_loads_vacuum_floor_from_snapshot`.)
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.dat");
         let (wal, pin_lsn, truncate_at) = aborted_across_checkpoint_layout(&path);
         wal.set_vacuum_floor(13).unwrap();
         drop(wal);
 
-        // Reopen: the floor resets to its conservative initial value (not persisted).
+        // Reopen: with no snapshot the floor falls back to its conservative initial value.
         let reopened = FileWalManager::open(&path).unwrap();
         reopened.truncate_before(truncate_at).unwrap();
         let retained: Vec<_> = reopened

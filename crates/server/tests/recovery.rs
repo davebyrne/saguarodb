@@ -443,6 +443,57 @@ async fn aborted_update_leaves_old_value_after_restart() {
 }
 
 #[tokio::test]
+async fn durable_clog_snapshot_carries_outcomes_across_checkpoint_and_restart() {
+    // End-to-end durable CLOG (`docs/specs/mvcc.md` §5.4): a checkpoint writes
+    // `clog.dat`, and recovery seeds the CLOG from it instead of rebuilding from the
+    // full WAL. An aborted UPDATE (unique violation) leaves an orphan version in the
+    // heap; after a checkpoint and restart the snapshot records the abort, so the
+    // orphan stays invisible and the committed rows survive.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        for sql in [
+            "create table users (id integer primary key, name text)",
+            "create unique index uq_name on users (name)",
+            "insert into users (id, name) values (1, 'Ada')",
+            "insert into users (id, name) values (2, 'Bea')",
+        ] {
+            server.simple_query(sql).await.unwrap();
+        }
+        // Aborts the autocommit transaction (collides with row 2's name).
+        let err = server
+            .simple_query("update users set name = 'Bea' where id = 1")
+            .await
+            .err()
+            .expect("unique violation aborts the update");
+        assert!(err.message.to_lowercase().contains("unique"));
+
+        // The checkpoint persists the durable CLOG snapshot covering these outcomes.
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // The snapshot file exists, so the next open recovers via it (not a WAL rebuild).
+    assert!(
+        dir.path().join("clog.dat").exists(),
+        "the checkpoint must persist a durable CLOG snapshot"
+    );
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("2".to_string()), Some("Bea".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn uncommitted_wal_record_is_invisible_after_restart() {
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2) REPLAYS an uncommitted
     // transaction's flushed heap records (reconstructing the page), rather than

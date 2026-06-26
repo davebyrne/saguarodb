@@ -1709,7 +1709,8 @@ pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> R
     let boundary = components.next_txn_id.load(Ordering::Acquire);
     vacuum_all_user_tables(components, horizon)?;
     // Advance the floor only AFTER the pass has reclaimed every aborted-creator tuple
-    // below B. Monotonic; in-memory; reset-at-restart (see `WalManager::set_vacuum_floor`).
+    // below B. Monotonic; persisted in `clog.dat` and reloaded at open (falls back to the
+    // conservative value when no snapshot is present) — see `WalManager::set_vacuum_floor`.
     components.wal.set_vacuum_floor(boundary)
 }
 
