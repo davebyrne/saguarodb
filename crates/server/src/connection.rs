@@ -931,6 +931,8 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::DatatypeMismatch => "42804",
         SqlState::DivisionByZero => "22012",
         SqlState::NumericValueOutOfRange => "22003",
+        SqlState::InvalidTextRepresentation => "22P02",
+        SqlState::BadCopyFileFormat => "22P04",
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
         SqlState::QueryCanceled => "57014",

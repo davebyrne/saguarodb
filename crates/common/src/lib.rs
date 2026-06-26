@@ -25,4 +25,4 @@ pub use mvcc::{
 };
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};
-pub use value::Value;
+pub use value::{Value, parse_bool_text};

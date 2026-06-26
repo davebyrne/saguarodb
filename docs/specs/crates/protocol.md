@@ -226,7 +226,12 @@ unsupported format codes.
 - Performing the TLS handshake itself. The protocol layer only encodes the
   `SslAccepted`/`SslRejected` negotiation byte; `server` owns the handshake.
 - GSSAPI transport encryption (the GSSENCRequest is declined with `N`).
-- COPY.
+- COPY through the *extended* query protocol (rejected; COPY is simple-query
+  only). The COPY sub-protocol itself **is** supported: the codec encodes/decodes
+  the `CopyInResponse`/`CopyOutResponse`/`CopyData`/`CopyDone`/`CopyFail` messages.
+  Their wire encodings are specified in `docs/specs/copy.md` §4 (the authoritative
+  source); the message variants and their acceptance tests are added to this
+  crate alongside that code.
 
 ## Acceptance Tests
 

@@ -32,6 +32,12 @@ pub enum SqlState {
     DatatypeMismatch,
     DivisionByZero,
     NumericValueOutOfRange,
+    /// `22P02`: a text field could not be parsed into its target type (e.g. a
+    /// non-numeric value for an `INTEGER` column in `COPY ... FROM`).
+    InvalidTextRepresentation,
+    /// `22P04`: a `COPY ... FROM` input row is structurally malformed — the
+    /// wrong number of columns, or an unterminated CSV quote.
+    BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
     QueryCanceled,

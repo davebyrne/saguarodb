@@ -11,6 +11,10 @@
 
 - Stable identifiers: `TableId`, `ColumnId`, `IndexId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
+- The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
+  (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
+  parameter path and the `COPY` import path so both share one accept-set; each
+  caller maps `None` to its own SQLSTATE.
 - Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`, `ColumnInfo`, `TableSchema`, `IndexSchema`.
 - Query access helpers: `KeyRange`.
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
@@ -166,6 +170,8 @@ pub enum SqlState {
     DatatypeMismatch,
     DivisionByZero,
     NumericValueOutOfRange,
+    InvalidTextRepresentation,
+    BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
     QueryCanceled,
@@ -196,6 +202,12 @@ another in-progress inserter that may yet abort, so uniqueness is undecidable
 (classifier `common::mvcc::classify_unique_conflict` → `UniqueConflict::InFlight`).
 A committed-live duplicate is instead a definite `UniqueViolation` (`23505`). See
 `docs/specs/mvcc.md` §7.3, Milestone E.
+
+`SqlState::InvalidTextRepresentation` maps to SQLSTATE `22P02`: a text field could
+not be parsed into its target type. `SqlState::BadCopyFileFormat` maps to SQLSTATE
+`22P04`: a `COPY ... FROM` input row is structurally malformed (wrong column count
+or an unterminated CSV quote). Both are raised on the `COPY` import path; see
+`docs/specs/copy.md` §7.
 
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 

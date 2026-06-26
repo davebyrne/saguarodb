@@ -8,6 +8,19 @@ pub enum Value {
     Text(String),
 }
 
+/// Parse PostgreSQL boolean input text, returning `None` for unrecognized input
+/// so each caller can map the failure to its own SQLSTATE (the protocol
+/// extended-query path uses a protocol error; the `COPY` import path uses
+/// `SqlState::InvalidTextRepresentation`). Surrounding whitespace is ignored and
+/// matching is case-insensitive, matching PostgreSQL's `boolin`.
+pub fn parse_bool_text(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
+        "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Value;
