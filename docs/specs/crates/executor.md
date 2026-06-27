@@ -132,8 +132,8 @@ Aggregate execution groups input rows by the `GROUP BY` expressions into ordered
 
 - Materialize the source plan fully before inserting any row, so that `INSERT ... SELECT` reading the target table observes only pre-insert rows.
 - For each source row, build row values in table column order.
-- Validate runtime values match destination column types. `NULL` is accepted at this step and checked by nullability validation.
-- Validate non-null constraints.
+- Validate runtime values match destination column types. `NULL` is accepted at this step and checked by row-constraint validation.
+- Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.
 
@@ -143,6 +143,7 @@ Aggregate execution groups input rows by the `GROUP BY` expressions into ordered
 - For each source `ExecRow`, read identity key.
 - Evaluate assignments against the source row.
 - Build a full replacement row. The primary-key column cannot change; storage rejects an update whose replacement key differs with `SqlState::DatatypeMismatch` ("primary key updates are not supported").
+- Validate per-column row constraints on the replacement row (`validate_row_constraints`): non-null and bounded character-type length, same as INSERT.
 - Call `StorageEngine::update`.
 - Return count.
 

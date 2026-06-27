@@ -53,6 +53,7 @@ mod tests {
             name: "id".to_string(),
             data_type: DataType::Integer,
             nullable,
+            max_length: None,
         }
     }
 
@@ -68,6 +69,7 @@ mod tests {
                         name: "name".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
+                        max_length: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -87,11 +89,13 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Integer,
                         nullable: true,
+                        max_length: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
+                        max_length: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -139,6 +143,7 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
+                        max_length: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -176,6 +181,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
+                max_length: None,
             }],
             primary_key: vec![0],
         };
@@ -204,12 +210,14 @@ mod tests {
                     name: "id".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
+                    max_length: None,
                 },
                 ColumnDef {
                     id: 1,
                     name: "tenant".to_string(),
                     data_type: DataType::Integer,
                     nullable: false,
+                    max_length: None,
                 },
             ],
             primary_key: vec![0, 1],
@@ -237,6 +245,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: true,
+                max_length: None,
             }],
             primary_key: vec![0],
         };
@@ -263,6 +272,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
+                max_length: None,
             }],
             primary_key: vec![1],
         };
@@ -320,6 +330,7 @@ mod tests {
                         name: "tenant".to_string(),
                         data_type: DataType::Integer,
                         nullable: false,
+                        max_length: None,
                     },
                 ],
                 vec!["id".to_string(), "tenant".to_string()],
@@ -413,6 +424,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
+                max_length: None,
             }],
             primary_key: vec![0],
         };
@@ -733,6 +745,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
+                max_length: None,
             }],
             primary_key: vec![0],
         };
@@ -768,6 +781,7 @@ mod tests {
                 name: "id".to_string(),
                 data_type: DataType::Integer,
                 nullable: false,
+                max_length: None,
             }],
             primary_key: vec![0],
         };

@@ -278,7 +278,7 @@ pub(crate) fn map_and_insert_row(
         validate_value_type(&schema.columns[slot], &value)?;
         full[slot] = value;
     }
-    validate_not_null(schema, &full)?;
+    validate_row_constraints(schema, &full)?;
     ctx.storage
         .insert(&ctx.statement, table, Row { values: full })?;
     Ok(())
@@ -429,7 +429,7 @@ fn execute_update(
                 let slot = column_slot(&schema, *column)?;
                 values[slot] = eval_expr(expr, &source_row)?;
             }
-            validate_not_null(&schema, &values)?;
+            validate_row_constraints(&schema, &values)?;
             if ctx
                 .storage
                 .update(&ctx.statement, table, &identity.key, Row { values })?
@@ -568,13 +568,28 @@ fn column_slot(schema: &TableSchema, column: ColumnId) -> Result<usize> {
         })
 }
 
-fn validate_not_null(schema: &TableSchema, values: &[Value]) -> Result<()> {
+/// Enforce per-column runtime constraints on a full row before it is written:
+/// NOT NULL, and the bounded character-type length (`VARCHAR(n)` / `CHAR(n)`).
+/// Shared by INSERT, `COPY ... FROM`, and UPDATE.
+fn validate_row_constraints(schema: &TableSchema, values: &[Value]) -> Result<()> {
     for (column, value) in schema.columns.iter().zip(values) {
-        if !column.nullable && matches!(value, Value::Null) {
-            return Err(DbError::execute(
-                SqlState::NotNullViolation,
-                format!("column {} cannot be NULL", column.name),
-            ));
+        match (value, column.max_length) {
+            (Value::Null, _) if !column.nullable => {
+                return Err(DbError::execute(
+                    SqlState::NotNullViolation,
+                    format!("column {} cannot be NULL", column.name),
+                ));
+            }
+            (Value::Text(text), Some(max)) if text.chars().count() > max as usize => {
+                return Err(DbError::execute(
+                    SqlState::StringDataRightTruncation,
+                    format!(
+                        "value too long for column {} (maximum {max} characters)",
+                        column.name
+                    ),
+                ));
+            }
+            _ => {}
         }
     }
     Ok(())

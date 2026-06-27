@@ -3,7 +3,7 @@ use sqlparser::ast as sql;
 
 use crate::Statement;
 
-use super::{convert_data_type, ident_name, object_name, unsupported};
+use super::{column_char_length, convert_data_type, ident_name, object_name, unsupported};
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
     let sql::CreateIndex {
@@ -252,6 +252,7 @@ fn convert_column_def(
         name: ident_name(&column.name)?,
         data_type: convert_data_type(&column.data_type)?,
         nullable,
+        max_length: column_char_length(&column.data_type)?,
     })
 }
 

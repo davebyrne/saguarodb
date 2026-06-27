@@ -106,6 +106,35 @@ async fn copy_from_bad_value_aborts_whole_copy() {
 }
 
 #[tokio::test]
+async fn copy_from_enforces_varchar_length() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, name varchar(3))")
+        .await;
+
+    // An in-limit value imports fine.
+    let ok = conn
+        .copy_from("copy t from stdin", &[b"1\tabc\n"])
+        .await
+        .unwrap();
+    assert_eq!(ok.command_tag.as_deref(), Some("COPY 1"));
+
+    // An over-limit value aborts the COPY with 22001 and persists nothing from it.
+    let bad = conn
+        .copy_from("copy t from stdin", &[b"2\tabcd\n"])
+        .await
+        .unwrap();
+    assert_eq!(
+        bad.error_code.as_deref(),
+        Some("22001"),
+        "over-length VARCHAR in COPY is string_data_right_truncation"
+    );
+
+    let rows = conn.ok("select id from t order by id").await.rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
 async fn copy_from_wrong_column_count_is_bad_format() {
     let (_server, mut conn) = server_with_table().await;
     let copy = conn

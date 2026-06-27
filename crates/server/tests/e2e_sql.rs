@@ -441,6 +441,66 @@ async fn e2e_integer_width_aliases_behave_as_64bit_integers() {
 }
 
 #[tokio::test]
+async fn e2e_varchar_char_length_is_enforced() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, name varchar(5), code char(3))")
+        .await
+        .unwrap();
+
+    // Values within the declared length are accepted and stored verbatim (no padding).
+    server
+        .simple_query("insert into t (id, name, code) values (1, 'hello', 'abc')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select name, code from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("hello".to_string()), Some("abc".to_string())]]
+    );
+
+    // VARCHAR over the limit -> 22001 (string_data_right_truncation).
+    let err = server
+        .simple_query("insert into t (id, name) values (2, 'toolong')")
+        .await
+        .err()
+        .expect("over-length VARCHAR should be rejected");
+    assert!(err.message.contains("22001"), "got: {}", err.message);
+
+    // CHAR over the limit -> 22001.
+    let err = server
+        .simple_query("insert into t (id, code) values (3, 'abcd')")
+        .await
+        .err()
+        .expect("over-length CHAR should be rejected");
+    assert!(err.message.contains("22001"), "got: {}", err.message);
+
+    // UPDATE that exceeds the limit is rejected too.
+    let err = server
+        .simple_query("update t set name = 'waytoolong' where id = 1")
+        .await
+        .err()
+        .expect("over-length UPDATE should be rejected");
+    assert!(err.message.contains("22001"), "got: {}", err.message);
+
+    // Length is counted in characters, not bytes: 'héllo' is 5 chars (6 bytes).
+    server
+        .simple_query("insert into t (id, name) values (4, 'héllo')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select name from t where id = 4")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("héllo".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

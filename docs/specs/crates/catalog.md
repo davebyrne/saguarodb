@@ -94,6 +94,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 - Exactly one primary-key column is required; an empty or composite primary key returns `SqlState::DatatypeMismatch`.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
+- A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 
 ## Create Index Rules

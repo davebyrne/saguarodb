@@ -103,6 +103,7 @@ pub struct ParsedColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
 }
 
 pub struct ColumnDef {
@@ -110,6 +111,7 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
 }
 
 pub struct ColumnInfo {
@@ -171,6 +173,7 @@ pub enum SqlState {
     DatatypeMismatch,
     DivisionByZero,
     NumericValueOutOfRange,
+    StringDataRightTruncation,
     InvalidTextRepresentation,
     BadCopyFileFormat,
     NotNullViolation,

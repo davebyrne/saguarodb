@@ -37,6 +37,9 @@ pub enum SqlState {
     DatatypeMismatch,
     DivisionByZero,
     NumericValueOutOfRange,
+    /// `22001`: a value is too long for a bounded character type, e.g. a string
+    /// longer than `n` assigned to a `VARCHAR(n)` / `CHAR(n)` column.
+    StringDataRightTruncation,
     /// `22P02`: a text field could not be parsed into its target type (e.g. a
     /// non-numeric value for an `INTEGER` column in `COPY ... FROM`).
     InvalidTextRepresentation,

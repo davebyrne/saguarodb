@@ -283,12 +283,45 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         | sql::DataType::Int4(None)
         | sql::DataType::Int8(None)
         | sql::DataType::BigInt(None) => Ok(DataType::Integer),
+        // Character types all map to the single unbounded TEXT value; any
+        // declared length is a column-level constraint, captured separately by
+        // `column_char_length` (CAST targets ignore the length).
         sql::DataType::Text
-        | sql::DataType::Varchar(None)
-        | sql::DataType::Char(None)
-        | sql::DataType::Character(None) => Ok(DataType::Text),
+        | sql::DataType::Varchar(_)
+        | sql::DataType::Char(_)
+        | sql::DataType::Character(_) => Ok(DataType::Text),
         sql::DataType::Boolean | sql::DataType::Bool => Ok(DataType::Boolean),
         _ => unsupported("unsupported data type"),
+    }
+}
+
+/// Extract the declared maximum length (in characters) of a bounded character
+/// type (`VARCHAR(n)` / `CHAR(n)` / `CHARACTER(n)`). Returns `None` for
+/// unbounded character types and all non-character types. `VARCHAR(MAX)`,
+/// octet-unit lengths, and a zero length are rejected.
+fn column_char_length(data_type: &sql::DataType) -> Result<Option<u32>> {
+    let length = match data_type {
+        sql::DataType::Varchar(length)
+        | sql::DataType::Char(length)
+        | sql::DataType::Character(length) => length,
+        _ => return Ok(None),
+    };
+    match length {
+        None => Ok(None),
+        Some(sql::CharacterLength::Max) => unsupported("VARCHAR(MAX) is not supported"),
+        Some(sql::CharacterLength::IntegerLength { length, unit }) => {
+            if matches!(unit, Some(sql::CharLengthUnits::Octets)) {
+                return unsupported("character length in octets is not supported");
+            }
+            if *length == 0 {
+                return Err(parse_error(
+                    "length for a character type must be at least 1",
+                ));
+            }
+            let length = u32::try_from(*length)
+                .map_err(|_| parse_error("character type length is too large"))?;
+            Ok(Some(length))
+        }
     }
 }
 

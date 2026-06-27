@@ -595,6 +595,32 @@ mod tests {
     }
 
     #[test]
+    fn varchar_char_lengths_are_parsed() {
+        let Statement::CreateTable { columns, .. } =
+            parse("create table t (a varchar(10), b char(5), c character(3), d varchar, e text)")
+                .unwrap()
+        else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(columns.len(), 5);
+        for column in &columns {
+            assert_eq!(column.data_type, DataType::Text);
+        }
+        // Bounded character types carry their length; unbounded VARCHAR and TEXT do not.
+        assert_eq!(columns[0].max_length, Some(10));
+        assert_eq!(columns[1].max_length, Some(5));
+        assert_eq!(columns[2].max_length, Some(3));
+        assert_eq!(columns[3].max_length, None);
+        assert_eq!(columns[4].max_length, None);
+    }
+
+    #[test]
+    fn rejects_zero_length_character_type() {
+        assert!(parse("create table t (a varchar(0))").is_err());
+    }
+
+    #[test]
     fn parses_representative_expressions() {
         let stmt = parse(
             "select -id + 2 * 3, not active, name || 'x', id is not null, \

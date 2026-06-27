@@ -13,7 +13,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - PostgreSQL simple query wire protocol (abstracted for future custom protocol)
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
-- Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced), `TEXT`, `BOOLEAN`, `NULL`
+- Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time; not blank-padded), `BOOLEAN`, `NULL`
 - SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
@@ -232,6 +232,7 @@ pub enum SqlState {
     DatatypeMismatch,           // 42804
     DivisionByZero,             // 22012
     NumericValueOutOfRange,     // 22003
+    StringDataRightTruncation,  // 22001
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
     QueryCanceled,              // 57014

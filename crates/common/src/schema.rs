@@ -14,6 +14,11 @@ pub struct ParsedColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Maximum length in characters for a bounded character type
+    /// (`VARCHAR(n)` / `CHAR(n)`). `None` for unbounded `TEXT` and all
+    /// non-character types.
+    #[serde(default)]
+    pub max_length: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +27,11 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Maximum length in characters for a bounded character type
+    /// (`VARCHAR(n)` / `CHAR(n)`); `None` means unbounded. Enforced at write
+    /// time by the executor, not represented as a distinct `DataType`.
+    #[serde(default)]
+    pub max_length: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -277,6 +277,7 @@ fn build_schema(
             name: column.name,
             data_type: column.data_type,
             nullable: column.nullable,
+            max_length: column.max_length,
         });
     }
 

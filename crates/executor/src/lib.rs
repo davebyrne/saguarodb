@@ -352,11 +352,13 @@ mod tests {
                         name: "id".to_string(),
                         data_type: DataType::Integer,
                         nullable: false,
+                        max_length: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
+                        max_length: None,
                     },
                 ],
                 vec!["id".to_string()],
