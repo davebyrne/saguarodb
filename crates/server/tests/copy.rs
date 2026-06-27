@@ -206,7 +206,11 @@ async fn copy_into_missing_table_errors() {
     assert!(outcome.result.is_err());
 }
 
-#[tokio::test]
+// Multi-thread runtime so the 5s safety `timeout` below can fire even if a
+// regression makes `run_graceful_shutdown` reach the blocking `run_checkpoint`
+// (which would monopolize a single-threaded runtime and defeat the timer),
+// matching `shutdown.rs`'s `graceful_shutdown_timeout_does_not_block_on_statement_guard`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_shutdown_times_out_on_open_copy_from() {
     use saguarodb_server::config::Config;
     use saguarodb_server::shutdown::run_graceful_shutdown;
