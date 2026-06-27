@@ -78,45 +78,68 @@ top-level allocation at `BEGIN`; lazy assignment is a future optimization).
 A write statement stamps the current writing xid as the tuple's `xmin`
 (`xmax` for deletes), unchanged from today — a subxid is just an xid.
 
+The transaction also keeps a **live-(sub)xid set** = `T` plus every subxid not
+rolled back (open *and* released). It is what visibility and the conflict
+classifiers treat as "self" (§4), and its members stay registered in the active
+set until the top settles.
+
 ### Operations on the stack and CLOG
 
-- **`SAVEPOINT s`**: allocate `subxid`, register it active, push `(s, subxid)`.
-- **`RELEASE SAVEPOINT s`**: pop the nearest level named `s` and every level above
-  it; mark each popped subxid **`Committed`** in the CLOG (its writes now belong
-  to the parent; their final fate follows the top-level commit), and deregister
-  them from the active set.
+- **`SAVEPOINT s`**: allocate `subxid`, register it active, add it to the live-set,
+  push `(s, subxid)`.
+- **`RELEASE SAVEPOINT s`**: a **pure in-memory stack merge** — pop the nearest
+  level named `s` (and any levels above it) into their parent. The popped subxids
+  are **not** marked in the CLOG and **not** deregistered: they stay in the active
+  set and in the live-set. This is load-bearing for atomicity — a released subxid
+  must *not* become visible to other transactions before the top commits. While
+  `T` is in progress its rows stay invisible to others (still in their snapshots'
+  `xip`) and visible to `T` (own-write); they settle `Committed` only at the
+  top-level `COMMIT`. (This is precisely why a flat CLOG suffices without
+  `pg_subtrans`: **a subxid reads `Committed` only after its top commits** — until
+  then it is either in `xip` or recorded `Aborted`.)
 - **`ROLLBACK TO SAVEPOINT s`**: find the nearest level named `s`; mark its subxid
-  and every subxid above it **`Aborted`** in the CLOG, deregister them, pop the
-  levels above `s`, and replace `s`'s subxid with a **fresh** subxid (PG keeps `s`
-  active for continued work). Clears the failed state if set.
-- **Top-level `COMMIT`**: `T` and every still-live (released or open) subxid commit
-  durably together (§5). Rolled-back subxids stay aborted.
-- **Top-level `ROLLBACK`** (or disconnect/crash): `T` and all its subxids abort.
+  and every subxid above it **`Aborted`** in the CLOG, deregister them and remove
+  them from the live-set, pop the levels above `s`, and replace `s`'s subxid with a
+  **fresh** subxid (PG keeps `s` active for continued work). Clears the failed
+  state if set.
+- **Top-level `COMMIT`**: `T` and every live-set subxid (open or released — i.e.
+  all non-rolled-back) commit durably and atomically together (§5), and are
+  deregistered. Rolled-back subxids stay aborted.
+- **Top-level `ROLLBACK`** (or disconnect/crash): `T` and all its (sub)xids abort.
 
 ## 4. Visibility & own-writes
 
-Subxids reuse the existing predicate (`common::mvcc::is_visible` /
-`txn_effect_visible`) with one change: the **own-write check** generalizes from
-`xid == current_txn` to "`xid` is one of the reading transaction's *live*
-(sub)xids." The reading transaction's live-(sub)xid set (small — at most the
-savepoint depth plus `T`) travels on `StatementContext`/`Snapshot`.
+The reading transaction's **live-(sub)xid set** (§3 — `T` plus its non-rolled-back
+subxids; small) travels on `StatementContext`/`Snapshot`. The "self" check that is
+today `xid == current_txn` (a scalar) generalizes to "`xid` ∈ the live-set" in
+**three** places — `is_visible`/`txn_effect_visible` (own-write) **and** the two
+conflict classifiers `common::mvcc::write_conflict` and `classify_unique_conflict`
+(own row-lock; §9). All three otherwise unchanged.
 
-Consequences, all via the existing machinery — **no `pg_subtrans` mapping**:
+Consequences, all via the existing machinery — **no `pg_subtrans` mapping** (which
+holds precisely because a released subxid stays registered/in `xip` until the top
+commits, §3):
 
-- **My own live subxid** → own-write → visible.
-- **My own rolled-back subxid** → removed from the live set on `ROLLBACK TO`, so it
-  is *not* own-write; it falls to the CLOG → `Aborted` → invisible (even to me).
-- **Another transaction's in-progress subxid** → it is in the snapshot's `xip`
-  (the active registry tracks subxids; §6) → invisible.
-- **A settled subxid** (its top committed) → CLOG: released → `Committed` →
+- **My own live subxid** (open or released) → self → visible / not a conflict.
+- **My own rolled-back subxid** → removed from the live-set on `ROLLBACK TO`, so it
+  is *not* self; it falls to the CLOG → `Aborted` → invisible (even to me).
+- **Another transaction's in-progress *or released* subxid** → it is still in the
+  snapshot's `xip` (the active registry holds it until that top commits; §3, §6) →
+  invisible.
+- **A settled subxid** (its top has committed) → CLOG: released → `Committed` →
   visible; rolled-back → `Aborted` → invisible.
 
 `xmin`/`xmax`/infomask hint bits are unchanged. A `DELETE`/`UPDATE` under a subxid
-stamps `xmax = subxid`; if that subxid is later rolled back, the next writer that
-encounters the stale `xmax` lock must treat it as released — the **same** path the
-first-updater-wins conflict classifier already takes for an aborted deleter's
-`xmax` (it consults CLOG status; see `mvcc.md` §7.3). The implementation verifies
-this generalizes to subxids.
+stamps `xmax = subxid`. Two cases the conflict classifiers must handle:
+- **Rolled-back subxid's stale `xmax`** → the next writer treats it as released —
+  the **same** path the first-updater-wins classifier already takes for an aborted
+  deleter's `xmax` (it consults CLOG status; see `mvcc.md` §7.3). Confirmed to work
+  as-is.
+- **A still-live earlier (sub)xid of the *same* transaction** (e.g. the top deleted
+  a key, then a savepoint re-inserts it) → must be treated as **self** via the
+  live-set, not a foreign lock; otherwise the transaction spuriously conflicts with
+  itself (`40001`/`23505`). This is the live-set generalization of the classifiers
+  above.
 
 ## 5. CLOG, WAL & crash recovery (durability-critical)
 
@@ -143,10 +166,14 @@ in-memory-only scheme would lose released-subxid rows on a crash.
 
 - The active-transaction registry tracks **subxids alongside top-level xids**.
   `capture_snapshot` includes active subxids in `xip`, so other transactions see
-  an in-progress subxid as in-progress (invisible). `xmin`/`xmax` are computed
-  over the combined set as today.
-- `RELEASE`/`ROLLBACK TO` deregister the settled subxids, recomputing the GC
-  horizon (advertised-`xmin`) like any txn end. No `pg_subtrans`.
+  an in-progress (or released-but-not-top-committed) subxid as in-progress
+  (invisible). `xmin`/`xmax` are computed over the combined set as today.
+- A subxid stays registered from `SAVEPOINT` until it settles: **`ROLLBACK TO`
+  deregisters** the rolled-back subxids (marked `Aborted`); **`RELEASE` does
+  not** (it is an in-memory merge, §3 — the released subxid stays registered, and
+  in others' `xip`, until the top commits). The top-level `COMMIT`/`ROLLBACK`
+  deregisters all remaining subxids, recomputing the GC horizon
+  (advertised-`xmin`). No `pg_subtrans`.
 
 ## 7. VACUUM
 
@@ -167,16 +194,21 @@ ordinary xids.
 ## 9. Crate responsibilities
 
 - `common`: the two new SQLSTATEs; the live-(sub)xid set on the visibility inputs;
-  the small `is_visible` own-write generalization.
+  and generalizing the scalar `== current_txn` self-check to "∈ live-set" in **all
+  three** of `is_visible`/`txn_effect_visible` (own-write), `write_conflict`, and
+  `classify_unique_conflict` (own row-lock) — so a transaction never spuriously
+  conflicts with its own earlier subtransaction.
 - `parser`: `Statement::Savepoint`/`ReleaseSavepoint`/`RollbackToSavepoint`
   (sqlparser 0.56 already parses all three; today they are rejected).
 - `wal`: subxid-aware top-level `Commit` record (carrying the committed subxid
   set) + recovery rebuild + truncation-floor handling.
-- `server`: `Transaction` savepoint stack; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
-  handlers; failed-state recovery; active-registry subxid tracking;
-  `StatementClass::Savepoint` routing; command tags.
-- `storage`: confirm the `xmax` stale-lock conflict path generalizes to subxids
-  (expected: it already consults CLOG status).
+- `server`: `Transaction` savepoint stack + live-set; `SAVEPOINT`/`RELEASE`
+  (in-memory merge) / `ROLLBACK TO` handlers; failed-state recovery; active-registry
+  subxid tracking (released subxids stay registered until the top commits);
+  `StatementClass::Savepoint` routing; command tags; threading the live-set into
+  every statement's `StatementContext`.
+- `storage`: pass the live-set through to the conflict classifiers; the `xmax`
+  stale-lock (aborted-subxid) case already works via CLOG status.
 
 ## 10. Implementation milestones
 
