@@ -573,6 +573,28 @@ mod tests {
     }
 
     #[test]
+    fn integer_width_aliases_map_to_integer() {
+        // SMALLINT/INT2/INT4/INT8/BIGINT are all 64-bit integers in SaguaroDB
+        // (no distinct width); they parse to DataType::Integer like INTEGER/INT.
+        let Statement::CreateTable { columns, .. } = parse(
+            "create table widths (a smallint, b int2, c int4, d int8, e bigint, f integer, g int)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(columns.len(), 7);
+        for column in &columns {
+            assert_eq!(
+                column.data_type,
+                DataType::Integer,
+                "column {} should map to Integer",
+                column.name
+            );
+        }
+    }
+
+    #[test]
     fn parses_representative_expressions() {
         let stmt = parse(
             "select -id + 2 * 3, not active, name || 'x', id is not null, \

@@ -400,6 +400,47 @@ async fn e2e_scalar_functions_evaluate() {
 }
 
 #[tokio::test]
+async fn e2e_integer_width_aliases_behave_as_64bit_integers() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table nums (id bigint primary key, small smallint, big int8)")
+        .await
+        .unwrap();
+    // Values beyond the 32-bit range prove all widths are backed by i64.
+    server
+        .simple_query(
+            "insert into nums (id, small, big) values (9000000000, 5, 9223372036854775807)",
+        )
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id, small, big from nums")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("9000000000".to_string()),
+            Some("5".to_string()),
+            Some("9223372036854775807".to_string()),
+        ]]
+    );
+
+    // BIGINT / INT4 are accepted CAST target types (all integer-typed).
+    let rows = server
+        .simple_query("select cast('9000000000' as bigint), cast(small as int4) from nums")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("9000000000".to_string()), Some("5".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

@@ -274,7 +274,15 @@ fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel 
 
 fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
     match data_type {
-        sql::DataType::Integer(None) | sql::DataType::Int(None) => Ok(DataType::Integer),
+        // All integer widths are backed by a single 64-bit integer; SMALLINT/
+        // BIGINT and the `intN` aliases are accepted but not range-enforced.
+        sql::DataType::Integer(None)
+        | sql::DataType::Int(None)
+        | sql::DataType::Int2(None)
+        | sql::DataType::SmallInt(None)
+        | sql::DataType::Int4(None)
+        | sql::DataType::Int8(None)
+        | sql::DataType::BigInt(None) => Ok(DataType::Integer),
         sql::DataType::Text
         | sql::DataType::Varchar(None)
         | sql::DataType::Char(None)

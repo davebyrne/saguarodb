@@ -189,7 +189,7 @@ The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` gramm
 
 Parser may produce AST variants for syntax that binder rejects. The parser parses:
 
-- `CREATE TABLE` with column definitions and primary key. The parser parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys.
+- `CREATE TABLE` with column definitions and primary key. The parser parses both inline single-column `id INTEGER PRIMARY KEY` and table-level `PRIMARY KEY (id)` forms into `Statement::CreateTable.primary_key = vec!["id"]`; binder rejects composite primary keys. Column type spellings map to the three `DataType`s: `INTEGER`/`INT` and the width aliases `SMALLINT`/`BIGINT`/`INT2`/`INT4`/`INT8` all map to `Integer` (a single 64-bit integer — width is not enforced); `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER` (without a length) map to `Text`; `BOOLEAN`/`BOOL` map to `Boolean`. A length/precision qualifier (e.g. `VARCHAR(255)`, `INT(11)`) and every other type are rejected with `SqlState::SyntaxError` ("unsupported data type"). The same mapping applies to `CAST` target types.
 - `DROP TABLE`.
 - `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (SaguaroDB does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
 - `DROP INDEX name`.
