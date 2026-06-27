@@ -35,8 +35,9 @@ the same change (per `AGENTS.md`).
 - **Serializable isolation (SSI)** — only snapshot isolation (and Read Committed)
   initially.
 - **Time-travel / as-of queries.**
-- **Savepoints / sub-transactions** — deferred (they fit the model via
-  sub-transaction xids without undo; see §12).
+- **Savepoints / sub-transactions** — implemented via sub-transaction xids
+  without undo (`docs/specs/savepoints.md`); subxids share the xid space, CLOG,
+  and snapshot machinery, with no `pg_subtrans` mapping.
 
 ---
 
@@ -1371,7 +1372,8 @@ savepoints via sub-transaction xids (optional, deferred).
 - **Transactional DDL** — requires catalog MVCC + transactional file lifecycle;
   additive later, does not invalidate data MVCC.
 - **Serializable (SSI)** — layer predicate/SIREAD tracking on snapshot isolation.
-- **Savepoints / sub-transactions** — sub-transaction xids + CLOG; no undo needed.
+- ~~**Savepoints / sub-transactions**~~ — **implemented** via sub-transaction
+  xids + CLOG, no undo (`docs/specs/savepoints.md`).
 - **Time-travel / as-of** — would motivate adding commit timestamps (Decision 1
   leaves the door open; versions already carry `xmin`/`xmax`).
 

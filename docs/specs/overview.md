@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64), `TEXT`, `BOOLEAN`, `NULL`
-- SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms
+- SQL subset: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read, the latter setting the per-connection default for future transactions; SERIALIZABLE aliases Repeatable Read, no SSI; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -23,7 +23,6 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 ### Non-Goals
 
 - Serializable isolation / SSI (SERIALIZABLE is accepted as an alias for Repeatable Read)
-- Savepoints / sub-transactions
 - Transactional DDL (DDL takes the exclusive guard, commits immediately, and is rejected inside an explicit transaction block)
 - Time-travel / as-of queries
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
@@ -1806,7 +1805,7 @@ Loaded from command-line args only. There is no environment-variable or config-f
 ## 12. Future Work (Designed For, Not Implemented)
 
 - **Serializable Isolation (SSI):** Snapshot isolation and Read Committed are implemented; true serializable isolation with predicate-based conflict detection is not. `SERIALIZABLE` is accepted as an alias for Repeatable Read.
-- **Savepoints / Sub-transactions:** The model accommodates sub-transaction xids without undo, but `SAVEPOINT`/`ROLLBACK TO` are not implemented.
+- **Savepoints / Sub-transactions:** Implemented via sub-transaction xids without undo (`SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`, nested, crash-recoverable); see `docs/specs/savepoints.md`.
 - **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol (with blocking + deadlock detection and fuzzy checkpointing) is future work.

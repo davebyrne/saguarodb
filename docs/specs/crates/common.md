@@ -178,6 +178,8 @@ pub enum SqlState {
     QueryCanceled,
     FeatureNotSupported,
     InFailedSqlTransaction,
+    NoActiveSqlTransaction,
+    InvalidSavepointSpecification,
     SerializationFailure,
     IoError,
     InternalError,
@@ -192,6 +194,12 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction block.
 The server raises it while gating an aborted transaction block (see
 `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7.2).
+
+`SqlState::NoActiveSqlTransaction` maps to SQLSTATE `25P01`: a savepoint command
+(`SAVEPOINT`/`RELEASE`/`ROLLBACK TO`) issued with no open transaction block.
+`SqlState::InvalidSavepointSpecification` maps to `3B001`: `RELEASE`/`ROLLBACK TO`
+named a savepoint that does not exist. Both are raised on the savepoint path; see
+`docs/specs/savepoints.md` §2.
 
 `SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write conflict under
 MVCC's fail-fast, first-updater-wins policy. It arises in two cases (no blocking, no
