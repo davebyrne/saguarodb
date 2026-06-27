@@ -103,9 +103,21 @@ set until the top settles.
   **fresh** subxid (PG keeps `s` active for continued work). Clears the failed
   state if set.
 - **Top-level `COMMIT`**: `T` and every live-set subxid (open or released — i.e.
-  all non-rolled-back) commit durably and atomically together (§5), and are
-  deregistered. Rolled-back subxids stay aborted.
-- **Top-level `ROLLBACK`** (or disconnect/crash): `T` and all its (sub)xids abort.
+  all non-rolled-back) commit durably together (§5). The in-memory CLOG statuses
+  for the whole family are set `Committed` first, then `{T}` ∪ all live-set
+  subxids are removed from the active registry in a **single latched batch**
+  (`deregister_all`). This atomicity is load-bearing: the active set holds the
+  family as independent entries (a concurrent reader cannot map `S→T` — that is
+  the `pg_subtrans` job we avoid), so visibility of the commit flips per-xid as
+  each leaves the active set. A per-id deregister loop would let a concurrent
+  snapshot `capture` observe a torn commit (a released subxid visible while `T`
+  still appears in-progress, or vice versa). The batch makes a concurrent
+  `capture` see the family either all-present (all invisible) or all-absent (all
+  settled), mirroring the capture-vs-`register_allocated` guarantee (`mvcc.md`
+  §7.1). Rolled-back subxids stay aborted.
+- **Top-level `ROLLBACK`** (or disconnect/crash): `T` and all its remaining
+  (sub)xids abort — set `Aborted`, then the same single latched batch
+  `deregister_all`.
 
 ## 4. Visibility & own-writes
 
@@ -114,7 +126,10 @@ subxids; small) travels on `StatementContext`/`Snapshot`. The "self" check that 
 today `xid == current_txn` (a scalar) generalizes to "`xid` ∈ the live-set" in
 **three** places — `is_visible`/`txn_effect_visible` (own-write) **and** the two
 conflict classifiers `common::mvcc::write_conflict` and `classify_unique_conflict`
-(own row-lock; §9). All three otherwise unchanged.
+(own row-lock; §9). All three otherwise unchanged. The live-set check stays
+positionally **first** in `txn_effect_visible` (before the future `>= xmax` and
+`xip` checks), so an own subxid allocated *after* a Repeatable Read snapshot
+(`subxid >= snapshot.xmax`) is still seen by its owner.
 
 Consequences, all via the existing machinery — **no `pg_subtrans` mapping** (which
 holds precisely because a released subxid stays registered/in `xip` until the top
@@ -172,8 +187,10 @@ in-memory-only scheme would lose released-subxid rows on a crash.
   deregisters** the rolled-back subxids (marked `Aborted`); **`RELEASE` does
   not** (it is an in-memory merge, §3 — the released subxid stays registered, and
   in others' `xip`, until the top commits). The top-level `COMMIT`/`ROLLBACK`
-  deregisters all remaining subxids, recomputing the GC horizon
-  (advertised-`xmin`). No `pg_subtrans`.
+  deregisters `{T}` ∪ all remaining subxids in **one latched batch**
+  (`ActiveTxnRegistry::deregister_all`, after their CLOG statuses are set), so a
+  concurrent `capture` never sees a partially-settled family, then recomputes the
+  GC horizon (advertised-`xmin`). No `pg_subtrans`.
 
 ## 7. VACUUM
 
@@ -204,9 +221,10 @@ ordinary xids.
   set) + recovery rebuild + truncation-floor handling.
 - `server`: `Transaction` savepoint stack + live-set; `SAVEPOINT`/`RELEASE`
   (in-memory merge) / `ROLLBACK TO` handlers; failed-state recovery; active-registry
-  subxid tracking (released subxids stay registered until the top commits);
-  `StatementClass::Savepoint` routing; command tags; threading the live-set into
-  every statement's `StatementContext`.
+  subxid tracking (released subxids stay registered until the top commits) plus a
+  new `ActiveTxnRegistry::deregister_all(&[TxnId])` for the atomic family-deregister
+  at top-level COMMIT/ROLLBACK; `StatementClass::Savepoint` routing; command tags;
+  threading the live-set into every statement's `StatementContext`.
 - `storage`: pass the live-set through to the conflict classifiers; the `xmax`
   stale-lock (aborted-subxid) case already works via CLOG status.
 
