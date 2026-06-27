@@ -45,13 +45,13 @@ pub const XMAX_ABORTED: u16 = 1 << 3;
 fn txn_effect_visible(
     xid: TxnId,
     snapshot: &Snapshot,
-    current_txn: TxnId,
+    current_txns: &[TxnId],
     status: &dyn TxnStatusView,
     committed_hint: bool,
     aborted_hint: bool,
 ) -> bool {
     // Own write: my uncommitted effects are visible to me regardless of CLOG.
-    if xid == current_txn {
+    if current_txns.contains(&xid) {
         return true;
     }
     // The future (allocated at or after my snapshot) is never visible.
@@ -102,14 +102,14 @@ pub fn is_visible(
     xmax: TxnId,
     infomask: u16,
     snapshot: &Snapshot,
-    current_txn: TxnId,
+    current_txns: &[TxnId],
     status: &dyn TxnStatusView,
 ) -> bool {
     // 1. Creator must be visible, else the version never existed for me.
     let creator_visible = txn_effect_visible(
         xmin,
         snapshot,
-        current_txn,
+        current_txns,
         status,
         infomask & XMIN_COMMITTED != 0,
         infomask & XMIN_ABORTED != 0,
@@ -127,7 +127,7 @@ pub fn is_visible(
     let deleter_visible = txn_effect_visible(
         xmax,
         snapshot,
-        current_txn,
+        current_txns,
         status,
         infomask & XMAX_COMMITTED != 0,
         infomask & XMAX_ABORTED != 0,

@@ -102,7 +102,7 @@ impl PageBackedStorageEngine {
                 decoded.xmax,
                 decoded.infomask,
                 snapshot,
-                current_txn,
+                &[current_txn],
                 self.txn_status_view(),
             ) {
                 return Ok(Some((

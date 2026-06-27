@@ -236,7 +236,7 @@ impl PageBackedStorageEngine {
         if write_conflict(
             current_xmax,
             current_infomask,
-            txn_id,
+            &[txn_id],
             self.txn_status_view(),
         ) == WriteConflict::Conflict
         {

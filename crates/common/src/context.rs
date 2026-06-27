@@ -23,6 +23,14 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    /// The reading/writing transaction's **live (sub)xid set** — `txn_id` plus any
+    /// not-rolled-back savepoint subxids (`docs/specs/savepoints.md` §4). A tuple
+    /// whose `xmin`/`xmax` is in this set is the transaction's own (uncommitted)
+    /// effect, visible to it and not a self-conflict. Defaults to just `[txn_id]`
+    /// (no savepoints); the server widens it for a transaction with open/released
+    /// savepoints. `Arc`-shared so the executor clones a context per scan operator
+    /// cheaply, like `snapshot`.
+    pub live_txns: Arc<[u64]>,
     /// The GC horizon (minimum advertised snapshot `xmin`) the server captured for
     /// this statement. Consumed ONLY by the storage engine's HOT update-path prune
     /// (`docs/specs/mvcc.md` §10 Milestone H3): when a same-page HOT update has no
@@ -46,6 +54,7 @@ impl StatementContext {
             snapshot: Arc::new(Snapshot::sees_all_committed()),
             isolation: IsolationLevel::default(),
             gc_horizon: 0,
+            live_txns: Arc::from([txn_id]),
         }
     }
 
@@ -59,6 +68,7 @@ impl StatementContext {
             snapshot,
             isolation: IsolationLevel::default(),
             gc_horizon: 0,
+            live_txns: Arc::from([txn_id]),
         }
     }
 
@@ -74,6 +84,7 @@ impl StatementContext {
             snapshot,
             isolation,
             gc_horizon: 0,
+            live_txns: Arc::from([txn_id]),
         }
     }
 
@@ -82,6 +93,14 @@ impl StatementContext {
     #[must_use]
     pub fn with_gc_horizon(mut self, gc_horizon: u64) -> Self {
         self.gc_horizon = gc_horizon;
+        self
+    }
+
+    /// Set the transaction's live (sub)xid set (the server uses this for a
+    /// transaction with savepoints; see the `live_txns` field). Builder-style.
+    #[must_use]
+    pub fn with_live_txns(mut self, live_txns: Arc<[u64]>) -> Self {
+        self.live_txns = live_txns;
         self
     }
 }

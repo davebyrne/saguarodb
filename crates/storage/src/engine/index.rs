@@ -109,7 +109,7 @@ impl PageBackedStorageEngine {
                     decoded.xmin,
                     decoded.xmax,
                     decoded.infomask,
-                    current_txn,
+                    &[current_txn],
                     status,
                 ) {
                     // A committed-live duplicate is definitive; nothing outranks it.

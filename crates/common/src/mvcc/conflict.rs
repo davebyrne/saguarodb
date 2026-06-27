@@ -19,7 +19,7 @@ use super::{TxnStatus, TxnStatusView, XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED
 /// - its creator is **aborted** (`status(xmin) == Aborted`, or `XMIN_ABORTED`) —
 ///   the row never really existed; or
 /// - it is **committed-deleted**: `xmax` is set (`!= INVALID_XID`) and the delete
-///   is settled — either `xmax == current_txn` (deleted by me earlier in this
+///   is settled — either `current_txns.contains(&xmax)` (deleted by me earlier in this
 ///   txn; with no command ids yet this counts as deleted, mirroring `is_visible`'s
 ///   own-delete handling, so I may re-insert the key within my own txn) or the
 ///   deleter committed (`status(xmax) == Committed`, or `XMAX_COMMITTED`).
@@ -33,10 +33,10 @@ pub fn version_conflicts(
     xmin: TxnId,
     xmax: TxnId,
     infomask: u16,
-    current_txn: TxnId,
+    current_txns: &[TxnId],
     status: &dyn TxnStatusView,
 ) -> bool {
-    classify_unique_conflict(xmin, xmax, infomask, current_txn, status) != UniqueConflict::None
+    classify_unique_conflict(xmin, xmax, infomask, current_txns, status) != UniqueConflict::None
 }
 
 /// The three-way outcome of the concurrent-inserter uniqueness check of
@@ -78,7 +78,7 @@ pub enum UniqueConflict {
 ///
 /// - **Dead ⇒ [`UniqueConflict::None`]:** the creator aborted (`XMIN_ABORTED`, or
 ///   `status(xmin) == Aborted`), **or** the version is committed-deleted —
-///   `xmax` is set and either the delete is by me (`xmax == current_txn`, e.g. an
+///   `xmax` is set and either the delete is by me (`current_txns.contains(&xmax)`, e.g. an
 ///   UPDATE's own superseded old version, so an UPDATE does not false-conflict on
 ///   the row it supersedes), the deleter committed (`XMAX_COMMITTED`, or
 ///   `status(xmax) == Committed`). The candidate does not occupy the key.
@@ -99,13 +99,13 @@ pub fn classify_unique_conflict(
     xmin: TxnId,
     xmax: TxnId,
     infomask: u16,
-    current_txn: TxnId,
+    current_txns: &[TxnId],
     status: &dyn TxnStatusView,
 ) -> UniqueConflict {
     // Resolve the creator's settled status once (hint bits short-circuit the CLOG
     // probe; my own write is always treated as committed-to-me). `current_txn`
     // takes precedence so PanicStatus is never consulted for an own write.
-    let creator = if xmin == current_txn || infomask & XMIN_COMMITTED != 0 {
+    let creator = if current_txns.contains(&xmin) || infomask & XMIN_COMMITTED != 0 {
         TxnStatus::Committed
     } else if infomask & XMIN_ABORTED != 0 {
         TxnStatus::Aborted
@@ -120,7 +120,7 @@ pub fn classify_unique_conflict(
     // Committed-deleted (including deleted-by-me, e.g. an UPDATE's superseded old
     // version) ⇒ the row is gone; no conflict.
     if xmax != INVALID_XID
-        && (xmax == current_txn
+        && (current_txns.contains(&xmax)
             || infomask & XMAX_COMMITTED != 0
             || status.status(xmax) == TxnStatus::Committed)
     {
@@ -165,7 +165,7 @@ pub enum WriteConflict {
 /// Rule (fail-fast, first-updater-wins — §4, §7.3):
 /// - `xmax == INVALID_XID` ⇒ [`WriteConflict::Proceed`]: no one has locked the
 ///   row; this writer is the first updater.
-/// - `xmax == current_txn` ⇒ [`WriteConflict::Proceed`]: this writer already
+/// - `current_txns.contains(&xmax)` ⇒ [`WriteConflict::Proceed`]: this writer already
 ///   locked/deleted the row itself earlier in the same transaction.
 /// - the deleter **aborted** (`XMAX_ABORTED` hint, or `status(xmax) == Aborted`)
 ///   ⇒ [`WriteConflict::Proceed`]: the other lock evaporated — its delete never
@@ -188,7 +188,7 @@ pub enum WriteConflict {
 pub fn write_conflict(
     xmax: u64,
     infomask: u16,
-    current_txn: u64,
+    current_txns: &[TxnId],
     status: &dyn TxnStatusView,
 ) -> WriteConflict {
     // No deleter: the row is unlocked ⇒ I am the first updater.
@@ -196,7 +196,7 @@ pub fn write_conflict(
         return WriteConflict::Proceed;
     }
     // I already hold the lock (locked/deleted it earlier in my own txn).
-    if xmax == current_txn {
+    if current_txns.contains(&xmax) {
         return WriteConflict::Proceed;
     }
     // Settled hint bits decide the deleter's fate without a CLOG probe (mirrors

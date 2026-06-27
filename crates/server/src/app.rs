@@ -233,7 +233,7 @@ mod tests {
         );
         // The reader genuinely sees the row as live (the delete is not effective).
         assert!(
-            common::is_visible(creator, deleter, 0, &snapshot, 0, &view),
+            common::is_visible(creator, deleter, 0, &snapshot, &[], &view),
             "the deleted version is live to the long-lived snapshot"
         );
 

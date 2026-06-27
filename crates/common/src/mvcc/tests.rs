@@ -5,9 +5,53 @@ use crate::ids::{FIRST_NORMAL_XID, FROZEN_XID, INVALID_XID, TxnId};
 
 use super::{
     IsolationLevel, Snapshot, TxnStatus, TxnStatusView, UniqueConflict, WriteConflict,
-    XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,
-    is_dead_to_all, is_visible, version_conflicts, write_conflict,
+    XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED,
+    classify_unique_conflict as classify_unique_conflict_set, is_dead_to_all,
+    is_visible as is_visible_set, version_conflicts as version_conflicts_set,
+    write_conflict as write_conflict_set,
 };
+
+// The production predicates take the transaction's live (sub)xid *set* (savepoints,
+// `docs/specs/savepoints.md` §4). These pre-savepoint tests pass a single
+// `current_txn` scalar, so these same-named shims wrap it in a one-element set,
+// keeping the existing test calls unchanged. The multi-xid (subxid) own behavior is
+// covered by `own_subxid_set_is_self_for_visibility_and_conflicts`.
+fn is_visible(
+    xmin: TxnId,
+    xmax: TxnId,
+    infomask: u16,
+    snapshot: &Snapshot,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> bool {
+    is_visible_set(xmin, xmax, infomask, snapshot, &[current_txn], status)
+}
+fn classify_unique_conflict(
+    xmin: TxnId,
+    xmax: TxnId,
+    infomask: u16,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> UniqueConflict {
+    classify_unique_conflict_set(xmin, xmax, infomask, &[current_txn], status)
+}
+fn version_conflicts(
+    xmin: TxnId,
+    xmax: TxnId,
+    infomask: u16,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> bool {
+    version_conflicts_set(xmin, xmax, infomask, &[current_txn], status)
+}
+fn write_conflict(
+    xmax: TxnId,
+    infomask: u16,
+    current_txn: TxnId,
+    status: &dyn TxnStatusView,
+) -> WriteConflict {
+    write_conflict_set(xmax, infomask, &[current_txn], status)
+}
 
 #[test]
 fn empty_snapshot_is_a_degenerate_non_capture() {
@@ -745,6 +789,60 @@ fn write_conflict_reserved_frozen_xmax_conflicts() {
     );
     assert_eq!(
         write_conflict(FIRST_NORMAL_XID - 1, 0, CURRENT_TXN, &view),
+        WriteConflict::Conflict
+    );
+}
+
+// --- savepoints: the live (sub)xid set is treated as "self" ---
+
+#[test]
+fn own_subxid_set_is_self_for_visibility_and_conflicts() {
+    // A transaction T=100 with a savepoint subxid 8 (in `xip`, i.e. registered
+    // active) and 25 (allocated after this snapshot, i.e. "future"). Its live-set
+    // is {100, 8, 25}. All three predicates must treat every member as self.
+    let live = [100u64, 8, 25];
+    let view = MockStatus::new(&[(7, TxnStatus::Committed)]);
+
+    // Own subxid's creation is visible to the transaction even though the subxid is
+    // in `xip` (8) or in the future past `xmax` (25) — the live-set check is first.
+    assert!(is_visible_set(8, INVALID_XID, 0, &snapshot(), &live, &view));
+    assert!(is_visible_set(
+        25,
+        INVALID_XID,
+        0,
+        &snapshot(),
+        &live,
+        &view
+    ));
+    // Sanity: without the subxid in the set, 8 is in-progress (in `xip`) ⇒ invisible.
+    assert!(!is_visible_set(
+        8,
+        INVALID_XID,
+        0,
+        &snapshot(),
+        &[100],
+        &view
+    ));
+
+    // A row whose committed creator (7) my own subxid (8) deleted is not a unique
+    // conflict for me — I deleted it. Without the subxid in the set it would be an
+    // in-flight conflict (the deleter looks like another, in-progress txn).
+    assert_eq!(
+        classify_unique_conflict_set(7, 8, 0, &live, &view),
+        UniqueConflict::None
+    );
+    assert_ne!(
+        classify_unique_conflict_set(7, 8, 0, &[100], &view),
+        UniqueConflict::None
+    );
+
+    // And the row lock my own subxid holds is not a write-write conflict for me.
+    assert_eq!(
+        write_conflict_set(8, 0, &live, &view),
+        WriteConflict::Proceed
+    );
+    assert_eq!(
+        write_conflict_set(8, 0, &[100], &view),
         WriteConflict::Conflict
     );
 }
