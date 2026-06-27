@@ -628,6 +628,15 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
+        // Staged: real savepoint routing (StatementClass::Savepoint + the
+        // transaction-lifecycle handlers) lands in the server milestone; until then
+        // they parse but are not yet executable.
+        Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::RollbackToSavepoint { .. } => Err(DbError::plan(
+            SqlState::FeatureNotSupported,
+            "savepoints are not yet implemented",
+        )),
     }
 }
 

@@ -48,8 +48,22 @@ pub enum Statement {
     },
     /// `COMMIT` / `END`.
     Commit,
-    /// `ROLLBACK`. Savepoints are not supported in v1.
+    /// `ROLLBACK` (without a savepoint).
     Rollback,
+    /// `SAVEPOINT <name>` — establish a savepoint (open a subtransaction). `name`
+    /// is the lowercase-normalized identifier. See `docs/specs/savepoints.md`.
+    Savepoint {
+        name: String,
+    },
+    /// `RELEASE [SAVEPOINT] <name>` — release (merge) a savepoint into its parent.
+    ReleaseSavepoint {
+        name: String,
+    },
+    /// `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>` — roll back to a
+    /// savepoint, which remains active for continued work.
+    RollbackToSavepoint {
+        name: String,
+    },
     /// `SET TRANSACTION ISOLATION LEVEL <level>` (transaction-scoped). Sets the
     /// CURRENT transaction's isolation level; valid only before the transaction
     /// has run its first query (`docs/specs/mvcc.md` §10 Milestone G1). `isolation`

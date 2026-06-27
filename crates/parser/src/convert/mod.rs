@@ -163,12 +163,24 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             Ok(Statement::Commit)
         }
         sql::Statement::Rollback { chain, savepoint } => {
-            // Accept plain `ROLLBACK`. `AND CHAIN` and savepoints are unsupported.
-            if chain || savepoint.is_some() {
+            // `AND CHAIN` is unsupported. `ROLLBACK TO [SAVEPOINT] <name>` becomes a
+            // savepoint rollback; plain `ROLLBACK` aborts the transaction.
+            if chain {
                 return unsupported("unsupported ROLLBACK form");
             }
-            Ok(Statement::Rollback)
+            match savepoint {
+                Some(name) => Ok(Statement::RollbackToSavepoint {
+                    name: ident_name(&name)?,
+                }),
+                None => Ok(Statement::Rollback),
+            }
         }
+        sql::Statement::Savepoint { name } => Ok(Statement::Savepoint {
+            name: ident_name(&name)?,
+        }),
+        sql::Statement::ReleaseSavepoint { name } => Ok(Statement::ReleaseSavepoint {
+            name: ident_name(&name)?,
+        }),
         sql::Statement::Copy {
             source,
             to,

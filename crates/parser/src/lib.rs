@@ -308,22 +308,66 @@ mod tests {
     fn rejects_unsupported_transaction_control_forms() {
         // sqlparser 0.56's PostgreSQL dialect does not recognize `ABORT`, so it
         // is a syntax error rather than mapping to ROLLBACK; v1 does not add it.
-        // READ ONLY (we don't enforce read-only), chaining, and savepoints are
-        // rejected at parse time. (`SET SESSION CHARACTERISTICS` IS supported as of
-        // G2 — see `parses_session_characteristics_isolation_levels`.)
+        // READ ONLY (we don't enforce read-only) and chaining are rejected at parse
+        // time. (`SET SESSION CHARACTERISTICS` IS supported as of G2; savepoints ARE
+        // supported — see `parses_savepoint_statements`.)
         for sql in [
             "abort",
             "start transaction read only",
             "begin read only",
             "commit and chain",
             "rollback and chain",
-            "rollback to savepoint s1",
             "set session characteristics as transaction read only",
         ] {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
             assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
         }
+    }
+
+    #[test]
+    fn parses_savepoint_statements() {
+        assert_eq!(
+            parse("savepoint s1").unwrap(),
+            Statement::Savepoint {
+                name: "s1".to_string()
+            }
+        );
+        // Identifiers are lowercase-normalized.
+        assert_eq!(
+            parse("SAVEPOINT MyPoint").unwrap(),
+            Statement::Savepoint {
+                name: "mypoint".to_string()
+            }
+        );
+        assert_eq!(
+            parse("release savepoint s1").unwrap(),
+            Statement::ReleaseSavepoint {
+                name: "s1".to_string()
+            }
+        );
+        // RELEASE without the SAVEPOINT keyword is also accepted.
+        assert_eq!(
+            parse("release s1").unwrap(),
+            Statement::ReleaseSavepoint {
+                name: "s1".to_string()
+            }
+        );
+        assert_eq!(
+            parse("rollback to savepoint s1").unwrap(),
+            Statement::RollbackToSavepoint {
+                name: "s1".to_string()
+            }
+        );
+        // `ROLLBACK TO <name>` (no SAVEPOINT keyword) and `ROLLBACK WORK TO`.
+        assert_eq!(
+            parse("rollback to s1").unwrap(),
+            Statement::RollbackToSavepoint {
+                name: "s1".to_string()
+            }
+        );
+        // Plain ROLLBACK (no savepoint) still aborts the transaction.
+        assert_eq!(parse("rollback").unwrap(), Statement::Rollback);
     }
 
     #[test]
