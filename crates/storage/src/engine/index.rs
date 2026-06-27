@@ -56,10 +56,15 @@ impl PageBackedStorageEngine {
     /// CLOG (`TxnStatusView`) + the tuple's `infomask` hint bits — never a
     /// [`Snapshot`] — so it sees concurrently in-flight and already-committed state,
     /// not just what `current_txn`'s snapshot would observe. Each candidate TID from
-    /// `scan_key` is read at the *physical* tuple header (NOT via
-    /// [`Self::read_visible_row`], which would wrongly hide non-visible-but-alive
-    /// versions); a DEAD/UNUSED line pointer (`read_row` ⇒ `None`) is a reclaimed
-    /// slot and contributes no conflict. The per-candidate decision is
+    /// `scan_key` is a (possibly HOT) root: its `REDIRECT` + bounded HOT chain is
+    /// resolved ([`Self::collect_chain_versions`]) and EVERY physically-present member
+    /// is classified at its *physical* tuple header (NOT via [`Self::read_visible_row`],
+    /// which would wrongly hide non-visible-but-alive versions). Resolving the chain is
+    /// essential after a HOT update + VACUUM collapses the root to a `REDIRECT`: the
+    /// live version is then a heap-only successor, and reading the redirect root
+    /// directly yields no bytes — so without this resolution a duplicate of the
+    /// unchanged key would bypass the constraint. A reclaimed (`DEAD`/`UNUSED`) root
+    /// contributes no members and no conflict. The per-candidate decision is
     /// [`common::classify_unique_conflict`]: a creator-aborted or committed-deleted
     /// (incl. deleted-by-me) version is [`UniqueConflict::None`] and ignored; a
     /// committed/own/frozen-live version is a definite [`UniqueConflict::Violation`]
@@ -87,27 +92,33 @@ impl PageBackedStorageEngine {
         let status = self.txn_status_view();
         let mut strongest = UniqueConflict::None;
         for location in index_btree.scan_key(key)? {
-            let readable = self
-                .buffer_pool
-                .read_page(location.file_id, location.page_num)?;
-            let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
-                // DEAD/UNUSED line pointer: the slot was reclaimed; no conflict.
-                continue;
-            };
-            let decoded = decode_row(schema, &bytes)?;
-            match classify_unique_conflict(
-                decoded.xmin,
-                decoded.xmax,
-                decoded.infomask,
-                current_txn,
-                status,
-            ) {
-                // A committed-live duplicate is definitive; nothing outranks it.
-                UniqueConflict::Violation => return Ok(UniqueConflict::Violation),
-                // An in-flight candidate is the strongest seen so far, but a later
-                // candidate could still be a definite Violation, so keep scanning.
-                UniqueConflict::InFlight => strongest = UniqueConflict::InFlight,
-                UniqueConflict::None => {}
+            // Each index TID is a (possibly HOT) root. Resolve a `REDIRECT` (a
+            // VACUUM-collapsed root whose original tuple was pruned) and walk the bounded
+            // HOT chain via [`Self::collect_chain_versions`], so we examine EVERY
+            // physically-present version that shares this key — not just the bytes at the
+            // root slot. This is load-bearing after a HOT update + VACUUM: the live
+            // version is a heap-only successor reached through the redirect, and reading
+            // the redirect root directly yields no bytes (it would be wrongly treated as a
+            // reclaimed slot, so a duplicate of the unchanged key would slip past the
+            // unique constraint). A reclaimed (`DEAD`/`UNUSED`) root yields no members and
+            // contributes no conflict. Each member is still classified at its *physical*
+            // header (NOT snapshot visibility): a unique conflict may be with an in-flight
+            // or committed-but-not-yet-visible version.
+            for (_member_loc, decoded) in self.collect_chain_versions(schema, location)? {
+                match classify_unique_conflict(
+                    decoded.xmin,
+                    decoded.xmax,
+                    decoded.infomask,
+                    current_txn,
+                    status,
+                ) {
+                    // A committed-live duplicate is definitive; nothing outranks it.
+                    UniqueConflict::Violation => return Ok(UniqueConflict::Violation),
+                    // An in-flight candidate is the strongest seen so far, but a later
+                    // candidate could still be a definite Violation, so keep scanning.
+                    UniqueConflict::InFlight => strongest = UniqueConflict::InFlight,
+                    UniqueConflict::None => {}
+                }
             }
         }
         Ok(strongest)

@@ -163,13 +163,15 @@ impl PageBackedStorageEngine {
     /// is `(RowLocation, DecodedRow)` for a `NORMAL` member.
     ///
     /// Used by `create_index`'s HOT broken-chain check (`docs/specs/mvcc.md` §10
-    /// Milestone H2): a non-HOT root resolves to a one-element vec (so a plain
+    /// Milestone H2) — a non-HOT root resolves to a one-element vec (so a plain
     /// single-version table is untouched); a HOT chain yields its root + heap-only
     /// members so the build can test whether two not-dead-to-all versions disagree on
-    /// the new index's key. Runs under the exclusive guard (stable physical view), so
-    /// the walk is a pure read with no concurrent mutation. A `DEAD`/`UNUSED` root
-    /// resolves to no versions (`Ok(vec![])`); a corrupt chain (cycle, bad redirect,
-    /// non-NORMAL HOT successor) is a structured error, never a spin.
+    /// the new index's key — and by [`Self::unique_conflict_kind`] to examine every
+    /// physically-present version sharing an index key. The walk is a pure read whose
+    /// physical view is stable because it holds the page read latch for its duration
+    /// (`create_index` additionally runs under the exclusive guard). A `DEAD`/`UNUSED`
+    /// root resolves to no versions (`Ok(vec![])`); a corrupt chain (cycle, bad
+    /// redirect, non-NORMAL HOT successor) is a structured error, never a spin.
     pub(super) fn collect_chain_versions(
         &self,
         schema: &TableSchema,

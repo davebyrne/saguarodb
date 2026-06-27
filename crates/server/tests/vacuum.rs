@@ -309,6 +309,132 @@ async fn vacuum_recollapse_of_a_hot_chain_does_not_corrupt_the_page() {
     assert_eq!(count, vec![vec![Some("1".to_string())]]);
 }
 
+/// Regression: a UNIQUE secondary index must keep rejecting duplicates AFTER a HOT
+/// update collapses the chain under VACUUM (`docs/specs/mvcc.md` §6/§9). A HOT update
+/// of a NON-indexed column leaves the unique key's index entry pointing at the chain
+/// root; VACUUM then turns that root into a REDIRECT to the live tail. The
+/// uniqueness check must follow the REDIRECT + HOT chain to see the live version —
+/// otherwise it reads no bytes at the redirect root, treats the key as absent, and
+/// wrongly accepts a duplicate (a silent unique-constraint violation).
+#[tokio::test]
+async fn unique_secondary_index_rejects_duplicate_after_hot_update_and_vacuum() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table u (id integer primary key, k text, v text)")
+        .await;
+    conn.ok("create unique index uq_u_k on u (k)").await;
+    conn.ok("insert into u (id, k, v) values (1, 'x', 'a')")
+        .await;
+
+    // Sanity: a duplicate of 'k' is rejected BEFORE any HOT update / vacuum.
+    let before = conn
+        .query("insert into u (id, k, v) values (2, 'x', 'dup')")
+        .await
+        .unwrap();
+    assert!(
+        before.result.is_err(),
+        "duplicate must be rejected before vacuum"
+    );
+
+    // HOT update of the NON-indexed column `v` (keeps `k` = 'x'), then VACUUM collapses
+    // the chain (root -> REDIRECT to the live tail).
+    conn.ok("update u set v = 'b' where id = 1").await;
+    assert!(conn.ok("vacuum u").await.result.is_ok());
+
+    // The duplicate of the unchanged unique key MUST still be rejected.
+    let after = conn
+        .query("insert into u (id, k, v) values (3, 'x', 'dup2')")
+        .await
+        .unwrap();
+    let err = after
+        .result
+        .err()
+        .expect("duplicate 'k' must be rejected after HOT update + vacuum");
+    assert!(
+        err.message.to_lowercase().contains("duplicate"),
+        "expected a unique violation, got: {}",
+        err.message
+    );
+    let count = conn.ok("select count(*) from u").await.rows();
+    assert_eq!(
+        count,
+        vec![vec![Some("1".to_string())]],
+        "no duplicate row should have been inserted"
+    );
+}
+
+/// Regression: a UNIQUE index must reject a duplicate after a HOT update even BEFORE
+/// VACUUM — the index still points at the chain root, which the HOT update made dead
+/// (its live successor is a heap-only tuple). The uniqueness check must walk the HOT
+/// chain to the live successor; reading only the dead root would miss it. (Same root
+/// cause as the post-VACUUM case, exercising the chain-walk rather than the REDIRECT
+/// branch.)
+#[tokio::test]
+async fn unique_index_rejects_duplicate_after_hot_update_before_vacuum() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table h (id integer primary key, k text, v text)")
+        .await;
+    conn.ok("create unique index uq_h_k on h (k)").await;
+    conn.ok("insert into h (id, k, v) values (1, 'x', 'a')")
+        .await;
+
+    // HOT update of the non-indexed `v` (keeps `k`='x'); NO vacuum.
+    conn.ok("update h set v = 'b' where id = 1").await;
+
+    let dup = conn
+        .query("insert into h (id, k, v) values (2, 'x', 'dup')")
+        .await
+        .unwrap();
+    let err = dup
+        .result
+        .err()
+        .expect("duplicate 'k' must be rejected after a HOT update (pre-vacuum)");
+    assert!(
+        err.message.to_lowercase().contains("duplicate"),
+        "expected a unique violation, got: {}",
+        err.message
+    );
+    let count = conn.ok("select count(*) from h").await.rows();
+    assert_eq!(count, vec![vec![Some("1".to_string())]]);
+}
+
+/// Regression: the PRIMARY KEY must keep rejecting duplicates AFTER a HOT update +
+/// VACUUM, for the same REDIRECT-resolution reason as the secondary-index case
+/// (`unique_conflict_kind` is the shared check for both, `docs/specs/mvcc.md` §6).
+#[tokio::test]
+async fn primary_key_rejects_duplicate_after_hot_update_and_vacuum() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table p (id integer primary key, v text)")
+        .await;
+    conn.ok("insert into p (id, v) values (1, 'a')").await;
+
+    // HOT update of the non-indexed `v` (PK unchanged), then VACUUM collapses the chain.
+    conn.ok("update p set v = 'b' where id = 1").await;
+    assert!(conn.ok("vacuum p").await.result.is_ok());
+
+    // A duplicate primary key MUST still be rejected.
+    let dup = conn
+        .query("insert into p (id, v) values (1, 'c')")
+        .await
+        .unwrap();
+    let err = dup
+        .result
+        .err()
+        .expect("duplicate primary key must be rejected after HOT update + vacuum");
+    assert!(
+        err.message.to_lowercase().contains("duplicate"),
+        "expected a unique violation, got: {}",
+        err.message
+    );
+    let count = conn.ok("select count(*) from p").await.rows();
+    assert_eq!(count, vec![vec![Some("1".to_string())]]);
+}
+
 /// The horizon-safety invariant at the server level. While a snapshot advertises an
 /// old `xmin`, the GC horizon is pinned at or below that `xmin` even after a delete
 /// commits and the id allocator advances well past it — so VACUUM (which captures

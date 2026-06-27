@@ -97,7 +97,13 @@ results are unchanged from the pre-MVCC engine.
   crossed — so no row is double-returned; a cyclic `t_ctid` is a structured error,
   not a spin. The walk is read-latch-only (no page mutation; pruning is the
   UPDATE/VACUUM path, H3). The resolved live version's `RowId` is what a scan yields,
-  not the index TID.
+  not the index TID. The **uniqueness check** (`unique_conflict_kind`) likewise must
+  resolve the chain — via `collect_chain_versions` (the same `REDIRECT` + bounded
+  `t_ctid` resolution, but gathering *all* physically-present members rather than the
+  one visible version, since a unique conflict may be with a non-visible-but-alive
+  version). Reading only the root slot would miss the live version after a HOT update
+  collapses the root to a dead tuple or (post-VACUUM) a `REDIRECT`, silently admitting
+  a duplicate of the unchanged key.
 - **HOT-update fast path (Milestone H2).** `update` attempts a HOT update before the
   normal path (`try_hot_update`): eligible when no indexed column changed (the new
   row's PK and every secondary key match the predecessor's) AND the new tuple fits on
