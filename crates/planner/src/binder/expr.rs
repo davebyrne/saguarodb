@@ -568,9 +568,9 @@ fn bind_nullif(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr>
     let equals = BoundExpr::BinaryOp {
         left: Box::new(a.clone()),
         op: BinOp::Eq,
-        right: Box::new(b),
+        right: Box::new(b.clone()),
         data_type: DataType::Boolean,
-        nullable: a.nullable(),
+        nullable: a.nullable() || b.nullable(),
     };
     let then_null = BoundExpr::Literal {
         value: Value::Null,

@@ -476,6 +476,11 @@ fn eval_mod(left: &Value, right: &Value) -> Result<Value> {
             "division by zero",
         ));
     }
+    // `i64::MIN % -1` overflows `checked_rem`, but the remainder is mathematically
+    // 0; PostgreSQL returns 0 here rather than erroring.
+    if right == -1 {
+        return Ok(Value::Integer(0));
+    }
     left.checked_rem(right)
         .map(Value::Integer)
         .ok_or_else(integer_overflow)

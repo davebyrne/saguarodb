@@ -1193,6 +1193,29 @@ mod tests {
     }
 
     #[test]
+    fn mod_of_min_integer_by_negative_one_is_zero() {
+        // `i64::MIN % -1` overflows `checked_rem`, but the remainder is 0 (matching
+        // PostgreSQL). `i64::MIN` cannot be written as a literal, so evaluate directly.
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let int = |value| BoundExpr::Literal {
+            value: Value::Integer(value),
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+        let expr = BoundExpr::Function {
+            name: "mod".to_string(),
+            args: vec![int(i64::MIN), int(-1)],
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        assert_eq!(eval_expr(&expr, &row).unwrap(), Value::Integer(0));
+    }
+
+    #[test]
     fn coalesce_returns_first_non_null_argument() {
         let harness = ExecutorHarness::with_users();
         harness
