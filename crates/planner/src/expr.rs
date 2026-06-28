@@ -186,6 +186,18 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    /// Sample standard deviation (`STDDEV`/`STDDEV_SAMP`), divisor `n - 1`.
+    StddevSamp,
+    /// Population standard deviation (`STDDEV_POP`), divisor `n`.
+    StddevPop,
+    /// Sample variance (`VARIANCE`/`VAR_SAMP`), divisor `n - 1`.
+    VarSamp,
+    /// Population variance (`VAR_POP`), divisor `n`.
+    VarPop,
+    /// `BOOL_AND` — true when every non-NULL input is true.
+    BoolAnd,
+    /// `BOOL_OR` — true when any non-NULL input is true.
+    BoolOr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

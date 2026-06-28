@@ -1449,6 +1449,101 @@ mod tests {
     }
 
     #[test]
+    fn statistical_aggregates_compute_variance_stddev_and_bools() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table s (id integer primary key, v integer, flag boolean)")
+            .unwrap();
+        for (id, v, flag) in [
+            (1, 2, "true"),
+            (2, 4, "true"),
+            (3, 4, "false"),
+            (4, 4, "true"),
+            (5, 5, "true"),
+            (6, 5, "true"),
+            (7, 7, "true"),
+            (8, 9, "true"),
+        ] {
+            harness
+                .execute(&format!(
+                    "insert into s (id, v, flag) values ({id}, {v}, {flag})"
+                ))
+                .unwrap();
+        }
+
+        // mean = 5, sum of squared deviations = 32, n = 8.
+        let rows = harness
+            .select_rows(
+                "select var_pop(v), stddev_pop(v), var_samp(v), stddev_samp(v), \
+                 bool_and(flag), bool_or(flag) from s",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Float(4.0_f64.into()),                 // 32 / 8
+                    Value::Float(2.0_f64.into()),                 // sqrt(4)
+                    Value::Float((32.0_f64 / 7.0).into()),        // 32 / (8 - 1)
+                    Value::Float((32.0_f64 / 7.0).sqrt().into()), // sqrt(32/7)
+                    Value::Boolean(false),                        // one flag is false
+                    Value::Boolean(true),                         // some flag is true
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn statistical_aggregates_handle_sparse_input() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table s (id integer primary key, v integer, flag boolean)")
+            .unwrap();
+        harness
+            .execute("insert into s (id, v, flag) values (1, 5, null)")
+            .unwrap();
+
+        // A single value: population variance is 0, sample variance/stddev are
+        // NULL, and BOOL_AND over only-NULL input is NULL.
+        let rows = harness
+            .select_rows("select var_pop(v), var_samp(v), stddev_samp(v), bool_and(flag) from s")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Float(0.0_f64.into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn sum_and_avg_aggregate_over_double() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table d (id integer primary key, v double precision)")
+            .unwrap();
+        harness
+            .execute("insert into d (id, v) values (1, 1.5)")
+            .unwrap();
+        harness
+            .execute("insert into d (id, v) values (2, 2.5)")
+            .unwrap();
+
+        let rows = harness.select_rows("select sum(v), avg(v) from d").unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Float(4.0_f64.into()), Value::Float(2.0_f64.into())],
+            }]
+        );
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness

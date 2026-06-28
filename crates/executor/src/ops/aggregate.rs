@@ -98,6 +98,85 @@ fn evaluate_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Val
         AggregateFunc::Avg => fold_aggregate(aggregate, rows, FoldKind::Avg),
         AggregateFunc::Min => min_max_aggregate(aggregate, rows, true),
         AggregateFunc::Max => min_max_aggregate(aggregate, rows, false),
+        AggregateFunc::StddevSamp => variance_aggregate(aggregate, rows, Spread::Sample, true),
+        AggregateFunc::StddevPop => variance_aggregate(aggregate, rows, Spread::Population, true),
+        AggregateFunc::VarSamp => variance_aggregate(aggregate, rows, Spread::Sample, false),
+        AggregateFunc::VarPop => variance_aggregate(aggregate, rows, Spread::Population, false),
+        AggregateFunc::BoolAnd => bool_aggregate(aggregate, rows, true),
+        AggregateFunc::BoolOr => bool_aggregate(aggregate, rows, false),
+    }
+}
+
+/// Whether a variance/stddev divides by `n - 1` (sample) or `n` (population).
+#[derive(Clone, Copy)]
+enum Spread {
+    Sample,
+    Population,
+}
+
+/// `STDDEV_*` / `VAR_*`: the population/sample variance of the non-NULL numeric
+/// inputs (or its square root for stddev). Returns NULL when there are too few
+/// values (no rows for population; fewer than two for sample).
+fn variance_aggregate(
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    spread: Spread,
+    stddev: bool,
+) -> Result<Value> {
+    let mut data = Vec::new();
+    for value in aggregate_values(aggregate, rows)? {
+        match value {
+            Value::Null => {}
+            Value::Integer(value) => data.push(value as f64),
+            Value::Float(value) => data.push(value.0),
+            _ => {
+                return Err(DbError::execute(
+                    SqlState::DatatypeMismatch,
+                    "STDDEV and VARIANCE require numeric input",
+                ));
+            }
+        }
+    }
+
+    let n = data.len();
+    let divisor = match spread {
+        Spread::Sample if n < 2 => return Ok(Value::Null),
+        Spread::Sample => (n - 1) as f64,
+        Spread::Population if n == 0 => return Ok(Value::Null),
+        Spread::Population => n as f64,
+    };
+
+    let mean = data.iter().sum::<f64>() / n as f64;
+    let sum_squares = data.iter().map(|value| (value - mean).powi(2)).sum::<f64>();
+    let variance = sum_squares / divisor;
+    let result = if stddev { variance.sqrt() } else { variance };
+    Ok(Value::Float(result.into()))
+}
+
+/// `BOOL_AND` (all) / `BOOL_OR` (any) over the non-NULL boolean inputs; NULL when
+/// there are no non-NULL inputs.
+fn bool_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], all: bool) -> Result<Value> {
+    let mut seen = false;
+    let mut acc = all;
+    for value in aggregate_values(aggregate, rows)? {
+        match value {
+            Value::Null => {}
+            Value::Boolean(value) => {
+                seen = true;
+                acc = if all { acc && value } else { acc || value };
+            }
+            _ => {
+                return Err(DbError::execute(
+                    SqlState::DatatypeMismatch,
+                    "BOOL_AND and BOOL_OR require boolean input",
+                ));
+            }
+        }
+    }
+    if seen {
+        Ok(Value::Boolean(acc))
+    } else {
+        Ok(Value::Null)
     }
 }
 

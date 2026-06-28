@@ -2443,3 +2443,36 @@ async fn e2e_string_functions() {
         ]
     );
 }
+
+#[tokio::test]
+async fn e2e_statistical_aggregates() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table s (id integer primary key, v integer, flag boolean)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into s (id, v, flag) values (1, 1, true)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into s (id, v, flag) values (2, 5, false)")
+        .await
+        .unwrap();
+
+    // mean = 3, squared deviations 4 + 4 = 8, n = 2: var_pop = 4, stddev_pop = 2.
+    let rows = server
+        .simple_query("select var_pop(v), stddev_pop(v), bool_and(flag), bool_or(flag) from s")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("4".to_string()),
+            Some("2".to_string()),
+            Some("f".to_string()),
+            Some("t".to_string()),
+        ]]
+    );
+}

@@ -657,6 +657,43 @@ fn bind_aggregate(
             };
             (arg.data_type(), true)
         }
+        // STDDEV/VARIANCE accept either numeric type and always return DOUBLE.
+        AggregateFunc::StddevSamp
+        | AggregateFunc::StddevPop
+        | AggregateFunc::VarSamp
+        | AggregateFunc::VarPop => {
+            let Some(arg) = &arg else {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "STDDEV and VARIANCE require an expression argument",
+                ));
+            };
+            let arg_type = arg.data_type();
+            if !matches!(arg_type, DataType::Integer | DataType::Double) {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!("STDDEV and VARIANCE require a numeric argument, got {arg_type:?}"),
+                ));
+            }
+            (DataType::Double, true)
+        }
+        // BOOL_AND/BOOL_OR require a boolean argument and return BOOLEAN.
+        AggregateFunc::BoolAnd | AggregateFunc::BoolOr => {
+            let Some(arg) = &arg else {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "BOOL_AND and BOOL_OR require an expression argument",
+                ));
+            };
+            let arg_type = arg.data_type();
+            if arg_type != DataType::Boolean {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!("BOOL_AND and BOOL_OR require a boolean argument, got {arg_type:?}"),
+                ));
+            }
+            (DataType::Boolean, true)
+        }
     };
 
     Ok(BoundExpr::AggregateCall {
@@ -1108,6 +1145,12 @@ fn aggregate_func(name: &str) -> Option<AggregateFunc> {
         "avg" => Some(AggregateFunc::Avg),
         "min" => Some(AggregateFunc::Min),
         "max" => Some(AggregateFunc::Max),
+        "stddev" | "stddev_samp" => Some(AggregateFunc::StddevSamp),
+        "stddev_pop" => Some(AggregateFunc::StddevPop),
+        "variance" | "var_samp" => Some(AggregateFunc::VarSamp),
+        "var_pop" => Some(AggregateFunc::VarPop),
+        "bool_and" => Some(AggregateFunc::BoolAnd),
+        "bool_or" => Some(AggregateFunc::BoolOr),
         _ => None,
     }
 }

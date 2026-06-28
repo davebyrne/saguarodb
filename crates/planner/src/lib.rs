@@ -1097,6 +1097,48 @@ mod tests {
     }
 
     #[test]
+    fn binder_assigns_statistical_aggregate_types() {
+        let catalog = catalog_with_users();
+
+        // STDDEV/VARIANCE accept a numeric argument and return nullable DOUBLE.
+        for sql in [
+            "select stddev(id) from users",
+            "select stddev_pop(id) from users",
+            "select var_samp(id) from users",
+            "select var_pop(id) from users",
+            "select variance(id) from users",
+        ] {
+            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+            let BoundStatement::Select(select) = bound else {
+                panic!("expected bound select for {sql}");
+            };
+            assert_eq!(
+                select.columns[0].expr.data_type(),
+                DataType::Double,
+                "for `{sql}`"
+            );
+            assert!(select.columns[0].expr.nullable());
+        }
+
+        // BOOL_AND/BOOL_OR require a boolean argument and return BOOLEAN.
+        let bound = bind(
+            &parse("select bool_and(id = 1) from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.columns[0].expr.data_type(), DataType::Boolean);
+
+        // STDDEV rejects non-numeric arguments; BOOL_AND rejects non-boolean ones.
+        let err = bind(&parse("select stddev(name) from users").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        let err = bind(&parse("select bool_and(id) from users").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn binder_desugars_comma_from_list_into_cross_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select users.id from users, accounts").unwrap();

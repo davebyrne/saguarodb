@@ -818,6 +818,12 @@ fn aggregate_name(func: AggregateFunc) -> &'static str {
         AggregateFunc::Avg => "AVG",
         AggregateFunc::Min => "MIN",
         AggregateFunc::Max => "MAX",
+        AggregateFunc::StddevSamp => "STDDEV_SAMP",
+        AggregateFunc::StddevPop => "STDDEV_POP",
+        AggregateFunc::VarSamp => "VAR_SAMP",
+        AggregateFunc::VarPop => "VAR_POP",
+        AggregateFunc::BoolAnd => "BOOL_AND",
+        AggregateFunc::BoolOr => "BOOL_OR",
     }
 }
 
