@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use common::TxnId;
@@ -36,6 +37,13 @@ struct RegistryState {
     /// [`BTreeMap`] gives an `O(log n)` minimum (the GC horizon) and shares one key
     /// across the many snapshots that captured the same `xmin`.
     xmins: BTreeMap<TxnId, usize>,
+    /// `subxid → top-level txn id` for currently-active savepoint subtransactions
+    /// (`docs/specs/deadlock.md` §4). Populated when a savepoint subxid is allocated
+    /// and pruned on deregister. Used only by the deadlock detector to canonicalize
+    /// wait-for edges to transaction granularity; it is an in-memory, active-only
+    /// map, distinct from a durable `pg_subtrans`, and the visibility path never
+    /// consults it.
+    subtrans: HashMap<TxnId, TxnId>,
 }
 
 /// A concurrent set of in-progress transaction ids plus the advertised-`xmin`
@@ -82,9 +90,26 @@ impl ActiveTxnRegistry {
         txn_id
     }
 
+    /// Allocate and register a savepoint **subxid** owned by top-level `top`,
+    /// recording the subxid→top mapping for deadlock-detection canonicalization
+    /// (`docs/specs/deadlock.md` §4). Like [`register_allocated`](Self::register_allocated)
+    /// the allocate-and-insert is atomic under the latch.
+    pub fn register_subxid_allocated<F>(&self, top: TxnId, allocate: F) -> TxnId
+    where
+        F: FnOnce() -> TxnId,
+    {
+        let mut guard = self.lock();
+        let subxid = allocate();
+        guard.active.insert(subxid);
+        guard.subtrans.insert(subxid, top);
+        subxid
+    }
+
     /// Deregister `txn_id`. Called on commit or rollback.
     pub fn deregister(&self, txn_id: TxnId) {
-        self.lock().active.remove(&txn_id);
+        let mut guard = self.lock();
+        guard.active.remove(&txn_id);
+        guard.subtrans.remove(&txn_id);
     }
 
     /// Atomically deregister every id in `txn_ids` under one latch. Used at a
@@ -99,7 +124,24 @@ impl ActiveTxnRegistry {
         let mut guard = self.lock();
         for id in txn_ids {
             guard.active.remove(id);
+            guard.subtrans.remove(id);
         }
+    }
+
+    /// Whether `xid` (a top-level txn or a subxid) is currently in-progress. Used by
+    /// the lock manager to decide when a blocked writer's blocker has finished
+    /// (`docs/specs/deadlock.md` §4) — keyed on the specific (sub)xid, so a partial
+    /// `ROLLBACK TO` that deregisters only a subxid frees its waiters.
+    pub fn is_active(&self, xid: TxnId) -> bool {
+        self.lock().active.contains(&xid)
+    }
+
+    /// The top-level transaction id owning `xid`: the subxid→top mapping for an
+    /// active savepoint subxid, or `xid` itself for a top-level id (or any id with no
+    /// recorded parent). Used to canonicalize wait-for edges to transaction
+    /// granularity for deadlock detection (`docs/specs/deadlock.md` §4).
+    pub fn top_of(&self, xid: TxnId) -> TxnId {
+        self.lock().subtrans.get(&xid).copied().unwrap_or(xid)
     }
 
     /// The oldest in-progress transaction id, or `None` if none are active.

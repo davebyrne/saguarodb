@@ -1319,7 +1319,7 @@ async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
         // pages must spill to the heap mid-transaction. The autocommit `execute_sql`
         // cannot hold a transaction across calls, so drive the explicit transaction
         // through the session-carrying simple path.
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The session default isolation is irrelevant here (these are plain explicit
         // transactions); thread the built-in default and ignore the returned one.
         let iso = common::IsolationLevel::default();
@@ -1365,7 +1365,7 @@ async fn uncommitted_pages_evicted_under_pressure_then_aborted_are_invisible() {
         app.query_service
             .execute_sql("create table big (id integer primary key, payload text)")
             .unwrap();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The session default isolation is irrelevant here (these are plain explicit
         // transactions); thread the built-in default and ignore the returned one.
         let iso = common::IsolationLevel::default();

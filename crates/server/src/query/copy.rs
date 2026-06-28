@@ -30,7 +30,7 @@ impl QueryService {
         &self,
         job: CopyJob,
         slot: Option<Transaction>,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
         match slot {
@@ -45,7 +45,7 @@ impl QueryService {
     fn copy_in_autocommit(
         &self,
         job: CopyJob,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> Result<u64> {
         let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
@@ -100,7 +100,7 @@ impl QueryService {
         &self,
         mut txn: Transaction,
         job: CopyJob,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
         if txn.write_guard.is_none()
@@ -144,7 +144,7 @@ impl QueryService {
         &self,
         job: CopyJob,
         slot: Option<Transaction>,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
         match slot {
@@ -158,7 +158,7 @@ impl QueryService {
     fn copy_out_autocommit(
         &self,
         job: CopyJob,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<u64> {
         let (snapshot, _advertised) = self.capture_snapshot(0);
@@ -179,7 +179,7 @@ impl QueryService {
         &self,
         mut txn: Transaction,
         job: CopyJob,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
         let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);

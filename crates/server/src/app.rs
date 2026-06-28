@@ -42,6 +42,11 @@ pub struct ServerComponents {
     /// outcomes; this registry tracks which transactions are still running, for
     /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
     pub active_txns: ActiveTxnRegistry,
+    /// Row-lock wait coordination + deadlock detection (`docs/specs/deadlock.md`).
+    /// A writer that conflicts with an in-progress holder blocks here via the
+    /// [`common::ConflictWaiter`] installed on its `StatementContext`; commit/abort/
+    /// rollback wake waiters through [`crate::lock_manager::LockManager::on_txn_finished`].
+    pub lock_manager: Arc<crate::lock_manager::LockManager>,
     /// TLS acceptor when the server is configured for SSL, else `None`.
     pub tls: Option<TlsAcceptor>,
     /// Per-connection cancellation keys, used to act on `CancelRequest`.

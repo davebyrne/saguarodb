@@ -43,7 +43,7 @@ impl QueryService {
         kind: TransactionControl,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        _cancel: &AtomicBool,
+        _cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         match kind {
             TransactionControl::Begin(isolation) => match slot {
@@ -134,7 +134,7 @@ impl QueryService {
                 if txn.failed {
                     return (Some(txn), default_isolation, Err(failed_block_error()));
                 }
-                let subxid = self.register_active_txn();
+                let subxid = self.register_active_subxid(txn.txn_id);
                 txn.live_subxids.push(subxid);
                 txn.savepoints.push(SavepointLevel { name, subxid });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
@@ -181,7 +181,7 @@ impl QueryService {
                         txn.savepoints.truncate(idx);
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
-                        let fresh = self.register_active_txn();
+                        let fresh = self.register_active_subxid(txn.txn_id);
                         txn.live_subxids.push(fresh);
                         txn.savepoints.push(SavepointLevel {
                             name,
@@ -371,6 +371,7 @@ impl QueryService {
         // return. Appending a `Commit` for it is unnecessary; skip the WAL.
         if txn.write_guard.is_none() {
             self.components.active_txns.deregister_all(&family);
+            self.components.lock_manager.on_txn_finished();
             return Ok(());
         }
 
@@ -393,6 +394,8 @@ impl QueryService {
         // concurrent snapshot capture sees the family all-present (all invisible) or
         // all-absent (all settled), never a torn commit (`docs/specs/savepoints.md` §3).
         self.components.active_txns.deregister_all(&family);
+        // Wake any writer blocked on this transaction's row locks.
+        self.components.lock_manager.on_txn_finished();
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
 
@@ -424,6 +427,7 @@ impl QueryService {
                 .chain(txn.live_subxids.iter().copied())
                 .collect();
             self.components.active_txns.deregister_all(&family);
+            self.components.lock_manager.on_txn_finished();
             return;
         }
         // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
@@ -441,6 +445,9 @@ impl QueryService {
     /// no durable `Commit`/`CommitWithSubxids` anyway). Used by `ROLLBACK TO
     /// SAVEPOINT` and the top-level abort paths (`docs/specs/savepoints.md` §3, §5).
     pub(super) fn abort_subxids(&self, subxids: &[u64]) {
+        if subxids.is_empty() {
+            return;
+        }
         for &subxid in subxids {
             if let Err(err) = self.components.wal.append(WalRecord {
                 lsn: 0,
@@ -451,6 +458,8 @@ impl QueryService {
             }
         }
         self.components.active_txns.deregister_all(subxids);
+        // A partial ROLLBACK TO frees any writer blocked on a rolled-back subxid.
+        self.components.lock_manager.on_txn_finished();
     }
 
     /// Allocate the next transaction id and register it active atomically under
@@ -461,6 +470,17 @@ impl QueryService {
         self.components
             .active_txns
             .register_allocated(|| self.components.next_txn_id.fetch_add(1, Ordering::AcqRel))
+    }
+
+    /// Allocate and register a savepoint **subxid** owned by top-level `top`,
+    /// recording the subxid→top mapping so the deadlock detector can canonicalize
+    /// wait-for edges to transaction granularity (`docs/specs/deadlock.md` §4).
+    pub(super) fn register_active_subxid(&self, top: u64) -> u64 {
+        self.components
+            .active_txns
+            .register_subxid_allocated(top, || {
+                self.components.next_txn_id.fetch_add(1, Ordering::AcqRel)
+            })
     }
 
     /// The snapshot a statement of `txn` reads with, per isolation level
@@ -508,17 +528,21 @@ impl QueryService {
         isolation: IsolationLevel,
         gc_horizon: u64,
         live_txns: Arc<[u64]>,
-        cancel: &'a AtomicBool,
+        cancel: &'a Arc<AtomicBool>,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
+            // Install the lock manager (so an in-progress row-lock conflict blocks
+            // instead of failing fast) and the connection's cancel flag (so a blocked
+            // writer is interruptible) on the statement context — `docs/specs/deadlock.md`.
             statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
                 .with_gc_horizon(gc_horizon)
-                .with_live_txns(live_txns),
+                .with_live_txns(live_txns)
+                .with_conflict_waiter(self.components.lock_manager.clone(), cancel.clone()),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,
-            cancel,
+            cancel: cancel.as_ref(),
         }
     }
 
@@ -622,6 +646,8 @@ impl QueryService {
             eprintln!("failed to append Abort record for txn {txn_id}: {err}");
         }
         self.components.active_txns.deregister(txn_id);
+        // Wake any writer blocked on this aborted transaction's row locks.
+        self.components.lock_manager.on_txn_finished();
 
         // Abort is status-based (`docs/specs/mvcc.md` §4 Decision 3, Milestone D1):
         // there is NO before-image page undo. The transaction's modified tuples

@@ -23,7 +23,7 @@ impl QueryService {
         statement: Statement,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let class = match statement_class(&statement) {
             Ok(class) => class,
@@ -145,7 +145,7 @@ impl QueryService {
         txn: Transaction,
         class: StatementClass,
         statement: Statement,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         self.run_bound_in_transaction(txn, class, BindSource::Unbound(statement), cancel)
     }
@@ -161,7 +161,7 @@ impl QueryService {
         mut txn: Transaction,
         class: StatementClass,
         source: BindSource,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
         // `handle_transaction_control`, never reaching here).
@@ -283,7 +283,7 @@ impl QueryService {
         &self,
         class: StatementClass,
         statement: Statement,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
         let bound = bind(&statement, self.components.catalog.as_ref())?;
         match class {
@@ -319,7 +319,7 @@ impl QueryService {
     pub(super) fn autocommit_read(
         &self,
         bound: BoundStatement,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
         if let BoundStatement::Explain(inner) = &bound {
             return self.explain(inner.as_ref());
@@ -366,7 +366,7 @@ impl QueryService {
     pub(super) fn autocommit_write(
         &self,
         bound: BoundStatement,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
         // CREATE INDEX takes the exclusive guard (stable chain view for the HOT
         // broken-chain check); every other write/DDL takes the shared writer guard.

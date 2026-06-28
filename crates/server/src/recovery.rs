@@ -116,6 +116,13 @@ pub fn open_app(config: Config) -> Result<AppState> {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
         None => None,
     };
+    // The lock manager shares the registry handle (Arc-backed) so it can re-check a
+    // blocker's liveness and canonicalize wait-for edges to top-level txn ids.
+    let active_txns = crate::registry::ActiveTxnRegistry::new();
+    let lock_manager = Arc::new(crate::lock_manager::LockManager::new(
+        active_txns.clone(),
+        std::time::Duration::from_millis(config.deadlock_timeout_ms),
+    ));
     let components = Arc::new(ServerComponents {
         config,
         catalog,
@@ -133,7 +140,8 @@ pub fn open_app(config: Config) -> Result<AppState> {
         shutdown: Arc::new(ShutdownState::new()),
         next_txn_id: AtomicU64::new(next_txn_id),
         dead_rows_since_vacuum: AtomicU64::new(0),
-        active_txns: crate::registry::ActiveTxnRegistry::new(),
+        active_txns,
+        lock_manager,
         tls,
         cancel_registry: crate::cancel::CancelRegistry::new(),
     });

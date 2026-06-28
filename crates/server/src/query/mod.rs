@@ -182,7 +182,7 @@ impl QueryService {
         sql: &str,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let parsed = match parser::parse(sql) {
             Ok(parsed) => parsed,
@@ -198,7 +198,7 @@ impl QueryService {
     /// Backwards-compatible autocommit entry point: run one SQL string with no
     /// surrounding transaction. Used by the prepared-statement path and by tests.
     pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
-        self.execute_sql_cancelable(sql, &AtomicBool::new(false))
+        self.execute_sql_cancelable(sql, &Arc::new(AtomicBool::new(false)))
     }
 
     /// Like `execute_sql`, but aborts with `QueryCanceled` if `cancel` becomes
@@ -207,7 +207,7 @@ impl QueryService {
     pub fn execute_sql_cancelable(
         &self,
         sql: &str,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
         // The autocommit helper has no persistent session: pass the built-in default
         // and discard the returned (possibly updated) default. A bare `SET SESSION
@@ -292,7 +292,7 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        self.execute_prepared_cancelable(prepared, params, &AtomicBool::new(false))
+        self.execute_prepared_cancelable(prepared, params, &Arc::new(AtomicBool::new(false)))
     }
 
     /// Like `execute_prepared`, but cancelable mid-flight via `cancel`. Runs as an
@@ -305,7 +305,7 @@ impl QueryService {
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
         // Maintenance does not bind/plan; run it before parameter substitution. The
         // connection routes maintenance through `execute_prepared_in_session`, so this
@@ -358,7 +358,7 @@ impl QueryService {
         params: &[Value],
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
             return self.handle_transaction_control(kind, slot, default_isolation, cancel);
@@ -728,7 +728,7 @@ impl QueryService {
         &self,
         sql: &str,
         slot: Option<Transaction>,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         let (slot, _default, result) =
             self.execute_simple(sql, slot, IsolationLevel::default(), cancel);
@@ -759,7 +759,7 @@ mod tests {
             .execute_sql("insert into users (id) values (1)")
             .unwrap();
 
-        let cancel = AtomicBool::new(true);
+        let cancel = std::sync::Arc::new(AtomicBool::new(true));
         let err = app
             .query_service
             .execute_sql_cancelable("select id from users", &cancel)
@@ -775,7 +775,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key, name text)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         // BEGIN; INSERT; SELECT (sees own insert); COMMIT;
         let (slot, result) = app
             .query_service
@@ -824,7 +824,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key, name text)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, result) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -857,7 +857,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, result) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -896,7 +896,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -931,7 +931,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -954,7 +954,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, result) = app
             .query_service
             .execute_simple_default("commit", None, &cancel);
@@ -972,7 +972,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -1011,7 +1011,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
 
         // Contrast: with the session default Read Committed, the second SELECT in an
         // open transaction sees the concurrently-committed row.
@@ -1099,7 +1099,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (_slot, session_default, res) = app.query_service.execute_simple(
             "set session characteristics as transaction isolation level repeatable read",
             None,
@@ -1175,7 +1175,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (_slot, sd, res) = app.query_service.execute_simple(
             "set session characteristics as transaction isolation level repeatable read",
             None,
@@ -1230,7 +1230,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         // Open an explicit Read Committed transaction and capture its first snapshot.
         let (slot, sd, res) = app.query_service.execute_simple(
             "begin isolation level read committed",
@@ -1310,7 +1310,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, sd, res) = app.query_service.execute_simple(
             "set session characteristics as transaction read write",
             None,
@@ -1334,7 +1334,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = AtomicBool::new(false);
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (slot, sd, res) =
             app.query_service
                 .execute_simple("begin", None, IsolationLevel::default(), &cancel);
@@ -1376,7 +1376,7 @@ mod tests {
             .execute_sql("insert into users (id) values (1)")
             .unwrap();
 
-        let cancel = AtomicBool::new(true);
+        let cancel = std::sync::Arc::new(AtomicBool::new(true));
         let err = app
             .query_service
             .execute_sql_cancelable("insert into users (id) values (2)", &cancel)
