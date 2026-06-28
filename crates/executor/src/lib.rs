@@ -1388,6 +1388,67 @@ mod tests {
     }
 
     #[test]
+    fn string_functions_replace_position_left_right() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'hello world')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select replace(name, 'o', '0'), position('world' in name), \
+                 left(name, 5), right(name, 5), left(name, -6), right(name, -6) from users",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Text("hell0 w0rld".to_string()),
+                    Value::Integer(7), // 'world' begins at the 7th character
+                    Value::Text("hello".to_string()),
+                    Value::Text("world".to_string()),
+                    Value::Text("hello".to_string()), // all but the last 6
+                    Value::Text("world".to_string()), // all but the first 6
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn concat_skips_nulls_and_never_returns_null() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, null)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'Ada')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select concat(name, '-', name), concat(name) from users order by id")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    // Both NULLs are skipped, leaving just the separator and an
+                    // empty string (never NULL).
+                    values: vec![Value::Text("-".to_string()), Value::Text(String::new())],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("Ada-Ada".to_string()),
+                        Value::Text("Ada".to_string()),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness

@@ -135,6 +135,15 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         )?))),
         sql::Expr::Ceil { expr, field } => convert_ceil_floor("ceil", expr, field),
         sql::Expr::Floor { expr, field } => convert_ceil_floor("floor", expr, field),
+        // POSITION(substring IN string) -> position(substring, string).
+        sql::Expr::Position { expr, r#in } => Ok(Expr::Function {
+            name: "position".to_string(),
+            args: vec![
+                FunctionArg::Expr(convert_expr(expr)?),
+                FunctionArg::Expr(convert_expr(r#in)?),
+            ],
+            distinct: false,
+        }),
         sql::Expr::Function(function) => convert_function(function),
         sql::Expr::Substring {
             expr,

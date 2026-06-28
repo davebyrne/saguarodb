@@ -274,7 +274,12 @@ fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value>
     for arg in args {
         values.push(eval_expr(arg, row)?);
     }
-    // Every v1 scalar function is NULL-propagating.
+    // CONCAT ignores NULL arguments rather than propagating them, so it is handled
+    // before the blanket NULL short-circuit below.
+    if name == "concat" {
+        return eval_concat(&values);
+    }
+    // Every other scalar function is NULL-propagating.
     if values.iter().any(|value| matches!(value, Value::Null)) {
         return Ok(Value::Null);
     }
@@ -299,6 +304,10 @@ fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value>
         "sqrt" => eval_sqrt(&values[0]),
         "power" | "pow" => eval_power(&values[0], &values[1]),
         "mod" => eval_mod(&values[0], &values[1]),
+        "replace" => eval_replace(&values),
+        "position" => eval_position(&values),
+        "left" => eval_left_right(&values, true),
+        "right" => eval_left_right(&values, false),
         "substring" => eval_substring(&values),
         _ => Err(DbError::internal(format!(
             "unknown scalar function {name} reached the executor"
@@ -421,6 +430,80 @@ fn eval_mod(left: &Value, right: &Value) -> Result<Value> {
     left.checked_rem(right)
         .map(Value::Integer)
         .ok_or_else(integer_overflow)
+}
+
+/// `CONCAT(...)`: ignore NULL arguments and concatenate the rest; the result is
+/// the empty string when every argument is NULL (never NULL).
+fn eval_concat(values: &[Value]) -> Result<Value> {
+    let mut out = String::new();
+    for value in values {
+        match value {
+            Value::Null => {}
+            Value::Text(text) => out.push_str(text),
+            _ => return datatype_mismatch("concat requires text arguments"),
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+/// `REPLACE(string, from, to)`: replace every non-overlapping occurrence of
+/// `from` with `to`. An empty `from` leaves the string unchanged (matching
+/// PostgreSQL, unlike Rust's `str::replace`).
+fn eval_replace(values: &[Value]) -> Result<Value> {
+    let string = function_text(&values[0])?;
+    let from = function_text(&values[1])?;
+    let to = function_text(&values[2])?;
+    if from.is_empty() {
+        Ok(Value::Text(string.to_string()))
+    } else {
+        Ok(Value::Text(string.replace(from, to)))
+    }
+}
+
+/// `POSITION(substring, string)`: the 1-based character index of the first
+/// occurrence of `substring` in `string`, or 0 if absent. An empty substring is
+/// at position 1.
+fn eval_position(values: &[Value]) -> Result<Value> {
+    let needle: Vec<char> = function_text(&values[0])?.chars().collect();
+    let haystack: Vec<char> = function_text(&values[1])?.chars().collect();
+    let position = if needle.is_empty() {
+        1
+    } else if needle.len() > haystack.len() {
+        0
+    } else {
+        (0..=haystack.len() - needle.len())
+            .find(|&start| haystack[start..start + needle.len()] == needle[..])
+            .map_or(0, |start| (start + 1) as i64)
+    };
+    Ok(Value::Integer(position))
+}
+
+/// `LEFT(string, n)` / `RIGHT(string, n)`, by character. A negative `n` removes
+/// `|n|` characters from the far end (PostgreSQL semantics).
+fn eval_left_right(values: &[Value], left: bool) -> Result<Value> {
+    let chars: Vec<char> = function_text(&values[0])?.chars().collect();
+    let n = function_integer(&values[1])?;
+    let len = chars.len() as i64;
+    let result: String = if left {
+        // First `take` characters: `min(n, len)` for n >= 0, else all but the
+        // last `|n|` (`len + n`), clamped to `[0, len]`.
+        let take = if n >= 0 {
+            n.min(len)
+        } else {
+            len.saturating_add(n).max(0)
+        } as usize;
+        chars[..take].iter().collect()
+    } else {
+        // Characters from `start` to the end: skip the first `len - n` for n >= 0
+        // (keeping the last n), or skip the first `|n|` for n < 0.
+        let start = if n >= 0 {
+            len.saturating_sub(n).max(0)
+        } else {
+            n.saturating_neg().min(len)
+        } as usize;
+        chars[start..].iter().collect()
+    };
+    Ok(Value::Text(result))
 }
 
 pub(crate) fn sql_and(left: Value, right: Value) -> Result<Value> {

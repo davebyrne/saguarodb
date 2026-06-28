@@ -740,6 +740,41 @@ fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> 
             require_type(&args[1], DataType::Integer)?;
             Ok((DataType::Integer, nullable))
         }
+        "replace" => {
+            expect_arity(name, args, 3)?;
+            for arg in args {
+                require_type(arg, DataType::Text)?;
+            }
+            Ok((DataType::Text, nullable))
+        }
+        // POSITION(substring, string) -> 1-based index, 0 if not found.
+        "position" => {
+            expect_arity(name, args, 2)?;
+            require_type(&args[0], DataType::Text)?;
+            require_type(&args[1], DataType::Text)?;
+            Ok((DataType::Integer, nullable))
+        }
+        "left" | "right" => {
+            expect_arity(name, args, 2)?;
+            require_type(&args[0], DataType::Text)?;
+            require_type(&args[1], DataType::Integer)?;
+            Ok((DataType::Text, nullable))
+        }
+        // CONCAT is variadic over TEXT, ignores NULL arguments, and never returns
+        // NULL (empty string when every argument is NULL). Non-text arguments must
+        // be cast explicitly (no implicit cast).
+        "concat" => {
+            if args.is_empty() {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "concat requires at least one argument",
+                ));
+            }
+            for arg in args {
+                require_type(arg, DataType::Text)?;
+            }
+            Ok((DataType::Text, false))
+        }
         "substring" => {
             if args.len() != 2 && args.len() != 3 {
                 return Err(plan_error(

@@ -2403,3 +2403,43 @@ async fn e2e_math_functions() {
         ]]
     );
 }
+
+#[tokio::test]
+async fn e2e_string_functions() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, name) values (1, null)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, name) values (2, 'hello world')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select concat(name, '!'), replace(name, 'o', '0'), position('world' in name), \
+             left(name, 5), right(name, 5) from t order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            // CONCAT skips the NULL name; the NULL-propagating functions return NULL.
+            vec![Some("!".to_string()), None, None, None, None],
+            vec![
+                Some("hello world!".to_string()),
+                Some("hell0 w0rld".to_string()),
+                Some("7".to_string()),
+                Some("hello".to_string()),
+                Some("world".to_string()),
+            ],
+        ]
+    );
+}

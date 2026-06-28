@@ -1058,6 +1058,45 @@ mod tests {
     }
 
     #[test]
+    fn binder_assigns_string_function_result_types() {
+        let catalog = catalog_with_users();
+
+        // CONCAT never returns NULL, even over a nullable argument.
+        let bound = bind(
+            &parse("select concat(name, '!') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.columns[0].expr.data_type(), DataType::Text);
+        assert!(!select.columns[0].expr.nullable());
+
+        let cases = [
+            ("select replace(name, 'a', 'b') from users", DataType::Text),
+            ("select position('a' in name) from users", DataType::Integer),
+            ("select left(name, 2) from users", DataType::Text),
+            ("select right(name, 2) from users", DataType::Text),
+        ];
+        for (sql, expected) in cases {
+            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+            let BoundStatement::Select(select) = bound else {
+                panic!("expected bound select for {sql}");
+            };
+            assert_eq!(select.columns[0].expr.data_type(), expected, "for `{sql}`");
+        }
+
+        // LEFT requires an integer count.
+        let err = bind(
+            &parse("select left(name, 'x') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn binder_desugars_comma_from_list_into_cross_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select users.id from users, accounts").unwrap();

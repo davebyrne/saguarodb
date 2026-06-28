@@ -934,6 +934,21 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_position_into_function_call() {
+        let stmt = parse("select position('b' in name) from users").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            &select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { name, args, distinct: false },
+                ..
+            } if name == "position" && args.len() == 2
+        ));
+    }
+
+    #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
         let Statement::Select(select) = stmt else {
