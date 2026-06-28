@@ -185,12 +185,9 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => {
             let parsed = common::numeric::parse_numeric(text)
                 .ok_or_else(|| parse_error(format!("invalid numeric literal: \"{text}\"")))?;
-            // Apply any (precision, scale) carried by the literal's type.
-            let (precision, scale) = match info {
-                sql::ExactNumberInfo::None => (None, 0),
-                sql::ExactNumberInfo::Precision(p) => (Some(*p as u32), 0),
-                sql::ExactNumberInfo::PrecisionAndScale(p, s) => (Some(*p as u32), *s as u32),
-            };
+            // Validate and apply any (precision, scale) carried by the literal's
+            // type (shared with the column-type/CAST paths; rejects scale > precision).
+            let (precision, scale) = super::numeric_typmod(info)?;
             common::numeric::apply_typmod(parsed, precision, scale)
                 .map(|value| Expr::Literal(Value::Numeric(value)))
                 .ok_or_else(|| parse_error(format!("numeric literal out of range: \"{text}\"")))

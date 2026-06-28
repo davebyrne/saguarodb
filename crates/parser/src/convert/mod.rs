@@ -313,9 +313,11 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
     }
 }
 
-/// Convert a NUMERIC/DECIMAL type modifier into `DataType::Numeric`, validating
-/// precision (1..=28, our `Decimal` limit) and scale (`0..=precision`).
-fn convert_numeric_typmod(info: &sql::ExactNumberInfo) -> Result<DataType> {
+/// Validate a NUMERIC/DECIMAL type modifier and return `(precision, scale)`:
+/// precision must be `1..=28` (our `Decimal` limit) and scale `0..=precision`.
+/// Shared by the column-type, `CAST`, and typed-literal paths so all three reject
+/// the same way (and `apply_typmod`'s `scale <= precision` precondition holds).
+pub(super) fn numeric_typmod(info: &sql::ExactNumberInfo) -> Result<(Option<u32>, u32)> {
     let (precision, scale) = match info {
         sql::ExactNumberInfo::None => (None, 0_u64),
         sql::ExactNumberInfo::Precision(p) => (Some(*p), 0),
@@ -331,10 +333,13 @@ fn convert_numeric_typmod(info: &sql::ExactNumberInfo) -> Result<DataType> {
             )));
         }
     }
-    Ok(DataType::Numeric {
-        precision: precision.map(|p| p as u32),
-        scale: scale as u32,
-    })
+    Ok((precision.map(|p| p as u32), scale as u32))
+}
+
+/// Convert a NUMERIC/DECIMAL type modifier into `DataType::Numeric`.
+fn convert_numeric_typmod(info: &sql::ExactNumberInfo) -> Result<DataType> {
+    let (precision, scale) = numeric_typmod(info)?;
+    Ok(DataType::Numeric { precision, scale })
 }
 
 /// Extract the declared maximum length (in characters) of a bounded character

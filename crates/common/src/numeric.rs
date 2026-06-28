@@ -65,7 +65,9 @@ pub fn apply_typmod(value: Decimal, precision: Option<u32>, scale: u32) -> Optio
     };
     let mut rounded = value.round_dp_with_strategy(scale, RoundingStrategy::MidpointAwayFromZero);
     // The integer part must fit `p - scale` digits, i.e. |value| < 10^(p - scale).
-    let limit = pow10(i32::try_from(p - scale).ok()?)?;
+    // `checked_sub` guards the documented `scale <= precision` precondition so a
+    // bad caller gets `None` rather than a panic.
+    let limit = pow10(i32::try_from(p.checked_sub(scale)?).ok()?)?;
     if rounded.abs() >= limit {
         return None;
     }
@@ -354,6 +356,9 @@ mod tests {
             "0.99"
         );
         assert_eq!(apply_typmod(d("1.00"), Some(2), 2), None);
+        // Defense-in-depth: scale > precision returns None, never panics on the
+        // `precision - scale` subtraction.
+        assert_eq!(apply_typmod(d("1.23"), Some(2), 5), None);
     }
 
     #[test]

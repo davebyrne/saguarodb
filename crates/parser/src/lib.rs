@@ -30,6 +30,19 @@ mod tests {
     }
 
     #[test]
+    fn numeric_typed_literal_validates_precision_and_scale() {
+        // A valid NUMERIC literal parses.
+        assert!(parse("select numeric '1.23' from t").is_ok());
+        // scale > precision is rejected cleanly (a parse error), not a panic.
+        let err = parse("select numeric(2,5) '1.23' from t").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+        // precision beyond the Decimal limit (28) is likewise rejected at parse.
+        let err = parse("select numeric(50,2) '1.23' from t").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+    }
+
+    #[test]
     fn parses_select_with_alias_and_qualified_wildcard() {
         let stmt = parse("select users.*, name as n from users where id = 7").unwrap();
 
