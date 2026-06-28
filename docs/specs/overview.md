@@ -1106,7 +1106,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 
 ### Expression Evaluator
 
-A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ABS`, and `SUBSTRING`. Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
+A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Value`. Column access is by slot index (`exec_row.row.values[input_ref.slot]`) — no schema lookup needed at evaluation time. Handles arithmetic, comparisons, the NULL-safe `IS [NOT] DISTINCT FROM`, string concatenation (`||`), boolean logic, NULL propagation (three-valued logic), `CASE`, `CAST`, `IN`, `LIKE`, `BETWEEN`, and the scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM`, `ABS`, and `SUBSTRING` (`COALESCE`/`NULLIF` are desugared to `CASE` by the binder). Aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) are evaluated by `AggregateOp`, not scalar expression evaluation. Type information is carried in bound expressions (`data_type`, `nullable`), so the evaluator can validate without external lookups.
 
 Expression semantics:
 

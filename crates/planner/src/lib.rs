@@ -973,6 +973,66 @@ mod tests {
     }
 
     #[test]
+    fn binder_desugars_coalesce_to_case_with_tight_nullability() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select coalesce(name, 'fallback') from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        let expr = &select.columns[0].expr;
+        assert!(matches!(expr, BoundExpr::Case { .. }));
+        assert_eq!(expr.data_type(), DataType::Text);
+        // A non-null fallback makes the whole COALESCE non-nullable.
+        assert!(!expr.nullable());
+    }
+
+    #[test]
+    fn binder_coalesce_all_nullable_stays_nullable() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select coalesce(name, name) from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(select.columns[0].expr.nullable());
+    }
+
+    #[test]
+    fn binder_coalesce_rejects_type_mismatch() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select coalesce(name, 1) from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_nullif_is_nullable_and_typed_from_first_arg() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select nullif(id, 0) from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        let expr = &select.columns[0].expr;
+        assert_eq!(expr.data_type(), DataType::Integer);
+        assert!(expr.nullable());
+    }
+
+    #[test]
+    fn binder_is_distinct_from_is_never_null() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id is distinct from 1 from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        let expr = &select.columns[0].expr;
+        assert_eq!(expr.data_type(), DataType::Boolean);
+        assert!(!expr.nullable());
+    }
+
+    #[test]
     fn binder_desugars_comma_from_list_into_cross_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select users.id from users, accounts").unwrap();

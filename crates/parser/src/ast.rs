@@ -273,6 +273,10 @@ pub enum BinOp {
     And,
     Or,
     Concat,
+    /// `a IS DISTINCT FROM b` — NULL-safe inequality (never returns NULL).
+    IsDistinctFrom,
+    /// `a IS NOT DISTINCT FROM b` — NULL-safe equality (never returns NULL).
+    IsNotDistinctFrom,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

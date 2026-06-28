@@ -115,7 +115,25 @@ fn eval_binary(left: &BoundExpr, op: BinOp, right: &BoundExpr, row: &ExecRow) ->
         BinOp::And => sql_and(left, right),
         BinOp::Or => sql_or(left, right),
         BinOp::Concat => concat_values(left, right),
+        BinOp::IsDistinctFrom => eval_is_distinct(left, right, false),
+        BinOp::IsNotDistinctFrom => eval_is_distinct(left, right, true),
     }
+}
+
+/// NULL-safe comparison backing `IS [NOT] DISTINCT FROM`. Two NULLs are *not*
+/// distinct; a NULL and a non-NULL are distinct; otherwise it follows ordinary
+/// equality. The result is always a boolean, never NULL.
+fn eval_is_distinct(left: Value, right: Value, not: bool) -> Result<Value> {
+    let equal = match (&left, &right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => matches!(
+            compare_values(&left, BinOp::Eq, &right)?,
+            Value::Boolean(true)
+        ),
+    };
+    // `a IS DISTINCT FROM b` is `!equal`; `a IS NOT DISTINCT FROM b` is `equal`.
+    Ok(Value::Boolean(if not { equal } else { !equal }))
 }
 
 fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {

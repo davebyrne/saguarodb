@@ -267,7 +267,10 @@ fn fold_binary(op: BinOp, left: &Value, right: &Value) -> Option<Value> {
             };
             Some(Value::Boolean(result))
         }
-        BinOp::And | BinOp::Or => None,
+        // Boolean and NULL-safe operators are not constant-folded here: the
+        // distinct operators are only reached with two non-NULL literals (their
+        // interesting cases involve NULL), so folding them buys nothing.
+        BinOp::And | BinOp::Or | BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => None,
     }
 }
 

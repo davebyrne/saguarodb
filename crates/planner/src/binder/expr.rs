@@ -368,6 +368,18 @@ fn bind_binary_op(
                 nullable,
             })
         }
+        BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom => {
+            // Same-type operands like an ordinary comparison, but the result is a
+            // NULL-safe boolean that is never NULL itself.
+            let (left, right) = bind_comparison_operands(ctx, left, right)?;
+            Ok(BoundExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+                data_type: DataType::Boolean,
+                nullable: false,
+            })
+        }
     }
 }
 
@@ -454,7 +466,122 @@ fn bind_function(
             format!("function {name} does not support DISTINCT"),
         ));
     }
+    match name.as_str() {
+        "coalesce" => return bind_coalesce(ctx, args),
+        "nullif" => return bind_nullif(ctx, args),
+        _ => {}
+    }
     bind_scalar_function(ctx, &name, args)
+}
+
+/// Extract the plain expression arguments of a call, rejecting `*` wildcards.
+fn expr_args<'a>(name: &str, args: &'a [FunctionArg]) -> Result<Vec<&'a Expr>> {
+    args.iter()
+        .map(|arg| match arg {
+            FunctionArg::Expr(expr) => Ok(expr),
+            FunctionArg::Wildcard => Err(plan_error(
+                SqlState::SyntaxError,
+                format!("function {name} does not accept a wildcard argument"),
+            )),
+        })
+        .collect()
+}
+
+/// `COALESCE(v1, ..., vn)` returns the first non-NULL argument. It is desugared
+/// to a searched `CASE`: `CASE WHEN v1 IS NOT NULL THEN v1 ... ELSE vn END`. All
+/// arguments must share one type (no implicit cast); a bare untyped NULL takes
+/// its type from a sibling. The result is non-nullable when any argument is.
+fn bind_coalesce(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let exprs = expr_args("coalesce", args)?;
+    if exprs.is_empty() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "coalesce requires at least one argument",
+        ));
+    }
+
+    // First pass: infer the common type from the non-NULL arguments.
+    let mut inferred: Option<DataType> = None;
+    for expr in &exprs {
+        if is_null_literal(expr) {
+            continue;
+        }
+        let bound = bind_expr(ctx, expr, inferred.clone())?;
+        match &inferred {
+            Some(data_type) => require_type(&bound, data_type.clone())?,
+            None => inferred = Some(bound.data_type()),
+        }
+    }
+    let data_type = inferred.ok_or_else(|| {
+        plan_error(
+            SqlState::DatatypeMismatch,
+            "coalesce requires at least one argument with a known type",
+        )
+    })?;
+
+    // Second pass: bind every argument with the resolved type.
+    let mut bound = Vec::with_capacity(exprs.len());
+    for expr in &exprs {
+        let arg = bind_expr(ctx, expr, Some(data_type.clone()))?;
+        require_type(&arg, data_type.clone())?;
+        bound.push(arg);
+    }
+
+    // COALESCE is non-null exactly when some argument can never be NULL.
+    let nullable = bound.iter().all(BoundExpr::nullable);
+    let last = bound.pop().expect("coalesce has at least one argument");
+    let when_clauses = bound
+        .into_iter()
+        .map(|arg| {
+            let guard = BoundExpr::IsNotNull {
+                expr: Box::new(arg.clone()),
+                data_type: DataType::Boolean,
+                nullable: false,
+            };
+            (guard, arg)
+        })
+        .collect();
+    Ok(BoundExpr::Case {
+        operand: None,
+        when_clauses,
+        else_clause: Some(Box::new(last)),
+        data_type,
+        nullable,
+    })
+}
+
+/// `NULLIF(a, b)` returns NULL when `a = b`, otherwise `a`. It is desugared to
+/// `CASE WHEN a = b THEN NULL ELSE a END`. The operands must be comparable (same
+/// type); the result is always nullable.
+fn bind_nullif(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let exprs = expr_args("nullif", args)?;
+    let [a, b] = exprs.as_slice() else {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "nullif requires exactly two arguments",
+        ));
+    };
+    let (a, b) = bind_comparison_operands(ctx, a, b)?;
+    let data_type = a.data_type();
+    let equals = BoundExpr::BinaryOp {
+        left: Box::new(a.clone()),
+        op: BinOp::Eq,
+        right: Box::new(b),
+        data_type: DataType::Boolean,
+        nullable: a.nullable(),
+    };
+    let then_null = BoundExpr::Literal {
+        value: Value::Null,
+        data_type: data_type.clone(),
+        nullable: true,
+    };
+    Ok(BoundExpr::Case {
+        operand: None,
+        when_clauses: vec![(equals, then_null)],
+        else_clause: Some(Box::new(a)),
+        data_type,
+        nullable: true,
+    })
 }
 
 fn bind_aggregate(
@@ -918,6 +1045,8 @@ fn convert_bin_op(op: parser::BinOp) -> BinOp {
         parser::BinOp::And => BinOp::And,
         parser::BinOp::Or => BinOp::Or,
         parser::BinOp::Concat => BinOp::Concat,
+        parser::BinOp::IsDistinctFrom => BinOp::IsDistinctFrom,
+        parser::BinOp::IsNotDistinctFrom => BinOp::IsNotDistinctFrom,
     }
 }
 

@@ -40,6 +40,16 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         },
         sql::Expr::IsNull(expr) => Ok(Expr::IsNull(Box::new(convert_expr(expr)?))),
         sql::Expr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(convert_expr(expr)?))),
+        sql::Expr::IsDistinctFrom(left, right) => Ok(Expr::BinaryOp {
+            left: Box::new(convert_expr(left)?),
+            op: BinOp::IsDistinctFrom,
+            right: Box::new(convert_expr(right)?),
+        }),
+        sql::Expr::IsNotDistinctFrom(left, right) => Ok(Expr::BinaryOp {
+            left: Box::new(convert_expr(left)?),
+            op: BinOp::IsNotDistinctFrom,
+            right: Box::new(convert_expr(right)?),
+        }),
         sql::Expr::InList {
             expr,
             list,

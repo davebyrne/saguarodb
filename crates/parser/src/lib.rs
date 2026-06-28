@@ -813,6 +813,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_coalesce_nullif_and_distinct_operators() {
+        let stmt = parse(
+            "select coalesce(name, 'x'), nullif(id, 0), id is distinct from 1, \
+             id is not distinct from 2 from users",
+        )
+        .unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        // COALESCE / NULLIF parse as ordinary function calls (the binder desugars
+        // them to CASE).
+        assert!(matches!(
+            &select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { name, .. },
+                ..
+            } if name.eq_ignore_ascii_case("coalesce")
+        ));
+        assert!(matches!(
+            &select.columns[1],
+            SelectItem::Expression {
+                expr: Expr::Function { name, .. },
+                ..
+            } if name.eq_ignore_ascii_case("nullif")
+        ));
+        assert!(matches!(
+            select.columns[2],
+            SelectItem::Expression {
+                expr: Expr::BinaryOp {
+                    op: BinOp::IsDistinctFrom,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            select.columns[3],
+            SelectItem::Expression {
+                expr: Expr::BinaryOp {
+                    op: BinOp::IsNotDistinctFrom,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
         let Statement::Select(select) = stmt else {

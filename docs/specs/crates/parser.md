@@ -172,6 +172,8 @@ pub enum BinOp {
     And,
     Or,
     Concat,
+    IsDistinctFrom,    // a IS DISTINCT FROM b (NULL-safe)
+    IsNotDistinctFrom, // a IS NOT DISTINCT FROM b (NULL-safe)
 }
 
 pub enum UnaryOp {
@@ -189,6 +191,8 @@ Parser `BinOp` and `UnaryOp` variants use the same names as planner expression o
 Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`, and `COUNT(DISTINCT id)` is `Function { name: "count", args: vec![FunctionArg::Expr(...)] , distinct: true }`. Binder converts `COUNT(*)` to `BoundExpr::AggregateCall { arg: None, ... }`, carries `distinct: true` through to `BoundExpr::AggregateCall { distinct: true, ... }` so the executor de-duplicates the argument (e.g. `COUNT(DISTINCT id)`), and rejects `FunctionArg::Wildcard` for non-`COUNT` functions, mixed with other arguments, or combined with `DISTINCT` (`COUNT(DISTINCT *)`).
 
 The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` grammar (and the comma form `SUBSTRING(expr, start[, length])`) is normalized into ordinary `Function { name: "trim" | "substring", ... }` calls so the binder treats them uniformly. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported.
+
+`a IS [NOT] DISTINCT FROM b` parses to `BinaryOp { op: BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom, ... }`. `COALESCE(...)` and `NULLIF(a, b)` parse as ordinary `Function` calls (named `coalesce`/`nullif`); the binder desugars them to `CASE` because, unlike the generic scalar functions, they are not NULL-propagating.
 
 ## SQL Scope
 

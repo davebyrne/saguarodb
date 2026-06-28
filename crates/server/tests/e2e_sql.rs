@@ -2283,3 +2283,59 @@ async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
         vec![vec![Some("3".to_string()), Some("2".to_string())]]
     );
 }
+
+#[tokio::test]
+async fn e2e_coalesce_nullif_and_distinct_operators() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, name) values (1, null)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, name) values (2, 'Ada')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select coalesce(name, 'none'), nullif(id, 1), \
+             name is distinct from 'Ada', name is not distinct from null \
+             from t order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("none".to_string()),
+                None,
+                Some("t".to_string()),
+                Some("t".to_string()),
+            ],
+            vec![
+                Some("Ada".to_string()),
+                Some("2".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+            ],
+        ]
+    );
+
+    // No implicit cast: COALESCE arguments must share a type.
+    let err = server
+        .simple_query("select coalesce(name, 1) from t")
+        .await
+        .err()
+        .expect("expected type-mismatched COALESCE to be rejected");
+    assert!(
+        err.message.contains("42804"),
+        "expected datatype_mismatch, got: {}",
+        err.message
+    );
+}

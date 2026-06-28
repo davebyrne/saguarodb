@@ -1193,6 +1193,88 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_returns_first_non_null_argument() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, null)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'set')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select coalesce(name, 'fallback') from users order by id")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Text("fallback".to_string())],
+                },
+                Row {
+                    values: vec![Value::Text("set".to_string())],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nullif_returns_null_when_arguments_are_equal() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (5, 'a')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (7, 'b')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select nullif(id, 5) from users order by id")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Null],
+                },
+                Row {
+                    values: vec![Value::Integer(7)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn is_distinct_from_treats_nulls_safely() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, null)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select name is distinct from null, name is not distinct from null, \
+                 id is distinct from id from users",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    // NULL is *not* distinct from NULL.
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    // 1 is *not* distinct from 1.
+                    Value::Boolean(false),
+                ],
+            }]
+        );
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness
