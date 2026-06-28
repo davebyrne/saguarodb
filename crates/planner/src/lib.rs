@@ -705,6 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_parameter_number_above_maximum() {
+        // PostgreSQL caps bind parameters at 65535 (the wire protocol uses a
+        // 16-bit parameter count). A `$N` above that must be rejected at bind
+        // time — otherwise `collect_param_types` resizes a Vec to `N` entries,
+        // and an attacker-supplied `$4294967295` forces a multi-GB allocation
+        // (process abort, whole-server DoS).
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $70000").unwrap();
+        let err = bind_parameterized(&stmt, &catalog, &[]).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn accepts_parameter_number_at_maximum() {
+        // $65535 is the boundary (PostgreSQL's maximum) and must NOT be rejected
+        // by the cap. Declared types are supplied for every position so the only
+        // thing that could reject it is an off-by-one in the cap check.
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = $65535").unwrap();
+        let declared = vec![Some(DataType::Integer); 65535];
+        assert!(bind_parameterized(&stmt, &catalog, &declared).is_ok());
+    }
+
+    #[test]
     fn simple_bind_rejects_parameters() {
         let catalog = catalog_with_users();
         let stmt = parse("select id from users where id = $1").unwrap();

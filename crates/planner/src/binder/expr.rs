@@ -80,13 +80,25 @@ pub(super) fn bind_expr(
     }
 }
 
+/// PostgreSQL caps the number of bind parameters at 65535 (the wire protocol
+/// carries the parameter count in a 16-bit field). We enforce the same ceiling so
+/// a large `$n` can never drive an unbounded allocation in `collect_param_types`
+/// (`record_param` resizes a `Vec` to `n`, so an unbounded `$4294967295` would
+/// attempt a multi-GB allocation and abort the process).
+const MAX_PARAM_NUMBER: u32 = u16::MAX as u32;
+
 fn bind_placeholder(
     ctx: &BindContext,
     index: u32,
     expected: Option<DataType>,
 ) -> Result<BoundExpr> {
-    let slot = usize::try_from(index - 1)
-        .map_err(|_| plan_error(SqlState::SyntaxError, "invalid parameter index"))?;
+    if index == 0 || index > MAX_PARAM_NUMBER {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("parameter number ${index} is out of range (must be 1..={MAX_PARAM_NUMBER})"),
+        ));
+    }
+    let slot = (index - 1) as usize;
     let declared = ctx.declared_param(slot);
     let data_type = match (declared, expected) {
         (Some(declared), Some(expected)) if declared != expected => {
