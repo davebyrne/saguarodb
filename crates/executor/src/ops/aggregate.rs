@@ -205,6 +205,7 @@ enum FoldKind {
 fn fold_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], kind: FoldKind) -> Result<Value> {
     match aggregate.data_type {
         DataType::Double => float_fold_aggregate(aggregate, rows, kind),
+        DataType::Real => real_fold_aggregate(aggregate, rows, kind),
         DataType::Numeric { .. } => numeric_fold_aggregate(aggregate, rows, kind),
         _ => integer_fold_aggregate(aggregate, rows, kind),
     }
@@ -275,6 +276,40 @@ fn float_fold_aggregate(
     match kind {
         FoldKind::Sum => Ok(Value::Float(sum.into())),
         FoldKind::Avg => Ok(Value::Float((sum / count as f64).into())),
+    }
+}
+
+fn real_fold_aggregate(
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    kind: FoldKind,
+) -> Result<Value> {
+    let values = aggregate_values(aggregate, rows)?;
+    let mut sum = 0.0_f32;
+    let mut count = 0_i64;
+    for value in values {
+        match value {
+            Value::Null => {}
+            Value::Real(value) => {
+                sum += value.0;
+                count += 1;
+            }
+            _ => {
+                return Err(DbError::execute(
+                    SqlState::DatatypeMismatch,
+                    "SUM and AVG require numeric input",
+                ));
+            }
+        }
+    }
+
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+
+    match kind {
+        FoldKind::Sum => Ok(Value::Real(sum.into())),
+        FoldKind::Avg => Ok(Value::Real((sum / count as f32).into())),
     }
 }
 

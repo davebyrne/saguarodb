@@ -885,6 +885,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
         (&column.data_type, value),
         (DataType::Integer, Value::Integer(_))
             | (DataType::Double, Value::Float(_))
+            | (DataType::Real, Value::Real(_))
             | (DataType::Numeric { .. }, Value::Numeric(_))
             | (DataType::Text, Value::Text(_))
             | (DataType::Boolean, Value::Boolean(_))
@@ -946,5 +947,6 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Uuid => "UUID",
         DataType::Double => "DOUBLE PRECISION",
         DataType::Numeric { .. } => "NUMERIC",
+        DataType::Real => "REAL",
     }
 }

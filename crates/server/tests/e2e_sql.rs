@@ -1692,6 +1692,89 @@ async fn e2e_numeric_arithmetic_and_aggregates() {
 }
 
 #[tokio::test]
+async fn e2e_real_round_trips_arithmetic_aggregates_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, r real)")
+        .await
+        .unwrap();
+    for (id, lit) in [(1, "2.5"), (2, "7.5")] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, r) values ({id}, REAL '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Round-trip + ordering.
+    let rows = server
+        .simple_query("select r from t order by r")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("2.5".to_string())], vec![Some("7.5".to_string())]]
+    );
+
+    // Arithmetic, aggregates, and casts (REAL -> DOUBLE/INTEGER, INTEGER -> REAL).
+    let rows = server
+        .simple_query(
+            "select cast(REAL '1.5' + REAL '2.0' as text), cast(REAL '1.5' * REAL '2.0' as text), \
+             cast(sum(r) as text), cast(avg(r) as text), cast(cast(2 as real) as text) from t",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3.5".to_string()),
+            Some("3".to_string()),
+            Some("10".to_string()), // sum 2.5 + 7.5
+            Some("5".to_string()),  // avg 5.0
+            Some("2".to_string()),
+        ]]
+    );
+
+    // REAL primary key uses an index.
+    server
+        .simple_query("create table k (r real primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into k (r, note) values (REAL '2.5', 'x')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from k where r = REAL '2.5'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "REAL primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+
+    // No implicit cross-family coercion: REAL with DOUBLE, or a double literal
+    // into a REAL column.
+    let err = server
+        .simple_query("select REAL '1.5' + 1.0 from t where id = 1")
+        .await
+        .err()
+        .expect("real + double should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+    let err = server
+        .simple_query("insert into t (id, r) values (9, 1.5)")
+        .await
+        .err()
+        .expect("double literal into real column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

@@ -20,7 +20,7 @@ pub use concurrency::{
 pub use context::{ConflictWaiter, SsiTracker, StatementContext};
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
-pub use float::OrderedF64;
+pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};
 pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,

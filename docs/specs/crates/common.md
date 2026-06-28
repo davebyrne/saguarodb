@@ -58,6 +58,7 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Float(OrderedF64), // DOUBLE PRECISION (total-order f64 wrapper)
+    Real(OrderedF32),  // REAL (total-order f32 wrapper)
     Numeric(Decimal),  // NUMERIC/DECIMAL (exact decimal; compares by value)
     Text(String),
     Date(i64),       // days from the Unix epoch (1970-01-01)
@@ -74,7 +75,8 @@ not implement `Ord`/`Eq`/`Hash`, so `Value::Float` wraps it in the `float`
 module's `OrderedF64`, which supplies a total order matching PostgreSQL's float
 btree semantics (`NaN` sorts greatest and equals itself, `-0.0 == +0.0`) and a
 consistent `Hash`, keeping `Value`'s derives valid for keys, `DISTINCT`, and
-grouping. The `datetime` module provides the proleptic Gregorian calendar
+grouping. `Value::Real` wraps `f32` the same way in `OrderedF32` (with
+`format_real`/`parse_real`). The `datetime` module provides the proleptic Gregorian calendar
 conversions and the `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format
 helpers (`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
 `parse_timestamp`, `format_timestamp`); the `bytea` module provides the hex
@@ -136,6 +138,7 @@ pub enum DataType {
     Bytea,
     Uuid,
     Double,
+    Real,
     Numeric { precision: Option<u32>, scale: u32 },
 }
 

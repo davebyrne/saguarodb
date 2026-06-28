@@ -147,6 +147,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Numeric { .. } => common::numeric::parse_numeric(text)
             .map(Value::Numeric)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for numeric: \"{text}\""))),
+        DataType::Real => common::float::parse_real(text)
+            .map(|value| Value::Real(value.into()))
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for real: \"{text}\""))),
     }
 }
 
@@ -387,6 +390,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Uuid(raw) => Some(common::uuid::format_uuid(raw)),
         Value::Float(value) => Some(common::float::format_double(value.0)),
         Value::Numeric(value) => Some(common::numeric::format_numeric(value)),
+        Value::Real(value) => Some(common::float::format_real(value.0)),
     }
 }
 

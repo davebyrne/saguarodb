@@ -73,6 +73,7 @@ const KEY_TAG_BYTEA: u8 = 6;
 const KEY_TAG_UUID: u8 = 7;
 const KEY_TAG_DOUBLE: u8 = 8;
 const KEY_TAG_NUMERIC: u8 = 9;
+const KEY_TAG_REAL: u8 = 10;
 
 /// Serialize a `NUMERIC` value as its exact `i128` mantissa (16 bytes LE) plus
 /// `u32` scale (4 bytes LE) — a fixed 20 bytes that preserves value and scale.
@@ -144,6 +145,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Numeric(value) => {
                 bytes.push(KEY_TAG_NUMERIC);
                 put_numeric(&mut bytes, value);
+            }
+            Value::Real(value) => {
+                bytes.push(KEY_TAG_REAL);
+                bytes.extend_from_slice(&value.0.to_le_bytes());
             }
         }
     }
@@ -220,6 +225,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 Value::Float(f64::from_le_bytes(raw.try_into().expect("8 bytes")).into())
             }
             KEY_TAG_NUMERIC => Value::Numeric(read_numeric(bytes, &mut offset)?),
+            KEY_TAG_REAL => {
+                let raw = read_exact(bytes, &mut offset, 4)?;
+                Value::Real(f32::from_le_bytes(raw.try_into().expect("4 bytes")).into())
+            }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
         values.push(value);
@@ -285,6 +294,9 @@ pub(crate) fn encode_row_with_infomask(
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             Value::Float(value) if column.data_type == DataType::Double => {
+                bytes.extend_from_slice(&value.0.to_le_bytes());
+            }
+            Value::Real(value) if column.data_type == DataType::Real => {
                 bytes.extend_from_slice(&value.0.to_le_bytes());
             }
             Value::Numeric(value) if matches!(column.data_type, DataType::Numeric { .. }) => {
@@ -388,6 +400,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 Value::Float(f64::from_le_bytes(array).into())
             }
             DataType::Numeric { .. } => Value::Numeric(read_numeric(bytes, &mut offset)?),
+            DataType::Real => {
+                let raw = read_exact(bytes, &mut offset, 4)?;
+                let mut array = [0; 4];
+                array.copy_from_slice(raw);
+                Value::Real(f32::from_le_bytes(array).into())
+            }
             DataType::Text => {
                 let raw_len = read_exact(bytes, &mut offset, 4)?;
                 let mut array = [0; 4];
@@ -625,6 +643,7 @@ mod tests {
                 Value::Uuid(value) => bytes.extend_from_slice(value),
                 Value::Float(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
                 Value::Numeric(value) => put_numeric(&mut bytes, value),
+                Value::Real(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
             }
         }
         bytes

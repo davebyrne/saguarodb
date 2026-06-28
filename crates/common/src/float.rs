@@ -115,6 +115,100 @@ pub fn parse_double(text: &str) -> Option<f64> {
     text.trim().parse::<f64>().ok()
 }
 
+/// An `f32` with a total order, the `REAL` analogue of [`OrderedF64`] (same NaN /
+/// signed-zero semantics) so `Value::Real` keeps `Value`'s derived
+/// `Ord`/`Eq`/`Hash`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrderedF32(pub f32);
+
+impl OrderedF32 {
+    #[inline]
+    pub fn new(value: f32) -> Self {
+        OrderedF32(value)
+    }
+
+    #[inline]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl From<f32> for OrderedF32 {
+    fn from(value: f32) -> Self {
+        OrderedF32(value)
+    }
+}
+
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.0.partial_cmp(&other.0).expect("non-NaN comparison"),
+        }
+    }
+}
+
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for OrderedF32 {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for OrderedF32 {}
+
+impl Hash for OrderedF32 {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let bits = if self.0.is_nan() {
+            f32::NAN.to_bits()
+        } else if self.0 == 0.0 {
+            0
+        } else {
+            self.0.to_bits()
+        };
+        bits.hash(state);
+    }
+}
+
+/// Format a single-precision float for text output, like [`format_double`] but
+/// for `f32` (shortest round-trippable; `Infinity`/`-Infinity`/`NaN` for
+/// non-finite values).
+pub fn format_real(value: f32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output always contains an exponent");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("`{:e}` exponent is a base-10 integer");
+    if (-4..=15).contains(&exponent) {
+        format!("{value}")
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
+/// Parse a single-precision float from text (decimal/scientific plus the
+/// `Infinity`/`-Infinity`/`NaN` spellings; surrounding whitespace ignored).
+pub fn parse_real(text: &str) -> Option<f32> {
+    text.trim().parse::<f32>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +218,37 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         OrderedF64(value).hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn hash32_of(value: f32) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        OrderedF32(value).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn ordered_f32_matches_f64_semantics() {
+        let mut v = [
+            OrderedF32(1.0),
+            OrderedF32(f32::NAN),
+            OrderedF32(-1.0),
+            OrderedF32(f32::INFINITY),
+        ];
+        v.sort();
+        assert_eq!(v[0].0, -1.0);
+        assert_eq!(v[1].0, 1.0);
+        assert_eq!(v[2].0, f32::INFINITY);
+        assert!(v[3].0.is_nan()); // NaN sorts last
+        assert_eq!(OrderedF32(f32::NAN), OrderedF32(f32::NAN));
+        assert_eq!(OrderedF32(-0.0), OrderedF32(0.0));
+        assert_eq!(hash32_of(-0.0), hash32_of(0.0));
+        assert_eq!(hash32_of(f32::NAN), hash32_of(f32::NAN));
+        // Text round-trips, with PostgreSQL spellings for non-finite values.
+        assert_eq!(format_real(1.5), "1.5");
+        assert_eq!(format_real(f32::INFINITY), "Infinity");
+        assert_eq!(format_real(f32::NAN), "NaN");
+        assert_eq!(parse_real(&format_real(123.456)), Some(123.456_f32));
+        assert_eq!(parse_real("1e20"), Some(1e20_f32));
     }
 
     #[test]

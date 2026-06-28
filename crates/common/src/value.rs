@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::float::OrderedF64;
+use crate::float::{OrderedF32, OrderedF64};
 use crate::numeric::Decimal;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -12,6 +12,9 @@ pub enum Value {
     /// greatest and equals itself, `-0.0 == +0.0`) so `Value`'s derived
     /// `Ord`/`Eq`/`Hash` stay valid for keys, `DISTINCT`, and grouping.
     Float(OrderedF64),
+    /// `REAL` (single precision), an IEEE 754 `f32` wrapped for a total order
+    /// (same NaN / signed-zero rules as `Float`).
+    Real(OrderedF32),
     /// `NUMERIC` / `DECIMAL`, an exact base-10 value carrying its own scale.
     /// `Decimal` compares and hashes by value (`1.0` == `1.00`), so the derived
     /// `Ord`/`Eq`/`Hash` stay valid for keys, `DISTINCT`, and grouping.

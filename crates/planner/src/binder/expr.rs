@@ -226,6 +226,7 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Boolean(_) => (DataType::Boolean, false),
         Value::Integer(_) => (DataType::Integer, false),
         Value::Float(_) => (DataType::Double, false),
+        Value::Real(_) => (DataType::Real, false),
         Value::Numeric(_) => (
             DataType::Numeric {
                 precision: None,
@@ -247,14 +248,15 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
 }
 
 /// The numeric "family" of a type for arithmetic compatibility: `INTEGER` (0),
-/// `DOUBLE PRECISION` (1), or `NUMERIC` (2, regardless of `(precision, scale)`);
-/// `None` for non-numeric types. Operands must share a family — there is no
-/// implicit coercion between them.
+/// `DOUBLE PRECISION` (1), `NUMERIC` (2, regardless of `(precision, scale)`), or
+/// `REAL` (3); `None` for non-numeric types. Operands must share a family — there
+/// is no implicit coercion between them.
 fn numeric_family(data_type: &DataType) -> Option<u8> {
     match data_type {
         DataType::Integer => Some(0),
         DataType::Double => Some(1),
         DataType::Numeric { .. } => Some(2),
+        DataType::Real => Some(3),
         _ => None,
     }
 }
@@ -269,8 +271,9 @@ fn bind_binary_op(
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
             // Both operands must share one numeric "family" — INTEGER, DOUBLE
-            // PRECISION, or NUMERIC (any `(p, s)` collapse to one family) — with no
-            // implicit coercion between families. Bind each side once with no hint;
+            // PRECISION, REAL, or NUMERIC (any `(p, s)` collapse to one family) —
+            // with no implicit coercion between families. Bind each side once with
+            // no hint;
             // only a bare untyped NULL or undeclared parameter fails. Take the
             // family from whichever side is numeric, re-binding a failed (untyped)
             // leaf with the resolved type; default to INTEGER when neither has one.
@@ -280,6 +283,7 @@ fn bind_binary_op(
                     precision: None,
                     scale: 0,
                 },
+                3 => DataType::Real,
                 _ => DataType::Integer,
             };
             let left_res = bind_expr(ctx, left, None);
@@ -316,10 +320,10 @@ fn bind_binary_op(
                     ),
                 ));
             }
-            if family == 1 && matches!(op, BinOp::Mod) {
+            if matches!(family, 1 | 3) && matches!(op, BinOp::Mod) {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
-                    "modulo is not defined for double precision",
+                    "modulo is not defined for floating-point types",
                 ));
             }
             let nullable = left.nullable() || right.nullable();
@@ -635,6 +639,7 @@ fn bind_aggregate(
             let result_type = match arg_type {
                 DataType::Integer => DataType::Integer,
                 DataType::Double => DataType::Double,
+                DataType::Real => DataType::Real,
                 DataType::Numeric { .. } => DataType::Numeric {
                     precision: None,
                     scale: 0,

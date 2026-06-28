@@ -160,6 +160,7 @@ The codec may return errors after buffering bytes. The server treats any decode 
 - `Bytes` -> `BYTEA` (`type_oid = 17`, `type_size = -1`)
 - `Uuid` -> `UUID` (`type_oid = 2950`, `type_size = 16`)
 - `Float` -> `DOUBLE PRECISION` (`type_oid = 701`, `type_size = 8`)
+- `Real` -> `REAL` (`type_oid = 700`, `type_size = 4`)
 - `Numeric` -> `NUMERIC` (`type_oid = 1700`, `type_size = -1`)
 
 The public helper `type_oid(data_type: &DataType) -> i32` returns the OID for a
@@ -226,6 +227,7 @@ Text value encoding:
 - `Bytea`: hex `\x` followed by lowercase hex digits (two per byte).
 - `Uuid`: canonical lowercase `8-4-4-4-12` hyphenated form.
 - `Float`: round-trippable decimal — fixed-point for moderate magnitudes, `e±NN` scientific for extreme exponents (or `Infinity`/`-Infinity`/`NaN` for non-finite values).
+- `Real`: same form as `Float`, single precision.
 - `Numeric`: decimal text preserving the value's scale (e.g. `1.50`).
 - `NULL`: encoded as a `DataRow` field length of `-1`.
 
@@ -239,6 +241,7 @@ Binary value encoding (extended protocol, format code `1`):
 - `Bytea`: the raw bytes (identical to the stored value).
 - `Uuid`: the 16 raw bytes.
 - `Float`: 8-byte big-endian IEEE 754 binary64.
+- `Real`: 4-byte big-endian IEEE 754 binary32.
 - `Numeric`: PostgreSQL's base-10000 `NumericVar` format (`int16 ndigits, weight, sign, dscale`, then the digit groups).
 - `NULL`: `DataRow` field length of `-1`.
 

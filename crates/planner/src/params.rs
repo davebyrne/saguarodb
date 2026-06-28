@@ -523,6 +523,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Boolean(_) => Some(DataType::Boolean),
         Value::Integer(_) => Some(DataType::Integer),
         Value::Float(_) => Some(DataType::Double),
+        Value::Real(_) => Some(DataType::Real),
         Value::Numeric(_) => Some(DataType::Numeric {
             precision: None,
             scale: 0,

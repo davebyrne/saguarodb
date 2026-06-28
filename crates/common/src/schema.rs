@@ -18,6 +18,8 @@ pub enum DataType {
     Uuid,
     /// `DOUBLE PRECISION` — IEEE 754 binary64, value carried as `Value::Float`.
     Double,
+    /// `REAL` — IEEE 754 binary32 (single precision), value carried as `Value::Real`.
+    Real,
     /// `NUMERIC` / `DECIMAL` — exact decimal, value carried as `Value::Numeric`.
     /// `precision: None` is unconstrained `NUMERIC` (any precision/scale); `Some(p)`
     /// constrains to `p` total digits with the given `scale` (values are rounded to

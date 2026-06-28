@@ -653,6 +653,7 @@ fn literal_key(expr: &BoundExpr) -> Option<Value> {
             value:
                 Value::Integer(_)
                 | Value::Float(_)
+                | Value::Real(_)
                 | Value::Numeric(_)
                 | Value::Text(_)
                 | Value::Boolean(_)

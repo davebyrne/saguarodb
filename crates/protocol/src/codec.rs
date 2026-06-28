@@ -542,6 +542,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             // PostgreSQL binary `float8` is the 8-byte big-endian IEEE 754 value.
             ValueFormat::Binary => value.0.to_be_bytes().to_vec(),
         },
+        Value::Real(value) => match format {
+            ValueFormat::Text => common::float::format_real(value.0).into_bytes(),
+            // PostgreSQL binary `float4` is the 4-byte big-endian IEEE 754 value.
+            ValueFormat::Binary => value.0.to_be_bytes().to_vec(),
+        },
         Value::Numeric(value) => match format {
             ValueFormat::Text => common::numeric::format_numeric(value).into_bytes(),
             // PostgreSQL binary `numeric` is the base-10000 NumericVar format.
@@ -618,6 +623,18 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .try_into()
                 .map_err(|_| protocol_error("binary double precision parameter must be 8 bytes"))?;
             Ok(Value::Float(f64::from_be_bytes(array).into()))
+        }
+        (DataType::Real, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "real parameter")?;
+            common::float::parse_real(text)
+                .map(|value| Value::Real(value.into()))
+                .ok_or_else(|| protocol_error("invalid real parameter"))
+        }
+        (DataType::Real, ValueFormat::Binary) => {
+            let array: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary real parameter must be 4 bytes"))?;
+            Ok(Value::Real(f32::from_be_bytes(array).into()))
         }
         (DataType::Numeric { .. }, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "numeric parameter")?;
@@ -712,6 +729,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Bytea => (17, -1),
         DataType::Uuid => (2950, 16),
         DataType::Double => (701, 8),
+        DataType::Real => (700, 4),
         DataType::Numeric { .. } => (1700, -1),
     }
 }
@@ -974,5 +992,39 @@ mod numeric_value_tests {
     #[test]
     fn invalid_numeric_text_is_rejected() {
         assert!(decode_value(b"not-a-number", UNCONSTRAINED, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod real_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    #[test]
+    fn real_text_round_trips_with_pg_spellings() {
+        let value = Value::Real(2.5_f32.into());
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"2.5");
+        assert_eq!(decode_value(&text, DataType::Real, 0).unwrap(), value);
+        assert_eq!(
+            encode_value(&Value::Real(f32::INFINITY.into()), 0)
+                .unwrap()
+                .unwrap(),
+            b"Infinity"
+        );
+    }
+
+    #[test]
+    fn real_binary_is_4_byte_ieee_and_round_trips() {
+        let value = Value::Real((-12.5_f32).into());
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, (-12.5_f32).to_be_bytes());
+        assert_eq!(decode_value(&binary, DataType::Real, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_real_is_rejected() {
+        assert!(decode_value(b"not-a-number", DataType::Real, 0).is_err());
+        assert!(decode_value(&[0u8; 8], DataType::Real, 1).is_err()); // wrong length
     }
 }

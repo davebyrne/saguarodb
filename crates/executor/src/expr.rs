@@ -148,6 +148,7 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
                 .map(Value::Integer)
                 .ok_or_else(integer_overflow),
             Value::Float(value) => Ok(Value::Float((-value.0).into())),
+            Value::Real(value) => Ok(Value::Real((-value.0).into())),
             Value::Numeric(value) => Ok(Value::Numeric(-value)),
             _ => datatype_mismatch("unary minus requires a numeric operand"),
         },
@@ -192,6 +193,24 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
                 _ => return datatype_mismatch("modulo is not defined for double precision"),
             };
             Ok(Value::Float(result.into()))
+        }
+        (Value::Real(left), Value::Real(right)) => {
+            let (left, right) = (left.0, right.0);
+            let result = match op {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
+                BinOp::Div if right == 0.0 => {
+                    return Err(DbError::execute(
+                        SqlState::DivisionByZero,
+                        "division by zero",
+                    ));
+                }
+                BinOp::Div => left / right,
+                // Modulo is rejected for floating-point types during binding.
+                _ => return datatype_mismatch("modulo is not defined for real"),
+            };
+            Ok(Value::Real(result.into()))
         }
         (Value::Numeric(left), Value::Numeric(right)) => {
             // Exact decimal arithmetic. `checked_*` avoid rust_decimal's panic-on-
@@ -239,6 +258,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         // Total order: NaN sorts greatest and equals itself, -0.0 == +0.0
         // (matching PostgreSQL's float comparison operators).
         (Value::Float(left), Value::Float(right)) => left.cmp(right),
+        (Value::Real(left), Value::Real(right)) => left.cmp(right),
         // Decimal compares by value, so 1.0 and 1.00 are equal.
         (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
@@ -860,6 +880,30 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
             common::numeric::apply_typmod(parsed, *precision, *scale)
                 .map(Value::Numeric)
                 .ok_or_else(numeric_overflow)
+        }
+        // REAL casts, mirroring DOUBLE; REAL bridges to NUMERIC via DOUBLE.
+        (Value::Real(value), DataType::Real) => Ok(Value::Real(value)),
+        (Value::Real(value), DataType::Text) => {
+            Ok(Value::Text(common::float::format_real(value.0)))
+        }
+        (Value::Text(value), DataType::Real) => common::float::parse_real(&value)
+            .map(|v| Value::Real(v.into()))
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid real cast")),
+        (Value::Integer(value), DataType::Real) => Ok(Value::Real((value as f32).into())),
+        (Value::Real(value), DataType::Double) => Ok(Value::Float(f64::from(value.0).into())),
+        (Value::Float(value), DataType::Real) => Ok(Value::Real((value.0 as f32).into())),
+        (Value::Real(value), DataType::Integer) => {
+            // Round half-to-even (PostgreSQL's float-to-int cast); reject
+            // NaN/infinity/out-of-range.
+            let rounded = f64::from(value.0.round_ties_even());
+            if rounded.is_finite() && rounded >= -(2f64.powi(63)) && rounded < 2f64.powi(63) {
+                Ok(Value::Integer(rounded as i64))
+            } else {
+                Err(DbError::execute(
+                    SqlState::NumericValueOutOfRange,
+                    "real value out of range for integer",
+                ))
+            }
         }
         _ => datatype_mismatch("unsupported cast"),
     }

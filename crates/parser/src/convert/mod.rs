@@ -304,13 +304,20 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         ) => Ok(DataType::Timestamp),
         sql::DataType::Bytea => Ok(DataType::Bytea),
         sql::DataType::Uuid => Ok(DataType::Uuid),
-        // DOUBLE PRECISION and its aliases. `FLOAT` with no precision is double
-        // precision in PostgreSQL; `REAL`/`FLOAT4` (single precision) and an
-        // explicit `FLOAT(p)` precision are not supported.
+        // DOUBLE PRECISION and its aliases (`FLOAT8`, bare `FLOAT`).
         sql::DataType::DoublePrecision
         | sql::DataType::Float8
-        | sql::DataType::Double(sql::ExactNumberInfo::None)
-        | sql::DataType::Float(None) => Ok(DataType::Double),
+        | sql::DataType::Double(sql::ExactNumberInfo::None) => Ok(DataType::Double),
+        // REAL / FLOAT4 (single precision).
+        sql::DataType::Real | sql::DataType::Float4 => Ok(DataType::Real),
+        // `FLOAT(p)`: PostgreSQL maps p in 1..=24 to REAL and 25..=53 to DOUBLE
+        // PRECISION; bare `FLOAT` is DOUBLE PRECISION.
+        sql::DataType::Float(precision) => match precision {
+            None => Ok(DataType::Double),
+            Some(p) if (1..=24).contains(p) => Ok(DataType::Real),
+            Some(p) if (25..=53).contains(p) => Ok(DataType::Double),
+            Some(_) => unsupported("float precision must be between 1 and 53"),
+        },
         // NUMERIC / DECIMAL, optionally with (precision[, scale]).
         sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => convert_numeric_typmod(info),
         _ => unsupported("unsupported data type"),
