@@ -949,6 +949,28 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_extract_into_function_call() {
+        let stmt = parse("select extract(year from d) from t").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            &select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { name, args, distinct: false },
+                ..
+            } if name == "extract"
+                && args.len() == 2
+                && matches!(
+                    &args[0],
+                    FunctionArg::Expr(Expr::Literal(Value::Text(field))) if field == "year"
+                )
+        ));
+        // An unsupported field is rejected.
+        assert!(parse("select extract(quarter from d) from t").is_err());
+    }
+
+    #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
         let Statement::Select(select) = stmt else {

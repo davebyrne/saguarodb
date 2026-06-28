@@ -1139,6 +1139,29 @@ mod tests {
     }
 
     #[test]
+    fn binder_extract_returns_double_and_validates_source() {
+        let catalog = catalog_with_users();
+
+        let bound = bind(
+            &parse("select extract(year from date '2024-03-15') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.columns[0].expr.data_type(), DataType::Double);
+
+        // EXTRACT requires a date/timestamp source.
+        let err = bind(
+            &parse("select extract(year from id) from users").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn binder_desugars_comma_from_list_into_cross_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select users.id from users, accounts").unwrap();

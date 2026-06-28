@@ -308,6 +308,7 @@ fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value>
         "position" => eval_position(&values),
         "left" => eval_left_right(&values, true),
         "right" => eval_left_right(&values, false),
+        "extract" => eval_extract(&values[0], &values[1]),
         "substring" => eval_substring(&values),
         _ => Err(DbError::internal(format!(
             "unknown scalar function {name} reached the executor"
@@ -344,6 +345,54 @@ fn eval_substring(values: &[Value]) -> Result<Value> {
     let begin = usize::try_from(lower - 1).map_err(|_| DbError::internal("substring index"))?;
     let end = usize::try_from(upper - 1).map_err(|_| DbError::internal("substring index"))?;
     Ok(Value::Text(chars[begin..end].iter().collect()))
+}
+
+/// `EXTRACT(field FROM source)`: the requested calendar/clock component of a DATE
+/// or TIMESTAMP, returned as `DOUBLE PRECISION` (seconds include the fractional
+/// part). DATE sources have zero-valued time components.
+fn eval_extract(field: &Value, source: &Value) -> Result<Value> {
+    const MICROS_PER_SEC: i64 = 1_000_000;
+    const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
+
+    let field = function_text(field)?;
+    let (year, month, day, hour, minute, second) = match source {
+        Value::Date(days) => {
+            let (year, month, day) = common::datetime::civil_from_days(*days);
+            (year as f64, month as f64, day as f64, 0.0, 0.0, 0.0)
+        }
+        Value::Timestamp(micros) => {
+            let days = micros.div_euclid(MICROS_PER_DAY);
+            let rest = micros.rem_euclid(MICROS_PER_DAY);
+            let (year, month, day) = common::datetime::civil_from_days(days);
+            let total_secs = rest / MICROS_PER_SEC;
+            let fraction = (rest % MICROS_PER_SEC) as f64 / MICROS_PER_SEC as f64;
+            (
+                year as f64,
+                month as f64,
+                day as f64,
+                (total_secs / 3_600) as f64,
+                ((total_secs % 3_600) / 60) as f64,
+                (total_secs % 60) as f64 + fraction,
+            )
+        }
+        _ => return datatype_mismatch("extract requires a date or timestamp argument"),
+    };
+
+    let value = match field {
+        "year" => year,
+        "month" => month,
+        "day" => day,
+        "hour" => hour,
+        "minute" => minute,
+        "second" => second,
+        other => {
+            return Err(DbError::execute(
+                SqlState::FeatureNotSupported,
+                format!("EXTRACT field {other} is not supported"),
+            ));
+        }
+    };
+    Ok(Value::Float(value.into()))
 }
 
 fn function_text(value: &Value) -> Result<&str> {

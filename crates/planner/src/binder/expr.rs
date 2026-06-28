@@ -812,6 +812,32 @@ fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> 
             }
             Ok((DataType::Text, false))
         }
+        // EXTRACT(field FROM source) -> extract('field', source). The field is a
+        // text literal (validated here when literal); the source is a DATE or
+        // TIMESTAMP. The result is DOUBLE (PostgreSQL returns numeric).
+        "extract" => {
+            expect_arity(name, args, 2)?;
+            require_type(&args[0], DataType::Text)?;
+            if let BoundExpr::Literal {
+                value: Value::Text(field),
+                ..
+            } = &args[0]
+                && !is_supported_extract_field(field)
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    format!("EXTRACT field {field} is not supported"),
+                ));
+            }
+            let source_type = args[1].data_type();
+            if !matches!(source_type, DataType::Date | DataType::Timestamp) {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!("EXTRACT requires a date or timestamp argument, got {source_type:?}"),
+                ));
+            }
+            Ok((DataType::Double, nullable))
+        }
         "substring" => {
             if args.len() != 2 && args.len() != 3 {
                 return Err(plan_error(
@@ -849,6 +875,14 @@ fn numeric_arg_type(name: &str, arg: &BoundExpr) -> Result<DataType> {
 /// the result type (`SQRT`, `POWER`).
 fn require_numeric(name: &str, arg: &BoundExpr) -> Result<()> {
     numeric_arg_type(name, arg).map(|_| ())
+}
+
+/// The `EXTRACT` fields SaguaroDB supports.
+fn is_supported_extract_field(field: &str) -> bool {
+    matches!(
+        field,
+        "year" | "month" | "day" | "hour" | "minute" | "second"
+    )
 }
 
 fn expect_arity(name: &str, args: &[BoundExpr], arity: usize) -> Result<()> {

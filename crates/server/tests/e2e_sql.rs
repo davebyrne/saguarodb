@@ -2476,3 +2476,45 @@ async fn e2e_statistical_aggregates() {
         ]]
     );
 }
+
+#[tokio::test]
+async fn e2e_extract_from_date_and_timestamp() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, d date, ts timestamp)")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into t (id, d, ts) values \
+             (1, date '2024-03-15', timestamp '2024-03-15 13:24:35')",
+        )
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, d, ts) values (2, null, null)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select extract(year from d), extract(month from d), \
+             extract(hour from ts), extract(minute from ts) from t order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("2024".to_string()),
+                Some("3".to_string()),
+                Some("13".to_string()),
+                Some("24".to_string()),
+            ],
+            // A NULL source propagates to NULL.
+            vec![None, None, None, None],
+        ]
+    );
+}

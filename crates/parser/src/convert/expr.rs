@@ -135,6 +135,7 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         )?))),
         sql::Expr::Ceil { expr, field } => convert_ceil_floor("ceil", expr, field),
         sql::Expr::Floor { expr, field } => convert_ceil_floor("floor", expr, field),
+        sql::Expr::Extract { field, expr, .. } => convert_extract(field, expr),
         // POSITION(substring IN string) -> position(substring, string).
         sql::Expr::Position { expr, r#in } => Ok(Expr::Function {
             name: "position".to_string(),
@@ -168,6 +169,29 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }
         _ => unsupported("unsupported expression"),
     }
+}
+
+/// Normalize `EXTRACT(field FROM source)` into `extract('field', source)`, where
+/// the field name is carried as a lowercase text literal. Only the calendar/clock
+/// fields are supported.
+fn convert_extract(field: &sql::DateTimeField, expr: &sql::Expr) -> Result<Expr> {
+    let name = match field {
+        sql::DateTimeField::Year => "year",
+        sql::DateTimeField::Month => "month",
+        sql::DateTimeField::Day => "day",
+        sql::DateTimeField::Hour => "hour",
+        sql::DateTimeField::Minute => "minute",
+        sql::DateTimeField::Second => "second",
+        _ => return unsupported("unsupported EXTRACT field"),
+    };
+    Ok(Expr::Function {
+        name: "extract".to_string(),
+        args: vec![
+            FunctionArg::Expr(Expr::Literal(Value::Text(name.to_string()))),
+            FunctionArg::Expr(convert_expr(expr)?),
+        ],
+        distinct: false,
+    })
 }
 
 /// Normalize the dedicated `CEIL(expr)` / `FLOOR(expr)` grammar into ordinary

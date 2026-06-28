@@ -1544,6 +1544,39 @@ mod tests {
     }
 
     #[test]
+    fn extract_pulls_date_and_time_fields() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'x')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select extract(year from date '2024-03-15'), \
+                 extract(month from date '2024-03-15'), \
+                 extract(day from date '2024-03-15'), \
+                 extract(hour from timestamp '2024-03-15 13:24:35.5'), \
+                 extract(minute from timestamp '2024-03-15 13:24:35.5'), \
+                 extract(second from timestamp '2024-03-15 13:24:35.5') from users",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Float(2024.0_f64.into()),
+                    Value::Float(3.0_f64.into()),
+                    Value::Float(15.0_f64.into()),
+                    Value::Float(13.0_f64.into()),
+                    Value::Float(24.0_f64.into()),
+                    Value::Float(35.5_f64.into()), // 35 seconds + 0.5 fractional
+                ],
+            }]
+        );
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness
