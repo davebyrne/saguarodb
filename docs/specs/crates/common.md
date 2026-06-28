@@ -79,7 +79,9 @@ helpers (`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
 `\x...` parse/format helpers (`parse_hex`, `format_hex`, hex-only — no legacy
 escape); the `uuid` module provides the canonical `8-4-4-4-12` parse/format
 helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase); the `float`
-module provides the shortest-round-trip `format_double` / `parse_double` helpers.
+module provides the `format_double` / `parse_double` helpers (round-trippable
+text: fixed-point for moderate magnitudes, `e±NN` scientific for extreme
+exponents, and `Infinity`/`-Infinity`/`NaN` for non-finite values).
 All are shared by the parser, executor, protocol, and COPY paths; there is no
 external date/time/uuid/float dependency.
 

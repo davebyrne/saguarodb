@@ -224,7 +224,7 @@ Text value encoding:
 - `Timestamp`: `YYYY-MM-DD HH:MM:SS[.ffffff]` (fractional seconds only when non-zero).
 - `Bytea`: hex `\x` followed by lowercase hex digits (two per byte).
 - `Uuid`: canonical lowercase `8-4-4-4-12` hyphenated form.
-- `Float`: shortest round-trippable decimal (or `Infinity`/`-Infinity`/`NaN` for non-finite values).
+- `Float`: round-trippable decimal — fixed-point for moderate magnitudes, `e±NN` scientific for extreme exponents (or `Infinity`/`-Infinity`/`NaN` for non-finite values).
 - `NULL`: encoded as a `DataRow` field length of `-1`.
 
 Binary value encoding (extended protocol, format code `1`):

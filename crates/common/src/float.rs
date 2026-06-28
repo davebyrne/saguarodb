@@ -78,20 +78,33 @@ impl Hash for OrderedF64 {
     }
 }
 
-/// Format a double for text output. Finite values use the shortest representation
-/// that round-trips; non-finite values use PostgreSQL's spellings.
+/// Format a double for text output. Finite values use a round-trippable form:
+/// fixed-point notation for moderate magnitudes (base-10 exponent in `[-4, 15]`,
+/// matching PostgreSQL and avoiding the pathologically long decimal expansions
+/// that plain `Display` produces for extreme exponents), and scientific notation
+/// — spelled `e±NN` with at least two exponent digits — outside that range.
+/// Non-finite values use PostgreSQL's `Infinity`/`-Infinity`/`NaN` spellings.
 pub fn format_double(value: f64) -> String {
     if value.is_nan() {
-        "NaN".to_string()
-    } else if value.is_infinite() {
-        if value < 0.0 {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        }
-    } else {
-        // Rust's default float formatting is the shortest string that round-trips.
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    // Rust's `{:e}` gives the shortest significant digits with an exact base-10
+    // exponent; the fixed form `{}` is the shortest fixed-point that round-trips.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output always contains an exponent");
+    let exponent: i32 = exponent
+        .parse()
+        .expect("`{:e}` exponent is a base-10 integer");
+    if (-4..=15).contains(&exponent) {
         format!("{value}")
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
     }
 }
 
@@ -150,9 +163,27 @@ mod tests {
         assert_eq!(format_double(42.0), "42");
         assert_eq!(format_double(1.5), "1.5");
         assert_eq!(format_double(-0.25), "-0.25");
+        assert_eq!(format_double(-0.0), "-0"); // sign of zero preserved
         assert_eq!(format_double(f64::INFINITY), "Infinity");
         assert_eq!(format_double(f64::NEG_INFINITY), "-Infinity");
         assert_eq!(format_double(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn format_uses_scientific_only_for_extreme_exponents() {
+        // Moderate magnitudes stay fixed-point (no pathological expansions).
+        assert_eq!(format_double(100000.0), "100000");
+        assert_eq!(format_double(0.0001), "0.0001");
+        assert_eq!(format_double(1e15), "1000000000000000");
+        // Extreme exponents use scientific notation spelled `e±NN`.
+        assert_eq!(format_double(1e16), "1e+16");
+        assert_eq!(format_double(1e308), "1e+308");
+        assert_eq!(format_double(1e-5), "1e-05");
+        assert_eq!(format_double(-2.5e-300), "-2.5e-300");
+        // ...and these still round-trip exactly.
+        for value in [1e16, 1e308, 1e-5, 5e-324, -2.5e-300] {
+            assert_eq!(parse_double(&format_double(value)), Some(value));
+        }
     }
 
     #[test]
