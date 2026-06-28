@@ -26,9 +26,10 @@
   these bits; `storage`'s tuple codec re-uses them).
 - The pure write-conflict classifiers (see `docs/specs/mvcc.md` §7.3): the
   uniqueness liveness check `version_conflicts` and its three-way refinement
-  `classify_unique_conflict -> UniqueConflict` (`None`/`Violation`/`InFlight`, which
-  splits a definite duplicate `23505` from an in-flight-other `40001`), and the
-  write-write row-lock check `write_conflict -> WriteConflict`.
+  `classify_unique_conflict -> UniqueConflict` (`None`/`Violation`/`WouldBlock`,
+  which splits a definite duplicate `23505` from an in-flight-other the writer
+  blocks on — `docs/specs/deadlock.md`), and the write-write row-lock check
+  `write_conflict -> WriteConflict` (`Proceed`/`Conflict`/`WouldBlock`).
 - The pure VACUUM reclaimability oracle `is_dead_to_all` (see
   `docs/specs/mvcc.md` §9), the sibling of `is_visible`: it answers "is this
   version dead to **every** snapshot?" against a single scalar GC `horizon`, used
