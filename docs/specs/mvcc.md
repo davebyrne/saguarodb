@@ -32,8 +32,6 @@ the same change (per `AGENTS.md`).
 
 - **Transactional DDL** — DDL stays non-transactional (takes the exclusive lock,
   commits immediately, is rejected inside an explicit transaction block).
-- **Serializable isolation (SSI)** — only snapshot isolation (and Read Committed)
-  initially.
 - **Time-travel / as-of queries.**
 - **Savepoints / sub-transactions** — implemented via sub-transaction xids
   without undo (`docs/specs/savepoints.md`); subxids share the xid space, CLOG,
@@ -1093,15 +1091,15 @@ savepoints via sub-transaction xids (optional, deferred).
   transaction, **activating Repeatable Read** (the per-transaction snapshot,
   advertisement, and write-conflict machinery were built in C–F and were dormant
   until now — G1 is only the SQL + wiring that selects the level).
-  - **Four SQL levels → two.** SaguaroDB has two levels, so the four standard SQL
-    levels are mapped: `READ UNCOMMITTED` → **Read Committed** (we never expose
+  - **Four SQL levels → three.** SaguaroDB has three levels, so the four standard
+    SQL levels are mapped: `READ UNCOMMITTED` → **Read Committed** (we never expose
     uncommitted data; the weaker request is strengthened to our weakest);
     `READ COMMITTED` → **Read Committed**; `REPEATABLE READ` → **Repeatable Read**;
-    `SERIALIZABLE` → **Repeatable Read**. SERIALIZABLE is an **alias** for snapshot
-    isolation (Repeatable Read): we do **not** implement SSI / predicate-based
-    serializability, so a SERIALIZABLE transaction gets a stable per-transaction
-    snapshot but no serialization-anomaly prevention beyond write-write conflicts.
-    The non-standard `SNAPSHOT` level also maps to Repeatable Read.
+    `SERIALIZABLE` → **Serializable**. `SERIALIZABLE` is its own level (no longer an
+    alias): it is Serializable Snapshot Isolation (SSI) — the Repeatable Read
+    per-transaction snapshot plus rw-conflict tracking and dangerous-structure
+    detection, specified in `docs/specs/ssi.md`. The non-standard `SNAPSHOT` level
+    maps to Repeatable Read.
   - **`BEGIN`/`START TRANSACTION` isolation** is read at BEGIN: an explicit
     `ISOLATION LEVEL` mode sets `Transaction.isolation`; with no mode the
     transaction inherits the **session default** (`Session.default_isolation`, Read
@@ -1133,10 +1131,11 @@ savepoints via sub-transaction xids (optional, deferred).
 - **G2 — session-default isolation.** *(implemented.)*
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` sets a
   **per-connection default** isolation (`Session.default_isolation`, default Read
-  Committed) used by FUTURE transactions. It reuses G1's four-to-two level mapping
+  Committed) used by FUTURE transactions. It reuses G1's level mapping
   (`READ UNCOMMITTED`/`READ COMMITTED` → Read Committed; `REPEATABLE READ`/
-  `SERIALIZABLE`/`SNAPSHOT` → Repeatable Read) and the same access-mode handling
-  (`READ WRITE` accepted-and-ignored, `READ ONLY` rejected at parse time).
+  `SNAPSHOT` → Repeatable Read; `SERIALIZABLE` → Serializable) and the same
+  access-mode handling (`READ WRITE` accepted-and-ignored, `READ ONLY` rejected at
+  parse time).
   - **Inheritance precedence** for a new transaction: explicit
     `BEGIN`/`START TRANSACTION ISOLATION LEVEL` > `SET TRANSACTION` (current txn,
     before its first query) > **session default** > Read Committed. A plain `BEGIN`

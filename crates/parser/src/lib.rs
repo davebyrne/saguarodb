@@ -427,9 +427,8 @@ mod tests {
         use common::IsolationLevel;
 
         // BEGIN / START TRANSACTION ISOLATION LEVEL <level> carries the mapped level.
-        // The four SQL levels collapse onto two: READ UNCOMMITTED/READ COMMITTED ->
-        // ReadCommitted; REPEATABLE READ/SERIALIZABLE -> RepeatableRead (SERIALIZABLE
-        // aliases snapshot isolation; we do not implement SSI).
+        // READ UNCOMMITTED/READ COMMITTED -> ReadCommitted; REPEATABLE READ/SNAPSHOT
+        // -> RepeatableRead; SERIALIZABLE -> Serializable (SSI, `docs/specs/ssi.md`).
         for (sql, level) in [
             (
                 "begin isolation level read uncommitted",
@@ -445,7 +444,7 @@ mod tests {
             ),
             (
                 "start transaction isolation level serializable",
-                IsolationLevel::RepeatableRead,
+                IsolationLevel::Serializable,
             ),
         ] {
             assert_eq!(
@@ -466,7 +465,7 @@ mod tests {
             ),
             (
                 "set transaction isolation level serializable",
-                IsolationLevel::RepeatableRead,
+                IsolationLevel::Serializable,
             ),
         ] {
             assert_eq!(
@@ -496,7 +495,7 @@ mod tests {
         use common::IsolationLevel;
 
         // `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` parses
-        // to the session-default variant with the SAME four-to-two level mapping as
+        // to the session-default variant with the SAME level mapping as
         // BEGIN / SET TRANSACTION (G2 reuses G1's `map_isolation_level`).
         for (sql, level) in [
             (
@@ -513,7 +512,7 @@ mod tests {
             ),
             (
                 "set session characteristics as transaction isolation level serializable",
-                IsolationLevel::RepeatableRead,
+                IsolationLevel::Serializable,
             ),
         ] {
             assert_eq!(

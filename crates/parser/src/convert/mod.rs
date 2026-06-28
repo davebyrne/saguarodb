@@ -255,24 +255,24 @@ fn transaction_isolation_mode(modes: &[sql::TransactionMode]) -> Result<Option<I
 }
 
 /// Map the four SQL isolation levels (plus the non-standard `SNAPSHOT`) onto
-/// SaguaroDB's two: Read Committed and Repeatable Read (= snapshot isolation).
+/// SaguaroDB's three: Read Committed, Repeatable Read (= snapshot isolation), and
+/// Serializable (SSI).
 ///
 /// - `READ UNCOMMITTED` -> Read Committed (we never expose uncommitted data; the
 ///   weaker level is strengthened to the weakest we offer).
 /// - `READ COMMITTED` -> Read Committed.
 /// - `REPEATABLE READ` -> Repeatable Read.
-/// - `SERIALIZABLE` -> Repeatable Read. We do **not** implement SSI / true
-///   serializability; SERIALIZABLE is aliased to snapshot isolation (Repeatable
-///   Read), so it gets a stable per-transaction snapshot but no predicate-based
-///   serialization. Documented in `docs/specs/mvcc.md` §10 Milestone G.
+/// - `SERIALIZABLE` -> Serializable (SSI): the Repeatable Read snapshot plus
+///   rw-conflict tracking and dangerous-structure detection. See
+///   `docs/specs/ssi.md`.
 /// - `SNAPSHOT` -> Repeatable Read (snapshot isolation by definition).
 fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel {
     match level {
         sql::TransactionIsolationLevel::ReadUncommitted
         | sql::TransactionIsolationLevel::ReadCommitted => IsolationLevel::ReadCommitted,
         sql::TransactionIsolationLevel::RepeatableRead
-        | sql::TransactionIsolationLevel::Serializable
         | sql::TransactionIsolationLevel::Snapshot => IsolationLevel::RepeatableRead,
+        sql::TransactionIsolationLevel::Serializable => IsolationLevel::Serializable,
     }
 }
 

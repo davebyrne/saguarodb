@@ -76,8 +76,9 @@ precedence.
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
-  (per-connection default) — Read Committed / Repeatable Read,
-  with SERIALIZABLE aliased to Repeatable Read; no SSI), and the maintenance
+  (per-connection default) — Read Committed / Repeatable Read / Serializable,
+  with SERIALIZABLE implemented as Serializable Snapshot Isolation
+  (`docs/specs/ssi.md`)), and the maintenance
   command `VACUUM [table]` (non-relational: it does not bind/plan, takes the
   exclusive guard, and is rejected inside a transaction block).
 - Unsupported parsed forms should be rejected by the binder or server with

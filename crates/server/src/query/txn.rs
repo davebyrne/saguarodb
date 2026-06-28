@@ -505,7 +505,9 @@ impl QueryService {
                 let (snapshot, advertised) = self.capture_snapshot(txn.txn_id);
                 (snapshot, Some(advertised))
             }
-            IsolationLevel::RepeatableRead => {
+            // Serializable shares Repeatable Read's single per-transaction snapshot;
+            // SSI layers rw-conflict tracking on top of it (`docs/specs/ssi.md`).
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
                 if let Some(snapshot) = &txn.rr_snapshot {
                     (snapshot.clone(), None)
                 } else {

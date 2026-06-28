@@ -117,12 +117,16 @@ pub enum TxnStatus {
 
 /// Transaction isolation level. `RepeatableRead` is snapshot isolation: one
 /// snapshot captured at the first statement and reused (see `docs/specs/mvcc.md`
-/// §6, Milestone G).
+/// §6). `Serializable` adds SSI on top of that same snapshot (`docs/specs/ssi.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IsolationLevel {
     ReadCommitted,
     /// = snapshot isolation.
     RepeatableRead,
+    /// Snapshot isolation plus Serializable Snapshot Isolation (SSI): rw-conflict
+    /// tracking and dangerous-structure detection on top of the Repeatable Read
+    /// snapshot (`docs/specs/ssi.md`). No longer an alias for Repeatable Read.
+    Serializable,
 }
 
 impl Default for IsolationLevel {

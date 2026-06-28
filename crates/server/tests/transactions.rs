@@ -880,11 +880,12 @@ async fn session_characteristics_does_not_change_the_open_transaction() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
-/// `SERIALIZABLE` aliases Repeatable Read (we do not implement SSI): a
-/// `START TRANSACTION ISOLATION LEVEL SERIALIZABLE` transaction behaves as RR — its
-/// snapshot is stable across a concurrent commit.
+/// A `SERIALIZABLE` transaction shares Repeatable Read's stable per-transaction
+/// snapshot (SSI layers rw-conflict tracking on top; `docs/specs/ssi.md`). A
+/// read-only serializable transaction simply sees a stable snapshot across a
+/// concurrent commit and commits cleanly.
 #[tokio::test]
-async fn serializable_aliases_repeatable_read_with_a_stable_snapshot() {
+async fn serializable_holds_a_stable_snapshot_like_repeatable_read() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -901,11 +902,11 @@ async fn serializable_aliases_repeatable_read_with_a_stable_snapshot() {
     let mut writer = Connection::connect(&server).await.unwrap();
     writer.ok("insert into users (id) values (2)").await;
 
-    // SERIALIZABLE -> snapshot isolation: the second read is unchanged.
+    // SERIALIZABLE builds on snapshot isolation: the second read is unchanged.
     assert_eq!(
         txn.ok("select id from users order by id").await.rows(),
         first,
-        "a SERIALIZABLE transaction gets a stable per-transaction snapshot (aliased to RR)"
+        "a SERIALIZABLE transaction gets a stable per-transaction snapshot"
     );
     txn.ok("commit").await;
     assert_eq!(server.active_txn_count(), 0);
