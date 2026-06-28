@@ -1111,7 +1111,7 @@ A recursive function that takes a `BoundExpr` and an `ExecRow` and returns a `Va
 Expression semantics:
 
 - Comparisons with `NULL` return `NULL`; `WHERE` and `HAVING` keep only `TRUE`.
-- `LIKE` requires text operands, is case-sensitive, supports `%` and `_`, and uses backslash to escape `%`, `_`, or `\`. A SQL `ESCAPE` clause is not supported. If the value or pattern is `NULL`, the result is `NULL`.
+- `LIKE`/`ILIKE` require text operands, support `%` and `_`, and use the pattern escape character (default backslash, overridable with `ESCAPE c`, disabled with `ESCAPE ''`) to escape `%`, `_`, or the escape character. `ILIKE` matches case-insensitively. If the value or pattern is `NULL`, the result is `NULL`.
 - `IN` returns `TRUE` on the first non-null equal item, `FALSE` when no item matches and no list item is `NULL`, and `NULL` when the left side is `NULL` or no item matches but some list item is `NULL`. `NOT IN` applies SQL `NOT`.
 - `BETWEEN` evaluates as `(expr >= low) AND (expr <= high)`; `NOT BETWEEN` applies SQL `NOT`.
 - String concatenation `||` requires text operands and returns `NULL` if either side is `NULL`. The scalar functions `UPPER`/`LOWER`/`LENGTH`/`TRIM` (text) and `ABS` (integer) and `SUBSTRING(text, start[, length])` are NULL-propagating; `LENGTH` and `SUBSTRING` count Unicode characters, and `SUBSTRING` uses 1-based positions clamped to the string and rejects a negative length.

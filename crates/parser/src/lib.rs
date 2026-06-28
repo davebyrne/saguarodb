@@ -861,6 +861,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_ilike_keeps_case_insensitive_flag() {
+        let stmt = parse("select id from users where name ilike 'a%'").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(Expr::Like {
+                case_insensitive: true,
+                negated: false,
+                escape: Some('\\'),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_like_escape_clause() {
+        let stmt = parse("select id from users where name like 'x!%' escape '!'").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(Expr::Like {
+                case_insensitive: false,
+                escape: Some('!'),
+                ..
+            })
+        ));
+
+        // `ESCAPE ''` disables escaping.
+        let empty = parse("select id from users where name like 'x' escape ''").unwrap();
+        let Statement::Select(select) = empty else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(Expr::Like { escape: None, .. })
+        ));
+
+        // A multi-character ESCAPE is rejected.
+        assert!(parse("select id from users where name like 'x' escape 'ab'").is_err());
+    }
+
+    #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
         let Statement::Select(select) = stmt else {

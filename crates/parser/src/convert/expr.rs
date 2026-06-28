@@ -89,16 +89,14 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             expr,
             pattern,
             escape_char,
-        } => {
-            if *any || escape_char.is_some() {
-                return unsupported("unsupported LIKE form");
-            }
-            Ok(Expr::Like {
-                expr: Box::new(convert_expr(expr)?),
-                pattern: Box::new(convert_expr(pattern)?),
-                negated: *negated,
-            })
-        }
+        } => convert_like(*negated, *any, expr, pattern, escape_char.as_deref(), false),
+        sql::Expr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => convert_like(*negated, *any, expr, pattern, escape_char.as_deref(), true),
         sql::Expr::Case {
             operand,
             conditions,
@@ -159,6 +157,42 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }
         _ => unsupported("unsupported expression"),
     }
+}
+
+/// Build a `LIKE` / `ILIKE` expression. The `ANY` (pattern-list) form is
+/// unsupported. The optional `ESCAPE c` clause must name a single character; an
+/// empty string disables escaping, and no clause defaults to backslash.
+fn convert_like(
+    negated: bool,
+    any: bool,
+    expr: &sql::Expr,
+    pattern: &sql::Expr,
+    escape_char: Option<&str>,
+    case_insensitive: bool,
+) -> Result<Expr> {
+    if any {
+        return unsupported("unsupported LIKE form");
+    }
+    let escape = match escape_char {
+        None => Some('\\'),
+        Some(text) => {
+            let mut chars = text.chars();
+            match (chars.next(), chars.next()) {
+                (None, _) => None,
+                (Some(c), None) => Some(c),
+                (Some(_), Some(_)) => {
+                    return Err(parse_error("ESCAPE must be a single character"));
+                }
+            }
+        }
+    };
+    Ok(Expr::Like {
+        expr: Box::new(convert_expr(expr)?),
+        pattern: Box::new(convert_expr(pattern)?),
+        negated,
+        case_insensitive,
+        escape,
+    })
 }
 
 /// Normalizes `SUBSTRING(expr [FROM start] [FOR len])` and the comma form

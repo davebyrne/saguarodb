@@ -83,6 +83,10 @@ pub enum BoundExpr {
         expr: Box<BoundExpr>,
         pattern: Box<BoundExpr>,
         negated: bool,
+        /// `ILIKE` (case-insensitive) when true; plain `LIKE` when false.
+        case_insensitive: bool,
+        /// Pattern escape character; `None` disables escaping (`ESCAPE ''`).
+        escape: Option<char>,
         data_type: DataType,
         nullable: bool,
     },

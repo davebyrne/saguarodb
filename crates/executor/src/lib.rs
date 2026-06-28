@@ -1275,6 +1275,59 @@ mod tests {
     }
 
     #[test]
+    fn ilike_matches_case_insensitively() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, 'bob')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select id from users where name ilike 'a%' order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1)],
+            }]
+        );
+
+        let rows = harness
+            .select_rows("select id from users where name not ilike 'a%' order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(2)],
+            }]
+        );
+    }
+
+    #[test]
+    fn like_escape_clause_changes_escape_character() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, '100%')")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (2, '100x')")
+            .unwrap();
+
+        // With `ESCAPE '!'`, `!%` is a literal percent sign, so only '100%' matches.
+        let rows = harness
+            .select_rows("select id from users where name like '100!%' escape '!' order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1)],
+            }]
+        );
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness

@@ -143,7 +143,7 @@ pub enum Expr {
     IsNotNull(Box<Expr>),
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
     Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
-    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },
+    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool, case_insensitive: bool, escape: Option<char> },
     Case {
         operand: Option<Box<Expr>>,
         when_clauses: Vec<(Expr, Expr)>,
@@ -193,6 +193,8 @@ Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name
 The dedicated `TRIM(expr)` and `SUBSTRING(expr [FROM start] [FOR length])` grammar (and the comma form `SUBSTRING(expr, start[, length])`) is normalized into ordinary `Function { name: "trim" | "substring", ... }` calls so the binder treats them uniformly. `SUBSTRING` requires a start argument; `TRIM` with `LEADING`/`TRAILING`/`BOTH` or trim characters is unsupported.
 
 `a IS [NOT] DISTINCT FROM b` parses to `BinaryOp { op: BinOp::IsDistinctFrom | BinOp::IsNotDistinctFrom, ... }`. `COALESCE(...)` and `NULLIF(a, b)` parse as ordinary `Function` calls (named `coalesce`/`nullif`); the binder desugars them to `CASE` because, unlike the generic scalar functions, they are not NULL-propagating.
+
+`ILIKE`/`NOT ILIKE` parse to `Expr::Like { case_insensitive: true, ... }` (plain `LIKE` is `case_insensitive: false`). The optional `ESCAPE c` clause sets `Expr::Like.escape`: no clause defaults to `Some('\\')` (backslash), `ESCAPE 'x'` is `Some('x')`, and `ESCAPE ''` disables escaping (`None`). An `ESCAPE` argument longer than one character, or the Snowflake `ANY` pattern-list form, is rejected.
 
 ## SQL Scope
 

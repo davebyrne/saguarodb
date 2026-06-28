@@ -2339,3 +2339,34 @@ async fn e2e_coalesce_nullif_and_distinct_operators() {
         err.message
     );
 }
+
+#[tokio::test]
+async fn e2e_ilike_and_like_escape() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, name text)")
+        .await
+        .unwrap();
+    for (id, name) in [(1, "Ada"), (2, "bob"), (3, "50%off")] {
+        server
+            .simple_query(&format!("insert into t (id, name) values ({id}, '{name}')"))
+            .await
+            .unwrap();
+    }
+
+    // ILIKE is case-insensitive.
+    let rows = server
+        .simple_query("select id from t where name ilike 'a%' order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // ESCAPE makes '!%' a literal percent sign.
+    let rows = server
+        .simple_query("select id from t where name like '50!%off' escape '!' order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+}

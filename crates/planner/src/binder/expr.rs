@@ -66,7 +66,9 @@ pub(super) fn bind_expr(
             expr,
             pattern,
             negated,
-        } => bind_like(ctx, expr, pattern, *negated),
+            case_insensitive,
+            escape,
+        } => bind_like(ctx, expr, pattern, *negated, *case_insensitive, *escape),
         Expr::Case {
             operand,
             when_clauses,
@@ -849,6 +851,8 @@ fn bind_like(
     expr: &Expr,
     pattern: &Expr,
     negated: bool,
+    case_insensitive: bool,
+    escape: Option<char>,
 ) -> Result<BoundExpr> {
     let expr = bind_expr(ctx, expr, Some(DataType::Text))?;
     let pattern = bind_expr(ctx, pattern, Some(DataType::Text))?;
@@ -859,6 +863,8 @@ fn bind_like(
         expr: Box::new(expr),
         pattern: Box::new(pattern),
         negated,
+        case_insensitive,
+        escape,
         data_type: DataType::Boolean,
         nullable,
     })

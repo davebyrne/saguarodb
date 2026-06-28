@@ -239,6 +239,11 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+        /// `ILIKE` (case-insensitive) when true; plain `LIKE` when false.
+        case_insensitive: bool,
+        /// The pattern escape character. Defaults to `Some('\\')`; an explicit
+        /// `ESCAPE ''` disables escaping (`None`).
+        escape: Option<char>,
     },
     Case {
         operand: Option<Box<Expr>>,

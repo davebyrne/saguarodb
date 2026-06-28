@@ -67,11 +67,13 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             expr,
             pattern,
             negated,
+            case_insensitive,
+            escape,
             ..
         } => {
             let value = eval_expr(expr, row)?;
             let pattern = eval_expr(pattern, row)?;
-            let result = eval_like(value, pattern)?;
+            let result = eval_like(value, pattern, *case_insensitive, *escape)?;
             if *negated {
                 sql_not(result)
             } else {
@@ -406,17 +408,33 @@ fn eval_in_list(expr: &BoundExpr, list: &[BoundExpr], row: &ExecRow) -> Result<V
     }
 }
 
-fn eval_like(value: Value, pattern: Value) -> Result<Value> {
+fn eval_like(
+    value: Value,
+    pattern: Value,
+    case_insensitive: bool,
+    escape: Option<char>,
+) -> Result<Value> {
     match (value, pattern) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(value), Value::Text(pattern)) => {
-            Ok(Value::Boolean(like_matches(&value, &pattern)))
+            // `ILIKE` lowercases both sides (and the escape character) up front so
+            // the structural `%`/`_` matching below is unchanged.
+            let (value, pattern, escape) = if case_insensitive {
+                (
+                    value.to_lowercase(),
+                    pattern.to_lowercase(),
+                    escape.map(|c| c.to_lowercase().next().unwrap_or(c)),
+                )
+            } else {
+                (value, pattern, escape)
+            };
+            Ok(Value::Boolean(like_matches(&value, &pattern, escape)))
         }
         _ => datatype_mismatch("LIKE operands must be text"),
     }
 }
 
-fn like_matches(value: &str, pattern: &str) -> bool {
+fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> bool {
     #[derive(Clone, Copy)]
     enum Token {
         AnySeq,
@@ -427,18 +445,27 @@ fn like_matches(value: &str, pattern: &str) -> bool {
     let mut tokens = Vec::new();
     let mut chars = pattern.chars();
     while let Some(ch) = chars.next() {
-        match ch {
-            '%' => tokens.push(Token::AnySeq),
-            '_' => tokens.push(Token::AnyOne),
-            '\\' => match chars.next() {
-                Some(escaped @ ('%' | '_' | '\\')) => tokens.push(Token::Char(escaped)),
+        if Some(ch) == escape {
+            // The escape character: `e%`, `e_`, and `ee` are the literal `%`,
+            // `_`, and escape character; `e` before any other character is a
+            // literal escape character followed by that character; a trailing
+            // lone escape character is itself literal.
+            match chars.next() {
+                Some(next) if next == '%' || next == '_' || Some(next) == escape => {
+                    tokens.push(Token::Char(next));
+                }
                 Some(other) => {
-                    tokens.push(Token::Char('\\'));
+                    tokens.push(Token::Char(ch));
                     tokens.push(Token::Char(other));
                 }
-                None => tokens.push(Token::Char('\\')),
-            },
-            other => tokens.push(Token::Char(other)),
+                None => tokens.push(Token::Char(ch)),
+            }
+        } else {
+            match ch {
+                '%' => tokens.push(Token::AnySeq),
+                '_' => tokens.push(Token::AnyOne),
+                other => tokens.push(Token::Char(other)),
+            }
         }
     }
 
