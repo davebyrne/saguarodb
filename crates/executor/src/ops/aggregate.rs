@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{ColumnInfo, DataType, DbError, ExecRow, Result, Row, SqlState, Value};
+use common::{ColumnInfo, DataType, DbError, Decimal, ExecRow, Result, Row, SqlState, Value};
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
 use crate::eval_expr;
@@ -121,12 +121,13 @@ enum FoldKind {
     Avg,
 }
 
-/// Dispatch SUM/AVG to the integer or double fold based on the bound result type.
+/// Dispatch SUM/AVG to the integer, double, or numeric fold based on the bound
+/// result type.
 fn fold_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], kind: FoldKind) -> Result<Value> {
-    if aggregate.data_type == DataType::Double {
-        float_fold_aggregate(aggregate, rows, kind)
-    } else {
-        integer_fold_aggregate(aggregate, rows, kind)
+    match aggregate.data_type {
+        DataType::Double => float_fold_aggregate(aggregate, rows, kind),
+        DataType::Numeric { .. } => numeric_fold_aggregate(aggregate, rows, kind),
+        _ => integer_fold_aggregate(aggregate, rows, kind),
     }
 }
 
@@ -196,6 +197,48 @@ fn float_fold_aggregate(
         FoldKind::Sum => Ok(Value::Float(sum.into())),
         FoldKind::Avg => Ok(Value::Float((sum / count as f64).into())),
     }
+}
+
+fn numeric_fold_aggregate(
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    kind: FoldKind,
+) -> Result<Value> {
+    let values = aggregate_values(aggregate, rows)?;
+    let mut sum = Decimal::ZERO;
+    let mut count = 0_i64;
+    for value in values {
+        match value {
+            Value::Null => {}
+            Value::Numeric(value) => {
+                sum = sum.checked_add(value).ok_or_else(numeric_overflow)?;
+                count += 1;
+            }
+            _ => {
+                return Err(DbError::execute(
+                    SqlState::DatatypeMismatch,
+                    "SUM and AVG require numeric input",
+                ));
+            }
+        }
+    }
+
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+
+    match kind {
+        FoldKind::Sum => Ok(Value::Numeric(sum)),
+        // AVG divides by the row count; the divisor is non-zero here.
+        FoldKind::Avg => sum
+            .checked_div(Decimal::from(count))
+            .map(Value::Numeric)
+            .ok_or_else(numeric_overflow),
+    }
+}
+
+fn numeric_overflow() -> DbError {
+    DbError::execute(SqlState::NumericValueOutOfRange, "numeric field overflow")
 }
 
 fn min_max_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], min: bool) -> Result<Value> {

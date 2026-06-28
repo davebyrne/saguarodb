@@ -1341,6 +1341,103 @@ async fn e2e_numeric_casts_rejections_and_index() {
 }
 
 #[tokio::test]
+async fn e2e_numeric_arithmetic_and_aggregates() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, a numeric)")
+        .await
+        .unwrap();
+    for (id, lit) in [(1, "1.50"), (2, "2.50")] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, a) values ({id}, NUMERIC '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Arithmetic with PostgreSQL scale rules: +/- keep max scale, * sums scales.
+    let rows = server
+        .simple_query(
+            "select cast(NUMERIC '1.50' + NUMERIC '2.00' as text), \
+             cast(NUMERIC '1.50' - NUMERIC '2.00' as text), \
+             cast(NUMERIC '1.50' * NUMERIC '2.00' as text) from t where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3.50".to_string()),
+            Some("-0.50".to_string()),
+            Some("3.0000".to_string()),
+        ]]
+    );
+
+    // Division, modulo (defined for NUMERIC, unlike DOUBLE), and unary minus.
+    let rows = server
+        .simple_query(
+            "select cast(NUMERIC '3' / NUMERIC '2' as text), \
+             cast(NUMERIC '5.5' % NUMERIC '2' as text), \
+             cast(-(NUMERIC '1.50') as text) from t where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1.50".to_string()), // 3 / 2 (rust_decimal division scale)
+            Some("1.5".to_string()),  // 5.5 % 2
+            Some("-1.50".to_string()),
+        ]]
+    );
+
+    // Aggregates: SUM keeps exact scale, MIN/MAX by value, AVG is true division.
+    let rows = server
+        .simple_query("select cast(sum(a) as text), cast(min(a) as text), cast(max(a) as text), cast(avg(a) as integer) from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("4.00".to_string()),
+            Some("1.50".to_string()),
+            Some("2.50".to_string()),
+            Some("2".to_string()), // avg = 2.00 -> int 2
+        ]]
+    );
+
+    // Division by zero errors (like INTEGER).
+    let err = server
+        .simple_query("select a / NUMERIC '0' from t where id = 1")
+        .await
+        .err()
+        .expect("numeric division by zero should error");
+    assert!(
+        err.message.to_lowercase().contains("division by zero"),
+        "got: {}",
+        err.message
+    );
+
+    // No implicit cross-type coercion: NUMERIC with INTEGER or DOUBLE.
+    for bad in ["a + 1", "a + 1.0"] {
+        let err = server
+            .simple_query(&format!("select {bad} from t where id = 1"))
+            .await
+            .err()
+            .expect("mixed numeric/non-numeric arithmetic should be rejected");
+        assert!(
+            err.message.contains("42804"),
+            "for `{bad}`: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

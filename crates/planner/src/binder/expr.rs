@@ -159,6 +159,19 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
     })
 }
 
+/// The numeric "family" of a type for arithmetic compatibility: `INTEGER` (0),
+/// `DOUBLE PRECISION` (1), or `NUMERIC` (2, regardless of `(precision, scale)`);
+/// `None` for non-numeric types. Operands must share a family — there is no
+/// implicit coercion between them.
+fn numeric_family(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Integer => Some(0),
+        DataType::Double => Some(1),
+        DataType::Numeric { .. } => Some(2),
+        _ => None,
+    }
+}
+
 fn bind_binary_op(
     ctx: &mut BindContext,
     left: &Expr,
@@ -168,28 +181,34 @@ fn bind_binary_op(
     let op = convert_bin_op(op);
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-            // Both operands must share one numeric type (INTEGER or DOUBLE
-            // PRECISION); there is no implicit int/float coercion. Bind each side
-            // once with no hint — concrete operands resolve directly, and only a
-            // bare untyped NULL or undeclared parameter fails. Take the type from
-            // whichever side is numeric, re-binding a failed (untyped) leaf with
-            // that type; default to INTEGER when neither side has one.
-            let is_numeric = |t: &DataType| matches!(t, DataType::Integer | DataType::Double);
+            // Both operands must share one numeric "family" — INTEGER, DOUBLE
+            // PRECISION, or NUMERIC (any `(p, s)` collapse to one family) — with no
+            // implicit coercion between families. Bind each side once with no hint;
+            // only a bare untyped NULL or undeclared parameter fails. Take the
+            // family from whichever side is numeric, re-binding a failed (untyped)
+            // leaf with the resolved type; default to INTEGER when neither has one.
+            let result_type = |family: u8| match family {
+                1 => DataType::Double,
+                2 => DataType::Numeric {
+                    precision: None,
+                    scale: 0,
+                },
+                _ => DataType::Integer,
+            };
             let left_res = bind_expr(ctx, left, None);
             let right_res = bind_expr(ctx, right, None);
-            let operand_type = left_res
+            let family = left_res
                 .as_ref()
                 .ok()
-                .map(|e| e.data_type())
-                .filter(is_numeric)
+                .and_then(|e| numeric_family(&e.data_type()))
                 .or_else(|| {
                     right_res
                         .as_ref()
                         .ok()
-                        .map(|e| e.data_type())
-                        .filter(is_numeric)
+                        .and_then(|e| numeric_family(&e.data_type()))
                 })
-                .unwrap_or(DataType::Integer);
+                .unwrap_or(0);
+            let operand_type = result_type(family);
             let left = match left_res {
                 Ok(expr) => expr,
                 Err(_) => bind_expr(ctx, left, Some(operand_type.clone()))?,
@@ -198,9 +217,19 @@ fn bind_binary_op(
                 Ok(expr) => expr,
                 Err(_) => bind_expr(ctx, right, Some(operand_type.clone()))?,
             };
-            require_type(&left, operand_type.clone())?;
-            require_type(&right, operand_type.clone())?;
-            if operand_type == DataType::Double && matches!(op, BinOp::Mod) {
+            if numeric_family(&left.data_type()) != Some(family)
+                || numeric_family(&right.data_type()) != Some(family)
+            {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "arithmetic operands must be the same numeric type, got {:?} and {:?}",
+                        left.data_type(),
+                        right.data_type()
+                    ),
+                ));
+            }
+            if family == 1 && matches!(op, BinOp::Mod) {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
                     "modulo is not defined for double precision",
@@ -290,14 +319,14 @@ fn bind_unary_op(ctx: &mut BindContext, op: parser::UnaryOp, expr: &Expr) -> Res
     let op = convert_unary_op(op);
     match op {
         UnaryOp::Neg => {
-            // Negation applies to either numeric type; an untyped NULL defaults
-            // to INTEGER (matching the arithmetic operators).
+            // Negation applies to any numeric type; an untyped NULL defaults to
+            // INTEGER (matching the arithmetic operators).
             let bound = bind_expr(ctx, expr, None);
             let operand_type = bound
                 .as_ref()
                 .ok()
                 .map(|e| e.data_type())
-                .filter(|t| matches!(t, DataType::Integer | DataType::Double))
+                .filter(|t| numeric_family(t).is_some())
                 .unwrap_or(DataType::Integer);
             let expr = match bound {
                 Ok(expr) => expr,
@@ -385,17 +414,25 @@ fn bind_aggregate(
                     "SUM and AVG require an expression argument",
                 ));
             };
-            // SUM/AVG accept either numeric type and return that same type
-            // (INTEGER stays INTEGER with integer division for AVG; DOUBLE
-            // PRECISION stays DOUBLE).
+            // SUM/AVG accept any numeric type. INTEGER stays INTEGER (integer
+            // division for AVG); DOUBLE PRECISION stays DOUBLE; NUMERIC returns an
+            // unconstrained NUMERIC (the accumulated value carries its own scale).
             let arg_type = arg.data_type();
-            if !matches!(arg_type, DataType::Integer | DataType::Double) {
-                return Err(plan_error(
-                    SqlState::DatatypeMismatch,
-                    format!("SUM and AVG require a numeric argument, got {arg_type:?}"),
-                ));
-            }
-            (arg_type, true)
+            let result_type = match arg_type {
+                DataType::Integer => DataType::Integer,
+                DataType::Double => DataType::Double,
+                DataType::Numeric { .. } => DataType::Numeric {
+                    precision: None,
+                    scale: 0,
+                },
+                other => {
+                    return Err(plan_error(
+                        SqlState::DatatypeMismatch,
+                        format!("SUM and AVG require a numeric argument, got {other:?}"),
+                    ));
+                }
+            };
+            (result_type, true)
         }
         AggregateFunc::Min | AggregateFunc::Max => {
             let Some(arg) = &arg else {

@@ -121,6 +121,7 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
                 .map(Value::Integer)
                 .ok_or_else(integer_overflow),
             Value::Float(value) => Ok(Value::Float((-value.0).into())),
+            Value::Numeric(value) => Ok(Value::Numeric(-value)),
             _ => datatype_mismatch("unary minus requires a numeric operand"),
         },
         UnaryOp::Not => sql_not(value),
@@ -164,6 +165,33 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
                 _ => return datatype_mismatch("modulo is not defined for double precision"),
             };
             Ok(Value::Float(result.into()))
+        }
+        (Value::Numeric(left), Value::Numeric(right)) => {
+            // Exact decimal arithmetic. `checked_*` avoid rust_decimal's panic-on-
+            // overflow; division/modulo by zero error like INTEGER. Result scale
+            // follows rust_decimal (add/sub: max scale; mul: sum of scales;
+            // div: up to 28 significant digits).
+            let result = match op {
+                BinOp::Add => left.checked_add(right),
+                BinOp::Sub => left.checked_sub(right),
+                BinOp::Mul => left.checked_mul(right),
+                BinOp::Div if right == common::Decimal::ZERO => {
+                    return Err(DbError::execute(
+                        SqlState::DivisionByZero,
+                        "division by zero",
+                    ));
+                }
+                BinOp::Div => left.checked_div(right),
+                BinOp::Mod if right == common::Decimal::ZERO => {
+                    return Err(DbError::execute(
+                        SqlState::DivisionByZero,
+                        "division by zero",
+                    ));
+                }
+                BinOp::Mod => left.checked_rem(right),
+                _ => unreachable!(),
+            };
+            result.map(Value::Numeric).ok_or_else(numeric_overflow)
         }
         _ => datatype_mismatch("arithmetic operands must be the same numeric type"),
     }
