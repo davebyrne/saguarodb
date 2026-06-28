@@ -626,6 +626,116 @@ async fn e2e_date_primary_key_round_trips_through_btree() {
 }
 
 #[tokio::test]
+async fn e2e_timestamp_type_round_trips_orders_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table logs (id integer primary key, at timestamp)")
+        .await
+        .unwrap();
+    for (id, at) in [
+        (1, "2024-02-29 12:30:45"),
+        (2, "2023-01-15 00:00:00"),
+        (3, "2024-12-31 23:59:59.5"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into logs (id, at) values ({id}, TIMESTAMP '{at}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Round-trips (fractional seconds trimmed) and orders chronologically.
+    let rows = server
+        .simple_query("select id, at from logs order by at")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("2".to_string()),
+                Some("2023-01-15 00:00:00".to_string())
+            ],
+            vec![
+                Some("1".to_string()),
+                Some("2024-02-29 12:30:45".to_string())
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("2024-12-31 23:59:59.5".to_string()),
+            ],
+        ]
+    );
+
+    // Comparison against a timestamp literal.
+    let rows = server
+        .simple_query("select id from logs where at < TIMESTAMP '2024-01-01 00:00:00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // CAST timestamp <-> text.
+    let rows = server
+        .simple_query("select cast(at as text) from logs where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2024-02-29 12:30:45".to_string())]]);
+
+    // TIMESTAMP literal without a time component defaults to midnight.
+    let rows = server
+        .simple_query("select id from logs where at = cast('2023-01-15' as timestamp)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // WITH TIME ZONE is unsupported.
+    let err = server
+        .simple_query("create table tz (id integer primary key, at timestamp with time zone)")
+        .await
+        .err()
+        .expect("TIMESTAMP WITH TIME ZONE should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("data type"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_timestamp_primary_key_uses_index() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (at timestamp primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (at, note) values (TIMESTAMP '2024-01-01 09:00:00', 'open')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from t where at = TIMESTAMP '2024-01-01 09:00:00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "TIMESTAMP primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query("select note from t where at = TIMESTAMP '2024-01-01 09:00:00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("open".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

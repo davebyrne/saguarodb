@@ -170,6 +170,12 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         sql::DataType::Date => common::datetime::parse_date(text)
             .map(|days| Expr::Literal(Value::Date(days)))
             .ok_or_else(|| parse_error(format!("invalid date literal: \"{text}\""))),
+        sql::DataType::Timestamp(
+            None,
+            sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone,
+        ) => common::datetime::parse_timestamp(text)
+            .map(|micros| Expr::Literal(Value::Timestamp(micros)))
+            .ok_or_else(|| parse_error(format!("invalid timestamp literal: \"{text}\""))),
         _ => unsupported("unsupported typed literal"),
     }
 }

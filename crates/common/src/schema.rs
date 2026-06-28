@@ -9,6 +9,9 @@ pub enum DataType {
     Boolean,
     /// `DATE` — calendar date, value carried as `Value::Date` (days from epoch).
     Date,
+    /// `TIMESTAMP` (without time zone), value carried as `Value::Timestamp`
+    /// (microseconds from epoch).
+    Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -60,6 +60,77 @@ pub fn format_date(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+const MICROS_PER_SEC: i64 = 1_000_000;
+const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SEC;
+
+/// Parse a `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` timestamp into microseconds from the
+/// Unix epoch. The date and time may be separated by a space or `T`; the time is
+/// optional (defaults to midnight) and the fractional seconds are optional (up to
+/// microsecond resolution, extra digits ignored). Returns `None` for any
+/// malformed or out-of-range input. No time zone is accepted.
+pub fn parse_timestamp(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (date_part, time_part) = match text.find([' ', 'T']) {
+        Some(idx) => (&text[..idx], Some(text[idx + 1..].trim())),
+        None => (text, None),
+    };
+    let days = parse_date(date_part)?;
+    let time_micros = match time_part {
+        None => 0,
+        Some(time) => parse_time_of_day(time)?,
+    };
+    days.checked_mul(MICROS_PER_DAY)?.checked_add(time_micros)
+}
+
+/// Parse `HH:MM:SS[.ffffff]` into microseconds since midnight (`0..MICROS_PER_DAY`).
+fn parse_time_of_day(text: &str) -> Option<i64> {
+    let mut parts = text.splitn(3, ':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let seconds_field = parts.next()?;
+    let (seconds_str, fraction) = match seconds_field.split_once('.') {
+        Some((seconds, fraction)) => (seconds, Some(fraction)),
+        None => (seconds_field, None),
+    };
+    let seconds: i64 = seconds_str.parse().ok()?;
+    if !(0..24).contains(&hours) || !(0..60).contains(&minutes) || !(0..60).contains(&seconds) {
+        return None;
+    }
+    let fraction_micros = match fraction {
+        None => 0,
+        Some(fraction) => parse_fraction_micros(fraction)?,
+    };
+    Some((hours * 3_600 + minutes * 60 + seconds) * MICROS_PER_SEC + fraction_micros)
+}
+
+/// Parse the digits after the decimal point into microseconds (e.g. `5` ->
+/// 500000, `123456` -> 123456). Digits beyond microsecond resolution are ignored.
+fn parse_fraction_micros(fraction: &str) -> Option<i64> {
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let take = fraction.len().min(6);
+    let value: i64 = fraction[..take].parse().ok()?;
+    Some(value * 10_i64.pow(6 - take as u32))
+}
+
+/// Format microseconds-from-epoch as `YYYY-MM-DD HH:MM:SS[.ffffff]` (the
+/// fractional part is shown only when non-zero, with trailing zeros trimmed).
+pub fn format_timestamp(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let rest = micros.rem_euclid(MICROS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    let seconds = rest / MICROS_PER_SEC;
+    let fraction = rest % MICROS_PER_SEC;
+    let (hours, minutes, secs) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    let mut out = format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{secs:02}");
+    if fraction != 0 {
+        out.push('.');
+        out.push_str(format!("{fraction:06}").trim_end_matches('0'));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +175,49 @@ mod tests {
         assert_eq!(format_date(0), "1970-01-01");
         for s in ["1970-01-01", "2024-02-29", "1999-12-31", "0001-01-01"] {
             assert_eq!(format_date(parse_date(s).unwrap()), s);
+        }
+    }
+
+    #[test]
+    fn timestamp_epoch_and_components() {
+        assert_eq!(parse_timestamp("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(parse_timestamp("1970-01-01"), Some(0)); // date-only -> midnight
+        assert_eq!(parse_timestamp("1970-01-01T00:00:01"), Some(1_000_000)); // 'T' separator
+        assert_eq!(
+            parse_timestamp("2024-01-15 12:30:45"),
+            Some(
+                days_from_civil(2024, 1, 15) * 86_400_000_000
+                    + (12 * 3600 + 30 * 60 + 45) * 1_000_000
+            )
+        );
+    }
+
+    #[test]
+    fn timestamp_fractions_and_rejections() {
+        assert_eq!(parse_timestamp("1970-01-01 00:00:00.5"), Some(500_000));
+        assert_eq!(parse_timestamp("1970-01-01 00:00:00.123456"), Some(123_456));
+        // Digits beyond microsecond resolution are ignored.
+        assert_eq!(
+            parse_timestamp("1970-01-01 00:00:00.1234569"),
+            Some(123_456)
+        );
+        assert_eq!(parse_timestamp("2024-01-15 24:00:00"), None); // hour out of range
+        assert_eq!(parse_timestamp("2024-01-15 12:60:00"), None); // minute out of range
+        assert_eq!(parse_timestamp("2024-01-15 12:00:60"), None); // second out of range
+        assert_eq!(parse_timestamp("2023-02-29 00:00:00"), None); // bad date part
+        assert_eq!(parse_timestamp("2024-01-15 12:00"), None); // missing seconds
+    }
+
+    #[test]
+    fn timestamp_format_round_trips() {
+        for s in [
+            "1970-01-01 00:00:00",
+            "2024-01-15 12:30:45",
+            "2024-02-29 23:59:59.123456",
+            "1969-12-31 23:59:59", // pre-epoch (negative micros)
+            "2000-01-01 00:00:00.5",
+        ] {
+            assert_eq!(format_timestamp(parse_timestamp(s).unwrap()), s);
         }
     }
 }

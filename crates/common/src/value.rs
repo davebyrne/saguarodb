@@ -9,6 +9,9 @@ pub enum Value {
     /// `DATE`, stored as days from the Unix epoch (1970-01-01 = 0). i64-backed so
     /// the derived `Ord`/`Hash` give correct date ordering and key/dedup behavior.
     Date(i64),
+    /// `TIMESTAMP` (without time zone), stored as microseconds from the Unix epoch
+    /// (1970-01-01 00:00:00 = 0). i64-backed, like `Date`.
+    Timestamp(i64),
 }
 
 /// Parse PostgreSQL boolean input text, returning `None` for unrecognized input

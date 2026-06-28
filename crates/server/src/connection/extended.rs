@@ -225,6 +225,7 @@ fn oid_to_data_type(oid: i32) -> Result<Option<DataType>> {
         25 => Ok(Some(DataType::Text)),
         16 => Ok(Some(DataType::Boolean)),
         1082 => Ok(Some(DataType::Date)),
+        1114 => Ok(Some(DataType::Timestamp)),
         other => Err(protocol_error(format!(
             "unsupported parameter type OID {other}"
         ))),

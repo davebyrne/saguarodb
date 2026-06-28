@@ -126,6 +126,11 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Date => common::datetime::parse_date(text)
             .map(Value::Date)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for date: \"{text}\""))),
+        DataType::Timestamp => common::datetime::parse_timestamp(text)
+            .map(Value::Timestamp)
+            .ok_or_else(|| {
+                invalid_value(format!("invalid input syntax for timestamp: \"{text}\""))
+            }),
     }
 }
 
@@ -361,6 +366,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Boolean(flag) => Some(if *flag { "t" } else { "f" }.to_string()),
         Value::Text(text) => Some(text.clone()),
         Value::Date(days) => Some(common::datetime::format_date(*days)),
+        Value::Timestamp(micros) => Some(common::datetime::format_timestamp(*micros)),
     }
 }
 

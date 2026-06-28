@@ -292,6 +292,12 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         | sql::DataType::Character(_) => Ok(DataType::Text),
         sql::DataType::Boolean | sql::DataType::Bool => Ok(DataType::Boolean),
         sql::DataType::Date => Ok(DataType::Date),
+        // TIMESTAMP without time zone and without a fractional-seconds precision.
+        // WITH TIME ZONE and an explicit precision are not supported.
+        sql::DataType::Timestamp(
+            None,
+            sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone,
+        ) => Ok(DataType::Timestamp),
         _ => unsupported("unsupported data type"),
     }
 }

@@ -543,6 +543,13 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             // PostgreSQL binary `date` is an i32 day count from 2000-01-01.
             ValueFormat::Binary => date_to_pg_binary(*days)?.to_be_bytes().to_vec(),
         },
+        Value::Timestamp(micros) => match format {
+            ValueFormat::Text => common::datetime::format_timestamp(*micros).into_bytes(),
+            // PostgreSQL binary `timestamp` is an i64 microsecond count from 2000-01-01.
+            ValueFormat::Binary => (micros - PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .to_be_bytes()
+                .to_vec(),
+        },
     };
     Ok(Some(bytes))
 }
@@ -551,6 +558,10 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
 /// (2000-01-01), used to convert our internal day count to/from the wire's
 /// binary `date` representation.
 const PG_DATE_EPOCH_OFFSET_DAYS: i64 = 10957;
+
+/// Microseconds from the Unix epoch (1970-01-01) to the PostgreSQL timestamp
+/// epoch (2000-01-01), used for the binary `timestamp` wire representation.
+const PG_TIMESTAMP_EPOCH_OFFSET_MICROS: i64 = 10957 * 86_400 * 1_000_000;
 
 fn date_to_pg_binary(days: i64) -> Result<i32> {
     i32::try_from(days - PG_DATE_EPOCH_OFFSET_DAYS)
@@ -605,6 +616,20 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 i32::from_be_bytes(array) as i64 + PG_DATE_EPOCH_OFFSET_DAYS,
             ))
         }
+        (DataType::Timestamp, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "timestamp parameter")?;
+            common::datetime::parse_timestamp(text)
+                .map(Value::Timestamp)
+                .ok_or_else(|| protocol_error("invalid timestamp parameter"))
+        }
+        (DataType::Timestamp, ValueFormat::Binary) => {
+            let array: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary timestamp parameter must be 8 bytes"))?;
+            Ok(Value::Timestamp(
+                i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
+            ))
+        }
     }
 }
 
@@ -624,6 +649,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Text => (25, -1),
         DataType::Boolean => (16, 1),
         DataType::Date => (1082, 4),
+        DataType::Timestamp => (1114, 8),
     }
 }
 
@@ -701,5 +727,46 @@ mod date_value_tests {
     #[test]
     fn invalid_date_text_is_rejected() {
         assert!(decode_value(b"2023-02-29", DataType::Date, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    // 2000-01-01 00:00:00 is the PG timestamp epoch: 10957 days of micros from 1970.
+    const PG_EPOCH_MICROS: i64 = 10957 * 86_400 * 1_000_000;
+
+    #[test]
+    fn timestamp_text_round_trips_and_formats() {
+        let value = Value::Timestamp(PG_EPOCH_MICROS + 45 * 1_000_000);
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"2000-01-01 00:00:45");
+        assert_eq!(decode_value(&text, DataType::Timestamp, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn timestamp_binary_uses_pg_2000_epoch_and_round_trips() {
+        let value = Value::Timestamp(PG_EPOCH_MICROS);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, 0_i64.to_be_bytes());
+        assert_eq!(
+            decode_value(&binary, DataType::Timestamp, 1).unwrap(),
+            value
+        );
+
+        let value = Value::Timestamp(PG_EPOCH_MICROS - 1_000_000); // one second before
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, (-1_000_000_i64).to_be_bytes());
+        assert_eq!(
+            decode_value(&binary, DataType::Timestamp, 1).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_text_is_rejected() {
+        assert!(decode_value(b"2024-01-15 25:00:00", DataType::Timestamp, 0).is_err());
     }
 }

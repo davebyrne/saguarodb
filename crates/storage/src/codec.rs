@@ -68,6 +68,7 @@ const KEY_TAG_INTEGER: u8 = 1;
 const KEY_TAG_TEXT: u8 = 2;
 const KEY_TAG_BOOLEAN: u8 = 3;
 const KEY_TAG_DATE: u8 = 4;
+const KEY_TAG_TIMESTAMP: u8 = 5;
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
 /// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
@@ -98,6 +99,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             }
             Value::Date(value) => {
                 bytes.push(KEY_TAG_DATE);
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Timestamp(value) => {
+                bytes.push(KEY_TAG_TIMESTAMP);
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -153,6 +158,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
             KEY_TAG_DATE => {
                 let raw = read_exact(bytes, &mut offset, 8)?;
                 Value::Date(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+            }
+            KEY_TAG_TIMESTAMP => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                Value::Timestamp(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
             }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
@@ -228,6 +237,9 @@ pub(crate) fn encode_row_with_infomask(
                 bytes.push(u8::from(*value));
             }
             Value::Date(value) if column.data_type == DataType::Date => {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Timestamp(value) if column.data_type == DataType::Timestamp => {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             _ => {
@@ -320,6 +332,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 let mut array = [0; 8];
                 array.copy_from_slice(raw);
                 Value::Date(i64::from_le_bytes(array))
+            }
+            DataType::Timestamp => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                let mut array = [0; 8];
+                array.copy_from_slice(raw);
+                Value::Timestamp(i64::from_le_bytes(array))
             }
         };
         values.push(value);
@@ -507,6 +525,7 @@ mod tests {
                 }
                 Value::Boolean(value) => bytes.push(u8::from(*value)),
                 Value::Date(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Value::Timestamp(value) => bytes.extend_from_slice(&value.to_le_bytes()),
             }
         }
         bytes

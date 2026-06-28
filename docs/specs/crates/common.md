@@ -57,15 +57,18 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Text(String),
-    Date(i64),  // days from the Unix epoch (1970-01-01)
+    Date(i64),       // days from the Unix epoch (1970-01-01)
+    Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
 }
 ```
 
-`Value::Date` is backed by `i64`, so the derived `Ord`/`Hash` give correct date
-ordering and key/dedup behavior. The `datetime` module provides the proleptic
-Gregorian calendar conversions and `YYYY-MM-DD` parse/format helpers
-(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`) shared by the
-parser, executor, protocol, and COPY paths; there is no external date dependency.
+`Value::Date` and `Value::Timestamp` are backed by `i64`, so the derived
+`Ord`/`Hash` give correct chronological ordering and key/dedup behavior. The
+`datetime` module provides the proleptic Gregorian calendar conversions and the
+`YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format helpers
+(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
+`parse_timestamp`, `format_timestamp`) shared by the parser, executor, protocol,
+and COPY paths; there is no external date/time dependency.
 
 ```rust
 pub struct Row {
@@ -107,6 +110,7 @@ pub enum DataType {
     Text,
     Boolean,
     Date,
+    Timestamp,
 }
 
 pub struct ParsedColumnDef {
