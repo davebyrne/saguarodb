@@ -55,7 +55,9 @@ Identifiers normalize to lowercase (quoted identifiers remain unsupported).
 - `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` outside a transaction block →
   `NoActiveSqlTransaction` (`25P01`).
 - `RELEASE`/`ROLLBACK TO` of a name with no matching live savepoint →
-  `InvalidSavepointSpecification` (`3B001`).
+  `InvalidSavepointSpecification` (`3B001`). Like any statement error, this aborts
+  the block to the failed (`'E'`) state (PostgreSQL behavior); a subsequent
+  `ROLLBACK TO` of an *existing* savepoint can still recover it.
 - These commands via the **extended** query protocol are rejected
   (`FeatureNotSupported`), like other transaction control (simple-query only).
 

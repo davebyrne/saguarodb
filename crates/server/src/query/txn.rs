@@ -151,17 +151,33 @@ impl QueryService {
                         txn.savepoints.truncate(idx);
                         (Some(txn), default_isolation, Ok(release_complete()))
                     }
-                    None => (Some(txn), default_isolation, Err(no_such_savepoint(&name))),
+                    // Unknown savepoint: an error that aborts the block to 'E'
+                    // (PostgreSQL raises an ERROR like any statement error).
+                    None => {
+                        txn.failed = true;
+                        (Some(txn), default_isolation, Err(no_such_savepoint(&name)))
+                    }
                 }
             }
             Statement::RollbackToSavepoint { name } => {
                 match txn.savepoints.iter().rposition(|level| level.name == name) {
                     Some(idx) => {
-                        // Abort the named level's subxid and every deeper one.
-                        let rolled: Vec<u64> =
-                            txn.savepoints[idx..].iter().map(|l| l.subxid).collect();
+                        // Roll back ALL work done since the named level was
+                        // established. Select by subxid VALUE, not stack position:
+                        // subxids are allocated monotonically (`register_active_txn`),
+                        // so every live subxid `>=` the named level's is work since
+                        // that savepoint — INCLUDING a subxid that was `RELEASE`d into
+                        // a nested level (popped from the stack but still live). A
+                        // by-position slice would miss it and wrongly commit its rows.
+                        let level_subxid = txn.savepoints[idx].subxid;
+                        let rolled: Vec<u64> = txn
+                            .live_subxids
+                            .iter()
+                            .copied()
+                            .filter(|&s| s >= level_subxid)
+                            .collect();
                         self.abort_subxids(&rolled);
-                        txn.live_subxids.retain(|s| !rolled.contains(s));
+                        txn.live_subxids.retain(|&s| s < level_subxid);
                         txn.savepoints.truncate(idx);
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
@@ -175,8 +191,12 @@ impl QueryService {
                         txn.failed = false;
                         (Some(txn), default_isolation, Ok(rollback_complete()))
                     }
-                    // Unknown savepoint: a failed block stays failed ('E').
-                    None => (Some(txn), default_isolation, Err(no_such_savepoint(&name))),
+                    // Unknown savepoint: an error that aborts the block to 'E'
+                    // (PostgreSQL raises an ERROR like any statement error).
+                    None => {
+                        txn.failed = true;
+                        (Some(txn), default_isolation, Err(no_such_savepoint(&name)))
+                    }
                 }
             }
             other => (

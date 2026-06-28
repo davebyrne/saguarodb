@@ -1230,22 +1230,23 @@ async fn same_name_savepoint_targets_most_recent() {
     conn.ok("commit").await;
 }
 
-/// Error paths: savepoint commands outside a block (`25P01`) and unknown savepoint
-/// names (`3B001`).
+/// Error paths: savepoint commands outside a block (`25P01`), and unknown savepoint
+/// names (`3B001`) — which abort the block to 'E' like any statement error, so each
+/// is exercised in its own fresh transaction.
 #[tokio::test]
 async fn savepoint_error_paths() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
 
-    // Outside a transaction block: 25P01. (The harness encodes the SQLSTATE into
-    // the decoded message as `C=<code>`.)
+    // Outside a transaction block: 25P01, no block to poison. (The harness encodes
+    // the SQLSTATE into the decoded message as `C=<code>`.)
     let outside = conn.query("savepoint s").await.unwrap();
     let err = outside.result.err().unwrap();
     assert!(err.message.contains("C=25P01"), "message: {}", err.message);
     assert_eq!(outside.status, b'I');
 
+    // Unknown ROLLBACK TO: 3B001, and the block is poisoned to 'E'.
     conn.ok("begin").await;
-    // Unknown savepoint for ROLLBACK TO and RELEASE: 3B001.
     let rb = conn.query("rollback to savepoint nope").await.unwrap();
     let rb_err = rb.result.err().unwrap();
     assert!(
@@ -1253,6 +1254,11 @@ async fn savepoint_error_paths() {
         "message: {}",
         rb_err.message
     );
+    assert_eq!(rb.status, b'E', "unknown ROLLBACK TO aborts the block");
+    conn.ok("rollback").await;
+
+    // Unknown RELEASE: 3B001, and the block is poisoned to 'E'.
+    conn.ok("begin").await;
     let rel = conn.query("release savepoint nope").await.unwrap();
     let rel_err = rel.result.err().unwrap();
     assert!(
@@ -1260,7 +1266,33 @@ async fn savepoint_error_paths() {
         "message: {}",
         rel_err.message
     );
+    assert_eq!(rel.status, b'E', "unknown RELEASE aborts the block");
     conn.ok("rollback").await;
+}
+
+/// Regression (review of the savepoint lifecycle): a subxid `RELEASE`d into a
+/// nested level must still be rolled back when `ROLLBACK TO` targets an enclosing
+/// savepoint — its rows must NOT survive the commit. A by-stack-position selection
+/// would miss the released subxid; selection is by subxid value.
+#[tokio::test]
+async fn rollback_to_outer_discards_released_nested_subxid() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("savepoint a").await;
+    conn.ok("insert into t (id) values (1)").await; // under a
+    conn.ok("savepoint b").await;
+    conn.ok("insert into t (id) values (2)").await; // under b
+    conn.ok("release savepoint b").await; // b popped, its subxid stays live
+    conn.ok("rollback to savepoint a").await; // must discard BOTH 1 and 2
+    assert!(
+        conn.ok("select id from t").await.rows().is_empty(),
+        "rolling back to a discards work under a and the released-into-b subxid"
+    );
+    conn.ok("commit").await;
+    assert!(conn.ok("select id from t").await.rows().is_empty());
 }
 
 /// Savepoints are rejected over the extended query protocol (simple-query only).
