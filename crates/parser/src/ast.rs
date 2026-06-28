@@ -182,6 +182,11 @@ pub enum Expr {
         table: Option<String>,
         column: String,
     },
+    /// A scalar subquery `(SELECT ...)` used as an expression. It must produce a
+    /// single column and at most one row; an empty result is `NULL`. The binder
+    /// validates the single-column shape; the one-row cardinality is enforced at
+    /// run time.
+    Subquery(Box<SelectStatement>),
     BinaryOp {
         left: Box<Expr>,
         op: BinOp,

@@ -428,10 +428,15 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
                 collect_aggregates(else_clause, output);
             }
         }
+        // A subquery body is its own (uncorrelated) scope; only `InSubquery`'s
+        // left operand belongs to the outer query and may carry an aggregate.
+        BoundExpr::InSubquery { expr, .. } => collect_aggregates(expr, output),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => {}
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => {}
     }
 }
 
@@ -611,10 +616,27 @@ fn rewrite_aggregate_expr(
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
+        // The subquery body is uncorrelated (its own scope), so it needs no
+        // grouped-expression rewrite; only `InSubquery`'s left operand does.
+        BoundExpr::InSubquery {
+            expr,
+            select,
+            negated,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::InSubquery {
+            expr: Box::new(rewrite_aggregate_expr(expr, group_by, aggregates)?),
+            select: select.clone(),
+            negated: *negated,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => Ok(expr.clone()),
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => Ok(expr.clone()),
         BoundExpr::AggregateCall { .. } => Err(DbError::internal(
             "nested aggregate survived binder validation",
         )),
@@ -653,9 +675,12 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
                 || else_clause.as_deref().is_some_and(contains_aggregate)
         }
+        BoundExpr::InSubquery { expr, .. } => contains_aggregate(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => false,
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => false,
     }
 }

@@ -108,6 +108,7 @@ The evaluator handles:
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
 - `Parameter` (`$n`) references must be substituted to literals before execution. One reaching the evaluator is an internal error (`"unbound parameter $N reached the executor"`).
+- Subquery expressions (`ScalarSubquery`, `Exists`, `InSubquery`) must be resolved to constants before scalar evaluation; one reaching the evaluator is an internal error. See "Subquery Resolution" below.
 
 Division by zero returns `SqlState::DivisionByZero` for both integer and double precision (PostgreSQL also raises on float division by zero rather than producing infinity). Integer overflow in scalar arithmetic or integer aggregate accumulation returns `SqlState::NumericValueOutOfRange`; double-precision arithmetic follows IEEE 754 (overflow yields infinity rather than erroring).
 
@@ -125,6 +126,17 @@ Expression semantics:
 - Type mismatches in expression evaluation return `SqlState::DatatypeMismatch`.
 
 Aggregate execution groups input rows by the `GROUP BY` expressions into ordered groups and emits one output row per group (group-key columns first, then the aggregates); with no `GROUP BY` the entire input is a single group. A `DISTINCT` aggregate argument (e.g. `COUNT(DISTINCT x)`) de-duplicates its argument values before aggregating. Return-type rules: `COUNT` returns `0` for empty input and ignores nulls for `COUNT(expr)`; `SUM`, `AVG`, `MIN`, and `MAX` return `NULL` for empty input. `SUM` and `AVG` require a numeric argument (`INTEGER`, `DOUBLE PRECISION`, or `NUMERIC`) and otherwise return `SqlState::DatatypeMismatch`; the result type matches the argument family (`NUMERIC` yields an unconstrained `NUMERIC`). `AVG(integer)` uses integer division truncated toward zero, while `AVG(double precision)` and `AVG(numeric)` are true division. `MIN` and `MAX` order any `Value` type (including text and boolean) via the value ordering, ignoring nulls.
+### Subquery Resolution
+
+Uncorrelated subqueries are resolved to constants by a one-time pre-pass over the physical plan, run at the start of `QueryEngine::execute` before any operator is built. The pass walks every expression in the plan (scan/join/filter predicates, projection and sort and distinct expressions, aggregate group keys and arguments, `Values` rows, and `UPDATE` assignments) and rewrites each subquery expression:
+
+- A scalar subquery `(SELECT ...)` is executed under the statement's snapshot; an empty result becomes `NULL`, exactly one row becomes its single column value (as a typed literal), and more than one row returns `SqlState::CardinalityViolation` (`21000`).
+- `[NOT] EXISTS (...)` becomes a boolean literal: whether the sub-plan produced at least one row, negated for `NOT EXISTS`.
+- `expr [NOT] IN (SELECT ...)` materializes the subquery's single column into an `InList` of literals, so the existing `IN`/`NOT IN` three-valued-logic evaluation applies unchanged (including `NULL` items).
+
+Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and executed once; the pass recurses so nested subqueries are resolved bottom-up. Because the subqueries are uncorrelated, a single execution under the statement snapshot is correct; correlated subqueries are not yet supported.
+
+Aggregate execution groups input rows by the `GROUP BY` expressions into ordered groups and emits one output row per group (group-key columns first, then the aggregates); with no `GROUP BY` the entire input is a single group. A `DISTINCT` aggregate argument (e.g. `COUNT(DISTINCT x)`) de-duplicates its argument values before aggregating. Return-type rules: `COUNT` returns `0` for empty input and ignores nulls for `COUNT(expr)`; `SUM`, `AVG`, `MIN`, and `MAX` return `NULL` for empty input. `SUM` and `AVG` require a numeric argument (`INTEGER` or `DOUBLE PRECISION`) and otherwise return `SqlState::DatatypeMismatch`; the result type matches the argument type. `AVG(integer)` uses integer division truncated toward zero, while `AVG(double precision)` is true floating-point division. `MIN` and `MAX` order any `Value` type (including text and boolean) via the value ordering, ignoring nulls.
 
 ## DML Execution
 

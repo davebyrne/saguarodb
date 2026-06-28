@@ -1,8 +1,9 @@
 use common::{DataType, Result, SqlState, Value};
-use parser::{Expr, FunctionArg};
+use parser::{Expr, FunctionArg, SelectStatement};
 
-use crate::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
+use crate::{AggregateFunc, BinOp, BoundExpr, BoundSelect, UnaryOp};
 
+use super::query::bind_select;
 use super::{BindContext, input_ref, plan_error, reject_aggregate, require_type};
 
 pub(super) fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
@@ -20,6 +21,7 @@ pub(super) fn bind_expr(
         Expr::Literal(value) => bind_literal(value, expected),
         Expr::Placeholder(index) => bind_placeholder(ctx, *index, expected),
         Expr::ColumnRef { table, column } => resolve_column(ctx, table.as_deref(), column),
+        Expr::Subquery(select) => bind_scalar_subquery(ctx, select),
         Expr::BinaryOp { left, op, right } => bind_binary_op(ctx, left, op.clone(), right),
         Expr::UnaryOp { op, expr } => bind_unary_op(ctx, op.clone(), expr),
         Expr::Function {
@@ -78,6 +80,39 @@ pub(super) fn bind_expr(
             })
         }
     }
+}
+
+/// Bind a subquery's inner SELECT in its own fresh binding scope (uncorrelated
+/// semantics: it does not see the outer query's columns), reusing the outer
+/// parameter declarations so `$n` placeholders inside the subquery resolve the
+/// same way.
+fn bind_subquery_select(ctx: &BindContext, select: &SelectStatement) -> Result<BoundSelect> {
+    bind_select(ctx.catalog, select, &ctx.declared_params)
+}
+
+/// Require that a subquery used where a single value is expected (a scalar
+/// subquery, or the right side of `IN`) produces exactly one output column.
+fn single_subquery_column(select: &BoundSelect) -> Result<&common::ColumnInfo> {
+    match select.output_schema.as_slice() {
+        [column] => Ok(column),
+        _ => Err(plan_error(
+            SqlState::SyntaxError,
+            "subquery must return only one column",
+        )),
+    }
+}
+
+/// `(SELECT ...)` as a scalar value: a single-column subquery whose row count is
+/// checked at run time. The result is always nullable (an empty result is NULL).
+fn bind_scalar_subquery(ctx: &mut BindContext, select: &SelectStatement) -> Result<BoundExpr> {
+    let bound = bind_subquery_select(ctx, select)?;
+    let column = single_subquery_column(&bound)?;
+    let data_type = column.data_type.clone();
+    Ok(BoundExpr::ScalarSubquery {
+        select: Box::new(bound),
+        data_type,
+        nullable: true,
+    })
 }
 
 /// PostgreSQL caps the number of bind parameters at 65535 (the wire protocol

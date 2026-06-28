@@ -24,7 +24,7 @@ pub(super) fn bind_select(
         ));
     }
 
-    let mut ctx = BindContext::new(declared);
+    let mut ctx = BindContext::new(catalog, declared);
     let from = bind_from_items(catalog, &mut ctx, &select.from)?;
     let filter = select
         .filter
@@ -444,10 +444,15 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             }
             Ok(())
         }
+        // `InSubquery`'s left operand is an outer-scope expression; the subquery
+        // body is its own (uncorrelated) scope and is treated as a constant.
+        BoundExpr::InSubquery { expr, .. } => validate_grouped_expr(expr, group_by),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => validate_grouped_expr(expr, group_by),
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => validate_grouped_expr(expr, group_by),
         BoundExpr::AggregateCall { .. } => Ok(()),
     }
 }
@@ -485,9 +490,14 @@ fn references_input(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| references_input(when) || references_input(then))
                 || else_clause.as_deref().is_some_and(references_input)
         }
-        BoundExpr::Literal { .. } | BoundExpr::Parameter { .. } | BoundExpr::LocalRef { .. } => {
-            false
-        }
+        // The left operand of `IN (subquery)` is an outer-scope expression; the
+        // subquery body itself is uncorrelated and never references outer input.
+        BoundExpr::InSubquery { expr, .. } => references_input(expr),
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => false,
     }
 }
 

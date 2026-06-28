@@ -69,6 +69,10 @@ impl QueryEngine {
         ctx: &ExecutionContext<'_>,
         plan: &PhysicalPlan,
     ) -> Result<ExecutionResult> {
+        // Resolve uncorrelated subqueries to constants once, up front, so the
+        // operators below evaluate only ordinary expressions.
+        let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
+        let plan = &resolved;
         match plan {
             PhysicalPlan::CreateTable {
                 name,

@@ -232,6 +232,27 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    // Subquery expressions. Each carries its inner SELECT as a `Box<BoundSelect>`
+    // bound in its own (uncorrelated) scope, preserved unchanged through logical
+    // and physical planning and evaluated by the executor.
+    ScalarSubquery {              // (SELECT ...) used as a single value
+        select: Box<BoundSelect>,
+        data_type: DataType,      // the subquery's single output column type
+        nullable: bool,           // always true (an empty result is NULL)
+    },
+    Exists {                      // [NOT] EXISTS (SELECT ...)
+        select: Box<BoundSelect>,
+        negated: bool,
+        data_type: DataType,      // Boolean
+        nullable: bool,           // false (EXISTS never yields NULL)
+    },
+    InSubquery {                  // expr [NOT] IN (SELECT ...)
+        expr: Box<BoundExpr>,     // left operand (outer scope)
+        select: Box<BoundSelect>, // single-column subquery
+        negated: bool,
+        data_type: DataType,      // Boolean
+        nullable: bool,
+    },
 }
 ```
 
@@ -247,6 +268,7 @@ Expression metadata rules:
 - `Case`: binder-selected result type; nullable when any selected result expression is nullable or no `ELSE` exists.
 - `Cast`: target type; nullable matches the input expression.
 - `AggregateCall` and `LocalRef`: use the aggregate/group output metadata assigned by logical planning.
+- `ScalarSubquery`, `Exists`, `InSubquery`: the binder binds the inner SELECT in a fresh, uncorrelated scope (it does not see the outer query's columns). A scalar subquery and the right side of `IN` must produce exactly one output column (else `SqlState::SyntaxError`); a scalar subquery's type is that column's type and it is always nullable. `EXISTS` is a non-null boolean. For `IN`/`NOT IN`, the left operand is type-checked against the subquery's column type (no implicit casts; mismatch is `SqlState::DatatypeMismatch`). These variants are constants with respect to the outer query, so the outer aggregate/grouping analyses treat them as leaves (only `InSubquery`'s left operand participates in the outer scope). Logical/physical planning preserve the inner `BoundSelect` unchanged; the executor plans and runs it.
 
 ## Shared Plan Expression Types
 

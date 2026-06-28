@@ -2050,6 +2050,65 @@ async fn e2e_select_distinct_rejects_order_by_outside_select_list() {
 }
 
 #[tokio::test]
+async fn e2e_scalar_subquery_in_projection_and_where() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada'), (2, 'Grace')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into accounts (id, owner) values (10, 'a'), (20, 'b')")
+        .await
+        .unwrap();
+
+    // Scalar subquery in the projection: every row sees the same max(id).
+    let rows = server
+        .simple_query("select name, (select max(id) from accounts) from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("Ada".to_string()), Some("20".to_string())],
+            vec![Some("Grace".to_string()), Some("20".to_string())],
+        ]
+    );
+
+    // Scalar subquery in WHERE.
+    let rows = server
+        .simple_query("select id from users where id = (select min(id) from users)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // An empty subquery result is NULL.
+    let rows = server
+        .simple_query("select (select id from accounts where id = 999) from users where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![None]]);
+
+    // More than one row from a scalar subquery is a cardinality violation (21000).
+    let err = server
+        .simple_query("select (select id from accounts) from users")
+        .await
+        .err()
+        .expect("scalar subquery returning multiple rows should be rejected");
+    assert!(err.message.contains("21000"), "got: {}", err.message);
+}
+
+#[tokio::test]
 async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
     let server = TestServer::start().await.unwrap();
     server

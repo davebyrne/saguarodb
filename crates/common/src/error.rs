@@ -48,6 +48,9 @@ pub enum SqlState {
     BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
+    /// `21000`: a subquery used as an expression returned more than one row where
+    /// at most one was expected (a scalar subquery).
+    CardinalityViolation,
     QueryCanceled,
     FeatureNotSupported,
     /// `25P02`: a statement other than `COMMIT`/`ROLLBACK` was issued inside a

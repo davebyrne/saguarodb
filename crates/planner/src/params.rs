@@ -121,6 +121,9 @@ fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()
 
 fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<DataType>>) -> Result<()> {
     for_each_child(expr, &mut |child| collect_expr(child, used))?;
+    if let Some(select) = subquery_select(expr) {
+        collect_select(select, used)?;
+    }
     if let BoundExpr::Parameter {
         index, data_type, ..
     } = expr
@@ -128,6 +131,26 @@ fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<DataType>>) -> Result<()
         record_param(used, *index, data_type)?;
     }
     Ok(())
+}
+
+/// The inner SELECT of a subquery expression, if any. Parameter handling recurses
+/// into it so `$n` placeholders inside a subquery are collected and substituted.
+fn subquery_select(expr: &BoundExpr) -> Option<&BoundSelect> {
+    match expr {
+        BoundExpr::ScalarSubquery { select, .. }
+        | BoundExpr::Exists { select, .. }
+        | BoundExpr::InSubquery { select, .. } => Some(select),
+        _ => None,
+    }
+}
+
+fn subquery_select_mut(expr: &mut BoundExpr) -> Option<&mut BoundSelect> {
+    match expr {
+        BoundExpr::ScalarSubquery { select, .. }
+        | BoundExpr::Exists { select, .. }
+        | BoundExpr::InSubquery { select, .. } => Some(select),
+        _ => None,
+    }
 }
 
 fn record_param(
@@ -227,6 +250,9 @@ fn substitute_from(from: &mut BoundFrom, params: &[Value]) -> Result<()> {
 
 fn substitute_expr(expr: &mut BoundExpr, params: &[Value]) -> Result<()> {
     for_each_child_mut(expr, &mut |child| substitute_expr(child, params))?;
+    if let Some(select) = subquery_select_mut(expr) {
+        substitute_select(select, params)?;
+    }
 
     let BoundExpr::Parameter {
         index,
@@ -261,10 +287,15 @@ fn substitute_expr(expr: &mut BoundExpr, params: &[Value]) -> Result<()> {
 
 fn for_each_child(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Result<()>) -> Result<()> {
     match expr {
+        // The subquery body is reached via `subquery_select`, not as a BoundExpr
+        // child; only `InSubquery`'s left operand is a direct child here.
+        BoundExpr::InSubquery { expr, .. } => f(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => Ok(()),
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => Ok(()),
         BoundExpr::BinaryOp { left, right, .. } => {
             f(left)?;
             f(right)
@@ -329,10 +360,13 @@ fn for_each_child_mut(
     f: &mut impl FnMut(&mut BoundExpr) -> Result<()>,
 ) -> Result<()> {
     match expr {
+        BoundExpr::InSubquery { expr, .. } => f(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => Ok(()),
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => Ok(()),
         BoundExpr::BinaryOp { left, right, .. } => {
             f(left)?;
             f(right)

@@ -1,5 +1,7 @@
 use common::{BindingId, ColumnId, DataType, Value};
 
+use crate::BoundSelect;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundExpr {
     Literal {
@@ -96,6 +98,33 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    /// A scalar subquery `(SELECT ...)`: a single-column, at-most-one-row SELECT
+    /// used as a value. The sub-plan is carried as a bound SELECT (unchanged
+    /// through logical and physical planning) and evaluated by the executor —
+    /// an empty result yields `NULL`, more than one row is a runtime error.
+    /// Uncorrelated: the inner SELECT is its own binding scope.
+    ScalarSubquery {
+        select: Box<BoundSelect>,
+        data_type: DataType,
+        nullable: bool,
+    },
+    /// `[NOT] EXISTS (SELECT ...)`. Yields a non-null boolean: whether the
+    /// sub-plan produces at least one row (negated for `NOT EXISTS`).
+    Exists {
+        select: Box<BoundSelect>,
+        negated: bool,
+        data_type: DataType,
+        nullable: bool,
+    },
+    /// `expr [NOT] IN (SELECT ...)` over a single-column sub-plan. The executor
+    /// materializes the column and applies SQL `IN`/`NOT IN` three-valued logic.
+    InSubquery {
+        expr: Box<BoundExpr>,
+        select: Box<BoundSelect>,
+        negated: bool,
+        data_type: DataType,
+        nullable: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +202,10 @@ impl BoundExpr {
             | BoundExpr::Between { data_type, .. }
             | BoundExpr::Like { data_type, .. }
             | BoundExpr::Case { data_type, .. }
-            | BoundExpr::Cast { data_type, .. } => data_type.clone(),
+            | BoundExpr::Cast { data_type, .. }
+            | BoundExpr::ScalarSubquery { data_type, .. }
+            | BoundExpr::Exists { data_type, .. }
+            | BoundExpr::InSubquery { data_type, .. } => data_type.clone(),
         }
     }
 
@@ -193,7 +225,10 @@ impl BoundExpr {
             | BoundExpr::Between { nullable, .. }
             | BoundExpr::Like { nullable, .. }
             | BoundExpr::Case { nullable, .. }
-            | BoundExpr::Cast { nullable, .. } => *nullable,
+            | BoundExpr::Cast { nullable, .. }
+            | BoundExpr::ScalarSubquery { nullable, .. }
+            | BoundExpr::Exists { nullable, .. }
+            | BoundExpr::InSubquery { nullable, .. } => *nullable,
         }
     }
 

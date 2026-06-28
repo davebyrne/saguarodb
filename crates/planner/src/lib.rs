@@ -304,6 +304,36 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_scalar_subquery_in_projection() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select (select max(id) from accounts) as m from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        // A scalar subquery is always nullable (empty result is NULL), and its
+        // type is the single output column's type (max(id) -> Integer).
+        assert_eq!(select.output_schema[0].data_type, DataType::Integer);
+        assert!(matches!(
+            select.columns[0].expr,
+            BoundExpr::ScalarSubquery {
+                data_type: DataType::Integer,
+                nullable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binder_rejects_multi_column_scalar_subquery() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select (select id, owner from accounts) from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_rejects_composite_primary_key_for_v1() {
         let catalog = catalog_with_users();
         let stmt =

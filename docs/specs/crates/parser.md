@@ -131,6 +131,7 @@ pub enum Expr {
     Literal(Value),
     Placeholder(u32), // extended-protocol parameter `$n` (1-based)
     ColumnRef { table: Option<String>, column: String },
+    Subquery(Box<SelectStatement>), // scalar subquery (SELECT ...) as a value
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
@@ -195,6 +196,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `DROP INDEX name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
+- Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`. The inner `SELECT` is converted with the same query rules; cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but only a `SELECT` inner statement is accepted; any other inner statement is rejected as unsupported.

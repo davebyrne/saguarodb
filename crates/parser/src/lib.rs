@@ -67,6 +67,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_scalar_subquery_in_projection() {
+        let stmt = parse("select (select max(id) from accounts) from users").unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        let SelectItem::Expression {
+            expr: Expr::Subquery(inner),
+            ..
+        } = &select.columns[0]
+        else {
+            panic!("expected scalar subquery, got {:?}", select.columns[0]);
+        };
+        assert!(
+            matches!(inner.from.as_slice(), [FromItem::Table { name, .. }] if name == "accounts")
+        );
+    }
+
+    #[test]
+    fn parses_scalar_subquery_in_where() {
+        let stmt =
+            parse("select name from users where id = (select min(id) from accounts)").unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(Expr::BinaryOp {
+                op: BinOp::Eq,
+                ref right,
+                ..
+            }) if matches!(**right, Expr::Subquery(_))
+        ));
+    }
+
+    #[test]
     fn parses_count_star_and_aggregate_distinct_shape() {
         let stmt = parse("select count(*), count(distinct id) from users").unwrap();
 

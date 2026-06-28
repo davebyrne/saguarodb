@@ -23,8 +23,10 @@ struct Binding {
     slot_start: usize,
 }
 
-#[derive(Default)]
-struct BindContext {
+struct BindContext<'a> {
+    /// The catalog, carried so expression binding can resolve a subquery's tables
+    /// (a subquery is bound in its own fresh scope — uncorrelated semantics).
+    catalog: &'a dyn CatalogManager,
     bindings: Vec<Binding>,
     next_binding: BindingId,
     next_slot: usize,
@@ -33,11 +35,14 @@ struct BindContext {
     declared_params: Vec<Option<DataType>>,
 }
 
-impl BindContext {
-    fn new(declared_params: &[Option<DataType>]) -> Self {
+impl<'a> BindContext<'a> {
+    fn new(catalog: &'a dyn CatalogManager, declared_params: &[Option<DataType>]) -> Self {
         Self {
+            catalog,
+            bindings: Vec::new(),
+            next_binding: 0,
+            next_slot: 0,
             declared_params: declared_params.to_vec(),
-            ..Self::default()
         }
     }
 
@@ -257,10 +262,16 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
                 || else_clause.as_deref().is_some_and(contains_aggregate)
         }
+        // A subquery is its own (uncorrelated) scope: its inner select cannot
+        // contain an aggregate of the OUTER query. `InSubquery`'s left operand,
+        // however, is an outer-scope expression and may.
+        BoundExpr::InSubquery { expr, .. } => contains_aggregate(expr),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => false,
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => false,
     }
 }
 

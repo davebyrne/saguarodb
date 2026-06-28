@@ -50,7 +50,9 @@ pub(super) fn bind_insert(
     validate_insert_omissions(&table, &columns)?;
 
     let source = match source {
-        InsertSource::Values(rows) => bind_insert_values(&table, &columns, rows, declared)?,
+        InsertSource::Values(rows) => {
+            bind_insert_values(catalog, &table, &columns, rows, declared)?
+        }
         InsertSource::Query(select) => {
             bind_insert_query(catalog, &table, &columns, select, declared)?
         }
@@ -64,6 +66,7 @@ pub(super) fn bind_insert(
 }
 
 fn bind_insert_values(
+    catalog: &dyn CatalogManager,
     table: &TableSchema,
     columns: &[ColumnId],
     rows: &[Vec<Expr>],
@@ -82,7 +85,7 @@ fn bind_insert_values(
         for (expr, column_id) in row.iter().zip(columns) {
             let column = column_by_id(table, *column_id)?;
             let bound = bind_expr(
-                &mut BindContext::new(declared),
+                &mut BindContext::new(catalog, declared),
                 expr,
                 Some(column.data_type.clone()),
             )?;
@@ -136,7 +139,7 @@ pub(super) fn bind_update(
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let mut ctx = BindContext::new(declared);
+    let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
@@ -192,7 +195,7 @@ pub(super) fn bind_delete(
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let mut ctx = BindContext::new(declared);
+    let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))

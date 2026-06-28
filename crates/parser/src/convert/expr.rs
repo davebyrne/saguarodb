@@ -3,6 +3,7 @@ use sqlparser::ast as sql;
 
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
+use super::query::convert_query_to_select;
 use super::{convert_data_type, ident_name, object_name, parse_error, unsupported};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
@@ -108,6 +109,9 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             })
         }
         sql::Expr::TypedString { data_type, value } => convert_typed_string(data_type, value),
+        sql::Expr::Subquery(query) => Ok(Expr::Subquery(Box::new(convert_query_to_select(
+            (**query).clone(),
+        )?))),
         sql::Expr::Function(function) => convert_function(function),
         sql::Expr::Substring {
             expr,

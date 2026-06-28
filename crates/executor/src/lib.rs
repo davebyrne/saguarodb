@@ -2,6 +2,7 @@ pub mod copy;
 mod expr;
 mod query;
 mod result;
+mod subquery;
 
 pub mod ops;
 
@@ -666,6 +667,94 @@ mod tests {
                     Value::Integer(1),
                     Value::Integer(2),
                 ]
+            }]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_in_projection_returns_single_value() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table accounts (id integer primary key, owner text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into accounts (id, owner) values (10, 'a'), (20, 'b')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select name, (select max(id) from accounts) from users")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("Ada".to_string()), Value::Integer(20)]
+            }]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_empty_result_is_null() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table accounts (id integer primary key, owner text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select (select id from accounts where id = 999) from users")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Null]
+            }]
+        );
+    }
+
+    #[test]
+    fn scalar_subquery_with_more_than_one_row_errors() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table accounts (id integer primary key, owner text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        harness
+            .execute("insert into accounts (id, owner) values (10, 'a'), (20, 'b')")
+            .unwrap();
+
+        let err = harness
+            .execute("select (select id from accounts) from users")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::CardinalityViolation);
+    }
+
+    #[test]
+    fn scalar_subquery_in_where_filters_rows() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table accounts (id integer primary key, owner text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada'), (2, 'Grace')")
+            .unwrap();
+        harness
+            .execute("insert into accounts (id, owner) values (2, 'a')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select name from users where id = (select max(id) from accounts)")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("Grace".to_string())]
             }]
         );
     }

@@ -63,7 +63,8 @@ precedence.
 
 - Preserve the supported SQL subset unless the specs are intentionally updated:
   `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
-  `INSERT ... VALUES`, `SELECT` with the supported clauses and joins, `UPDATE`, `DELETE`,
+  `INSERT ... VALUES`, `SELECT` with the supported clauses and joins (including
+  uncorrelated scalar subqueries `(SELECT ...)` in expressions), `UPDATE`, `DELETE`,
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped

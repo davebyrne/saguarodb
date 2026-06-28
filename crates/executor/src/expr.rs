@@ -92,6 +92,13 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
         BoundExpr::Cast {
             expr, data_type, ..
         } => cast_value(eval_expr(expr, row)?, data_type),
+        // Subqueries are resolved to literals (or an `IN` list) by the executor's
+        // pre-pass before any row is evaluated; reaching here is a routing bug.
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => Err(DbError::internal(
+            "subquery expression reached scalar evaluation without being resolved",
+        )),
     }
 }
 

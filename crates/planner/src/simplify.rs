@@ -421,10 +421,16 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             data_type,
             nullable,
         },
+        // Subqueries are not folded here: the inner SELECT is planned and folded
+        // on its own when the executor materializes it. (`InSubquery`'s left
+        // operand is left intact too — correct, just not constant-folded.)
         leaf @ (BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. }) => leaf,
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. }) => leaf,
     }
 }
 
