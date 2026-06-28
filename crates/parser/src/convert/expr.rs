@@ -133,6 +133,8 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         sql::Expr::Subquery(query) => Ok(Expr::Subquery(Box::new(convert_query_to_select(
             (**query).clone(),
         )?))),
+        sql::Expr::Ceil { expr, field } => convert_ceil_floor("ceil", expr, field),
+        sql::Expr::Floor { expr, field } => convert_ceil_floor("floor", expr, field),
         sql::Expr::Function(function) => convert_function(function),
         sql::Expr::Substring {
             expr,
@@ -156,6 +158,21 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             })
         }
         _ => unsupported("unsupported expression"),
+    }
+}
+
+/// Normalize the dedicated `CEIL(expr)` / `FLOOR(expr)` grammar into ordinary
+/// `Function` calls. The SQL `CEIL(expr TO <field>)` and scale forms are
+/// unsupported. (`CEILING` is not a sqlparser keyword, so it already arrives as a
+/// plain `ceiling` function call, which the binder treats like `ceil`.)
+fn convert_ceil_floor(name: &str, expr: &sql::Expr, field: &sql::CeilFloorKind) -> Result<Expr> {
+    match field {
+        sql::CeilFloorKind::DateTimeField(sql::DateTimeField::NoDateTime) => Ok(Expr::Function {
+            name: name.to_string(),
+            args: vec![FunctionArg::Expr(convert_expr(expr)?)],
+            distinct: false,
+        }),
+        _ => unsupported("CEIL/FLOOR with a TO field or scale is not supported"),
     }
 }
 

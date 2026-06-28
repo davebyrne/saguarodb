@@ -1328,6 +1328,66 @@ mod tests {
     }
 
     #[test]
+    fn math_functions_over_integer_and_double() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table m (id integer primary key, d double precision)")
+            .unwrap();
+        harness
+            .execute("insert into m (id, d) values (1, 2.5)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select floor(d), ceil(d), round(d), round(3.5), sqrt(9), \
+                 power(2.0, 3.0), power(2, 10), floor(id), abs(-7), abs(-2.5), \
+                 mod(7, 3) from m",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Float(2.0_f64.into()),    // floor(2.5)
+                    Value::Float(3.0_f64.into()),    // ceil(2.5)
+                    Value::Float(2.0_f64.into()),    // round(2.5) ties to even
+                    Value::Float(4.0_f64.into()),    // round(3.5) ties to even
+                    Value::Float(3.0_f64.into()),    // sqrt(9), integer widened
+                    Value::Float(8.0_f64.into()),    // power(2.0, 3.0)
+                    Value::Float(1024.0_f64.into()), // power(2, 10)
+                    Value::Integer(1),               // floor(id) keeps integer
+                    Value::Integer(7),               // abs(-7)
+                    Value::Float(2.5_f64.into()),    // abs(-2.5)
+                    Value::Integer(1),               // mod(7, 3)
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn math_function_type_and_domain_errors() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'x')")
+            .unwrap();
+
+        // FLOOR of text is a binder type mismatch.
+        let err = harness
+            .execute("select floor(name) from users")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+
+        // SQRT of a negative number is a runtime out-of-range error.
+        let err = harness.execute("select sqrt(-4.0) from users").unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+
+        // MOD by zero is division by zero.
+        let err = harness.execute("select mod(7, 0) from users").unwrap_err();
+        assert_eq!(err.code, SqlState::DivisionByZero);
+    }
+
+    #[test]
     fn string_concatenation_operator_evaluates_and_propagates_null() {
         let harness = ExecutorHarness::with_users();
         harness

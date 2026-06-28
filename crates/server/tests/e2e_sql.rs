@@ -2370,3 +2370,36 @@ async fn e2e_ilike_and_like_escape() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("3".to_string())]]);
 }
+
+#[tokio::test]
+async fn e2e_math_functions() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table m (id integer primary key, d double precision)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into m (id, d) values (1, 2.5)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select floor(d), ceil(d), round(d), sqrt(9), power(2, 10), mod(7, 3), abs(-5) from m",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2".to_string()),    // floor(2.5)
+            Some("3".to_string()),    // ceil(2.5)
+            Some("2".to_string()),    // round(2.5) ties to even
+            Some("3".to_string()),    // sqrt(9)
+            Some("1024".to_string()), // power(2, 10)
+            Some("1".to_string()),    // mod(7, 3)
+            Some("5".to_string()),    // abs(-5)
+        ]]
+    );
+}

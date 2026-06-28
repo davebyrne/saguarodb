@@ -711,9 +711,33 @@ fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> 
             require_type(&args[0], DataType::Text)?;
             Ok((DataType::Integer, nullable))
         }
-        "abs" => {
+        // ABS, FLOOR, CEIL/CEILING, and ROUND accept either numeric type and
+        // return that same type (FLOOR/CEIL/ROUND of an INTEGER is the integer
+        // itself; of a DOUBLE they round and stay DOUBLE).
+        "abs" | "floor" | "ceil" | "ceiling" | "round" => {
             expect_arity(name, args, 1)?;
+            let data_type = numeric_arg_type(name, &args[0])?;
+            Ok((data_type, nullable))
+        }
+        // SQRT always returns DOUBLE; an INTEGER argument is widened (PostgreSQL's
+        // sqrt(int) → double precision).
+        "sqrt" => {
+            expect_arity(name, args, 1)?;
+            require_numeric(name, &args[0])?;
+            Ok((DataType::Double, nullable))
+        }
+        // POWER/POW take two numeric arguments and return DOUBLE.
+        "power" | "pow" => {
+            expect_arity(name, args, 2)?;
+            require_numeric(name, &args[0])?;
+            require_numeric(name, &args[1])?;
+            Ok((DataType::Double, nullable))
+        }
+        // MOD is integer-only (matching the `%` operator, which rejects DOUBLE).
+        "mod" => {
+            expect_arity(name, args, 2)?;
             require_type(&args[0], DataType::Integer)?;
+            require_type(&args[1], DataType::Integer)?;
             Ok((DataType::Integer, nullable))
         }
         "substring" => {
@@ -735,6 +759,24 @@ fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> 
             format!("function {name} is not supported in v1"),
         )),
     }
+}
+
+/// The numeric type (`Integer` or `Double`) of an argument for functions that
+/// return their argument's type (`ABS`, `FLOOR`, `CEIL`, `ROUND`).
+fn numeric_arg_type(name: &str, arg: &BoundExpr) -> Result<DataType> {
+    match arg.data_type() {
+        data_type @ (DataType::Integer | DataType::Double) => Ok(data_type),
+        other => Err(plan_error(
+            SqlState::DatatypeMismatch,
+            format!("function {name} requires a numeric argument, got {other:?}"),
+        )),
+    }
+}
+
+/// Validate that an argument is numeric (`Integer` or `Double`) without fixing
+/// the result type (`SQRT`, `POWER`).
+fn require_numeric(name: &str, arg: &BoundExpr) -> Result<()> {
+    numeric_arg_type(name, arg).map(|_| ())
 }
 
 fn expect_arity(name: &str, args: &[BoundExpr], arity: usize) -> Result<()> {

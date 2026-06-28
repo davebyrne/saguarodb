@@ -289,10 +289,16 @@ fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value>
                 .map(Value::Integer)
                 .map_err(|_| DbError::internal("string length exceeds i64 range"))
         }
-        "abs" => function_integer(&values[0])?
-            .checked_abs()
-            .map(Value::Integer)
-            .ok_or_else(integer_overflow),
+        "abs" => eval_abs(&values[0]),
+        // FLOOR/CEIL/ROUND keep an integer unchanged; for a double they round and
+        // stay double. ROUND uses round-half-to-even, matching PostgreSQL's
+        // `round(double precision)` and the double→integer cast.
+        "floor" => numeric_round(&values[0], f64::floor),
+        "ceil" | "ceiling" => numeric_round(&values[0], f64::ceil),
+        "round" => numeric_round(&values[0], f64::round_ties_even),
+        "sqrt" => eval_sqrt(&values[0]),
+        "power" | "pow" => eval_power(&values[0], &values[1]),
+        "mod" => eval_mod(&values[0], &values[1]),
         "substring" => eval_substring(&values),
         _ => Err(DbError::internal(format!(
             "unknown scalar function {name} reached the executor"
@@ -343,6 +349,78 @@ fn function_integer(value: &Value) -> Result<i64> {
         Value::Integer(value) => Ok(*value),
         _ => datatype_mismatch("function expected an integer argument"),
     }
+}
+
+/// Read a numeric (`Integer` or `Double`) argument as `f64`.
+fn function_double(value: &Value) -> Result<f64> {
+    match value {
+        Value::Integer(value) => Ok(*value as f64),
+        Value::Float(value) => Ok(value.0),
+        _ => datatype_mismatch("function expected a numeric argument"),
+    }
+}
+
+/// `ABS`: integer stays integer (with overflow checking); double uses `f64::abs`.
+fn eval_abs(value: &Value) -> Result<Value> {
+    match value {
+        Value::Integer(value) => value
+            .checked_abs()
+            .map(Value::Integer)
+            .ok_or_else(integer_overflow),
+        Value::Float(value) => Ok(Value::Float(value.0.abs().into())),
+        _ => datatype_mismatch("abs requires a numeric argument"),
+    }
+}
+
+/// `FLOOR`/`CEIL`/`ROUND`: an integer is returned unchanged; a double is rounded
+/// by `round` and stays double.
+fn numeric_round(value: &Value, round: fn(f64) -> f64) -> Result<Value> {
+    match value {
+        Value::Integer(value) => Ok(Value::Integer(*value)),
+        Value::Float(value) => Ok(Value::Float(round(value.0).into())),
+        _ => datatype_mismatch("function requires a numeric argument"),
+    }
+}
+
+/// `SQRT(numeric)` → double. A negative argument is rejected (PostgreSQL raises
+/// rather than returning NaN).
+fn eval_sqrt(value: &Value) -> Result<Value> {
+    let value = function_double(value)?;
+    if value < 0.0 {
+        return Err(DbError::execute(
+            SqlState::NumericValueOutOfRange,
+            "cannot take square root of a negative number",
+        ));
+    }
+    Ok(Value::Float(value.sqrt().into()))
+}
+
+/// `POWER(base, exp)` → double. A non-finite result (overflow, or an undefined
+/// case such as a negative base to a fractional power) is rejected.
+fn eval_power(base: &Value, exp: &Value) -> Result<Value> {
+    let result = function_double(base)?.powf(function_double(exp)?);
+    if !result.is_finite() {
+        return Err(DbError::execute(
+            SqlState::NumericValueOutOfRange,
+            "power result is out of range or undefined",
+        ));
+    }
+    Ok(Value::Float(result.into()))
+}
+
+/// `MOD(a, b)` → integer remainder (`a % b`), with division-by-zero rejected.
+fn eval_mod(left: &Value, right: &Value) -> Result<Value> {
+    let left = function_integer(left)?;
+    let right = function_integer(right)?;
+    if right == 0 {
+        return Err(DbError::execute(
+            SqlState::DivisionByZero,
+            "division by zero",
+        ));
+    }
+    left.checked_rem(right)
+        .map(Value::Integer)
+        .ok_or_else(integer_overflow)
 }
 
 pub(crate) fn sql_and(left: Value, right: Value) -> Result<Value> {

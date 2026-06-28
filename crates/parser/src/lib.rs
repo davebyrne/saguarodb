@@ -907,6 +907,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_ceil_floor_into_function_calls() {
+        // CEIL/FLOOR are dedicated grammar; CEILING is an ordinary function. All
+        // three normalize to `Function` calls.
+        for (sql, expected) in [
+            ("select ceil(d) from m", "ceil"),
+            ("select ceiling(d) from m", "ceiling"),
+            ("select floor(d) from m", "floor"),
+        ] {
+            let Statement::Select(select) = parse(sql).unwrap() else {
+                panic!("expected select");
+            };
+            assert!(
+                matches!(
+                    &select.columns[0],
+                    SelectItem::Expression {
+                        expr: Expr::Function { name, args, distinct: false },
+                        ..
+                    } if name == expected && args.len() == 1
+                ),
+                "for `{sql}`"
+            );
+        }
+        // `CEIL(expr TO field)` is unsupported.
+        assert!(parse("select ceil(d to day) from m").is_err());
+    }
+
+    #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
         let Statement::Select(select) = stmt else {

@@ -107,7 +107,7 @@ The evaluator handles:
 - `IN`, `BETWEEN`, `LIKE`.
 - `CASE`.
 - `CAST`.
-- Scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), `ABS` (integer), and `SUBSTRING(text, start[, length])`. All are NULL-propagating (any NULL argument yields NULL). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`.
+- Scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), and `SUBSTRING(text, start[, length])`, plus the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, and `MOD`. All are NULL-propagating (any NULL argument yields NULL). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`. `FLOOR`/`CEIL`/`ROUND` leave an integer unchanged and round a double (`ROUND` is round-half-to-even, matching PostgreSQL's `round(double precision)`); `ABS` of `i64::MIN` returns `SqlState::NumericValueOutOfRange`; `SQRT` of a negative number and a non-finite `POWER` result return `NumericValueOutOfRange`; `MOD` by zero returns `SqlState::DivisionByZero`.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
 - `Parameter` (`$n`) references must be substituted to literals before execution. One reaching the evaluator is an internal error (`"unbound parameter $N reached the executor"`).

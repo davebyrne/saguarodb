@@ -1033,6 +1033,31 @@ mod tests {
     }
 
     #[test]
+    fn binder_assigns_math_function_result_types() {
+        let catalog = catalog_with_users();
+        let cases = [
+            ("select abs(id) from users", DataType::Integer),
+            ("select floor(id) from users", DataType::Integer),
+            ("select floor(2.5) from users", DataType::Double),
+            ("select round(2.5) from users", DataType::Double),
+            ("select sqrt(id) from users", DataType::Double),
+            ("select power(id, 2) from users", DataType::Double),
+            ("select mod(id, 2) from users", DataType::Integer),
+        ];
+        for (sql, expected) in cases {
+            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+            let BoundStatement::Select(select) = bound else {
+                panic!("expected bound select for {sql}");
+            };
+            assert_eq!(select.columns[0].expr.data_type(), expected, "for `{sql}`");
+        }
+
+        // MOD is integer-only; a double argument is a type mismatch.
+        let err = bind(&parse("select mod(2.5, 1.0) from users").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn binder_desugars_comma_from_list_into_cross_join() {
         let catalog = catalog_with_users_and_accounts();
         let stmt = parse("select users.id from users, accounts").unwrap();
