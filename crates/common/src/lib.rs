@@ -9,6 +9,7 @@ pub mod ids;
 pub mod mvcc;
 pub mod row;
 pub mod schema;
+pub mod uuid;
 pub mod value;
 
 pub use concurrency::{

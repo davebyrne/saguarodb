@@ -14,6 +14,9 @@ pub enum Value {
     Timestamp(i64),
     /// `BYTEA` — a raw byte string. `Vec<u8>` ordering/hashing are lexicographic.
     Bytes(Vec<u8>),
+    /// `UUID`, stored as its 16 bytes. `[u8; 16]` ordering is the canonical
+    /// (network-order) byte ordering, matching PostgreSQL.
+    Uuid([u8; 16]),
 }
 
 /// Parse PostgreSQL boolean input text, returning `None` for unrecognized input

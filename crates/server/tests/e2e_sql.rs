@@ -844,6 +844,131 @@ async fn e2e_bytea_primary_key_uses_index() {
 }
 
 #[tokio::test]
+async fn e2e_uuid_type_round_trips_orders_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table sessions (id integer primary key, sid uuid)")
+        .await
+        .unwrap();
+    for (id, sid) in [
+        (1, "00000000-0000-0000-0000-000000000002"),
+        (2, "00000000-0000-0000-0000-000000000001"),
+        (3, "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into sessions (id, sid) values ({id}, UUID '{sid}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Canonical lowercase output, ordered lexicographically by the 16 bytes.
+    let rows = server
+        .simple_query("select id, sid from sessions order by sid")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("2".to_string()),
+                Some("00000000-0000-0000-0000-000000000001".to_string()),
+            ],
+            vec![
+                Some("1".to_string()),
+                Some("00000000-0000-0000-0000-000000000002".to_string()),
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
+            ],
+        ]
+    );
+
+    // Lenient input: a no-hyphen literal matches the canonical-stored value.
+    let rows = server
+        .simple_query("select id from sessions where sid = UUID '00000000000000000000000000000001'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // CAST uuid <-> text.
+    let rows = server
+        .simple_query("select cast(sid as text) from sessions where id = 3")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()
+        )]]
+    );
+
+    // Invalid UUID literal is rejected at parse time.
+    let err = server
+        .simple_query("insert into sessions (id, sid) values (9, UUID 'not-a-uuid')")
+        .await
+        .err()
+        .expect("invalid uuid literal should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("uuid"),
+        "got: {}",
+        err.message
+    );
+
+    // No implicit cast: a plain string into a UUID column is a type mismatch.
+    let err = server
+        .simple_query(
+            "insert into sessions (id, sid) values (9, '00000000-0000-0000-0000-000000000009')",
+        )
+        .await
+        .err()
+        .expect("string into uuid column should be rejected");
+    assert!(
+        err.message.contains("42804"),
+        "expected datatype_mismatch, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_uuid_primary_key_uses_index() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table u (id uuid primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into u (id, note) values (UUID '12345678-9abc-def0-1234-56789abcdef0', 'x')",
+        )
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query(
+            "explain select note from u where id = UUID '12345678-9abc-def0-1234-56789abcdef0'",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "UUID primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query("select note from u where id = UUID '12345678-9abc-def0-1234-56789abcdef0'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("x".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

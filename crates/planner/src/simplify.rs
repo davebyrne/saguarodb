@@ -279,6 +279,7 @@ fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         (Value::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
         (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+        (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }

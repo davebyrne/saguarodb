@@ -555,6 +555,10 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             ValueFormat::Text => common::bytea::format_hex(raw).into_bytes(),
             ValueFormat::Binary => raw.clone(),
         },
+        Value::Uuid(raw) => match format {
+            ValueFormat::Text => common::uuid::format_uuid(raw).into_bytes(),
+            ValueFormat::Binary => raw.to_vec(),
+        },
     };
     Ok(Some(bytes))
 }
@@ -642,6 +646,18 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .ok_or_else(|| protocol_error("invalid bytea parameter"))
         }
         (DataType::Bytea, ValueFormat::Binary) => Ok(Value::Bytes(bytes.to_vec())),
+        (DataType::Uuid, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "uuid parameter")?;
+            common::uuid::parse_uuid(text)
+                .map(Value::Uuid)
+                .ok_or_else(|| protocol_error("invalid uuid parameter"))
+        }
+        (DataType::Uuid, ValueFormat::Binary) => {
+            let array: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary uuid parameter must be 16 bytes"))?;
+            Ok(Value::Uuid(array))
+        }
     }
 }
 
@@ -663,6 +679,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Date => (1082, 4),
         DataType::Timestamp => (1114, 8),
         DataType::Bytea => (17, -1),
+        DataType::Uuid => (2950, 16),
     }
 }
 
@@ -814,5 +831,38 @@ mod bytea_value_tests {
     fn invalid_bytea_text_is_rejected() {
         assert!(decode_value(b"\\xabc", DataType::Bytea, 0).is_err()); // odd length
         assert!(decode_value(b"nothex", DataType::Bytea, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod uuid_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    const SAMPLE: [u8; 16] = [
+        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19,
+    ];
+
+    #[test]
+    fn uuid_text_is_canonical_and_round_trips() {
+        let value = Value::Uuid(SAMPLE);
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"0a0b0c0d-0e0f-1011-1213-141516171819");
+        assert_eq!(decode_value(&text, DataType::Uuid, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn uuid_binary_is_16_raw_bytes_and_round_trips() {
+        let value = Value::Uuid(SAMPLE);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, SAMPLE.to_vec());
+        assert_eq!(decode_value(&binary, DataType::Uuid, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_uuid_is_rejected() {
+        assert!(decode_value(b"not-a-uuid", DataType::Uuid, 0).is_err());
+        assert!(decode_value(&[0u8; 15], DataType::Uuid, 1).is_err()); // wrong length
     }
 }

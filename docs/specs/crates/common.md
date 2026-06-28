@@ -60,18 +60,22 @@ pub enum Value {
     Date(i64),       // days from the Unix epoch (1970-01-01)
     Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
     Bytes(Vec<u8>),  // BYTEA, raw bytes
+    Uuid([u8; 16]),  // UUID, 16 bytes
 }
 ```
 
-`Value::Date` and `Value::Timestamp` are backed by `i64`, and `Value::Bytes` by
-`Vec<u8>`, so the derived `Ord`/`Hash` give correct chronological / lexicographic
-ordering and key/dedup behavior. The `datetime` module provides the proleptic
-Gregorian calendar conversions and the `YYYY-MM-DD` / `YYYY-MM-DD
-HH:MM:SS[.ffffff]` parse/format helpers (`days_from_civil`, `civil_from_days`,
-`parse_date`, `format_date`, `parse_timestamp`, `format_timestamp`); the `bytea`
-module provides the hex `\x...` parse/format helpers (`parse_hex`, `format_hex`,
-hex-only — no legacy escape). Both are shared by the parser, executor, protocol,
-and COPY paths; there is no external date/time dependency.
+`Value::Date`/`Value::Timestamp` are backed by `i64`, `Value::Bytes` by
+`Vec<u8>`, and `Value::Uuid` by `[u8; 16]`, so the derived `Ord`/`Hash` give
+correct chronological / lexicographic ordering and key/dedup behavior. The
+`datetime` module provides the proleptic Gregorian calendar conversions and the
+`YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format helpers
+(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
+`parse_timestamp`, `format_timestamp`); the `bytea` module provides the hex
+`\x...` parse/format helpers (`parse_hex`, `format_hex`, hex-only — no legacy
+escape); the `uuid` module provides the canonical `8-4-4-4-12` parse/format
+helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase). All are shared
+by the parser, executor, protocol, and COPY paths; there is no external
+date/time/uuid dependency.
 
 ```rust
 pub struct Row {
@@ -115,6 +119,7 @@ pub enum DataType {
     Date,
     Timestamp,
     Bytea,
+    Uuid,
 }
 
 pub struct ParsedColumnDef {

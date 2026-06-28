@@ -299,6 +299,7 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
             sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone,
         ) => Ok(DataType::Timestamp),
         sql::DataType::Bytea => Ok(DataType::Bytea),
+        sql::DataType::Uuid => Ok(DataType::Uuid),
         _ => unsupported("unsupported data type"),
     }
 }

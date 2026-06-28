@@ -607,6 +607,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
             | (DataType::Date, Value::Date(_))
             | (DataType::Timestamp, Value::Timestamp(_))
             | (DataType::Bytea, Value::Bytes(_))
+            | (DataType::Uuid, Value::Uuid(_))
     );
     if matches_type {
         return Ok(());
@@ -658,5 +659,6 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
         DataType::Bytea => "BYTEA",
+        DataType::Uuid => "UUID",
     }
 }

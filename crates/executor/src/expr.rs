@@ -165,6 +165,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
         (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
+        (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
     };
 
@@ -467,6 +468,11 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
         (Value::Text(value), DataType::Bytea) => common::bytea::parse_hex(&value)
             .map(Value::Bytes)
             .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid bytea cast")),
+        (Value::Uuid(raw), DataType::Uuid) => Ok(Value::Uuid(raw)),
+        (Value::Uuid(raw), DataType::Text) => Ok(Value::Text(common::uuid::format_uuid(&raw))),
+        (Value::Text(value), DataType::Uuid) => common::uuid::parse_uuid(&value)
+            .map(Value::Uuid)
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid uuid cast")),
         _ => datatype_mismatch("unsupported cast"),
     }
 }

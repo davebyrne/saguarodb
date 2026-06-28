@@ -179,6 +179,9 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         sql::DataType::Bytea => common::bytea::parse_hex(text)
             .map(|raw| Expr::Literal(Value::Bytes(raw)))
             .ok_or_else(|| parse_error(format!("invalid bytea literal: \"{text}\""))),
+        sql::DataType::Uuid => common::uuid::parse_uuid(text)
+            .map(|raw| Expr::Literal(Value::Uuid(raw)))
+            .ok_or_else(|| parse_error(format!("invalid uuid literal: \"{text}\""))),
         _ => unsupported("unsupported typed literal"),
     }
 }

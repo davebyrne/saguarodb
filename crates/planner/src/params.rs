@@ -401,6 +401,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Date(_) => Some(DataType::Date),
         Value::Timestamp(_) => Some(DataType::Timestamp),
         Value::Bytes(_) => Some(DataType::Bytea),
+        Value::Uuid(_) => Some(DataType::Uuid),
     }
 }
 

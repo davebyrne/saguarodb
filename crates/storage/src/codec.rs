@@ -70,6 +70,7 @@ const KEY_TAG_BOOLEAN: u8 = 3;
 const KEY_TAG_DATE: u8 = 4;
 const KEY_TAG_TIMESTAMP: u8 = 5;
 const KEY_TAG_BYTEA: u8 = 6;
+const KEY_TAG_UUID: u8 = 7;
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
 /// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
@@ -112,6 +113,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
                     DbError::storage(SqlState::InternalError, "key bytea is too large")
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(value);
+            }
+            Value::Uuid(value) => {
+                bytes.push(KEY_TAG_UUID);
                 bytes.extend_from_slice(value);
             }
         }
@@ -179,6 +184,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                         .expect("4 bytes"),
                 ) as usize;
                 Value::Bytes(read_exact(bytes, &mut offset, len)?.to_vec())
+            }
+            KEY_TAG_UUID => {
+                let raw = read_exact(bytes, &mut offset, 16)?;
+                Value::Uuid(raw.try_into().expect("16 bytes"))
             }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
@@ -263,6 +272,9 @@ pub(crate) fn encode_row_with_infomask(
                 let len = u32::try_from(value.len())
                     .map_err(|_| DbError::storage(SqlState::InternalError, "bytea is too large"))?;
                 bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(value);
+            }
+            Value::Uuid(value) if column.data_type == DataType::Uuid => {
                 bytes.extend_from_slice(value);
             }
             _ => {
@@ -368,6 +380,10 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 array.copy_from_slice(raw_len);
                 let len = u32::from_le_bytes(array) as usize;
                 Value::Bytes(read_exact(bytes, &mut offset, len)?.to_vec())
+            }
+            DataType::Uuid => {
+                let raw = read_exact(bytes, &mut offset, 16)?;
+                Value::Uuid(raw.try_into().expect("16 bytes"))
             }
         };
         values.push(value);
@@ -560,6 +576,7 @@ mod tests {
                     bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
                     bytes.extend_from_slice(value);
                 }
+                Value::Uuid(value) => bytes.extend_from_slice(value),
             }
         }
         bytes
