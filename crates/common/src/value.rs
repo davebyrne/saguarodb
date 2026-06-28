@@ -6,6 +6,9 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Text(String),
+    /// `DATE`, stored as days from the Unix epoch (1970-01-01 = 0). i64-backed so
+    /// the derived `Ord`/`Hash` give correct date ordering and key/dedup behavior.
+    Date(i64),
 }
 
 /// Parse PostgreSQL boolean input text, returning `None` for unrecognized input

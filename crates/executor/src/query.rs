@@ -604,6 +604,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
         (DataType::Integer, Value::Integer(_))
             | (DataType::Text, Value::Text(_))
             | (DataType::Boolean, Value::Boolean(_))
+            | (DataType::Date, Value::Date(_))
     );
     if matches_type {
         return Ok(());
@@ -652,5 +653,6 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Integer => "INTEGER",
         DataType::Text => "TEXT",
         DataType::Boolean => "BOOLEAN",
+        DataType::Date => "DATE",
     }
 }

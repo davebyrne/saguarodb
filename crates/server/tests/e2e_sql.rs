@@ -501,6 +501,131 @@ async fn e2e_varchar_char_length_is_enforced() {
 }
 
 #[tokio::test]
+async fn e2e_date_type_round_trips_orders_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table events (id integer primary key, d date)")
+        .await
+        .unwrap();
+    for (id, d) in [(1, "2024-02-29"), (2, "2023-01-15"), (3, "2024-12-31")] {
+        server
+            .simple_query(&format!(
+                "insert into events (id, d) values ({id}, DATE '{d}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Round-trips as YYYY-MM-DD and orders chronologically (i64-backed Ord).
+    let rows = server
+        .simple_query("select id, d from events order by d")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".to_string()), Some("2023-01-15".to_string())],
+            vec![Some("1".to_string()), Some("2024-02-29".to_string())],
+            vec![Some("3".to_string()), Some("2024-12-31".to_string())],
+        ]
+    );
+
+    // Comparison against a date literal.
+    let rows = server
+        .simple_query("select id from events where d < DATE '2024-01-01'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // CAST date -> text and text -> date.
+    let rows = server
+        .simple_query("select cast(d as text) from events where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2024-02-29".to_string())]]);
+    let rows = server
+        .simple_query("select id from events where d = cast('2024-12-31' as date)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // MIN/MAX work via ordering.
+    let rows = server
+        .simple_query("select min(d), max(d) from events")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2023-01-15".to_string()),
+            Some("2024-12-31".to_string()),
+        ]]
+    );
+
+    // An impossible date literal is rejected.
+    let err = server
+        .simple_query("insert into events (id, d) values (9, DATE '2023-02-29')")
+        .await
+        .err()
+        .expect("impossible date literal should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("date"),
+        "got: {}",
+        err.message
+    );
+
+    // No implicit cast: a plain string into a DATE column is a type mismatch.
+    let err = server
+        .simple_query("insert into events (id, d) values (9, '2024-01-01')")
+        .await
+        .err()
+        .expect("string into date column should be rejected");
+    assert!(
+        err.message.contains("42804"),
+        "expected datatype_mismatch, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_date_primary_key_round_trips_through_btree() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table d (day date primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into d (day, note) values (DATE '2024-01-01', 'new year')")
+        .await
+        .unwrap();
+    // A point lookup on the DATE primary key uses the index access path, not a
+    // full scan — DATE literals must produce a key candidate in the planner.
+    let explain = server
+        .simple_query("explain select note from d where day = DATE '2024-01-01'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "DATE primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+
+    // ...and it returns the right row through the key codec.
+    let rows = server
+        .simple_query("select note from d where day = DATE '2024-01-01'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("new year".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

@@ -7,6 +7,8 @@ pub enum DataType {
     Integer,
     Text,
     Boolean,
+    /// `DATE` — calendar date, value carried as `Value::Date` (days from epoch).
+    Date,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

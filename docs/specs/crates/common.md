@@ -57,8 +57,17 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Text(String),
+    Date(i64),  // days from the Unix epoch (1970-01-01)
 }
+```
 
+`Value::Date` is backed by `i64`, so the derived `Ord`/`Hash` give correct date
+ordering and key/dedup behavior. The `datetime` module provides the proleptic
+Gregorian calendar conversions and `YYYY-MM-DD` parse/format helpers
+(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`) shared by the
+parser, executor, protocol, and COPY paths; there is no external date dependency.
+
+```rust
 pub struct Row {
     pub values: Vec<Value>,
 }
@@ -97,6 +106,7 @@ pub enum DataType {
     Integer,
     Text,
     Boolean,
+    Date,
 }
 
 pub struct ParsedColumnDef {

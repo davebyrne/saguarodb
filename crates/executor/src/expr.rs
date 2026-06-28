@@ -162,6 +162,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
         (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
+        (Value::Date(left), Value::Date(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
     };
 
@@ -447,6 +448,11 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
             "false" | "f" | "0" => Ok(Value::Boolean(false)),
             _ => datatype_mismatch("invalid boolean cast"),
         },
+        (Value::Date(days), DataType::Date) => Ok(Value::Date(days)),
+        (Value::Date(days), DataType::Text) => Ok(Value::Text(common::datetime::format_date(days))),
+        (Value::Text(value), DataType::Date) => common::datetime::parse_date(&value)
+            .map(Value::Date)
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid date cast")),
         _ => datatype_mismatch("unsupported cast"),
     }
 }

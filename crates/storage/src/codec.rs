@@ -67,6 +67,7 @@ const KEY_TAG_NULL: u8 = 0;
 const KEY_TAG_INTEGER: u8 = 1;
 const KEY_TAG_TEXT: u8 = 2;
 const KEY_TAG_BOOLEAN: u8 = 3;
+const KEY_TAG_DATE: u8 = 4;
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
 /// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
@@ -94,6 +95,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Boolean(value) => {
                 bytes.push(KEY_TAG_BOOLEAN);
                 bytes.push(u8::from(*value));
+            }
+            Value::Date(value) => {
+                bytes.push(KEY_TAG_DATE);
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
@@ -145,6 +150,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 1 => Value::Boolean(true),
                 _ => return Err(corrupt_row("key boolean is not 0 or 1")),
             },
+            KEY_TAG_DATE => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                Value::Date(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+            }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
         values.push(value);
@@ -217,6 +226,9 @@ pub(crate) fn encode_row_with_infomask(
             }
             Value::Boolean(value) if column.data_type == DataType::Boolean => {
                 bytes.push(u8::from(*value));
+            }
+            Value::Date(value) if column.data_type == DataType::Date => {
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
             _ => {
                 return Err(DbError::storage(
@@ -302,6 +314,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                     1 => Value::Boolean(true),
                     _ => return Err(corrupt_row("boolean value is not 0 or 1")),
                 }
+            }
+            DataType::Date => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                let mut array = [0; 8];
+                array.copy_from_slice(raw);
+                Value::Date(i64::from_le_bytes(array))
             }
         };
         values.push(value);
@@ -488,6 +506,7 @@ mod tests {
                     bytes.extend_from_slice(value.as_bytes());
                 }
                 Value::Boolean(value) => bytes.push(u8::from(*value)),
+                Value::Date(value) => bytes.extend_from_slice(&value.to_le_bytes()),
             }
         }
         bytes

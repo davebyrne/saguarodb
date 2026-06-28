@@ -629,7 +629,7 @@ fn key_input_column(expr: &BoundExpr, primary_key: ColumnId) -> bool {
 fn literal_key(expr: &BoundExpr) -> Option<Value> {
     match expr {
         BoundExpr::Literal {
-            value: Value::Integer(_) | Value::Text(_) | Value::Boolean(_),
+            value: Value::Integer(_) | Value::Text(_) | Value::Boolean(_) | Value::Date(_),
             ..
         } => {
             let BoundExpr::Literal { value, .. } = expr else {

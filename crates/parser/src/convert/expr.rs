@@ -107,6 +107,7 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
                 data_type: convert_data_type(data_type)?,
             })
         }
+        sql::Expr::TypedString { data_type, value } => convert_typed_string(data_type, value),
         sql::Expr::Function(function) => convert_function(function),
         sql::Expr::Substring {
             expr,
@@ -156,6 +157,21 @@ fn convert_substring(
         args,
         distinct: false,
     })
+}
+
+/// Convert a typed string literal (`TYPE 'text'`), e.g. `DATE '2024-01-01'`,
+/// into a typed `Value` literal. Only the temporal types are accepted here.
+fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result<Expr> {
+    let text = match value {
+        sql::Value::SingleQuotedString(text) => text,
+        _ => return unsupported("unsupported typed literal"),
+    };
+    match data_type {
+        sql::DataType::Date => common::datetime::parse_date(text)
+            .map(|days| Expr::Literal(Value::Date(days)))
+            .ok_or_else(|| parse_error(format!("invalid date literal: \"{text}\""))),
+        _ => unsupported("unsupported typed literal"),
+    }
 }
 
 fn convert_value(value: &sql::Value) -> Result<Expr> {

@@ -538,8 +538,23 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             ValueFormat::Binary => int.to_be_bytes().to_vec(),
         },
         Value::Text(text) => text.clone().into_bytes(),
+        Value::Date(days) => match format {
+            ValueFormat::Text => common::datetime::format_date(*days).into_bytes(),
+            // PostgreSQL binary `date` is an i32 day count from 2000-01-01.
+            ValueFormat::Binary => date_to_pg_binary(*days)?.to_be_bytes().to_vec(),
+        },
     };
     Ok(Some(bytes))
+}
+
+/// Days from the Unix epoch (1970-01-01) to the PostgreSQL date epoch
+/// (2000-01-01), used to convert our internal day count to/from the wire's
+/// binary `date` representation.
+const PG_DATE_EPOCH_OFFSET_DAYS: i64 = 10957;
+
+fn date_to_pg_binary(days: i64) -> Result<i32> {
+    i32::try_from(days - PG_DATE_EPOCH_OFFSET_DAYS)
+        .map_err(|_| protocol_error("date is out of range for the binary wire format"))
 }
 
 /// Decode a non-NULL parameter's wire bytes into a `Value` of the target type,
@@ -576,6 +591,20 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
         (DataType::Text, _) => Ok(Value::Text(
             decode_utf8(bytes, "text parameter")?.to_string(),
         )),
+        (DataType::Date, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "date parameter")?;
+            common::datetime::parse_date(text)
+                .map(Value::Date)
+                .ok_or_else(|| protocol_error("invalid date parameter"))
+        }
+        (DataType::Date, ValueFormat::Binary) => {
+            let array: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary date parameter must be 4 bytes"))?;
+            Ok(Value::Date(
+                i32::from_be_bytes(array) as i64 + PG_DATE_EPOCH_OFFSET_DAYS,
+            ))
+        }
     }
 }
 
@@ -594,6 +623,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Integer => (20, 8),
         DataType::Text => (25, -1),
         DataType::Boolean => (16, 1),
+        DataType::Date => (1082, 4),
     }
 }
 
@@ -637,4 +667,39 @@ fn checked_i32(value: usize, message: &'static str) -> i32 {
 
 fn protocol_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::SyntaxError, message)
+}
+
+#[cfg(test)]
+mod date_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    #[test]
+    fn date_text_round_trips_and_formats() {
+        // 2000-01-01 is exactly the PG date epoch (10957 days from 1970-01-01).
+        let value = Value::Date(10957);
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"2000-01-01");
+        assert_eq!(decode_value(&text, DataType::Date, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn date_binary_uses_pg_2000_epoch_and_round_trips() {
+        // Binary date is i32 BE days-from-2000, so 2000-01-01 encodes to 0.
+        let value = Value::Date(10957);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, 0_i32.to_be_bytes());
+        assert_eq!(decode_value(&binary, DataType::Date, 1).unwrap(), value);
+
+        // A day before the epoch is -1.
+        let value = Value::Date(10956);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, (-1_i32).to_be_bytes());
+        assert_eq!(decode_value(&binary, DataType::Date, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_date_text_is_rejected() {
+        assert!(decode_value(b"2023-02-29", DataType::Date, 0).is_err());
+    }
 }

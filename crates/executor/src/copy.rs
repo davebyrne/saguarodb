@@ -123,6 +123,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
             .map(Value::Boolean)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for boolean: \"{text}\""))),
         DataType::Text => Ok(Value::Text(text.to_string())),
+        DataType::Date => common::datetime::parse_date(text)
+            .map(Value::Date)
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for date: \"{text}\""))),
     }
 }
 
@@ -357,6 +360,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Integer(int) => Some(int.to_string()),
         Value::Boolean(flag) => Some(if *flag { "t" } else { "f" }.to_string()),
         Value::Text(text) => Some(text.clone()),
+        Value::Date(days) => Some(common::datetime::format_date(*days)),
     }
 }
 

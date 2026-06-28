@@ -276,6 +276,7 @@ fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
         (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+        (Value::Date(a), Value::Date(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
