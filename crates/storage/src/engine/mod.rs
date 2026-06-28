@@ -370,7 +370,7 @@ impl StorageEngine for PageBackedStorageEngine {
         {
             let latch = self.structural_latch(index_fid);
             let _pk_guard = latch.lock();
-            match self.unique_conflict_kind(&btree, &key, &schema, ctx.txn_id)? {
+            match self.unique_conflict_kind(&btree, &key, &schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_primary_key()),
                 UniqueConflict::InFlight => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
@@ -396,7 +396,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // single one visible to this snapshot. Today there is one entry per key.
         for location in self.btree(index_fid).scan_key(key)? {
             if let Some((_resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
             {
                 return Ok(Some(row));
             }
@@ -413,7 +413,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // executor matched). If none is visible the key was already deleted or is
         // absent, so the delete affects no row — preserve the no-op semantics.
         let Some((location, infomask)) =
-            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, ctx.txn_id)?
+            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, &ctx.live_txns)?
         else {
             return Ok(false);
         };
@@ -423,7 +423,13 @@ impl StorageEngine for PageBackedStorageEngine {
         // row is hidden by visibility (xmax committed ⇒ invisible to later
         // snapshots), and VACUUM (Milestone F) reclaims the dead version and its
         // entries. No tombstone, no index-entry removal.
-        self.stamp_xmax_logged(location, crate::codec::INVALID_TID, infomask, ctx.txn_id)?;
+        self.stamp_xmax_logged(
+            location,
+            crate::codec::INVALID_TID,
+            infomask,
+            ctx.txn_id,
+            &ctx.live_txns,
+        )?;
         Ok(true)
     }
 
@@ -438,7 +444,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // is visible the key was already deleted or is absent, so the update affects
         // no row — preserve the no-op semantics.
         let Some((previous_location, infomask)) =
-            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, ctx.txn_id)?
+            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, &ctx.live_txns)?
         else {
             return Ok(false);
         };
@@ -496,7 +502,13 @@ impl StorageEngine for PageBackedStorageEngine {
         // deferred optimization; the authoritative check stays atomic at stamp time
         // to keep first-updater-wins race-free.)
         let new_tid = (new_location.page_num, new_location.slot_num);
-        self.stamp_xmax_logged(previous_location, new_tid, infomask, ctx.txn_id)?;
+        self.stamp_xmax_logged(
+            previous_location,
+            new_tid,
+            infomask,
+            ctx.txn_id,
+            &ctx.live_txns,
+        )?;
 
         // Primary-key entry for the new version, under ONE hold of the PK index
         // structural latch across the uniqueness check AND the insert (Milestone E2a,
@@ -513,7 +525,7 @@ impl StorageEngine for PageBackedStorageEngine {
         {
             let latch = self.structural_latch(index_fid);
             let _pk_guard = latch.lock();
-            match self.unique_conflict_kind(&btree, key, &schema, ctx.txn_id)? {
+            match self.unique_conflict_kind(&btree, key, &schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_primary_key()),
                 UniqueConflict::InFlight => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
@@ -559,7 +571,7 @@ impl StorageEngine for PageBackedStorageEngine {
             // from being returned twice (`mvcc.md` §10 Milestone H1). The yielded
             // `RowId` is the resolved live version, not the index TID.
             let Some((resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
             else {
                 continue;
             };
@@ -604,7 +616,7 @@ impl StorageEngine for PageBackedStorageEngine {
             // Resolve to the visible version; an invisible chain (or a DEAD/absent
             // root line pointer) is skipped, not an error.
             let Some((resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, ctx.txn_id)?
+                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
             else {
                 continue;
             };

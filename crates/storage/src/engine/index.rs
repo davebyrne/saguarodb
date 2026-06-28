@@ -36,7 +36,7 @@ impl PageBackedStorageEngine {
         let latch = self.structural_latch(secondary_index_file_id(index.id));
         let _index_guard = latch.lock();
         if index.unique && !has_null {
-            match self.unique_conflict_kind(&secondary, entry_key, table_schema, ctx.txn_id)? {
+            match self.unique_conflict_kind(&secondary, entry_key, table_schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_unique_index(&index.name)),
                 UniqueConflict::InFlight => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
@@ -45,7 +45,7 @@ impl PageBackedStorageEngine {
         secondary.insert(ctx.txn_id, entry_key, location)
     }
     /// Whether any existing version indexed under `key` in `index_btree` **conflicts**
-    /// with a unique-constraint insert by `current_txn` — the shared,
+    /// with a unique-constraint insert by `current_txns` — the shared,
     /// visibility-aware uniqueness check for the primary-key index and unique
     /// secondary indexes (`docs/specs/mvcc.md` §6/§7.3). It replaces the temporary
     /// presence-probes (B2 commits 3–4): "any entry for the key" became "the
@@ -55,7 +55,7 @@ impl PageBackedStorageEngine {
     /// This is a **liveness ("dirty") check, not a snapshot read**: it consults the
     /// CLOG (`TxnStatusView`) + the tuple's `infomask` hint bits — never a
     /// [`Snapshot`] — so it sees concurrently in-flight and already-committed state,
-    /// not just what `current_txn`'s snapshot would observe. Each candidate TID from
+    /// not just what `current_txns`'s snapshot would observe. Each candidate TID from
     /// `scan_key` is a (possibly HOT) root: its `REDIRECT` + bounded HOT chain is
     /// resolved ([`Self::collect_chain_versions`]) and EVERY physically-present member
     /// is classified at its *physical* tuple header (NOT via [`Self::read_visible_row`],
@@ -87,7 +87,7 @@ impl PageBackedStorageEngine {
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         schema: &TableSchema,
-        current_txn: u64,
+        current_txnss: &[u64],
     ) -> Result<UniqueConflict> {
         let status = self.txn_status_view();
         let mut strongest = UniqueConflict::None;
@@ -109,7 +109,7 @@ impl PageBackedStorageEngine {
                     decoded.xmin,
                     decoded.xmax,
                     decoded.infomask,
-                    &[current_txn],
+                    current_txnss,
                     status,
                 ) {
                     // A committed-live duplicate is definitive; nothing outranks it.

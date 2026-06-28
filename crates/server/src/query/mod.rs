@@ -103,6 +103,49 @@ pub struct Transaction {
     /// old versions it superseded stay live), so a rolled-back DELETE/UPDATE produces
     /// no committed dead version and this is discarded.
     dead_versions_pending: u64,
+    /// The OPEN savepoint stack, outermost first (`docs/specs/savepoints.md` §3).
+    /// Each level owns a subxid; the innermost level's subxid is the current
+    /// writing xid (`writing_xid`), or `txn_id` when the stack is empty. `SAVEPOINT`
+    /// pushes, `RELEASE` pops the named level and any above it (a pure in-memory
+    /// merge — the popped subxids stay live), `ROLLBACK TO` pops down to the named
+    /// level and re-establishes it with a fresh subxid.
+    savepoints: Vec<SavepointLevel>,
+    /// Every not-rolled-back subxid (open AND released), i.e. the transaction's
+    /// live-set minus `txn_id`. This is what the top-level COMMIT records as
+    /// committed subxids and, together with `txn_id`, the live (sub)xid set threaded
+    /// into each statement's `StatementContext` (`live_txns`). `SAVEPOINT` appends;
+    /// `ROLLBACK TO` removes the rolled-back subxids; `RELEASE` leaves it unchanged.
+    live_subxids: Vec<u64>,
+}
+
+/// One open savepoint: its name and the subxid that owns writes made under it.
+struct SavepointLevel {
+    name: String,
+    subxid: u64,
+}
+
+impl Transaction {
+    /// The current writing xid: the innermost open savepoint's subxid, or the
+    /// top-level `txn_id` when no savepoint is open. New tuples stamp this as `xmin`.
+    fn writing_xid(&self) -> u64 {
+        self.savepoints
+            .last()
+            .map(|level| level.subxid)
+            .unwrap_or(self.txn_id)
+    }
+
+    /// The transaction's live (sub)xid set — `txn_id` plus every not-rolled-back
+    /// subxid — for `StatementContext::live_txns` (the "self" set for visibility and
+    /// conflict detection; `docs/specs/savepoints.md` §4).
+    fn live_txns(&self) -> Arc<[u64]> {
+        if self.live_subxids.is_empty() {
+            return Arc::from([self.txn_id]);
+        }
+        let mut ids = Vec::with_capacity(self.live_subxids.len() + 1);
+        ids.push(self.txn_id);
+        ids.extend_from_slice(&self.live_subxids);
+        Arc::from(ids)
+    }
 }
 
 impl Transaction {
@@ -192,6 +235,15 @@ impl QueryService {
                 "COPY is not supported in the extended query protocol",
             ));
         }
+        if let StatementClass::Savepoint = class {
+            // Savepoints are driven through the simple-query transaction lifecycle
+            // (`docs/specs/savepoints.md` §2), like transaction control via the
+            // extended protocol — rejected here so an Execute never reaches them.
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "savepoints require the simple query protocol",
+            ));
+        }
         if let StatementClass::TransactionControl(_) = class {
             // BEGIN/COMMIT/ROLLBACK take no parameters and produce no rows; they do
             // not bind. Carry the prepared statement with a no-op bound payload so
@@ -278,6 +330,12 @@ impl QueryService {
                 SqlState::FeatureNotSupported,
                 "COPY is not supported in the extended query protocol",
             )),
+            // Savepoints are likewise rejected at prepare time for the extended
+            // protocol, so an already-prepared statement is never a savepoint.
+            StatementClass::Savepoint => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "savepoints require the simple query protocol",
+            )),
         }
     }
 
@@ -358,6 +416,11 @@ impl QueryService {
                     }
                     StatementClass::Copy(_) => {
                         unreachable!("COPY is rejected at prepare time for the extended protocol")
+                    }
+                    StatementClass::Savepoint => {
+                        unreachable!(
+                            "savepoints are rejected at prepare time for the extended protocol"
+                        )
                     }
                 };
                 (None, default_isolation, result)
@@ -494,6 +557,20 @@ fn set_complete() -> ExecutionResult {
     }
 }
 
+fn savepoint_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "SAVEPOINT".to_string(),
+        count: 0,
+    }
+}
+
+fn release_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "RELEASE".to_string(),
+        count: 0,
+    }
+}
+
 /// The statement supplied to the in-transaction execution path: either an
 /// unbound AST (simple query, bound here against the live catalog) or an
 /// already-bound statement (extended-protocol `Execute`, with its parameters
@@ -535,6 +612,11 @@ enum StatementClass {
     /// (`docs/specs/copy.md`). It binds (resolve table/columns) but is not lowered.
     Copy(CopyDirection),
     TransactionControl(TransactionControl),
+    /// `SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK TO [SAVEPOINT]` — driven
+    /// through the session's transaction lifecycle like transaction control
+    /// (`docs/specs/savepoints.md`); simple-query only. The op + name are read from
+    /// the parsed `Statement` in `handle_savepoint` (so this stays a `Copy` marker).
+    Savepoint,
 }
 
 /// A parsed and bound extended-protocol statement that can be executed
@@ -628,15 +710,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
-        // Staged: real savepoint routing (StatementClass::Savepoint + the
-        // transaction-lifecycle handlers) lands in the server milestone; until then
-        // they parse but are not yet executable.
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
-        | Statement::RollbackToSavepoint { .. } => Err(DbError::plan(
-            SqlState::FeatureNotSupported,
-            "savepoints are not yet implemented",
-        )),
+        | Statement::RollbackToSavepoint { .. } => Ok(StatementClass::Savepoint),
     }
 }
 

@@ -87,6 +87,21 @@ impl ActiveTxnRegistry {
         self.lock().active.remove(&txn_id);
     }
 
+    /// Atomically deregister every id in `txn_ids` under one latch. Used at a
+    /// top-level COMMIT/ROLLBACK of a transaction with savepoint subtransactions to
+    /// remove the whole family `{top} ∪ subxids` in a single critical section
+    /// (`docs/specs/savepoints.md` §3, §6): a per-id `deregister` loop would let a
+    /// concurrent [`capture`](Self::capture) observe a partially-settled family
+    /// (e.g. a released subxid already visible while the parent still appears
+    /// in-progress). One latched batch makes `capture` see the family either
+    /// all-present (all invisible) or all-absent (all settled).
+    pub fn deregister_all(&self, txn_ids: &[TxnId]) {
+        let mut guard = self.lock();
+        for id in txn_ids {
+            guard.active.remove(id);
+        }
+    }
+
     /// The oldest in-progress transaction id, or `None` if none are active.
     ///
     /// This is the active-id minimum, used for a snapshot's `xmin` (via

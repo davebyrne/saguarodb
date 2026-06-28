@@ -1,4 +1,5 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::{CopyDirection, DbError, IsolationLevel, Result, SqlState};
@@ -36,6 +37,13 @@ impl QueryService {
 
         if let StatementClass::TransactionControl(kind) = class {
             return self.handle_transaction_control(kind, slot, default_isolation, cancel);
+        }
+
+        // Savepoints (SAVEPOINT / RELEASE / ROLLBACK TO) drive the session's
+        // transaction lifecycle like transaction control; the op + name are read
+        // from the parsed statement (`docs/specs/savepoints.md`).
+        if let StatementClass::Savepoint = class {
+            return self.handle_savepoint(statement, slot, default_isolation);
         }
 
         // VACUUM is a maintenance command: it does not bind/plan, and like DDL it is
@@ -227,7 +235,17 @@ impl QueryService {
         // horizon only prunes less, never unsafely (the prune reclaims only dead-to-all
         // versions and mutates one latched page).
         let gc_horizon = self.components.gc_horizon();
-        let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, gc_horizon, cancel);
+        // The writing xid is the innermost open savepoint's subxid (or `txn_id`),
+        // and the live (sub)xid set is threaded for own-write/own-conflict detection
+        // (`docs/specs/savepoints.md` §4).
+        let ctx = self.execution_context(
+            txn.writing_xid(),
+            snapshot,
+            txn.isolation,
+            gc_horizon,
+            txn.live_txns(),
+            cancel,
+        );
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
         // The snapshot can no longer be used to read once `run_plan` has returned;
@@ -286,6 +304,11 @@ impl QueryService {
             StatementClass::Copy(_) => {
                 Err(DbError::internal("COPY reached the autocommit data path"))
             }
+            // Savepoints are routed through `handle_savepoint` in `dispatch`, never
+            // the autocommit data path.
+            StatementClass::Savepoint => Err(DbError::internal(
+                "savepoint reached the autocommit data path",
+            )),
         }
     }
 
@@ -315,7 +338,14 @@ impl QueryService {
         let (snapshot, _advertised) = self.capture_snapshot(0);
         // A read never runs CREATE INDEX (the only horizon consumer), so the horizon
         // is unused on this path; pass `0`.
-        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), 0, cancel);
+        let ctx = self.execution_context(
+            0,
+            snapshot,
+            IsolationLevel::default(),
+            0,
+            Arc::from([0]),
+            cancel,
+        );
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         self.engine.execute(&ctx, &physical)
@@ -374,6 +404,7 @@ impl QueryService {
             snapshot,
             IsolationLevel::default(),
             gc_horizon,
+            Arc::from([txn_id]),
             cancel,
         );
 
@@ -390,7 +421,8 @@ impl QueryService {
             }
         };
 
-        if let Err(err) = self.append_and_flush_commit(txn_id) {
+        // An autocommit unit has no savepoints, so no committed subxids.
+        if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
             self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
             return Err(err);
         }

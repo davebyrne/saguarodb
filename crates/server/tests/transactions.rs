@@ -1076,3 +1076,206 @@ async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
+
+// --- savepoints (docs/specs/savepoints.md) ---
+
+/// `ROLLBACK TO SAVEPOINT` undoes work done since the savepoint but keeps the
+/// transaction (and the savepoint) open, and earlier work survives the commit.
+#[tokio::test]
+async fn rollback_to_savepoint_undoes_inner_work() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("insert into t (id) values (1)").await;
+    let sp = conn.ok("savepoint s").await;
+    assert_eq!(sp.status, b'T');
+    conn.ok("insert into t (id) values (2)").await;
+    // The transaction sees both its own inserts before the rollback.
+    assert_eq!(
+        conn.ok("select id from t order by id").await.rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+
+    let rb = conn.ok("rollback to savepoint s").await;
+    assert_eq!(rb.status, b'T', "ROLLBACK TO keeps the block open");
+    // The work since the savepoint is gone; the earlier insert remains.
+    assert_eq!(
+        conn.ok("select id from t order by id").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    conn.ok("commit").await;
+    // After commit, only the kept row is visible; the family is fully settled.
+    assert_eq!(
+        conn.ok("select id from t").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    assert_eq!(
+        server.active_txn_count(),
+        0,
+        "the whole family is deregistered"
+    );
+}
+
+/// `RELEASE SAVEPOINT` keeps the subtransaction's work; it commits with the parent
+/// and is visible to a later transaction.
+#[tokio::test]
+async fn release_savepoint_keeps_work_after_commit() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("savepoint s").await;
+    conn.ok("insert into t (id) values (1)").await;
+    let rel = conn.ok("release savepoint s").await;
+    assert_eq!(rel.status, b'T');
+    conn.ok("commit").await;
+
+    assert_eq!(
+        conn.ok("select id from t").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// Nested savepoints: `ROLLBACK TO` the outer level discards both the outer and
+/// inner work done after it, while work before the outer savepoint survives.
+#[tokio::test]
+async fn nested_savepoint_rollback_to_outer_discards_inner() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("insert into t (id) values (1)").await;
+    conn.ok("savepoint outer").await;
+    conn.ok("insert into t (id) values (2)").await;
+    conn.ok("savepoint inner").await;
+    conn.ok("insert into t (id) values (3)").await;
+    conn.ok("rollback to savepoint outer").await;
+    // Both the inner (3) and post-outer (2) inserts are gone; 1 remains.
+    assert_eq!(
+        conn.ok("select id from t order by id").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    conn.ok("commit").await;
+    assert_eq!(
+        conn.ok("select id from t").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+/// `ROLLBACK TO SAVEPOINT` recovers a transaction that entered the failed ('E')
+/// state after the savepoint was established: the block becomes usable again and
+/// commits the pre-savepoint work plus work done after recovery.
+#[tokio::test]
+async fn rollback_to_savepoint_recovers_failed_block() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("insert into t (id) values (1)").await;
+    conn.ok("savepoint s").await;
+    // A bad statement poisons the block to 'E'.
+    let bad = conn.query("select id from ghosts").await.unwrap();
+    assert!(bad.result.is_err());
+    assert_eq!(bad.status, b'E');
+    // While 'E', a normal statement is still rejected with 25P02.
+    let rejected = conn.query("insert into t (id) values (9)").await.unwrap();
+    let err = rejected.result.err().unwrap();
+    assert!(err.message.contains("C=25P02"), "message: {}", err.message);
+    assert_eq!(rejected.status, b'E');
+
+    // ROLLBACK TO the savepoint recovers the block to 'T'.
+    let rb = conn.ok("rollback to savepoint s").await;
+    assert_eq!(rb.status, b'T', "ROLLBACK TO clears the failed state");
+    conn.ok("insert into t (id) values (2)").await;
+    conn.ok("commit").await;
+
+    assert_eq!(
+        conn.ok("select id from t order by id").await.rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+}
+
+/// Same-name re-establishment: a second `SAVEPOINT s` shadows the first; `ROLLBACK
+/// TO s` targets the most recent, and the older `s` is reachable again afterward.
+#[tokio::test]
+async fn same_name_savepoint_targets_most_recent() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    conn.ok("begin").await;
+    conn.ok("savepoint s").await;
+    conn.ok("insert into t (id) values (1)").await;
+    conn.ok("savepoint s").await;
+    conn.ok("insert into t (id) values (2)").await;
+    // ROLLBACK TO s hits the most recent s, discarding only the second insert; the
+    // inner s remains established (re-established with a fresh subxid).
+    conn.ok("rollback to savepoint s").await;
+    assert_eq!(
+        conn.ok("select id from t order by id").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    // Releasing the inner s exposes the older (outer) s again; rolling back to it
+    // now discards the first insert too.
+    conn.ok("release savepoint s").await;
+    conn.ok("rollback to savepoint s").await;
+    assert!(conn.ok("select id from t").await.rows().is_empty());
+    conn.ok("commit").await;
+}
+
+/// Error paths: savepoint commands outside a block (`25P01`) and unknown savepoint
+/// names (`3B001`).
+#[tokio::test]
+async fn savepoint_error_paths() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    // Outside a transaction block: 25P01. (The harness encodes the SQLSTATE into
+    // the decoded message as `C=<code>`.)
+    let outside = conn.query("savepoint s").await.unwrap();
+    let err = outside.result.err().unwrap();
+    assert!(err.message.contains("C=25P01"), "message: {}", err.message);
+    assert_eq!(outside.status, b'I');
+
+    conn.ok("begin").await;
+    // Unknown savepoint for ROLLBACK TO and RELEASE: 3B001.
+    let rb = conn.query("rollback to savepoint nope").await.unwrap();
+    let rb_err = rb.result.err().unwrap();
+    assert!(
+        rb_err.message.contains("C=3B001"),
+        "message: {}",
+        rb_err.message
+    );
+    let rel = conn.query("release savepoint nope").await.unwrap();
+    let rel_err = rel.result.err().unwrap();
+    assert!(
+        rel_err.message.contains("C=3B001"),
+        "message: {}",
+        rel_err.message
+    );
+    conn.ok("rollback").await;
+}
+
+/// Savepoints are rejected over the extended query protocol (simple-query only).
+#[tokio::test]
+async fn savepoint_rejected_in_extended_protocol() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("begin").await;
+    let err = conn
+        .extended_execute("savepoint s")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("savepoint must be rejected via the extended protocol");
+    assert!(err.message.contains("C=0A000"), "message: {}", err.message);
+    conn.ok("rollback").await;
+}

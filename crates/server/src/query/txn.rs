@@ -3,15 +3,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{DbError, IsolationLevel, Result, Snapshot, SqlState, StatementContext};
 use executor::{ExecutionContext, ExecutionResult};
+use parser::Statement;
 use storage::StorageEngine;
 use wal::{WalRecord, WalRecordKind};
 
 use super::{
-    QueryService, Transaction, TransactionControl, begin_complete, commit_complete,
-    rollback_complete, set_complete,
+    QueryService, SavepointLevel, Transaction, TransactionControl, begin_complete, commit_complete,
+    release_complete, rollback_complete, savepoint_complete, set_complete,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint;
 use crate::registry::AdvertisedSnapshot;
+
+/// The `25P02` error for a statement issued in a failed (`'E'`) transaction block
+/// (matching `run_bound_in_transaction`'s gate). `SAVEPOINT`/`RELEASE` hit this;
+/// `ROLLBACK TO` is the exception that recovers the block instead.
+fn failed_block_error() -> DbError {
+    DbError::execute(
+        SqlState::InFailedSqlTransaction,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+}
+
+/// The `3B001` error for `RELEASE`/`ROLLBACK TO` of a name with no matching live
+/// savepoint (`docs/specs/savepoints.md` §2).
+fn no_such_savepoint(name: &str) -> DbError {
+    DbError::plan(
+        SqlState::InvalidSavepointSpecification,
+        format!("savepoint \"{name}\" does not exist"),
+    )
+}
 
 impl QueryService {
     /// Handle BEGIN/COMMIT/ROLLBACK/SET TRANSACTION/SET SESSION CHARACTERISTICS
@@ -72,6 +92,100 @@ impl QueryService {
                 // ROLLBACK with no open transaction is a no-op warning, stays Idle.
                 None => (None, default_isolation, Ok(rollback_complete())),
             },
+        }
+    }
+
+    /// Handle a savepoint command (`SAVEPOINT` / `RELEASE [SAVEPOINT]` / `ROLLBACK
+    /// TO [SAVEPOINT]`) against the session's transaction `slot`
+    /// (`docs/specs/savepoints.md`). Savepoints require an open transaction block.
+    ///
+    /// - `SAVEPOINT s` eagerly allocates a subxid, registers it active, and pushes a
+    ///   level (the innermost subxid becomes the writing xid).
+    /// - `RELEASE s` is a pure in-memory merge: it pops the named level and any above
+    ///   it; the popped subxids stay live and registered (settled only at the
+    ///   top-level COMMIT) so a released subtransaction never becomes visible to
+    ///   other transactions before the top commits.
+    /// - `ROLLBACK TO s` aborts the named level's subxid and every deeper one, drops
+    ///   them from the live-set, re-establishes `s` with a fresh subxid for continued
+    ///   work, and clears the failed (`'E'`) state — the failed-transaction recovery
+    ///   point. `SAVEPOINT`/`RELEASE` in a failed block are rejected (`25P02`).
+    pub(super) fn handle_savepoint(
+        &self,
+        statement: Statement,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        let Some(mut txn) = slot else {
+            // No open transaction block: PostgreSQL rejects with 25P01.
+            let label = match &statement {
+                Statement::ReleaseSavepoint { .. } => "RELEASE SAVEPOINT",
+                Statement::RollbackToSavepoint { .. } => "ROLLBACK TO SAVEPOINT",
+                _ => "SAVEPOINT",
+            };
+            let err = DbError::plan(
+                SqlState::NoActiveSqlTransaction,
+                format!("{label} can only be used in transaction blocks"),
+            );
+            return (None, default_isolation, Err(err));
+        };
+
+        match statement {
+            Statement::Savepoint { name } => {
+                if txn.failed {
+                    return (Some(txn), default_isolation, Err(failed_block_error()));
+                }
+                let subxid = self.register_active_txn();
+                txn.live_subxids.push(subxid);
+                txn.savepoints.push(SavepointLevel { name, subxid });
+                (Some(txn), default_isolation, Ok(savepoint_complete()))
+            }
+            Statement::ReleaseSavepoint { name } => {
+                if txn.failed {
+                    return (Some(txn), default_isolation, Err(failed_block_error()));
+                }
+                match txn.savepoints.iter().rposition(|level| level.name == name) {
+                    // In-memory merge only: pop the named level and any above it. The
+                    // popped subxids stay in `live_subxids` (still live) and
+                    // registered until the top commits.
+                    Some(idx) => {
+                        txn.savepoints.truncate(idx);
+                        (Some(txn), default_isolation, Ok(release_complete()))
+                    }
+                    None => (Some(txn), default_isolation, Err(no_such_savepoint(&name))),
+                }
+            }
+            Statement::RollbackToSavepoint { name } => {
+                match txn.savepoints.iter().rposition(|level| level.name == name) {
+                    Some(idx) => {
+                        // Abort the named level's subxid and every deeper one.
+                        let rolled: Vec<u64> =
+                            txn.savepoints[idx..].iter().map(|l| l.subxid).collect();
+                        self.abort_subxids(&rolled);
+                        txn.live_subxids.retain(|s| !rolled.contains(s));
+                        txn.savepoints.truncate(idx);
+                        // Re-establish the named level with a fresh subxid so work can
+                        // continue under it (PostgreSQL keeps the savepoint active).
+                        let fresh = self.register_active_txn();
+                        txn.live_subxids.push(fresh);
+                        txn.savepoints.push(SavepointLevel {
+                            name,
+                            subxid: fresh,
+                        });
+                        // ROLLBACK TO recovers a failed ('E') block to this savepoint.
+                        txn.failed = false;
+                        (Some(txn), default_isolation, Ok(rollback_complete()))
+                    }
+                    // Unknown savepoint: a failed block stays failed ('E').
+                    None => (Some(txn), default_isolation, Err(no_such_savepoint(&name))),
+                }
+            }
+            other => (
+                Some(txn),
+                default_isolation,
+                Err(DbError::internal(format!(
+                    "handle_savepoint received a non-savepoint statement: {other:?}"
+                ))),
+            ),
         }
     }
 
@@ -185,6 +299,8 @@ impl QueryService {
             rr_snapshot: None,
             rr_advertised: None,
             dead_versions_pending: 0,
+            savepoints: Vec::new(),
+            live_subxids: Vec::new(),
         })
     }
 
@@ -224,21 +340,26 @@ impl QueryService {
     fn commit_transaction(&self, txn: Transaction) -> Result<()> {
         let txn_id = txn.txn_id;
         let dead_versions = txn.dead_versions_pending;
-        // A read-only explicit transaction (no write guard, no writes) has nothing
-        // durable to commit: just deregister and return. Appending a `Commit` for
-        // it is harmless but unnecessary; skip it so a pure-reader transaction
-        // never touches the WAL.
+        // The whole family `{top} ∪ subxids` settles together. Compute it before any
+        // settle so the atomic family-deregister (`docs/specs/savepoints.md` §3) can
+        // run after the CLOG is marked committed.
+        let family: Vec<u64> = std::iter::once(txn_id)
+            .chain(txn.live_subxids.iter().copied())
+            .collect();
+        // A read-only explicit transaction (no write guard, no writes by the top or
+        // any subxid) has nothing durable to commit: just deregister the family and
+        // return. Appending a `Commit` for it is unnecessary; skip the WAL.
         if txn.write_guard.is_none() {
-            self.components.active_txns.deregister(txn_id);
+            self.components.active_txns.deregister_all(&family);
             return Ok(());
         }
 
-        if let Err(err) = self.append_and_flush_commit(txn_id) {
-            // The commit is not durable: abort instead (append `Abort` +
-            // CLOG=Aborted, clear per-txn bookkeeping, restore DDL metadata)
-            // so the transaction's effects are hidden by the CLOG. Abort is
-            // status-based — no page-content undo (`docs/specs/mvcc.md` §4
-            // Decision 3, Milestone D1).
+        if let Err(err) = self.append_and_flush_commit(txn_id, &txn.live_subxids) {
+            // The commit is not durable: abort the whole family instead (append
+            // `Abort` records + CLOG=Aborted, clear per-txn bookkeeping, restore DDL
+            // metadata) so its effects are hidden by the CLOG. Abort is status-based
+            // — no page-content undo (`docs/specs/mvcc.md` §4 Decision 3).
+            self.abort_subxids(&txn.live_subxids);
             self.rollback_pre_durable_or_die(txn_id, None);
             // `txn` (and its write guard) drops here, releasing the guard.
             return Err(err);
@@ -247,7 +368,11 @@ impl QueryService {
         if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
             self.fatal_after_durable_commit(err);
         }
-        self.components.active_txns.deregister(txn_id);
+        // The CLOG marked the top + every committed subxid `Committed` at flush;
+        // remove the whole family from the active set in ONE latched batch so a
+        // concurrent snapshot capture sees the family all-present (all invisible) or
+        // all-absent (all settled), never a torn commit (`docs/specs/savepoints.md` §3).
+        self.components.active_txns.deregister_all(&family);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
 
@@ -273,14 +398,39 @@ impl QueryService {
     pub(super) fn abort_transaction(&self, txn: Transaction) {
         let txn_id = txn.txn_id;
         if txn.write_guard.is_none() {
-            // A read-only transaction wrote nothing: no Abort record, no cleanup,
-            // just deregister.
-            self.components.active_txns.deregister(txn_id);
+            // A read-only transaction (top + subxids) wrote nothing: no Abort record,
+            // no cleanup, just deregister the whole family.
+            let family: Vec<u64> = std::iter::once(txn_id)
+                .chain(txn.live_subxids.iter().copied())
+                .collect();
+            self.components.active_txns.deregister_all(&family);
             return;
         }
+        // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
+        // VACUUM-reclaimable), then the top-level transaction.
+        self.abort_subxids(&txn.live_subxids);
         self.rollback_pre_durable_or_die(txn_id, None);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
+    }
+
+    /// Abort `subxids` (savepoint subtransactions): append an `Abort` record per
+    /// subxid — which sets the in-memory CLOG to `Aborted` so its rows are hidden
+    /// and VACUUM-reclaimable — and deregister them from the active set. Not
+    /// fsynced: abort durability is not critical (recovery aborts any subxid with
+    /// no durable `Commit`/`CommitWithSubxids` anyway). Used by `ROLLBACK TO
+    /// SAVEPOINT` and the top-level abort paths (`docs/specs/savepoints.md` §3, §5).
+    pub(super) fn abort_subxids(&self, subxids: &[u64]) {
+        for &subxid in subxids {
+            if let Err(err) = self.components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id: subxid,
+                kind: WalRecordKind::Abort,
+            }) {
+                eprintln!("failed to append Abort record for subxid {subxid}: {err}");
+            }
+        }
+        self.components.active_txns.deregister_all(subxids);
     }
 
     /// Allocate the next transaction id and register it active atomically under
@@ -337,11 +487,13 @@ impl QueryService {
         snapshot: Arc<Snapshot>,
         isolation: IsolationLevel,
         gc_horizon: u64,
+        live_txns: Arc<[u64]>,
         cancel: &'a AtomicBool,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
-                .with_gc_horizon(gc_horizon),
+                .with_gc_horizon(gc_horizon)
+                .with_live_txns(live_txns),
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
@@ -395,11 +547,25 @@ impl QueryService {
         (Arc::new(Snapshot { xmin, xmax, xip }), advertised)
     }
 
-    pub(super) fn append_and_flush_commit(&self, txn_id: u64) -> Result<()> {
+    pub(super) fn append_and_flush_commit(
+        &self,
+        txn_id: u64,
+        committed_subxids: &[u64],
+    ) -> Result<()> {
+        // A transaction with committed (live or released, not-rolled-back) savepoint
+        // subxids records them in one atomic `CommitWithSubxids`; otherwise the plain
+        // `Commit` (unchanged format). See `docs/specs/savepoints.md` §5.
+        let kind = if committed_subxids.is_empty() {
+            WalRecordKind::Commit
+        } else {
+            WalRecordKind::CommitWithSubxids {
+                subxids: committed_subxids.to_vec(),
+            }
+        };
         self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
-            kind: WalRecordKind::Commit,
+            kind,
         })?;
         self.components.wal.flush()?;
         Ok(())

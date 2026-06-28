@@ -219,6 +219,7 @@ impl PageBackedStorageEngine {
         t_ctid: (PageNum, u16),
         infomask: u16,
         txn_id: u64,
+        current_txns: &[u64],
     ) -> Result<()> {
         let mut guard = self
             .buffer_pool
@@ -236,7 +237,7 @@ impl PageBackedStorageEngine {
         if write_conflict(
             current_xmax,
             current_infomask,
-            &[txn_id],
+            current_txns,
             self.txn_status_view(),
         ) == WriteConflict::Conflict
         {
@@ -386,6 +387,7 @@ impl PageBackedStorageEngine {
             new_tid,
             infomask | crate::codec::HOT_UPDATED,
             ctx.txn_id,
+            &ctx.live_txns,
         )?;
 
         // No index entries: the index keeps pointing at the chain root; the new

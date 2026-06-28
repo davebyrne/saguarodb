@@ -1,4 +1,5 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::{DbError, IsolationLevel, Result, SqlState};
@@ -51,11 +52,14 @@ impl QueryService {
         let txn_id = self.register_active_txn();
         let (snapshot, _advertised) = self.capture_snapshot(txn_id);
         let gc_horizon = self.components.gc_horizon();
+        // Autocommit COPY FROM: a fresh txn with no savepoints, so the live-set is
+        // just `[txn_id]`.
         let ctx = self.execution_context(
             txn_id,
             snapshot,
             IsolationLevel::default(),
             gc_horizon,
+            Arc::from([txn_id]),
             cancel,
         );
 
@@ -72,7 +76,7 @@ impl QueryService {
             }
         };
 
-        if let Err(err) = self.append_and_flush_commit(txn_id) {
+        if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
             self.rollback_pre_durable_or_die(txn_id, None);
             return Err(err);
         }
@@ -109,8 +113,16 @@ impl QueryService {
         txn.first_statement_ran = true;
         let gc_horizon = self.components.gc_horizon();
         let result = {
-            let ctx =
-                self.execution_context(txn.txn_id, snapshot, txn.isolation, gc_horizon, cancel);
+            // COPY FROM may run inside a transaction with open savepoints: stamp
+            // inserts with the innermost subxid and thread the live (sub)xid set.
+            let ctx = self.execution_context(
+                txn.writing_xid(),
+                snapshot,
+                txn.isolation,
+                gc_horizon,
+                txn.live_txns(),
+                cancel,
+            );
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
             result
@@ -150,7 +162,14 @@ impl QueryService {
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<u64> {
         let (snapshot, _advertised) = self.capture_snapshot(0);
-        let ctx = self.execution_context(0, snapshot, IsolationLevel::default(), 0, cancel);
+        let ctx = self.execution_context(
+            0,
+            snapshot,
+            IsolationLevel::default(),
+            0,
+            Arc::from([0]),
+            cancel,
+        );
         drive_copy_out(&ctx, job, frame_tx)
     }
 
@@ -166,7 +185,16 @@ impl QueryService {
         let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
         txn.first_statement_ran = true;
         let result = {
-            let ctx = self.execution_context(txn.txn_id, snapshot, txn.isolation, 0, cancel);
+            // A read inside a savepoint transaction must see its own subxids' writes,
+            // so thread the live (sub)xid set.
+            let ctx = self.execution_context(
+                txn.writing_xid(),
+                snapshot,
+                txn.isolation,
+                0,
+                txn.live_txns(),
+                cancel,
+            );
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);
             result

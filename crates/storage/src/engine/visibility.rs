@@ -21,7 +21,7 @@ impl PageBackedStorageEngine {
         Ok(Some(decode_row(schema, &bytes)?.row))
     }
     /// Resolve an index entry's TID — possibly a HOT root — to the heap slot of the
-    /// single version **visible** to `snapshot` from `current_txn`, reading the
+    /// single version **visible** to `snapshot` from `current_txns`, reading the
     /// `location` page once under a read latch (pure: no page mutation; pruning is
     /// the UPDATE/VACUUM path's job, `mvcc.md` §10 Milestone H). The two-step
     /// resolution (`mvcc.md` §5.2, §10 Milestone H1) is:
@@ -53,7 +53,7 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
-        current_txn: u64,
+        current_txnss: &[u64],
     ) -> Result<Option<(RowLocation, u16)>> {
         let readable = self
             .buffer_pool
@@ -102,7 +102,7 @@ impl PageBackedStorageEngine {
                 decoded.xmax,
                 decoded.infomask,
                 snapshot,
-                &[current_txn],
+                current_txnss,
                 self.txn_status_view(),
             ) {
                 return Ok(Some((
@@ -265,10 +265,10 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
-        current_txn: u64,
+        current_txnss: &[u64],
     ) -> Result<Option<(RowLocation, Row)>> {
         let Some((resolved, _infomask)) =
-            self.resolve_visible_in_chain(schema, location, snapshot, current_txn)?
+            self.resolve_visible_in_chain(schema, location, snapshot, current_txnss)?
         else {
             return Ok(None);
         };
@@ -278,7 +278,7 @@ impl PageBackedStorageEngine {
         };
         Ok(Some((resolved, row)))
     }
-    /// Locate the single version of `key` visible to `snapshot` from `current_txn`
+    /// Locate the single version of `key` visible to `snapshot` from `current_txns`
     /// and return its heap location together with the version's current `infomask`
     /// (`docs/specs/mvcc.md` §6). The primary-key index may carry an entry per
     /// version (B4); each candidate TID is decoded at its *physical* header and the
@@ -294,7 +294,7 @@ impl PageBackedStorageEngine {
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         snapshot: &Snapshot,
-        current_txn: u64,
+        current_txnss: &[u64],
     ) -> Result<Option<(RowLocation, u16)>> {
         for location in index_btree.scan_key(key)? {
             // Each index entry's TID is a (possibly HOT) root: resolve REDIRECT +
@@ -303,7 +303,7 @@ impl PageBackedStorageEngine {
             // stamp), not the index TID — so a HOT-updated row is stamped at the live
             // heap-only version, not its pruned root.
             if let Some(resolved) =
-                self.resolve_visible_in_chain(schema, location, snapshot, current_txn)?
+                self.resolve_visible_in_chain(schema, location, snapshot, current_txnss)?
             {
                 return Ok(Some(resolved));
             }
