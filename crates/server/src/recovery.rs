@@ -138,6 +138,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
         active_txns.clone(),
         std::time::Duration::from_millis(config.deadlock_timeout_ms),
     ));
+    // SSI conflict tracking for SERIALIZABLE transactions (`docs/specs/ssi.md`).
+    // Shares the registry handle to canonicalize subxids to top-level ids.
+    let ssi_manager = Arc::new(crate::ssi_manager::SerializableConflictManager::new(
+        active_txns.clone(),
+    ));
     let components = Arc::new(ServerComponents {
         config,
         catalog,
@@ -157,6 +162,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         dead_rows_since_vacuum: AtomicU64::new(0),
         active_txns,
         lock_manager,
+        ssi_manager,
         tls,
         cancel_registry: crate::cancel::CancelRegistry::new(),
     });

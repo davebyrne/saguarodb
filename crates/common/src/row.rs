@@ -9,7 +9,7 @@ pub struct Row {
     pub values: Vec<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Key(pub Vec<Value>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

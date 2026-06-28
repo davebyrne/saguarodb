@@ -8,4 +8,5 @@ pub mod query;
 pub mod recovery;
 pub mod registry;
 pub mod shutdown;
+pub mod ssi_manager;
 pub mod tls;

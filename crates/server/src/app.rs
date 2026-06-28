@@ -47,6 +47,11 @@ pub struct ServerComponents {
     /// [`common::ConflictWaiter`] installed on its `StatementContext`; commit/abort/
     /// rollback wake waiters through [`crate::lock_manager::LockManager::on_txn_finished`].
     pub lock_manager: Arc<crate::lock_manager::LockManager>,
+    /// Serializable Snapshot Isolation conflict tracking (`docs/specs/ssi.md`).
+    /// `SERIALIZABLE` statements install it on their `StatementContext` as the real
+    /// [`common::SsiTracker`]; it holds the SIREAD lock table and (from Milestone 5)
+    /// the rw-conflict graph. Read Committed / Repeatable Read never touch it.
+    pub ssi_manager: Arc<crate::ssi_manager::SerializableConflictManager>,
     /// TLS acceptor when the server is configured for SSL, else `None`.
     pub tls: Option<TlsAcceptor>,
     /// Per-connection cancellation keys, used to act on `CancelRequest`.
