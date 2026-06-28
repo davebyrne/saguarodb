@@ -78,12 +78,20 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // rebuilt CLOG. Its index/heap pages (physical records) may still replay
     // harmlessly as orphan pages; they are unreferenced and invisible.
     let mut replay_applied = false;
+    // Writers whose page mutations were replayed: any of these left InProgress (no
+    // durable Commit/Abort) is a crashed in-flight transaction whose versions are on
+    // disk. They are resolved to Aborted below so VACUUM reclaims them before the floor
+    // crosses them (`docs/specs/mvcc.md` §8; the FATAL-B resurrection fix).
+    let mut writer_xids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for record in wal.replay_from(checkpoint_lsn)? {
         let record = record?;
         if !is_redo_operation(&record.kind) {
             // `Commit`/`Abort`/`Checkpoint` are metadata markers, not page
             // mutations; the CLOG already absorbed them at WAL open.
             continue;
+        }
+        if record.txn_id != 0 {
+            writer_xids.insert(record.txn_id);
         }
         if is_logical_catalog_record(&record.kind) && !wal.is_committed(record.txn_id) {
             // An aborted/in-flight DDL's catalog mutation must not be applied
@@ -112,6 +120,13 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // WAL guarantees every transaction dropped below the oldest non-committed one was
     // committed, so flooring just under it never marks an aborted/in-flight txn committed.
     wal.establish_recovery_committed_floor(next_txn_id)?;
+    // Resolve crashed in-flight writers to Aborted (no-undo MVCC has no undo pass).
+    // Must run AFTER the floor is set, so a ghost xid sits at/above the floor and reads
+    // InProgress; marking it Aborted lets VACUUM reclaim its on-disk versions and keeps
+    // the floor pinned below it until then, instead of floating past it and resurrecting
+    // never-committed data as committed (`docs/specs/mvcc.md` §8). Persisted by the
+    // recovery checkpoint below via `clog.dat`.
+    wal.resolve_in_flight_as_aborted(&writer_xids)?;
     let tls = match config.tls_files().map_err(DbError::io)? {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
         None => None,
@@ -391,6 +406,351 @@ mod tests {
             .expect("Ada should be found through the recovered index");
         assert_eq!(row.row.values[0], Value::Integer(1));
         assert!(iter.next().unwrap().is_none());
+    }
+
+    /// FATAL-B regression: a transaction that crashed in flight (its pages were
+    /// stolen to disk, but it never got a durable `Commit` or `Abort`) must NEVER
+    /// become visible. Today a later full `VACUUM` followed by a checkpoint floats
+    /// the implicit-committed floor *past* the unresolved xid — because nothing
+    /// resolves a crashed in-flight transaction to `Aborted` and `vacuum_heap` only
+    /// reclaims recorded-aborted creators — so its never-committed rows resurrect as
+    /// committed data. See `clog.rs::live_snapshot` (floor pinned only by recorded
+    /// aborts) and `query/vacuum.rs::full_vacuum_pass` (floor = `next_txn_id`).
+    ///
+    /// Fixed by `resolve_in_flight_as_aborted` at recovery (`open_app`): crashed
+    /// in-flight writers are marked `Aborted` in the CLOG (persisted via `clog.dat`
+    /// by the recovery checkpoint), so VACUUM reclaims their tuples before the floor
+    /// crosses them and they never read as committed.
+    #[test]
+    fn crashed_in_flight_transaction_is_not_resurrected_by_vacuum() {
+        use super::open_app;
+        use crate::checkpoint::run_checkpoint;
+        use common::IsolationLevel;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny buffer pool forces eviction (steal) of the uncommitted transaction's
+        // dirty pages to disk; `auto_vacuum_dead_rows: 0` makes the explicit VACUUM
+        // the only thing that advances the vacuum floor, so the two phases below are
+        // cleanly separated.
+        let config = || crate::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            buffer_pool_frames: 8,
+            auto_vacuum_dead_rows: 0,
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..crate::config::Config::default()
+        };
+
+        // Lifetime 1: create + checkpoint a clean baseline, then run an explicit
+        // transaction that inserts many rows and NEVER commits. The tiny pool steals
+        // its uncommitted heap/index pages to disk (their WAL records fsynced by the
+        // steal path). We then "crash" by leaking the open transaction (no Drop-time
+        // cleanup) and dropping the app with no commit, no rollback, and no WAL flush
+        // — a faithful power-loss mid-transaction.
+        {
+            let app = open_app(config()).unwrap();
+            app.query_service
+                .execute_sql("create table ghosts (id integer primary key, payload text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (mut slot, mut iso, res) = app.query_service.execute_simple(
+                "begin",
+                None,
+                IsolationLevel::RepeatableRead,
+                &cancel,
+            );
+            res.unwrap();
+            let payload = "x".repeat(300);
+            for id in 0..1000 {
+                let sql = format!("insert into ghosts (id, payload) values ({id}, '{payload}')");
+                let (next, next_iso, res) =
+                    app.query_service.execute_simple(&sql, slot, iso, &cancel);
+                res.unwrap();
+                slot = next;
+                iso = next_iso;
+            }
+            // Simulate the process vanishing: never run the transaction's destructor
+            // and never flush. No `Commit`/`Abort` reaches the WAL.
+            std::mem::forget(slot);
+        }
+
+        // Lifetime 2: recover. The in-flight txn has no Commit/Abort record, so it is
+        // InProgress and its replayed rows MUST be invisible. (Sanity check — this
+        // holds today.)
+        let app = open_app(config()).unwrap();
+        let after_crash = app
+            .query_service
+            .execute_sql("select id from ghosts")
+            .unwrap()
+            .row_count();
+        assert_eq!(
+            after_crash, 0,
+            "sanity: a crashed in-flight transaction's rows must be invisible right after recovery"
+        );
+
+        // Full VACUUM advances the vacuum floor to next_txn_id (above the ghost xid);
+        // the checkpoint's `persist_clog` floats the implicit-committed floor up to it.
+        // Nothing ever resolved the ghost to Aborted, so it must STILL be invisible.
+        app.query_service.execute_sql("vacuum").unwrap();
+        run_checkpoint(&app.components).unwrap();
+
+        let after_vacuum = app
+            .query_service
+            .execute_sql("select id from ghosts")
+            .unwrap()
+            .row_count();
+        assert_eq!(
+            after_vacuum, 0,
+            "FATAL-B: VACUUM + checkpoint resurrected {after_vacuum} never-committed rows as \
+             visible (the implicit-committed floor floated past an unresolved in-flight xid)"
+        );
+    }
+
+    /// FATAL-B (subtransaction variant): rows written by a crashed transaction's
+    /// SAVEPOINT subtransaction are stamped with the *subxid*. The recovery
+    /// resolution must abort the subxid too (it must appear in the replayed redo
+    /// records' txn ids), or those rows resurrect just like top-level writes.
+    #[test]
+    fn crashed_subtransaction_writes_are_not_resurrected() {
+        use super::open_app;
+        use crate::checkpoint::run_checkpoint;
+        use common::IsolationLevel;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            buffer_pool_frames: 8,
+            auto_vacuum_dead_rows: 0,
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..crate::config::Config::default()
+        };
+
+        {
+            let app = open_app(config()).unwrap();
+            app.query_service
+                .execute_sql("create table ghosts (id integer primary key, payload text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let payload = "x".repeat(300);
+            let (mut slot, mut iso, res) = app.query_service.execute_simple(
+                "begin",
+                None,
+                IsolationLevel::RepeatableRead,
+                &cancel,
+            );
+            res.unwrap();
+            // One row under the top-level xid, then a savepoint subtransaction that
+            // inserts the flood — those rows are stamped with the subxid, and the flood
+            // forces their pages to be stolen to disk.
+            for stmt in [
+                format!("insert into ghosts (id, payload) values (0, '{payload}')"),
+                "savepoint s1".to_string(),
+            ] {
+                let (s, i, res) = app.query_service.execute_simple(&stmt, slot, iso, &cancel);
+                res.unwrap();
+                slot = s;
+                iso = i;
+            }
+            for id in 1..1000 {
+                let sql = format!("insert into ghosts (id, payload) values ({id}, '{payload}')");
+                let (s, i, res) = app.query_service.execute_simple(&sql, slot, iso, &cancel);
+                res.unwrap();
+                slot = s;
+                iso = i;
+            }
+            std::mem::forget(slot);
+        }
+
+        let app = open_app(config()).unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_sql("select id from ghosts")
+                .unwrap()
+                .row_count(),
+            0,
+            "sanity: crashed subtransaction rows must be invisible right after recovery"
+        );
+
+        app.query_service.execute_sql("vacuum").unwrap();
+        run_checkpoint(&app.components).unwrap();
+
+        let after_vacuum = app
+            .query_service
+            .execute_sql("select id from ghosts")
+            .unwrap()
+            .row_count();
+        assert_eq!(
+            after_vacuum, 0,
+            "FATAL-B (subxid): VACUUM resurrected {after_vacuum} rows from a crashed \
+             subtransaction — the subxid creator was not resolved to Aborted at recovery"
+        );
+    }
+
+    /// FATAL-B (delete face): a crashed in-flight `DELETE` stamps `xmax` on committed
+    /// rows. If the ghost later reads as committed, that `xmax` becomes a committed
+    /// delete and the rows wrongly disappear. Resolving the ghost to Aborted keeps the
+    /// committed rows alive.
+    #[test]
+    fn crashed_in_flight_delete_does_not_drop_committed_rows() {
+        use super::open_app;
+        use crate::checkpoint::run_checkpoint;
+        use common::IsolationLevel;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            buffer_pool_frames: 8,
+            auto_vacuum_dead_rows: 0,
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..crate::config::Config::default()
+        };
+
+        let base_rows: u32 = 200;
+        {
+            let app = open_app(config()).unwrap();
+            app.query_service
+                .execute_sql("create table t (id integer primary key, payload text)")
+                .unwrap();
+            let payload = "x".repeat(300);
+            for id in 0..base_rows {
+                app.query_service
+                    .execute_sql(&format!(
+                        "insert into t (id, payload) values ({id}, '{payload}')"
+                    ))
+                    .unwrap();
+            }
+            run_checkpoint(&app.components).unwrap();
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (mut slot, mut iso, res) = app.query_service.execute_simple(
+                "begin",
+                None,
+                IsolationLevel::RepeatableRead,
+                &cancel,
+            );
+            res.unwrap();
+            // Delete every committed row (stamps xmax in place), then flood inserts so
+            // the xmax-stamped base pages are stolen to disk before the crash.
+            let (s, i, res) = app
+                .query_service
+                .execute_simple("delete from t", slot, iso, &cancel);
+            res.unwrap();
+            slot = s;
+            iso = i;
+            for id in base_rows..(base_rows + 1000) {
+                let sql = format!("insert into t (id, payload) values ({id}, '{payload}')");
+                let (s, i, res) = app.query_service.execute_simple(&sql, slot, iso, &cancel);
+                res.unwrap();
+                slot = s;
+                iso = i;
+            }
+            std::mem::forget(slot);
+        }
+
+        let app = open_app(config()).unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_sql("select id from t")
+                .unwrap()
+                .row_count() as u32,
+            base_rows,
+            "sanity: committed rows survive a crashed in-flight DELETE right after recovery"
+        );
+
+        app.query_service.execute_sql("vacuum").unwrap();
+        run_checkpoint(&app.components).unwrap();
+
+        let surviving = app
+            .query_service
+            .execute_sql("select id from t")
+            .unwrap()
+            .row_count() as u32;
+        assert_eq!(
+            surviving, base_rows,
+            "FATAL-B (delete): VACUUM + checkpoint left {surviving} of {base_rows} committed rows \
+             — a crashed in-flight DELETE's xmax read as a committed delete"
+        );
+    }
+
+    /// The recovery resolution must be durable: after the recovery checkpoint persists
+    /// the aborts to `clog.dat` and truncates the WAL, a SECOND restart (which has no
+    /// redo records left for the ghost) plus a VACUUM must still not resurrect it.
+    #[test]
+    fn resolved_in_flight_abort_survives_restart_and_vacuum() {
+        use super::open_app;
+        use crate::checkpoint::run_checkpoint;
+        use common::IsolationLevel;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = || crate::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            buffer_pool_frames: 8,
+            auto_vacuum_dead_rows: 0,
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..crate::config::Config::default()
+        };
+
+        {
+            let app = open_app(config()).unwrap();
+            app.query_service
+                .execute_sql("create table ghosts (id integer primary key, payload text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let payload = "x".repeat(300);
+            let (mut slot, mut iso, res) = app.query_service.execute_simple(
+                "begin",
+                None,
+                IsolationLevel::RepeatableRead,
+                &cancel,
+            );
+            res.unwrap();
+            for id in 0..1000 {
+                let sql = format!("insert into ghosts (id, payload) values ({id}, '{payload}')");
+                let (s, i, res) = app.query_service.execute_simple(&sql, slot, iso, &cancel);
+                res.unwrap();
+                slot = s;
+                iso = i;
+            }
+            std::mem::forget(slot);
+        }
+
+        // First restart resolves the ghost to Aborted and the recovery checkpoint
+        // persists it to clog.dat (then truncates the WAL).
+        drop(open_app(config()).unwrap());
+
+        // Second restart has NO redo records for the ghost; it must rely on the durable
+        // clog.dat abort. A VACUUM here must reclaim, not resurrect.
+        let app = open_app(config()).unwrap();
+        app.query_service.execute_sql("vacuum").unwrap();
+        run_checkpoint(&app.components).unwrap();
+
+        let after = app
+            .query_service
+            .execute_sql("select id from ghosts")
+            .unwrap()
+            .row_count();
+        assert_eq!(
+            after, 0,
+            "FATAL-B (durability): {after} ghost rows resurrected after a second restart — the \
+             recovery abort was not persisted to clog.dat"
+        );
     }
 
     #[test]

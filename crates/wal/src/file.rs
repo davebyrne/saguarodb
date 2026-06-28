@@ -465,6 +465,22 @@ impl WalManager for FileWalManager {
         Ok(())
     }
 
+    fn resolve_in_flight_as_aborted(&self, writer_xids: &HashSet<u64>) -> Result<()> {
+        let mut state = self.lock_state()?;
+        // Mark every writer that recovery rebuilt as `InProgress` (no durable
+        // `Commit`/`Abort`) as `Aborted`. Recorded `Committed`/`Aborted` ids are left
+        // alone — `status() == InProgress` is true only for an unrecorded id at/above
+        // the implicit-committed floor, i.e. exactly a crashed in-flight writer in the
+        // live window. The next checkpoint's `persist_clog` makes these durable in
+        // `clog.dat`; no WAL record is appended (recovery never logs).
+        for &xid in writer_xids {
+            if state.clog.status(xid) == TxnStatus::InProgress {
+                state.clog.set_aborted(xid);
+            }
+        }
+        Ok(())
+    }
+
     fn set_vacuum_floor(&self, boundary: TxnId) -> Result<()> {
         // Monotonic; runtime-resident but persisted to `clog.dat` (see the trait doc):
         // a full VACUUM pass under the exclusive guard reclaimed every aborted-creator

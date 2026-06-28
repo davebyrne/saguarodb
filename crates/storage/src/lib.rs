@@ -1032,6 +1032,13 @@ mod tests {
             Ok(())
         }
 
+        fn resolve_in_flight_as_aborted(
+            &self,
+            _writer_xids: &std::collections::HashSet<u64>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
         fn set_vacuum_floor(&self, _boundary: TxnId) -> Result<()> {
             Ok(())
         }

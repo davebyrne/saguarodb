@@ -576,7 +576,19 @@ becomes load-bearing once writers run concurrently (E2b).
   `clog.dat` and brought current by folding the post-`clog_lsn` `Commit`/`Abort`
   records as the WAL opens (or, with no snapshot, fully rebuilt from those records;
   §5.4) — decides visibility afterwards. Any transaction with neither a durable
-  `Commit` nor `Abort` at crash (in-flight at crash) is treated as **Aborted**. There
+  `Commit` nor `Abort` at crash (in-flight at crash) is **resolved to `Aborted`**:
+  after the redo pass, `resolve_in_flight_as_aborted` marks every replayed writer xid
+  still rebuilt as `InProgress` (no durable outcome) as `Aborted` in the CLOG —
+  including savepoint subxids, which appear as redo-record writers — and the recovery
+  checkpoint persists those aborts to `clog.dat`. This is load-bearing, not cosmetic:
+  an *unrecorded* in-flight writer would neither be reclaimed by VACUUM (which reclaims
+  only recorded-aborted creators) nor pin the implicit-committed floor, so a later full
+  VACUUM would float the floor past it (`vacuum_floor = next_txn_id`) and its
+  never-committed versions — inserted tuples and `xmax` delete-stamps alike — would read
+  as committed: silent data resurrection and wrongly-dropped committed rows. Recording
+  the abort makes VACUUM reclaim its tuples and keeps the floor pinned below it until
+  then. Per the no-undo model (§4 Decision 3) recovery appends **no** WAL record for
+  this — the abort lives in the in-memory CLOG and is made durable via `clog.dat`. There
   is **no undo pass**.
   - **Logical catalog records** (`CreateTable`/`DropTable`/`CreateIndex`/
     `DropIndex`) are the one exception: they mutate the durable catalog directly

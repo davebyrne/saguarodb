@@ -76,6 +76,24 @@ pub trait WalManager: Send + Sync + TxnStatusView {
     /// transaction implicitly committed. The floor is monotonic; this is called once
     /// after recovery seeds the allocator.
     fn establish_recovery_committed_floor(&self, allocation_boundary: u64) -> Result<()>;
+
+    /// Resolve crashed in-flight writers to `Aborted` at the end of recovery.
+    ///
+    /// Under no-undo MVCC there is no undo pass: a transaction whose pages reached
+    /// disk (the relaxed flush gate / steal) but which never wrote a durable
+    /// `Commit`/`Abort` is rebuilt as `InProgress` (absent from the CLOG). Left
+    /// unresolved, it is neither reclaimed by VACUUM (which only reclaims recorded
+    /// aborts) nor pins the implicit-committed floor, so a later full VACUUM floats
+    /// the floor past it and its never-committed versions read as committed
+    /// (`docs/specs/mvcc.md` §5.4, §8). This marks every still-`InProgress` id in
+    /// `writer_xids` (the txn ids seen in the replayed redo records) as `Aborted` in
+    /// the in-memory CLOG; the recovery checkpoint persists it via `clog.dat`.
+    /// Appends NO WAL record (recovery never logs). Ids already
+    /// `Committed`/`Aborted` are left unchanged.
+    fn resolve_in_flight_as_aborted(
+        &self,
+        writer_xids: &std::collections::HashSet<u64>,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

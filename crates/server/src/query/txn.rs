@@ -633,11 +633,13 @@ impl QueryService {
         // Record the abort: append an `Abort` record (which sets the CLOG to
         // `Aborted`) and drop the transaction from the active set. The abort is not
         // fsynced here — a transaction with no durable `Commit` is recovered as
-        // aborted regardless (redo-all + in-flight = aborted, `docs/specs/mvcc.md`
-        // §8). The next checkpoint's `persist_clog` durably records the `Aborted`
-        // status in `clog.dat`, so the aborted txn's flushed pages stay hidden across a
-        // checkpoint even though truncation drops the `Abort` record (§5.4). A failure
-        // to append it is logged but not fatal: the txn is still recovered as aborted.
+        // aborted regardless: recovery's `resolve_in_flight_as_aborted` marks every
+        // replayed-but-unresolved writer `Aborted` (redo-all + in-flight = aborted,
+        // `docs/specs/mvcc.md` §8). The next checkpoint's `persist_clog` durably records
+        // the `Aborted` status in `clog.dat`, so the aborted txn's flushed pages stay
+        // hidden across a checkpoint even though truncation drops the `Abort` record
+        // (§5.4). A failure to append it is logged but not fatal: the txn is still
+        // recovered as aborted.
         if let Err(err) = self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
