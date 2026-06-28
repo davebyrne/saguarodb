@@ -58,12 +58,11 @@ pub enum UniqueConflict {
     Violation,
     /// The candidate version is **alive but only potentially a duplicate**: its
     /// creator is **another in-progress transaction** (not me, not committed) that
-    /// has not yet committed or aborted. Under the fail-fast first-updater-wins
-    /// policy the inserter cannot determine uniqueness, so it fails with
-    /// [`SqlState::SerializationFailure`](crate::SqlState::SerializationFailure)
-    /// (`40001`, "retry") rather than blocking — should that creator abort, the
-    /// retry would succeed.
-    InFlight,
+    /// has not yet committed or aborted, so uniqueness is undecidable. The inserter
+    /// **blocks** on that creator (`docs/specs/deadlock.md`) and re-checks when it
+    /// finishes (committed ⇒ `23505`; aborted ⇒ no conflict). Carries the creator's
+    /// xid for the waiter / deadlock detector.
+    WouldBlock(TxnId),
 }
 
 /// The three-way **concurrent-inserter uniqueness** classifier of
@@ -87,9 +86,10 @@ pub enum UniqueConflict {
 ///   the key — a real duplicate within my own txn), or it is committed
 ///   (`XMIN_COMMITTED`, or `status(xmin) == Committed`, which the reserved/frozen
 ///   `< FIRST_NORMAL_XID ⇒ Committed` rule also covers). Definitely a duplicate.
-/// - **Alive, creator is another in-progress txn ⇒ [`UniqueConflict::InFlight`]:**
+/// - **Alive, creator is another in-progress txn ⇒ [`UniqueConflict::WouldBlock`]:**
 ///   the creator is neither me nor committed (`status(xmin) == InProgress`). It may
-///   yet abort, so we cannot call it a definite duplicate; fail fast with `40001`.
+///   yet abort, so uniqueness is undecidable; block on the creator (`xmin`) and
+///   re-check when it finishes (committed ⇒ `23505`; aborted ⇒ no conflict).
 ///
 /// **Hint bits** short-circuit the CLOG probe exactly as in [`version_conflicts`]:
 /// `XMIN_ABORTED` settles a dead creator, `XMIN_COMMITTED` settles a `Violation`
@@ -129,11 +129,11 @@ pub fn classify_unique_conflict(
     // Alive: classify the creator. A committed creator (or my own live version, or
     // reserved/frozen via the status rule) is a definite duplicate; only ANOTHER
     // txn's still-running creator is in-flight — it may yet abort, so uniqueness is
-    // undecidable ⇒ retry (40001).
+    // undecidable ⇒ block on it (WouldBlock) and re-check when it finishes.
     if creator == TxnStatus::Committed {
         UniqueConflict::Violation
     } else {
-        UniqueConflict::InFlight
+        UniqueConflict::WouldBlock(xmin)
     }
 }
 
@@ -145,11 +145,16 @@ pub enum WriteConflict {
     /// supersede this version (it is the first updater, or it already owns the
     /// lock, or the prior lock evaporated when its holder aborted).
     Proceed,
-    /// Another transaction beat this writer to the version's `xmax` and has not
-    /// aborted (it is committed, or another live writer holds the lock). E1b maps
-    /// this to [`SqlState::SerializationFailure`](crate::SqlState::SerializationFailure)
-    /// (`40001`) under the fail-fast first-updater-wins policy.
+    /// Another transaction **committed** a delete/update of this version since the
+    /// writer's snapshot, so the row changed under it ⇒
+    /// [`SqlState::SerializationFailure`](crate::SqlState::SerializationFailure)
+    /// (`40001`).
     Conflict,
+    /// Another **in-progress** writer holds the version's `xmax` row lock. The
+    /// writer must **block** on that holder (`docs/specs/deadlock.md`) and re-check
+    /// once it finishes (aborted ⇒ `Proceed`; committed ⇒ `Conflict`). Carries the
+    /// holder's xid for the waiter / deadlock detector.
+    WouldBlock(TxnId),
 }
 
 /// The pure **write-write conflict** predicate of `docs/specs/mvcc.md` §7.3:
@@ -162,7 +167,7 @@ pub enum WriteConflict {
 /// here; this predicate is pure (no [`Snapshot`]) because the row lock is an
 /// **actual-status** check against the live CLOG, not a snapshot-relative read.
 ///
-/// Rule (fail-fast, first-updater-wins — §4, §7.3):
+/// Rule (blocking + deadlock detection — §7.3, `docs/specs/deadlock.md`):
 /// - `xmax == INVALID_XID` ⇒ [`WriteConflict::Proceed`]: no one has locked the
 ///   row; this writer is the first updater.
 /// - `current_txns.contains(&xmax)` ⇒ [`WriteConflict::Proceed`]: this writer already
@@ -170,11 +175,12 @@ pub enum WriteConflict {
 /// - the deleter **aborted** (`XMAX_ABORTED` hint, or `status(xmax) == Aborted`)
 ///   ⇒ [`WriteConflict::Proceed`]: the other lock evaporated — its delete never
 ///   happened — so the row is free to claim.
-/// - otherwise the deleter is **committed** (`XMAX_COMMITTED` hint, or
-///   `status == Committed`) or **in-progress** (another live writer holds the
-///   lock) ⇒ [`WriteConflict::Conflict`]: another transaction beat this writer to
-///   the row. There is no blocking or deadlock detection; E1b fails fast with
+/// - the deleter **committed** (`XMAX_COMMITTED` hint, or `status == Committed`) ⇒
+///   [`WriteConflict::Conflict`]: the row changed since the writer's snapshot ⇒
 ///   `40001`.
+/// - the deleter is **in-progress** (another live writer holds the lock) ⇒
+///   [`WriteConflict::WouldBlock(xmax)`]: the writer blocks on that holder and
+///   re-checks when it finishes (no fail-fast).
 ///
 /// **Hint bits** short-circuit the CLOG probe exactly as in [`is_visible`] and
 /// [`version_conflicts`]: a settled `XMAX_ABORTED`/`XMAX_COMMITTED` bit decides
@@ -208,13 +214,14 @@ pub fn write_conflict(
     if infomask & XMAX_COMMITTED != 0 {
         return WriteConflict::Conflict;
     }
-    // No hint: probe the CLOG. An aborted lock holder evaporated ⇒ the row is
-    // free; otherwise (committed or in-progress) another txn beat me ⇒ conflict.
-    // (Reserved/frozen xids never appear here: a real `xmax` is 0 or a normal
-    // xid, so the status view's "< FIRST_NORMAL_XID ⇒ Committed" rule would push
-    // such a value to Conflict.)
-    if status.status(xmax) == TxnStatus::Aborted {
-        return WriteConflict::Proceed;
+    // No hint: probe the CLOG. An aborted lock holder evaporated ⇒ the row is free;
+    // a committed one beat me ⇒ conflict (`40001`); an in-progress one ⇒ I block on
+    // it and re-check when it finishes (`docs/specs/deadlock.md`). (Reserved/frozen
+    // xids never appear here: a real `xmax` is 0 or a normal xid, and the status
+    // view's "< FIRST_NORMAL_XID ⇒ Committed" rule maps such a value to Conflict.)
+    match status.status(xmax) {
+        TxnStatus::Aborted => WriteConflict::Proceed,
+        TxnStatus::Committed => WriteConflict::Conflict,
+        TxnStatus::InProgress => WriteConflict::WouldBlock(xmax),
     }
-    WriteConflict::Conflict
 }

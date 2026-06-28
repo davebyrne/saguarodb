@@ -537,36 +537,36 @@ fn classify_committed_hint_is_violation_without_probe() {
 }
 
 #[test]
-fn classify_another_in_progress_creator_is_in_flight() {
+fn classify_another_in_progress_creator_would_block() {
     // The key is held only by ANOTHER txn's still-running, uncommitted insert
-    // (creator in-progress, not me, not committed) ⇒ uniqueness undecidable ⇒
-    // 40001 (it may yet abort).
+    // (creator in-progress, not me, not committed) ⇒ uniqueness undecidable ⇒ block
+    // on that creator (its xmin) and re-check when it finishes.
     let view = MockStatus::new(&[(7, TxnStatus::InProgress)]);
     assert_eq!(
         classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
-        UniqueConflict::InFlight
+        UniqueConflict::WouldBlock(7)
     );
 }
 
 #[test]
-fn classify_another_in_progress_creator_unrecorded_is_in_flight() {
-    // An unrecorded creator reads InProgress (the CLOG default) ⇒ InFlight.
+fn classify_another_in_progress_creator_unrecorded_would_block() {
+    // An unrecorded creator reads InProgress (the CLOG default) ⇒ WouldBlock(creator).
     let view = MockStatus::new(&[]);
     assert_eq!(
         classify_unique_conflict(7, INVALID_XID, 0, CURRENT_TXN, &view),
-        UniqueConflict::InFlight
+        UniqueConflict::WouldBlock(7)
     );
 }
 
 #[test]
-fn classify_in_progress_creator_with_aborted_delete_is_in_flight() {
+fn classify_in_progress_creator_with_aborted_delete_would_block() {
     // Another txn's in-progress creator whose (in-progress) delete aborted is
-    // still alive-but-undecidable ⇒ InFlight, not Violation. Guards against the
-    // aborted-delete branch reclassifying the creator.
+    // still alive-but-undecidable ⇒ WouldBlock(creator), not Violation. Guards
+    // against the aborted-delete branch reclassifying the creator.
     let view = MockStatus::new(&[(7, TxnStatus::InProgress), (9, TxnStatus::Aborted)]);
     assert_eq!(
         classify_unique_conflict(7, 9, 0, CURRENT_TXN, &view),
-        UniqueConflict::InFlight
+        UniqueConflict::WouldBlock(7)
     );
 }
 
@@ -745,13 +745,13 @@ fn write_conflict_deleter_committed_conflicts() {
 }
 
 #[test]
-fn write_conflict_deleter_in_progress_conflicts() {
-    // Another live writer holds the row lock (delete not yet committed) ⇒
-    // fail-fast conflict (no blocking).
+fn write_conflict_deleter_in_progress_would_block() {
+    // Another live writer holds the row lock (delete not yet committed) ⇒ block on
+    // that holder and re-check when it finishes (`docs/specs/deadlock.md`).
     let view = MockStatus::new(&[(9, TxnStatus::InProgress)]);
     assert_eq!(
         write_conflict(9, 0, CURRENT_TXN, &view),
-        WriteConflict::Conflict
+        WriteConflict::WouldBlock(9)
     );
 }
 
@@ -836,13 +836,14 @@ fn own_subxid_set_is_self_for_visibility_and_conflicts() {
         UniqueConflict::None
     );
 
-    // And the row lock my own subxid holds is not a write-write conflict for me.
+    // And the row lock my own subxid holds is not a write-write conflict for me;
+    // without the subxid in the set, the in-progress holder would make me block.
     assert_eq!(
         write_conflict_set(8, 0, &live, &view),
         WriteConflict::Proceed
     );
     assert_eq!(
         write_conflict_set(8, 0, &[100], &view),
-        WriteConflict::Conflict
+        WriteConflict::WouldBlock(8)
     );
 }

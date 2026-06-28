@@ -1,6 +1,36 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use crate::error::{DbError, Result};
 use crate::mvcc::{IsolationLevel, Snapshot};
+
+/// Blocks a writer that hit an in-progress row-lock conflict until the holder
+/// finishes, so the writer can re-check (`docs/specs/deadlock.md`). The storage
+/// engine's write paths call this at a conflict point (after dropping the page
+/// latch); the server's lock manager implements it. `wait_for` returns `Ok` once
+/// `blocker` is no longer active (the caller then re-checks the row), or `Err` with
+/// `DeadlockDetected` (`40P01`) if waiting would deadlock, or `QueryCanceled`
+/// (`57014`) if `cancel` is set.
+pub trait ConflictWaiter: Send + Sync + std::fmt::Debug {
+    fn wait_for(&self, waiter: u64, blocker: u64, cancel: &AtomicBool) -> Result<()>;
+}
+
+/// The default `ConflictWaiter` for read-only / test contexts. A real `WouldBlock`
+/// only arises at a storage write-conflict point, which always carries the server's
+/// real lock manager, so this is never legitimately reached. It **errors loudly**
+/// rather than returning `Ok` — returning `Ok` would make a mis-wired write path
+/// spin forever (`WouldBlock → wait → Ok → re-attempt → WouldBlock → …`).
+#[derive(Debug)]
+struct NoConflictWaiter;
+
+impl ConflictWaiter for NoConflictWaiter {
+    fn wait_for(&self, waiter: u64, blocker: u64, _cancel: &AtomicBool) -> Result<()> {
+        Err(DbError::internal(format!(
+            "no conflict waiter configured: a write path reached a row-lock conflict \
+             (waiter={waiter}, blocker={blocker}) without a lock manager"
+        )))
+    }
+}
 
 /// Per-statement execution context threaded into every storage operation.
 ///
@@ -18,11 +48,22 @@ use crate::mvcc::{IsolationLevel, Snapshot};
 /// (`docs/specs/mvcc.md` §10 C3). `isolation` is honored by the server's snapshot
 /// capture from Milestone C (Read Committed = fresh per statement, Repeatable Read =
 /// captured once); the storage engine does not consult it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `PartialEq`/`Eq` are hand-rolled below (not derived) because `conflict_waiter`
+/// and `cancel` are not comparable; equality compares the value fields only.
+#[derive(Clone, Debug)]
 pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    /// Blocks this statement when it hits an in-progress row-lock conflict, until
+    /// the holder finishes (`docs/specs/deadlock.md`). The default
+    /// ([`NoConflictWaiter`]) errors if ever asked to wait; the server installs the
+    /// real lock manager on write-capable contexts.
+    pub conflict_waiter: Arc<dyn ConflictWaiter>,
+    /// The per-statement cancel flag, shared with the connection (set by a client
+    /// `CancelRequest`). Threaded to the storage conflict point so a blocked writer
+    /// can be interrupted (`docs/specs/deadlock.md` §5). Defaults to a never-set flag.
+    pub cancel: Arc<AtomicBool>,
     /// The reading/writing transaction's **live (sub)xid set** — `txn_id` plus any
     /// not-rolled-back savepoint subxids (`docs/specs/savepoints.md` §4). A tuple
     /// whose `xmin`/`xmax` is in this set is the transaction's own (uncommitted)
@@ -55,6 +96,8 @@ impl StatementContext {
             isolation: IsolationLevel::default(),
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
+            conflict_waiter: Arc::new(NoConflictWaiter),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -69,6 +112,8 @@ impl StatementContext {
             isolation: IsolationLevel::default(),
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
+            conflict_waiter: Arc::new(NoConflictWaiter),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -85,6 +130,8 @@ impl StatementContext {
             isolation,
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
+            conflict_waiter: Arc::new(NoConflictWaiter),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -103,11 +150,55 @@ impl StatementContext {
         self.live_txns = live_txns;
         self
     }
+
+    /// Install the real conflict waiter (the server's lock manager) and the
+    /// connection's cancel flag for a write-capable statement (`docs/specs/deadlock.md`).
+    /// Builder-style.
+    #[must_use]
+    pub fn with_conflict_waiter(
+        mut self,
+        conflict_waiter: Arc<dyn ConflictWaiter>,
+        cancel: Arc<AtomicBool>,
+    ) -> Self {
+        self.conflict_waiter = conflict_waiter;
+        self.cancel = cancel;
+        self
+    }
 }
+
+// Hand-rolled to exclude `conflict_waiter` and `cancel` (neither is comparable);
+// two contexts are equal when their value fields match, as before the deadlock
+// waiter/cancel fields were added.
+impl PartialEq for StatementContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.txn_id == other.txn_id
+            && self.snapshot == other.snapshot
+            && self.isolation == other.isolation
+            && self.live_txns == other.live_txns
+            && self.gc_horizon == other.gc_horizon
+    }
+}
+
+impl Eq for StatementContext {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::{IsolationLevel, Snapshot, StatementContext};
+
+    #[test]
+    fn default_conflict_waiter_errors_rather_than_spinning() {
+        // A read/test context's waiter must never be asked to wait (a real
+        // WouldBlock only arises on a write path with the real lock manager). If it
+        // ever is, it errors loudly instead of returning Ok and spinning forever.
+        let ctx = StatementContext::new(7);
+        let err = ctx
+            .conflict_waiter
+            .wait_for(7, 8, &AtomicBool::new(false))
+            .expect_err("default waiter must error, not return Ok");
+        assert!(err.message.contains("no conflict waiter configured"));
+    }
 
     #[test]
     fn new_sets_txn_id_and_placeholder_fields() {

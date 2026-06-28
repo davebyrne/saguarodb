@@ -38,7 +38,7 @@ impl PageBackedStorageEngine {
         if index.unique && !has_null {
             match self.unique_conflict_kind(&secondary, entry_key, table_schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_unique_index(&index.name)),
-                UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
             }
         }
@@ -69,18 +69,19 @@ impl PageBackedStorageEngine {
     /// (incl. deleted-by-me) version is [`UniqueConflict::None`] and ignored; a
     /// committed/own/frozen-live version is a definite [`UniqueConflict::Violation`]
     /// (`23505`); a version created by another still-running txn is
-    /// [`UniqueConflict::InFlight`] (`40001`, "retry").
+    /// [`UniqueConflict::WouldBlock`] (block on that creator, then re-check —
+    /// `docs/specs/deadlock.md`).
     ///
-    /// **Precedence `Violation > InFlight > None`** (returns the strongest across
+    /// **Precedence `Violation > WouldBlock > None`** (returns the strongest across
     /// candidates): a single committed-live duplicate is a definite `23505` even if
     /// another candidate is only in-flight; only when no candidate is a definite
-    /// duplicate but at least one is in-flight do we return `InFlight`.
+    /// duplicate but at least one is in-flight do we return `WouldBlock`.
     ///
     /// While writers are serialized (Stage 1) no concurrent uncommitted inserter
-    /// exists, so this never returns `InFlight` at runtime and every index entry is a
-    /// committed, non-deleted tuple — it returns `Violation` exactly when the old
+    /// exists, so this never returns `WouldBlock` at runtime and every index entry is
+    /// a committed, non-deleted tuple — it returns `Violation` exactly when the old
     /// presence-probe / boolean check did, so existing uniqueness behavior is
-    /// unchanged. The `InFlight` arm becomes load-bearing once writers run
+    /// unchanged. The `WouldBlock` arm becomes load-bearing once writers run
     /// concurrently (Milestone E2b).
     pub(super) fn unique_conflict_kind(
         &self,
@@ -116,7 +117,7 @@ impl PageBackedStorageEngine {
                     UniqueConflict::Violation => return Ok(UniqueConflict::Violation),
                     // An in-flight candidate is the strongest seen so far, but a later
                     // candidate could still be a definite Violation, so keep scanning.
-                    UniqueConflict::InFlight => strongest = UniqueConflict::InFlight,
+                    UniqueConflict::WouldBlock(b) => strongest = UniqueConflict::WouldBlock(b),
                     UniqueConflict::None => {}
                 }
             }

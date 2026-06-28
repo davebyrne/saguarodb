@@ -234,17 +234,23 @@ impl PageBackedStorageEngine {
             .ok_or_else(|| storage_internal("cannot stamp xmax on a non-live slot"))?;
         let (_xmin, current_xmax, _t_ctid, current_infomask) =
             crate::codec::decode_mvcc_header(&current)?;
-        if write_conflict(
+        // Staged: a `WouldBlock` (in-progress holder) is treated as a fail-fast
+        // `40001` here for now, preserving the prior behavior so the workspace
+        // builds. The wait-retry loop (block on the holder, re-check) lands once the
+        // server installs the real lock manager (`docs/specs/deadlock.md`).
+        match write_conflict(
             current_xmax,
             current_infomask,
             current_txns,
             self.txn_status_view(),
-        ) == WriteConflict::Conflict
-        {
-            return Err(DbError::execute(
-                SqlState::SerializationFailure,
-                "could not serialize access due to concurrent update",
-            ));
+        ) {
+            WriteConflict::Proceed => {}
+            WriteConflict::Conflict | WriteConflict::WouldBlock(_) => {
+                return Err(DbError::execute(
+                    SqlState::SerializationFailure,
+                    "could not serialize access due to concurrent update",
+                ));
+            }
         }
 
         if guard.take_needs_fpi() {

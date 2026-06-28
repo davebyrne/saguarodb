@@ -372,7 +372,9 @@ impl StorageEngine for PageBackedStorageEngine {
             let _pk_guard = latch.lock();
             match self.unique_conflict_kind(&btree, &key, &schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+                // Staged: in-progress holder -> fail-fast 40001 for now; the
+                // wait-retry loop lands with the lock manager (docs/specs/deadlock.md).
+                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
             }
             btree.insert(ctx.txn_id, &key, &location)?;
@@ -527,7 +529,9 @@ impl StorageEngine for PageBackedStorageEngine {
             let _pk_guard = latch.lock();
             match self.unique_conflict_kind(&btree, key, &schema, &ctx.live_txns)? {
                 UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                UniqueConflict::InFlight => return Err(unique_conflict_retry()),
+                // Staged: in-progress holder -> fail-fast 40001 for now; the
+                // wait-retry loop lands with the lock manager (docs/specs/deadlock.md).
+                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
                 UniqueConflict::None => {}
             }
             btree.insert(ctx.txn_id, key, &new_location)?;
