@@ -84,6 +84,8 @@ impl QueryService {
             self.fatal_after_durable_commit(err);
         }
         self.components.active_txns.deregister(txn_id);
+        // Wake any writer blocked on this committed COPY's row locks.
+        self.components.lock_manager.on_txn_finished();
         drop(guard);
         // COPY FROM only inserts, so it produces no committed dead versions; still
         // count the commit toward the checkpoint trigger.

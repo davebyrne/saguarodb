@@ -431,8 +431,10 @@ impl QueryService {
             self.fatal_after_durable_commit(err);
         }
         // The commit is durable and cleaned up; the CLOG already recorded it
-        // `Committed` (set inside `wal.flush`). Drop it from the active set.
+        // `Committed` (set inside `wal.flush`). Drop it from the active set and wake
+        // any writer blocked on its row locks.
         self.components.active_txns.deregister(txn_id);
+        self.components.lock_manager.on_txn_finished();
         drop(guard);
 
         // Account this committed statement's dead versions toward the auto-prune

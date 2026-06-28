@@ -103,12 +103,17 @@ impl ConflictWaiter for LockManager {
                     "canceling statement due to user request",
                 ));
             }
-            let (next_graph, timed_out) = self
+            // Ignore WHY we woke (a poll timeout, or an unrelated transaction's
+            // `notify_all`): detection is purely time-based. Gating on `timed_out`
+            // would starve detection on a busy server, where unrelated commit/abort
+            // notifications keep waking this waiter before the poll elapses, so a
+            // real deadlock would never be detected (`docs/specs/deadlock.md` §4).
+            let (next_graph, _woken) = self
                 .cond
                 .wait_timeout(graph, POLL_INTERVAL)
                 .expect("lock manager mutex poisoned");
             graph = next_graph;
-            if timed_out.timed_out() && last_detection.elapsed() >= self.deadlock_timeout {
+            if last_detection.elapsed() >= self.deadlock_timeout {
                 last_detection = Instant::now();
                 if Self::on_cycle(&graph, waiter_top) {
                     // Drop the victim's edge in the SAME critical section as detection
