@@ -83,39 +83,43 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 
 `LockManager` (a new `Arc` field on `ServerComponents`) owns the wait coordination:
 
-- State: `Mutex<{ waits_for: HashMap<TxnId, TxnId> }>` + a `Condvar`, plus a shared
-  `ActiveTxnRegistry` handle and the configured `deadlock_timeout`. The edge key/
-  value are the actual (sub)xids the engine passes — `waiter` is the writer's
-  *writing xid* (`ctx.txn_id`, the innermost subxid) and `blocker` is the stamped
-  `xmax` (also possibly a subxid).
-- `wait_for(waiter, blocker, cancel)` — under the lock: record the edge
-  `waiter → blocker`, then loop:
-  - blocker no longer active (`registry.is_active(blocker)` is false) → return `Ok`
-    (re-check the row). **`is_active` is keyed on the specific (sub)xid**, because a
-    partial `ROLLBACK TO` aborts and deregisters only that subxid — a waiter on it
-    must then proceed even though the top is still live.
+- State: `Mutex<{ waits_for_top: HashMap<TopId, TopId> }>` + a `Condvar`, plus a
+  shared `ActiveTxnRegistry` handle and the configured `deadlock_timeout`. **The
+  wait-for graph is keyed and valued by *top-level* txn ids** (`TopId`), not subxids:
+  a transaction waits for at most one other at a time, and a deadlock is between
+  *transactions*. Each (sub)xid is canonicalized to its top via `registry.top_of`
+  (identity for a top-level id) at edge **insert** time.
+- `wait_for(waiter_subxid, blocker_subxid, cancel)` — the engine passes the writer's
+  *writing xid* (`ctx.txn_id`, the innermost subxid) and the stamped `xmax` (also
+  possibly a subxid). Under the lock: insert the edge
+  `top_of(waiter_subxid) → top_of(blocker_subxid)` into `waits_for_top`, then loop:
+  - blocker no longer active (`registry.is_active(blocker_subxid)` is false) → return
+    `Ok` (re-check the row). **`is_active` is keyed on the specific blocker subxid**
+    (held as a local, *not* in the graph), because a partial `ROLLBACK TO` aborts and
+    deregisters only that subxid — a waiter on it must then proceed even though the
+    top is still live.
   - `cancel` set → return `Err(QueryCanceled)`;
   - `condvar.wait_timeout(poll_interval)`; accumulate elapsed; every
-    `deadlock_timeout` of accumulated wait, run cycle detection from `waiter`.
-  - On exit (any branch), remove the `waiter → blocker` edge.
-- **Deadlock detection (top-level canonicalized, single critical section).** Cycle
-  detection, victim selection, and removal of the victim's edge happen **together,
-  under the held `LockManager` lock** (the detector already holds it at the
-  `wait_timeout` tick) — so a chosen victim is no longer a graph node when any other
-  detector reads the graph, which is what makes §9's "exactly one victim" hold even
-  though every waiter is its own detector. Detection follows `waits_for` edges from
-  `waiter`, **canonicalizing each endpoint to its top-level txn id** via
-  `registry.top_of(xid)` (a subxid resolves to its owning transaction); a cycle is a
-  walk that revisits the waiter's *top*. This is required for correctness: a
-  deadlock is between *transactions*, and with savepoints both the writing xid and a
-  stamped `xmax` are subxids, so an un-canonicalized walk would miss a genuine
-  cross-subxid cycle (e.g. edges `{200→101, 102→200}` where 101/102 are subxids of
-  the two tops). **Victim = the detecting waiter's transaction**, which returns
-  `Err(DeadlockDetected)` and drops its edge in the same critical section. (`top_of`
-  is backed by a small in-memory subxid→top map maintained only for *active*
-  transactions — distinct from a durable `pg_subtrans`, and not used by the
-  visibility path.) A `poll_interval` of ~100 ms bounds cancel latency; cycle
-  detection runs only at the full `deadlock_timeout`.
+    `deadlock_timeout` of accumulated wait, run cycle detection from
+    `top_of(waiter_subxid)`.
+  - On exit (any branch), remove this waiter's `top → …` edge.
+- **Deadlock detection (single critical section).** Cycle detection, victim
+  selection, and removal of the victim's edge happen **together, under the held
+  `LockManager` lock** (the detector already holds it at the `wait_timeout` tick) —
+  so a chosen victim is no longer a graph node when any other detector reads the
+  graph, which is what makes §9's "exactly one victim" hold even though every waiter
+  is its own detector. Detection walks `waits_for_top` **top → top** (each top has at
+  most one outgoing edge); a cycle is a walk that revisits the waiter's own top.
+  Because both endpoints were canonicalized at insert, the next hop
+  `waits_for_top[current_top]` is well-defined regardless of which subxid stamped the
+  row or which subxid a blocked transaction is currently parked under — closing the
+  cross-subxid case (e.g. `{101→200, 201→101}` for tops 100/200 becomes
+  `{100→200, 200→100}`, a detected cycle). **Victim = the detecting waiter's
+  transaction**, which returns `Err(DeadlockDetected)` and drops its edge in the
+  same critical section. (`top_of` is backed by a small in-memory subxid→top map
+  maintained only for *active* transactions — distinct from a durable `pg_subtrans`,
+  and not used by the visibility path.) A `poll_interval` of ~100 ms bounds cancel
+  latency; cycle detection runs only at the full `deadlock_timeout`.
 
 ### Waking waiters (lost-wakeup-safe)
 
@@ -160,7 +164,10 @@ long-running statement — no new hang path.
   `wait_for` is ever actually called — a real `WouldBlock` must never reach it, so a
   mis-wired write context fails fast instead of spinning forever (`WouldBlock →
   no-op Ok → re-attempt → WouldBlock → …`). The server sets the real `LockManager`
-  waiter and the connection's cancel `Arc` on every write-capable context.
+  waiter and the connection's cancel `Arc` on every write-capable context. (Neither
+  `Arc<dyn ConflictWaiter>` nor `Arc<AtomicBool>` is `PartialEq`/`Eq`, so
+  `StatementContext`'s derived `PartialEq`/`Eq` must be hand-rolled to exclude both
+  new fields — comparing the existing value fields as today.)
 
 ## 7. Crate responsibilities
 
