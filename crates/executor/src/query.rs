@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key, ParsedColumnDef,
-    Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
+    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key, KeyRange,
+    ParsedColumnDef, Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
@@ -123,28 +123,51 @@ pub(crate) fn build_executor<'a>(
     plan: &PhysicalPlan,
 ) -> Result<Box<dyn PlanExecutor + 'a>> {
     match plan {
-        PhysicalPlan::SeqScan { table, filter, .. } => Ok(Box::new(SeqScanOp::new(
-            ctx.statement.clone(),
-            ctx.storage,
-            *table,
-            filter.clone(),
-            table_output_schema(ctx.catalog, *table)?,
-        ))),
+        PhysicalPlan::SeqScan { table, filter, .. } => {
+            // SSI: a sequential scan reads the whole relation (`docs/specs/ssi.md` §5).
+            // No-op unless this is a SERIALIZABLE statement (NoSsiTracker otherwise).
+            ctx.statement
+                .ssi_tracker
+                .record_relation_read(ctx.statement.txn_id, *table);
+            Ok(Box::new(SeqScanOp::new(
+                ctx.statement.clone(),
+                ctx.storage,
+                *table,
+                filter.clone(),
+                table_output_schema(ctx.catalog, *table)?,
+            )))
+        }
         PhysicalPlan::IndexScan {
             table,
             index,
             range,
             filter,
             ..
-        } => Ok(Box::new(IndexScanOp::new(
-            ctx.statement.clone(),
-            ctx.storage,
-            *table,
-            *index,
-            range.clone(),
-            filter.clone(),
-            table_output_schema(ctx.catalog, *table)?,
-        ))),
+        } => {
+            // SSI: an exact-key lookup reads one tuple (recorded even when no row
+            // matches, so a later insert of that key is caught as a phantom); a range
+            // scan reads the whole relation (`docs/specs/ssi.md` §5).
+            match range {
+                KeyRange::Exact(key) => {
+                    ctx.statement
+                        .ssi_tracker
+                        .record_tuple_read(ctx.statement.txn_id, *table, key)
+                }
+                KeyRange::Range { .. } | KeyRange::All => ctx
+                    .statement
+                    .ssi_tracker
+                    .record_relation_read(ctx.statement.txn_id, *table),
+            }
+            Ok(Box::new(IndexScanOp::new(
+                ctx.statement.clone(),
+                ctx.storage,
+                *table,
+                *index,
+                range.clone(),
+                filter.clone(),
+                table_output_schema(ctx.catalog, *table)?,
+            )))
+        }
         PhysicalPlan::NestedLoopJoin {
             left,
             right,
@@ -546,6 +569,13 @@ impl CopyOut {
             slots.push(slot);
             column_names.push(schema.columns[slot].name.clone());
         }
+        // SSI: COPY ... TO scans the whole relation, so it records a relation SIREAD
+        // lock like a SeqScan (`docs/specs/ssi.md` §5.1). This scan path bypasses
+        // `build_executor`, so the lock must be recorded here. No-op for RC/RR via
+        // NoSsiTracker (autocommit COPY TO is Read Committed and records nothing).
+        ctx.statement
+            .ssi_tracker
+            .record_relation_read(ctx.statement.txn_id, table);
         let iter = ctx.storage.scan(&ctx.statement, table)?;
         Ok(Self {
             iter,

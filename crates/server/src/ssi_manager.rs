@@ -76,10 +76,12 @@ impl SerializableConflictManager {
         self.state.lock().expect("ssi manager mutex poisoned")
     }
 
-    /// Begin tracking serializable top-level transaction `top` under `snapshot`
-    /// (called when it captures its first-statement snapshot). Idempotent: a repeat
-    /// keeps the existing locks.
-    pub fn register(&self, top: TxnId, snapshot: Arc<Snapshot>) {
+    /// Begin tracking the serializable transaction `txn_id` under `snapshot` (called
+    /// when it captures its first-statement snapshot). `txn_id` may be a savepoint
+    /// subxid; it is canonicalized to its top-level id. Idempotent: a repeat keeps the
+    /// existing (immutable) snapshot and locks.
+    pub fn register(&self, txn_id: TxnId, snapshot: Arc<Snapshot>) {
+        let top = self.registry.top_of(txn_id);
         let mut st = self.lock();
         st.txns.entry(top).or_insert_with(|| TxnSsi {
             snapshot,
@@ -125,6 +127,15 @@ impl SerializableConflictManager {
                 }
             }
         }
+    }
+
+    /// Observability for metrics and tests: `(tracked transactions, relation SIREAD
+    /// lock memberships, tuple SIREAD lock memberships)`.
+    pub fn tracking_counts(&self) -> (usize, usize, usize) {
+        let st = self.lock();
+        let relation = st.relation_readers.values().map(HashSet::len).sum();
+        let tuple = st.tuple_readers.values().map(HashSet::len).sum();
+        (st.txns.len(), relation, tuple)
     }
 
     /// Record `top`'s relation SIREAD lock on `table` (under the manager lock).

@@ -912,6 +912,52 @@ async fn serializable_holds_a_stable_snapshot_like_repeatable_read() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
+/// SSI read tracking is wired only for `SERIALIZABLE`: a serializable scan records a
+/// relation SIREAD lock and a PK lookup records a tuple SIREAD lock, while a Read
+/// Committed transaction records nothing (the no-op `NoSsiTracker`). Verified via the
+/// manager's tracking counts (`docs/specs/ssi.md` §5). (SIREAD-lock release is wired
+/// in a later milestone, so the serializable locks linger here — this test checks the
+/// recording deltas, not the lifetime.)
+#[tokio::test]
+async fn serializable_records_siread_locks_but_read_committed_does_not() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+
+    let ssi = || server.app().components.ssi_manager.tracking_counts();
+    let (t0, r0, p0) = ssi();
+
+    // SERIALIZABLE seq scan → one relation SIREAD lock + the txn is registered.
+    let mut s = Connection::connect(&server).await.unwrap();
+    s.ok("begin isolation level serializable").await;
+    s.ok("select v from t").await;
+    let (t1, r1, _p1) = ssi();
+    assert!(t1 > t0, "the serializable transaction is registered");
+    assert!(r1 > r0, "a seq scan records a relation SIREAD lock");
+
+    // SERIALIZABLE PK lookup → a tuple SIREAD lock.
+    s.ok("select v from t where id = 1").await;
+    let (_t2, _r2, p2) = ssi();
+    assert!(p2 > p0, "a PK lookup records a tuple SIREAD lock");
+    s.ok("commit").await;
+
+    // READ COMMITTED records nothing and is not registered.
+    let (t3, r3, p3) = ssi();
+    let mut rc = Connection::connect(&server).await.unwrap();
+    rc.ok("begin").await; // default Read Committed
+    rc.ok("select v from t").await;
+    rc.ok("select v from t where id = 1").await;
+    rc.ok("commit").await;
+    assert_eq!(
+        ssi(),
+        (t3, r3, p3),
+        "a Read Committed transaction records no SIREAD locks and is not tracked"
+    );
+}
+
 /// Repeatable Read write-write conflict: an RR transaction reads a row, another
 /// transaction updates+commits it, and the RR transaction's UPDATE of that row
 /// surfaces `40001` (`SerializationFailure`) — the first-updater-wins machinery

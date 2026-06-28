@@ -532,14 +532,31 @@ impl QueryService {
         live_txns: Arc<[u64]>,
         cancel: &'a Arc<AtomicBool>,
     ) -> ExecutionContext<'a> {
-        ExecutionContext {
-            // Install the lock manager (so an in-progress row-lock conflict blocks
-            // instead of failing fast) and the connection's cancel flag (so a blocked
-            // writer is interruptible) on the statement context — `docs/specs/deadlock.md`.
-            statement: StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
+        // A SERIALIZABLE statement registers its transaction with the SSI manager
+        // (idempotent; canonicalized to the top-level id) and installs the real SSI
+        // tracker so its reads record SIREAD locks (`docs/specs/ssi.md`). Registering
+        // here, in the same place the tracker is installed, guarantees the transaction
+        // is registered before any read can record a lock; Read Committed / Repeatable
+        // Read keep the no-op tracker and pay nothing (not even the snapshot clone).
+        let serializable = isolation == IsolationLevel::Serializable;
+        if serializable {
+            self.components
+                .ssi_manager
+                .register(txn_id, snapshot.clone());
+        }
+        let mut statement =
+            StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
                 .with_gc_horizon(gc_horizon)
                 .with_live_txns(live_txns)
-                .with_conflict_waiter(self.components.lock_manager.clone(), cancel.clone()),
+                // Install the lock manager (so an in-progress row-lock conflict blocks
+                // instead of failing fast) and the connection's cancel flag (so a
+                // blocked writer is interruptible) — `docs/specs/deadlock.md`.
+                .with_conflict_waiter(self.components.lock_manager.clone(), cancel.clone());
+        if serializable {
+            statement = statement.with_ssi_tracker(self.components.ssi_manager.clone());
+        }
+        ExecutionContext {
+            statement,
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
