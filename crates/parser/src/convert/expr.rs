@@ -58,6 +58,10 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             subquery: Box::new(convert_set_expr_to_select((**subquery).clone())?),
             negated: *negated,
         }),
+        sql::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+            subquery: Box::new(convert_query_to_select((**subquery).clone())?),
+            negated: *negated,
+        }),
         sql::Expr::Between {
             expr,
             negated,

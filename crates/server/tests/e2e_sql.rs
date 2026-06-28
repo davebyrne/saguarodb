@@ -2160,6 +2160,56 @@ async fn e2e_in_and_not_in_subquery_null_semantics() {
 }
 
 #[tokio::test]
+async fn e2e_exists_and_not_exists_subquery() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    // accounts empty: EXISTS removes all rows, NOT EXISTS keeps all.
+    let rows = server
+        .simple_query("select id from users where exists (select 1 from accounts)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty(), "got {rows:?}");
+
+    let rows = server
+        .simple_query("select id from users where not exists (select 1 from accounts) order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+
+    // Populate accounts: EXISTS now keeps all rows.
+    server
+        .simple_query("insert into accounts (id, owner) values (10, 'x')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where exists (select 1 from accounts) order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
     let server = TestServer::start().await.unwrap();
     server

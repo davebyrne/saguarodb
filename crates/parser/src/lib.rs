@@ -129,6 +129,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_exists_and_not_exists_subquery() {
+        for (sql, negated) in [
+            (
+                "select id from users where exists (select 1 from accounts)",
+                false,
+            ),
+            (
+                "select id from users where not exists (select 1 from accounts)",
+                true,
+            ),
+        ] {
+            let Statement::Select(select) = parse(sql).unwrap() else {
+                panic!("expected select");
+            };
+            assert!(
+                matches!(select.filter, Some(Expr::Exists { negated: n, .. }) if n == negated),
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
     fn parses_count_star_and_aggregate_distinct_shape() {
         let stmt = parse("select count(*), count(distinct id) from users").unwrap();
 

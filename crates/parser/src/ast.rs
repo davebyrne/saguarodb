@@ -194,6 +194,12 @@ pub enum Expr {
         subquery: Box<SelectStatement>,
         negated: bool,
     },
+    /// `[NOT] EXISTS (SELECT ...)`. `negated` is `true` for `NOT EXISTS`. The
+    /// subquery's projected columns are ignored — only whether it produces a row.
+    Exists {
+        subquery: Box<SelectStatement>,
+        negated: bool,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinOp,

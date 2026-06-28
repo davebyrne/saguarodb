@@ -55,6 +55,7 @@ pub(super) fn bind_expr(
             subquery,
             negated,
         } => bind_in_subquery(ctx, expr, subquery, *negated),
+        Expr::Exists { subquery, negated } => bind_exists(ctx, subquery, *negated),
         Expr::Between {
             expr,
             low,
@@ -117,6 +118,22 @@ fn bind_scalar_subquery(ctx: &mut BindContext, select: &SelectStatement) -> Resu
         select: Box::new(bound),
         data_type,
         nullable: true,
+    })
+}
+
+/// `[NOT] EXISTS (SELECT ...)`. Any number of output columns is allowed (they are
+/// ignored); the result is a non-null boolean.
+fn bind_exists(
+    ctx: &mut BindContext,
+    subquery: &SelectStatement,
+    negated: bool,
+) -> Result<BoundExpr> {
+    let select = bind_subquery_select(ctx, subquery)?;
+    Ok(BoundExpr::Exists {
+        select: Box::new(select),
+        negated,
+        data_type: DataType::Boolean,
+        nullable: false,
     })
 }
 

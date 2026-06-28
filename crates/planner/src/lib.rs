@@ -371,6 +371,28 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_exists_subquery() {
+        let catalog = catalog_with_users_and_accounts();
+        // EXISTS ignores the projected columns and is a non-null boolean.
+        let stmt =
+            parse("select name from users where exists (select id, owner from accounts)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(BoundExpr::Exists {
+                negated: false,
+                data_type: DataType::Boolean,
+                nullable: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn binder_rejects_composite_primary_key_for_v1() {
         let catalog = catalog_with_users();
         let stmt =

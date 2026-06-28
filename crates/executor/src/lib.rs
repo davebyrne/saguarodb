@@ -834,6 +834,50 @@ mod tests {
     }
 
     #[test]
+    fn exists_subquery_gates_all_rows() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table accounts (id integer primary key, owner text)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        // Empty accounts: EXISTS is false -> no rows; NOT EXISTS is true -> all rows.
+        assert!(
+            harness
+                .select_rows("select id from users where exists (select 1 from accounts)")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            harness
+                .select_rows("select id from users where not exists (select 1 from accounts)")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Non-empty accounts flips both.
+        harness
+            .execute("insert into accounts (id, owner) values (10, 'x')")
+            .unwrap();
+        assert_eq!(
+            harness
+                .select_rows("select id from users where exists (select 1 from accounts)")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            harness
+                .select_rows("select id from users where not exists (select 1 from accounts)")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn insert_select_copies_rows_from_another_table() {
         let harness = ExecutorHarness::with_users();
         harness
