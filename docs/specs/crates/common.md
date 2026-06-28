@@ -58,6 +58,7 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Float(OrderedF64), // DOUBLE PRECISION (total-order f64 wrapper)
+    Numeric(Decimal),  // NUMERIC/DECIMAL (exact decimal; compares by value)
     Text(String),
     Date(i64),       // days from the Unix epoch (1970-01-01)
     Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
@@ -82,9 +83,14 @@ escape); the `uuid` module provides the canonical `8-4-4-4-12` parse/format
 helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase); the `float`
 module provides the `format_double` / `parse_double` helpers (round-trippable
 text: fixed-point for moderate magnitudes, `e±NN` scientific for extreme
-exponents, and `Infinity`/`-Infinity`/`NaN` for non-finite values).
+exponents, and `Infinity`/`-Infinity`/`NaN` for non-finite values). `Value::Numeric`
+wraps `rust_decimal::Decimal` (re-exported as `common::Decimal`), an exact base-10
+value that compares and hashes *by value* (`1.0` == `1.00`) while carrying its own
+display scale; the `numeric` module provides `parse_numeric`/`format_numeric`,
+`apply_typmod` (round to a `NUMERIC(p, s)` modifier), the PostgreSQL base-10000
+binary codec (`to_pg_binary`/`from_pg_binary`), and `Decimal` conversions.
 All are shared by the parser, executor, protocol, and COPY paths; there is no
-external date/time/uuid/float dependency.
+external date/time/uuid/float dependency (`rust_decimal` backs `NUMERIC`).
 
 ```rust
 pub struct Row {
@@ -130,6 +136,7 @@ pub enum DataType {
     Bytea,
     Uuid,
     Double,
+    Numeric { precision: Option<u32>, scale: u32 },
 }
 
 pub struct ParsedColumnDef {

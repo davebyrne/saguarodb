@@ -1164,6 +1164,183 @@ async fn e2e_double_primary_key_uses_index() {
 }
 
 #[tokio::test]
+async fn e2e_numeric_store_rounding_and_overflow() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n numeric(10,2))")
+        .await
+        .unwrap();
+    for (id, lit) in [(1, "1.239"), (2, "5"), (3, "-0.005"), (4, "99999999.99")] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, n) values ({id}, NUMERIC '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+    // Stored values are rounded to scale 2 (half away from zero) and padded.
+    let rows = server
+        .simple_query("select n from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1.24".to_string())],
+            vec![Some("5.00".to_string())],
+            vec![Some("-0.01".to_string())],
+            vec![Some("99999999.99".to_string())],
+        ]
+    );
+
+    // Precision overflow: NUMERIC(10,2) allows |v| < 10^8.
+    let err = server
+        .simple_query("insert into t (id, n) values (9, NUMERIC '100000000')")
+        .await
+        .err()
+        .expect("numeric precision overflow should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("overflow"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_numeric_unconstrained_scale_ordering_and_distinct() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n numeric)")
+        .await
+        .unwrap();
+    for (id, lit) in [(1, "1.0"), (2, "1.00"), (3, "2.5"), (4, "1.50")] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, n) values ({id}, NUMERIC '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+    // Unconstrained NUMERIC keeps each value's own display scale.
+    let rows = server
+        .simple_query("select n from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1.0".to_string())],
+            vec![Some("1.00".to_string())],
+            vec![Some("2.5".to_string())],
+            vec![Some("1.50".to_string())],
+        ]
+    );
+
+    // Ordering is by value: 1.0 == 1.00 (tie, broken by id), then 1.50, then 2.5.
+    let rows = server
+        .simple_query("select id from t order by n, id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("4".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // Equality matches by value: NUMERIC '1.0' matches both 1.0 and 1.00.
+    let rows = server
+        .simple_query("select count(*) from t where n = NUMERIC '1.0'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // DISTINCT collapses 1.0/1.00 into one value: {1.0, 1.5, 2.5} = 3 rows.
+    let rows = server
+        .simple_query("select distinct n from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows.len(), 3, "DISTINCT rows: {rows:?}");
+}
+
+#[tokio::test]
+async fn e2e_numeric_casts_rejections_and_index() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n numeric(10,2))")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, n) values (1, NUMERIC '12.34')")
+        .await
+        .unwrap();
+
+    // CAST numeric<->text/integer/double (numeric->int rounds half away from zero).
+    let rows = server
+        .simple_query(
+            "select cast(n as text), cast(n as integer), cast(NUMERIC '2.5' as integer), \
+             cast(7 as numeric(10,2)), cast(n as double precision) from t where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("12.34".to_string()),
+            Some("12".to_string()),
+            Some("3".to_string()), // 2.5 -> 3 (ties away)
+            Some("7.00".to_string()),
+            Some("12.34".to_string()),
+        ]]
+    );
+
+    // No implicit casts: an integer or a double literal into a NUMERIC column.
+    for bad in ["7", "3.14"] {
+        let err = server
+            .simple_query(&format!("insert into t (id, n) values (9, {bad})"))
+            .await
+            .err()
+            .expect("non-numeric literal into numeric column should be rejected");
+        assert!(err.message.contains("42804"), "got: {}", err.message);
+    }
+
+    // NUMERIC primary key uses an index.
+    server
+        .simple_query("create table k (n numeric primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into k (n, note) values (NUMERIC '3.14', 'pi')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from k where n = NUMERIC '3.14'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "NUMERIC primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query("select note from k where n = NUMERIC '3.14'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("pi".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

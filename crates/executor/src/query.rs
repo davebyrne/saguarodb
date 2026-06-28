@@ -278,6 +278,7 @@ pub(crate) fn map_and_insert_row(
         validate_value_type(&schema.columns[slot], &value)?;
         full[slot] = value;
     }
+    coerce_numeric_columns(schema, &mut full)?;
     validate_row_constraints(schema, &full)?;
     ctx.storage
         .insert(&ctx.statement, table, Row { values: full })?;
@@ -429,6 +430,7 @@ fn execute_update(
                 let slot = column_slot(&schema, *column)?;
                 values[slot] = eval_expr(expr, &source_row)?;
             }
+            coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
             if ctx
                 .storage
@@ -571,6 +573,26 @@ fn column_slot(schema: &TableSchema, column: ColumnId) -> Result<usize> {
 /// Enforce per-column runtime constraints on a full row before it is written:
 /// NOT NULL, and the bounded character-type length (`VARCHAR(n)` / `CHAR(n)`).
 /// Shared by INSERT, `COPY ... FROM`, and UPDATE.
+/// Round each `NUMERIC(p, s)` column's value to its scale and reject precision
+/// overflow before the row is validated and stored. Unconstrained `NUMERIC` and
+/// non-numeric columns are left unchanged.
+fn coerce_numeric_columns(schema: &TableSchema, values: &mut [Value]) -> Result<()> {
+    for (column, value) in schema.columns.iter().zip(values.iter_mut()) {
+        if let DataType::Numeric { precision, scale } = column.data_type
+            && let Value::Numeric(d) = value
+        {
+            let coerced = common::numeric::apply_typmod(*d, precision, scale).ok_or_else(|| {
+                DbError::execute(
+                    SqlState::NumericValueOutOfRange,
+                    format!("numeric field overflow for column {}", column.name),
+                )
+            })?;
+            *value = Value::Numeric(coerced);
+        }
+    }
+    Ok(())
+}
+
 fn validate_row_constraints(schema: &TableSchema, values: &[Value]) -> Result<()> {
     for (column, value) in schema.columns.iter().zip(values) {
         match (value, column.max_length) {
@@ -603,6 +625,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
         (&column.data_type, value),
         (DataType::Integer, Value::Integer(_))
             | (DataType::Double, Value::Float(_))
+            | (DataType::Numeric { .. }, Value::Numeric(_))
             | (DataType::Text, Value::Text(_))
             | (DataType::Boolean, Value::Boolean(_))
             | (DataType::Date, Value::Date(_))
@@ -662,5 +685,6 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Bytea => "BYTEA",
         DataType::Uuid => "UUID",
         DataType::Double => "DOUBLE PRECISION",
+        DataType::Numeric { .. } => "NUMERIC",
     }
 }

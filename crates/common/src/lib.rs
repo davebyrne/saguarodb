@@ -8,6 +8,7 @@ pub mod float;
 pub mod flush;
 pub mod ids;
 pub mod mvcc;
+pub mod numeric;
 pub mod row;
 pub mod schema;
 pub mod uuid;
@@ -30,6 +31,7 @@ pub use mvcc::{
     XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,
     is_dead_to_all, is_visible, version_conflicts, write_conflict,
 };
+pub use numeric::{Decimal, RoundingStrategy};
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};
 pub use value::{Value, parse_bool_text};

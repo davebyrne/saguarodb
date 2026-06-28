@@ -184,6 +184,8 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         // Total order: NaN sorts greatest and equals itself, -0.0 == +0.0
         // (matching PostgreSQL's float comparison operators).
         (Value::Float(left), Value::Float(right)) => left.cmp(right),
+        // Decimal compares by value, so 1.0 and 1.00 are equal.
+        (Value::Numeric(left), Value::Numeric(right)) => left.cmp(right),
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
@@ -517,6 +519,53 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
                 ))
             }
         }
+        // NUMERIC. A cast to `NUMERIC(p, s)` applies the type modifier (round to
+        // scale, reject precision overflow); a cast to bare `NUMERIC` is identity.
+        (Value::Numeric(value), DataType::Numeric { precision, scale }) => {
+            common::numeric::apply_typmod(value, *precision, *scale)
+                .map(Value::Numeric)
+                .ok_or_else(numeric_overflow)
+        }
+        (Value::Numeric(value), DataType::Text) => {
+            Ok(Value::Text(common::numeric::format_numeric(&value)))
+        }
+        (Value::Text(value), DataType::Numeric { precision, scale }) => {
+            let parsed = common::numeric::parse_numeric(&value).ok_or_else(|| {
+                DbError::execute(SqlState::DatatypeMismatch, "invalid numeric cast")
+            })?;
+            common::numeric::apply_typmod(parsed, *precision, *scale)
+                .map(Value::Numeric)
+                .ok_or_else(numeric_overflow)
+        }
+        (Value::Integer(value), DataType::Numeric { precision, scale }) => {
+            common::numeric::apply_typmod(common::numeric::from_i64(value), *precision, *scale)
+                .map(Value::Numeric)
+                .ok_or_else(numeric_overflow)
+        }
+        (Value::Numeric(value), DataType::Integer) => common::numeric::to_i64_rounded(&value)
+            .map(Value::Integer)
+            .ok_or_else(|| {
+                DbError::execute(
+                    SqlState::NumericValueOutOfRange,
+                    "numeric value out of range for integer",
+                )
+            }),
+        (Value::Numeric(value), DataType::Double) => common::numeric::to_f64(&value)
+            .map(|f| Value::Float(f.into()))
+            .ok_or_else(|| {
+                DbError::execute(
+                    SqlState::NumericValueOutOfRange,
+                    "numeric value out of range for double precision",
+                )
+            }),
+        (Value::Float(value), DataType::Numeric { precision, scale }) => {
+            let parsed = common::numeric::from_f64(value.0).ok_or_else(|| {
+                DbError::execute(SqlState::DatatypeMismatch, "invalid numeric cast")
+            })?;
+            common::numeric::apply_typmod(parsed, *precision, *scale)
+                .map(Value::Numeric)
+                .ok_or_else(numeric_overflow)
+        }
         _ => datatype_mismatch("unsupported cast"),
     }
 }
@@ -540,4 +589,8 @@ pub(crate) fn integer_overflow() -> DbError {
         SqlState::NumericValueOutOfRange,
         "integer value out of range",
     )
+}
+
+fn numeric_overflow() -> DbError {
+    DbError::execute(SqlState::NumericValueOutOfRange, "numeric field overflow")
 }

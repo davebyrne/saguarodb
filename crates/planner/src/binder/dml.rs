@@ -278,7 +278,16 @@ fn column_by_id(table: &TableSchema, id: ColumnId) -> Result<&ColumnDef> {
 }
 
 fn validate_assignable(expr: &BoundExpr, column: &ColumnDef) -> Result<()> {
-    require_type(expr, column.data_type.clone())?;
+    // A NUMERIC value is assignable to any NUMERIC column regardless of the
+    // declared (precision, scale): the value is rounded to the column's scale and
+    // checked for precision overflow at store time, not by type identity.
+    let numeric_compatible = matches!(
+        (expr.data_type(), &column.data_type),
+        (DataType::Numeric { .. }, DataType::Numeric { .. })
+    );
+    if !numeric_compatible {
+        require_type(expr, column.data_type.clone())?;
+    }
     if !column.nullable && expr.nullable() {
         return Err(plan_error(
             SqlState::NotNullViolation,

@@ -144,6 +144,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
                     "invalid input syntax for double precision: \"{text}\""
                 ))
             }),
+        DataType::Numeric { .. } => common::numeric::parse_numeric(text)
+            .map(Value::Numeric)
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for numeric: \"{text}\""))),
     }
 }
 
@@ -383,6 +386,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Bytes(raw) => Some(common::bytea::format_hex(raw)),
         Value::Uuid(raw) => Some(common::uuid::format_uuid(raw)),
         Value::Float(value) => Some(common::float::format_double(value.0)),
+        Value::Numeric(value) => Some(common::numeric::format_numeric(value)),
     }
 }
 

@@ -139,6 +139,13 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Boolean(_) => (DataType::Boolean, false),
         Value::Integer(_) => (DataType::Integer, false),
         Value::Float(_) => (DataType::Double, false),
+        Value::Numeric(_) => (
+            DataType::Numeric {
+                precision: None,
+                scale: 0,
+            },
+            false,
+        ),
         Value::Text(_) => (DataType::Text, false),
         Value::Date(_) => (DataType::Date, false),
         Value::Timestamp(_) => (DataType::Timestamp, false),

@@ -307,8 +307,34 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         | sql::DataType::Float8
         | sql::DataType::Double(sql::ExactNumberInfo::None)
         | sql::DataType::Float(None) => Ok(DataType::Double),
+        // NUMERIC / DECIMAL, optionally with (precision[, scale]).
+        sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => convert_numeric_typmod(info),
         _ => unsupported("unsupported data type"),
     }
+}
+
+/// Convert a NUMERIC/DECIMAL type modifier into `DataType::Numeric`, validating
+/// precision (1..=28, our `Decimal` limit) and scale (`0..=precision`).
+fn convert_numeric_typmod(info: &sql::ExactNumberInfo) -> Result<DataType> {
+    let (precision, scale) = match info {
+        sql::ExactNumberInfo::None => (None, 0_u64),
+        sql::ExactNumberInfo::Precision(p) => (Some(*p), 0),
+        sql::ExactNumberInfo::PrecisionAndScale(p, s) => (Some(*p), *s),
+    };
+    if let Some(p) = precision {
+        if !(1..=28).contains(&p) {
+            return unsupported("numeric precision must be between 1 and 28");
+        }
+        if scale > p {
+            return Err(parse_error(format!(
+                "numeric scale {scale} must not exceed precision {p}"
+            )));
+        }
+    }
+    Ok(DataType::Numeric {
+        precision: precision.map(|p| p as u32),
+        scale: scale as u32,
+    })
 }
 
 /// Extract the declared maximum length (in characters) of a bounded character

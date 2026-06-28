@@ -542,6 +542,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             // PostgreSQL binary `float8` is the 8-byte big-endian IEEE 754 value.
             ValueFormat::Binary => value.0.to_be_bytes().to_vec(),
         },
+        Value::Numeric(value) => match format {
+            ValueFormat::Text => common::numeric::format_numeric(value).into_bytes(),
+            // PostgreSQL binary `numeric` is the base-10000 NumericVar format.
+            ValueFormat::Binary => common::numeric::to_pg_binary(value),
+        },
         Value::Text(text) => text.clone().into_bytes(),
         Value::Date(days) => match format {
             ValueFormat::Text => common::datetime::format_date(*days).into_bytes(),
@@ -614,6 +619,15 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .map_err(|_| protocol_error("binary double precision parameter must be 8 bytes"))?;
             Ok(Value::Float(f64::from_be_bytes(array).into()))
         }
+        (DataType::Numeric { .. }, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "numeric parameter")?;
+            common::numeric::parse_numeric(text)
+                .map(Value::Numeric)
+                .ok_or_else(|| protocol_error("invalid numeric parameter"))
+        }
+        (DataType::Numeric { .. }, ValueFormat::Binary) => common::numeric::from_pg_binary(bytes)
+            .map(Value::Numeric)
+            .ok_or_else(|| protocol_error("invalid binary numeric parameter")),
         (DataType::Boolean, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "boolean parameter")?;
             parse_bool_text(text)
@@ -698,6 +712,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Bytea => (17, -1),
         DataType::Uuid => (2950, 16),
         DataType::Double => (701, 8),
+        DataType::Numeric { .. } => (1700, -1),
     }
 }
 
@@ -923,5 +938,41 @@ mod double_value_tests {
     fn invalid_double_is_rejected() {
         assert!(decode_value(b"not-a-number", DataType::Double, 0).is_err());
         assert!(decode_value(&[0u8; 4], DataType::Double, 1).is_err()); // wrong length
+    }
+}
+
+#[cfg(test)]
+mod numeric_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    fn num(s: &str) -> Value {
+        Value::Numeric(common::numeric::parse_numeric(s).unwrap())
+    }
+    const UNCONSTRAINED: DataType = DataType::Numeric {
+        precision: None,
+        scale: 0,
+    };
+
+    #[test]
+    fn numeric_text_preserves_scale_and_round_trips() {
+        let value = num("1.50");
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"1.50"); // trailing zero kept
+        assert_eq!(decode_value(&text, UNCONSTRAINED, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn numeric_binary_round_trips() {
+        for s in ["0", "1", "-2.5", "12345.678", "0.001", "-9999999.99"] {
+            let value = num(s);
+            let binary = encode_value(&value, 1).unwrap().unwrap();
+            assert_eq!(decode_value(&binary, UNCONSTRAINED, 1).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn invalid_numeric_text_is_rejected() {
+        assert!(decode_value(b"not-a-number", UNCONSTRAINED, 0).is_err());
     }
 }

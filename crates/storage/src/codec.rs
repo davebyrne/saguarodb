@@ -1,6 +1,6 @@
 use common::{
-    DataType, DbError, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row, SqlState, TableSchema,
-    TxnId, Value, XMIN_COMMITTED,
+    DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row, SqlState,
+    TableSchema, TxnId, Value, XMIN_COMMITTED,
 };
 
 /// On-page row encoding version. The current MVCC layout (v2) is
@@ -72,6 +72,23 @@ const KEY_TAG_TIMESTAMP: u8 = 5;
 const KEY_TAG_BYTEA: u8 = 6;
 const KEY_TAG_UUID: u8 = 7;
 const KEY_TAG_DOUBLE: u8 = 8;
+const KEY_TAG_NUMERIC: u8 = 9;
+
+/// Serialize a `NUMERIC` value as its exact `i128` mantissa (16 bytes LE) plus
+/// `u32` scale (4 bytes LE) — a fixed 20 bytes that preserves value and scale.
+fn put_numeric(bytes: &mut Vec<u8>, value: &Decimal) {
+    bytes.extend_from_slice(&value.mantissa().to_le_bytes());
+    bytes.extend_from_slice(&value.scale().to_le_bytes());
+}
+
+/// Decode a `NUMERIC` value written by [`put_numeric`].
+fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
+    let mantissa =
+        i128::from_le_bytes(read_exact(bytes, offset, 16)?.try_into().expect("16 bytes"));
+    let scale = u32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
+    Decimal::try_from_i128_with_scale(mantissa, scale)
+        .map_err(|_| corrupt_row("invalid numeric value"))
+}
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
 /// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
@@ -123,6 +140,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Float(value) => {
                 bytes.push(KEY_TAG_DOUBLE);
                 bytes.extend_from_slice(&value.0.to_le_bytes());
+            }
+            Value::Numeric(value) => {
+                bytes.push(KEY_TAG_NUMERIC);
+                put_numeric(&mut bytes, value);
             }
         }
     }
@@ -198,6 +219,7 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 let raw = read_exact(bytes, &mut offset, 8)?;
                 Value::Float(f64::from_le_bytes(raw.try_into().expect("8 bytes")).into())
             }
+            KEY_TAG_NUMERIC => Value::Numeric(read_numeric(bytes, &mut offset)?),
             _ => return Err(corrupt_row("unknown key value tag")),
         };
         values.push(value);
@@ -264,6 +286,9 @@ pub(crate) fn encode_row_with_infomask(
             }
             Value::Float(value) if column.data_type == DataType::Double => {
                 bytes.extend_from_slice(&value.0.to_le_bytes());
+            }
+            Value::Numeric(value) if matches!(column.data_type, DataType::Numeric { .. }) => {
+                put_numeric(&mut bytes, value);
             }
             Value::Text(value) if column.data_type == DataType::Text => {
                 let len = u32::try_from(value.len())
@@ -362,6 +387,7 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 array.copy_from_slice(raw);
                 Value::Float(f64::from_le_bytes(array).into())
             }
+            DataType::Numeric { .. } => Value::Numeric(read_numeric(bytes, &mut offset)?),
             DataType::Text => {
                 let raw_len = read_exact(bytes, &mut offset, 4)?;
                 let mut array = [0; 4];
@@ -546,7 +572,7 @@ mod tests {
 
     use super::{
         INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, decode_key,
-        decode_row, encode_key, encode_row, null_bitmap_len, set_mvcc_header_fields,
+        decode_row, encode_key, encode_row, null_bitmap_len, put_numeric, set_mvcc_header_fields,
     };
 
     fn schema() -> TableSchema {
@@ -596,6 +622,7 @@ mod tests {
                 }
                 Value::Uuid(value) => bytes.extend_from_slice(value),
                 Value::Float(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
+                Value::Numeric(value) => put_numeric(&mut bytes, value),
             }
         }
         bytes

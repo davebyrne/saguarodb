@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::float::OrderedF64;
+use crate::numeric::Decimal;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {
@@ -11,6 +12,10 @@ pub enum Value {
     /// greatest and equals itself, `-0.0 == +0.0`) so `Value`'s derived
     /// `Ord`/`Eq`/`Hash` stay valid for keys, `DISTINCT`, and grouping.
     Float(OrderedF64),
+    /// `NUMERIC` / `DECIMAL`, an exact base-10 value carrying its own scale.
+    /// `Decimal` compares and hashes by value (`1.0` == `1.00`), so the derived
+    /// `Ord`/`Eq`/`Hash` stay valid for keys, `DISTINCT`, and grouping.
+    Numeric(Decimal),
     Text(String),
     /// `DATE`, stored as days from the Unix epoch (1970-01-01 = 0). i64-backed so
     /// the derived `Ord`/`Hash` give correct date ordering and key/dedup behavior.
