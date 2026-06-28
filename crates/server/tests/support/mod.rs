@@ -122,6 +122,25 @@ impl TestServer {
             .map_err(|err| common::DbError::io(format!("failed to connect to test server: {err}")))
     }
 
+    /// Send a PostgreSQL `CancelRequest` for `(process_id, secret_key)` on its own
+    /// fresh connection (as a real client does), so the server signals that
+    /// connection's in-flight query to cancel.
+    pub async fn send_cancel(&self, process_id: i32, secret_key: i32) -> Result<()> {
+        let mut stream = TcpStream::connect(self.addr)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to connect for cancel: {err}")))?;
+        let mut msg = Vec::with_capacity(16);
+        msg.extend_from_slice(&16i32.to_be_bytes()); // length
+        msg.extend_from_slice(&80877102i32.to_be_bytes()); // CancelRequest code (1234<<16|5678)
+        msg.extend_from_slice(&process_id.to_be_bytes());
+        msg.extend_from_slice(&secret_key.to_be_bytes());
+        stream
+            .write_all(&msg)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send CancelRequest: {err}")))?;
+        Ok(())
+    }
+
     pub async fn force_checkpoint(&self) -> Result<()> {
         let app = self.app.clone();
         tokio::task::spawn_blocking(move || run_checkpoint(&app.components))
@@ -207,6 +226,9 @@ impl SimpleQueryResult {
 /// byte (`b'I'`/`b'T'`/`b'E'`).
 pub struct Connection {
     stream: TcpStream,
+    /// The `(process_id, secret_key)` from the startup `BackendKeyData`, used to
+    /// target this connection's in-flight query with a `CancelRequest`.
+    backend_key: (i32, i32),
 }
 
 impl Connection {
@@ -219,8 +241,17 @@ impl Connection {
             .write_all(&startup_bytes())
             .await
             .map_err(|err| common::DbError::io(format!("failed to send startup message: {err}")))?;
-        read_until_ready(&mut stream).await?;
-        Ok(Self { stream })
+        let response = read_until_ready(&mut stream).await?;
+        let backend_key = parse_backend_key(&response)?;
+        Ok(Self {
+            stream,
+            backend_key,
+        })
+    }
+
+    /// The connection's `(process_id, secret_key)` for issuing a `CancelRequest`.
+    pub fn backend_key(&self) -> (i32, i32) {
+        self.backend_key
     }
 
     /// Run one simple query on this connection, returning the decoded rows and the
@@ -838,6 +869,33 @@ fn execute_bytes(portal: &str) -> Vec<u8> {
 
 fn sync_bytes() -> Vec<u8> {
     tagged(b'S', &[])
+}
+
+/// Scan a startup response for the `BackendKeyData` (`K`) message and return its
+/// `(process_id, secret_key)`. Mirrors `ready_for_query_status`'s message framing.
+fn parse_backend_key(bytes: &[u8]) -> Result<(i32, i32)> {
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let tag = bytes[offset];
+        if tag == b'N' {
+            offset += 1;
+            continue;
+        }
+        let len = read_i32(&bytes[offset + 1..offset + 5])? as usize;
+        let end = offset + 1 + len;
+        if end > bytes.len() {
+            break;
+        }
+        if tag == b'K' && len == 12 {
+            let body = &bytes[offset + 5..end];
+            return Ok((read_i32(&body[0..4])?, read_i32(&body[4..8])?));
+        }
+        offset = end;
+    }
+    Err(common::DbError::protocol(
+        common::SqlState::InternalError,
+        "no BackendKeyData in startup response",
+    ))
 }
 
 fn read_i32(bytes: &[u8]) -> Result<i32> {
