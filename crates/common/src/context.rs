@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::error::{DbError, Result};
+use crate::ids::{TableId, TxnId};
 use crate::mvcc::{IsolationLevel, Snapshot};
+use crate::row::Key;
 
 /// Blocks a writer that hit an in-progress row-lock conflict until the holder
 /// finishes, so the writer can re-check (`docs/specs/deadlock.md`). The storage
@@ -32,6 +34,43 @@ impl ConflictWaiter for NoConflictWaiter {
     }
 }
 
+/// Records what a `SERIALIZABLE` transaction reads (SIREAD locks) and forms
+/// rw-antidependency edges when a write overwrites a concurrent read, so the server's
+/// serializable-conflict manager can detect dangerous structures and abort to preserve
+/// serializability (`docs/specs/ssi.md`). The executor's scan operators call the
+/// `record_*` methods; the storage write paths call `note_write`. Only `SERIALIZABLE`
+/// transactions install the real tracker; every other context keeps the no-op
+/// [`NoSsiTracker`], so Read Committed / Repeatable Read pay nothing.
+pub trait SsiTracker: Send + Sync + std::fmt::Debug {
+    /// Record a point read of `(table, key)` by serializable transaction `reader` (an
+    /// exact-key index lookup) — recorded even when no row matches, so a later insert
+    /// of that key is caught as a phantom.
+    fn record_tuple_read(&self, reader: TxnId, table: TableId, key: &Key);
+    /// Record a scan / range read of the whole `table` by serializable `reader`.
+    fn record_relation_read(&self, reader: TxnId, table: TableId);
+    /// A write of `(table, key)` by serializable `writer`: form rw-edges from the
+    /// concurrent SIREAD holders of the item to `writer`, then run edge-time
+    /// dangerous-structure detection. Returns `Err` with `SerializationFailure`
+    /// (`40001`) when `writer` is the SSI victim and must abort; otherwise `Ok`.
+    fn note_write(&self, writer: TxnId, table: TableId, key: &Key) -> Result<()>;
+}
+
+/// The default no-op `SsiTracker` for non-serializable (Read Committed / Repeatable
+/// Read) and pre-capture / test contexts: recording does nothing and `note_write`
+/// returns `Ok`. Outside `SERIALIZABLE` there is no read tracking and a write never
+/// fails an SSI check, so a silent no-op is correct here — in contrast to
+/// [`NoConflictWaiter`], where a no-op would mask a mis-wired write path.
+#[derive(Debug)]
+struct NoSsiTracker;
+
+impl SsiTracker for NoSsiTracker {
+    fn record_tuple_read(&self, _reader: TxnId, _table: TableId, _key: &Key) {}
+    fn record_relation_read(&self, _reader: TxnId, _table: TableId) {}
+    fn note_write(&self, _writer: TxnId, _table: TableId, _key: &Key) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Per-statement execution context threaded into every storage operation.
 ///
 /// `snapshot` is the visibility snapshot threaded into the storage engine's read
@@ -48,8 +87,9 @@ impl ConflictWaiter for NoConflictWaiter {
 /// (`docs/specs/mvcc.md` §10 C3). `isolation` is honored by the server's snapshot
 /// capture from Milestone C (Read Committed = fresh per statement, Repeatable Read =
 /// captured once); the storage engine does not consult it.
-/// `PartialEq`/`Eq` are hand-rolled below (not derived) because `conflict_waiter`
-/// and `cancel` are not comparable; equality compares the value fields only.
+/// `PartialEq`/`Eq` are hand-rolled below (not derived) because `conflict_waiter`,
+/// `cancel`, and `ssi_tracker` are not comparable; equality compares the value fields
+/// only.
 #[derive(Clone, Debug)]
 pub struct StatementContext {
     pub txn_id: u64,
@@ -81,6 +121,11 @@ pub struct StatementContext {
     /// Defaults to `0` (prune nothing committed-dead) for pre-capture / read / test
     /// contexts; the server sets it on write paths via [`StatementContext::with_gc_horizon`].
     pub gc_horizon: u64,
+    /// Records SIREAD locks and forms rw-antidependency edges for a `SERIALIZABLE`
+    /// transaction (`docs/specs/ssi.md`). The default [`NoSsiTracker`] is a no-op, so
+    /// Read Committed / Repeatable Read are untouched; the server installs the real
+    /// serializable-conflict manager only on SERIALIZABLE contexts.
+    pub ssi_tracker: Arc<dyn SsiTracker>,
 }
 
 impl StatementContext {
@@ -98,6 +143,7 @@ impl StatementContext {
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
+            ssi_tracker: Arc::new(NoSsiTracker),
         }
     }
 
@@ -114,6 +160,7 @@ impl StatementContext {
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
+            ssi_tracker: Arc::new(NoSsiTracker),
         }
     }
 
@@ -132,6 +179,7 @@ impl StatementContext {
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
+            ssi_tracker: Arc::new(NoSsiTracker),
         }
     }
 
@@ -164,11 +212,19 @@ impl StatementContext {
         self.cancel = cancel;
         self
     }
+
+    /// Install the real SSI tracker (the server's serializable-conflict manager) for a
+    /// `SERIALIZABLE` statement (`docs/specs/ssi.md`). Builder-style.
+    #[must_use]
+    pub fn with_ssi_tracker(mut self, ssi_tracker: Arc<dyn SsiTracker>) -> Self {
+        self.ssi_tracker = ssi_tracker;
+        self
+    }
 }
 
-// Hand-rolled to exclude `conflict_waiter` and `cancel` (neither is comparable);
-// two contexts are equal when their value fields match, as before the deadlock
-// waiter/cancel fields were added.
+// Hand-rolled to exclude `conflict_waiter`, `cancel`, and `ssi_tracker` (none is
+// comparable); two contexts are equal when their value fields match, as before the
+// deadlock-waiter and SSI-tracker fields were added.
 impl PartialEq for StatementContext {
     fn eq(&self, other: &Self) -> bool {
         self.txn_id == other.txn_id
@@ -214,5 +270,18 @@ mod tests {
     fn contexts_with_same_txn_id_are_equal() {
         assert_eq!(StatementContext::new(7), StatementContext::new(7));
         assert_ne!(StatementContext::new(7), StatementContext::new(8));
+    }
+
+    #[test]
+    fn default_ssi_tracker_is_a_no_op() {
+        // Outside SERIALIZABLE there is no read tracking and a write never fails an
+        // SSI check: recording is a no-op and `note_write` returns Ok (unlike the
+        // conflict waiter, whose default errors). Equality ignores the tracker.
+        let ctx = StatementContext::new(7);
+        let key = crate::row::Key(vec![crate::value::Value::Integer(1)]);
+        ctx.ssi_tracker.record_tuple_read(7, 1, &key);
+        ctx.ssi_tracker.record_relation_read(7, 1);
+        assert!(ctx.ssi_tracker.note_write(7, 1, &key).is_ok());
+        assert_eq!(ctx, StatementContext::new(7));
     }
 }
