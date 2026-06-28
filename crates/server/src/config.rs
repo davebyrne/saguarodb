@@ -15,6 +15,10 @@ pub struct Config {
     /// auto-prune entirely (space is then bounded only by explicit `VACUUM`).
     pub auto_vacuum_dead_rows: u64,
     pub shutdown_timeout_ms: u64,
+    /// How long a writer blocked on an in-progress row-lock holder waits before the
+    /// deadlock detector runs a wait-for-graph cycle check (`docs/specs/deadlock.md`).
+    /// Matches PostgreSQL's `deadlock_timeout`. Must be positive.
+    pub deadlock_timeout_ms: u64,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
 }
@@ -29,6 +33,7 @@ impl Default for Config {
             checkpoint_wal_bytes: 64 * 1024 * 1024,
             auto_vacuum_dead_rows: 10000,
             shutdown_timeout_ms: 30000,
+            deadlock_timeout_ms: 1000,
             tls_cert_file: None,
             tls_key_file: None,
         }
@@ -102,6 +107,10 @@ where
                 let value = next_value(&mut args, "--shutdown-timeout-ms")?;
                 config.shutdown_timeout_ms = parse_positive_u64(&value, "--shutdown-timeout-ms")?;
             }
+            "--deadlock-timeout-ms" => {
+                let value = next_value(&mut args, "--deadlock-timeout-ms")?;
+                config.deadlock_timeout_ms = parse_positive_u64(&value, "--deadlock-timeout-ms")?;
+            }
             "--tls-cert-file" => {
                 let value = next_value(&mut args, "--tls-cert-file")?;
                 config.tls_cert_file = Some(PathBuf::from(value));
@@ -131,6 +140,7 @@ pub fn usage(program: &str) -> String {
            --checkpoint-wal-bytes <BYTES>     default 67108864\n\
            --auto-vacuum-dead-rows <N>        default 10000 (0 disables auto-prune)\n\
            --shutdown-timeout-ms <MS>         default 30000\n\
+           --deadlock-timeout-ms <MS>         default 1000\n\
            --tls-cert-file <PATH>             PEM cert chain; enables TLS (needs --tls-key-file)\n\
            --tls-key-file <PATH>              PEM private key; enables TLS (needs --tls-cert-file)\n\
            --help                             print usage and exit 0\n"
@@ -199,6 +209,7 @@ mod tests {
         assert_eq!(config.checkpoint_wal_bytes, 64 * 1024 * 1024);
         assert_eq!(config.auto_vacuum_dead_rows, 10000);
         assert_eq!(config.shutdown_timeout_ms, 30000);
+        assert_eq!(config.deadlock_timeout_ms, 1000);
         assert_eq!(config.tls_cert_file, None);
         assert_eq!(config.tls_key_file, None);
     }
@@ -255,6 +266,8 @@ mod tests {
             "250",
             "--shutdown-timeout-ms",
             "99",
+            "--deadlock-timeout-ms",
+            "250",
         ])
         .unwrap();
 
@@ -268,6 +281,12 @@ mod tests {
         assert_eq!(config.checkpoint_wal_bytes, 4096);
         assert_eq!(config.auto_vacuum_dead_rows, 250);
         assert_eq!(config.shutdown_timeout_ms, 99);
+        assert_eq!(config.deadlock_timeout_ms, 250);
+    }
+
+    #[test]
+    fn rejects_non_positive_deadlock_timeout() {
+        assert!(parse_args(["saguarodb", "--deadlock-timeout-ms", "0"]).is_err());
     }
 
     #[test]

@@ -216,6 +216,7 @@ pub enum SqlState {
     NoActiveSqlTransaction,
     InvalidSavepointSpecification,
     SerializationFailure,
+    DeadlockDetected,
     IoError,
     InternalError,
 }
@@ -236,16 +237,18 @@ The server raises it while gating an aborted transaction block (see
 named a savepoint that does not exist. Both are raised on the savepoint path; see
 `docs/specs/savepoints.md` §2.
 
-`SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write conflict under
-MVCC's fail-fast, first-updater-wins policy. It arises in two cases (no blocking, no
-deadlock detection): a **write-write** conflict, when the losing UPDATE/DELETE finds
-the target version's `xmax` row-lock already held by a committed or in-progress
-transaction (classifier `common::mvcc::write_conflict`); and a **concurrent-inserter
-unique** conflict (Milestone E1c), when an INSERT finds the unique key held only by
-another in-progress inserter that may yet abort, so uniqueness is undecidable
-(classifier `common::mvcc::classify_unique_conflict` → `UniqueConflict::InFlight`).
-A committed-live duplicate is instead a definite `UniqueViolation` (`23505`). See
-`docs/specs/mvcc.md` §7.3, Milestone E.
+`SqlState::SerializationFailure` maps to SQLSTATE `40001`: a write-write conflict
+against a **committed**-superseded version — the losing UPDATE/DELETE finds the
+target version's `xmax` row-lock held by a transaction that has committed since this
+writer's snapshot (classifier `common::mvcc::write_conflict` → `WriteConflict::
+Conflict`). A conflict against an *in-progress* holder no longer maps here:
+SaguaroDB now **blocks** on it (`WriteConflict::WouldBlock` / `UniqueConflict::
+WouldBlock`) and only surfaces `40001` (or `23505` for a unique key) if the holder
+turns out to have committed. See `docs/specs/mvcc.md` §7.3 and `docs/specs/deadlock.md`.
+
+`SqlState::DeadlockDetected` maps to SQLSTATE `40P01`: the timeout-based deadlock
+detector found a cycle of blocked writers and aborted a victim (the detecting
+waiter). See `docs/specs/deadlock.md`.
 
 `SqlState::InvalidTextRepresentation` maps to SQLSTATE `22P02`: a text field could
 not be parsed into its target type. `SqlState::BadCopyFileFormat` maps to SQLSTATE

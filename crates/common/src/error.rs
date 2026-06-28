@@ -60,12 +60,18 @@ pub enum SqlState {
     /// `3B001`: `RELEASE`/`ROLLBACK TO` named a savepoint that does not exist in
     /// the current transaction. See `docs/specs/savepoints.md` §2.
     InvalidSavepointSpecification,
-    /// `40001`: a write-write conflict was detected — another transaction has
-    /// locked or committed-superseded the target version since this writer's
-    /// snapshot. SaguaroDB's policy is fail-fast first-updater-wins (no blocking,
-    /// no deadlock detection): the losing writer aborts with this code. See
-    /// `docs/specs/mvcc.md` §7.3 and `crate::mvcc::write_conflict`.
+    /// `40001`: a write-write conflict against a **committed**-superseded version —
+    /// another transaction updated/deleted the target row since this writer's
+    /// snapshot. A conflict against an *in-progress* writer no longer maps here:
+    /// SaguaroDB now **blocks** on it (waiting for the holder) and only surfaces
+    /// `40001` if the holder turns out to have committed. See `docs/specs/mvcc.md`
+    /// §7.3, `docs/specs/deadlock.md`, and `crate::mvcc::write_conflict`.
     SerializationFailure,
+    /// `40P01`: a deadlock was detected — two or more transactions are each waiting
+    /// for a row lock held by another, forming a cycle. The timeout-based detector
+    /// aborts a victim (the detecting waiter) with this code. See
+    /// `docs/specs/deadlock.md`.
+    DeadlockDetected,
     IoError,
     InternalError,
 }

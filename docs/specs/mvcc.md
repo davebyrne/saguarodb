@@ -504,19 +504,25 @@ the other transaction's status:
   lock evaporated, its delete never happened;
 - **committed** (`XMAX_COMMITTED` hint, or CLOG `Committed`) → **serialization
   failure**;
-- **in-progress** (another live writer holds the lock) → **serialization
-  failure** as well.
+- **in-progress** (another live writer holds the lock) → **block** (wait for the
+  holder to finish), then re-check.
 
-**Policy decision (fail-fast, first-updater-wins):** SaguaroDB does **not** block
-on an in-progress conflict and runs **no deadlock detection**. The first writer to
-stamp `xmax` wins; every later writer that finds a committed-or-in-progress lock
-aborts immediately with `SqlState::SerializationFailure` (`40001`). (Blocking +
-deadlock detection is deferred — §10 Milestone E, §12.) Treating in-progress as a
-hard conflict, rather than blocking, is what makes the check pure and lock-free.
+**Policy decision (blocking + deadlock detection):** SaguaroDB **blocks** on an
+in-progress conflict — the later writer waits for the lock holder to finish, then
+re-checks (holder aborted → proceed; holder committed → `40001`). Deadlocks
+(waiters forming a cycle) are broken by a timeout-based detector that aborts a
+victim with `SqlState::DeadlockDetected` (`40P01`). Only a *committed*-superseded
+conflict yields `SqlState::SerializationFailure` (`40001`) now; an in-progress one
+no longer fails fast. The wait happens per row, after releasing the page latch, by
+re-attempting only the stamp — see **`docs/specs/deadlock.md`** for the full
+contract (lock manager, wait-for graph, victim = the detecting waiter, and cancel /
+shutdown interaction). This replaces the earlier fail-fast first-updater-wins
+policy.
 
-The pure classifier is `common::mvcc::write_conflict(xmax, infomask, current_txn,
-status) -> WriteConflict` (`Proceed`/`Conflict`); it takes **no snapshot** because
-the row lock is an actual-status check, not a snapshot-relative read. It is a
+The pure classifier is `common::mvcc::write_conflict(xmax, infomask, current_txns,
+status) -> WriteConflict` (`Proceed` / `Conflict` / `WouldBlock(holder)` — the last
+carries the in-progress holder's xid for the waiter); it takes **no snapshot**
+because the row lock is an actual-status check, not a snapshot-relative read. It is a
 sibling of `version_conflicts`, not a duplicate: `version_conflicts` answers "is
 *some* version with this key alive?" (uniqueness, keyed on a candidate's creator);
 `write_conflict` answers "may I lock *this* version, or did another txn beat me to
@@ -524,22 +530,23 @@ its `xmax`?" (first-updater-wins, keyed on the candidate's deleter).
 
 Concurrent inserts of the same unique key are resolved by the **same status check**
 (Milestone E1c). The uniqueness classifier `common::mvcc::classify_unique_conflict(
-xmin, xmax, infomask, current_txn, status) -> UniqueConflict`
-(`None`/`Violation`/`InFlight`) refines the boolean `version_conflicts` (which is
-just `classify != None`) by distinguishing, for an alive candidate, whether its
-creator is settled or in-flight:
+xmin, xmax, infomask, current_txns, status) -> UniqueConflict`
+(`None`/`Violation`/`WouldBlock(creator)`) refines the boolean `version_conflicts`
+(which is just `classify != None`) by distinguishing, for an alive candidate,
+whether its creator is settled or in-flight:
 
 - **`None`** — the candidate is dead (creator aborted, or committed-deleted /
   deleted-by-me): no conflict.
-- **`Violation`** — alive *and* a definite duplicate (creator committed, is
-  `current_txn` itself, or frozen/reserved) ⇒ `SqlState::UniqueViolation` (`23505`).
-- **`InFlight`** — alive but its creator is **another in-progress transaction** that
-  may yet abort, so uniqueness is undecidable ⇒ fail fast with
-  `SqlState::SerializationFailure` (`40001`, retry) rather than blocking — the same
-  first-updater-wins policy as `write_conflict`.
+- **`Violation`** — alive *and* a definite duplicate (creator committed, is one of
+  `current_txns` itself, or frozen/reserved) ⇒ `SqlState::UniqueViolation`
+  (`23505`).
+- **`WouldBlock(creator)`** — alive but its creator is **another in-progress
+  transaction** that may yet abort, so uniqueness is undecidable ⇒ **block** on that
+  creator, then re-check (committed → `23505`; aborted → no conflict). The variant
+  carries the creator's xid for the waiter. See `docs/specs/deadlock.md`.
 
 The engine (`unique_conflict_kind`) returns the strongest conflict across the key's
-candidates (precedence `Violation > InFlight > None`). Under serialized writers
+candidates (precedence `Violation > WouldBlock > None`). Under serialized writers
 (Stage 1) no concurrent uncommitted inserter exists, so the `InFlight` arm never
 fires at runtime and a duplicate key still raises `23505` exactly as before; it
 becomes load-bearing once writers run concurrently (E2b).
@@ -1023,9 +1030,10 @@ plus a checkpoint-coordination guard.
   allocation and the extent seed are pool-lock-atomic).
 
 **Deferred from Milestone E** (§12): the true concurrent / B-link writer protocol
-(latch-coupled, fully-concurrent B-tree); blocking + deadlock detection (instead
-of fail-fast `40001`); fuzzy checkpoint (checkpointing with writers in flight);
-and per-tuple CLOG-probe contention reduction.
+(latch-coupled, fully-concurrent B-tree); fuzzy checkpoint (checkpointing with
+writers in flight); and per-tuple CLOG-probe contention reduction. (Blocking +
+deadlock detection is now **implemented**, replacing fail-fast `40001` on
+in-progress conflicts — see §7.3 and `docs/specs/deadlock.md`.)
 
 ### Milestone F — VACUUM / GC *(near-MVP in this model)*
 
