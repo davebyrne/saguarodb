@@ -62,6 +62,8 @@ mod recovery;
 mod vacuum;
 mod visibility;
 
+use dml::StampOutcome;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageMode {
     Recovery,
@@ -369,15 +371,24 @@ impl StorageEngine for PageBackedStorageEngine {
         // `SerializationFailure` (in-flight), never a silent double-insert.
         {
             let latch = self.structural_latch(index_fid);
-            let _pk_guard = latch.lock();
-            match self.unique_conflict_kind(&btree, &key, &schema, &ctx.live_txns)? {
-                UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                // Staged: in-progress holder -> fail-fast 40001 for now; the
-                // wait-retry loop lands with the lock manager (docs/specs/deadlock.md).
-                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
-                UniqueConflict::None => {}
+            loop {
+                let guard = latch.lock();
+                match self.unique_conflict_kind(&btree, &key, &schema, &ctx.live_txns)? {
+                    UniqueConflict::Violation => return Err(duplicate_primary_key()),
+                    UniqueConflict::None => {
+                        btree.insert(ctx.txn_id, &key, &location)?;
+                        break;
+                    }
+                    // A key held only by an in-progress inserter is undecidable: drop
+                    // the structural latch BEFORE blocking (the holder may itself be
+                    // waiting on this latch, which would deadlock — `docs/specs/deadlock.md`),
+                    // then re-check under a fresh latch (committed ⇒ 23505; aborted ⇒ free).
+                    UniqueConflict::WouldBlock(blocker) => {
+                        drop(guard);
+                        self.wait_for_conflict(ctx, blocker)?;
+                    }
+                }
             }
-            btree.insert(ctx.txn_id, &key, &location)?;
         }
 
         for index in self.table_indexes(table)? {
@@ -425,13 +436,16 @@ impl StorageEngine for PageBackedStorageEngine {
         // row is hidden by visibility (xmax committed ⇒ invisible to later
         // snapshots), and VACUUM (Milestone F) reclaims the dead version and its
         // entries. No tombstone, no index-entry removal.
-        self.stamp_xmax_logged(
+        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
             location,
             crate::codec::INVALID_TID,
             infomask,
             ctx.txn_id,
             &ctx.live_txns,
-        )?;
+        )? {
+            // An in-progress writer holds this row's lock: wait, then re-check.
+            self.wait_for_conflict(ctx, blocker)?;
+        }
         Ok(true)
     }
 
@@ -504,13 +518,17 @@ impl StorageEngine for PageBackedStorageEngine {
         // deferred optimization; the authoritative check stays atomic at stamp time
         // to keep first-updater-wins race-free.)
         let new_tid = (new_location.page_num, new_location.slot_num);
-        self.stamp_xmax_logged(
+        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
             previous_location,
             new_tid,
             infomask,
             ctx.txn_id,
             &ctx.live_txns,
-        )?;
+        )? {
+            // An in-progress writer holds the predecessor's lock: wait, then
+            // re-attempt the stamp (the new version is already written).
+            self.wait_for_conflict(ctx, blocker)?;
+        }
 
         // Primary-key entry for the new version, under ONE hold of the PK index
         // structural latch across the uniqueness check AND the insert (Milestone E2a,
@@ -526,15 +544,22 @@ impl StorageEngine for PageBackedStorageEngine {
         // released before the secondary inserts each take their own latch (rule 1).
         {
             let latch = self.structural_latch(index_fid);
-            let _pk_guard = latch.lock();
-            match self.unique_conflict_kind(&btree, key, &schema, &ctx.live_txns)? {
-                UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                // Staged: in-progress holder -> fail-fast 40001 for now; the
-                // wait-retry loop lands with the lock manager (docs/specs/deadlock.md).
-                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
-                UniqueConflict::None => {}
+            loop {
+                let guard = latch.lock();
+                match self.unique_conflict_kind(&btree, key, &schema, &ctx.live_txns)? {
+                    UniqueConflict::Violation => return Err(duplicate_primary_key()),
+                    UniqueConflict::None => {
+                        btree.insert(ctx.txn_id, key, &new_location)?;
+                        break;
+                    }
+                    // Drop the structural latch before blocking on the in-progress
+                    // holder, then re-check (`docs/specs/deadlock.md`).
+                    UniqueConflict::WouldBlock(blocker) => {
+                        drop(guard);
+                        self.wait_for_conflict(ctx, blocker)?;
+                    }
+                }
             }
-            btree.insert(ctx.txn_id, key, &new_location)?;
         }
 
         // A new per-version entry for the new tuple in *every* secondary index
@@ -1034,21 +1059,12 @@ fn duplicate_primary_key() -> DbError {
     DbError::storage(SqlState::UniqueViolation, "duplicate primary key")
 }
 
-/// A concurrent inserter held the unique key with an as-yet-uncommitted version, so
-/// uniqueness is undecidable. The fail-fast first-updater-wins policy (§7.3) returns
-/// [`SqlState::SerializationFailure`] (`40001`) rather than blocking; the client may
-/// retry, and if the other inserter aborts the retry succeeds.
-fn unique_conflict_retry() -> DbError {
-    DbError::storage(
-        SqlState::SerializationFailure,
-        "could not determine uniqueness: a concurrent transaction holds this key; retry",
-    )
-}
-
 fn storage_internal(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 
+#[cfg(test)]
+mod conflict_wait_test_support;
 #[cfg(test)]
 mod visibility_tests;
 

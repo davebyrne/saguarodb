@@ -8,6 +8,7 @@ use common::{
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::PageBackedStorageEngine;
+use super::conflict_wait_test_support::{aborting_blocker, committing_blocker};
 use crate::HeapPageStore;
 use crate::traits::{SchemaOperations, StorageEngine};
 
@@ -711,12 +712,12 @@ fn fixture_with_table_and_name_index() -> Fixture {
     fixture
 }
 
-/// INSERT racing an **in-progress** other inserter of the same primary key fails
-/// fast with `SerializationFailure` (40001), not `UniqueViolation`: the key's
-/// only version has an uncommitted creator that may yet abort, so uniqueness is
-/// undecidable.
+/// INSERT racing an **in-progress** other inserter of the same primary key BLOCKS
+/// on that inserter (no fail-fast). When the holder commits during the wait, the
+/// racer re-checks and gets a definite `UniqueViolation` (23505)
+/// (`docs/specs/deadlock.md`).
 #[test]
-fn insert_pk_in_flight_other_inserter_is_serialization_failure() {
+fn insert_pk_blocks_on_in_flight_holder_then_unique_violation() {
     let fixture = fixture_with_table_and_name_index();
 
     // Creator txn 10 inserts key 1 and is left in-progress (no commit/abort).
@@ -725,18 +726,23 @@ fn insert_pk_in_flight_other_inserter_is_serialization_failure() {
         .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "inflight"))
         .unwrap();
 
-    // Txn 11 races to insert the same key: the in-flight version is undecidable.
+    // Txn 11 races: it blocks on txn 10; the waiter commits 10 during the wait, so
+    // the retry sees a committed duplicate.
     let err = fixture
         .engine
-        .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "racer"))
+        .insert(
+            &committing_blocker(ctx(11, snapshot(12, vec![])), fixture.wal.clone()),
+            TABLE_ID,
+            row(1, "racer"),
+        )
         .unwrap_err();
-    assert_eq!(err.code, common::SqlState::SerializationFailure);
+    assert_eq!(err.code, common::SqlState::UniqueViolation);
 }
 
-/// Sequencing the same race: once the in-flight creator **commits**, a later
-/// INSERT of that key is a definite duplicate ⇒ `UniqueViolation` (23505).
+/// If the in-flight holder **aborts** during the wait instead, its version is dead,
+/// so the blocked racer's re-check finds the key free and the INSERT proceeds.
 #[test]
-fn insert_pk_in_flight_then_committed_becomes_unique_violation() {
+fn insert_pk_blocks_on_in_flight_holder_then_succeeds_when_holder_aborts() {
     let fixture = fixture_with_table_and_name_index();
 
     fixture
@@ -744,20 +750,23 @@ fn insert_pk_in_flight_then_committed_becomes_unique_violation() {
         .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "inflight"))
         .unwrap();
 
-    // Phase 1 — still in-flight ⇒ 40001.
-    let retry = fixture
+    // Txn 11 blocks on txn 10; the waiter aborts 10, so the retry finds the key free.
+    fixture
         .engine
-        .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(1, "racer"))
-        .unwrap_err();
-    assert_eq!(retry.code, common::SqlState::SerializationFailure);
-
-    // Phase 2 — the creator commits ⇒ a later INSERT is a definite duplicate.
-    fixture.commit(10);
-    let dup = fixture
-        .engine
-        .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(1, "racer"))
-        .unwrap_err();
-    assert_eq!(dup.code, common::SqlState::UniqueViolation);
+        .insert(
+            &aborting_blocker(ctx(11, snapshot(12, vec![])), fixture.wal.clone()),
+            TABLE_ID,
+            row(1, "racer"),
+        )
+        .unwrap();
+    fixture.commit(11);
+    assert_eq!(
+        fixture
+            .engine
+            .get(&ctx(0, snapshot(20, vec![])), TABLE_ID, &key(1))
+            .unwrap(),
+        Some(row(1, "racer"))
+    );
 }
 
 /// If the in-flight creator **aborts** instead, its version is dead, so a later
@@ -811,11 +820,12 @@ fn fixture_with_unique_name_index() -> Fixture {
     fixture
 }
 
-/// The same in-flight→40001 / committed→23505 split for a UNIQUE SECONDARY index:
-/// a duplicate unique name held only by an uncommitted inserter is `40001`; once
-/// that inserter commits it becomes a definite `UniqueViolation`.
+/// A duplicate unique SECONDARY-index name held by an in-progress inserter BLOCKS
+/// the racer (no fail-fast); when the holder commits during the wait, the racer
+/// gets a definite `UniqueViolation` (23505) on the secondary index
+/// (`docs/specs/deadlock.md`).
 #[test]
-fn insert_unique_secondary_in_flight_then_committed_split() {
+fn insert_unique_secondary_blocks_on_in_flight_then_violation() {
     let fixture = fixture_with_unique_name_index();
 
     // Creator txn 10 inserts (id 1, name "amy") and is left in-progress.
@@ -824,22 +834,18 @@ fn insert_unique_secondary_in_flight_then_committed_split() {
         .insert(&ctx(10, snapshot(11, vec![])), TABLE_ID, row(1, "amy"))
         .unwrap();
 
-    // Phase 1 — a different row with the same unique name, while the holder is
-    // in-flight ⇒ undecidable ⇒ 40001 (note: a DIFFERENT pk, so the conflict is
-    // on the secondary index, not the PK).
-    let retry = fixture
+    // A DIFFERENT pk with the same unique name ⇒ the conflict is on the secondary
+    // index, not the PK. Txn 11 blocks on txn 10; the waiter commits 10, so the
+    // retry sees a committed duplicate unique name.
+    let err = fixture
         .engine
-        .insert(&ctx(11, snapshot(12, vec![])), TABLE_ID, row(2, "amy"))
+        .insert(
+            &committing_blocker(ctx(11, snapshot(12, vec![])), fixture.wal.clone()),
+            TABLE_ID,
+            row(2, "amy"),
+        )
         .unwrap_err();
-    assert_eq!(retry.code, common::SqlState::SerializationFailure);
-
-    // Phase 2 — the holder commits ⇒ the duplicate unique name is definite ⇒ 23505.
-    fixture.commit(10);
-    let dup = fixture
-        .engine
-        .insert(&ctx(12, snapshot(13, vec![])), TABLE_ID, row(3, "amy"))
-        .unwrap_err();
-    assert_eq!(dup.code, common::SqlState::UniqueViolation);
+    assert_eq!(err.code, common::SqlState::UniqueViolation);
 }
 
 /// Unique-secondary in-flight holder that **aborts** ⇒ a later insert of the same
@@ -1534,30 +1540,35 @@ fn update_conflicts_with_committed_deleter() {
     assert_eq!(err.code, common::SqlState::SerializationFailure);
 }
 
-/// DELETE conflicts with an **in-progress** deleter: `xmax = DELETER` is planted
-/// with no Commit/Abort, so the CLOG reads it `InProgress`; the fail-fast policy
-/// treats a live lock holder as a hard conflict ⇒ `40001`.
+/// DELETE BLOCKS on an **in-progress** deleter (`xmax = DELETER`, no Commit/Abort);
+/// when that deleter commits during the wait, the writer re-checks, sees the row
+/// committed-deleted, and gets `40001` (`docs/specs/deadlock.md`).
 #[test]
-fn delete_conflicts_with_in_progress_deleter() {
+fn delete_blocks_on_in_progress_deleter_then_conflicts() {
     let (fixture, _rid) = fixture_with_planted_deleter();
-    // DELETER neither committed nor aborted ⇒ in-progress.
-
+    // DELETER is in-progress; the writer blocks on it. The waiter commits DELETER,
+    // so the retry sees a committed deleter ⇒ conflict.
     let err = fixture
         .engine
-        .delete(&ctx(WRITER, writer_snapshot()), TABLE_ID, &key(1))
+        .delete(
+            &committing_blocker(ctx(WRITER, writer_snapshot()), fixture.wal.clone()),
+            TABLE_ID,
+            &key(1),
+        )
         .unwrap_err();
     assert_eq!(err.code, common::SqlState::SerializationFailure);
 }
 
-/// UPDATE conflicts with an **in-progress** deleter (same fail-fast policy).
+/// UPDATE BLOCKS on an **in-progress** deleter (same path); a committed deleter on
+/// re-check ⇒ `40001`.
 #[test]
-fn update_conflicts_with_in_progress_deleter() {
+fn update_blocks_on_in_progress_deleter_then_conflicts() {
     let (fixture, _rid) = fixture_with_planted_deleter();
 
     let err = fixture
         .engine
         .update(
-            &ctx(WRITER, writer_snapshot()),
+            &committing_blocker(ctx(WRITER, writer_snapshot()), fixture.wal.clone()),
             TABLE_ID,
             &key(1),
             row(1, "new"),

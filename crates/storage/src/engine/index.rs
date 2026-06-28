@@ -34,15 +34,29 @@ impl PageBackedStorageEngine {
         // latch (rule 1: never two structural latches at once). Contended under E2b's
         // concurrent writers: same-secondary writers serialize here.
         let latch = self.structural_latch(secondary_index_file_id(index.id));
-        let _index_guard = latch.lock();
-        if index.unique && !has_null {
-            match self.unique_conflict_kind(&secondary, entry_key, table_schema, &ctx.live_txns)? {
-                UniqueConflict::Violation => return Err(duplicate_unique_index(&index.name)),
-                UniqueConflict::WouldBlock(_) => return Err(unique_conflict_retry()),
-                UniqueConflict::None => {}
+        loop {
+            let guard = latch.lock();
+            if index.unique && !has_null {
+                match self.unique_conflict_kind(
+                    &secondary,
+                    entry_key,
+                    table_schema,
+                    &ctx.live_txns,
+                )? {
+                    UniqueConflict::Violation => return Err(duplicate_unique_index(&index.name)),
+                    // Drop the structural latch before blocking on the in-progress
+                    // holder (it may itself be waiting on this latch), then re-check.
+                    UniqueConflict::WouldBlock(blocker) => {
+                        drop(guard);
+                        self.wait_for_conflict(ctx, blocker)?;
+                        continue;
+                    }
+                    UniqueConflict::None => {}
+                }
             }
+            // Check (if any) and the insert run under the same latch hold.
+            return secondary.insert(ctx.txn_id, entry_key, location);
         }
-        secondary.insert(ctx.txn_id, entry_key, location)
     }
     /// Whether any existing version indexed under `key` in `index_btree` **conflicts**
     /// with a unique-constraint insert by `current_txns` — the shared,
@@ -88,7 +102,7 @@ impl PageBackedStorageEngine {
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         schema: &TableSchema,
-        current_txnss: &[u64],
+        current_txns: &[u64],
     ) -> Result<UniqueConflict> {
         let status = self.txn_status_view();
         let mut strongest = UniqueConflict::None;
@@ -110,7 +124,7 @@ impl PageBackedStorageEngine {
                     decoded.xmin,
                     decoded.xmax,
                     decoded.infomask,
-                    current_txnss,
+                    current_txns,
                     status,
                 ) {
                     // A committed-live duplicate is definitive; nothing outranks it.

@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, DataType, IndexSchema, Key, PageFlushInfo, Row, Snapshot, SqlState,
-    StatementContext, TableSchema, Value,
+    ColumnDef, DataType, IndexSchema, PageFlushInfo, Row, Snapshot, SqlState, StatementContext,
+    TableSchema, Value,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::PageBackedStorageEngine;
+use super::conflict_wait_test_support::committing_blocker;
 use crate::HeapPageStore;
 use crate::traits::{SchemaOperations, StorageEngine};
 
@@ -308,92 +309,14 @@ fn cross_table_writers_are_concurrent_and_correct() {
     assert_eq!(b, expected);
 }
 
-/// N writers each UPDATE the SAME committed key under their OWN in-flight txn.
-/// First-updater-wins: exactly one stamps `xmax` and succeeds; every other sees
-/// the winner's `xmax` (a committed-or-in-progress deleter) and aborts with
-/// `40001`. The surviving committed value is the winner's.
-#[test]
-fn concurrent_update_same_key_one_winner_others_40001() {
-    let shared = SharedEngine::new();
-    let setup = ctx(100, 101);
-    shared.engine.create_table(&setup, &users_schema()).unwrap();
-    shared.commit(100);
-    // The single committed row every updater targets.
-    shared
-        .engine
-        .insert(&ctx(10, 11), TABLE_ID, row(1, "original"))
-        .unwrap();
-    shared.commit(10);
-
-    const THREADS: usize = 5;
-    let key = Key(vec![Value::Integer(1)]);
-    let barrier = Arc::new(Barrier::new(THREADS));
-    let winners = Arc::new(AtomicUsize::new(0));
-    let conflicts = Arc::new(AtomicUsize::new(0));
-    let mut handles = Vec::new();
-    for t in 0..THREADS {
-        let engine = shared.engine.clone();
-        let barrier = barrier.clone();
-        let winners = winners.clone();
-        let conflicts = conflicts.clone();
-        let key = key.clone();
-        handles.push(thread::spawn(move || {
-            let txn_id = 5000 + t as u64;
-            // Each updater's snapshot sees the original committed row (txn 10) and
-            // excludes the other in-flight updaters (degenerate xip is fine: the
-            // conflict is decided by the physical `xmax`, not the snapshot).
-            let new_name = format!("by-{txn_id}");
-            barrier.wait();
-            match engine.update(&ctx(txn_id, 10_000), TABLE_ID, &key, row(1, &new_name)) {
-                Ok(true) => {
-                    winners.fetch_add(1, Ordering::AcqRel);
-                    txn_id // the winner's txn id (commit it below)
-                }
-                Ok(false) => panic!("update located no visible row"),
-                Err(err) => {
-                    assert_eq!(
-                        err.code,
-                        SqlState::SerializationFailure,
-                        "a losing concurrent updater must get 40001, got: {err:?}"
-                    );
-                    conflicts.fetch_add(1, Ordering::AcqRel);
-                    0
-                }
-            }
-        }));
-    }
-    let mut winner_txn = 0u64;
-    for handle in handles {
-        let result = handle.join().expect("updater thread finished");
-        if result != 0 {
-            winner_txn = result;
-        }
-    }
-    assert_eq!(
-        winners.load(Ordering::Acquire),
-        1,
-        "exactly one updater wins the first-updater-wins race"
-    );
-    assert_eq!(
-        conflicts.load(Ordering::Acquire),
-        THREADS - 1,
-        "every other updater aborts with 40001"
-    );
-
-    // Commit the winner; the surviving visible value is the winner's.
-    shared.commit(winner_txn);
-    let mut iter = shared.engine.scan(&ctx(0, 10_000), TABLE_ID).unwrap();
-    let mut names = Vec::new();
-    while let Some(stored) = iter.next().unwrap() {
-        names.push(stored.row.values[1].clone());
-    }
-    assert_eq!(names.len(), 1, "exactly one visible version of the row");
-    assert_eq!(
-        names[0],
-        Value::Text(format!("by-{winner_txn}")),
-        "the surviving value is the winning updater's"
-    );
-}
+// NOTE: the former `concurrent_update_same_key_one_winner_others_40001` test is
+// removed. Its fail-fast "exactly one winner" premise no longer holds: writers now
+// BLOCK on an in-progress holder (docs/specs/deadlock.md). Faithful concurrent
+// update-blocking — losers wait for the winner to commit at its own COMMIT, under
+// proper snapshots — requires the server's real LockManager and is covered by the
+// server-level integration tests (it cannot be modeled here with the degenerate
+// per-statement snapshots these storage unit tests use: an early commit-on-wait
+// lets a late updater see and chain-update the winner's committed version).
 
 /// N writers each INSERT the SAME primary key under their own in-flight txn.
 /// The per-index latch makes uniqueness-check-and-insert atomic: exactly one
@@ -414,13 +337,20 @@ fn concurrent_insert_same_key_one_winner_others_conflict() {
     let mut handles = Vec::new();
     for t in 0..THREADS {
         let engine = shared.engine.clone();
+        let wal = shared.wal.clone();
         let barrier = barrier.clone();
         let winners = winners.clone();
         let conflicts = conflicts.clone();
         handles.push(thread::spawn(move || {
             let txn_id = 6000 + t as u64;
             barrier.wait();
-            match engine.insert(&ctx(txn_id, 10_000), TABLE_ID, row(7, "dup")) {
+            // A loser blocks on the in-progress winner; the waiter commits it, so the
+            // retry sees a committed duplicate and the loser gets 23505 (or 40001).
+            match engine.insert(
+                &committing_blocker(ctx(txn_id, 10_000), wal.clone()),
+                TABLE_ID,
+                row(7, "dup"),
+            ) {
                 Ok(_) => {
                     winners.fetch_add(1, Ordering::AcqRel);
                     txn_id

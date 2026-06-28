@@ -53,7 +53,7 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
-        current_txnss: &[u64],
+        current_txns: &[u64],
     ) -> Result<Option<(RowLocation, u16)>> {
         let readable = self
             .buffer_pool
@@ -102,7 +102,7 @@ impl PageBackedStorageEngine {
                 decoded.xmax,
                 decoded.infomask,
                 snapshot,
-                current_txnss,
+                current_txns,
                 self.txn_status_view(),
             ) {
                 return Ok(Some((
@@ -265,10 +265,10 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
-        current_txnss: &[u64],
+        current_txns: &[u64],
     ) -> Result<Option<(RowLocation, Row)>> {
         let Some((resolved, _infomask)) =
-            self.resolve_visible_in_chain(schema, location, snapshot, current_txnss)?
+            self.resolve_visible_in_chain(schema, location, snapshot, current_txns)?
         else {
             return Ok(None);
         };
@@ -294,7 +294,7 @@ impl PageBackedStorageEngine {
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         snapshot: &Snapshot,
-        current_txnss: &[u64],
+        current_txns: &[u64],
     ) -> Result<Option<(RowLocation, u16)>> {
         for location in index_btree.scan_key(key)? {
             // Each index entry's TID is a (possibly HOT) root: resolve REDIRECT +
@@ -303,7 +303,7 @@ impl PageBackedStorageEngine {
             // stamp), not the index TID — so a HOT-updated row is stamped at the live
             // heap-only version, not its pruned root.
             if let Some(resolved) =
-                self.resolve_visible_in_chain(schema, location, snapshot, current_txnss)?
+                self.resolve_visible_in_chain(schema, location, snapshot, current_txns)?
             {
                 return Ok(Some(resolved));
             }

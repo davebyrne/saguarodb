@@ -1,5 +1,16 @@
 use super::*;
 
+/// The outcome of a [`PageBackedStorageEngine::stamp_xmax_logged`] attempt: the
+/// version was stamped, or its `xmax` row lock is held by an in-progress writer
+/// (`WouldBlock(holder)`) that the caller must block on before retrying the stamp
+/// (`docs/specs/deadlock.md`). A committed-superseded conflict is an `Err(40001)`
+/// instead, not a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StampOutcome {
+    Stamped,
+    WouldBlock(u64),
+}
+
 impl PageBackedStorageEngine {
     pub(super) fn write_new_row(
         &self,
@@ -220,7 +231,7 @@ impl PageBackedStorageEngine {
         infomask: u16,
         txn_id: u64,
         current_txns: &[u64],
-    ) -> Result<()> {
+    ) -> Result<StampOutcome> {
         let mut guard = self
             .buffer_pool
             .write_page(location.file_id, location.page_num, txn_id)?;
@@ -234,10 +245,6 @@ impl PageBackedStorageEngine {
             .ok_or_else(|| storage_internal("cannot stamp xmax on a non-live slot"))?;
         let (_xmin, current_xmax, _t_ctid, current_infomask) =
             crate::codec::decode_mvcc_header(&current)?;
-        // Staged: a `WouldBlock` (in-progress holder) is treated as a fail-fast
-        // `40001` here for now, preserving the prior behavior so the workspace
-        // builds. The wait-retry loop (block on the holder, re-check) lands once the
-        // server installs the real lock manager (`docs/specs/deadlock.md`).
         match write_conflict(
             current_xmax,
             current_infomask,
@@ -245,11 +252,18 @@ impl PageBackedStorageEngine {
             self.txn_status_view(),
         ) {
             WriteConflict::Proceed => {}
-            WriteConflict::Conflict | WriteConflict::WouldBlock(_) => {
+            // The deleter committed since my snapshot ⇒ the row changed under me.
+            WriteConflict::Conflict => {
                 return Err(DbError::execute(
                     SqlState::SerializationFailure,
                     "could not serialize access due to concurrent update",
                 ));
+            }
+            // An in-progress writer holds the lock: return WITHOUT stamping (the
+            // frame latch drops on return) so the caller blocks on that holder and
+            // re-attempts the stamp (`docs/specs/deadlock.md`).
+            WriteConflict::WouldBlock(holder) => {
+                return Ok(StampOutcome::WouldBlock(holder));
             }
         }
 
@@ -298,7 +312,17 @@ impl PageBackedStorageEngine {
                 lsn,
             )?;
         }
-        Ok(())
+        Ok(StampOutcome::Stamped)
+    }
+
+    /// Block until the in-progress `blocker` holding a row/key lock this statement
+    /// wants has finished, so the caller can re-attempt the conflict check
+    /// (`docs/specs/deadlock.md`). Delegates to the lock manager installed on the
+    /// statement context; returns `Err` on deadlock (`40P01`) or cancel (`57014`).
+    /// The waiter is the statement's writing xid (`ctx.txn_id`).
+    pub(super) fn wait_for_conflict(&self, ctx: &StatementContext, blocker: u64) -> Result<()> {
+        ctx.conflict_waiter
+            .wait_for(ctx.txn_id, blocker, ctx.cancel.as_ref())
     }
     /// Attempt the HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2) for
     /// an `UPDATE` whose visible predecessor is at `previous_location` (`infomask` its
@@ -388,13 +412,17 @@ impl PageBackedStorageEngine {
         // the predecessor by construction, so the H1 walk's same-page `HOT_UPDATED →
         // HEAP_ONLY` step reaches it.
         let new_tid = (new_location.page_num, new_location.slot_num);
-        self.stamp_xmax_logged(
+        while let StampOutcome::WouldBlock(blocker) = self.stamp_xmax_logged(
             previous_location,
             new_tid,
             infomask | crate::codec::HOT_UPDATED,
             ctx.txn_id,
             &ctx.live_txns,
-        )?;
+        )? {
+            // An in-progress writer holds the predecessor's lock: wait for it, then
+            // re-attempt the stamp (the heap-only successor is already written).
+            self.wait_for_conflict(ctx, blocker)?;
+        }
 
         // No index entries: the index keeps pointing at the chain root; the new
         // heap-only version is reached only by the bounded `t_ctid` walk from it. This
