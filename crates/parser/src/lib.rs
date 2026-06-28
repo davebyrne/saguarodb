@@ -151,6 +151,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_derived_table_with_column_aliases() {
+        let stmt = parse("select d.x from (select id from users) as d(x)").unwrap();
+        let Statement::Select(select) = stmt else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.from.as_slice(),
+            [FromItem::Derived { alias, column_aliases, .. }]
+                if alias == "d" && column_aliases.as_slice() == ["x".to_string()]
+        ));
+    }
+
+    #[test]
+    fn rejects_derived_table_without_alias() {
+        let err = parse("select * from (select id from users)").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn parses_count_star_and_aggregate_distinct_shape() {
         let stmt = parse("select count(*), count(distinct id) from users").unwrap();
 

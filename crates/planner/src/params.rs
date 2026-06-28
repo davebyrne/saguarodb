@@ -103,6 +103,7 @@ fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Res
 fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()> {
     match from {
         BoundFrom::Table { .. } => Ok(()),
+        BoundFrom::Derived { select, .. } => collect_select(select, used),
         BoundFrom::Join {
             left,
             right,
@@ -232,6 +233,7 @@ fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {
 fn substitute_from(from: &mut BoundFrom, params: &[Value]) -> Result<()> {
     match from {
         BoundFrom::Table { .. } => Ok(()),
+        BoundFrom::Derived { select, .. } => substitute_select(select, params),
         BoundFrom::Join {
             left,
             right,

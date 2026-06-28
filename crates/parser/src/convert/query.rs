@@ -210,8 +210,39 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 alias,
             })
         }
+        sql::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+        } => {
+            if *lateral {
+                return unsupported("LATERAL derived tables are not supported");
+            }
+            let Some(alias) = alias else {
+                return unsupported("a subquery in FROM must have an alias");
+            };
+            let column_aliases = alias
+                .columns
+                .iter()
+                .map(table_alias_column_name)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FromItem::Derived {
+                subquery: Box::new(convert_query_to_select((**subquery).clone())?),
+                alias: ident_name(&alias.name)?,
+                column_aliases,
+            })
+        }
         _ => unsupported("unsupported table factor"),
     }
+}
+
+/// A column alias in `AS alias(col, ...)`. Type-annotated aliases (used by some
+/// table-valued functions) are rejected.
+fn table_alias_column_name(column: &sql::TableAliasColumnDef) -> Result<String> {
+    if column.data_type.is_some() {
+        return unsupported("typed column aliases are not supported");
+    }
+    ident_name(&column.name)
 }
 
 pub(super) fn table_name_from_table_with_joins(table: &sql::TableWithJoins) -> Result<String> {

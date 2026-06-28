@@ -121,6 +121,12 @@ pub enum BoundFrom {
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
+    Derived {                     // (SELECT ...) AS alias [(cols)]
+        select: Box<BoundSelect>,
+        binding: BindingId,
+        alias: String,
+        schema: Vec<ColumnDef>,   // derived columns projected into the outer scope
+    },
     Join {
         left: Box<BoundFrom>,
         right: Box<BoundFrom>,
@@ -129,6 +135,8 @@ pub enum BoundFrom {
     },
 }
 ```
+
+A `BoundFrom::Derived` binds its inner `SELECT` in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner SELECT's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
 `BoundSelect` is also used as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
 

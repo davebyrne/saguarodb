@@ -878,6 +878,93 @@ mod tests {
     }
 
     #[test]
+    fn derived_table_projects_columns() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select x from (select id as x from users) d order by x")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1)]
+                },
+                Row {
+                    values: vec![Value::Integer(2)]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_table_column_aliases_rename_output() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select y from (select id from users) d(y)")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1)]
+            }]
+        );
+    }
+
+    #[test]
+    fn derived_table_with_outer_filter() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+
+        // The outer WHERE references the derived column and is applied above the
+        // derived sub-plan.
+        let rows = harness
+            .select_rows("select x from (select id as x from users) d where x > 1 order by x")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(2)]
+                },
+                Row {
+                    values: vec![Value::Integer(3)]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_table_joined_with_base_table() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select users.name, d.x from users \
+                 join (select id as x from users where id = 2) d on users.id = d.x",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("b".to_string()), Value::Integer(2)]
+            }]
+        );
+    }
+
+    #[test]
     fn insert_select_copies_rows_from_another_table() {
         let harness = ExecutorHarness::with_users();
         harness

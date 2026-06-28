@@ -393,6 +393,39 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_derived_table_columns() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select d.x from (select id as x from users) as d").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].name, "x");
+        assert_eq!(select.output_schema[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn binder_applies_derived_column_aliases() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select d.y from (select id from users) as d(y)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].name, "y");
+    }
+
+    #[test]
+    fn binder_rejects_too_many_derived_column_aliases() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select d.a from (select id from users) as d(a, b)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_rejects_composite_primary_key_for_v1() {
         let catalog = catalog_with_users();
         let stmt =

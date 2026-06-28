@@ -2210,6 +2210,54 @@ async fn e2e_exists_and_not_exists_subquery() {
 }
 
 #[tokio::test]
+async fn e2e_derived_table_in_from() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    // Column aliasing and an outer filter over a derived table.
+    let rows = server
+        .simple_query(
+            "select d.n from (select id, name from users) as d(i, n) where i > 1 order by i",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("b".to_string())], vec![Some("c".to_string())]]
+    );
+
+    // Aggregate over a derived table that pre-filters its rows.
+    let rows = server
+        .simple_query("select count(*), max(x) from (select id as x from users where id >= 2) d")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string()), Some("3".to_string())]]
+    );
+
+    // Join a base table with a derived table.
+    let rows = server
+        .simple_query(
+            "select users.name from users \
+             join (select id as x from users where id = 3) d on users.id = d.x",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("c".to_string())]]);
+}
+
+#[tokio::test]
 async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
     let server = TestServer::start().await.unwrap();
     server

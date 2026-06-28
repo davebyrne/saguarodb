@@ -65,7 +65,8 @@ precedence.
   `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
   `INSERT ... VALUES`, `SELECT` with the supported clauses and joins (including
   uncorrelated subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and
-  `[NOT] EXISTS (SELECT ...)` — in expressions), `UPDATE`, `DELETE`,
+  `[NOT] EXISTS (SELECT ...)` — in expressions, and derived tables
+  `FROM (SELECT ...) AS alias [(cols)]`), `UPDATE`, `DELETE`,
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped

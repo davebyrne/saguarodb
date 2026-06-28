@@ -314,6 +314,20 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
             table: *table,
             filter,
         }),
+        // A derived table lowers to its inner SELECT's plan. Its columns already
+        // sit at the derived binding's slots, so an outer WHERE (the standalone
+        // case) is applied as a Filter above it — it cannot be pushed into the
+        // inner scan.
+        BoundFrom::Derived { select, .. } => {
+            let plan = plan_select(select)?;
+            Ok(match filter {
+                Some(predicate) => LogicalPlan::Filter {
+                    source: Box::new(plan),
+                    predicate,
+                },
+                None => plan,
+            })
+        }
         BoundFrom::Join {
             left,
             right,

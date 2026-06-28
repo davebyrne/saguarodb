@@ -16,7 +16,9 @@ use query::bind_select;
 #[derive(Clone, Debug)]
 struct Binding {
     id: BindingId,
-    table_id: TableId,
+    /// The catalog table id, or `None` for a derived table (a subquery in FROM),
+    /// which has no underlying table.
+    table_id: Option<TableId>,
     table_name: String,
     visible_name: String,
     columns: Vec<ColumnDef>,

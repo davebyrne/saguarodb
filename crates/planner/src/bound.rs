@@ -98,6 +98,15 @@ pub enum BoundFrom {
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
+    /// A derived table `(SELECT ...) AS alias [(cols)]`. The inner SELECT is bound
+    /// in its own scope; `schema` is the derived columns (renamed by the optional
+    /// column-alias list) projected into the outer scope at `binding`'s slots.
+    Derived {
+        select: Box<BoundSelect>,
+        binding: common::BindingId,
+        alias: String,
+        schema: Vec<ColumnDef>,
+    },
     Join {
         left: Box<BoundFrom>,
         right: Box<BoundFrom>,

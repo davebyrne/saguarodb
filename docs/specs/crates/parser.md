@@ -105,6 +105,8 @@ pub enum SelectItem {
 
 pub enum FromItem {
     Table { name: String, alias: Option<String> },
+    // Derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required.
+    Derived { subquery: Box<SelectStatement>, alias: String, column_aliases: Vec<String> },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -199,6 +201,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. The inner `SELECT` is converted with the same query rules; cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
+- Derived tables: `(SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived`. The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases and `LATERAL` are rejected).
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but only a `SELECT` inner statement is accepted; any other inner statement is rejected as unsupported.

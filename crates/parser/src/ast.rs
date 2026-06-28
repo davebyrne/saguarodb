@@ -149,6 +149,14 @@ pub enum FromItem {
         name: String,
         alias: Option<String>,
     },
+    /// A derived table: `(SELECT ...) AS alias [(col, ...)]`. A subquery in the
+    /// FROM clause. The alias is required; `column_aliases` optionally renames the
+    /// subquery's output columns left to right.
+    Derived {
+        subquery: Box<SelectStatement>,
+        alias: String,
+        column_aliases: Vec<String>,
+    },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,

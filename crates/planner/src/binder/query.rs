@@ -1,5 +1,7 @@
 use catalog::CatalogManager;
-use common::{ColumnId, ColumnInfo, DataType, Result, SqlState, TableId, TableSchema, Value};
+use common::{
+    ColumnDef, ColumnId, ColumnInfo, DataType, Result, SqlState, TableId, TableSchema, Value,
+};
 use parser::{Distinct, Expr, FromItem, OrderByItem, SelectItem, SelectStatement};
 
 use crate::{
@@ -122,6 +124,11 @@ fn bind_from_item(
             let table = require_table(catalog, name)?;
             Ok(bind_table_from_schema(ctx, table, alias.clone()))
         }
+        FromItem::Derived {
+            subquery,
+            alias,
+            column_aliases,
+        } => bind_derived_table(catalog, ctx, subquery, alias, column_aliases),
         FromItem::Join {
             left,
             right,
@@ -171,7 +178,7 @@ pub(super) fn bind_table_from_schema(
     ctx.next_slot += table.columns.len();
     ctx.bindings.push(Binding {
         id: binding,
-        table_id: table.id,
+        table_id: Some(table.id),
         table_name: table.name.clone(),
         visible_name: alias.clone().unwrap_or_else(|| table.name.clone()),
         columns: table.columns.clone(),
@@ -183,6 +190,65 @@ pub(super) fn bind_table_from_schema(
         alias,
         schema: table.columns,
     }
+}
+
+/// Bind a derived table `(SELECT ...) AS alias [(cols)]`: bind the inner SELECT in
+/// its own scope, derive the visible columns (optionally renamed by the column
+/// alias list), and register a binding that projects them into the outer scope.
+fn bind_derived_table(
+    catalog: &dyn CatalogManager,
+    ctx: &mut BindContext,
+    subquery: &SelectStatement,
+    alias: &str,
+    column_aliases: &[String],
+) -> Result<BoundFrom> {
+    let select = bind_select(catalog, subquery, &ctx.declared_params)?;
+    if column_aliases.len() > select.columns.len() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!(
+                "table \"{alias}\" has {} columns available but {} column aliases specified",
+                select.columns.len(),
+                column_aliases.len()
+            ),
+        ));
+    }
+
+    let columns: Vec<ColumnDef> = select
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, item)| ColumnDef {
+            id: index as ColumnId,
+            name: column_aliases
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| item.alias.clone()),
+            data_type: item.expr.data_type(),
+            nullable: item.expr.nullable(),
+            max_length: None,
+        })
+        .collect();
+
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += columns.len();
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: None,
+        table_name: alias.to_string(),
+        visible_name: alias.to_string(),
+        columns: columns.clone(),
+        slot_start,
+    });
+
+    Ok(BoundFrom::Derived {
+        select: Box::new(select),
+        binding,
+        alias: alias.to_string(),
+        schema: columns,
+    })
 }
 
 fn bind_select_item(
@@ -526,7 +592,7 @@ fn output_table_id(ctx: &BindContext, expr: &BoundExpr) -> Option<TableId> {
             .bindings
             .iter()
             .find(|binding| binding.id == *input)
-            .map(|binding| binding.table_id),
+            .and_then(|binding| binding.table_id),
         _ => None,
     }
 }
