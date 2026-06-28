@@ -250,9 +250,12 @@ fn apply_redo(
             storage::apply_physical_redo(guard.data_mut(), lsn, &kind)?;
             Ok(())
         }
-        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. } => Err(
-            DbError::internal("recovery replay received an unexpected WAL record"),
-        ),
+        WalRecordKind::Commit
+        | WalRecordKind::CommitWithSubxids { .. }
+        | WalRecordKind::Abort
+        | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
+            "recovery replay received an unexpected WAL record",
+        )),
     }
 }
 
@@ -263,9 +266,20 @@ fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
     // mark — recovering the allocator boundary even when every data record below
     // the checkpoint was truncated.
     for record in wal.replay_from(checkpoint_lsn)? {
-        let txn_id = record?.txn_id;
-        if txn_id != 0 {
-            max_txn_id = max_txn_id.max(txn_id);
+        let record = record?;
+        if record.txn_id != 0 {
+            max_txn_id = max_txn_id.max(record.txn_id);
+        }
+        // A committed savepoint subxid lives only in the `CommitWithSubxids`
+        // payload, not a record header (e.g. a released read-only savepoint).
+        // Fold it in so the allocator never reissues a committed subxid. (Records
+        // truncated below the checkpoint are covered by the retained `Checkpoint`
+        // marker's high-water mark, which already includes subxids — they are
+        // allocated from the same counter.)
+        if let WalRecordKind::CommitWithSubxids { subxids } = &record.kind
+            && let Some(max_sub) = subxids.iter().copied().max()
+        {
+            max_txn_id = max_txn_id.max(max_sub);
         }
     }
     let next = max_txn_id
@@ -385,5 +399,23 @@ mod tests {
 
         let err = super::next_txn_id(&wal, 0).unwrap_err();
         assert!(err.message.contains("transaction id overflow"));
+    }
+
+    #[test]
+    fn next_txn_id_accounts_for_committed_subxids_in_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+        // Top txn 5 commits with a released subxid 9 that did no writes, so 9
+        // appears only in the commit payload, not a record header. The allocator
+        // must resume at 10 (above 9), or it would reissue the committed subxid.
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 5,
+            kind: WalRecordKind::CommitWithSubxids { subxids: vec![9] },
+        })
+        .unwrap();
+        wal.flush().unwrap();
+
+        assert_eq!(super::next_txn_id(&wal, 0).unwrap(), 10);
     }
 }

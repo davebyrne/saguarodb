@@ -222,14 +222,23 @@ impl WalManager for FileWalManager {
             return Err(err);
         }
 
-        match record.kind {
+        match &record.kind {
             // A commit only becomes visible in the CLOG once it is durable, so it
             // is staged as pending until `flush` fsyncs it.
             WalRecordKind::Commit => {
                 state.pending_commits.insert(record.txn_id);
             }
+            // A commit with subtransactions stages the top txn AND every committed
+            // subxid pending; the single flush makes them durable atomically.
+            WalRecordKind::CommitWithSubxids { subxids } => {
+                state.pending_commits.insert(record.txn_id);
+                for sub in subxids {
+                    state.pending_commits.insert(*sub);
+                }
+            }
             // Abort is not fsync-gated: recording it eagerly is safe because a
             // transaction with no durable commit is recovered as aborted anyway.
+            // (`ROLLBACK TO` appends one Abort per rolled-back subxid this way.)
             WalRecordKind::Abort => {
                 state.clog.set_aborted(record.txn_id);
             }
@@ -578,8 +587,14 @@ fn rebuild_clog(records: &[StoredRecord], flushed_lsn: Lsn) -> Clog {
         .iter()
         .filter(|stored| stored.record.lsn <= flushed_lsn)
     {
-        match stored.record.kind {
+        match &stored.record.kind {
             WalRecordKind::Commit => clog.set_committed(stored.record.txn_id),
+            WalRecordKind::CommitWithSubxids { subxids } => {
+                clog.set_committed(stored.record.txn_id);
+                for sub in subxids {
+                    clog.set_committed(*sub);
+                }
+            }
             WalRecordKind::Abort => clog.set_aborted(stored.record.txn_id),
             _ => {}
         }
@@ -620,8 +635,14 @@ fn fold_commit_abort_after(
         .iter()
         .filter(|stored| stored.record.lsn > clog_lsn && stored.record.lsn <= flushed_lsn)
     {
-        match stored.record.kind {
+        match &stored.record.kind {
             WalRecordKind::Commit => clog.set_committed(stored.record.txn_id),
+            WalRecordKind::CommitWithSubxids { subxids } => {
+                clog.set_committed(stored.record.txn_id);
+                for sub in subxids {
+                    clog.set_committed(*sub);
+                }
+            }
             WalRecordKind::Abort => clog.set_aborted(stored.record.txn_id),
             _ => {}
         }
@@ -669,12 +690,23 @@ fn write_clog_file(path: &Path, snapshot: &ClogSnapshot) -> Result<()> {
 }
 
 fn pending_commits(records: &[StoredRecord], flushed_lsn: Lsn) -> HashSet<u64> {
-    records
+    let mut pending = HashSet::new();
+    for stored in records
         .iter()
         .filter(|stored| stored.record.lsn > flushed_lsn)
-        .filter(|stored| matches!(stored.record.kind, WalRecordKind::Commit))
-        .map(|stored| stored.record.txn_id)
-        .collect()
+    {
+        match &stored.record.kind {
+            WalRecordKind::Commit => {
+                pending.insert(stored.record.txn_id);
+            }
+            WalRecordKind::CommitWithSubxids { subxids } => {
+                pending.insert(stored.record.txn_id);
+                pending.extend(subxids.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    pending
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {

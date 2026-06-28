@@ -225,6 +225,59 @@ mod tests {
     }
 
     #[test]
+    fn recovery_marks_committed_subxids_and_keeps_rolled_back_ones_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+
+        // Top txn 100 with savepoint subxids: 101 rolled back (its own Abort
+        // record, header txn_id = the subxid), 102 released (carried in the top
+        // commit's subxid list). The single CommitWithSubxids commits 100 + 102.
+        wal.append(WalRecord::insert_for_test(101, 1)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 101,
+            kind: WalRecordKind::Abort,
+        })
+        .unwrap();
+        wal.append(WalRecord::insert_for_test(102, 2)).unwrap();
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 100,
+            kind: WalRecordKind::CommitWithSubxids { subxids: vec![102] },
+        })
+        .unwrap();
+        wal.flush().unwrap();
+
+        drop(wal);
+        let recovered = FileWalManager::open(&path).unwrap();
+        assert!(recovered.is_committed(100), "top-level txn committed");
+        assert!(recovered.is_committed(102), "released subxid committed");
+        assert!(recovered.is_aborted(101), "rolled-back subxid aborted");
+        assert!(!recovered.is_committed(101));
+    }
+
+    #[test]
+    fn commit_with_subxids_is_pending_until_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.dat");
+        let wal = FileWalManager::open(&path).unwrap();
+
+        wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 100,
+            kind: WalRecordKind::CommitWithSubxids { subxids: vec![101] },
+        })
+        .unwrap();
+        // Before flush the commit (and its subxids) are not durable ⇒ not committed.
+        assert!(!wal.is_committed(100));
+        assert!(!wal.is_committed(101));
+        wal.flush().unwrap();
+        assert!(wal.is_committed(100));
+        assert!(wal.is_committed(101));
+    }
+
+    #[test]
     fn aborted_txn_is_recorded_before_flush() {
         let dir = tempfile::tempdir().unwrap();
         let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();

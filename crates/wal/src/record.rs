@@ -24,9 +24,21 @@ pub enum WalRecordKind {
         index: IndexId,
     },
     Commit,
+    /// Commit of a transaction that had savepoint subtransactions: marks the
+    /// top-level transaction (`txn_id` in the header) AND every committed (live or
+    /// released, i.e. not-rolled-back) subxid committed, atomically in one durable
+    /// record. Recovery marks `txn_id` and each `subxids` entry `Committed`. A
+    /// rolled-back subxid is instead recorded by its own `Abort` record (header
+    /// `txn_id` = the subxid) and is NOT in `subxids`. See `docs/specs/savepoints.md`
+    /// §5; a no-savepoint commit uses the plain `Commit` record (unchanged format).
+    CommitWithSubxids {
+        subxids: Vec<u64>,
+    },
     /// Marks a transaction aborted. Payload is empty; the `txn_id` is in the
     /// `WalRecord` header, mirroring `Commit`. Recovery rebuilds the CLOG from
     /// `Commit`/`Abort` records and never redoes an aborted transaction's data.
+    /// `ROLLBACK TO SAVEPOINT` appends one of these per rolled-back subxid (header
+    /// `txn_id` = the subxid), reusing this record.
     Abort,
     Checkpoint {
         redo_lsn: Lsn,
@@ -73,13 +85,16 @@ pub enum WalRecordKind {
 }
 
 /// Whether `kind` is a replayable page-mutation record (anything recovery
-/// applies), i.e. every record except the `Commit` / `Abort` / `Checkpoint`
-/// metadata markers. Redo-all recovery (`docs/specs/mvcc.md` §8) replays these and
-/// skips the markers (the markers feed the CLOG, not the heap).
+/// applies), i.e. every record except the `Commit` / `CommitWithSubxids` / `Abort`
+/// / `Checkpoint` metadata markers. Redo-all recovery (`docs/specs/mvcc.md` §8)
+/// replays these and skips the markers (the markers feed the CLOG, not the heap).
 pub fn is_redo_operation(kind: &WalRecordKind) -> bool {
     !matches!(
         kind,
-        WalRecordKind::Commit | WalRecordKind::Abort | WalRecordKind::Checkpoint { .. }
+        WalRecordKind::Commit
+            | WalRecordKind::CommitWithSubxids { .. }
+            | WalRecordKind::Abort
+            | WalRecordKind::Checkpoint { .. }
     )
 }
 
