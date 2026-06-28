@@ -208,6 +208,8 @@ Checkpoint may run after successful writes according to configured thresholds. I
 
 The server materializes SELECT rows in `spawn_blocking` as `ExecutionResult::Query` and then writes them to the socket from the async connection task. A future streaming bridge may use a bounded channel with capacity 64, where the blocking producer owns `PlanExecutor` and the async task owns socket writes. That future change must not alter protocol message encoding or physical operator semantics.
 
+A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the auto-prune dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
+
 ## Checkpoint Orchestration
 
 `ServerComponents` is the server-owned component bundle that exists before `QueryService` is constructed:

@@ -72,15 +72,7 @@ pub(super) fn bind_select(
         distinct_on_keys,
     )?;
 
-    let output_schema = columns
-        .iter()
-        .map(|item| ColumnInfo {
-            name: item.alias.clone(),
-            data_type: item.expr.data_type(),
-            table_id: output_table_id(&ctx, &item.expr),
-            column_id: output_column_id(&item.expr),
-        })
-        .collect();
+    let output_schema = select_output_schema(&ctx, &columns);
 
     Ok(BoundSelect {
         distinct,
@@ -251,7 +243,26 @@ fn bind_derived_table(
     })
 }
 
-fn bind_select_item(
+/// Build the result-set column metadata for a bound projection list, deriving
+/// each column's name from its alias and its table/column ids from an underlying
+/// `InputRef` (so the wire `RowDescription` can carry them). Shared by `SELECT`
+/// and `RETURNING`.
+pub(super) fn select_output_schema(
+    ctx: &BindContext,
+    columns: &[BoundSelectItem],
+) -> Vec<ColumnInfo> {
+    columns
+        .iter()
+        .map(|item| ColumnInfo {
+            name: item.alias.clone(),
+            data_type: item.expr.data_type(),
+            table_id: output_table_id(ctx, &item.expr),
+            column_id: output_column_id(&item.expr),
+        })
+        .collect()
+}
+
+pub(super) fn bind_select_item(
     ctx: &mut BindContext,
     item: &SelectItem,
     output: &mut Vec<BoundSelectItem>,

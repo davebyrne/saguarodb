@@ -317,6 +317,24 @@ where
             )
             .await
         }
+        // A DML statement with RETURNING streams its DataRows (the RowDescription
+        // came from Describe) then the DML command tag, like the simple path but
+        // without RowDescription/ReadyForQuery.
+        ExecutionResult::ModifiedReturning {
+            command,
+            count,
+            rows,
+            ..
+        } => {
+            let mut messages = Vec::with_capacity(rows.len() + 1);
+            for row in &rows {
+                messages.push(ServerMessage::DataRow(encode_row(row, result_formats)?));
+            }
+            messages.push(ServerMessage::CommandComplete(command_complete_tag(
+                &command, count,
+            )));
+            write_messages(socket, codec, &messages).await
+        }
         ExecutionResult::Explanation { text } => {
             write_messages(
                 socket,

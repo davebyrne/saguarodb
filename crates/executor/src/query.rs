@@ -5,7 +5,7 @@ use common::{
     ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, ParsedColumnDef,
     Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
 };
-use planner::PhysicalPlan;
+use planner::{BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -91,13 +91,19 @@ impl QueryEngine {
                 table,
                 columns,
                 source,
-            } => execute_insert(ctx, *table, columns, source),
+                returning,
+            } => execute_insert(ctx, *table, columns, source, returning.as_ref()),
             PhysicalPlan::Update {
                 table,
                 assignments,
                 source,
-            } => execute_update(ctx, *table, assignments, source),
-            PhysicalPlan::Delete { table, source } => execute_delete(ctx, *table, source),
+                returning,
+            } => execute_update(ctx, *table, assignments, source, returning.as_ref()),
+            PhysicalPlan::Delete {
+                table,
+                source,
+                returning,
+            } => execute_delete(ctx, *table, source, returning.as_ref()),
             _ => execute_query(ctx, plan),
         }
     }
@@ -237,6 +243,7 @@ fn execute_insert(
     table: TableId,
     columns: &[ColumnId],
     source: &PhysicalPlan,
+    returning: Option<&BoundReturning>,
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
@@ -247,6 +254,7 @@ fn execute_insert(
     let source_rows = collect_all(executor.as_mut())?;
 
     let mut count = 0;
+    let mut returned = Vec::new();
     for source_row in source_rows {
         check_canceled(ctx)?;
         if source_row.row.values.len() != columns.len() {
@@ -255,26 +263,26 @@ fn execute_insert(
                 "INSERT source produced the wrong number of values",
             ));
         }
-        map_and_insert_row(ctx, table, &schema, columns, source_row.row.values)?;
+        let row = build_insert_row(&schema, columns, source_row.row.values)?;
+        if let Some(returning) = returning {
+            returned.push(eval_returning(returning, &row.values)?);
+        }
+        ctx.storage.insert(&ctx.statement, table, row)?;
         count += 1;
     }
 
-    Ok(ExecutionResult::Modified {
-        command: "INSERT".to_string(),
-        count,
-    })
+    Ok(modified_result("INSERT", count, returning, returned))
 }
 
 /// Map a row's `columns`-ordered values onto a full table row (NULL for omitted
-/// columns), validate types and NOT NULL, and insert. Shared by INSERT and the
-/// COPY FROM path. Callers guarantee `values.len() == columns.len()`.
-pub(crate) fn map_and_insert_row(
-    ctx: &ExecutionContext<'_>,
-    table: TableId,
+/// columns), validate types and NOT NULL, and round/validate NUMERIC columns.
+/// Shared by INSERT, INSERT ... ON CONFLICT, and COPY FROM. Callers guarantee
+/// `values.len() == columns.len()`.
+pub(crate) fn build_insert_row(
     schema: &TableSchema,
     columns: &[ColumnId],
     values: Vec<Value>,
-) -> Result<()> {
+) -> Result<Row> {
     debug_assert_eq!(values.len(), columns.len());
     let mut full = vec![Value::Null; schema.columns.len()];
     for (column, value) in columns.iter().zip(values) {
@@ -284,9 +292,62 @@ pub(crate) fn map_and_insert_row(
     }
     coerce_numeric_columns(schema, &mut full)?;
     validate_row_constraints(schema, &full)?;
-    ctx.storage
-        .insert(&ctx.statement, table, Row { values: full })?;
+    Ok(Row { values: full })
+}
+
+/// Map a row's `columns`-ordered values onto a full table row and insert it.
+/// Shared by INSERT and the COPY FROM path.
+pub(crate) fn map_and_insert_row(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    schema: &TableSchema,
+    columns: &[ColumnId],
+    values: Vec<Value>,
+) -> Result<()> {
+    let row = build_insert_row(schema, columns, values)?;
+    ctx.storage.insert(&ctx.statement, table, row)?;
     Ok(())
+}
+
+/// Evaluate a `RETURNING` projection over an affected full table row (in catalog
+/// slot order). The expressions reference table columns by slot, so the
+/// constructed `ExecRow` carries the row's values with no storage identity.
+fn eval_returning(returning: &BoundReturning, full_row: &[Value]) -> Result<Row> {
+    let exec_row = ExecRow {
+        row: Row {
+            values: full_row.to_vec(),
+        },
+        identity: None,
+    };
+    let values = returning
+        .exprs
+        .iter()
+        .map(|expr| eval_expr(expr, &exec_row))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Row { values })
+}
+
+/// Wrap a DML statement's affected-row `count` (and any collected `RETURNING`
+/// rows) into the right `ExecutionResult`: `ModifiedReturning` when the statement
+/// has a `RETURNING` clause, otherwise a plain `Modified` count.
+fn modified_result(
+    command: &str,
+    count: u64,
+    returning: Option<&BoundReturning>,
+    rows: Vec<Row>,
+) -> ExecutionResult {
+    match returning {
+        Some(returning) => ExecutionResult::ModifiedReturning {
+            command: command.to_string(),
+            count,
+            columns: returning.output_schema.clone(),
+            rows,
+        },
+        None => ExecutionResult::Modified {
+            command: command.to_string(),
+            count,
+        },
+    }
 }
 
 /// Drives `COPY <table> [(cols)] FROM STDIN`: parses streamed bytes into rows and
@@ -413,12 +474,14 @@ fn execute_update(
     table: TableId,
     assignments: &[(ColumnId, planner::BoundExpr)],
     source: &PhysicalPlan,
+    returning: Option<&BoundReturning>,
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
         let mut count = 0;
+        let mut returned = Vec::new();
         while let Some(source_row) = executor.next()? {
             check_canceled(ctx)?;
             let identity = source_row.identity.clone().ok_or_else(|| {
@@ -436,18 +499,23 @@ fn execute_update(
             }
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
+            // Evaluate RETURNING over the NEW row before it is moved into storage;
+            // only keep it if the update actually affected a row.
+            let returned_row = returning
+                .map(|returning| eval_returning(returning, &values))
+                .transpose()?;
             if ctx
                 .storage
                 .update(&ctx.statement, table, &identity.key, Row { values })?
             {
                 count += 1;
+                if let Some(row) = returned_row {
+                    returned.push(row);
+                }
             }
         }
 
-        Ok(ExecutionResult::Modified {
-            command: "UPDATE".to_string(),
-            count,
-        })
+        Ok(modified_result("UPDATE", count, returning, returned))
     })();
     close_after(executor.as_mut(), result)
 }
@@ -456,25 +524,32 @@ fn execute_delete(
     ctx: &ExecutionContext<'_>,
     table: TableId,
     source: &PhysicalPlan,
+    returning: Option<&BoundReturning>,
 ) -> Result<ExecutionResult> {
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
         let mut count = 0;
+        let mut returned = Vec::new();
         while let Some(source_row) = executor.next()? {
             check_canceled(ctx)?;
+            // RETURNING on DELETE projects the OLD (deleted) row; evaluate it
+            // before consuming the row's identity for the delete.
+            let returned_row = returning
+                .map(|returning| eval_returning(returning, &source_row.row.values))
+                .transpose()?;
             let identity = source_row.identity.ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
             })?;
             if ctx.storage.delete(&ctx.statement, table, &identity.key)? {
                 count += 1;
+                if let Some(row) = returned_row {
+                    returned.push(row);
+                }
             }
         }
 
-        Ok(ExecutionResult::Modified {
-            command: "DELETE".to_string(),
-            count,
-        })
+        Ok(modified_result("DELETE", count, returning, returned))
     })();
     close_after(executor.as_mut(), result)
 }

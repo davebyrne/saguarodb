@@ -27,16 +27,19 @@ pub enum BoundStatement {
         table: TableId,
         columns: Vec<ColumnId>,
         source: BoundInsertSource,
+        returning: Option<BoundReturning>,
     },
     Select(BoundSelect),
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: BoundSelect,
+        returning: Option<BoundReturning>,
     },
     Delete {
         table: TableId,
         source: BoundSelect,
+        returning: Option<BoundReturning>,
     },
     Explain(Box<BoundStatement>),
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. Resolved table
@@ -50,6 +53,17 @@ pub enum BoundStatement {
         direction: CopyDirection,
         options: CopyOptions,
     },
+}
+
+/// A bound `RETURNING` clause: the projection expressions evaluated over each
+/// affected row (the inserted/updated NEW row, or the deleted OLD row), and the
+/// result-set column metadata that becomes the statement's `RowDescription`. The
+/// expressions reference the target table's columns as a single binding in
+/// catalog (slot) order, so the executor evaluates them over the full row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundReturning {
+    pub exprs: Vec<BoundExpr>,
+    pub output_schema: Vec<ColumnInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

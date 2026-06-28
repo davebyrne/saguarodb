@@ -293,6 +293,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_returning_clause_for_dml() {
+        // INSERT ... RETURNING <items>: the projection list is carried on the AST.
+        let Statement::Insert { returning, .. } =
+            parse("insert into users (id, name) values (1, 'ann') returning id, name").unwrap()
+        else {
+            panic!("expected insert");
+        };
+        let returning = returning.expect("returning present");
+        assert_eq!(returning.len(), 2);
+        assert!(matches!(
+            returning[0],
+            SelectItem::Expression {
+                expr: Expr::ColumnRef { column: ref c, .. },
+                ..
+            } if c == "id"
+        ));
+
+        // UPDATE ... RETURNING * carries a wildcard item.
+        let Statement::Update { returning, .. } =
+            parse("update users set name = 'bob' where id = 1 returning *").unwrap()
+        else {
+            panic!("expected update");
+        };
+        assert!(matches!(returning.as_deref(), Some([SelectItem::Wildcard])));
+
+        // DELETE ... RETURNING <expr AS alias> carries an aliased expression.
+        let Statement::Delete { returning, .. } =
+            parse("delete from users where id = 1 returning id + 1 as next_id").unwrap()
+        else {
+            panic!("expected delete");
+        };
+        assert!(matches!(
+            returning.as_deref(),
+            Some([SelectItem::Expression { alias: Some(a), .. }]) if a == "next_id"
+        ));
+
+        // No RETURNING clause leaves the field None.
+        let Statement::Insert { returning, .. } =
+            parse("insert into users (id) values (1)").unwrap()
+        else {
+            panic!("expected insert");
+        };
+        assert!(returning.is_none());
+    }
+
+    #[test]
     fn parses_transaction_control_statements() {
         // BEGIN and its synonyms parse to a `Begin` with no explicit isolation.
         for sql in ["begin", "begin transaction", "start transaction"] {

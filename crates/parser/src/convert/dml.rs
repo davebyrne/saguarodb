@@ -5,7 +5,8 @@ use crate::{InsertSource, Statement};
 
 use super::expr::convert_expr;
 use super::query::{
-    convert_query_to_select, query_has_modifiers, table_name_from_table_with_joins,
+    convert_query_to_select, convert_returning, query_has_modifiers,
+    table_name_from_table_with_joins,
 };
 use super::{feature_not_supported, ident_name, object_name, parse_error, unsupported};
 
@@ -41,7 +42,6 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
         || !after_columns.is_empty()
         || has_table_keyword
         || on.is_some()
-        || returning.is_some()
         || replace_into
         || priority.is_some()
         || insert_alias.is_some()
@@ -76,6 +76,7 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
         table: object_name(&table)?,
         columns: columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
         source,
+        returning: convert_returning(&returning)?,
     })
 }
 
@@ -295,7 +296,6 @@ fn validate_copy_options(options: &CopyOptions) -> Result<()> {
 pub(super) fn convert_delete(delete: sql::Delete) -> Result<Statement> {
     if !delete.tables.is_empty()
         || delete.using.is_some()
-        || delete.returning.is_some()
         || !delete.order_by.is_empty()
         || delete.limit.is_some()
     {
@@ -316,5 +316,6 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<Statement> {
             .selection
             .map(|expr| convert_expr(&expr))
             .transpose()?,
+        returning: convert_returning(&delete.returning)?,
     })
 }

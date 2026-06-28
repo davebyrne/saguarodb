@@ -1,11 +1,116 @@
 mod support;
 
-use support::{TestServer, WorkspaceGraph};
+use support::{Connection, TestServer, WorkspaceGraph};
 
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+#[tokio::test]
+async fn e2e_returning_for_insert_update_delete() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+
+    // INSERT ... RETURNING projects the inserted row, including omitted-column
+    // defaults (NULL) and computed expressions.
+    let rows = server
+        .simple_query("insert into users (id, name) values (1, 'Ada') returning id, name")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
+    );
+
+    // RETURNING * over a multi-row INSERT returns one row per inserted tuple.
+    let rows = server
+        .simple_query("insert into users (id, name) values (2, 'Grace'), (3, 'Hopper') returning *")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2".to_string()), Some("Grace".to_string())],
+            vec![Some("3".to_string()), Some("Hopper".to_string())],
+        ]
+    );
+
+    // RETURNING expression over an INSERT that omits a nullable column.
+    let rows = server
+        .simple_query("insert into users (id) values (4) returning id + 10 as bumped, name")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("14".to_string()), None]]);
+
+    // UPDATE ... RETURNING projects the NEW row.
+    let rows = server
+        .simple_query("update users set name = 'Lovelace' where id = 1 returning id, name")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("Lovelace".to_string())]]
+    );
+
+    // DELETE ... RETURNING projects the OLD (deleted) row.
+    let rows = server
+        .simple_query("delete from users where id = 4 returning id, name")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("4".to_string()), None]]);
+
+    // An UPDATE that matches no row returns an empty result set.
+    let rows = server
+        .simple_query("update users set name = 'X' where id = 999 returning id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    // Final state: ids 1,2,3 remain.
+    let rows = server
+        .simple_query("select id from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_returning_over_extended_protocol() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, n text)")
+        .await;
+
+    // RETURNING over the extended query protocol: Describe yields a RowDescription
+    // and Execute streams the DataRow(s).
+    let rows = conn
+        .extended_execute("insert into t (id, n) values (7, 'seven') returning id, n")
+        .await
+        .unwrap()
+        .rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("7".to_string()), Some("seven".to_string())]]
+    );
+}
 
 #[tokio::test]
 async fn e2e_create_insert_select_update_delete_explain() {

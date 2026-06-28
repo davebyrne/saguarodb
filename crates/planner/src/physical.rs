@@ -5,7 +5,9 @@ use common::{
     Result, TableId, Value,
 };
 
-use crate::{AggregateExpr, BinOp, BoundExpr, BoundOrderByItem, JoinType, LogicalPlan};
+use crate::{
+    AggregateExpr, BinOp, BoundExpr, BoundOrderByItem, BoundReturning, JoinType, LogicalPlan,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PhysicalPlan {
@@ -30,15 +32,18 @@ pub enum PhysicalPlan {
         table: TableId,
         columns: Vec<ColumnId>,
         source: Box<PhysicalPlan>,
+        returning: Option<BoundReturning>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<PhysicalPlan>,
+        returning: Option<BoundReturning>,
     },
     Delete {
         table: TableId,
         source: Box<PhysicalPlan>,
+        returning: Option<BoundReturning>,
     },
     SeqScan {
         table: TableId,
@@ -134,23 +139,32 @@ pub fn physical_plan(
             table,
             columns,
             source,
+            returning,
         } => Ok(PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(physical_plan(source, catalog)?),
+            returning: returning.clone(),
         }),
         LogicalPlan::Update {
             table,
             assignments,
             source,
+            returning,
         } => Ok(PhysicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
             source: Box::new(physical_plan(source, catalog)?),
+            returning: returning.clone(),
         }),
-        LogicalPlan::Delete { table, source } => Ok(PhysicalPlan::Delete {
+        LogicalPlan::Delete {
+            table,
+            source,
+            returning,
+        } => Ok(PhysicalPlan::Delete {
             table: *table,
             source: Box::new(physical_plan(source, catalog)?),
+            returning: returning.clone(),
         }),
         LogicalPlan::Scan { table, filter } => plan_scan(*table, filter.clone(), catalog),
         LogicalPlan::Join {

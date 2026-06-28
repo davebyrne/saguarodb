@@ -40,7 +40,7 @@ parse -> bind -> logical_plan -> physical_plan -> execute
 
 For SELECT, it materializes plain `Row` values into `ExecutionResult::Query`. For DML/DDL, it executes immediately and returns command metadata. A future server streaming bridge may drive `PlanExecutor` directly without changing physical operator semantics.
 
-`ExecutionResult` has three variants: `Query` (SELECT rows and columns), `Modified { command, count }` (DML/DDL), and `Explanation { text }` (EXPLAIN). `QueryEngine::execute` produces only `Query` and `Modified`; `Explanation` is produced by the server's `QueryService` (EXPLAIN never calls the executor), but the variant lives in the executor crate's `ExecutionResult`.
+`ExecutionResult` has four variants: `Query` (SELECT rows and columns), `Modified { command, count }` (DML/DDL), `ModifiedReturning { command, count, columns, rows }` (a DML statement with a `RETURNING` clause — it both modifies rows and produces a result set; `count` drives the DML command tag while `columns`/`rows` are the `RETURNING` projection), and `Explanation { text }` (EXPLAIN). `QueryEngine::execute` produces `Query`, `Modified`, and `ModifiedReturning`; `Explanation` is produced by the server's `QueryService` (EXPLAIN never calls the executor), but the variant lives in the executor crate's `ExecutionResult`.
 
 Production execution uses an explicit context:
 
@@ -170,6 +170,8 @@ Aggregate execution groups input rows by the `GROUP BY` expressions into ordered
 - For each source `ExecRow`, read identity key.
 - Call `StorageEngine::delete`.
 - Return count.
+
+`RETURNING` (INSERT/UPDATE/DELETE): when the plan carries a `BoundReturning`, the executor evaluates the projection expressions over each affected full row — the inserted/updated NEW row for INSERT/UPDATE, the deleted OLD row for DELETE — and collects the result rows. For UPDATE/DELETE a row is collected only when storage actually mutated it (`update`/`delete` returned `true`); for an INSERT every inserted row is returned. The statement then returns `ModifiedReturning { command, count, columns, rows }` (with the `BoundReturning.output_schema` as `columns`) instead of `Modified`, so the affected-row count still drives the DML command tag.
 
 If a write errors after mutating pages or storage-owned metadata, the executor propagates the error without rolling back itself (consistent with `QueryEngine::execute` not calling storage/buffer commit or rollback). The server query orchestration — or the test harness — owns recovery and calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)` before returning the error.
 

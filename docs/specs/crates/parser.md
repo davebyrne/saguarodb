@@ -27,10 +27,10 @@ pub enum Statement {
     DropTable { name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
-    Insert { table: String, columns: Vec<String>, source: InsertSource },
+    Insert { table: String, columns: Vec<String>, source: InsertSource, returning: Option<Vec<SelectItem>> },
     Select(SelectStatement),
-    Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
-    Delete { table: String, filter: Option<Expr> },
+    Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
+    Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Explain(Box<Statement>),
     // `BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`. `isolation` is the
     // requested level mapped onto the two we support (`None` = transaction default).
@@ -210,6 +210,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - Derived tables: `(SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived`. The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases and `LATERAL` are rejected).
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.
+- `INSERT`/`UPDATE`/`DELETE ... RETURNING <items>`: the optional `RETURNING` clause is parsed into `returning: Option<Vec<SelectItem>>` on the `Insert`/`Update`/`Delete` AST node (`convert_returning` reuses the `SELECT`-list converter, so items may be expressions, `*`, or `table.*`). `None` when absent. (`UPDATE ... FROM` and `DELETE ... USING` remain unsupported.)
 - `EXPLAIN SELECT ...`. The AST node boxes any statement, but only a `SELECT` inner statement is accepted; any other inner statement is rejected as unsupported.
 - Transaction control: `BEGIN` / `BEGIN TRANSACTION` / `START TRANSACTION` parse to `Statement::Begin { isolation }`; `COMMIT` / `END` parse to `Statement::Commit`; `ROLLBACK` parses to `Statement::Rollback`. An optional `ISOLATION LEVEL <level>` mode is carried on `Begin.isolation` (and on `SetTransaction.isolation`), with the four SQL levels mapped onto SaguaroDB's two: `READ UNCOMMITTED`/`READ COMMITTED` → `IsolationLevel::ReadCommitted`, `REPEATABLE READ`/`SERIALIZABLE`/`SNAPSHOT` → `IsolationLevel::RepeatableRead` (SERIALIZABLE is **aliased** to snapshot isolation; no SSI — see `mvcc.md` §10 Milestone G). The `READ WRITE` access mode is accepted and ignored (the default); `READ ONLY` is rejected (SaguaroDB enforces no read-only restriction, so silently ignoring it would mislead), as are MySQL-style modifiers, `AND CHAIN`, and atomic-block bodies. `[NOT] DEFERRABLE` is not parsed by sqlparser 0.56 in this position and is an upstream syntax error. `ABORT` is not recognized by the dialect and is a syntax error (SaguaroDB does not add it).
 - Savepoints: `SAVEPOINT <name>` → `Statement::Savepoint { name }`; `RELEASE [SAVEPOINT] <name>` → `Statement::ReleaseSavepoint { name }`; `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>` → `Statement::RollbackToSavepoint { name }` (a plain `ROLLBACK` with no savepoint stays `Statement::Rollback`). Names are lowercase-normalized. sqlparser 0.56 parses all three; the server's transaction lifecycle executes them (`docs/specs/savepoints.md`). They do not bind/plan.

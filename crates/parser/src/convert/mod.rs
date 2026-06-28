@@ -13,7 +13,10 @@ mod query;
 use ddl::{convert_create_index, convert_create_table};
 use dml::{convert_copy, convert_delete, convert_insert};
 use expr::convert_expr;
-use query::{convert_assignment, convert_query_to_select, table_name_from_table_with_joins};
+use query::{
+    convert_assignment, convert_query_to_select, convert_returning,
+    table_name_from_table_with_joins,
+};
 
 pub fn parse_statement(sql: &str) -> Result<Statement> {
     // sqlparser 0.56 errors on `VACUUM`, so intercept it before handing the string
@@ -78,7 +81,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             returning,
             or,
         } => {
-            if from.is_some() || returning.is_some() || or.is_some() {
+            if from.is_some() || or.is_some() {
                 return unsupported("unsupported UPDATE form");
             }
 
@@ -93,6 +96,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
                 table,
                 assignments,
                 filter,
+                returning: convert_returning(&returning)?,
             })
         }
         sql::Statement::Delete(delete) => convert_delete(delete),

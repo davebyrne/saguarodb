@@ -381,6 +381,7 @@ mod tests {
         let plan = PhysicalPlan::Insert {
             table: schema.id,
             columns: vec![0, 1],
+            returning: None,
             source: Box::new(PhysicalPlan::Values {
                 rows: vec![vec![
                     BoundExpr::Literal {

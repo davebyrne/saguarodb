@@ -38,7 +38,7 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!("{padding}Update table={table}\n"));
             format_node(source, indent + 1, output);
         }
-        PhysicalPlan::Delete { table, source } => {
+        PhysicalPlan::Delete { table, source, .. } => {
             output.push_str(&format!("{padding}Delete table={table}\n"));
             format_node(source, indent + 1, output);
         }

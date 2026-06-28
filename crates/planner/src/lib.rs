@@ -9,7 +9,8 @@ mod simplify;
 
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
-    BoundDistinct, BoundFrom, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement,
+    BoundDistinct, BoundFrom, BoundInsertSource, BoundReturning, BoundSelect, BoundSelectItem,
+    BoundStatement,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -193,6 +194,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn binder_binds_returning_for_dml() {
+        let catalog = catalog_with_users();
+
+        // INSERT ... RETURNING id, name binds two output columns over the table.
+        let stmt =
+            parse("insert into users (id, name) values (1, 'Ada') returning id, name").unwrap();
+        let BoundStatement::Insert {
+            returning: Some(returning),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected insert with returning");
+        };
+        assert_eq!(returning.exprs.len(), 2);
+        assert_eq!(returning.output_schema[0].name, "id");
+        assert_eq!(returning.output_schema[1].name, "name");
+
+        // UPDATE ... RETURNING * expands to every table column.
+        let stmt = parse("update users set name = 'x' returning *").unwrap();
+        let BoundStatement::Update {
+            returning: Some(returning),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected update with returning");
+        };
+        assert_eq!(returning.output_schema.len(), 2);
+
+        // RETURNING cannot contain aggregate calls.
+        let stmt = parse("delete from users returning count(*)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+
+        // A RETURNING expression referencing an unknown column is rejected.
+        let stmt = parse("insert into users (id) values (1) returning missing").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
     }
 
     #[test]

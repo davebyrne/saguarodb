@@ -102,7 +102,23 @@ fn convert_select(
     })
 }
 
-fn convert_select_item(item: &sql::SelectItem) -> Result<SelectItem> {
+/// Convert a list of `RETURNING` projection items (shared by INSERT/UPDATE/DELETE).
+/// Each item is a select-list element: an expression, `*`, or `table.*`.
+pub(super) fn convert_returning(
+    returning: &Option<Vec<sql::SelectItem>>,
+) -> Result<Option<Vec<SelectItem>>> {
+    returning
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(convert_select_item)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+}
+
+pub(super) fn convert_select_item(item: &sql::SelectItem) -> Result<SelectItem> {
     match item {
         sql::SelectItem::Wildcard(options) => {
             reject_wildcard_options(options)?;

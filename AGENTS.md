@@ -67,6 +67,8 @@ precedence.
   uncorrelated subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and
   `[NOT] EXISTS (SELECT ...)` — in expressions, and derived tables
   `FROM (SELECT ...) AS alias [(cols)]`), `UPDATE`, `DELETE`,
+  `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (produces a result set
+  over each affected row — new row for INSERT/UPDATE, old row for DELETE),
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped

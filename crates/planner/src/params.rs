@@ -4,7 +4,7 @@
 
 use common::{DataType, DbError, Result, SqlState, Value};
 
-use crate::bound::{BoundFrom, BoundInsertSource};
+use crate::bound::{BoundFrom, BoundInsertSource, BoundReturning};
 use crate::{BoundExpr, BoundSelect, BoundStatement};
 
 /// Resolve the parameter types for a bound statement, indexed by 0-based
@@ -53,31 +53,54 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::Copy { .. } => Ok(()),
-        BoundStatement::Insert { source, .. } => match source {
-            BoundInsertSource::Values { rows, .. } => {
-                for row in rows {
-                    for expr in row {
-                        collect_expr(expr, used)?;
+        BoundStatement::Insert {
+            source, returning, ..
+        } => {
+            match source {
+                BoundInsertSource::Values { rows, .. } => {
+                    for row in rows {
+                        for expr in row {
+                            collect_expr(expr, used)?;
+                        }
                     }
                 }
-                Ok(())
+                BoundInsertSource::Query(select) => collect_select(select, used)?,
             }
-            BoundInsertSource::Query(select) => collect_select(select, used),
-        },
+            collect_returning(returning, used)
+        }
         BoundStatement::Select(select) => collect_select(select, used),
         BoundStatement::Update {
             assignments,
             source,
+            returning,
             ..
         } => {
             for (_, expr) in assignments {
                 collect_expr(expr, used)?;
             }
-            collect_select(source, used)
+            collect_select(source, used)?;
+            collect_returning(returning, used)
         }
-        BoundStatement::Delete { source, .. } => collect_select(source, used),
+        BoundStatement::Delete {
+            source, returning, ..
+        } => {
+            collect_select(source, used)?;
+            collect_returning(returning, used)
+        }
         BoundStatement::Explain(inner) => collect_statement(inner, used),
     }
+}
+
+fn collect_returning(
+    returning: &Option<BoundReturning>,
+    used: &mut Vec<Option<DataType>>,
+) -> Result<()> {
+    if let Some(returning) = returning {
+        for expr in &returning.exprs {
+            collect_expr(expr, used)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Result<()> {
@@ -183,31 +206,51 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::Copy { .. } => Ok(()),
-        BoundStatement::Insert { source, .. } => match source {
-            BoundInsertSource::Values { rows, .. } => {
-                for row in rows {
-                    for expr in row {
-                        substitute_expr(expr, params)?;
+        BoundStatement::Insert {
+            source, returning, ..
+        } => {
+            match source {
+                BoundInsertSource::Values { rows, .. } => {
+                    for row in rows {
+                        for expr in row {
+                            substitute_expr(expr, params)?;
+                        }
                     }
                 }
-                Ok(())
+                BoundInsertSource::Query(select) => substitute_select(select, params)?,
             }
-            BoundInsertSource::Query(select) => substitute_select(select, params),
-        },
+            substitute_returning(returning, params)
+        }
         BoundStatement::Select(select) => substitute_select(select, params),
         BoundStatement::Update {
             assignments,
             source,
+            returning,
             ..
         } => {
             for (_, expr) in assignments {
                 substitute_expr(expr, params)?;
             }
-            substitute_select(source, params)
+            substitute_select(source, params)?;
+            substitute_returning(returning, params)
         }
-        BoundStatement::Delete { source, .. } => substitute_select(source, params),
+        BoundStatement::Delete {
+            source, returning, ..
+        } => {
+            substitute_select(source, params)?;
+            substitute_returning(returning, params)
+        }
         BoundStatement::Explain(inner) => substitute_statement(inner, params),
     }
+}
+
+fn substitute_returning(returning: &mut Option<BoundReturning>, params: &[Value]) -> Result<()> {
+    if let Some(returning) = returning {
+        for expr in &mut returning.exprs {
+            substitute_expr(expr, params)?;
+        }
+    }
+    Ok(())
 }
 
 fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {

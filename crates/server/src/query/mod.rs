@@ -509,6 +509,7 @@ fn run_plan(
 fn dead_versions_in(result: &ExecutionResult) -> u64 {
     match result {
         ExecutionResult::Modified { command, count }
+        | ExecutionResult::ModifiedReturning { command, count, .. }
             if command == "DELETE" || command == "UPDATE" =>
         {
             *count
@@ -664,6 +665,13 @@ impl PreparedStatement {
 fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
     match bound {
         BoundStatement::Select(select) => Some(select.output_schema.clone()),
+        // A DML statement with a RETURNING clause produces a result set; its
+        // RowDescription is the RETURNING projection schema.
+        BoundStatement::Insert { returning, .. }
+        | BoundStatement::Update { returning, .. }
+        | BoundStatement::Delete { returning, .. } => returning
+            .as_ref()
+            .map(|returning| returning.output_schema.clone()),
         BoundStatement::Explain(_) => Some(vec![ColumnInfo {
             name: "QUERY PLAN".to_string(),
             data_type: DataType::Text,

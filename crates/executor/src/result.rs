@@ -21,6 +21,16 @@ pub enum ExecutionResult {
         command: String,
         count: u64,
     },
+    /// A DML statement (`INSERT`/`UPDATE`/`DELETE`) with a `RETURNING` clause: it
+    /// both modifies rows and produces a result set. `count` is the affected-row
+    /// count for the `CommandComplete` tag (e.g. `INSERT 0 n`); `columns`/`rows`
+    /// are the `RETURNING` projection sent as `RowDescription` + `DataRow`s.
+    ModifiedReturning {
+        command: String,
+        count: u64,
+        columns: Vec<ColumnInfo>,
+        rows: Vec<Row>,
+    },
     Explanation {
         text: String,
     },
@@ -37,7 +47,8 @@ impl ExecutionResult {
     pub fn row_count(&self) -> usize {
         match self {
             ExecutionResult::Query { rows, .. } => rows.len(),
-            ExecutionResult::Modified { count, .. } => *count as usize,
+            ExecutionResult::Modified { count, .. }
+            | ExecutionResult::ModifiedReturning { count, .. } => *count as usize,
             ExecutionResult::Explanation { .. } => 1,
             // No rows have been transferred yet; the COPY has not run.
             ExecutionResult::BeginCopyIn(_) | ExecutionResult::BeginCopyOut(_) => 0,

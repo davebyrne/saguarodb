@@ -23,16 +23,24 @@ pub enum Statement {
         table: String,
         columns: Vec<String>,
         source: InsertSource,
+        /// `INSERT ... RETURNING <items>`. `None` when no `RETURNING` clause is
+        /// present; `Some(items)` carries the projection list (expressions, `*`,
+        /// or `table.*`) evaluated over each inserted row.
+        returning: Option<Vec<SelectItem>>,
     },
     Select(SelectStatement),
     Update {
         table: String,
         assignments: Vec<Assignment>,
         filter: Option<Expr>,
+        /// `UPDATE ... RETURNING <items>`, evaluated over each updated (new) row.
+        returning: Option<Vec<SelectItem>>,
     },
     Delete {
         table: String,
         filter: Option<Expr>,
+        /// `DELETE ... RETURNING <items>`, evaluated over each deleted (old) row.
+        returning: Option<Vec<SelectItem>>,
     },
     Explain(Box<Statement>),
     /// `BEGIN [TRANSACTION] [ISOLATION LEVEL <level>] [READ WRITE]` /

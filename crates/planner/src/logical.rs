@@ -2,7 +2,7 @@ use common::{ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, Ta
 
 use crate::{
     AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem,
-    BoundSelect, BoundStatement, JoinType,
+    BoundReturning, BoundSelect, BoundStatement, JoinType,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,15 +28,18 @@ pub enum LogicalPlan {
         table: TableId,
         columns: Vec<ColumnId>,
         source: Box<LogicalPlan>,
+        returning: Option<BoundReturning>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<LogicalPlan>,
+        returning: Option<BoundReturning>,
     },
     Delete {
         table: TableId,
         source: Box<LogicalPlan>,
+        returning: Option<BoundReturning>,
     },
     Scan {
         table: TableId,
@@ -118,6 +121,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             table,
             columns,
             source,
+            returning,
         } => {
             let source = match source {
                 BoundInsertSource::Values {
@@ -133,6 +137,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 table: *table,
                 columns: columns.clone(),
                 source: Box::new(source),
+                returning: returning.clone(),
             })
         }
         BoundStatement::Select(select) => plan_select(select),
@@ -140,14 +145,21 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             table,
             assignments,
             source,
+            returning,
         } => Ok(LogicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
             source: Box::new(plan_select_source(source)?),
+            returning: returning.clone(),
         }),
-        BoundStatement::Delete { table, source } => Ok(LogicalPlan::Delete {
+        BoundStatement::Delete {
+            table,
+            source,
+            returning,
+        } => Ok(LogicalPlan::Delete {
             table: *table,
             source: Box::new(plan_select_source(source)?),
+            returning: returning.clone(),
         }),
         BoundStatement::Explain(_) => Err(DbError::plan(
             common::SqlState::SyntaxError,

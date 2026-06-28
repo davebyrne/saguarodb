@@ -103,15 +103,18 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             table,
             columns,
             source,
+            returning,
         } => LogicalPlan::Insert {
             table,
             columns,
             source: Box::new(simplify_logical(*source)),
+            returning,
         },
         LogicalPlan::Update {
             table,
             assignments,
             source,
+            returning,
         } => LogicalPlan::Update {
             table,
             assignments: assignments
@@ -119,10 +122,16 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .map(|(column, expr)| (column, fold_expr(expr)))
                 .collect(),
             source: Box::new(simplify_logical(*source)),
+            returning,
         },
-        LogicalPlan::Delete { table, source } => LogicalPlan::Delete {
+        LogicalPlan::Delete {
+            table,
+            source,
+            returning,
+        } => LogicalPlan::Delete {
             table,
             source: Box::new(simplify_logical(*source)),
+            returning,
         },
         ddl @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }

@@ -134,7 +134,15 @@ fn bind_inner(
             table,
             columns,
             source,
-        } => bind_insert(catalog, table, columns, source, declared),
+            returning,
+        } => bind_insert(
+            catalog,
+            table,
+            columns,
+            source,
+            returning.as_deref(),
+            declared,
+        ),
         Statement::Select(select) => {
             bind_select(catalog, select, declared).map(BoundStatement::Select)
         }
@@ -142,10 +150,26 @@ fn bind_inner(
             table,
             assignments,
             filter,
-        } => bind_update(catalog, table, assignments, filter.as_ref(), declared),
-        Statement::Delete { table, filter } => {
-            bind_delete(catalog, table, filter.as_ref(), declared)
-        }
+            returning,
+        } => bind_update(
+            catalog,
+            table,
+            assignments,
+            filter.as_ref(),
+            returning.as_deref(),
+            declared,
+        ),
+        Statement::Delete {
+            table,
+            filter,
+            returning,
+        } => bind_delete(
+            catalog,
+            table,
+            filter.as_ref(),
+            returning.as_deref(),
+            declared,
+        ),
         Statement::Explain(inner) => Ok(BoundStatement::Explain(Box::new(bind_inner(
             inner, catalog, declared,
         )?))),

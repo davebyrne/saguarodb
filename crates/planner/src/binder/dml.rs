@@ -5,12 +5,14 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError, Result,
     SqlState, TableSchema,
 };
-use parser::{Assignment, Expr, InsertSource, SelectStatement};
+use parser::{Assignment, Expr, InsertSource, SelectItem, SelectStatement};
 
-use crate::{BoundExpr, BoundInsertSource, BoundSelect, BoundSelectItem, BoundStatement};
+use crate::{
+    BoundExpr, BoundInsertSource, BoundReturning, BoundSelect, BoundSelectItem, BoundStatement,
+};
 
 use super::expr::{bind_boolean_expr, bind_expr};
-use super::query::{bind_select, bind_table_from_schema};
+use super::query::{bind_select, bind_select_item, bind_table_from_schema, select_output_schema};
 use super::{
     BindContext, Binding, input_ref, plan_error, reject_aggregate, require_table, require_type,
 };
@@ -43,6 +45,7 @@ pub(super) fn bind_insert(
     table_name: &str,
     column_names: &[String],
     source: &InsertSource,
+    returning: Option<&[SelectItem]>,
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
@@ -58,11 +61,44 @@ pub(super) fn bind_insert(
         }
     };
 
+    let returning = bind_returning(&table, returning, declared)?;
+
     Ok(BoundStatement::Insert {
         table: table.id,
         columns,
         source,
+        returning,
     })
+}
+
+/// Bind a `RETURNING` projection list over the target table. The expressions
+/// reference the table's columns as a single binding in catalog (slot) order, so
+/// at execution they evaluate over the affected full row (the inserted/updated
+/// NEW row or the deleted OLD row). Aggregates are rejected (PostgreSQL does not
+/// allow them in `RETURNING`).
+fn bind_returning(
+    table: &TableSchema,
+    items: Option<&[SelectItem]>,
+    declared: &[Option<DataType>],
+) -> Result<Option<BoundReturning>> {
+    let Some(items) = items else {
+        return Ok(None);
+    };
+    let mut ctx = BindContext::new(declared);
+    bind_table_from_schema(&mut ctx, table.clone(), None);
+    let mut bound_items = Vec::new();
+    for item in items {
+        bind_select_item(&mut ctx, item, &mut bound_items)?;
+    }
+    for item in &bound_items {
+        reject_aggregate(&item.expr)?;
+    }
+    let output_schema = select_output_schema(&ctx, &bound_items);
+    let exprs = bound_items.into_iter().map(|item| item.expr).collect();
+    Ok(Some(BoundReturning {
+        exprs,
+        output_schema,
+    }))
 }
 
 fn bind_insert_values(
@@ -136,9 +172,11 @@ pub(super) fn bind_update(
     table_name: &str,
     assignments: &[Assignment],
     filter: Option<&Expr>,
+    returning: Option<&[SelectItem]>,
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
+    let returning = bind_returning(&table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
@@ -185,6 +223,7 @@ pub(super) fn bind_update(
             offset: None,
             output_schema: table_output_schema(&table),
         },
+        returning,
     })
 }
 
@@ -192,9 +231,11 @@ pub(super) fn bind_delete(
     catalog: &dyn CatalogManager,
     table_name: &str,
     filter: Option<&Expr>,
+    returning: Option<&[SelectItem]>,
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
+    let returning = bind_returning(&table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
@@ -218,6 +259,7 @@ pub(super) fn bind_delete(
             offset: None,
             output_schema: table_output_schema(&table),
         },
+        returning,
     })
 }
 

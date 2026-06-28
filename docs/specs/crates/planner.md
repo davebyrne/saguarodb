@@ -64,6 +64,7 @@ Binder responsibilities:
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
+- Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
@@ -75,10 +76,10 @@ pub enum BoundStatement {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, returning: Option<BoundReturning> },
     Select(BoundSelect),
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
-    Delete { table: TableId, source: BoundSelect },
+    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
+    Delete { table: TableId, source: BoundSelect, returning: Option<BoundReturning> },
     Explain(Box<BoundStatement>),
     // COPY <table> [(cols)] FROM STDIN | TO STDOUT. Resolved table + column ids
     // (COPY order; defaulted to all columns in catalog order). Not lowered to a
@@ -90,6 +91,10 @@ pub enum BoundInsertSource {
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
     Query(Box<BoundSelect>),
 }
+
+// A bound RETURNING clause: the projection expressions evaluated over each
+// affected full row, and the result-set column metadata (the RowDescription).
+pub struct BoundReturning { exprs: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> }
 
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,  // All | On(keys)
@@ -352,9 +357,9 @@ pub enum LogicalPlan {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan> },
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan> },
-    Delete { table: TableId, source: Box<LogicalPlan> },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
+    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
+    Delete { table: TableId, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Scan { table: TableId, filter: Option<BoundExpr> },
     Join { left: Box<LogicalPlan>, right: Box<LogicalPlan>, condition: Option<BoundExpr>, join_type: JoinType },
     Filter { source: Box<LogicalPlan>, predicate: BoundExpr },
@@ -432,9 +437,9 @@ pub enum PhysicalPlan {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan> },
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan> },
-    Delete { table: TableId, source: Box<PhysicalPlan> },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
+    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
+    Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
     IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
     NestedLoopJoin {

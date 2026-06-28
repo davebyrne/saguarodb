@@ -143,6 +143,28 @@ where
             )
             .await
         }
+        // A DML statement with RETURNING: a result set (RowDescription + DataRows)
+        // followed by the DML command tag (e.g. `INSERT 0 n`), not `SELECT n`.
+        ExecutionResult::ModifiedReturning {
+            command,
+            count,
+            columns,
+            rows,
+        } => {
+            let mut messages = Vec::with_capacity(rows.len() + 3);
+            messages.push(ServerMessage::RowDescription {
+                columns,
+                formats: Vec::new(),
+            });
+            for row in rows {
+                messages.push(ServerMessage::DataRow(encode_row(&row, &[])?));
+            }
+            messages.push(ServerMessage::CommandComplete(command_complete_tag(
+                &command, count,
+            )));
+            messages.push(ServerMessage::ReadyForQuery(status));
+            write_messages(socket, codec, &messages).await
+        }
         ExecutionResult::Explanation { text } => {
             write_messages(
                 socket,
