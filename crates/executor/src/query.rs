@@ -602,6 +602,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
     let matches_type = matches!(
         (&column.data_type, value),
         (DataType::Integer, Value::Integer(_))
+            | (DataType::Double, Value::Float(_))
             | (DataType::Text, Value::Text(_))
             | (DataType::Boolean, Value::Boolean(_))
             | (DataType::Date, Value::Date(_))
@@ -660,5 +661,6 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Timestamp => "TIMESTAMP",
         DataType::Bytea => "BYTEA",
         DataType::Uuid => "UUID",
+        DataType::Double => "DOUBLE PRECISION",
     }
 }

@@ -397,6 +397,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Null => None,
         Value::Boolean(_) => Some(DataType::Boolean),
         Value::Integer(_) => Some(DataType::Integer),
+        Value::Float(_) => Some(DataType::Double),
         Value::Text(_) => Some(DataType::Text),
         Value::Date(_) => Some(DataType::Date),
         Value::Timestamp(_) => Some(DataType::Timestamp),

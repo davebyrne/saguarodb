@@ -1,10 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+use crate::float::OrderedF64;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Boolean(bool),
     Integer(i64),
+    /// `DOUBLE PRECISION`, an IEEE 754 `f64` wrapped for a total order (NaN sorts
+    /// greatest and equals itself, `-0.0 == +0.0`) so `Value`'s derived
+    /// `Ord`/`Eq`/`Hash` stay valid for keys, `DISTINCT`, and grouping.
+    Float(OrderedF64),
     Text(String),
     /// `DATE`, stored as days from the Unix epoch (1970-01-01 = 0). i64-backed so
     /// the derived `Ord`/`Hash` give correct date ordering and key/dedup behavior.

@@ -137,6 +137,13 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Uuid => common::uuid::parse_uuid(text)
             .map(Value::Uuid)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for uuid: \"{text}\""))),
+        DataType::Double => common::float::parse_double(text)
+            .map(|value| Value::Float(value.into()))
+            .ok_or_else(|| {
+                invalid_value(format!(
+                    "invalid input syntax for double precision: \"{text}\""
+                ))
+            }),
     }
 }
 
@@ -375,6 +382,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Timestamp(micros) => Some(common::datetime::format_timestamp(*micros)),
         Value::Bytes(raw) => Some(common::bytea::format_hex(raw)),
         Value::Uuid(raw) => Some(common::uuid::format_uuid(raw)),
+        Value::Float(value) => Some(common::float::format_double(value.0)),
     }
 }
 

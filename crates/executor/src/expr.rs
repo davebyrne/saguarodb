@@ -120,7 +120,8 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
                 .checked_neg()
                 .map(Value::Integer)
                 .ok_or_else(integer_overflow),
-            _ => datatype_mismatch("unary minus requires integer"),
+            Value::Float(value) => Ok(Value::Float((-value.0).into())),
+            _ => datatype_mismatch("unary minus requires a numeric operand"),
         },
         UnaryOp::Not => sql_not(value),
     }
@@ -145,7 +146,26 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
             BinOp::Mod => checked_integer(left.checked_rem(right)),
             _ => unreachable!(),
         },
-        _ => datatype_mismatch("arithmetic operands must be integers"),
+        (Value::Float(left), Value::Float(right)) => {
+            let (left, right) = (left.0, right.0);
+            let result = match op {
+                BinOp::Add => left + right,
+                BinOp::Sub => left - right,
+                BinOp::Mul => left * right,
+                // PostgreSQL raises division by zero for float division too.
+                BinOp::Div if right == 0.0 => {
+                    return Err(DbError::execute(
+                        SqlState::DivisionByZero,
+                        "division by zero",
+                    ));
+                }
+                BinOp::Div => left / right,
+                // Modulo is rejected for double precision during binding.
+                _ => return datatype_mismatch("modulo is not defined for double precision"),
+            };
+            Ok(Value::Float(result.into()))
+        }
+        _ => datatype_mismatch("arithmetic operands must be the same numeric type"),
     }
 }
 
@@ -161,6 +181,9 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
     let ordering = match (left, right) {
         (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
         (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+        // Total order: NaN sorts greatest and equals itself, -0.0 == +0.0
+        // (matching PostgreSQL's float comparison operators).
+        (Value::Float(left), Value::Float(right)) => left.cmp(right),
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
@@ -473,6 +496,27 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
         (Value::Text(value), DataType::Uuid) => common::uuid::parse_uuid(&value)
             .map(Value::Uuid)
             .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid uuid cast")),
+        (Value::Float(value), DataType::Double) => Ok(Value::Float(value)),
+        (Value::Float(value), DataType::Text) => {
+            Ok(Value::Text(common::float::format_double(value.0)))
+        }
+        (Value::Text(value), DataType::Double) => common::float::parse_double(&value)
+            .map(|v| Value::Float(v.into()))
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid double cast")),
+        (Value::Integer(value), DataType::Double) => Ok(Value::Float((value as f64).into())),
+        (Value::Float(value), DataType::Integer) => {
+            // Round half-to-even (matching PostgreSQL's float-to-int cast) and
+            // reject NaN/infinity/out-of-range.
+            let rounded = value.0.round_ties_even();
+            if rounded.is_finite() && rounded >= -(2f64.powi(63)) && rounded < 2f64.powi(63) {
+                Ok(Value::Integer(rounded as i64))
+            } else {
+                Err(DbError::execute(
+                    SqlState::NumericValueOutOfRange,
+                    "double precision value out of range for integer",
+                ))
+            }
+        }
         _ => datatype_mismatch("unsupported cast"),
     }
 }

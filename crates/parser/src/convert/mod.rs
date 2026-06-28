@@ -300,6 +300,13 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         ) => Ok(DataType::Timestamp),
         sql::DataType::Bytea => Ok(DataType::Bytea),
         sql::DataType::Uuid => Ok(DataType::Uuid),
+        // DOUBLE PRECISION and its aliases. `FLOAT` with no precision is double
+        // precision in PostgreSQL; `REAL`/`FLOAT4` (single precision) and an
+        // explicit `FLOAT(p)` precision are not supported.
+        sql::DataType::DoublePrecision
+        | sql::DataType::Float8
+        | sql::DataType::Double(sql::ExactNumberInfo::None)
+        | sql::DataType::Float(None) => Ok(DataType::Double),
         _ => unsupported("unsupported data type"),
     }
 }

@@ -537,6 +537,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             ValueFormat::Text => int.to_string().into_bytes(),
             ValueFormat::Binary => int.to_be_bytes().to_vec(),
         },
+        Value::Float(value) => match format {
+            ValueFormat::Text => common::float::format_double(value.0).into_bytes(),
+            // PostgreSQL binary `float8` is the 8-byte big-endian IEEE 754 value.
+            ValueFormat::Binary => value.0.to_be_bytes().to_vec(),
+        },
         Value::Text(text) => text.clone().into_bytes(),
         Value::Date(days) => match format {
             ValueFormat::Text => common::datetime::format_date(*days).into_bytes(),
@@ -596,6 +601,18 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .try_into()
                 .map_err(|_| protocol_error("binary integer parameter must be 8 bytes"))?;
             Ok(Value::Integer(i64::from_be_bytes(array)))
+        }
+        (DataType::Double, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "double precision parameter")?;
+            common::float::parse_double(text)
+                .map(|value| Value::Float(value.into()))
+                .ok_or_else(|| protocol_error("invalid double precision parameter"))
+        }
+        (DataType::Double, ValueFormat::Binary) => {
+            let array: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary double precision parameter must be 8 bytes"))?;
+            Ok(Value::Float(f64::from_be_bytes(array).into()))
         }
         (DataType::Boolean, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "boolean parameter")?;
@@ -680,6 +697,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Timestamp => (1114, 8),
         DataType::Bytea => (17, -1),
         DataType::Uuid => (2950, 16),
+        DataType::Double => (701, 8),
     }
 }
 
@@ -864,5 +882,46 @@ mod uuid_value_tests {
     fn invalid_uuid_is_rejected() {
         assert!(decode_value(b"not-a-uuid", DataType::Uuid, 0).is_err());
         assert!(decode_value(&[0u8; 15], DataType::Uuid, 1).is_err()); // wrong length
+    }
+}
+
+#[cfg(test)]
+mod double_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    #[test]
+    fn double_text_round_trips_and_uses_pg_special_spellings() {
+        let value = Value::Float(3.5.into());
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"3.5");
+        assert_eq!(decode_value(&text, DataType::Double, 0).unwrap(), value);
+
+        assert_eq!(
+            encode_value(&Value::Float(f64::INFINITY.into()), 0)
+                .unwrap()
+                .unwrap(),
+            b"Infinity"
+        );
+        assert_eq!(
+            encode_value(&Value::Float(f64::NAN.into()), 0)
+                .unwrap()
+                .unwrap(),
+            b"NaN"
+        );
+    }
+
+    #[test]
+    fn double_binary_is_8_byte_ieee_and_round_trips() {
+        let value = Value::Float((-12.625).into());
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, (-12.625_f64).to_be_bytes());
+        assert_eq!(decode_value(&binary, DataType::Double, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_double_is_rejected() {
+        assert!(decode_value(b"not-a-number", DataType::Double, 0).is_err());
+        assert!(decode_value(&[0u8; 4], DataType::Double, 1).is_err()); // wrong length
     }
 }

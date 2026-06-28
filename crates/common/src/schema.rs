@@ -16,6 +16,8 @@ pub enum DataType {
     Bytea,
     /// `UUID` — 128-bit identifier, value carried as `Value::Uuid` (16 bytes).
     Uuid,
+    /// `DOUBLE PRECISION` — IEEE 754 binary64, value carried as `Value::Float`.
+    Double,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

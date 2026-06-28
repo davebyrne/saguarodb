@@ -71,6 +71,7 @@ const KEY_TAG_DATE: u8 = 4;
 const KEY_TAG_TIMESTAMP: u8 = 5;
 const KEY_TAG_BYTEA: u8 = 6;
 const KEY_TAG_UUID: u8 = 7;
+const KEY_TAG_DOUBLE: u8 = 8;
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
 /// nodes: `[n: u16]` then each value as `[tag][payload]`. Self-describing so the
@@ -118,6 +119,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Uuid(value) => {
                 bytes.push(KEY_TAG_UUID);
                 bytes.extend_from_slice(value);
+            }
+            Value::Float(value) => {
+                bytes.push(KEY_TAG_DOUBLE);
+                bytes.extend_from_slice(&value.0.to_le_bytes());
             }
         }
     }
@@ -189,6 +194,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 let raw = read_exact(bytes, &mut offset, 16)?;
                 Value::Uuid(raw.try_into().expect("16 bytes"))
             }
+            KEY_TAG_DOUBLE => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                Value::Float(f64::from_le_bytes(raw.try_into().expect("8 bytes")).into())
+            }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
         values.push(value);
@@ -252,6 +261,9 @@ pub(crate) fn encode_row_with_infomask(
             }
             Value::Integer(value) if column.data_type == DataType::Integer => {
                 bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Float(value) if column.data_type == DataType::Double => {
+                bytes.extend_from_slice(&value.0.to_le_bytes());
             }
             Value::Text(value) if column.data_type == DataType::Text => {
                 let len = u32::try_from(value.len())
@@ -343,6 +355,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 let mut array = [0; 8];
                 array.copy_from_slice(raw);
                 Value::Integer(i64::from_le_bytes(array))
+            }
+            DataType::Double => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                let mut array = [0; 8];
+                array.copy_from_slice(raw);
+                Value::Float(f64::from_le_bytes(array).into())
             }
             DataType::Text => {
                 let raw_len = read_exact(bytes, &mut offset, 4)?;
@@ -577,6 +595,7 @@ mod tests {
                     bytes.extend_from_slice(value);
                 }
                 Value::Uuid(value) => bytes.extend_from_slice(value),
+                Value::Float(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
             }
         }
         bytes

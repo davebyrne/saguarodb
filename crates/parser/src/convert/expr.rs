@@ -191,10 +191,20 @@ fn convert_value(value: &sql::Value) -> Result<Expr> {
         sql::Value::Null => Ok(Expr::Literal(Value::Null)),
         sql::Value::Boolean(value) => Ok(Expr::Literal(Value::Boolean(*value))),
         sql::Value::Number(value, _) => {
-            let value = value
-                .parse::<i64>()
-                .map_err(|_| parse_error("invalid integer literal"))?;
-            Ok(Expr::Literal(Value::Integer(value)))
+            // A numeric literal written with a decimal point or exponent is
+            // DOUBLE PRECISION; a plain run of digits is INTEGER. There is no
+            // implicit int/float coercion downstream, so `42` stays an integer
+            // (use `42.0` or a cast for a double).
+            if value.contains('.') || value.contains('e') || value.contains('E') {
+                common::float::parse_double(value)
+                    .map(|v| Expr::Literal(Value::Float(v.into())))
+                    .ok_or_else(|| parse_error(format!("invalid numeric literal: \"{value}\"")))
+            } else {
+                value
+                    .parse::<i64>()
+                    .map(|v| Expr::Literal(Value::Integer(v)))
+                    .map_err(|_| parse_error("invalid integer literal"))
+            }
         }
         sql::Value::SingleQuotedString(value) => Ok(Expr::Literal(Value::Text(value.clone()))),
         sql::Value::Placeholder(name) => convert_placeholder(name),

@@ -367,11 +367,13 @@ read the `Aggregate` output.
 After logical planning, the planner runs a result-preserving simplification pass
 over the `LogicalPlan` (`logical_plan` returns the simplified plan):
 
-- **Constant folding.** Literal-only arithmetic, comparison, and `||` concat
-  sub-expressions, integer negation, `NOT`, `IS NULL`, and `IS NOT NULL` over a
-  literal are collapsed to a `Literal`. Folding is skipped for any operation that
-  could fail at runtime — integer overflow and divide/modulo by zero are left
-  intact so the executor raises the same error it would have without folding.
+- **Constant folding.** Literal-only integer arithmetic, comparison (all types,
+  using each value's ordering), and `||` concat sub-expressions, integer
+  negation, `NOT`, `IS NULL`, and `IS NOT NULL` over a literal are collapsed to a
+  `Literal`. Folding is skipped for any operation that could fail at runtime —
+  integer overflow and divide/modulo by zero are left intact so the executor
+  raises the same error it would have without folding. Double-precision
+  arithmetic and negation are left to the executor (not folded).
 - **Boolean simplification.** `AND`/`OR` over two boolean constants fold to a
   constant, and a redundant constant operand is dropped while the other operand
   is kept: `TRUE AND x → x`, `FALSE OR x → x` (and the symmetric forms). The

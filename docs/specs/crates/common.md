@@ -56,6 +56,7 @@ pub enum Value {
     Null,
     Boolean(bool),
     Integer(i64),
+    Float(OrderedF64), // DOUBLE PRECISION (total-order f64 wrapper)
     Text(String),
     Date(i64),       // days from the Unix epoch (1970-01-01)
     Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
@@ -66,16 +67,21 @@ pub enum Value {
 
 `Value::Date`/`Value::Timestamp` are backed by `i64`, `Value::Bytes` by
 `Vec<u8>`, and `Value::Uuid` by `[u8; 16]`, so the derived `Ord`/`Hash` give
-correct chronological / lexicographic ordering and key/dedup behavior. The
-`datetime` module provides the proleptic Gregorian calendar conversions and the
-`YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format helpers
-(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
+correct chronological / lexicographic ordering and key/dedup behavior. `f64` does
+not implement `Ord`/`Eq`/`Hash`, so `Value::Float` wraps it in the `float`
+module's `OrderedF64`, which supplies a total order matching PostgreSQL's float
+btree semantics (`NaN` sorts greatest and equals itself, `-0.0 == +0.0`) and a
+consistent `Hash`, keeping `Value`'s derives valid for keys, `DISTINCT`, and
+grouping. The `datetime` module provides the proleptic Gregorian calendar
+conversions and the `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format
+helpers (`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
 `parse_timestamp`, `format_timestamp`); the `bytea` module provides the hex
 `\x...` parse/format helpers (`parse_hex`, `format_hex`, hex-only — no legacy
 escape); the `uuid` module provides the canonical `8-4-4-4-12` parse/format
-helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase). All are shared
-by the parser, executor, protocol, and COPY paths; there is no external
-date/time/uuid dependency.
+helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase); the `float`
+module provides the shortest-round-trip `format_double` / `parse_double` helpers.
+All are shared by the parser, executor, protocol, and COPY paths; there is no
+external date/time/uuid/float dependency.
 
 ```rust
 pub struct Row {
@@ -120,6 +126,7 @@ pub enum DataType {
     Timestamp,
     Bytea,
     Uuid,
+    Double,
 }
 
 pub struct ParsedColumnDef {

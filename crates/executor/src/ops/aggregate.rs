@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{ColumnInfo, DbError, ExecRow, Result, Row, SqlState, Value};
+use common::{ColumnInfo, DataType, DbError, ExecRow, Result, Row, SqlState, Value};
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
 use crate::eval_expr;
@@ -94,8 +94,8 @@ fn build_groups(
 fn evaluate_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Value> {
     match aggregate.func {
         AggregateFunc::Count => count_aggregate(aggregate, rows),
-        AggregateFunc::Sum => integer_fold_aggregate(aggregate, rows, IntegerAggregate::Sum),
-        AggregateFunc::Avg => integer_fold_aggregate(aggregate, rows, IntegerAggregate::Avg),
+        AggregateFunc::Sum => fold_aggregate(aggregate, rows, FoldKind::Sum),
+        AggregateFunc::Avg => fold_aggregate(aggregate, rows, FoldKind::Avg),
         AggregateFunc::Min => min_max_aggregate(aggregate, rows, true),
         AggregateFunc::Max => min_max_aggregate(aggregate, rows, false),
     }
@@ -116,15 +116,24 @@ fn count_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Value>
 }
 
 #[derive(Clone, Copy)]
-enum IntegerAggregate {
+enum FoldKind {
     Sum,
     Avg,
+}
+
+/// Dispatch SUM/AVG to the integer or double fold based on the bound result type.
+fn fold_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], kind: FoldKind) -> Result<Value> {
+    if aggregate.data_type == DataType::Double {
+        float_fold_aggregate(aggregate, rows, kind)
+    } else {
+        integer_fold_aggregate(aggregate, rows, kind)
+    }
 }
 
 fn integer_fold_aggregate(
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
-    kind: IntegerAggregate,
+    kind: FoldKind,
 ) -> Result<Value> {
     let values = aggregate_values(aggregate, rows)?;
     let mut sum = 0_i64;
@@ -150,8 +159,42 @@ fn integer_fold_aggregate(
     }
 
     match kind {
-        IntegerAggregate::Sum => Ok(Value::Integer(sum)),
-        IntegerAggregate::Avg => Ok(Value::Integer(sum / count)),
+        FoldKind::Sum => Ok(Value::Integer(sum)),
+        FoldKind::Avg => Ok(Value::Integer(sum / count)),
+    }
+}
+
+fn float_fold_aggregate(
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    kind: FoldKind,
+) -> Result<Value> {
+    let values = aggregate_values(aggregate, rows)?;
+    let mut sum = 0.0_f64;
+    let mut count = 0_i64;
+    for value in values {
+        match value {
+            Value::Null => {}
+            Value::Float(value) => {
+                sum += value.0;
+                count += 1;
+            }
+            _ => {
+                return Err(DbError::execute(
+                    SqlState::DatatypeMismatch,
+                    "SUM and AVG require numeric input",
+                ));
+            }
+        }
+    }
+
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+
+    match kind {
+        FoldKind::Sum => Ok(Value::Float(sum.into())),
+        FoldKind::Avg => Ok(Value::Float((sum / count as f64).into())),
     }
 }
 

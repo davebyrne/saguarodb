@@ -126,6 +126,7 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         ),
         Value::Boolean(_) => (DataType::Boolean, false),
         Value::Integer(_) => (DataType::Integer, false),
+        Value::Float(_) => (DataType::Double, false),
         Value::Text(_) => (DataType::Text, false),
         Value::Date(_) => (DataType::Date, false),
         Value::Timestamp(_) => (DataType::Timestamp, false),
@@ -148,16 +149,50 @@ fn bind_binary_op(
     let op = convert_bin_op(op);
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-            let left = bind_expr(ctx, left, Some(DataType::Integer))?;
-            let right = bind_expr(ctx, right, Some(DataType::Integer))?;
-            require_type(&left, DataType::Integer)?;
-            require_type(&right, DataType::Integer)?;
+            // Both operands must share one numeric type (INTEGER or DOUBLE
+            // PRECISION); there is no implicit int/float coercion. Bind each side
+            // once with no hint — concrete operands resolve directly, and only a
+            // bare untyped NULL or undeclared parameter fails. Take the type from
+            // whichever side is numeric, re-binding a failed (untyped) leaf with
+            // that type; default to INTEGER when neither side has one.
+            let is_numeric = |t: &DataType| matches!(t, DataType::Integer | DataType::Double);
+            let left_res = bind_expr(ctx, left, None);
+            let right_res = bind_expr(ctx, right, None);
+            let operand_type = left_res
+                .as_ref()
+                .ok()
+                .map(|e| e.data_type())
+                .filter(is_numeric)
+                .or_else(|| {
+                    right_res
+                        .as_ref()
+                        .ok()
+                        .map(|e| e.data_type())
+                        .filter(is_numeric)
+                })
+                .unwrap_or(DataType::Integer);
+            let left = match left_res {
+                Ok(expr) => expr,
+                Err(_) => bind_expr(ctx, left, Some(operand_type.clone()))?,
+            };
+            let right = match right_res {
+                Ok(expr) => expr,
+                Err(_) => bind_expr(ctx, right, Some(operand_type.clone()))?,
+            };
+            require_type(&left, operand_type.clone())?;
+            require_type(&right, operand_type.clone())?;
+            if operand_type == DataType::Double && matches!(op, BinOp::Mod) {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    "modulo is not defined for double precision",
+                ));
+            }
             let nullable = left.nullable() || right.nullable();
             Ok(BoundExpr::BinaryOp {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-                data_type: DataType::Integer,
+                data_type: operand_type,
                 nullable,
             })
         }
@@ -236,13 +271,25 @@ fn bind_unary_op(ctx: &mut BindContext, op: parser::UnaryOp, expr: &Expr) -> Res
     let op = convert_unary_op(op);
     match op {
         UnaryOp::Neg => {
-            let expr = bind_expr(ctx, expr, Some(DataType::Integer))?;
-            require_type(&expr, DataType::Integer)?;
+            // Negation applies to either numeric type; an untyped NULL defaults
+            // to INTEGER (matching the arithmetic operators).
+            let bound = bind_expr(ctx, expr, None);
+            let operand_type = bound
+                .as_ref()
+                .ok()
+                .map(|e| e.data_type())
+                .filter(|t| matches!(t, DataType::Integer | DataType::Double))
+                .unwrap_or(DataType::Integer);
+            let expr = match bound {
+                Ok(expr) => expr,
+                Err(_) => bind_expr(ctx, expr, Some(operand_type.clone()))?,
+            };
+            require_type(&expr, operand_type.clone())?;
             Ok(BoundExpr::UnaryOp {
                 nullable: expr.nullable(),
                 op,
                 expr: Box::new(expr),
-                data_type: DataType::Integer,
+                data_type: operand_type,
             })
         }
         UnaryOp::Not => {
@@ -319,8 +366,17 @@ fn bind_aggregate(
                     "SUM and AVG require an expression argument",
                 ));
             };
-            require_type(arg, DataType::Integer)?;
-            (DataType::Integer, true)
+            // SUM/AVG accept either numeric type and return that same type
+            // (INTEGER stays INTEGER with integer division for AVG; DOUBLE
+            // PRECISION stays DOUBLE).
+            let arg_type = arg.data_type();
+            if !matches!(arg_type, DataType::Integer | DataType::Double) {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!("SUM and AVG require a numeric argument, got {arg_type:?}"),
+                ));
+            }
+            (arg_type, true)
         }
         AggregateFunc::Min | AggregateFunc::Max => {
             let Some(arg) = &arg else {

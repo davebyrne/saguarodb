@@ -969,6 +969,201 @@ async fn e2e_uuid_primary_key_uses_index() {
 }
 
 #[tokio::test]
+async fn e2e_double_round_trips_arithmetic_and_aggregates() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table m (id integer primary key, x double precision)")
+        .await
+        .unwrap();
+    for (id, x) in [(1, "2.5"), (2, "7.5"), (3, "1.0"), (4, "5.0")] {
+        server
+            .simple_query(&format!("insert into m (id, x) values ({id}, {x})"))
+            .await
+            .unwrap();
+    }
+
+    // Round-trip + ordering (1.0 prints as "1", 5.0 as "5").
+    let rows = server
+        .simple_query("select x from m order by x")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2.5".to_string())],
+            vec![Some("5".to_string())],
+            vec![Some("7.5".to_string())],
+        ]
+    );
+
+    // Arithmetic: +, *, / produce doubles.
+    let rows = server
+        .simple_query("select x + 0.5, x * 2.0, x / 2.0 from m where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3".to_string()),
+            Some("5".to_string()),
+            Some("1.25".to_string()),
+        ]]
+    );
+
+    // SUM = 16, AVG = 4 (sum divisible by the row count, so both print cleanly).
+    let rows = server
+        .simple_query("select sum(x), avg(x), min(x), max(x) from m")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("16".to_string()),
+            Some("4".to_string()),
+            Some("1".to_string()),
+            Some("7.5".to_string()),
+        ]]
+    );
+
+    // Float division by zero errors (like PostgreSQL).
+    let err = server
+        .simple_query("select x / 0.0 from m where id = 1")
+        .await
+        .err()
+        .expect("float division by zero should error");
+    assert!(
+        err.message.to_lowercase().contains("division by zero"),
+        "got: {}",
+        err.message
+    );
+
+    // Modulo is not defined for double precision.
+    let err = server
+        .simple_query("select x % 2.0 from m where id = 1")
+        .await
+        .err()
+        .expect("modulo on double should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+
+    // No implicit cast: an integer literal into a DOUBLE column is a mismatch.
+    let err = server
+        .simple_query("insert into m (id, x) values (9, 5)")
+        .await
+        .err()
+        .expect("integer into double column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+}
+
+#[tokio::test]
+async fn e2e_double_casts_and_special_values() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table m (id integer primary key, x double precision)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into m (id, x) values (1, 2.5)")
+        .await
+        .unwrap();
+
+    // CAST double <-> text, double <-> integer (round half-to-even).
+    let rows = server
+        .simple_query(
+            "select cast(x as text), cast(x as integer), cast(3.5 as integer), \
+             cast(5 as double precision) from m where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2.5".to_string()),
+            Some("2".to_string()), // 2.5 -> 2 (ties to even)
+            Some("4".to_string()), // 3.5 -> 4 (ties to even)
+            Some("5".to_string()),
+        ]]
+    );
+
+    // Special values: NaN == NaN, -0.0 == 0.0 (PostgreSQL float semantics).
+    let rows = server
+        .simple_query(
+            "select cast('NaN' as double precision) = cast('NaN' as double precision), \
+             cast('-0' as double precision) = cast('0' as double precision), \
+             cast('Infinity' as double precision) > 1e308 from m where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("t".to_string()),
+            Some("t".to_string()),
+            Some("t".to_string()),
+        ]]
+    );
+
+    // Ordering puts -Infinity first and NaN last.
+    server
+        .simple_query(
+            "insert into m (id, x) values \
+             (2, cast('NaN' as double precision)), \
+             (3, cast('-Infinity' as double precision)), \
+             (4, cast('Infinity' as double precision))",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, cast(x as text) from m order by x")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".to_string()), Some("-Infinity".to_string())],
+            vec![Some("1".to_string()), Some("2.5".to_string())],
+            vec![Some("4".to_string()), Some("Infinity".to_string())],
+            vec![Some("2".to_string()), Some("NaN".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_double_primary_key_uses_index() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table d (k double precision primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into d (k, note) values (3.25, 'a')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from d where k = 3.25")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "DOUBLE primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query("select note from d where k = 3.25")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("a".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

@@ -4,6 +4,7 @@ pub mod context;
 pub mod copy;
 pub mod datetime;
 pub mod error;
+pub mod float;
 pub mod flush;
 pub mod ids;
 pub mod mvcc;
@@ -18,6 +19,7 @@ pub use concurrency::{
 pub use context::StatementContext;
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
+pub use float::OrderedF64;
 pub use flush::{FlushPolicy, PageFlushInfo};
 pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
