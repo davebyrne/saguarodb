@@ -84,27 +84,49 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 `LockManager` (a new `Arc` field on `ServerComponents`) owns the wait coordination:
 
 - State: `Mutex<{ waits_for: HashMap<TxnId, TxnId> }>` + a `Condvar`, plus a shared
-  `ActiveTxnRegistry` handle and the configured `deadlock_timeout`.
+  `ActiveTxnRegistry` handle and the configured `deadlock_timeout`. The edge key/
+  value are the actual (sub)xids the engine passes — `waiter` is the writer's
+  *writing xid* (`ctx.txn_id`, the innermost subxid) and `blocker` is the stamped
+  `xmax` (also possibly a subxid).
 - `wait_for(waiter, blocker, cancel)` — under the lock: record the edge
   `waiter → blocker`, then loop:
   - blocker no longer active (`registry.is_active(blocker)` is false) → return `Ok`
-    (re-check the row);
+    (re-check the row). **`is_active` is keyed on the specific (sub)xid**, because a
+    partial `ROLLBACK TO` aborts and deregisters only that subxid — a waiter on it
+    must then proceed even though the top is still live.
   - `cancel` set → return `Err(QueryCanceled)`;
   - `condvar.wait_timeout(poll_interval)`; accumulate elapsed; every
     `deadlock_timeout` of accumulated wait, run cycle detection from `waiter`.
   - On exit (any branch), remove the `waiter → blocker` edge.
-- **Deadlock detection**: follow `waits_for` edges from `waiter`; if the walk
-  revisits `waiter`, there is a cycle. **Victim = the detecting waiter** itself —
-  the simplest policy that always breaks the cycle — which returns
-  `Err(DeadlockDetected)`. (A single fixed `poll_interval` of ~100 ms bounds cancel
-  latency; cycle detection runs only at the full `deadlock_timeout`.)
+- **Deadlock detection (top-level canonicalized, single critical section).** Cycle
+  detection, victim selection, and removal of the victim's edge happen **together,
+  under the held `LockManager` lock** (the detector already holds it at the
+  `wait_timeout` tick) — so a chosen victim is no longer a graph node when any other
+  detector reads the graph, which is what makes §9's "exactly one victim" hold even
+  though every waiter is its own detector. Detection follows `waits_for` edges from
+  `waiter`, **canonicalizing each endpoint to its top-level txn id** via
+  `registry.top_of(xid)` (a subxid resolves to its owning transaction); a cycle is a
+  walk that revisits the waiter's *top*. This is required for correctness: a
+  deadlock is between *transactions*, and with savepoints both the writing xid and a
+  stamped `xmax` are subxids, so an un-canonicalized walk would miss a genuine
+  cross-subxid cycle (e.g. edges `{200→101, 102→200}` where 101/102 are subxids of
+  the two tops). **Victim = the detecting waiter's transaction**, which returns
+  `Err(DeadlockDetected)` and drops its edge in the same critical section. (`top_of`
+  is backed by a small in-memory subxid→top map maintained only for *active*
+  transactions — distinct from a durable `pg_subtrans`, and not used by the
+  visibility path.) A `poll_interval` of ~100 ms bounds cancel latency; cycle
+  detection runs only at the full `deadlock_timeout`.
 
 ### Waking waiters (lost-wakeup-safe)
 
-On a transaction's commit/abort/rollback, **after** it is deregistered from the
-active set, the lifecycle calls `lock_manager.on_txn_finished()`, which takes the
-`LockManager` lock and `notify_all`. Waiters wake and re-check
-`registry.is_active(blocker)`. Lock ordering is `LockManager → ActiveTxnRegistry`
+Whenever a (sub)xid leaves the active set — top-level commit/abort/rollback **and a
+partial `ROLLBACK TO SAVEPOINT`** (`abort_subxids`, which deregisters only the
+rolled-back subxids) — **after** the deregister, the lifecycle calls
+`lock_manager.on_txn_finished()`, which takes the `LockManager` lock and
+`notify_all`. Waiters wake and re-check `registry.is_active(blocker)`. (Including
+partial rollback is a latency optimization — a waiter on a rolled-back subxid would
+otherwise proceed only on its next poll tick; correctness holds either way.) Lock
+ordering is `LockManager → ActiveTxnRegistry`
 (the registry is a leaf lock and never acquires the `LockManager` lock), and
 `on_txn_finished` runs after deregister while taking the `LockManager` lock — so a
 finishing transaction cannot slip its wakeup between a waiter's `is_active` check
@@ -113,9 +135,13 @@ waiter to the next poll tick, never lose correctness.
 
 ## 5. Cancel & graceful shutdown
 
-The wait honors the existing per-statement `cancel: &AtomicBool`
-(`ExecutionContext`), polled on each `poll_interval` tick, so a blocked writer
-responds to a client `CancelRequest` within ~100 ms. A blocked writer keeps holding
+The wait honors the per-statement cancel flag, polled on each `poll_interval` tick,
+so a blocked writer responds to a client `CancelRequest` within ~100 ms. The cancel
+flag is the connection's `Arc<AtomicBool>` (from `begin_cancelable`); since the
+conflict point only has the `StatementContext` (not the `ExecutionContext` that
+currently borrows `&AtomicBool`), `StatementContext` carries the cancel handle as a
+field (§6) so the storage wait-loop can thread it into `wait_for`. A blocked writer
+keeps holding
 its `InFlightQueryGuard`, so graceful shutdown's `wait_for_idle` accounts for it
 and times out gracefully (within `--shutdown-timeout-ms`) exactly as for any
 long-running statement — no new hang path.
@@ -129,20 +155,27 @@ long-running statement — no new hang path.
   `WouldBlock(TxnId)` (carrying the in-flight creator's xid). The pure classifiers
   `write_conflict` / `classify_unique_conflict` return the blocker.
 - A `ConflictWaiter` trait in `common`; `StatementContext` carries
-  `Arc<dyn ConflictWaiter>` (a no-op default for read/test contexts; the server sets
-  the real `LockManager` on write-capable contexts).
+  `Arc<dyn ConflictWaiter>` AND the cancel handle `Arc<AtomicBool>`. The default
+  `ConflictWaiter` (read/test contexts) **errors loudly** (`InternalError`) if its
+  `wait_for` is ever actually called — a real `WouldBlock` must never reach it, so a
+  mis-wired write context fails fast instead of spinning forever (`WouldBlock →
+  no-op Ok → re-attempt → WouldBlock → …`). The server sets the real `LockManager`
+  waiter and the connection's cancel `Arc` on every write-capable context.
 
 ## 7. Crate responsibilities
 
-- `common`: the `DeadlockDetected` SQLSTATE; the `ConflictWaiter` trait +
-  `StatementContext` field; `WriteConflict::WouldBlock` / `UniqueConflict::WouldBlock`
-  and the classifier changes.
+- `common`: the `DeadlockDetected` SQLSTATE; the `ConflictWaiter` trait + the
+  `StatementContext` waiter and cancel fields (the default waiter errors on use);
+  `WriteConflict::WouldBlock` / `UniqueConflict::WouldBlock` and the classifier
+  changes.
 - `storage`: `stamp_xmax_logged` / `unique_conflict_kind` return `WouldBlock(b)`;
   the engine's INSERT/UPDATE/DELETE methods wrap the conflict point in a wait-retry
-  loop driven by `ctx.conflict_waiter`.
-- `server`: the `LockManager` (implements `ConflictWaiter`), the `ActiveTxnRegistry::
-  is_active` method, wiring into `ServerComponents` / `execution_context`, the wake
-  calls on commit/abort/rollback, and the `--deadlock-timeout-ms` flag.
+  loop driven by `ctx.conflict_waiter`, threading `ctx.cancel`.
+- `server`: the `LockManager` (implements `ConflictWaiter`); `ActiveTxnRegistry::
+  is_active` and `top_of` (the active subxid→top map, populated when a savepoint
+  subxid is allocated and pruned on deregister); wiring into `ServerComponents` /
+  `execution_context` (waiter + cancel); the wake calls on commit/abort/rollback
+  **and partial `ROLLBACK TO`**; and the `--deadlock-timeout-ms` flag.
 
 ## 8. Implementation milestones
 
