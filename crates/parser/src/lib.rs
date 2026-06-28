@@ -104,6 +104,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_in_subquery_and_not_in_subquery() {
+        for (sql, negated) in [
+            (
+                "select id from users where id in (select id from accounts)",
+                false,
+            ),
+            (
+                "select id from users where id not in (select id from accounts)",
+                true,
+            ),
+        ] {
+            let Statement::Select(select) = parse(sql).unwrap() else {
+                panic!("expected select");
+            };
+            assert!(
+                matches!(
+                    select.filter,
+                    Some(Expr::InSubquery { negated: n, .. }) if n == negated
+                ),
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
     fn parses_count_star_and_aggregate_distinct_shape() {
         let stmt = parse("select count(*), count(distinct id) from users").unwrap();
 

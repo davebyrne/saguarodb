@@ -187,6 +187,13 @@ pub enum Expr {
     /// validates the single-column shape; the one-row cardinality is enforced at
     /// run time.
     Subquery(Box<SelectStatement>),
+    /// `expr [NOT] IN (SELECT ...)`. The subquery must produce a single column;
+    /// `negated` is `true` for `NOT IN`. Three-valued-logic NULL semantics apply.
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<SelectStatement>,
+        negated: bool,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinOp,

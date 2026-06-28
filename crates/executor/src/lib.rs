@@ -760,6 +760,80 @@ mod tests {
     }
 
     #[test]
+    fn in_subquery_keeps_matching_rows() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table vals (id integer primary key, v integer)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        harness
+            .execute("insert into vals (id, v) values (10, 1), (20, 3)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select id from users where id in (select v from vals) order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1)]
+                },
+                Row {
+                    values: vec![Value::Integer(3)]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn not_in_subquery_with_null_yields_no_rows() {
+        // SQL three-valued logic: `x NOT IN (.. NULL ..)` is never TRUE, so a NULL
+        // in the subquery result removes every row.
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table vals (id integer primary key, v integer)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b')")
+            .unwrap();
+        harness
+            .execute("insert into vals (id, v) values (10, 1), (20, null)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select id from users where id not in (select v from vals)")
+            .unwrap();
+        assert!(rows.is_empty(), "got {rows:?}");
+    }
+
+    #[test]
+    fn not_in_subquery_without_null_keeps_non_members() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table vals (id integer primary key, v integer)")
+            .unwrap();
+        harness
+            .execute("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        harness
+            .execute("insert into vals (id, v) values (10, 1), (20, 2)")
+            .unwrap();
+
+        let rows = harness
+            .select_rows("select id from users where id not in (select v from vals) order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(3)]
+            }]
+        );
+    }
+
+    #[test]
     fn insert_select_copies_rows_from_another_table() {
         let harness = ExecutorHarness::with_users();
         harness

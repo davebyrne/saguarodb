@@ -3,7 +3,7 @@ use sqlparser::ast as sql;
 
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
-use super::query::convert_query_to_select;
+use super::query::{convert_query_to_select, convert_set_expr_to_select};
 use super::{convert_data_type, ident_name, object_name, parse_error, unsupported};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
@@ -47,6 +47,15 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         } => Ok(Expr::InList {
             expr: Box::new(convert_expr(expr)?),
             list: list.iter().map(convert_expr).collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
+        sql::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
+            expr: Box::new(convert_expr(expr)?),
+            subquery: Box::new(convert_set_expr_to_select((**subquery).clone())?),
             negated: *negated,
         }),
         sql::Expr::Between {

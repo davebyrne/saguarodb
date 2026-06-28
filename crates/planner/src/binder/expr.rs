@@ -50,6 +50,11 @@ pub(super) fn bind_expr(
             list,
             negated,
         } => bind_in_list(ctx, expr, list, *negated),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => bind_in_subquery(ctx, expr, subquery, *negated),
         Expr::Between {
             expr,
             low,
@@ -111,6 +116,34 @@ fn bind_scalar_subquery(ctx: &mut BindContext, select: &SelectStatement) -> Resu
     Ok(BoundExpr::ScalarSubquery {
         select: Box::new(bound),
         data_type,
+        nullable: true,
+    })
+}
+
+/// `expr [NOT] IN (SELECT ...)` over a single-column subquery. The left operand
+/// is type-checked against the subquery's column type (no implicit casts); a bare
+/// `NULL` left operand is typed from the subquery column. The result is boolean
+/// and nullable (SQL `IN` three-valued logic can yield `NULL`).
+fn bind_in_subquery(
+    ctx: &mut BindContext,
+    expr: &Expr,
+    subquery: &SelectStatement,
+    negated: bool,
+) -> Result<BoundExpr> {
+    let select = bind_subquery_select(ctx, subquery)?;
+    let column_type = single_subquery_column(&select)?.data_type.clone();
+    let left = if matches!(expr, Expr::Literal(Value::Null)) {
+        bind_expr(ctx, expr, Some(column_type))?
+    } else {
+        let left = bind_expr(ctx, expr, None)?;
+        require_type(&left, column_type)?;
+        left
+    };
+    Ok(BoundExpr::InSubquery {
+        expr: Box::new(left),
+        select: Box::new(select),
+        negated,
+        data_type: DataType::Boolean,
         nullable: true,
     })
 }

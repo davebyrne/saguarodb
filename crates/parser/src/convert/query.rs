@@ -32,6 +32,17 @@ pub(super) fn convert_query_to_select(query: sql::Query) -> Result<SelectStateme
     convert_select(*select, order_by, limit, offset)
 }
 
+/// Convert a subquery body (`Box<SetExpr>`, as carried by `IN (subquery)`) into a
+/// `SelectStatement`. A bare `SELECT` has no ORDER BY / LIMIT of its own; a
+/// parenthesized query may, so it is routed through the full query converter.
+pub(super) fn convert_set_expr_to_select(set_expr: sql::SetExpr) -> Result<SelectStatement> {
+    match set_expr {
+        sql::SetExpr::Select(select) => convert_select(*select, Vec::new(), None, None),
+        sql::SetExpr::Query(query) => convert_query_to_select(*query),
+        _ => unsupported("unsupported subquery body"),
+    }
+}
+
 fn convert_select(
     select: sql::Select,
     order_by: Vec<OrderByItem>,

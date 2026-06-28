@@ -2109,6 +2109,57 @@ async fn e2e_scalar_subquery_in_projection_and_where() {
 }
 
 #[tokio::test]
+async fn e2e_in_and_not_in_subquery_null_semantics() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table vals (id integer primary key, v integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into vals (id, v) values (10, 1), (20, 3)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id from users where id in (select v from vals) order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]
+    );
+
+    // NOT IN with no NULL keeps the non-members.
+    let rows = server
+        .simple_query("select id from users where id not in (select v from vals) order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // A NULL in the subquery makes NOT IN never true: no rows.
+    server
+        .simple_query("insert into vals (id, v) values (30, null)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where id not in (select v from vals)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty(), "got {rows:?}");
+}
+
+#[tokio::test]
 async fn e2e_plain_and_distinct_aggregate_coexist_in_one_select() {
     let server = TestServer::start().await.unwrap();
     server

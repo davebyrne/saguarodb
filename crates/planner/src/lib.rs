@@ -334,6 +334,43 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_in_subquery() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select name from users where id in (select id from accounts)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            select.filter,
+            Some(BoundExpr::InSubquery {
+                negated: false,
+                data_type: DataType::Boolean,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn binder_rejects_in_subquery_type_mismatch() {
+        // `name` is TEXT but the subquery column `id` is INTEGER; no implicit cast.
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select id from users where name in (select id from accounts)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_rejects_multi_column_in_subquery() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt =
+            parse("select id from users where id in (select id, owner from accounts)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_rejects_composite_primary_key_for_v1() {
         let catalog = catalog_with_users();
         let stmt =
