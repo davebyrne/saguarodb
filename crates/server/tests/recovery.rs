@@ -1571,3 +1571,61 @@ fn corrupt_heap_pages(data_dir: &Path) {
         file.sync_all().unwrap();
     }
 }
+
+/// A committed transaction with a rolled-back savepoint survives a restart: the
+/// top-level and re-established-savepoint rows are present, and the rolled-back
+/// subxid's row stays hidden (its Abort record is made durable by the commit's
+/// flush, and the CommitWithSubxids record commits only the live subxids).
+#[tokio::test]
+async fn savepoint_commit_with_rollback_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table t (id integer primary key)").await;
+        conn.ok("begin").await;
+        conn.ok("insert into t (id) values (1)").await; // top-level
+        conn.ok("savepoint s").await;
+        conn.ok("insert into t (id) values (2)").await; // under s
+        conn.ok("rollback to savepoint s").await; // discards 2
+        conn.ok("insert into t (id) values (3)").await; // under re-established s
+        conn.ok("commit").await;
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]],
+        "committed top + re-established-savepoint rows survive; the rolled-back row is hidden"
+    );
+}
+
+/// A released savepoint's row survives a restart (it commits with the parent via
+/// the CommitWithSubxids record).
+#[tokio::test]
+async fn released_savepoint_row_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table t (id integer primary key)").await;
+        conn.ok("begin").await;
+        conn.ok("savepoint s").await;
+        conn.ok("insert into t (id) values (1)").await;
+        conn.ok("release savepoint s").await;
+        conn.ok("commit").await;
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}

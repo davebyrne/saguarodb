@@ -1311,3 +1311,60 @@ async fn savepoint_rejected_in_extended_protocol() {
     assert!(err.message.contains("C=0A000"), "message: {}", err.message);
     conn.ok("rollback").await;
 }
+
+// --- savepoints: cross-transaction visibility ---
+
+/// A released subtransaction's row stays invisible to a concurrent transaction
+/// until the top commits (no dirty read — the released subxid is still
+/// registered/in-progress), then becomes visible.
+#[tokio::test]
+async fn released_subxid_row_is_invisible_until_top_commits() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup.ok("create table t (id integer primary key)").await;
+
+    let mut a = Connection::connect(&server).await.unwrap();
+    a.ok("begin").await;
+    a.ok("savepoint s").await;
+    a.ok("insert into t (id) values (1)").await;
+    a.ok("release savepoint s").await; // released, but the top has NOT committed
+
+    // A concurrent reader must not see the released-but-uncommitted row.
+    let mut b = Connection::connect(&server).await.unwrap();
+    assert!(
+        b.ok("select id from t").await.rows().is_empty(),
+        "a released subxid's row must be invisible before the top commits"
+    );
+
+    a.ok("commit").await;
+    // Once the top commits, a fresh read sees the released row.
+    assert_eq!(
+        b.ok("select id from t").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+/// After a transaction with savepoints commits, another transaction sees exactly
+/// its released rows and never its rolled-back ones.
+#[tokio::test]
+async fn committed_savepoint_txn_exposes_released_hides_rolled_back() {
+    let server = TestServer::start().await.unwrap();
+    let mut a = Connection::connect(&server).await.unwrap();
+    a.ok("create table t (id integer primary key)").await;
+
+    a.ok("begin").await;
+    a.ok("savepoint keep").await;
+    a.ok("insert into t (id) values (1)").await;
+    a.ok("release savepoint keep").await; // 1 is kept
+    a.ok("savepoint drop_it").await;
+    a.ok("insert into t (id) values (2)").await;
+    a.ok("rollback to savepoint drop_it").await; // 2 is rolled back
+    a.ok("commit").await;
+
+    let mut b = Connection::connect(&server).await.unwrap();
+    assert_eq!(
+        b.ok("select id from t").await.rows(),
+        vec![vec![Some("1".to_string())]],
+        "the released row is visible; the rolled-back row is not"
+    );
+}
