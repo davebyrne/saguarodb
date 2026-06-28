@@ -69,7 +69,7 @@ pub enum UniqueConflict {
 /// `docs/specs/mvcc.md` §7.3. Given a candidate index version with creator `xmin`
 /// and deleter `xmax`, decide whether it blocks `current_txn` claiming the same
 /// unique key, and if so whether the conflict is **definite** ([`UniqueConflict::Violation`])
-/// or **in-flight** ([`UniqueConflict::InFlight`]).
+/// or **in-flight** ([`UniqueConflict::WouldBlock`]).
 ///
 /// This builds on the liveness logic of [`version_conflicts`] (the same "dirty",
 /// non-snapshot CLOG + hint-bit check; do not route it through [`is_visible`]) and

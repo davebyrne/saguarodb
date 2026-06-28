@@ -57,7 +57,7 @@ pub struct StatementContext {
     pub isolation: IsolationLevel,
     /// Blocks this statement when it hits an in-progress row-lock conflict, until
     /// the holder finishes (`docs/specs/deadlock.md`). The default
-    /// ([`NoConflictWaiter`]) errors if ever asked to wait; the server installs the
+    /// (`NoConflictWaiter`) errors if ever asked to wait; the server installs the
     /// real lock manager on write-capable contexts.
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
     /// The per-statement cancel flag, shared with the connection (set by a client

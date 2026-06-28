@@ -448,9 +448,9 @@ fn conflict_is_not_snapshot_relative() {
 // --- classify_unique_conflict (3-way concurrent-inserter resolution, §7.3) ---
 //
 // The boolean `version_conflicts` is just `classify != None`; these tests pin
-// the Violation-vs-InFlight split it cannot express. A creator that is committed
+// the Violation-vs-WouldBlock split it cannot express. A creator that is committed
 // / own / frozen is a definite duplicate (Violation ⇒ 23505); a creator that is
-// ANOTHER still-running txn is undecidable (InFlight ⇒ 40001).
+// ANOTHER still-running txn is undecidable (WouldBlock ⇒ block on it).
 
 #[test]
 fn classify_aborted_creator_is_none() {
@@ -592,7 +592,7 @@ fn classify_matches_version_conflicts_boolean() {
     ]);
     for (xmin, xmax) in [
         (7u64, INVALID_XID), // committed-live  -> Violation -> conflict
-        (8, INVALID_XID),    // in-progress     -> InFlight  -> conflict
+        (8, INVALID_XID),    // in-progress     -> WouldBlock -> conflict
         (9, INVALID_XID),    // aborted creator -> None      -> no conflict
         (7, 9),              // committed, aborted delete -> Violation -> conflict
     ] {
