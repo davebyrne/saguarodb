@@ -634,7 +634,8 @@ fn literal_key(expr: &BoundExpr) -> Option<Value> {
                 | Value::Text(_)
                 | Value::Boolean(_)
                 | Value::Date(_)
-                | Value::Timestamp(_),
+                | Value::Timestamp(_)
+                | Value::Bytes(_),
             ..
         } => {
             let BoundExpr::Literal { value, .. } = expr else {

@@ -176,6 +176,9 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         ) => common::datetime::parse_timestamp(text)
             .map(|micros| Expr::Literal(Value::Timestamp(micros)))
             .ok_or_else(|| parse_error(format!("invalid timestamp literal: \"{text}\""))),
+        sql::DataType::Bytea => common::bytea::parse_hex(text)
+            .map(|raw| Expr::Literal(Value::Bytes(raw)))
+            .ok_or_else(|| parse_error(format!("invalid bytea literal: \"{text}\""))),
         _ => unsupported("unsupported typed literal"),
     }
 }

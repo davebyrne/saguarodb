@@ -1,3 +1,4 @@
+pub mod bytea;
 pub mod concurrency;
 pub mod context;
 pub mod copy;

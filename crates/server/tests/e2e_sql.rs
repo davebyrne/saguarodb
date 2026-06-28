@@ -736,6 +736,114 @@ async fn e2e_timestamp_primary_key_uses_index() {
 }
 
 #[tokio::test]
+async fn e2e_bytea_type_round_trips_orders_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table blobs (id integer primary key, data bytea)")
+        .await
+        .unwrap();
+    // \xdeadbeef, a single 0x00 byte, and the empty byte string.
+    for (id, hex) in [(1, "\\xdeadbeef"), (2, "\\x00"), (3, "\\x")] {
+        server
+            .simple_query(&format!(
+                "insert into blobs (id, data) values ({id}, BYTEA '{hex}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Hex output, ordered lexicographically: "" < 0x00 < 0xdeadbeef.
+    let rows = server
+        .simple_query("select id, data from blobs order by data")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("3".to_string()), Some("\\x".to_string())],
+            vec![Some("2".to_string()), Some("\\x00".to_string())],
+            vec![Some("1".to_string()), Some("\\xdeadbeef".to_string())],
+        ]
+    );
+
+    // Equality against a bytea literal.
+    let rows = server
+        .simple_query("select id from blobs where data = BYTEA '\\xdeadbeef'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // CAST bytea <-> text (text form is the hex string).
+    let rows = server
+        .simple_query("select cast(data as text) from blobs where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("\\xdeadbeef".to_string())]]);
+    let rows = server
+        .simple_query("select id from blobs where data = cast('\\x00' as bytea)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // Odd-length hex is rejected at parse time.
+    let err = server
+        .simple_query("insert into blobs (id, data) values (9, BYTEA '\\xabc')")
+        .await
+        .err()
+        .expect("odd-length bytea literal should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("bytea"),
+        "got: {}",
+        err.message
+    );
+
+    // No implicit cast: a plain string into a BYTEA column is a type mismatch.
+    let err = server
+        .simple_query("insert into blobs (id, data) values (9, 'hello')")
+        .await
+        .err()
+        .expect("string into bytea column should be rejected");
+    assert!(
+        err.message.contains("42804"),
+        "expected datatype_mismatch, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn e2e_bytea_primary_key_uses_index() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table k (h bytea primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into k (h, note) values (BYTEA '\\x0102', 'a')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from k where h = BYTEA '\\x0102'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "BYTEA primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query("select note from k where h = BYTEA '\\x0102'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("a".to_string())]]);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

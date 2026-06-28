@@ -12,6 +12,8 @@ pub enum DataType {
     /// `TIMESTAMP` (without time zone), value carried as `Value::Timestamp`
     /// (microseconds from epoch).
     Timestamp,
+    /// `BYTEA` — raw byte string, value carried as `Value::Bytes`.
+    Bytea,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

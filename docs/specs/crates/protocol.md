@@ -157,6 +157,7 @@ The codec may return errors after buffering bytes. The server treats any decode 
 - `Boolean` -> `BOOL` (`type_oid = 16`, `type_size = 1`)
 - `Date` -> `DATE` (`type_oid = 1082`, `type_size = 4`)
 - `Timestamp` -> `TIMESTAMP` (`type_oid = 1114`, `type_size = 8`)
+- `Bytes` -> `BYTEA` (`type_oid = 17`, `type_size = -1`)
 
 The public helper `type_oid(data_type: &DataType) -> i32` returns the OID for a
 data type (used when building `RowDescription` and `ParameterDescription`).
@@ -219,6 +220,7 @@ Text value encoding:
 - `Boolean`: `t` for true, `f` for false.
 - `Date`: `YYYY-MM-DD`.
 - `Timestamp`: `YYYY-MM-DD HH:MM:SS[.ffffff]` (fractional seconds only when non-zero).
+- `Bytea`: hex `\x` followed by lowercase hex digits (two per byte).
 - `NULL`: encoded as a `DataRow` field length of `-1`.
 
 Binary value encoding (extended protocol, format code `1`):
@@ -228,6 +230,7 @@ Binary value encoding (extended protocol, format code `1`):
 - `Text`: raw UTF-8 bytes (identical to text format).
 - `Date`: 4-byte big-endian `int32` day count from 2000-01-01 (PostgreSQL's date epoch), converted to/from the internal Unix-epoch day count.
 - `Timestamp`: 8-byte big-endian `int64` microsecond count from 2000-01-01 00:00:00 (PostgreSQL's timestamp epoch), converted to/from the internal Unix-epoch microsecond count.
+- `Bytea`: the raw bytes (identical to the stored value).
 - `NULL`: `DataRow` field length of `-1`.
 
 `encode_value`/`decode_value` convert between `common::Value` and these wire

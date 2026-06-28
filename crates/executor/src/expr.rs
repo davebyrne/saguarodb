@@ -164,6 +164,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Text(left), Value::Text(right)) => left.cmp(right),
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
+        (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
     };
 
@@ -461,6 +462,11 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
         (Value::Text(value), DataType::Timestamp) => common::datetime::parse_timestamp(&value)
             .map(Value::Timestamp)
             .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid timestamp cast")),
+        (Value::Bytes(raw), DataType::Bytea) => Ok(Value::Bytes(raw)),
+        (Value::Bytes(raw), DataType::Text) => Ok(Value::Text(common::bytea::format_hex(&raw))),
+        (Value::Text(value), DataType::Bytea) => common::bytea::parse_hex(&value)
+            .map(Value::Bytes)
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid bytea cast")),
         _ => datatype_mismatch("unsupported cast"),
     }
 }

@@ -59,15 +59,18 @@ pub enum Value {
     Text(String),
     Date(i64),       // days from the Unix epoch (1970-01-01)
     Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
+    Bytes(Vec<u8>),  // BYTEA, raw bytes
 }
 ```
 
-`Value::Date` and `Value::Timestamp` are backed by `i64`, so the derived
-`Ord`/`Hash` give correct chronological ordering and key/dedup behavior. The
-`datetime` module provides the proleptic Gregorian calendar conversions and the
-`YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format helpers
-(`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
-`parse_timestamp`, `format_timestamp`) shared by the parser, executor, protocol,
+`Value::Date` and `Value::Timestamp` are backed by `i64`, and `Value::Bytes` by
+`Vec<u8>`, so the derived `Ord`/`Hash` give correct chronological / lexicographic
+ordering and key/dedup behavior. The `datetime` module provides the proleptic
+Gregorian calendar conversions and the `YYYY-MM-DD` / `YYYY-MM-DD
+HH:MM:SS[.ffffff]` parse/format helpers (`days_from_civil`, `civil_from_days`,
+`parse_date`, `format_date`, `parse_timestamp`, `format_timestamp`); the `bytea`
+module provides the hex `\x...` parse/format helpers (`parse_hex`, `format_hex`,
+hex-only — no legacy escape). Both are shared by the parser, executor, protocol,
 and COPY paths; there is no external date/time dependency.
 
 ```rust
@@ -111,6 +114,7 @@ pub enum DataType {
     Boolean,
     Date,
     Timestamp,
+    Bytea,
 }
 
 pub struct ParsedColumnDef {

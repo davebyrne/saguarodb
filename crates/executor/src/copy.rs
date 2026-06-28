@@ -131,6 +131,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
             .ok_or_else(|| {
                 invalid_value(format!("invalid input syntax for timestamp: \"{text}\""))
             }),
+        DataType::Bytea => common::bytea::parse_hex(text)
+            .map(Value::Bytes)
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for bytea: \"{text}\""))),
     }
 }
 
@@ -367,6 +370,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Text(text) => Some(text.clone()),
         Value::Date(days) => Some(common::datetime::format_date(*days)),
         Value::Timestamp(micros) => Some(common::datetime::format_timestamp(*micros)),
+        Value::Bytes(raw) => Some(common::bytea::format_hex(raw)),
     }
 }
 

@@ -12,6 +12,8 @@ pub enum Value {
     /// `TIMESTAMP` (without time zone), stored as microseconds from the Unix epoch
     /// (1970-01-01 00:00:00 = 0). i64-backed, like `Date`.
     Timestamp(i64),
+    /// `BYTEA` — a raw byte string. `Vec<u8>` ordering/hashing are lexicographic.
+    Bytes(Vec<u8>),
 }
 
 /// Parse PostgreSQL boolean input text, returning `None` for unrecognized input

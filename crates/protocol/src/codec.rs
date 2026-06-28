@@ -550,6 +550,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
                 .to_be_bytes()
                 .to_vec(),
         },
+        Value::Bytes(raw) => match format {
+            // PostgreSQL text `bytea` is the hex format `\x...`; binary is the raw bytes.
+            ValueFormat::Text => common::bytea::format_hex(raw).into_bytes(),
+            ValueFormat::Binary => raw.clone(),
+        },
     };
     Ok(Some(bytes))
 }
@@ -630,6 +635,13 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
             ))
         }
+        (DataType::Bytea, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "bytea parameter")?;
+            common::bytea::parse_hex(text)
+                .map(Value::Bytes)
+                .ok_or_else(|| protocol_error("invalid bytea parameter"))
+        }
+        (DataType::Bytea, ValueFormat::Binary) => Ok(Value::Bytes(bytes.to_vec())),
     }
 }
 
@@ -650,6 +662,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Boolean => (16, 1),
         DataType::Date => (1082, 4),
         DataType::Timestamp => (1114, 8),
+        DataType::Bytea => (17, -1),
     }
 }
 
@@ -768,5 +781,38 @@ mod timestamp_value_tests {
     #[test]
     fn invalid_timestamp_text_is_rejected() {
         assert!(decode_value(b"2024-01-15 25:00:00", DataType::Timestamp, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod bytea_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    #[test]
+    fn bytea_text_is_hex_and_round_trips() {
+        let value = Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]);
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"\\xdeadbeef");
+        assert_eq!(decode_value(&text, DataType::Bytea, 0).unwrap(), value);
+        // Empty bytea is `\x`.
+        assert_eq!(
+            encode_value(&Value::Bytes(vec![]), 0).unwrap().unwrap(),
+            b"\\x"
+        );
+    }
+
+    #[test]
+    fn bytea_binary_is_raw_bytes_and_round_trips() {
+        let value = Value::Bytes(vec![0x00, 0xff, 0x10]);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, vec![0x00, 0xff, 0x10]);
+        assert_eq!(decode_value(&binary, DataType::Bytea, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_bytea_text_is_rejected() {
+        assert!(decode_value(b"\\xabc", DataType::Bytea, 0).is_err()); // odd length
+        assert!(decode_value(b"nothex", DataType::Bytea, 0).is_err());
     }
 }

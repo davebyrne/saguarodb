@@ -400,6 +400,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Text(_) => Some(DataType::Text),
         Value::Date(_) => Some(DataType::Date),
         Value::Timestamp(_) => Some(DataType::Timestamp),
+        Value::Bytes(_) => Some(DataType::Bytea),
     }
 }
 

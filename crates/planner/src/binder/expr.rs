@@ -129,6 +129,7 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Text(_) => (DataType::Text, false),
         Value::Date(_) => (DataType::Date, false),
         Value::Timestamp(_) => (DataType::Timestamp, false),
+        Value::Bytes(_) => (DataType::Bytea, false),
     };
     Ok(BoundExpr::Literal {
         value: value.clone(),
