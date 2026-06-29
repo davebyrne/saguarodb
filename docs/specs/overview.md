@@ -13,8 +13,8 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - PostgreSQL simple query wire protocol (abstracted for future custom protocol)
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
-- Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, and `DEFAULT nextval('<sequence>')` constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms. `SERIAL` is tracked in `docs/specs/sequences.md` but is not part of the implemented subset until its later task lands.
+- Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced; `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')`), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
+- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, and `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -710,7 +710,7 @@ All three phases are separate modules within the `planner` crate. All three are 
 
 ### Phase 1: Binder
 
-The binder performs semantic analysis and name resolution. Its output is a `BoundStatement` — a validated, ID-resolved, slot-assigned representation of the query. No downstream phase does table, column, or index name lookups. `DROP SEQUENCE` intentionally carries the normalized sequence name plus `IF EXISTS` through planning so prepared statements resolve existence at execution time. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
+The binder performs semantic analysis and name resolution. Its output is a `BoundStatement` — a validated, ID-resolved, slot-assigned representation of the query. No downstream phase does table, column, or index name lookups for ordinary DML. Two DDL cases intentionally defer name work to execution: `DROP SEQUENCE` carries the normalized sequence name plus `IF EXISTS` through planning so prepared statements resolve existence at execution time, and `CREATE TABLE` with `SERIAL` chooses owned sequence names at execution time so prepared DDL observes current sequence-name collisions. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
 
 The binder:
 - Resolves table names to `TableId` via the catalog
@@ -721,10 +721,17 @@ The binder:
 - Expands `SELECT *` into explicit column lists
 
 ```rust
-/// Fully resolved statement. All names resolved, all types checked,
-/// all column references assigned physical slot positions.
+/// Fully resolved statement. Names are resolved except for documented
+/// execution-time DDL cases; all types are checked and all column references are
+/// assigned physical slot positions.
 pub enum BoundStatement {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable {
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
+        serial: Vec<SerialColumn>,
+    },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
@@ -902,7 +909,13 @@ Translates a `BoundStatement` into a `LogicalPlan` — relational algebra descri
 ```rust
 pub enum LogicalPlan {
     // DDL — passes through to physical plan unchanged
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable {
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
+        serial: Vec<SerialColumn>,
+    },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
@@ -967,7 +980,13 @@ Translates a `LogicalPlan` into a `PhysicalPlan` — chooses access methods and 
 ```rust
 pub enum PhysicalPlan {
     // DDL
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable {
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
+        serial: Vec<SerialColumn>,
+    },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
@@ -1712,7 +1731,7 @@ pub struct TableSchema {
 
 `ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only.
 
-The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` is resolved by name at execution time to preserve extended-protocol prepared-statement semantics.
+The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` resolves by name at execution time to preserve extended-protocol prepared-statement semantics, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
 ### Catalog Trait
 

@@ -607,6 +607,60 @@ mod tests {
     }
 
     #[test]
+    fn owned_sequence_drop_and_explicit_default_are_rejected() {
+        let catalog = MemoryCatalog::empty();
+        let sequence = catalog
+            .create_sequence("users_id_seq".to_string(), SequenceOptions::default(), true)
+            .unwrap();
+
+        let err = catalog.drop_sequence(sequence.id).unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+
+        let err = catalog
+            .create_table(
+                "borrower".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                }],
+                vec!["id".to_string()],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+    }
+
+    #[test]
+    fn create_table_accepts_internal_owned_nextval_default() {
+        let catalog = MemoryCatalog::empty();
+        let sequence = catalog
+            .create_sequence("users_id_seq".to_string(), SequenceOptions::default(), true)
+            .unwrap();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: Some(common::ParsedDefault::OwnedNextval(
+                        "users_id_seq".to_string(),
+                    )),
+                }],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            schema.columns[0].default,
+            Some(ColumnDefault::Nextval(sequence.id))
+        );
+    }
+
+    #[test]
     fn try_from_snapshot_accepts_composite_primary_key() {
         let schema = TableSchema {
             id: 3,

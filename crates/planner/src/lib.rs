@@ -10,7 +10,7 @@ mod simplify;
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect,
-    BoundSelectItem, BoundStatement,
+    BoundSelectItem, BoundStatement, SerialColumn,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -372,6 +372,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn binder_records_serial_columns() {
+        let catalog = MemoryCatalog::empty();
+        let stmt = parse("create table users (id serial primary key, name text)").unwrap();
+        let BoundStatement::CreateTable { serial, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(
+            serial,
+            vec![SerialColumn {
+                column: "id".to_string(),
+                index: 0,
+            }]
+        );
     }
 
     #[test]

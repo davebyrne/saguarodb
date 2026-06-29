@@ -227,6 +227,175 @@ async fn drop_sequence_referenced_by_default_is_rejected() {
 }
 
 #[tokio::test]
+async fn serial_creates_owned_sequence_and_drop_table_removes_it() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id serial primary key, name text)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("insert into users (name) values ('Ada') returning id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("insert into users (name) values ('Grace') returning id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string())]]
+    );
+
+    let err = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("owned sequence drop should fail");
+    assert!(
+        err.message.contains("2BP01"),
+        "expected DependentObjectsStillExist: {}",
+        err.message
+    );
+
+    server.simple_query("drop table users").await.unwrap();
+    let err = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("owned sequence should be gone after DROP TABLE");
+    assert!(
+        err.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn serial_uses_suffixed_sequence_name_when_default_collides() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create sequence users_id_seq")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table users (id serial primary key, name text)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("insert into users (name) values ('Ada') returning id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    // The explicitly created sequence was not borrowed by the SERIAL default.
+    assert_eq!(
+        server
+            .simple_query("select nextval('users_id_seq') from users")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("insert into users (name) values ('Grace') returning id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn prepared_serial_chooses_sequence_name_at_execute_time() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let prepare = conn
+        .prepare(
+            "create_users",
+            "create table users (id serial primary key, name text)",
+        )
+        .await
+        .unwrap();
+    assert!(prepare.result.is_ok(), "prepare failed");
+
+    assert!(
+        conn.ok("create sequence users_id_seq").await.result.is_ok(),
+        "create sequence failed"
+    );
+    let create = conn.execute_prepared("create_users").await.unwrap();
+    assert!(
+        create.result.is_ok(),
+        "prepared create failed: {:?}",
+        create.result.err()
+    );
+    assert_eq!(
+        conn.query("insert into users (name) values ('Ada') returning id")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+    // The explicitly created sequence was not borrowed by the prepared SERIAL DDL.
+    assert_eq!(
+        conn.query("select nextval('users_id_seq') from users")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn duplicate_column_name_with_serial_is_a_normal_ddl_error() {
+    let server = TestServer::start().await.unwrap();
+
+    let err = server
+        .simple_query("create table users (id integer, id serial, primary key (id))")
+        .await
+        .err()
+        .expect("duplicate column should fail");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError, not an internal error: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn explicit_default_cannot_borrow_serial_owned_sequence() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id serial primary key)")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("create table posts (id integer primary key default nextval('users_id_seq'))")
+        .await
+        .err()
+        .expect("explicit default should not borrow owned sequence");
+    assert!(
+        err.message.contains("2BP01"),
+        "expected DependentObjectsStillExist: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn sequence_ddl_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

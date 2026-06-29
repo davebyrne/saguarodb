@@ -103,6 +103,46 @@ async fn sequence_advances_survive_restart_with_checkpoint_and_wal() {
 }
 
 #[tokio::test]
+async fn serial_sequence_survives_restart_with_checkpoint_and_wal() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id serial primary key, name text)")
+            .await
+            .unwrap();
+        assert_eq!(
+            server
+                .simple_query("insert into users (name) values ('Ada') returning id")
+                .await
+                .unwrap()
+                .unwrap_rows(),
+            vec![vec![Some("1".to_string())]]
+        );
+        server.force_checkpoint().await.unwrap();
+        assert_eq!(
+            server
+                .simple_query("insert into users (name) values ('Grace') returning id")
+                .await
+                .unwrap()
+                .unwrap_rows(),
+            vec![vec![Some("2".to_string())]]
+        );
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("insert into users (name) values ('Lin') returning id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("3".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn committed_multi_statement_transaction_survives_restart() {
     // A committed explicit transaction's statements all share one txn_id with a
     // single durable Commit. Redo-all replays every record and the CLOG marks the

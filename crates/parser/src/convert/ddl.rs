@@ -253,6 +253,7 @@ fn convert_column_def(
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
     let mut default = None;
+    let serial = super::is_serial_type(&column.data_type)?;
 
     for option in &column.options {
         if option.name.is_some() {
@@ -263,6 +264,9 @@ fn convert_column_def(
             sql::ColumnOption::Null => nullable = true,
             sql::ColumnOption::NotNull => nullable = false,
             sql::ColumnOption::Default(expr) => {
+                if serial {
+                    return unsupported("SERIAL columns cannot specify an explicit DEFAULT");
+                }
                 if default.is_some() {
                     return unsupported("column has more than one DEFAULT");
                 }
@@ -290,10 +294,22 @@ fn convert_column_def(
 
     Ok(ParsedColumnDef {
         name: ident_name(&column.name)?,
-        data_type: convert_data_type(&column.data_type)?,
-        nullable,
-        max_length: column_char_length(&column.data_type)?,
-        default,
+        data_type: if serial {
+            common::DataType::Integer
+        } else {
+            convert_data_type(&column.data_type)?
+        },
+        nullable: if serial { false } else { nullable },
+        max_length: if serial {
+            None
+        } else {
+            column_char_length(&column.data_type)?
+        },
+        default: if serial {
+            Some(ParsedDefault::Serial)
+        } else {
+            default
+        },
     })
 }
 

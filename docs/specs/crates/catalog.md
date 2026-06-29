@@ -128,7 +128,7 @@ without installing a schema.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
-- A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time.
+- A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. User-written `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`, but cannot reference a sequence marked `owned`. Internal `ParsedDefault::OwnedNextval(name)` is accepted only for an owned sequence created by `SERIAL` desugaring. A remaining `ParsedDefault::Serial` marker is an internal error because execution must replace it before calling the catalog. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 - `UNIQUE` column / table constraints are not stored on the table schema; the executor creates a unique index per constraint immediately after the table (PostgreSQL-style auto name `<table>_<col...>_key`), reusing the normal `create_index` path (catalog + storage + `CreateIndex` WAL record). Recovery replays the `CreateTable` then `CreateIndex` records in order.
 
@@ -147,6 +147,10 @@ without installing a schema.
   min/max range are rejected with `SqlState::InvalidParameterValue` (`22023`).
 - `last_value` is initialized to `START` and `is_called` to `false`.
 - `CACHE` is parser input only and is ignored by the catalog.
+- `owned = true` is used only for sequences created by `SERIAL` desugaring.
+  `DROP SEQUENCE` rejects owned sequences with
+  `SqlState::DependentObjectsStillExist`; `DROP TABLE` removes the table and its
+  owned sequences in the same statement.
 
 ## Create Index Rules
 
@@ -157,7 +161,7 @@ without installing a schema.
 - Index columns keep the order written.
 - `IndexId` is assigned from `next_index_id`, starting at `PRIMARY_KEY_INDEX_ID + 1`.
 - The `unique` flag is recorded here; duplicate-value rejection for unique indexes happens at the storage layer, not in the catalog.
-- Dropping a table cascades in the catalog to remove every index on that table. The same cascade runs on the recovery `apply_drop_table` path, so the durable `DropTable` record alone restores the post-drop state.
+- Dropping a table cascades in the catalog to remove every index on that table. Owned SERIAL sequences are removed by separate `DropSequence` records emitted by the executor in the same statement. The index cascade runs on the recovery `apply_drop_table` path, so the durable `DropTable` record alone restores table/index state while the sibling `DropSequence` records restore owned-sequence state.
 
 ## Catalog Persistence
 
@@ -169,10 +173,9 @@ On startup:
 2. Catalog deserializes into memory.
 3. Recovery replays committed post-checkpoint `CreateTable`, `DropTable`,
    `CreateIndex`, `DropIndex`, `CreateSequence`, and `DropSequence` records.
-   Table/index records update both catalog and storage; sequence records update
-   catalog only. Aborted or in-flight create records are not installed, but
-   recovery still calls the matching `reserve_*_id` method so IDs are never
-   reused.
+   Table/index/sequence records update both catalog and storage. Aborted or
+   in-flight create records are not installed, but recovery still calls the
+   matching `reserve_*_id` method so IDs are never reused.
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
@@ -218,6 +221,7 @@ Recovery apply methods must update catalog state consistently with storage state
 - Serialization round-trip preserves indexes and `next_index_id`; a snapshot without index fields loads as an empty index set.
 - Snapshot validation rejects an index that references a missing table, uses the reserved primary-key index ID, or carries a stale `next_index_id`.
 - Create/drop sequence assigns monotonically increasing sequence IDs, validates
-  sequence options, rejects drops while a column default references the sequence,
-  persists through snapshot round-trip, and a snapshot without sequence fields
-  loads as an empty sequence set.
+  sequence options, rejects drops while a column default references the sequence
+  or the sequence is owned by `SERIAL`, rejects explicit defaults that borrow an
+  owned sequence, persists through snapshot round-trip, and a snapshot without
+  sequence fields loads as an empty sequence set.

@@ -380,6 +380,16 @@ impl CatalogManager for MemoryCatalog {
 
     fn drop_sequence(&self, id: SequenceId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot
+            .sequences_by_id
+            .get(&id)
+            .ok_or_else(|| undefined_sequence_id(id))?;
+        if schema.owned {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!("cannot drop owned sequence {}", schema.name),
+            ));
+        }
         reject_referenced_sequence(&snapshot, id)?;
         let schema = snapshot
             .sequences_by_id
@@ -481,22 +491,43 @@ fn convert_column_default(
 ) -> Result<Option<ColumnDefault>> {
     match default {
         Some(ParsedDefault::Const(value)) => Ok(Some(ColumnDefault::Const(value))),
-        Some(ParsedDefault::Nextval(name)) => {
-            let id = snapshot.sequences_by_name.get(&name).ok_or_else(|| {
-                DbError::plan(
-                    SqlState::UndefinedTable,
-                    format!("sequence {name} does not exist"),
-                )
-            })?;
-            if !snapshot.sequences_by_id.contains_key(id) {
-                return Err(DbError::internal(format!(
-                    "catalog sequence name {name} points to missing sequence id {id}",
-                )));
-            }
-            Ok(Some(ColumnDefault::Nextval(*id)))
-        }
+        Some(ParsedDefault::Serial) => Err(DbError::internal(
+            "unresolved SERIAL default reached catalog create_table",
+        )),
+        Some(ParsedDefault::Nextval(name)) => resolve_sequence_default(snapshot, name, false),
+        Some(ParsedDefault::OwnedNextval(name)) => resolve_sequence_default(snapshot, name, true),
         None => Ok(None),
     }
+}
+
+fn resolve_sequence_default(
+    snapshot: &CatalogSnapshot,
+    name: String,
+    allow_owned: bool,
+) -> Result<Option<ColumnDefault>> {
+    let id = snapshot.sequences_by_name.get(&name).ok_or_else(|| {
+        DbError::plan(
+            SqlState::UndefinedTable,
+            format!("sequence {name} does not exist"),
+        )
+    })?;
+    let sequence = snapshot.sequences_by_id.get(id).ok_or_else(|| {
+        DbError::internal(format!(
+            "catalog sequence name {name} points to missing sequence id {id}",
+        ))
+    })?;
+    if sequence.owned && !allow_owned {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!("sequence {name} is owned by a SERIAL column"),
+        ));
+    }
+    if allow_owned && !sequence.owned {
+        return Err(DbError::internal(format!(
+            "SERIAL default {name} resolved to a non-owned sequence"
+        )));
+    }
+    Ok(Some(ColumnDefault::Nextval(*id)))
 }
 
 fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) -> Result<()> {

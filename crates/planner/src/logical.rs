@@ -4,7 +4,7 @@ use common::{
 
 use crate::{
     AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
-    BoundOrderByItem, BoundReturning, BoundSelect, BoundStatement, JoinType,
+    BoundOrderByItem, BoundReturning, BoundSelect, BoundStatement, JoinType, SerialColumn,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +14,7 @@ pub enum LogicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
+        serial: Vec<SerialColumn>,
     },
     DropTable {
         table: TableId,
@@ -112,11 +113,13 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns,
             primary_key,
             unique,
+            serial,
         } => Ok(LogicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
+            serial: serial.clone(),
         }),
         BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
         BoundStatement::CreateIndex {

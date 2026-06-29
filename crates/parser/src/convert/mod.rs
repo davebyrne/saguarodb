@@ -341,6 +341,21 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
     }
 }
 
+pub(super) fn is_serial_type(data_type: &sql::DataType) -> Result<bool> {
+    let sql::DataType::Custom(name, modifiers) = data_type else {
+        return Ok(false);
+    };
+    let name = object_name(name)?;
+    let serial = matches!(
+        name.as_str(),
+        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+    );
+    if serial && !modifiers.is_empty() {
+        return unsupported("SERIAL type modifiers are not supported");
+    }
+    Ok(serial)
+}
+
 /// Validate a NUMERIC/DECIMAL type modifier and return `(precision, scale)`:
 /// precision must be `1..=28` (our `Decimal` limit) and scale `0..=precision`.
 /// Shared by the column-type, `CAST`, and typed-literal paths so all three reject

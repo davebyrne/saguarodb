@@ -7,7 +7,7 @@ use common::{
 
 use crate::{
     AggregateExpr, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning, JoinType,
-    LogicalPlan,
+    LogicalPlan, SerialColumn,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum PhysicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
+        serial: Vec<SerialColumn>,
     },
     DropTable {
         table: TableId,
@@ -129,11 +130,13 @@ pub fn physical_plan(
             columns,
             primary_key,
             unique,
+            serial,
         } => Ok(PhysicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
+            serial: serial.clone(),
         }),
         LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
         LogicalPlan::CreateIndex {

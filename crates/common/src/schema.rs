@@ -42,6 +42,12 @@ pub enum DataType {
 pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
+    /// Internal form used while executing `SERIAL` desugaring. Explicit user
+    /// defaults use `Nextval` and may not borrow a serial-owned sequence.
+    OwnedNextval(String),
+    /// Parse-time marker for a `SERIAL` family column. It is resolved during
+    /// `CREATE TABLE` execution into an owned sequence plus `OwnedNextval(name)`.
+    Serial,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

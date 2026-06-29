@@ -7,7 +7,7 @@ use common::{
 };
 use parser::Statement;
 
-use crate::{BoundExpr, BoundStatement};
+use crate::{BoundExpr, BoundStatement, SerialColumn};
 
 mod dml;
 mod expr;
@@ -118,11 +118,13 @@ fn bind_inner(
             for column in columns {
                 validate_default_value(catalog, column)?;
             }
+            let serial = bind_serial_columns(columns);
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
+                serial,
             })
         }
         Statement::DropTable { name } => {
@@ -340,7 +342,19 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
     };
     let value = match default {
         ParsedDefault::Const(value) => value,
-        ParsedDefault::Nextval(name) => {
+        ParsedDefault::Serial => {
+            if column.data_type != DataType::Integer {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "SERIAL column {} requires INTEGER, got {:?}",
+                        column.name, column.data_type
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        ParsedDefault::Nextval(name) | ParsedDefault::OwnedNextval(name) => {
             if column.data_type != DataType::Integer {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
@@ -350,12 +364,26 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
                     ),
                 ));
             }
-            catalog.get_sequence_by_name(name)?.ok_or_else(|| {
+            let sequence = catalog.get_sequence_by_name(name)?.ok_or_else(|| {
                 plan_error(
                     SqlState::UndefinedTable,
                     format!("sequence {name} does not exist"),
                 )
             })?;
+            match default {
+                ParsedDefault::Nextval(_) if sequence.owned => {
+                    return Err(plan_error(
+                        SqlState::DependentObjectsStillExist,
+                        format!("sequence {name} is owned by a SERIAL column"),
+                    ));
+                }
+                ParsedDefault::OwnedNextval(_) if !sequence.owned => {
+                    return Err(DbError::internal(format!(
+                        "SERIAL default {name} resolved to a non-owned sequence"
+                    )));
+                }
+                _ => {}
+            }
             return Ok(());
         }
     };
@@ -378,6 +406,20 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
             column.name, column.data_type
         ),
     ))
+}
+
+fn bind_serial_columns(columns: &[ParsedColumnDef]) -> Vec<SerialColumn> {
+    let mut serial = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        if !matches!(column.default, Some(ParsedDefault::Serial)) {
+            continue;
+        }
+        serial.push(SerialColumn {
+            column: column.name.clone(),
+            index,
+        });
+    }
+    serial
 }
 
 /// Whether a non-NULL `DEFAULT` constant's value matches the column type. Numeric

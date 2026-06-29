@@ -179,6 +179,13 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 `CREATE TABLE`:
 
 - Server query orchestration acquires the write guard before execution.
+- For `SERIAL` family columns, choose owned sequence names at execution time
+  (`<table>_<column>_seq`, with the smallest free numeric suffix if needed),
+  create each owned sequence first (`owned: true`, default sequence options),
+  then replace the parse-time `ParsedDefault::Serial` marker with the internal
+  owned `nextval` default before creating the table. If any later table or
+  unique-index step fails, drop the created serial sequences as part of
+  statement cleanup.
 - Use `CatalogManager::create_table` to assign IDs.
 - Call `SchemaOperations::create_table`.
 - `SchemaOperations::create_table` appends the `CreateTable` WAL operation record; server query orchestration appends the statement `Commit`.
@@ -188,8 +195,13 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 - Resolve table in binder.
 - Call `SchemaOperations::drop_table`.
-- Call `CatalogManager::drop_table`.
-- `SchemaOperations::drop_table` appends the `DropTable` WAL operation record; server query orchestration appends the statement `Commit`.
+- For each column default that references an owned sequence, call
+  `SchemaOperations::drop_sequence` in the same statement.
+- Call `CatalogManager::drop_table`, then remove the owned sequences from the
+  catalog.
+- `SchemaOperations::drop_table` appends the `DropTable` WAL operation record
+  and each owned sequence appends a sibling `DropSequence`; server query
+  orchestration appends the statement `Commit`.
 - Return `Modified { command: "DROP TABLE", count: 0 }`.
 
 `CREATE INDEX`:

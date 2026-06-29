@@ -876,6 +876,28 @@ mod tests {
     }
 
     #[test]
+    fn serial_family_maps_to_integer_serial_columns() {
+        let Statement::CreateTable { columns, .. } = parse(
+            "create table ids (a serial, b bigserial, c smallserial, d serial2, e serial4, f serial8)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(columns.len(), 6);
+        for column in &columns {
+            assert_eq!(column.data_type, DataType::Integer);
+            assert!(!column.nullable);
+            assert_eq!(column.default, Some(common::ParsedDefault::Serial));
+        }
+    }
+
+    #[test]
+    fn rejects_serial_with_explicit_default() {
+        assert!(parse("create table t (id serial default 7 primary key)").is_err());
+    }
+
+    #[test]
     fn varchar_char_lengths_are_parsed() {
         let Statement::CreateTable { columns, .. } =
             parse("create table t (a varchar(10), b char(5), c character(3), d varchar, e text)")

@@ -1,8 +1,8 @@
 # SaguaroDB Sequences and SERIAL Specification
 
 **Date:** 2026-06-29
-**Status:** Draft (revised after rebase onto constant-`DEFAULT`, RETURNING,
-`ON CONFLICT`, and SSI work)
+**Status:** Implemented feature spec (revised after rebase onto
+constant-`DEFAULT`, RETURNING, `ON CONFLICT`, and SSI work)
 
 > **Revision note.** This spec was first drafted against a base where column
 > `DEFAULT` did not exist. The branch has since gained **constant column
@@ -14,11 +14,9 @@
 ## 1. Overview
 
 Sequences are named, durable, monotonic number generators. They are the
-mechanism behind auto-incrementing keys: the planned `SERIAL` pseudo-type is
-sugar for an `INTEGER` column whose `DEFAULT` calls `nextval` on an owned
-sequence. This spec adds three things that build on each other; the current
-implemented subset covers explicit sequences, sequence functions, and
-`DEFAULT nextval('<existing-sequence>')`, while `SERIAL` remains the next task:
+mechanism behind auto-incrementing keys: the `SERIAL` pseudo-type is sugar for
+an `INTEGER` column whose `DEFAULT` calls `nextval` on an owned sequence. This
+spec adds three things that build on each other:
 
 1. **Generalize column `DEFAULT`** — the column default already exists as a
    constant (`ColumnDef.default: Option<Value>`, applied at `build_insert_row`).
@@ -56,11 +54,12 @@ binder/executor, and server wiring.
   `DEFAULT nextval('<existing-sequence>')` in `CREATE TABLE`. Omitted columns are
   filled from the default at `INSERT` and `COPY ... FROM` via the existing
   `build_insert_row` funnel (so `RETURNING` and `ON CONFLICT` get it for free).
+- `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`)
+  column types in `CREATE TABLE`, desugared to `INTEGER NOT NULL DEFAULT
+  nextval('<owned-sequence>')`.
 
 ### Out of scope (v1 deferrals)
 
-- `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`)
-  column types in `CREATE TABLE`; §6 specifies the planned follow-up task.
 - The `DEFAULT` keyword as a value in `INSERT ... VALUES (DEFAULT, ...)` — no
   `Expr::Default` marker is added; omit the column from the column list to get
   its default instead. (Deferred; the earlier draft included it.)
@@ -132,16 +131,18 @@ carrier holds the sequence *name* (a `String`, fine in the leaf crate) and the
 
 ```rust
 // parse-time, on ParsedColumnDef.default: Option<ParsedDefault>
-pub enum ParsedDefault { Const(Value), Nextval(String) }
+pub enum ParsedDefault { Const(Value), Nextval(String), OwnedNextval(String), Serial }
 
 // durable, on ColumnDef.default: Option<ColumnDefault>
 pub enum ColumnDefault { Const(Value), Nextval(SequenceId) }
 ```
 
-Both are `serde`-serializable. `ParsedColumnDef` also gains a transient
-`serial: bool` (not copied onto the durable `ColumnDef`) so the binder knows to
-run SERIAL desugaring (§6). Keeping `Const(Value)` as a variant preserves the
-existing constant behavior unchanged. See Decision 5 for the on-disk migration.
+Both are `serde`-serializable. `ParsedDefault::Serial` is a parse-time marker for
+the SERIAL family; execution replaces it with internal
+`ParsedDefault::OwnedNextval(name)` after creating the owned sequence. User
+defaults use `Nextval(name)` and may not borrow an owned sequence. Keeping
+`Const(Value)` as a variant preserves the existing constant behavior unchanged.
+See Decision 5 for the on-disk migration.
 
 ### 3.3 Parser
 
@@ -150,7 +151,9 @@ existing constant behavior unchanged. See Decision 5 for the on-disk migration.
   `ParsedDefault::Nextval(name)`; anything else is still rejected
   (`unsupported`).
 - Recognize the `SERIAL` family (§6) in `convert/ddl.rs`: emit
-  `data_type = Integer`, `nullable = false`, `serial = true`, no default.
+  `data_type = Integer`, `nullable = false`, and
+  `default = Some(ParsedDefault::Serial)`. Reject an explicit `DEFAULT` on a
+  `SERIAL` family column.
 
 ### 3.4 Binder
 
@@ -158,10 +161,13 @@ existing constant behavior unchanged. See Decision 5 for the on-disk migration.
   `crates/planner/src/binder/mod.rs`):
   - `Const(v)` → existing type-check (no implicit casts; `NULL` only if nullable).
   - `Nextval(name)` → look the sequence up in the catalog (error `42P01` if
-    missing) and require the column type to be `INTEGER`. The resolved
-    `SequenceId` is produced when the catalog turns `ParsedColumnDef` into
-    `ColumnDef` (the catalog owns the sequence registry); the binder's job is
-    pre-validation and good error messages.
+    missing), reject owned sequences with `2BP01`, and require the column type to
+    be `INTEGER`. The resolved `SequenceId` is produced when the catalog turns
+    `ParsedColumnDef` into `ColumnDef` (the catalog owns the sequence registry);
+    the binder's job is pre-validation and good error messages.
+  - `Serial` → require `INTEGER` (the parser has already normalized the type)
+    and carry the SERIAL column name and ordinal on the bound `CREATE TABLE`;
+    execution chooses the owned sequence name from the then-current catalog.
 - `validate_insert_omissions`: extend `has_usable_default` to treat a `Nextval`
   default as usable, so an omitted `NOT NULL` SERIAL/`nextval`-default column is
   not rejected.
@@ -335,10 +341,7 @@ because sequence ops touch no heap tuples.
 values, `UPDATE` SET expressions, and column `DEFAULT`s. Their evaluation count
 and order in a `WHERE` clause are unspecified (volatile), matching PostgreSQL.
 
-## 6. Planned SERIAL Desugaring
-
-This section specifies the follow-up `SERIAL` task. It is not part of the
-currently implemented SQL subset.
+## 6. SERIAL Desugaring
 
 `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`) are valid
 only as a column type in a `CREATE TABLE` column definition. All map to the same
@@ -352,20 +355,21 @@ stores no table reference (`owned: bool` only, §4.1) — so the order is simply
 "sequences first, then table," with no placeholder to patch:
 
 - **Binder:** for each `serial` column, validate it is a top-level `CREATE TABLE`
-  column, choose the sequence name `<table>_<column>_seq` (append the smallest
-  free numeric suffix if taken), and set the column to `INTEGER` + `NOT NULL`.
-  Record a pending owned-sequence request in `BoundStatement::CreateTable`. The
-  column's default is left to be finalized at execution.
+  column, set the column to `INTEGER` + `NOT NULL`, and record the SERIAL column
+  name and ordinal in `BoundStatement::CreateTable`. The column's default is
+  left to be finalized at execution.
 - **Executor (`execute_create_table`), in order, one autocommit transaction:**
-  1. For each pending request, `catalog.create_sequence(...)` (increment 1,
-     start 1, min 1, max `i64::MAX`, no cycle, `owned: true`) → `SequenceId`,
-     appending a `CreateSequence` WAL record. The record is final — it carries no
-     table id.
-  2. Set each SERIAL column's default to `ParsedDefault::Nextval(<generated name>)`.
-  3. `catalog.create_table(...)`, which resolves **every** `Nextval(name)` default
-     (SERIAL and explicit `DEFAULT nextval('existing')` alike) against the now-
-     present sequence registry → `ColumnDefault::Nextval(id)` on the stored
-     `ColumnDef`. One uniform resolution path.
+  1. Choose each owned sequence name from the current catalog under the DDL guard:
+     `<table>_<column>_seq`, appending the smallest free numeric suffix if taken.
+     For each request, `catalog.create_sequence(...)` (increment 1, start 1, min
+     1, max `i64::MAX`, no cycle, `owned: true`) → `SequenceId`, appending a
+     `CreateSequence` WAL record. The record is final — it carries no table id.
+  2. Set each SERIAL column's default to internal
+     `ParsedDefault::OwnedNextval(<generated name>)`.
+  3. `catalog.create_table(...)`, which resolves explicit `Nextval(name)`
+     defaults only against non-owned sequences and resolves
+     `OwnedNextval(name)` only against owned sequences created for SERIAL →
+     `ColumnDefault::Nextval(id)` on the stored `ColumnDef`.
 
 Because the sequences and table are created in the same autocommit transaction,
 they share its commit/abort outcome — if `CREATE TABLE` aborts, neither exists
@@ -401,9 +405,10 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 | `nextval`/`currval`/`setval` on unknown sequence | `42P01` UndefinedTable |
 | `nextval` past MAXVALUE / below MINVALUE, `NO CYCLE` | sequence-exhausted (`2200H`) / `NumericValueOutOfRange` |
 | `currval` before `nextval`/`setval(..., true)` in this session | object-not-in-prerequisite-state (`55000`) |
-| Planned `SERIAL` task: `SERIAL` outside a `CREATE TABLE` column def | bind error (`FeatureNotSupported`/`SyntaxError`) |
+| `SERIAL` outside a `CREATE TABLE` column def, `SERIAL` with explicit `DEFAULT`, or unsupported type modifiers | bind/parse error (`FeatureNotSupported`/`SyntaxError`) |
 | `DEFAULT` expr beyond literal/`nextval` | `FeatureNotSupported` |
 | `DEFAULT nextval('missing')` at `CREATE TABLE` | `42P01` UndefinedTable |
+| Explicit `DEFAULT nextval('<owned-serial-sequence>')` | `2BP01` DependentObjectsStillExist |
 | `CREATE`/`DROP SEQUENCE` inside a txn block | existing DDL-in-block error |
 | `DROP SEQUENCE` of a sequence referenced by a column default | `2BP01` DependentObjectsStillExist |
 | `INCREMENT BY 0`, or `MINVALUE > MAXVALUE`, etc. | `22023` InvalidParameterValue |
@@ -412,8 +417,8 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 
 - **parser**: sequence grammar + every option, `DEFAULT <const>` and
   `DEFAULT nextval('s')` column options, rejection cases (incl. `DEFAULT` as a
-  `VALUES` item still being rejected, and non-`nextval` function defaults). The
-  planned `SERIAL` task adds the `SERIAL` family cases.
+  `VALUES` item still being rejected, and non-`nextval` function defaults), plus
+  the `SERIAL` family cases.
 - **catalog**: create/drop, id allocation high-water behavior, snapshot
   round-trip including sequences + baseline values, old-snapshot compatibility.
 - **storage / recovery**: crash after N `nextval`s → no value reissued; an
@@ -422,10 +427,10 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   yields all-unique values.
 - **server integration**: `setval` repositioning; `SELECT nextval(...)` routes
   through the write path and is durable; DDL-in-transaction rejection of
-  `CREATE`/`DROP SEQUENCE`. The planned `SERIAL` task adds end-to-end insert and
-  id read-back via both `INSERT ... RETURNING id` (primary idiom) and `currval`,
-  `DROP TABLE` cascade-dropping the owned sequence, and `DROP SEQUENCE` of an
-  owned sequence erroring.
+  `CREATE`/`DROP SEQUENCE`; end-to-end SERIAL insert and id read-back via
+  `INSERT ... RETURNING id` (primary idiom) and `currval`; `DROP TABLE`
+  cascade-dropping the owned sequence; `DROP SEQUENCE` of an owned sequence
+  erroring.
 - **interactions (§12)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
   still consumes a sequence value (observable gap); `excluded.<serial_col>` sees
   the `nextval`-filled value; a `SERIALIZABLE` transaction that calls `nextval`
@@ -454,7 +459,7 @@ A single implementation plan, sequenced as independently testable commits:
    Also wire `nextval` as an explicit `DEFAULT nextval('existing')` resolved in
    `catalog.create_table`.
 4. **`SERIAL` desugaring + ownership.** `SERIAL` family parsing, desugar to
-   owned sequence + `ParsedDefault::Nextval`, owned-sequence cascade on
+   owned sequence + `ParsedDefault::OwnedNextval`, owned-sequence cascade on
    `DROP TABLE`, `DROP SEQUENCE` ownership guard.
 5. **Specs + sweep.** `COPY ... FROM` already inherits defaults via the shared
    funnel — add tests rather than code; update `docs/specs/overview.md` and the
@@ -462,11 +467,11 @@ A single implementation plan, sequenced as independently testable commits:
 
 ## 11. Spec impact
 
-When implemented, update in the same change:
+This feature updates:
 
 - `docs/specs/overview.md` — data types (note `SERIAL` family → `INTEGER`) and
-  SQL subset (`CREATE`/`DROP SEQUENCE`, `DEFAULT nextval`, sequence functions). No
-  `Value`/`DataType` change.
+  SQL subset (`CREATE`/`DROP SEQUENCE`, `DEFAULT nextval`, sequence functions,
+  and `SERIAL`). No `Value`/`DataType` change.
 - `docs/specs/crates/parser.md` — sequence grammar, `DEFAULT`, `SERIAL`.
 - `docs/specs/crates/catalog.md` — sequence object, allocator, snapshot field.
 - `docs/specs/crates/wal.md` — the four new record kinds and their replay gating.

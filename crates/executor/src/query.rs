@@ -1,12 +1,13 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key,
-    KeyRange, ParsedColumnDef, Result, Row, SqlState, StatementContext, TableId, TableSchema,
-    Value,
+    KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions, SequenceSchema,
+    SqlState, StatementContext, TableId, TableSchema, Value,
 };
-use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
+use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, SerialColumn};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -80,7 +81,8 @@ impl QueryEngine {
                 columns,
                 primary_key,
                 unique,
-            } => execute_create_table(ctx, name, columns, primary_key, unique),
+                serial,
+            } => execute_create_table(ctx, name, columns, primary_key, unique, serial),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
                 name,
@@ -754,12 +756,33 @@ fn execute_create_table(
     columns: &[ParsedColumnDef],
     primary_key: &[String],
     unique: &[Vec<String>],
+    serial: &[SerialColumn],
 ) -> Result<ExecutionResult> {
-    let schema =
-        ctx.catalog
-            .create_table(name.to_string(), columns.to_vec(), primary_key.to_vec())?;
+    let serial = resolve_serial_columns(ctx.catalog, name, serial)?;
+    let mut created_sequences = Vec::new();
+    for serial_column in &serial {
+        match create_owned_serial_sequence(ctx, &serial_column.sequence) {
+            Ok(sequence) => created_sequences.push(sequence),
+            Err(err) => {
+                cleanup_serial_sequences(ctx, &created_sequences);
+                return Err(err);
+            }
+        }
+    }
+
+    let columns = columns_with_serial_defaults(columns, &serial)?;
+    let schema = match ctx
+        .catalog
+        .create_table(name.to_string(), columns, primary_key.to_vec())
+    {
+        Ok(schema) => schema,
+        Err(err) => {
+            cleanup_serial_sequences(ctx, &created_sequences);
+            return Err(err);
+        }
+    };
     if let Err(err) = ctx.schema_ops.create_table(&ctx.statement, &schema) {
-        let _ = ctx.catalog.drop_table(schema.id);
+        cleanup_created_table(ctx, schema.id, &created_sequences);
         return Err(err);
     }
     // Each UNIQUE constraint becomes a unique index built on the just-created
@@ -768,7 +791,7 @@ fn execute_create_table(
     // autocommit unit also rolls back the storage-side DDL state.
     for columns in unique {
         if let Err(err) = create_unique_constraint_index(ctx, &schema, columns) {
-            let _ = ctx.catalog.drop_table(schema.id);
+            cleanup_created_table(ctx, schema.id, &created_sequences);
             return Err(err);
         }
     }
@@ -776,6 +799,108 @@ fn execute_create_table(
         command: "CREATE TABLE".to_string(),
         count: 0,
     })
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSerialColumn {
+    column: String,
+    index: usize,
+    sequence: String,
+}
+
+fn resolve_serial_columns(
+    catalog: &dyn CatalogManager,
+    table: &str,
+    serial: &[SerialColumn],
+) -> Result<Vec<ResolvedSerialColumn>> {
+    let mut generated = HashSet::new();
+    let mut resolved = Vec::new();
+    for serial_column in serial {
+        let sequence =
+            choose_serial_sequence_name(catalog, &mut generated, table, &serial_column.column)?;
+        resolved.push(ResolvedSerialColumn {
+            column: serial_column.column.clone(),
+            index: serial_column.index,
+            sequence,
+        });
+    }
+    Ok(resolved)
+}
+
+fn choose_serial_sequence_name(
+    catalog: &dyn CatalogManager,
+    generated: &mut HashSet<String>,
+    table: &str,
+    column: &str,
+) -> Result<String> {
+    let base = format!("{table}_{column}_seq");
+    let mut suffix = 0_u64;
+    loop {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}{suffix}")
+        };
+        if !generated.contains(&candidate) && catalog.get_sequence_by_name(&candidate)?.is_none() {
+            generated.insert(candidate.clone());
+            return Ok(candidate);
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("serial sequence suffix overflow"))?;
+    }
+}
+
+fn create_owned_serial_sequence(ctx: &ExecutionContext<'_>, name: &str) -> Result<SequenceSchema> {
+    let sequence =
+        ctx.catalog
+            .create_sequence(name.to_string(), SequenceOptions::default(), true)?;
+    if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &sequence) {
+        let _ = ctx.catalog.apply_drop_sequence(sequence.id);
+        return Err(err);
+    }
+    Ok(sequence)
+}
+
+fn columns_with_serial_defaults(
+    columns: &[ParsedColumnDef],
+    serial: &[ResolvedSerialColumn],
+) -> Result<Vec<ParsedColumnDef>> {
+    let mut columns = columns.to_vec();
+    for serial_column in serial {
+        let column = columns.get_mut(serial_column.index).ok_or_else(|| {
+            DbError::internal(format!(
+                "serial column {} index {} was not found in CREATE TABLE columns",
+                serial_column.column, serial_column.index
+            ))
+        })?;
+        if column.name != serial_column.column
+            || !matches!(column.default, Some(ParsedDefault::Serial))
+        {
+            return Err(DbError::internal(format!(
+                "serial column {} index {} did not carry a SERIAL marker",
+                serial_column.column, serial_column.index
+            )));
+        }
+        column.default = Some(ParsedDefault::OwnedNextval(serial_column.sequence.clone()));
+    }
+    Ok(columns)
+}
+
+fn cleanup_created_table(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    serial_sequences: &[SequenceSchema],
+) {
+    let _ = ctx.catalog.drop_table(table);
+    cleanup_serial_sequences(ctx, serial_sequences);
+}
+
+fn cleanup_serial_sequences(ctx: &ExecutionContext<'_>, sequences: &[SequenceSchema]) {
+    for sequence in sequences.iter().rev() {
+        let _ = ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id);
+        let _ = ctx.catalog.apply_drop_sequence(sequence.id);
+    }
 }
 
 /// Create one `UNIQUE` constraint's backing index on a freshly created table. The
@@ -800,12 +925,41 @@ fn create_unique_constraint_index(
 }
 
 fn execute_drop_table(ctx: &ExecutionContext<'_>, table: TableId) -> Result<ExecutionResult> {
+    let owned_sequences = owned_sequences_for_table(ctx, table)?;
     ctx.schema_ops.drop_table(&ctx.statement, table)?;
+    for sequence in &owned_sequences {
+        ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
+    }
     ctx.catalog.drop_table(table)?;
+    for sequence in &owned_sequences {
+        ctx.catalog.apply_drop_sequence(sequence.id)?;
+    }
     Ok(ExecutionResult::Modified {
         command: "DROP TABLE".to_string(),
         count: 0,
     })
+}
+
+fn owned_sequences_for_table(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+) -> Result<Vec<SequenceSchema>> {
+    let Some(schema) = ctx.catalog.get_table(table)? else {
+        return Ok(Vec::new());
+    };
+    let mut sequences = Vec::new();
+    for column in &schema.columns {
+        let Some(ColumnDefault::Nextval(sequence_id)) = column.default else {
+            continue;
+        };
+        let Some(sequence) = ctx.catalog.get_sequence(sequence_id)? else {
+            continue;
+        };
+        if sequence.owned {
+            sequences.push(sequence);
+        }
+    }
+    Ok(sequences)
 }
 
 fn execute_create_index(

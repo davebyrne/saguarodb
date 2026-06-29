@@ -158,6 +158,8 @@ pub enum DataType {
 pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
+    OwnedNextval(String),
+    Serial,
 }
 
 pub enum ColumnDefault {
@@ -236,8 +238,12 @@ is the catalog-owned durable sequence metadata. `last_value`/`is_called` are the
 checkpoint baseline for the storage runtime's current sequence state.
 `ColumnDefault::Nextval(SequenceId)` is the stored form of
 `DEFAULT nextval('<sequence>')` and is evaluated by the executor through the
-statement's sequence manager. Owned SERIAL sequences are reserved for the later
-SERIAL task.
+statement's sequence manager. `ParsedDefault::Serial` is the parse-time marker
+for a `SERIAL` family column during `CREATE TABLE`; the executor replaces it with
+the internal `ParsedDefault::OwnedNextval(name)` after creating the owned
+sequence, and the catalog resolves that internal form to
+`ColumnDefault::Nextval(SequenceId)`. User-written defaults use
+`ParsedDefault::Nextval(name)` and may not borrow an owned SERIAL sequence.
 
 ## Error Model
 
