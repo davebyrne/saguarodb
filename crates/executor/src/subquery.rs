@@ -36,15 +36,20 @@ pub(crate) fn resolve_plan_subqueries(
             table,
             columns,
             source,
+            on_conflict,
+            returning,
         } => PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
+            on_conflict: on_conflict.clone(),
+            returning: returning.clone(),
         },
         PhysicalPlan::Update {
             table,
             assignments,
             source,
+            returning,
         } => PhysicalPlan::Update {
             table: *table,
             assignments: assignments
@@ -52,10 +57,16 @@ pub(crate) fn resolve_plan_subqueries(
                 .map(|(column, expr)| Ok((*column, resolve_expr(ctx, expr)?)))
                 .collect::<Result<Vec<_>>>()?,
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
+            returning: returning.clone(),
         },
-        PhysicalPlan::Delete { table, source } => PhysicalPlan::Delete {
+        PhysicalPlan::Delete {
+            table,
+            source,
+            returning,
+        } => PhysicalPlan::Delete {
             table: *table,
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
+            returning: returning.clone(),
         },
         PhysicalPlan::SeqScan {
             table,
