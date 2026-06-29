@@ -7,6 +7,7 @@ pub mod error;
 pub mod float;
 pub mod flush;
 pub mod ids;
+pub mod interval;
 pub mod mvcc;
 pub mod numeric;
 pub mod row;
@@ -26,6 +27,7 @@ pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, TableId, TxnId,
 };
+pub use interval::Interval;
 pub use mvcc::{
     IsolationLevel, Snapshot, TxnStatus, TxnStatusView, UniqueConflict, WriteConflict,
     XMAX_ABORTED, XMAX_COMMITTED, XMIN_ABORTED, XMIN_COMMITTED, classify_unique_conflict,

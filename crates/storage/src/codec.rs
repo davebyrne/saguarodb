@@ -76,6 +76,22 @@ const KEY_TAG_NUMERIC: u8 = 9;
 const KEY_TAG_REAL: u8 = 10;
 const KEY_TAG_TIME: u8 = 11;
 const KEY_TAG_TIMESTAMPTZ: u8 = 12;
+const KEY_TAG_INTERVAL: u8 = 13;
+
+/// Serialize an `INTERVAL` as `[months: i32][days: i32][micros: i64]` (16 bytes LE).
+fn put_interval(bytes: &mut Vec<u8>, value: &common::Interval) {
+    bytes.extend_from_slice(&value.months.to_le_bytes());
+    bytes.extend_from_slice(&value.days.to_le_bytes());
+    bytes.extend_from_slice(&value.micros.to_le_bytes());
+}
+
+/// Decode an `INTERVAL` written by [`put_interval`].
+fn read_interval(bytes: &[u8], offset: &mut usize) -> Result<common::Interval> {
+    let months = i32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
+    let days = i32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
+    let micros = i64::from_le_bytes(read_exact(bytes, offset, 8)?.try_into().expect("8 bytes"));
+    Ok(common::Interval::new(months, days, micros))
+}
 
 /// Serialize a `NUMERIC` value as its exact `i128` mantissa (16 bytes LE) plus
 /// `u32` scale (4 bytes LE) — a fixed 20 bytes that preserves value and scale.
@@ -135,6 +151,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::TimestampTz(value) => {
                 bytes.push(KEY_TAG_TIMESTAMPTZ);
                 bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Interval(value) => {
+                bytes.push(KEY_TAG_INTERVAL);
+                put_interval(&mut bytes, value);
             }
             Value::Bytes(value) => {
                 bytes.push(KEY_TAG_BYTEA);
@@ -226,6 +246,7 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
                 let raw = read_exact(bytes, &mut offset, 8)?;
                 Value::TimestampTz(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
             }
+            KEY_TAG_INTERVAL => Value::Interval(read_interval(bytes, &mut offset)?),
             KEY_TAG_BYTEA => {
                 let len = u32::from_le_bytes(
                     read_exact(bytes, &mut offset, 4)?
@@ -340,6 +361,9 @@ pub(crate) fn encode_row_with_infomask(
             }
             Value::TimestampTz(value) if column.data_type == DataType::TimestampTz => {
                 bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Interval(value) if column.data_type == DataType::Interval => {
+                put_interval(&mut bytes, value);
             }
             Value::Bytes(value) if column.data_type == DataType::Bytea => {
                 let len = u32::try_from(value.len())
@@ -472,6 +496,7 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 array.copy_from_slice(raw);
                 Value::TimestampTz(i64::from_le_bytes(array))
             }
+            DataType::Interval => Value::Interval(read_interval(bytes, &mut offset)?),
             DataType::Bytea => {
                 let raw_len = read_exact(bytes, &mut offset, 4)?;
                 let mut array = [0; 4];
@@ -626,7 +651,8 @@ mod tests {
 
     use super::{
         INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, decode_key,
-        decode_row, encode_key, encode_row, null_bitmap_len, put_numeric, set_mvcc_header_fields,
+        decode_row, encode_key, encode_row, null_bitmap_len, put_interval, put_numeric,
+        set_mvcc_header_fields,
     };
 
     fn schema() -> TableSchema {
@@ -674,6 +700,7 @@ mod tests {
                 Value::Timestamp(value) => bytes.extend_from_slice(&value.to_le_bytes()),
                 Value::Time(value) => bytes.extend_from_slice(&value.to_le_bytes()),
                 Value::TimestampTz(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Value::Interval(value) => put_interval(&mut bytes, value),
                 Value::Bytes(value) => {
                     bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
                     bytes.extend_from_slice(value);

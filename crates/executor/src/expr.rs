@@ -266,6 +266,8 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
         (Value::Time(left), Value::Time(right)) => left.cmp(right),
         (Value::TimestampTz(left), Value::TimestampTz(right)) => left.cmp(right),
+        // Interval compares by canonical estimate (1 mon == 30 days).
+        (Value::Interval(left), Value::Interval(right)) => left.cmp(right),
         (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
@@ -826,6 +828,13 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
         // unchanged.
         (Value::Timestamp(micros), DataType::TimestampTz) => Ok(Value::TimestampTz(micros)),
         (Value::TimestampTz(micros), DataType::Timestamp) => Ok(Value::Timestamp(micros)),
+        (Value::Interval(iv), DataType::Interval) => Ok(Value::Interval(iv)),
+        (Value::Interval(iv), DataType::Text) => {
+            Ok(Value::Text(common::interval::format_interval(&iv)))
+        }
+        (Value::Text(value), DataType::Interval) => common::interval::parse_interval(&value)
+            .map(Value::Interval)
+            .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid interval cast")),
         (Value::Bytes(raw), DataType::Bytea) => Ok(Value::Bytes(raw)),
         (Value::Bytes(raw), DataType::Text) => Ok(Value::Text(common::bytea::format_hex(&raw))),
         (Value::Text(value), DataType::Bytea) => common::bytea::parse_hex(&value)

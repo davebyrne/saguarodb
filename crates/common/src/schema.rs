@@ -18,6 +18,8 @@ pub enum DataType {
     /// `TIMESTAMP WITH TIME ZONE`, value carried as `Value::TimestampTz`
     /// (microseconds from epoch, UTC-normalized).
     TimestampTz,
+    /// `INTERVAL`, value carried as `Value::Interval` (months/days/microseconds).
+    Interval,
     /// `BYTEA` — raw byte string, value carried as `Value::Bytes`.
     Bytea,
     /// `UUID` — 128-bit identifier, value carried as `Value::Uuid` (16 bytes).

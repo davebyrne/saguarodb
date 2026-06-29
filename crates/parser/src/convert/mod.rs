@@ -310,6 +310,7 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
         sql::DataType::Time(None, sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone) => {
             Ok(DataType::Time)
         }
+        sql::DataType::Interval => Ok(DataType::Interval),
         sql::DataType::Bytea => Ok(DataType::Bytea),
         sql::DataType::Uuid => Ok(DataType::Uuid),
         // DOUBLE PRECISION and its aliases (`FLOAT8`, bare `FLOAT`).

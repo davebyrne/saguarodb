@@ -578,6 +578,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
                 .to_be_bytes()
                 .to_vec(),
         },
+        Value::Interval(iv) => match format {
+            ValueFormat::Text => common::interval::format_interval(iv).into_bytes(),
+            // PostgreSQL binary `interval`: int64 micros, int32 days, int32 months.
+            ValueFormat::Binary => common::interval::to_pg_binary(iv).to_vec(),
+        },
         Value::Bytes(raw) => match format {
             // PostgreSQL text `bytea` is the hex format `\x...`; binary is the raw bytes.
             ValueFormat::Text => common::bytea::format_hex(raw).into_bytes(),
@@ -675,6 +680,15 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
             ))
         }
+        (DataType::Interval, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "interval parameter")?;
+            common::interval::parse_interval(text)
+                .map(Value::Interval)
+                .ok_or_else(|| protocol_error("invalid interval parameter"))
+        }
+        (DataType::Interval, ValueFormat::Binary) => common::interval::from_pg_binary(bytes)
+            .map(Value::Interval)
+            .ok_or_else(|| protocol_error("binary interval parameter must be 16 bytes")),
         (DataType::Numeric { .. }, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "numeric parameter")?;
             common::numeric::parse_numeric(text)
@@ -771,6 +785,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Real => (700, 4),
         DataType::Time => (1083, 8),
         DataType::TimestampTz => (1184, 8),
+        DataType::Interval => (1186, 16),
         DataType::Numeric { .. } => (1700, -1),
     }
 }
@@ -1134,5 +1149,33 @@ mod timestamptz_value_tests {
     #[test]
     fn invalid_timestamptz_text_is_rejected() {
         assert!(decode_value(b"2024-01-01 25:00:00+00", DataType::TimestampTz, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod interval_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Interval, Value};
+
+    #[test]
+    fn interval_text_round_trips() {
+        let value = Value::Interval(Interval::new(14, 3, (4 * 3600 + 5 * 60 + 6) * 1_000_000));
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"1 year 2 mons 3 days 04:05:06");
+        assert_eq!(decode_value(&text, DataType::Interval, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn interval_binary_round_trips() {
+        let value = Value::Interval(Interval::new(-1, 2, -3_000_000));
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary.len(), 16);
+        assert_eq!(decode_value(&binary, DataType::Interval, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_interval_is_rejected() {
+        assert!(decode_value(b"1 fortnight", DataType::Interval, 0).is_err());
+        assert!(decode_value(&[0u8; 8], DataType::Interval, 1).is_err()); // wrong length
     }
 }

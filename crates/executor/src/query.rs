@@ -893,6 +893,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
             | (DataType::Timestamp, Value::Timestamp(_))
             | (DataType::Time, Value::Time(_))
             | (DataType::TimestampTz, Value::TimestampTz(_))
+            | (DataType::Interval, Value::Interval(_))
             | (DataType::Bytea, Value::Bytes(_))
             | (DataType::Uuid, Value::Uuid(_))
     );
@@ -947,6 +948,7 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Timestamp => "TIMESTAMP",
         DataType::Time => "TIME",
         DataType::TimestampTz => "TIMESTAMP WITH TIME ZONE",
+        DataType::Interval => "INTERVAL",
         DataType::Bytea => "BYTEA",
         DataType::Uuid => "UUID",
         DataType::Double => "DOUBLE PRECISION",

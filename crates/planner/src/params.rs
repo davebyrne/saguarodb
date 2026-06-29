@@ -533,6 +533,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Timestamp(_) => Some(DataType::Timestamp),
         Value::Time(_) => Some(DataType::Time),
         Value::TimestampTz(_) => Some(DataType::TimestampTz),
+        Value::Interval(_) => Some(DataType::Interval),
         Value::Bytes(_) => Some(DataType::Bytea),
         Value::Uuid(_) => Some(DataType::Uuid),
     }

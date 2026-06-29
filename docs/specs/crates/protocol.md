@@ -159,6 +159,7 @@ The codec may return errors after buffering bytes. The server treats any decode 
 - `Timestamp` -> `TIMESTAMP` (`type_oid = 1114`, `type_size = 8`)
 - `Time` -> `TIME` (`type_oid = 1083`, `type_size = 8`)
 - `TimestampTz` -> `TIMESTAMP WITH TIME ZONE` (`type_oid = 1184`, `type_size = 8`)
+- `Interval` -> `INTERVAL` (`type_oid = 1186`, `type_size = 16`)
 - `Bytes` -> `BYTEA` (`type_oid = 17`, `type_size = -1`)
 - `Uuid` -> `UUID` (`type_oid = 2950`, `type_size = 16`)
 - `Float` -> `DOUBLE PRECISION` (`type_oid = 701`, `type_size = 8`)
@@ -228,6 +229,7 @@ Text value encoding:
 - `Timestamp`: `YYYY-MM-DD HH:MM:SS[.ffffff]` (fractional seconds only when non-zero).
 - `Time`: `HH:MM:SS[.ffffff]` (fractional seconds only when non-zero).
 - `TimestampTz`: `YYYY-MM-DD HH:MM:SS[.ffffff]+00` (always UTC).
+- `Interval`: PostgreSQL `postgres`-style text (e.g. `1 year 2 mons 3 days 04:05:06`).
 - `Bytea`: hex `\x` followed by lowercase hex digits (two per byte).
 - `Uuid`: canonical lowercase `8-4-4-4-12` hyphenated form.
 - `Float`: round-trippable decimal — fixed-point for moderate magnitudes, `e±NN` scientific for extreme exponents (or `Infinity`/`-Infinity`/`NaN` for non-finite values).
@@ -244,6 +246,7 @@ Binary value encoding (extended protocol, format code `1`):
 - `Timestamp`: 8-byte big-endian `int64` microsecond count from 2000-01-01 00:00:00 (PostgreSQL's timestamp epoch), converted to/from the internal Unix-epoch microsecond count.
 - `Time`: 8-byte big-endian `int64` microsecond count since midnight.
 - `TimestampTz`: 8-byte big-endian `int64` microsecond count from 2000-01-01 UTC.
+- `Interval`: `int64` microseconds, `int32` days, `int32` months (16 bytes, big-endian).
 - `Bytea`: the raw bytes (identical to the stored value).
 - `Uuid`: the 16 raw bytes.
 - `Float`: 8-byte big-endian IEEE 754 binary64.

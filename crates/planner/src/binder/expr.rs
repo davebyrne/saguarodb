@@ -239,6 +239,7 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Timestamp(_) => (DataType::Timestamp, false),
         Value::Time(_) => (DataType::Time, false),
         Value::TimestampTz(_) => (DataType::TimestampTz, false),
+        Value::Interval(_) => (DataType::Interval, false),
         Value::Bytes(_) => (DataType::Bytea, false),
         Value::Uuid(_) => (DataType::Uuid, false),
     };

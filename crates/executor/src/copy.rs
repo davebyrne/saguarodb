@@ -158,6 +158,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
             .ok_or_else(|| {
                 invalid_value(format!("invalid input syntax for timestamptz: \"{text}\""))
             }),
+        DataType::Interval => common::interval::parse_interval(text)
+            .map(Value::Interval)
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for interval: \"{text}\""))),
     }
 }
 
@@ -401,6 +404,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Real(value) => Some(common::float::format_real(value.0)),
         Value::Time(micros) => Some(common::datetime::format_time(*micros)),
         Value::TimestampTz(micros) => Some(common::datetime::format_timestamptz(*micros)),
+        Value::Interval(iv) => Some(common::interval::format_interval(iv)),
     }
 }
 

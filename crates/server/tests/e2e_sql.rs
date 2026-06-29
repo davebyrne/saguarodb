@@ -1944,6 +1944,92 @@ async fn e2e_timestamptz_normalizes_to_utc_orders_casts_and_indexes() {
 }
 
 #[tokio::test]
+async fn e2e_interval_round_trips_orders_by_estimate_and_casts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table e (id integer primary key, span interval)")
+        .await
+        .unwrap();
+    for (id, lit) in [
+        (1, "1 mon"),
+        (2, "30 days"),
+        (3, "31 days"),
+        (4, "1 day 02:30:00"),
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into e (id, span) values ({id}, INTERVAL '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Round-trip / PostgreSQL-style formatting.
+    let rows = server
+        .simple_query("select cast(span as text) from e order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1 mon".to_string())],
+            vec![Some("30 days".to_string())],
+            vec![Some("31 days".to_string())],
+            vec![Some("1 day 02:30:00".to_string())],
+        ]
+    );
+
+    // Ordering by canonical estimate: 1day02:30 (~1.1d) < 1mon == 30days < 31days.
+    let rows = server
+        .simple_query("select id from e order by span, id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("4".to_string())],
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // Equality is by estimate: INTERVAL '30 days' matches both 30 days and 1 mon.
+    let rows = server
+        .simple_query("select count(*) from e where span = INTERVAL '30 days'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    // DISTINCT collapses 1 mon / 30 days into one value -> 3 distinct rows.
+    let rows = server
+        .simple_query("select distinct span from e")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows.len(), 3, "distinct rows: {rows:?}");
+
+    // CAST text <-> interval round-trips.
+    let rows = server
+        .simple_query("select cast(cast('2 years 3 mons' as interval) as text) from e where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2 years 3 mons".to_string())]]);
+
+    // No implicit cast: a plain string into an INTERVAL column.
+    let err = server
+        .simple_query("insert into e (id, span) values (9, '1 day')")
+        .await
+        .err()
+        .expect("string into interval column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

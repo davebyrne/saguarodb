@@ -145,6 +145,7 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             ],
             distinct: false,
         }),
+        sql::Expr::Interval(interval) => convert_interval(interval),
         sql::Expr::Function(function) => convert_function(function),
         sql::Expr::Substring {
             expr,
@@ -318,6 +319,29 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         }
         _ => unsupported("unsupported typed literal"),
     }
+}
+
+/// Convert an `INTERVAL 'text'` literal to a `Value::Interval`. Only the
+/// full-string form is supported — field qualifiers (`INTERVAL '1' DAY`,
+/// `... SECOND(p)`) are rejected.
+fn convert_interval(interval: &sql::Interval) -> Result<Expr> {
+    if interval.leading_field.is_some()
+        || interval.last_field.is_some()
+        || interval.leading_precision.is_some()
+        || interval.fractional_seconds_precision.is_some()
+    {
+        return unsupported("only the INTERVAL 'string' form is supported");
+    }
+    let text = match interval.value.as_ref() {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::SingleQuotedString(s) => s,
+            _ => return unsupported("unsupported interval literal"),
+        },
+        _ => return unsupported("unsupported interval literal"),
+    };
+    common::interval::parse_interval(text)
+        .map(|iv| Expr::Literal(Value::Interval(iv)))
+        .ok_or_else(|| parse_error(format!("invalid interval literal: \"{text}\"")))
 }
 
 fn convert_value(value: &sql::Value) -> Result<Expr> {

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::float::{OrderedF32, OrderedF64};
+use crate::interval::Interval;
 use crate::numeric::Decimal;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -32,6 +33,9 @@ pub enum Value {
     /// `TIMESTAMP WITH TIME ZONE`, stored as microseconds from the Unix epoch in
     /// UTC (input offsets are normalized to UTC; always displayed in UTC).
     TimestampTz(i64),
+    /// `INTERVAL` — months/days/microseconds kept separate; compares by the
+    /// canonical estimate (so `1 mon` == `30 days`).
+    Interval(Interval),
     /// `BYTEA` — a raw byte string. `Vec<u8>` ordering/hashing are lexicographic.
     Bytes(Vec<u8>),
     /// `UUID`, stored as its 16 bytes. `[u8; 16]` ordering is the canonical
