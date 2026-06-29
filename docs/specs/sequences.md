@@ -1,7 +1,15 @@
 # SaguaroDB Sequences and SERIAL Specification
 
 **Date:** 2026-06-29
-**Status:** Draft
+**Status:** Draft (revised after rebase onto constant-`DEFAULT`, RETURNING,
+`ON CONFLICT`, and SSI work)
+
+> **Revision note.** This spec was first drafted against a base where column
+> `DEFAULT` did not exist. The branch has since gained **constant column
+> `DEFAULT`** (`ColumnDef.default: Option<Value>`), `RETURNING`,
+> `INSERT ... ON CONFLICT`, composite/`UNIQUE` keys, and real **SSI**
+> (`SERIALIZABLE` is now its own isolation level). The plan below is updated to
+> *extend* those mechanisms rather than build them; §12 records the interactions.
 
 ## 1. Overview
 
@@ -10,9 +18,11 @@ mechanism behind auto-incrementing keys: the `SERIAL` pseudo-type is sugar for
 an `INTEGER` column whose `DEFAULT` calls `nextval` on an owned sequence. This
 spec adds three things that build on each other:
 
-1. **Column `DEFAULT`** — a general, durable per-column default value applied
-   when a column is omitted on `INSERT`/`COPY` or written as the `DEFAULT`
-   keyword. Bounded for v1 to constant literals and `nextval(...)` calls.
+1. **Generalize column `DEFAULT`** — the column default already exists as a
+   constant (`ColumnDef.default: Option<Value>`, applied at `build_insert_row`).
+   We widen it from a bare constant to a small `ColumnDefault` enum that can also
+   be a `nextval(<sequence>)` call, and make the executor's default funnel
+   evaluate it (constants stay constant; `Nextval` advances a sequence).
 2. **Sequences** — a new catalog object (`CREATE SEQUENCE` / `DROP SEQUENCE`)
    with WAL-logged advancement and crash recovery, plus the `nextval`,
    `currval`, and `setval` functions.
@@ -38,14 +48,18 @@ binder/executor, and server wiring.
   for `<name>` **in the current session**. Errors if `nextval` has not been
   called for `<name>` this session.
 - `setval('<name>', n [, is_called])` — reposition the sequence. Non-transactional.
-- Column `DEFAULT <expr>` in `CREATE TABLE` (literal or `nextval(...)`).
-- `DEFAULT` keyword in `INSERT ... VALUES` and omitted-column defaulting in
-  `INSERT` and `COPY ... FROM`.
+- Column `DEFAULT <const>` (already shipped) and
+  `DEFAULT nextval('<existing-sequence>')` in `CREATE TABLE`. Omitted columns are
+  filled from the default at `INSERT` and `COPY ... FROM` via the existing
+  `build_insert_row` funnel (so `RETURNING` and `ON CONFLICT` get it for free).
 - `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`)
   column types in `CREATE TABLE`.
 
 ### Out of scope (v1 deferrals)
 
+- The `DEFAULT` keyword as a value in `INSERT ... VALUES (DEFAULT, ...)` — no
+  `Expr::Default` marker is added; omit the column from the column list to get
+  its default instead. (Deferred; the earlier draft included it.)
 - `lastval()` (no cross-sequence "last touched" session tracking).
 - A functional `CACHE` (per-session value pre-allocation) — parsed, ignored.
 - `ALTER SEQUENCE`, `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`, identity
@@ -61,8 +75,10 @@ binder/executor, and server wiring.
 These were settled during design and drive the rest of the spec.
 
 1. **General column `DEFAULT`, not a SERIAL-only attribute.** SERIAL desugars to
-   a real, visible, overridable default. The catalog stores a bounded
-   `ColumnDefault` enum so default storage stays serializable and simple.
+   a real, visible, overridable default. Because constant `DEFAULT` already
+   exists as `ColumnDef.default: Option<Value>`, we **generalize that field** to
+   `Option<ColumnDefault>` (a bounded enum) rather than add a parallel
+   sequence-only attribute — keeping one default mechanism.
 2. **WAL-logged advancement, no cache.** Each `nextval`/`setval` appends a
    logical WAL record. No extra fsync per call — the record rides the
    surrounding commit's WAL flush, so any value a committed transaction relied
@@ -72,82 +88,89 @@ These were settled during design and drive the rest of the spec.
    per-connection session state; `lastval` is deferred.
 4. **`CACHE` is a no-op.** Behavioral options (`INCREMENT`, `START`, `MINVALUE`,
    `MAXVALUE`, `CYCLE`) are honored; `CACHE` is accepted and ignored.
+5. **Widen the durable default field.** `ColumnDef.default` becomes
+   `Option<ColumnDefault>` where `ColumnDefault = Const(Value) | Nextval(SequenceId)`.
+   Constant `DEFAULT` landed unreleased on this branch, so changing its on-disk
+   shape is acceptable; we keep `#[serde(default)]` (pre-default catalogs still
+   load) and bump the catalog-snapshot version. A custom deserializer may accept
+   the brief legacy bare-`Value` form to avoid a dev-data reset (optional).
+6. **No `DEFAULT` keyword in `VALUES` for v1.** Reusing the existing
+   omitted-column funnel is enough for SERIAL; adding `Expr::Default` is deferred.
 
 ## 3. Column DEFAULT
 
-### 3.1 Types (`common`)
+### 3.1 What exists today
+
+- `common::ParsedColumnDef.default` and `common::ColumnDef.default` are both
+  `Option<Value>` (`crates/common/src/schema.rs`), `#[serde(default)]`, and
+  round-trip through the catalog snapshot — no version bump was needed for the
+  constant feature.
+- The parser **constant-folds** `DEFAULT <expr>` to a `Value` at parse time in
+  `fold_constant_default` (`crates/parser/src/convert/ddl.rs`), accepting literals
+  and unary-minus numerics and **rejecting function calls**. Folding to a `Value`
+  is how the existing code sidesteps the leaf-crate boundary (no `parser::Expr`
+  ever needs to live on the `common` type) — so the `ColumnDefAst` wrapper the
+  earlier draft proposed is unnecessary and is dropped.
+- The executor applies defaults in one funnel,
+  `build_insert_row(schema, columns, values) -> Row`
+  (`crates/executor/src/query.rs:417`), filling each omitted column with
+  `column.default.clone().unwrap_or(Value::Null)`. It is **shared by `INSERT`,
+  `INSERT ... ON CONFLICT`, and `COPY ... FROM`**.
+- The binder already permits omitting a `NOT NULL` column when it has a non-NULL
+  default (`validate_insert_omissions`, `crates/planner/src/binder/dml.rs`).
+
+### 3.2 Types (`common`) — generalize the default
+
+Widen the two default fields from a bare constant to a bounded enum. Because the
+non-constant default (`nextval`) needs name→id resolution, the **parse-time**
+carrier holds the sequence *name* (a `String`, fine in the leaf crate) and the
+**durable** carrier holds the resolved `SequenceId`:
 
 ```rust
-/// A column default. Bounded for v1 to a constant literal or a nextval call.
-pub enum ColumnDefault {
-    Literal(Value),
-    Nextval(SequenceId),
-}
+// parse-time, on ParsedColumnDef.default: Option<ParsedDefault>
+pub enum ParsedDefault { Const(Value), Nextval(String) }
+
+// durable, on ColumnDef.default: Option<ColumnDefault>
+pub enum ColumnDefault { Const(Value), Nextval(SequenceId) }
 ```
 
-`ColumnDefault` is added as `Option<ColumnDefault>` to both `ParsedColumnDef`
-and `ColumnDef` (`common::schema`). It is `serde`-serializable so it round-trips
-through the catalog manifest snapshot.
+Both are `serde`-serializable. `ParsedColumnDef` also gains a transient
+`serial: bool` (not copied onto the durable `ColumnDef`) so the binder knows to
+run SERIAL desugaring (§6). Keeping `Const(Value)` as a variant preserves the
+existing constant behavior unchanged. See Decision 5 for the on-disk migration.
 
-**Crate boundary.** `common` is the leaf crate and cannot depend on `parser`, so
-the unbound default expression cannot live on `common::ParsedColumnDef` (which
-the parser AST reuses directly in `Statement::CreateTable`). Instead the parser
-AST carries the raw default in a **parser-side column wrapper**:
+### 3.3 Parser
 
-```rust
-// parser::ast
-pub struct ColumnDefAst {
-    pub column: ParsedColumnDef,   // common type: name, data_type, nullable
-    pub default: Option<Expr>,     // unbound parser Expr (None for SERIAL)
-    pub serial: bool,              // SERIAL/BIGSERIAL/... => binder owns desugaring
-}
-// Statement::CreateTable { name, columns: Vec<ColumnDefAst>, primary_key }
-```
+- Generalize `fold_constant_default` (→ `convert_column_default`): constants fold
+  to `ParsedDefault::Const(value)` as today; `nextval('<string-literal>')` becomes
+  `ParsedDefault::Nextval(name)`; anything else is still rejected
+  (`unsupported`).
+- Recognize the `SERIAL` family (§6) in `convert/ddl.rs`: emit
+  `data_type = Integer`, `nullable = false`, `serial = true`, no default.
 
-The binder lowers each `ColumnDefAst` into a `common::ParsedColumnDef` with its
-`default: Option<ColumnDefault>` filled in (explicit `nextval('existing')` is
-resolved to a concrete `SequenceId` here; constant literals become
-`ColumnDefault::Literal`). The catalog then assigns ids to produce the stored
-`ColumnDef`, which carries the same `ColumnDefault`. SERIAL's implicit default is
-finalized at execution time (§6), because the owned sequence's id is not
-allocated until the `CREATE TABLE` runs.
+### 3.4 Binder
 
-### 3.2 Parser
+- `CREATE TABLE` default validation (`validate_default_value`,
+  `crates/planner/src/binder/mod.rs`):
+  - `Const(v)` → existing type-check (no implicit casts; `NULL` only if nullable).
+  - `Nextval(name)` → look the sequence up in the catalog (error `42P01` if
+    missing) and require the column type to be `INTEGER`. The resolved
+    `SequenceId` is produced when the catalog turns `ParsedColumnDef` into
+    `ColumnDef` (the catalog owns the sequence registry); the binder's job is
+    pre-validation and good error messages.
+- `validate_insert_omissions`: extend `has_usable_default` to treat a `Nextval`
+  default as usable, so an omitted `NOT NULL` SERIAL/`nextval`-default column is
+  not rejected.
 
-- `Statement::CreateTable.columns` becomes `Vec<ColumnDefAst>` (§3.1) so a column
-  can carry its unbound default expression and SERIAL flag.
-- New column option: `DEFAULT <expr>` in a `CREATE TABLE` column definition,
-  alongside the existing `NULL`/`NOT NULL`/`PRIMARY KEY` handling
-  (`parser/src/convert/ddl.rs`).
-- `SERIAL` family column types (§6): recognized in `convert/ddl.rs`; the parser
-  emits `column.data_type = Integer`, `nullable = false`, and `serial = true`.
-- New `INSERT` value form: the `DEFAULT` keyword as a value in
-  `INSERT ... VALUES (...)`. Represented as a new `Expr::Default` marker (only
-  valid in an `INSERT` value position; rejected elsewhere by the binder).
+### 3.5 Executor
 
-### 3.3 Binder
-
-- When binding `CREATE TABLE`, lower each column's optional default `Expr`:
-  - A constant literal → `ColumnDefault::Literal(value)`, type-checked against
-    the column type (no implicit casts; `NULL` only if the column is nullable).
-  - `nextval('<name>')` → resolve `<name>` to a `SequenceId` →
-    `ColumnDefault::Nextval(id)`.
-  - Anything else → bind error (`FeatureNotSupported`).
-- Relax the omitted-column rule: `validate_insert_omissions`
-  (`planner/src/binder/dml.rs`) must **not** reject an omitted `NOT NULL` column
-  that has a default. The default supplies the value.
-- Bind the `DEFAULT` keyword in `VALUES`: each `Expr::Default` is replaced by
-  the target column's bound default, or a bind error if the column has none.
-
-### 3.4 Executor
-
-- `map_and_insert_row` (`executor/src/query.rs`) currently fills omitted columns
-  with `Value::Null`. It changes to: for an omitted column, apply its
-  `ColumnDefault` if present (evaluating `Nextval` against the sequence manager),
-  else `NULL` (or the existing NOT-NULL error path for non-defaulted NOT NULL
-  columns — which the binder already enforces).
-- `COPY ... FROM` (`executor/src/copy.rs`) applies the same defaulting for
-  columns absent from the COPY column list, for consistency with `INSERT`.
+- `build_insert_row` changes the fill step from cloning a `Value` to **evaluating
+  a `ColumnDefault`**: `Const(v)` → `v`; `Nextval(seq_id)` → call the sequence
+  manager's `nextval` (advance + `SequenceAdvance` WAL + update session `currval`
+  state). Its signature gains access to the sequence handles (threaded via
+  `StatementContext`, §5). Because this is the shared funnel, `INSERT`,
+  `ON CONFLICT`, and `COPY ... FROM` all get sequence-backed defaults with no
+  per-path work — see §12 for the ordering consequences.
 
 ## 4. Sequences
 
@@ -196,6 +219,11 @@ The live current value lives in a `SequenceManager` owned by the storage engine
 (which already owns WAL append and the recovery replay loop). Per sequence it
 holds `(last_value, is_called)` behind a per-sequence lock so concurrent writers
 (the shared writer guard permits parallel DML) get unique values.
+
+The **`SequenceManager` trait is declared in `common`** (concrete impl in
+`storage`), mirroring the existing `SsiTracker`/`ConflictWaiter` traits, so that
+`StatementContext` can carry an `Arc<dyn SequenceManager>` (§5) without `common`
+depending on `storage`.
 
 ```text
 nextval(id):
@@ -277,12 +305,19 @@ string literal resolved to a `SequenceId` at bind time (unknown name →
 
 ### Session state and executor threading
 
-A per-connection `SessionSequenceState` (a `SequenceId -> i64` map) is added to
-the server session. Expression evaluation in the executor is given two new
-handles: a shared `&dyn SequenceManager` (for `nextval`/`setval`) and a mutable
-`&mut SessionSequenceState` (updated by `nextval`, read by `currval`). This is
-the one place the otherwise-pure expression evaluator gains side effects; it is
-confined to these three functions.
+Follow the pattern SSI already established: `StatementContext` carries the SSI
+tracker as a handle threaded into the executor (`crates/common/src/context.rs`).
+Add two handles there the same way:
+
+- a shared `Arc<dyn SequenceManager>` (for `nextval`/`setval`), defaulting to a
+  no-op/None for read-only contexts that never touch sequences; and
+- the per-connection `currval` state — a `SequenceId -> i64` map behind interior
+  mutability (`Arc<Mutex<SessionSequenceState>>`) since `StatementContext` fields
+  are shared `Arc`s — updated by `nextval`, read by `currval`.
+
+This is the one place the otherwise-pure expression evaluator gains side effects;
+it is confined to these three functions and does not perturb SSI tracking (§12),
+because sequence ops touch no heap tuples.
 
 `nextval`/`setval`/`currval` are permitted in projection lists, `INSERT`/`COPY`
 values, `UPDATE` SET expressions, and column `DEFAULT`s. Their evaluation count
@@ -305,18 +340,25 @@ stores no table reference (`owned: bool` only, §4.1) — so the order is simply
   column, choose the sequence name `<table>_<column>_seq` (append the smallest
   free numeric suffix if taken), and set the column to `INTEGER` + `NOT NULL`.
   Record a pending owned-sequence request in `BoundStatement::CreateTable`. The
-  column's `ColumnDefault` is left to be finalized at execution.
+  column's default is left to be finalized at execution.
 - **Executor (`execute_create_table`), in order, one autocommit transaction:**
   1. For each pending request, `catalog.create_sequence(...)` (increment 1,
      start 1, min 1, max `i64::MAX`, no cycle, `owned: true`) → `SequenceId`,
      appending a `CreateSequence` WAL record. The record is final — it carries no
      table id.
-  2. Fill each SERIAL column's `ColumnDefault::Nextval(seq_id)`.
-  3. `catalog.create_table(...)` with the finalized defaults.
+  2. Set each SERIAL column's default to `ParsedDefault::Nextval(<generated name>)`.
+  3. `catalog.create_table(...)`, which resolves **every** `Nextval(name)` default
+     (SERIAL and explicit `DEFAULT nextval('existing')` alike) against the now-
+     present sequence registry → `ColumnDefault::Nextval(id)` on the stored
+     `ColumnDef`. One uniform resolution path.
 
 Because the sequences and table are created in the same autocommit transaction,
 they share its commit/abort outcome — if `CREATE TABLE` aborts, neither exists
 (the `CreateSequence` records are CLOG-gated to the same txn).
+
+A SERIAL column may participate in a (possibly composite) `PRIMARY KEY` or a
+`UNIQUE` constraint — both now exist — with no special handling: the default
+fills the value before the key/uniqueness checks run in `build_insert_row`.
 
 **Ownership rules:**
 
@@ -353,50 +395,61 @@ they share its commit/abort outcome — if `CREATE TABLE` aborts, neither exists
 
 ## 9. Testing
 
-- **parser**: sequence grammar + every option, `SERIAL` family, `DEFAULT`
-  column option and `DEFAULT` value keyword, rejection cases.
+- **parser**: sequence grammar + every option, `SERIAL` family, `DEFAULT <const>`
+  and `DEFAULT nextval('s')` column options, rejection cases (incl. `DEFAULT` as a
+  `VALUES` item still being rejected, and non-`nextval` function defaults).
 - **catalog**: create/drop, id allocation high-water behavior, snapshot
   round-trip including sequences + baseline values, old-snapshot compatibility.
 - **storage / recovery**: crash after N `nextval`s → no value reissued; an
   aborted transaction's `nextval` keeps the gap; `setval` then crash; `CYCLE`
   wrap and `NO CYCLE` exhaustion; concurrent `nextval` from parallel writers
   yields all-unique values.
-- **server integration**: `SERIAL` end-to-end insert and id read-back via
-  `currval`; `setval` repositioning; `DROP TABLE` cascade-drops the owned
-  sequence; `DROP SEQUENCE` of an owned sequence errors; `SELECT nextval(...)`
-  routes through the write path and is durable; DDL-in-transaction rejection of
-  `CREATE`/`DROP SEQUENCE`.
+- **server integration**: `SERIAL` end-to-end insert and id read-back via both
+  `INSERT ... RETURNING id` (primary idiom) and `currval`; `setval`
+  repositioning; `DROP TABLE` cascade-drops the owned sequence; `DROP SEQUENCE`
+  of an owned sequence errors; `SELECT nextval(...)` routes through the write path
+  and is durable; DDL-in-transaction rejection of `CREATE`/`DROP SEQUENCE`.
+- **interactions (§12)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
+  still consumes a sequence value (observable gap); `excluded.<serial_col>` sees
+  the `nextval`-filled value; a `SERIALIZABLE` transaction that calls `nextval`
+  (with no heap reads/writes) commits without a `40001`, and a SERIALIZABLE abort
+  of a txn that did touch heap does not roll back its sequence advance.
 
 ## 10. Build order
 
 A single implementation plan, sequenced as independently testable commits:
 
-1. **Column `DEFAULT` (literals only).** Parser `DEFAULT` option + `DEFAULT`
-   value keyword, `ColumnDefault` in `common`, catalog storage + manifest
-   round-trip, binder omitted-column relaxation, executor application. No
-   sequences yet — defaults restricted to literals.
+1. **Generalize the default field (no sequences yet).** Introduce
+   `ColumnDefault`/`ParsedDefault` enums, migrate `ParsedColumnDef.default` and
+   `ColumnDef.default` to them with the `Const` variant preserving today's
+   constant behavior, update `fold_constant_default`, `validate_default_value`,
+   the catalog snapshot (version bump + `#[serde(default)]`), and the
+   `build_insert_row` fill step to match on `Const`. Pure refactor — existing
+   DEFAULT tests stay green; `Nextval` has no producer yet.
 2. **Sequence catalog object + DDL.** `SequenceId`/`SequenceSchema`, catalog
    map + allocator + recovery hooks, manifest field, `CreateSequence`/
    `DropSequence` WAL records, `CREATE`/`DROP SEQUENCE` parsing and server DDL
    dispatch, recovery replay. No functions yet.
 3. **Functions + runtime.** `SequenceManager` with WAL-logged advance/setval and
    recovery fast-forward, `nextval`/`currval`/`setval` evaluation, session
-   state + executor threading, write-path routing for sequence-mutating
-   statements.
+   state + `StatementContext` threading, write-path routing for
+   sequence-mutating statements, and the `build_insert_row` `Nextval` evaluation.
+   Also wire `nextval` as an explicit `DEFAULT nextval('existing')` resolved in
+   `catalog.create_table`.
 4. **`SERIAL` desugaring + ownership.** `SERIAL` family parsing, desugar to
-   sequence + `ColumnDefault::Nextval`, owned-sequence cascade on `DROP TABLE`,
-   `DROP SEQUENCE` ownership guard.
-5. **Consistency + specs.** `COPY ... FROM` default application, update
-   `docs/specs/overview.md` and the affected `docs/specs/crates/*.md`, and a
-   full `cargo fmt` / `clippy` / `test` sweep.
+   owned sequence + `ParsedDefault::Nextval`, owned-sequence cascade on
+   `DROP TABLE`, `DROP SEQUENCE` ownership guard.
+5. **Specs + sweep.** `COPY ... FROM` already inherits defaults via the shared
+   funnel — add tests rather than code; update `docs/specs/overview.md` and the
+   affected `docs/specs/crates/*.md`; full `cargo fmt` / `clippy` / `test` sweep.
 
 ## 11. Spec impact
 
 When implemented, update in the same change:
 
-- `docs/specs/overview.md` — data types (note `SERIAL` family → `INTEGER`), SQL
-  subset (`CREATE`/`DROP SEQUENCE`, `DEFAULT`, sequence functions), and the
-  `Value`/`DataType` discussion (unchanged, but defaults are new).
+- `docs/specs/overview.md` — data types (note `SERIAL` family → `INTEGER`) and
+  SQL subset (`CREATE`/`DROP SEQUENCE`, `DEFAULT nextval`, sequence functions). No
+  `Value`/`DataType` change.
 - `docs/specs/crates/parser.md` — sequence grammar, `DEFAULT`, `SERIAL`.
 - `docs/specs/crates/catalog.md` — sequence object, allocator, snapshot field.
 - `docs/specs/crates/wal.md` — the four new record kinds and their replay gating.
@@ -404,3 +457,35 @@ When implemented, update in the same change:
 - `docs/specs/crates/executor.md` — sequence functions and default application.
 - `docs/specs/crates/server.md` — DDL dispatch, write-path routing, session
   state, checkpoint baseline.
+
+## 12. Interactions with RETURNING, ON CONFLICT, and SSI
+
+These features landed after the first draft; all three flow through the shared
+`build_insert_row` funnel (`crates/executor/src/query.rs`), which fills defaults
+**before** the conflict probe and before `RETURNING` projection.
+
+- **RETURNING.** Because defaults (including a `Nextval`) are filled before
+  `eval_returning` (`query.rs:457`), `INSERT INTO t (...) RETURNING id` returns
+  the generated SERIAL value directly. This is the **primary** id read-back idiom
+  and is preferred over `currval` (no session round-trip, no separate query).
+  `UPDATE`/`DELETE ... RETURNING` have no sequence interaction unless an
+  assignment itself calls `nextval`.
+- **ON CONFLICT (gap on conflict).** `build_insert_row` constructs the proposed
+  row — evaluating any `Nextval` default — *before* the primary-key arbiter probe
+  (`query.rs:299` → key → probe). Therefore `nextval` is consumed **even when
+  `DO NOTHING` skips the insert** because of a conflict, producing an observable
+  sequence gap. This is intentional and matches PostgreSQL; it is consistent with
+  the non-transactional "advances are never rolled back" rule (§4.3). Workloads
+  that upsert mostly-conflicting rows will burn sequence values — expected.
+  `excluded.<col>` for a SERIAL column reflects the `nextval`-filled proposed
+  value.
+- **SSI.** `nextval`/`setval` touch only in-memory sequence state and WAL — never
+  heap tuples — so they record no SIREAD locks or rw-edges
+  (`crates/common/src/context.rs` `SsiTracker`; recording happens only at scan
+  operators and storage writes). A statement that *only* calls a sequence
+  function can never be the cause of a `40001` serialization abort, and a
+  `StatementContext` for such work keeps the no-op `NoSsiTracker` default. If a
+  `SERIALIZABLE` transaction is aborted by SSI for its heap activity, its
+  sequence advances are **not** undone — the same gap semantics as any abort.
+  `SERIALIZABLE` is now its own `IsolationLevel` variant; sequences need no
+  per-isolation special-casing.
