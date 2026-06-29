@@ -294,6 +294,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_update_from_and_delete_using() {
+        // `UPDATE ... FROM` and `DELETE ... USING` (joins into the write target) are
+        // intentionally not supported; they are rejected as unsupported forms.
+        let err = parse("update users set name = 'x' from accounts where users.id = accounts.id")
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+
+        let err =
+            parse("delete from users using accounts where users.id = accounts.id").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn parses_returning_clause_for_dml() {
         // INSERT ... RETURNING <items>: the projection list is carried on the AST.
         let Statement::Insert { returning, .. } =
