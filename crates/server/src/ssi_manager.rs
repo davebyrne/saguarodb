@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, Result, Snapshot, SsiTracker, TableId, TxnId};
+use common::{DbError, Key, Result, Snapshot, SqlState, SsiTracker, TableId, TxnId};
 
 use crate::registry::ActiveTxnRegistry;
 
@@ -44,13 +44,17 @@ struct SsiState {
     tuple_readers: HashMap<(TableId, Key), HashSet<TxnId>>,
     /// Per top-level serializable transaction.
     txns: HashMap<TxnId, TxnSsi>,
+    /// Monotonic commit-sequence counter assigned to a serializable transaction when
+    /// it passes its commit-time SSI check, so detection can ask "did `T_out` commit
+    /// first?" (`docs/specs/ssi.md` §7). Process-local, not a durable commit timestamp.
+    next_commit_seq: u64,
 }
 
 /// Per-transaction SSI state, kept until the GC horizon releases its SIREAD locks.
 #[derive(Debug)]
 struct TxnSsi {
-    /// The transaction's snapshot, for the lifetime test and (Milestone 5) the
-    /// reader/writer concurrency test.
+    /// The transaction's snapshot, for the lifetime test and the reader/writer
+    /// concurrency test (`docs/specs/ssi.md` §6).
     snapshot: Arc<Snapshot>,
     /// Tables this transaction holds a relation SIREAD lock on (reverse index for
     /// cleanup).
@@ -58,9 +62,20 @@ struct TxnSsi {
     /// Keys this transaction holds a tuple SIREAD lock on, grouped by table (reverse
     /// index for cleanup and the per-table cap).
     tuple_locks: HashMap<TableId, HashSet<Key>>,
-    /// Set once the transaction has committed or aborted. SIREAD locks outlive the
-    /// transaction (a later concurrent writer can still form an edge); they are
-    /// released only when the GC horizon passes the reader (`release_up_to`).
+    /// rw-antidependency successors: `W` such that `self →rw W` (self read an item `W`
+    /// then overwrote). Non-empty ⇒ this transaction has an *outgoing* conflict.
+    out_edges: HashSet<TxnId>,
+    /// rw-antidependency predecessors: `V` such that `V →rw self` (V read an item this
+    /// transaction then overwrote). Non-empty ⇒ this transaction has an *incoming*
+    /// conflict. A transaction with both an incoming and an outgoing edge is a pivot.
+    in_edges: HashSet<TxnId>,
+    /// Assigned (from `next_commit_seq`) when this transaction passes its commit-time
+    /// SSI check; `None` while it is still in progress. Used to order commits for the
+    /// "`T_out` commits first" condition (`docs/specs/ssi.md` §7).
+    commit_seq: Option<u64>,
+    /// Set once the transaction has committed or aborted. SIREAD locks and edges
+    /// outlive the transaction (a later concurrent writer can still form an edge);
+    /// they are released only when the GC horizon passes the reader (`release_up_to`).
     finished: bool,
 }
 
@@ -87,6 +102,9 @@ impl SerializableConflictManager {
             snapshot,
             relation_locks: HashSet::new(),
             tuple_locks: HashMap::new(),
+            out_edges: HashSet::new(),
+            in_edges: HashSet::new(),
+            commit_seq: None,
             finished: false,
         });
     }
@@ -118,15 +136,53 @@ impl SerializableConflictManager {
             .collect();
         for top in releasable {
             let txn = st.txns.remove(&top).expect("just collected");
-            for table in txn.relation_locks {
-                remove_reader(&mut st.relation_readers, &table, top);
-            }
-            for (table, keys) in txn.tuple_locks {
-                for key in keys {
-                    remove_reader(&mut st.tuple_readers, &(table, key), top);
-                }
-            }
+            purge(&mut st, top, txn);
         }
+    }
+
+    /// Drop all SSI state for an **aborted** transaction immediately: an aborted
+    /// transaction's reads and writes never happened, so its SIREAD locks and rw-edges
+    /// are void and need not wait for the GC horizon (`docs/specs/ssi.md` §8). A no-op
+    /// for an unregistered (non-tracked) transaction.
+    pub fn aborted(&self, top: TxnId) {
+        let mut st = self.lock();
+        if let Some(txn) = st.txns.remove(&top) {
+            purge(&mut st, top, txn);
+        }
+    }
+
+    /// The commit-time SSI check for a serializable transaction `top`, run **before**
+    /// the WAL `Commit` is flushed (`docs/specs/ssi.md` §7). Returns `Err(40001)` when
+    /// committing `top` would complete a dangerous structure; otherwise it stamps
+    /// `top` with its commit sequence and returns `Ok`. The acting transaction (`top`)
+    /// is always the participant aborted, so the abort is synchronous on its own
+    /// thread. A no-op `Ok` for an unregistered transaction.
+    pub fn commit_check(&self, top: TxnId) -> Result<()> {
+        let mut st = self.lock();
+        if !st.txns.contains_key(&top) {
+            return Ok(());
+        }
+        // (a) `top` is itself a pivot whose outbound neighbor committed first.
+        if is_doomed_pivot(&st, top) {
+            return Err(serialization_failure());
+        }
+        // (b) `top` is the `T_out` whose committing-first dooms an active in-neighbor
+        //     pivot `V` (`V →rw top`, V still in progress and itself having an inbound
+        //     edge). Breaking the `V → top` edge by aborting `top` breaks the structure.
+        let in_edges: Vec<TxnId> = st.txns[&top].in_edges.iter().copied().collect();
+        let dooms_in_neighbor = in_edges.iter().any(|v| {
+            st.txns
+                .get(v)
+                .is_some_and(|vt| vt.commit_seq.is_none() && !vt.in_edges.is_empty())
+        });
+        if dooms_in_neighbor {
+            return Err(serialization_failure());
+        }
+        // Passed: stamp the commit sequence so later checks can order this commit.
+        let seq = st.next_commit_seq;
+        st.next_commit_seq += 1;
+        st.txns.get_mut(&top).expect("present above").commit_seq = Some(seq);
+        Ok(())
     }
 
     /// Observability for metrics and tests: `(tracked transactions, relation SIREAD
@@ -163,6 +219,64 @@ fn remove_reader<K: std::hash::Hash + Eq>(
     }
 }
 
+/// Fully remove `top` (already taken out of `st.txns`) from the graph: its SIREAD
+/// lock memberships in the reader maps and its edges in every neighbor's edge set.
+fn purge(st: &mut SsiState, top: TxnId, txn: TxnSsi) {
+    for table in txn.relation_locks {
+        remove_reader(&mut st.relation_readers, &table, top);
+    }
+    for (table, keys) in txn.tuple_locks {
+        for key in keys {
+            remove_reader(&mut st.tuple_readers, &(table, key), top);
+        }
+    }
+    // `top →rw w` ⟹ `w.in_edges` holds `top`; `v →rw top` ⟹ `v.out_edges` holds `top`.
+    for w in txn.out_edges {
+        if let Some(wt) = st.txns.get_mut(&w) {
+            wt.in_edges.remove(&top);
+        }
+    }
+    for v in txn.in_edges {
+        if let Some(vt) = st.txns.get_mut(&v) {
+            vt.out_edges.remove(&top);
+        }
+    }
+}
+
+/// Whether `writer` is concurrent with the reader snapshot `s` — i.e. the reader did
+/// NOT see the writer's effect (the writer is in the reader's future, or was
+/// in-progress at the reader's snapshot). This is the condition for a relevant
+/// rw-antidependency edge `reader →rw writer` (`docs/specs/ssi.md` §6); if the reader
+/// had seen the writer's version there would be no antidependency.
+fn concurrent(s: &Snapshot, writer: TxnId) -> bool {
+    writer >= s.xmax || s.xip.contains(&writer)
+}
+
+/// Whether `t` is a pivot whose outbound rw-neighbor already committed first: `t` has
+/// both an inbound and an outbound edge, and some `t →rw W` target has committed
+/// (`W.commit_seq` is set) while `t` is still in progress — the dangerous structure of
+/// `docs/specs/ssi.md` §7.
+fn is_doomed_pivot(st: &SsiState, t: TxnId) -> bool {
+    let Some(txn) = st.txns.get(&t) else {
+        return false;
+    };
+    if txn.in_edges.is_empty() || txn.out_edges.is_empty() {
+        return false;
+    }
+    txn.out_edges
+        .iter()
+        .any(|w| st.txns.get(w).is_some_and(|o| o.commit_seq.is_some()))
+}
+
+/// The `40001` raised when an SSI check aborts a transaction (matches PostgreSQL's
+/// message and reuses the `SerializationFailure` SQLSTATE — `docs/specs/ssi.md` §3).
+fn serialization_failure() -> DbError {
+    DbError::execute(
+        SqlState::SerializationFailure,
+        "could not serialize access due to read/write dependencies among transactions",
+    )
+}
+
 impl SsiTracker for SerializableConflictManager {
     fn record_tuple_read(&self, reader: TxnId, table: TableId, key: &Key) {
         let top = self.registry.top_of(reader);
@@ -197,9 +311,50 @@ impl SsiTracker for SerializableConflictManager {
         Self::add_relation_lock(&mut st, top, table);
     }
 
-    fn note_write(&self, _writer: TxnId, _table: TableId, _key: &Key) -> Result<()> {
-        // rw-edge formation + detection land in Milestones 5–6; until then a
-        // serializable write forms no edges and never fails an SSI check.
+    fn note_write(&self, writer: TxnId, table: TableId, key: &Key) -> Result<()> {
+        let writer_top = self.registry.top_of(writer);
+        let mut st = self.lock();
+        if !st.txns.contains_key(&writer_top) {
+            return Ok(()); // not a tracked serializable writer
+        }
+        // Concurrent readers of this exact item — relation readers of the table plus
+        // tuple readers of (table, key) — that are a different transaction and did not
+        // see this writer (§6). Each yields an edge `reader →rw writer`.
+        let mut candidates: Vec<TxnId> = Vec::new();
+        if let Some(s) = st.relation_readers.get(&table) {
+            candidates.extend(s.iter().copied());
+        }
+        if let Some(s) = st.tuple_readers.get(&(table, key.clone())) {
+            candidates.extend(s.iter().copied());
+        }
+        let readers: Vec<TxnId> = candidates
+            .into_iter()
+            .filter(|&r| r != writer_top) // a txn reading then writing an item is no self-conflict
+            .filter(|&r| {
+                st.txns
+                    .get(&r)
+                    .is_some_and(|rt| concurrent(&rt.snapshot, writer_top))
+            })
+            .collect();
+        if readers.is_empty() {
+            return Ok(());
+        }
+        for &reader in &readers {
+            if let Some(rt) = st.txns.get_mut(&reader) {
+                rt.out_edges.insert(writer_top);
+            }
+        }
+        st.txns
+            .get_mut(&writer_top)
+            .expect("tracked above")
+            .in_edges
+            .extend(readers.iter().copied());
+        // Edge-time detection (§7.1): the new inbound edges can make the writer a pivot
+        // if it already had an outbound edge whose target committed first. The acting
+        // writer is the participant aborted.
+        if is_doomed_pivot(&st, writer_top) {
+            return Err(serialization_failure());
+        }
         Ok(())
     }
 }
@@ -299,5 +454,107 @@ mod tests {
         assert!(st.relation_readers.get(&7).is_some_and(|s| s.contains(&10)));
         // The earlier tuple-reader entries for table 7 were cleared.
         assert!(!st.tuple_readers.contains_key(&(7, key(0))));
+    }
+
+    /// A snapshot that excludes `others` (lists them in `xip`), so a writer among them
+    /// is concurrent with this reader.
+    fn snapshot_excluding(xmax: TxnId, others: &[TxnId]) -> Arc<Snapshot> {
+        Arc::new(Snapshot {
+            xmin: 1,
+            xmax,
+            xip: others.to_vec(),
+        })
+    }
+
+    #[test]
+    fn note_write_forms_edge_for_a_concurrent_reader_only() {
+        let mgr = manager();
+        mgr.register(10, snapshot(20)); // reader R; writers >= 20 are concurrent
+        mgr.record_relation_read(10, 1);
+        mgr.register(25, snapshot(30)); // writer W = 25 (>= R.xmax 20 ⇒ concurrent)
+        assert!(mgr.note_write(25, 1, &key(0)).is_ok());
+        let st = mgr.lock();
+        assert!(st.txns[&10].out_edges.contains(&25), "edge R→W formed");
+        assert!(st.txns[&25].in_edges.contains(&10));
+    }
+
+    #[test]
+    fn note_write_skips_self_and_non_concurrent_readers() {
+        // Self: a transaction reading then writing the same item forms no edge.
+        let mgr = manager();
+        mgr.register(10, snapshot(20));
+        mgr.record_relation_read(10, 1);
+        assert!(mgr.note_write(10, 1, &key(0)).is_ok());
+        assert!(mgr.lock().txns[&10].in_edges.is_empty());
+
+        // Non-concurrent: the reader's snapshot already saw the writer (writer < xmax,
+        // not in xip), so no antidependency.
+        let mgr = manager();
+        mgr.register(30, snapshot(40)); // R sees everything < 40 (empty xip)
+        mgr.record_relation_read(30, 1);
+        mgr.register(25, snapshot(50));
+        assert!(mgr.note_write(25, 1, &key(0)).is_ok());
+        assert!(
+            !mgr.lock().txns[&30].out_edges.contains(&25),
+            "R saw W ⇒ no edge"
+        );
+    }
+
+    #[test]
+    fn write_skew_makes_a_pivot_and_one_commit_aborts() {
+        let mgr = manager();
+        // Two mutually-concurrent transactions (each lists the other in xip).
+        mgr.register(10, snapshot_excluding(12, &[11]));
+        mgr.register(11, snapshot_excluding(12, &[10]));
+        mgr.record_relation_read(10, 1); // T1 reads table 1
+        mgr.record_relation_read(11, 2); // T2 reads table 2
+        assert!(mgr.note_write(10, 2, &key(0)).is_ok()); // T1 writes table 2 (T2 read it)
+        assert!(mgr.note_write(11, 1, &key(0)).is_ok()); // T2 writes table 1 (T1 read it)
+        // Both are pivots; the first to commit is the victim.
+        assert_eq!(
+            mgr.commit_check(10).unwrap_err().code,
+            SqlState::SerializationFailure
+        );
+        mgr.aborted(10);
+        // The survivor commits cleanly (its edges to the aborted pivot were purged).
+        assert!(mgr.commit_check(11).is_ok());
+    }
+
+    #[test]
+    fn edge_time_abort_once_out_neighbor_committed() {
+        let mgr = manager();
+        // Pivot reads tables 1 and 3; both 10 and 30 are concurrent with it.
+        mgr.register(20, snapshot_excluding(25, &[10, 30]));
+        mgr.record_relation_read(20, 1);
+        mgr.record_relation_read(20, 3);
+        // T_out=10 writes table 1 → edge pivot→T_out, then T_out commits first.
+        mgr.register(10, snapshot(25));
+        assert!(mgr.note_write(10, 1, &key(0)).is_ok());
+        assert!(mgr.commit_check(10).is_ok());
+        // R_in=30 reads table 3; the pivot writes table 3 → gains an in-edge, becoming
+        // a pivot whose out-neighbor already committed ⇒ edge-time abort.
+        mgr.register(30, snapshot_excluding(25, &[10, 20]));
+        mgr.record_relation_read(30, 3);
+        assert_eq!(
+            mgr.note_write(20, 3, &key(0)).unwrap_err().code,
+            SqlState::SerializationFailure
+        );
+    }
+
+    #[test]
+    fn pivot_committing_before_its_out_neighbor_proceeds() {
+        let mgr = manager();
+        mgr.register(20, snapshot_excluding(25, &[10, 30]));
+        mgr.record_relation_read(20, 1); // pivot's future out-edge target (table 1)
+        // R_in=30 reads table 3; pivot writes table 3 → in-edge for the pivot.
+        mgr.register(30, snapshot_excluding(25, &[10, 20]));
+        mgr.record_relation_read(30, 3);
+        assert!(mgr.note_write(20, 3, &key(0)).is_ok());
+        // T_out=10 writes table 1 → pivot gains its out-edge, but T_out has NOT
+        // committed, so no edge-time abort.
+        mgr.register(10, snapshot(25));
+        assert!(mgr.note_write(10, 1, &key(0)).is_ok());
+        // The pivot commits BEFORE its out-neighbor ⇒ it is not the dangerous pivot.
+        assert!(mgr.commit_check(20).is_ok());
     }
 }

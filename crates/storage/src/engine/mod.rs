@@ -396,6 +396,12 @@ impl StorageEngine for PageBackedStorageEngine {
             self.insert_secondary_entry(ctx, &schema, &index, &entry_key, has_null, &location)?;
         }
 
+        // SSI: this insert may complete an rw-antidependency with a concurrent
+        // serializable reader of the table (or a point reader of this key) — the
+        // phantom case (`docs/specs/ssi.md` §6). No-op for non-SERIALIZABLE writers; an
+        // `Err` is the SSI `40001` victim, aborting this statement.
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, &key)?;
+
         Ok(RowId {
             page_num: location.page_num,
             slot_num: location.slot_num,
@@ -446,6 +452,9 @@ impl StorageEngine for PageBackedStorageEngine {
             // An in-progress writer holds this row's lock: wait, then re-check.
             self.wait_for_conflict(ctx, blocker)?;
         }
+        // SSI: this delete overwrote the row a concurrent serializable reader may have
+        // read (`docs/specs/ssi.md` §6).
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
         Ok(true)
     }
 
@@ -485,6 +494,11 @@ impl StorageEngine for PageBackedStorageEngine {
         if let Some(result) =
             self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
         {
+            // SSI: a successful HOT update overwrote the row a concurrent serializable
+            // reader may have read (`docs/specs/ssi.md` §6).
+            if result {
+                ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
+            }
             return Ok(result);
         }
 
@@ -573,6 +587,9 @@ impl StorageEngine for PageBackedStorageEngine {
             self.insert_secondary_entry(ctx, &schema, &index, &new_key, has_null, &new_location)?;
         }
 
+        // SSI: the non-HOT update overwrote the row a concurrent serializable reader
+        // may have read (`docs/specs/ssi.md` §6).
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
         Ok(true)
     }
 

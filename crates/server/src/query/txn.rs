@@ -357,8 +357,28 @@ impl QueryService {
     /// set `CLOG=Committed` (done at flush), run post-durable-commit cleanup, and
     /// deregister. Releasing the write guard happens when `txn` is dropped after
     /// this returns.
+    /// Settle a serializable transaction's SSI state at the end of its life. On commit,
+    /// mark it finished (its SIREAD locks + rw-edges are retained so concurrent
+    /// transactions can still form edges) and release any SIREAD locks the now-advanced
+    /// GC horizon permits; on abort, drop its SSI state immediately (its reads/writes
+    /// are void). A no-op for non-serializable transactions (`docs/specs/ssi.md` §8).
+    fn ssi_finish(&self, txn_id: u64, isolation: IsolationLevel, committed: bool) {
+        if isolation != IsolationLevel::Serializable {
+            return;
+        }
+        if committed {
+            self.components.ssi_manager.finished(txn_id);
+            self.components
+                .ssi_manager
+                .release_up_to(self.components.gc_horizon());
+        } else {
+            self.components.ssi_manager.aborted(txn_id);
+        }
+    }
+
     fn commit_transaction(&self, txn: Transaction) -> Result<()> {
         let txn_id = txn.txn_id;
+        let isolation = txn.isolation;
         let dead_versions = txn.dead_versions_pending;
         // The whole family `{top} ∪ subxids` settles together. Compute it before any
         // settle so the atomic family-deregister (`docs/specs/savepoints.md` §3) can
@@ -372,7 +392,26 @@ impl QueryService {
         if txn.write_guard.is_none() {
             self.components.active_txns.deregister_all(&family);
             self.components.lock_manager.on_txn_finished();
+            // A read-only serializable transaction never writes, so it can never be a
+            // pivot or a dooming `T_out` (no commit check needed); but its SIREAD locks
+            // must persist for concurrent writers, so finish (not abort) it.
+            self.ssi_finish(txn_id, isolation, true);
             return Ok(());
+        }
+
+        // SSI commit-time check, BEFORE the durable Commit flush, so a serializable
+        // transaction that completes a dangerous structure is rolled back and never
+        // becomes durable (`docs/specs/ssi.md` §7). The committing transaction is the
+        // participant aborted, so this is synchronous.
+        if isolation == IsolationLevel::Serializable
+            && let Err(err) = self.components.ssi_manager.commit_check(txn_id)
+        {
+            // Abort the whole family (mirroring the flush-failure path) and drop its
+            // SSI state, then surface 40001.
+            self.abort_subxids(&txn.live_subxids);
+            self.rollback_pre_durable_or_die(txn_id, None);
+            self.ssi_finish(txn_id, isolation, false);
+            return Err(err);
         }
 
         if let Err(err) = self.append_and_flush_commit(txn_id, &txn.live_subxids) {
@@ -382,6 +421,9 @@ impl QueryService {
             // — no page-content undo (`docs/specs/mvcc.md` §4 Decision 3).
             self.abort_subxids(&txn.live_subxids);
             self.rollback_pre_durable_or_die(txn_id, None);
+            // The transaction passed its SSI commit check but did not commit durably:
+            // drop its (now void) SSI state.
+            self.ssi_finish(txn_id, isolation, false);
             // `txn` (and its write guard) drops here, releasing the guard.
             return Err(err);
         }
@@ -396,6 +438,9 @@ impl QueryService {
         self.components.active_txns.deregister_all(&family);
         // Wake any writer blocked on this transaction's row locks.
         self.components.lock_manager.on_txn_finished();
+        // Finish the serializable transaction's SSI state (retain its SIREAD locks for
+        // concurrent transactions; release whatever the advanced GC horizon permits).
+        self.ssi_finish(txn_id, isolation, true);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
 
@@ -420,6 +465,7 @@ impl QueryService {
     /// path.
     pub(super) fn abort_transaction(&self, txn: Transaction) {
         let txn_id = txn.txn_id;
+        let isolation = txn.isolation;
         if txn.write_guard.is_none() {
             // A read-only transaction (top + subxids) wrote nothing: no Abort record,
             // no cleanup, just deregister the whole family.
@@ -428,12 +474,16 @@ impl QueryService {
                 .collect();
             self.components.active_txns.deregister_all(&family);
             self.components.lock_manager.on_txn_finished();
+            // Drop the serializable transaction's SSI state (its reads are void).
+            self.ssi_finish(txn_id, isolation, false);
             return;
         }
         // Abort every not-rolled-back subxid (so its rows are CLOG-hidden and
         // VACUUM-reclaimable), then the top-level transaction.
         self.abort_subxids(&txn.live_subxids);
         self.rollback_pre_durable_or_die(txn_id, None);
+        // Drop the serializable transaction's SSI state (its reads/writes are void).
+        self.ssi_finish(txn_id, isolation, false);
         // `txn` drops here, releasing the exclusive write guard.
         drop(txn);
     }
