@@ -1,0 +1,142 @@
+mod support;
+
+use support::{Connection, TestServer};
+
+/// Classic write skew: two `SERIALIZABLE` transactions each read the whole table and
+/// then update a different row based on what they read. Snapshot isolation (Repeatable
+/// Read) lets both commit — a serializability anomaly — but SSI detects the rw-cycle
+/// and aborts exactly one with `40001` (`docs/specs/ssi.md`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_skew_aborts_one_serializable_transaction() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+    setup.ok("insert into t (id, v) values (2, 20)").await;
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level serializable").await;
+    t2.ok("begin isolation level serializable").await;
+    // Each reads the whole table (a relation SIREAD lock), then writes a different row.
+    t1.ok("select v from t").await;
+    t2.ok("select v from t").await;
+    t1.ok("update t set v = 100 where id = 1").await;
+    t2.ok("update t set v = 200 where id = 2").await;
+
+    // Both are pivots; committing closes the rw-cycle, so exactly one aborts with 40001.
+    let r1 = t1.query("commit").await.unwrap().result;
+    let r2 = t2.query("commit").await.unwrap().result;
+    let failures = [&r1, &r2].into_iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        failures,
+        1,
+        "exactly one serializable txn must abort (t1_err={}, t2_err={})",
+        r1.is_err(),
+        r2.is_err()
+    );
+    let err = r1.err().or(r2.err()).unwrap();
+    assert!(
+        err.message.contains("C=40001"),
+        "victim gets 40001: {}",
+        err.message
+    );
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// The SAME workload under REPEATABLE READ commits BOTH transactions: snapshot
+/// isolation permits write skew. This proves SERIALIZABLE is strictly stronger — the
+/// SSI machinery (not the shared snapshot) is what aborts the cycle above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_skew_is_allowed_under_repeatable_read() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+    setup.ok("insert into t (id, v) values (2, 20)").await;
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level repeatable read").await;
+    t2.ok("begin isolation level repeatable read").await;
+    t1.ok("select v from t").await;
+    t2.ok("select v from t").await;
+    t1.ok("update t set v = 100 where id = 1").await;
+    t2.ok("update t set v = 200 where id = 2").await;
+    // Disjoint rows ⇒ no write-write conflict; snapshot isolation commits both.
+    t1.ok("commit").await;
+    t2.ok("commit").await;
+    assert_eq!(server.active_txn_count(), 0);
+    assert_eq!(
+        setup.ok("select v from t order by id").await.rows(),
+        vec![vec![Some("100".to_string())], vec![Some("200".to_string())]],
+        "both write-skew updates committed under Repeatable Read"
+    );
+}
+
+/// Phantom protection: a SERIALIZABLE transaction scans a table while a concurrent
+/// SERIALIZABLE transaction INSERTs a new row into it (and each writes based on its
+/// scan). The insert forms an rw-edge with the scan's relation SIREAD lock, closing a
+/// cycle, so exactly one aborts with `40001` (`docs/specs/ssi.md` §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phantom_insert_into_scanned_table_aborts_one() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level serializable").await;
+    t2.ok("begin isolation level serializable").await;
+    t1.ok("select v from t").await; // relation SIREAD lock on t
+    t2.ok("select v from t").await;
+    t1.ok("update t set v = 11 where id = 1").await; // edge t2 →rw t1
+    t2.ok("insert into t (id, v) values (2, 20)").await; // phantom: edge t1 →rw t2
+    let r1 = t1.query("commit").await.unwrap().result;
+    let r2 = t2.query("commit").await.unwrap().result;
+    let failures = [&r1, &r2].into_iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        failures,
+        1,
+        "exactly one aborts (t1_err={}, t2_err={})",
+        r1.is_err(),
+        r2.is_err()
+    );
+    assert!(
+        r1.err().or(r2.err()).unwrap().message.contains("C=40001"),
+        "the victim gets 40001"
+    );
+    assert_eq!(server.active_txn_count(), 0);
+}
+
+/// A read-only SERIALIZABLE transaction is never a pivot (no writes ⇒ no incoming
+/// rw-edge), so it commits cleanly even when a concurrent SERIALIZABLE writer modifies
+/// a row it read. A single rw-edge is not a cycle — no false abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_serializable_does_not_falsely_abort() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+
+    let mut reader = Connection::connect(&server).await.unwrap();
+    let mut writer = Connection::connect(&server).await.unwrap();
+    reader.ok("begin isolation level serializable").await;
+    writer.ok("begin isolation level serializable").await;
+    reader.ok("select v from t").await; // reads the row the writer will change
+    writer.ok("update t set v = 99 where id = 1").await; // edge reader →rw writer
+    writer.ok("commit").await; // the writer is not a pivot ⇒ commits
+    // The read-only reader has only an outgoing edge (no cycle) ⇒ commits cleanly.
+    reader.ok("select v from t").await;
+    reader.ok("commit").await;
+    assert_eq!(server.active_txn_count(), 0);
+}
