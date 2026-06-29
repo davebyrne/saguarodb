@@ -98,6 +98,7 @@ fn bind_inner(
             name,
             columns,
             primary_key,
+            unique,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -121,6 +122,7 @@ fn bind_inner(
                 name: name.clone(),
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
+                unique: unique.clone(),
             })
         }
         Statement::DropTable { name } => {

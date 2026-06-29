@@ -16,6 +16,7 @@ pub enum PhysicalPlan {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
     },
     DropTable {
         table: TableId,
@@ -119,10 +120,12 @@ pub fn physical_plan(
             name,
             columns,
             primary_key,
+            unique,
         } => Ok(PhysicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
+            unique: unique.clone(),
         }),
         LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
         LogicalPlan::CreateIndex {

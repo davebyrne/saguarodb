@@ -869,6 +869,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_unique_constraints() {
+        let Statement::CreateTable {
+            unique,
+            primary_key,
+            ..
+        } = parse(
+            "create table t (id integer primary key, email text unique, \
+             a integer, b integer, unique (a, b))",
+        )
+        .unwrap()
+        else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(primary_key, vec!["id".to_string()]);
+        // Column-level UNIQUE on email, then table-level UNIQUE (a, b).
+        assert_eq!(
+            unique,
+            vec![
+                vec!["email".to_string()],
+                vec!["a".to_string(), "b".to_string()],
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_non_constant_default() {
         // A column reference / arithmetic default is not a foldable constant.
         let err = parse("create table t (a integer, b integer default a + 1)").unwrap_err();

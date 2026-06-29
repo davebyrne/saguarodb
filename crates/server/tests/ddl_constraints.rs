@@ -210,6 +210,151 @@ async fn composite_primary_key_columns_are_not_null() {
     );
 }
 
+/// A column-level `UNIQUE` constraint becomes a single-column unique index that
+/// rejects duplicate non-NULL values but treats NULLs as distinct.
+#[tokio::test]
+async fn column_unique_constraint_rejects_duplicates_but_allows_distinct_nulls() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, email text unique)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("insert into t (id, email) values (1, 'a@b')")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("insert into t (id, email) values (2, 'a@b')")
+        .await
+        .err()
+        .expect("duplicate unique value should be rejected");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("unique"),
+        "expected unique violation: {}",
+        err.message
+    );
+
+    // Two NULL emails coexist (SQL NULLs are distinct for a unique constraint).
+    server
+        .simple_query("insert into t (id, email) values (3, null)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, email) values (4, null)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select count(*) from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+}
+
+/// A table-level `UNIQUE (a, b)` constraint enforces uniqueness over the tuple.
+#[tokio::test]
+async fn table_unique_constraint_over_two_columns() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table t (id integer primary key, a integer, b integer, unique (a, b))",
+        )
+        .await
+        .unwrap();
+
+    server
+        .simple_query("insert into t (id, a, b) values (1, 1, 1)")
+        .await
+        .unwrap();
+    // Differs in one column: allowed.
+    server
+        .simple_query("insert into t (id, a, b) values (2, 1, 2)")
+        .await
+        .unwrap();
+    // Duplicate (a, b): rejected.
+    let err = server
+        .simple_query("insert into t (id, a, b) values (3, 1, 1)")
+        .await
+        .err()
+        .expect("duplicate (a, b) should be rejected");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("unique"),
+        "expected unique violation: {}",
+        err.message
+    );
+}
+
+/// A `UNIQUE` constraint's index is rebuilt on restart (replayed from its
+/// `CreateIndex` WAL record) and still enforces uniqueness.
+#[tokio::test]
+async fn unique_constraint_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key, email text unique)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id, email) values (1, 'a@b')")
+            .await
+            .unwrap();
+        // No checkpoint: recovery must replay both the CreateTable and the
+        // auto-created unique-index CreateIndex records.
+    }
+
+    let server = restart(&path).await;
+    let err = server
+        .simple_query("insert into t (id, email) values (2, 'a@b')")
+        .await
+        .err()
+        .expect("unique constraint should still be enforced after restart");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("unique"),
+        "expected unique violation: {}",
+        err.message
+    );
+}
+
+/// An explicit `NULL` for a `NOT NULL` column is rejected on both INSERT and
+/// UPDATE.
+#[tokio::test]
+async fn not_null_violation_on_insert_and_update() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, name text not null)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("insert into t (id, name) values (1, null)")
+        .await
+        .err()
+        .expect("explicit NULL into NOT NULL column should be rejected");
+    assert!(
+        err.message.contains("23502"),
+        "expected NotNullViolation: {}",
+        err.message
+    );
+
+    server
+        .simple_query("insert into t (id, name) values (1, 'ok')")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("update t set name = null where id = 1")
+        .await
+        .err()
+        .expect("UPDATE to NULL on NOT NULL column should be rejected");
+    assert!(
+        err.message.contains("23502"),
+        "expected NotNullViolation: {}",
+        err.message
+    );
+}
+
 async fn restart(path: &Path) -> TestServer {
     TestServer::start_with_data_dir(path).await.unwrap()
 }

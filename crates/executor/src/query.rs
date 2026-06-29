@@ -78,7 +78,8 @@ impl QueryEngine {
                 name,
                 columns,
                 primary_key,
-            } => execute_create_table(ctx, name, columns, primary_key),
+                unique,
+            } => execute_create_table(ctx, name, columns, primary_key, unique),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
                 name,
@@ -669,6 +670,7 @@ fn execute_create_table(
     name: &str,
     columns: &[ParsedColumnDef],
     primary_key: &[String],
+    unique: &[Vec<String>],
 ) -> Result<ExecutionResult> {
     let schema =
         ctx.catalog
@@ -677,10 +679,41 @@ fn execute_create_table(
         let _ = ctx.catalog.drop_table(schema.id);
         return Err(err);
     }
+    // Each UNIQUE constraint becomes a unique index built on the just-created
+    // (empty) table, in declared order. On any failure, drop the table — which
+    // cascades to every index created so far in the catalog — and return; the
+    // autocommit unit also rolls back the storage-side DDL state.
+    for columns in unique {
+        if let Err(err) = create_unique_constraint_index(ctx, &schema, columns) {
+            let _ = ctx.catalog.drop_table(schema.id);
+            return Err(err);
+        }
+    }
     Ok(ExecutionResult::Modified {
         command: "CREATE TABLE".to_string(),
         count: 0,
     })
+}
+
+/// Create one `UNIQUE` constraint's backing index on a freshly created table. The
+/// index name follows PostgreSQL's `<table>_<col...>_key` convention.
+fn create_unique_constraint_index(
+    ctx: &ExecutionContext<'_>,
+    schema: &TableSchema,
+    columns: &[String],
+) -> Result<()> {
+    let name = format!("{}_{}_key", schema.name, columns.join("_"));
+    let index = ctx
+        .catalog
+        .create_index(name, &schema.name, columns, true)?;
+    if let Err(err) = ctx
+        .schema_ops
+        .create_index(&ctx.statement, &index, ctx.gc_horizon)
+    {
+        let _ = ctx.catalog.drop_index(index.id);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn execute_drop_table(ctx: &ExecutionContext<'_>, table: TableId) -> Result<ExecutionResult> {

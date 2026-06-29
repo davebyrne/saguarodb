@@ -10,6 +10,9 @@ pub enum BoundStatement {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        /// Column name lists for `UNIQUE` constraints; each becomes a unique
+        /// index created together with the table.
+        unique: Vec<Vec<String>>,
     },
     DropTable {
         table: TableId,

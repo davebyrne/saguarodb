@@ -97,6 +97,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
 - A column's `default` (the constant `DEFAULT` value, `Option<Value>`) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The binder type-checks it before the catalog sees it; the executor applies it to omitted columns at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
+- `UNIQUE` column / table constraints are not stored on the table schema; the executor creates a unique index per constraint immediately after the table (PostgreSQL-style auto name `<table>_<col...>_key`), reusing the normal `create_index` path (catalog + storage + `CreateIndex` WAL record). Recovery replays the `CreateTable` then `CreateIndex` records in order.
 
 ## Create Index Rules
 

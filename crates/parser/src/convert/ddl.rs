@@ -179,9 +179,10 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
     }
 
     let mut primary_key = Vec::new();
+    let mut unique = Vec::new();
     let columns = columns
         .into_iter()
-        .map(|column| convert_column_def(column, &mut primary_key))
+        .map(|column| convert_column_def(column, &mut primary_key, &mut unique))
         .collect::<Result<Vec<_>>>()?;
 
     for constraint in constraints {
@@ -207,6 +208,32 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
                     columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
                 )?;
             }
+            sql::TableConstraint::Unique {
+                name,
+                index_name,
+                index_type_display,
+                index_type,
+                columns,
+                index_options,
+                characteristics,
+                nulls_distinct,
+            } => {
+                if name.is_some()
+                    || index_name.is_some()
+                    || !matches!(index_type_display, sql::KeyOrIndexDisplay::None)
+                    || index_type.is_some()
+                    || !index_options.is_empty()
+                    || characteristics.is_some()
+                    || !matches!(nulls_distinct, sql::NullsDistinctOption::None)
+                {
+                    return unsupported("unsupported UNIQUE constraint form");
+                }
+                let columns = columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?;
+                if columns.is_empty() {
+                    return unsupported("UNIQUE constraint requires at least one column");
+                }
+                unique.push(columns);
+            }
             _ => return unsupported("unsupported table constraint"),
         }
     }
@@ -215,12 +242,14 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         name: object_name(&name)?,
         columns,
         primary_key,
+        unique,
     })
 }
 
 fn convert_column_def(
     column: sql::ColumnDef,
     primary_key: &mut Vec<String>,
+    unique: &mut Vec<Vec<String>>,
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
     let mut default = None;
@@ -243,15 +272,17 @@ fn convert_column_def(
                 is_primary,
                 characteristics,
             } => {
-                if !is_primary {
-                    return unsupported("unsupported column option");
-                }
                 if characteristics.is_some() {
-                    return unsupported("unsupported PRIMARY KEY constraint form");
+                    return unsupported("unsupported UNIQUE/PRIMARY KEY constraint form");
                 }
                 let column_name = ident_name(&column.name)?;
-                set_primary_key(primary_key, vec![column_name])?;
-                nullable = false;
+                if *is_primary {
+                    set_primary_key(primary_key, vec![column_name])?;
+                    nullable = false;
+                } else {
+                    // Column-level UNIQUE becomes a single-column unique index.
+                    unique.push(vec![column_name]);
+                }
             }
             _ => return unsupported("unsupported column option"),
         }

@@ -11,6 +11,7 @@ pub enum LogicalPlan {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
     },
     DropTable {
         table: TableId,
@@ -100,10 +101,12 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             name,
             columns,
             primary_key,
+            unique,
         } => Ok(LogicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
+            unique: unique.clone(),
         }),
         BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
         BoundStatement::CreateIndex {

@@ -6,6 +6,10 @@ pub enum Statement {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        /// Column name lists for `UNIQUE` constraints (column-level `UNIQUE` and
+        /// table-level `UNIQUE (a, b)`). Each becomes a unique index at create
+        /// time. Empty when the table has no unique constraints.
+        unique: Vec<Vec<String>>,
     },
     DropTable {
         name: String,
