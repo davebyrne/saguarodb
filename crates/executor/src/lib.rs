@@ -18,8 +18,8 @@ pub use result::{CopyJob, ExecutionResult};
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
-        ColumnInfo, CopyFormat, CopyOptions, DataType, ExecRow, Key, ParsedColumnDef, Row, RowId,
-        RowIdentity, SqlState, StatementContext, Value,
+        ColumnDef, ColumnDefault, ColumnInfo, CopyFormat, CopyOptions, DataType, ExecRow, Key,
+        ParsedColumnDef, Row, RowId, RowIdentity, SqlState, StatementContext, TableSchema, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -404,6 +404,32 @@ mod tests {
             vec![Row {
                 values: vec![Value::Integer(1), Value::Text("Lovelace".to_string())]
             }]
+        );
+    }
+
+    #[test]
+    fn insert_row_does_not_evaluate_default_for_explicit_column() {
+        let schema = TableSchema {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: Some(ColumnDefault::Nextval(1)),
+            }],
+            primary_key: vec![0],
+        };
+
+        let row = crate::query::build_insert_row(&schema, &[0], vec![Value::Integer(9)]).unwrap();
+
+        assert_eq!(
+            row,
+            Row {
+                values: vec![Value::Integer(9)]
+            }
         );
     }
 

@@ -33,7 +33,7 @@ pub struct CatalogSnapshot {
 }
 ```
 
-`TableSchema`, `ColumnDef`, `DataType`, and `IndexSchema` live in `common`.
+`TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, and `IndexSchema` live in `common`.
 
 Table IDs and index IDs are independent namespaces; both are monotonically
 increasing and never reused. `next_index_id` starts at
@@ -97,7 +97,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
-- A column's `default` (the constant `DEFAULT` value, `Option<Value>`) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The binder type-checks it before the catalog sees it; the executor applies it to omitted columns at write time.
+- A column's constant `default` is converted from `ParsedDefault::Const(Value)` on `ParsedColumnDef` to `ColumnDefault::Const(Value)` on the stored `ColumnDef`. The binder type-checks it before the catalog sees it; the executor applies it to omitted columns at write time. `ParsedDefault::Nextval` / `ColumnDefault::Nextval` are reserved for the sequences feature and are rejected until sequence catalog objects exist.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 - `UNIQUE` column / table constraints are not stored on the table schema; the executor creates a unique index per constraint immediately after the table (PostgreSQL-style auto name `<table>_<col...>_key`), reusing the normal `create_index` path (catalog + storage + `CreateIndex` WAL record). Recovery replays the `CreateTable` then `CreateIndex` records in order.
 
@@ -114,7 +114,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 
 ## Catalog Persistence
 
-The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes existed still deserializes (empty index maps, `next_index_id = PRIMARY_KEY_INDEX_ID + 1`). `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`.
+The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes existed still deserializes (empty index maps, `next_index_id = PRIMARY_KEY_INDEX_ID + 1`). `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`; the brief legacy bare-`Value` default form deserializes as `ColumnDefault::Const(value)`.
 
 On startup:
 

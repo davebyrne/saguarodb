@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{ColumnId, IndexId, TableId, Value};
+use crate::{ColumnId, IndexId, SequenceId, TableId, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -39,6 +39,57 @@ pub enum DataType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParsedDefault {
+    Const(Value),
+    Nextval(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnDefault {
+    Const(Value),
+    Nextval(SequenceId),
+}
+
+#[derive(Serialize, Deserialize)]
+enum ColumnDefaultWire {
+    Const(Value),
+    Nextval(SequenceId),
+}
+
+impl Serialize for ColumnDefault {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Const(value) => ColumnDefaultWire::Const(value.clone()).serialize(serializer),
+            Self::Nextval(sequence) => ColumnDefaultWire::Nextval(*sequence).serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnDefault {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Tagged(ColumnDefaultWire),
+            LegacyConst(Value),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Tagged(ColumnDefaultWire::Const(value)) | Wire::LegacyConst(value) => {
+                Ok(Self::Const(value))
+            }
+            Wire::Tagged(ColumnDefaultWire::Nextval(sequence)) => Ok(Self::Nextval(sequence)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -48,11 +99,11 @@ pub struct ParsedColumnDef {
     /// non-character types.
     #[serde(default)]
     pub max_length: Option<u32>,
-    /// The column `DEFAULT` value, applied when an `INSERT` omits the column.
-    /// A constant value folded at parse time; `None` when the column has no
-    /// `DEFAULT` (an omitted value is then `NULL`).
+    /// The column `DEFAULT`, applied when an `INSERT` omits the column. Constants
+    /// are folded at parse time; sequence defaults keep a sequence name until the
+    /// catalog resolves it to a durable id.
     #[serde(default)]
-    pub default: Option<Value>,
+    pub default: Option<ParsedDefault>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,12 +117,10 @@ pub struct ColumnDef {
     /// time by the executor, not represented as a distinct `DataType`.
     #[serde(default)]
     pub max_length: Option<u32>,
-    /// The column `DEFAULT` value applied when an `INSERT`/`COPY` omits the
-    /// column. A constant `Value` folded at parse time; `None` when the column
-    /// has no `DEFAULT` (an omitted value is then `NULL`). Persisted with the
-    /// catalog and replayed via the `CreateTable` WAL record.
+    /// The column `DEFAULT` applied when an `INSERT`/`COPY` omits the column.
+    /// Persisted with the catalog and replayed via the `CreateTable` WAL record.
     #[serde(default)]
-    pub default: Option<Value>,
+    pub default: Option<ColumnDefault>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

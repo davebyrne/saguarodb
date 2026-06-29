@@ -859,11 +859,26 @@ mod tests {
             panic!("expected create table");
         };
 
-        assert_eq!(columns[1].default, Some(Value::Integer(7)));
-        assert_eq!(columns[2].default, Some(Value::Integer(-3)));
-        assert_eq!(columns[3].default, Some(Value::Text("hi".to_string())));
-        assert_eq!(columns[4].default, Some(Value::Boolean(true)));
-        assert_eq!(columns[5].default, Some(Value::Null));
+        assert_eq!(
+            columns[1].default,
+            Some(common::ParsedDefault::Const(Value::Integer(7)))
+        );
+        assert_eq!(
+            columns[2].default,
+            Some(common::ParsedDefault::Const(Value::Integer(-3)))
+        );
+        assert_eq!(
+            columns[3].default,
+            Some(common::ParsedDefault::Const(Value::Text("hi".to_string())))
+        );
+        assert_eq!(
+            columns[4].default,
+            Some(common::ParsedDefault::Const(Value::Boolean(true)))
+        );
+        assert_eq!(
+            columns[5].default,
+            Some(common::ParsedDefault::Const(Value::Null))
+        );
         assert_eq!(columns[0].default, None);
     }
 

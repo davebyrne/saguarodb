@@ -25,7 +25,7 @@ pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};
 pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
-    PRIMARY_KEY_INDEX_ID, PageNum, RowId, TableId, TxnId,
+    PRIMARY_KEY_INDEX_ID, PageNum, RowId, SequenceId, TableId, TxnId,
 };
 pub use interval::Interval;
 pub use mvcc::{
@@ -35,5 +35,8 @@ pub use mvcc::{
 };
 pub use numeric::{Decimal, RoundingStrategy};
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
-pub use schema::{ColumnDef, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, TableSchema};
+pub use schema::{
+    ColumnDef, ColumnDefault, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, ParsedDefault,
+    TableSchema,
+};
 pub use value::{Value, parse_bool_text};

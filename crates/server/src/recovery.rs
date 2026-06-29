@@ -360,6 +360,7 @@ mod tests {
                 data_type: common::DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         }

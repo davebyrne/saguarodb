@@ -9,7 +9,7 @@
 
 ## Owns
 
-- Stable identifiers: `TableId`, `ColumnId`, `IndexId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
+- Stable identifiers: `TableId`, `ColumnId`, `IndexId`, `SequenceId`, `BindingId`, `FileId`, `PageNum`, `Lsn`.
 - SQL values and row envelopes: `Value`, `Row`, `Key`, `StoredRow`, `ExecRow`, `RowIdentity`.
 - The shared boolean-text decoder `parse_bool_text(&str) -> Option<bool>`
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
@@ -42,6 +42,7 @@
 pub type TableId = u32;
 pub type ColumnId = u16;
 pub type IndexId = u32;
+pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;
 pub type BindingId = u32;
 pub type PageNum = u32;
@@ -152,11 +153,22 @@ pub enum DataType {
     Numeric { precision: Option<u32>, scale: u32 },
 }
 
+pub enum ParsedDefault {
+    Const(Value),
+    Nextval(String),
+}
+
+pub enum ColumnDefault {
+    Const(Value),
+    Nextval(SequenceId),
+}
+
 pub struct ParsedColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
+    pub default: Option<ParsedDefault>,
 }
 
 pub struct ColumnDef {
@@ -165,6 +177,7 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: bool,
     pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
+    pub default: Option<ColumnDefault>,
 }
 
 pub struct ColumnInfo {

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub type TableId = u32;
 pub type ColumnId = u16;
 pub type IndexId = u32;
+pub type SequenceId = u32;
 pub const PRIMARY_KEY_INDEX_ID: IndexId = 0;
 pub type BindingId = u32;
 pub type PageNum = u32;

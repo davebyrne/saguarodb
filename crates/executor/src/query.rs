@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key, KeyRange,
-    ParsedColumnDef, Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
+    ColumnDefault, ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key,
+    KeyRange, ParsedColumnDef, Result, Row, SqlState, StatementContext, TableId, TableSchema,
+    Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
@@ -420,21 +421,30 @@ pub(crate) fn build_insert_row(
     values: Vec<Value>,
 ) -> Result<Row> {
     debug_assert_eq!(values.len(), columns.len());
-    // Omitted columns take their DEFAULT value (NULL when none is declared); the
-    // provided columns then overwrite their slots.
-    let mut full: Vec<Value> = schema
-        .columns
-        .iter()
-        .map(|column| column.default.clone().unwrap_or(Value::Null))
-        .collect();
+    let mut full = vec![Value::Null; schema.columns.len()];
     for (column, value) in columns.iter().zip(values) {
         let slot = column_slot(schema, *column)?;
         validate_value_type(&schema.columns[slot], &value)?;
         full[slot] = value;
     }
+    for (slot, column) in schema.columns.iter().enumerate() {
+        if !columns.contains(&column.id) {
+            full[slot] = evaluate_column_default(column)?;
+        }
+    }
     coerce_numeric_columns(schema, &mut full)?;
     validate_row_constraints(schema, &full)?;
     Ok(Row { values: full })
+}
+
+fn evaluate_column_default(column: &common::ColumnDef) -> Result<Value> {
+    match &column.default {
+        Some(ColumnDefault::Const(value)) => Ok(value.clone()),
+        Some(ColumnDefault::Nextval(_)) => Err(DbError::internal(
+            "sequence defaults are not supported by this executor",
+        )),
+        None => Ok(Value::Null),
+    }
 }
 
 /// Map a row's `columns`-ordered values onto a full table row and insert it.

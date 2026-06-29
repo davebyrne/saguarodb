@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use catalog::CatalogManager;
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError, Result,
-    SqlState, TableSchema,
+    ColumnDef, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError,
+    Result, SqlState, TableSchema,
 };
 use parser::{
     Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, SelectItem,
@@ -415,8 +415,10 @@ fn validate_insert_omissions(table: &TableSchema, columns: &[ColumnId]) -> Resul
     for column in &table.columns {
         // A NOT NULL column may be omitted only when it supplies a non-NULL
         // DEFAULT; otherwise the omitted value would be NULL.
-        let has_usable_default =
-            matches!(&column.default, Some(value) if !matches!(value, common::Value::Null));
+        let has_usable_default = matches!(
+            &column.default,
+            Some(ColumnDefault::Const(value)) if !matches!(value, common::Value::Null)
+        );
         if !column.nullable && !has_usable_default && !provided.contains(&column.id) {
             return Err(plan_error(
                 SqlState::NotNullViolation,

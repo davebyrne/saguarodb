@@ -1,4 +1,4 @@
-use common::{ParsedColumnDef, Result, Value};
+use common::{ParsedColumnDef, ParsedDefault, Result, Value};
 use sqlparser::ast as sql;
 
 use crate::{Expr, Statement, UnaryOp};
@@ -266,7 +266,7 @@ fn convert_column_def(
                 if default.is_some() {
                     return unsupported("column has more than one DEFAULT");
                 }
-                default = Some(fold_constant_default(expr)?);
+                default = Some(convert_column_default(expr)?);
             }
             sql::ColumnOption::Unique {
                 is_primary,
@@ -297,21 +297,25 @@ fn convert_column_def(
     })
 }
 
-/// Fold a column `DEFAULT` expression into a constant [`Value`]. v1 supports
-/// constant defaults only: a literal (including `NULL`) or a unary-minus applied
-/// to a numeric literal. The value's type is checked against the column type by
-/// the binder. Anything else (column references, function calls, arithmetic) is
-/// rejected as unsupported.
-fn fold_constant_default(expr: &sql::Expr) -> Result<Value> {
+/// Convert a column `DEFAULT` expression into the bounded parse-time default
+/// representation. Phase 1 still supports constants only; `nextval` is added
+/// when sequence binding exists.
+fn convert_column_default(expr: &sql::Expr) -> Result<ParsedDefault> {
     match convert_expr(expr)? {
-        Expr::Literal(value) => Ok(value),
+        Expr::Literal(value) => Ok(ParsedDefault::Const(value)),
         Expr::UnaryOp {
             op: UnaryOp::Neg,
             expr,
         } => match *expr {
-            Expr::Literal(Value::Integer(value)) => Ok(Value::Integer(-value)),
-            Expr::Literal(Value::Float(value)) => Ok(Value::Float((-value.0).into())),
-            Expr::Literal(Value::Numeric(value)) => Ok(Value::Numeric(-value)),
+            Expr::Literal(Value::Integer(value)) => {
+                Ok(ParsedDefault::Const(Value::Integer(-value)))
+            }
+            Expr::Literal(Value::Float(value)) => {
+                Ok(ParsedDefault::Const(Value::Float((-value.0).into())))
+            }
+            Expr::Literal(Value::Numeric(value)) => {
+                Ok(ParsedDefault::Const(Value::Numeric(-value)))
+            }
             _ => unsupported("DEFAULT must be a constant expression"),
         },
         _ => unsupported("DEFAULT must be a constant expression"),

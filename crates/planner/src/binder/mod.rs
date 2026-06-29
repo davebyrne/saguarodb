@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use catalog::CatalogManager;
 use common::{
-    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, Result, SqlState, TableId,
-    TableSchema, Value,
+    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, ParsedDefault, Result, SqlState,
+    TableId, TableSchema, Value,
 };
 use parser::Statement;
 
@@ -324,6 +324,12 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
 fn validate_default_value(column: &ParsedColumnDef) -> Result<()> {
     let Some(value) = &column.default else {
         return Ok(());
+    };
+    let ParsedDefault::Const(value) = value else {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "sequence defaults are not supported yet",
+        ));
     };
     if matches!(value, Value::Null) {
         if column.nullable {

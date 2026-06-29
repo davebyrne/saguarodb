@@ -43,7 +43,8 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, DataType, ErrorKind, IndexSchema, ParsedColumnDef, SqlState, TableSchema,
+        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef, SqlState,
+        TableSchema,
     };
 
     use crate::{
@@ -149,7 +150,7 @@ mod tests {
                         data_type: DataType::Integer,
                         nullable: true,
                         max_length: None,
-                        default: Some(common::Value::Integer(42)),
+                        default: Some(common::ParsedDefault::Const(common::Value::Integer(42))),
                     },
                 ],
                 vec!["id".to_string()],
@@ -157,7 +158,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(schema.columns[0].default, None);
-        assert_eq!(schema.columns[1].default, Some(common::Value::Integer(42)));
+        assert_eq!(
+            schema.columns[1].default,
+            Some(common::ColumnDefault::Const(common::Value::Integer(42)))
+        );
 
         // The default survives a serialize/restore round trip.
         let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
@@ -166,7 +170,7 @@ mod tests {
         let restored_schema = restored.get_table_by_name("t").unwrap().unwrap();
         assert_eq!(
             restored_schema.columns[1].default,
-            Some(common::Value::Integer(42))
+            Some(common::ColumnDefault::Const(common::Value::Integer(42)))
         );
     }
 
@@ -310,6 +314,58 @@ mod tests {
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
         assert_eq!(err.code, SqlState::InternalError);
         assert!(err.message.contains("next_table_id"));
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_sequence_default_until_sequences_exist() {
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: Some(ColumnDefault::Nextval(1)),
+            }],
+            primary_key: vec![0],
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 4,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: 1,
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("unsupported sequence default"));
+    }
+
+    #[test]
+    fn apply_create_table_rejects_sequence_default_until_sequences_exist() {
+        let catalog = MemoryCatalog::empty();
+        let schema = TableSchema {
+            id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: Some(ColumnDefault::Nextval(1)),
+            }],
+            primary_key: vec![0],
+        };
+
+        let err = catalog.apply_create_table(schema).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("unsupported sequence default"));
+        assert_eq!(catalog.get_table_by_name("users").unwrap(), None);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnId, DbError, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
-    Result, SqlState, TableId, TableSchema,
+    ColumnDef, ColumnDefault, ColumnId, DbError, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID,
+    ParsedColumnDef, ParsedDefault, Result, SqlState, TableId, TableSchema,
 };
 
 use crate::CatalogManager;
@@ -123,6 +123,7 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
+        validate_schema(&schema)?;
         let mut snapshot = self.write_snapshot()?;
         reject_duplicate_table_name(&snapshot, &schema.name)?;
         reject_duplicate_table_id(&snapshot, schema.id)?;
@@ -299,7 +300,7 @@ fn build_schema(
             data_type: column.data_type,
             nullable: column.nullable,
             max_length: column.max_length,
-            default: column.default,
+            default: convert_column_default(column.default)?,
         });
     }
 
@@ -341,6 +342,17 @@ fn build_schema(
         columns: assigned_columns,
         primary_key: primary_key_ids,
     })
+}
+
+fn convert_column_default(default: Option<ParsedDefault>) -> Result<Option<ColumnDefault>> {
+    match default {
+        Some(ParsedDefault::Const(value)) => Ok(Some(ColumnDefault::Const(value))),
+        Some(ParsedDefault::Nextval(_)) => Err(DbError::plan(
+            SqlState::FeatureNotSupported,
+            "sequence defaults are not supported yet",
+        )),
+        None => Ok(None),
+    }
 }
 
 fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
@@ -507,6 +519,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 schema.name, column.name
             )));
         }
+        validate_column_default(&schema.name, column)?;
     }
 
     if schema.primary_key.is_empty() {
@@ -538,6 +551,16 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_column_default(table_name: &str, column: &ColumnDef) -> Result<()> {
+    match &column.default {
+        Some(ColumnDefault::Nextval(_)) => Err(DbError::internal(format!(
+            "catalog snapshot table {table_name} column {} has unsupported sequence default",
+            column.name
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn reject_duplicate_table_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {

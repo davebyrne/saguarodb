@@ -808,6 +808,9 @@ mod tests {
             active_txns.clone(),
             Duration::from_millis(config.deadlock_timeout_ms),
         ));
+        let ssi_manager = Arc::new(crate::ssi_manager::SerializableConflictManager::new(
+            active_txns.clone(),
+        ));
         let components = Arc::new(ServerComponents {
             config,
             catalog,
@@ -827,6 +830,7 @@ mod tests {
             dead_rows_since_vacuum: AtomicU64::new(0),
             active_txns,
             lock_manager,
+            ssi_manager,
             tls: None,
             cancel_registry: crate::cancel::CancelRegistry::new(),
         });
