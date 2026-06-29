@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use catalog::CatalogManager;
-use common::{BindingId, ColumnDef, DataType, DbError, Result, SqlState, TableId, TableSchema};
+use common::{
+    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, Result, SqlState, TableId,
+    TableSchema, Value,
+};
 use parser::Statement;
 
 use crate::{BoundExpr, BoundStatement};
@@ -110,6 +113,9 @@ fn bind_inner(
                     SqlState::DatatypeMismatch,
                     "v1 requires exactly one primary key column",
                 ));
+            }
+            for column in columns {
+                validate_default_value(column)?;
             }
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
@@ -307,6 +313,53 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }
+}
+
+/// Validate a column's `DEFAULT` constant against its declared type. The default
+/// is a constant folded by the parser; it must have the same type as the column
+/// (no implicit casts), except `NULL` is accepted only when the column is
+/// nullable (a `NULL` default on a `NOT NULL` column is rejected up front).
+fn validate_default_value(column: &ParsedColumnDef) -> Result<()> {
+    let Some(value) = &column.default else {
+        return Ok(());
+    };
+    if matches!(value, Value::Null) {
+        if column.nullable {
+            return Ok(());
+        }
+        return Err(plan_error(
+            SqlState::NotNullViolation,
+            format!("column {} is NOT NULL but its DEFAULT is NULL", column.name),
+        ));
+    }
+    if default_value_matches(&column.data_type, value) {
+        return Ok(());
+    }
+    Err(plan_error(
+        SqlState::DatatypeMismatch,
+        format!(
+            "DEFAULT value for column {} does not match its type {:?}",
+            column.name, column.data_type
+        ),
+    ))
+}
+
+/// Whether a non-NULL `DEFAULT` constant's value matches the column type. Numeric
+/// values are compatible with any `NUMERIC(p, s)` column (rounded/range-checked at
+/// store time), mirroring `INSERT` assignability.
+fn default_value_matches(data_type: &DataType, value: &Value) -> bool {
+    matches!(
+        (data_type, value),
+        (DataType::Integer, Value::Integer(_))
+            | (DataType::Double, Value::Float(_))
+            | (DataType::Numeric { .. }, Value::Numeric(_))
+            | (DataType::Text, Value::Text(_))
+            | (DataType::Boolean, Value::Boolean(_))
+            | (DataType::Date, Value::Date(_))
+            | (DataType::Timestamp, Value::Timestamp(_))
+            | (DataType::Bytea, Value::Bytes(_))
+            | (DataType::Uuid, Value::Uuid(_))
+    )
 }
 
 fn plan_error(code: SqlState, message: impl Into<String>) -> DbError {

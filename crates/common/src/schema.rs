@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ColumnId, IndexId, TableId};
+use crate::{ColumnId, IndexId, TableId, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -38,6 +38,11 @@ pub struct ParsedColumnDef {
     /// non-character types.
     #[serde(default)]
     pub max_length: Option<u32>,
+    /// The column `DEFAULT` value, applied when an `INSERT` omits the column.
+    /// A constant value folded at parse time; `None` when the column has no
+    /// `DEFAULT` (an omitted value is then `NULL`).
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +56,12 @@ pub struct ColumnDef {
     /// time by the executor, not represented as a distinct `DataType`.
     #[serde(default)]
     pub max_length: Option<u32>,
+    /// The column `DEFAULT` value applied when an `INSERT`/`COPY` omits the
+    /// column. A constant `Value` folded at parse time; `None` when the column
+    /// has no `DEFAULT` (an omitted value is then `NULL`). Persisted with the
+    /// catalog and replayed via the `CreateTable` WAL record.
+    #[serde(default)]
+    pub default: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

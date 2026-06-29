@@ -95,6 +95,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
+- A column's `default` (the constant `DEFAULT` value, `Option<Value>`) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The binder type-checks it before the catalog sees it; the executor applies it to omitted columns at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 
 ## Create Index Rules
@@ -110,7 +111,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 
 ## Catalog Persistence
 
-The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes existed still deserializes (empty index maps, `next_index_id = PRIMARY_KEY_INDEX_ID + 1`).
+The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes existed still deserializes (empty index maps, `next_index_id = PRIMARY_KEY_INDEX_ID + 1`). `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`.
 
 On startup:
 

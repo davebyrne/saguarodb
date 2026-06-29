@@ -100,6 +100,7 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -107,6 +108,7 @@ mod tests {
                     data_type: DataType::Text,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
             ],
             primary_key: vec![0],

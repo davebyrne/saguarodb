@@ -1075,6 +1075,7 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -1082,6 +1083,7 @@ mod tests {
                     data_type: DataType::Text,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -1089,6 +1091,7 @@ mod tests {
                     data_type: DataType::Boolean,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 3,
@@ -1096,6 +1099,7 @@ mod tests {
                     data_type: DataType::Text,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
             ],
             primary_key: vec![0],
@@ -1135,6 +1139,7 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -1142,6 +1147,7 @@ mod tests {
                     data_type: DataType::Text,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -1149,6 +1155,7 @@ mod tests {
                     data_type: DataType::Text,
                     nullable: true,
                     max_length: None,
+                    default: None,
                 },
             ],
             primary_key: vec![0],

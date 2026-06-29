@@ -850,6 +850,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_column_default_constants() {
+        let Statement::CreateTable { columns, .. } = parse(
+            "create table t (id integer primary key, n integer default 7, \
+             m integer default -3, s text default 'hi', b boolean default true, \
+             x text default null)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(columns[1].default, Some(Value::Integer(7)));
+        assert_eq!(columns[2].default, Some(Value::Integer(-3)));
+        assert_eq!(columns[3].default, Some(Value::Text("hi".to_string())));
+        assert_eq!(columns[4].default, Some(Value::Boolean(true)));
+        assert_eq!(columns[5].default, Some(Value::Null));
+        assert_eq!(columns[0].default, None);
+    }
+
+    #[test]
+    fn rejects_non_constant_default() {
+        // A column reference / arithmetic default is not a foldable constant.
+        let err = parse("create table t (a integer, b integer default a + 1)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        // A function-call default is likewise rejected in v1.
+        assert!(parse("create table t (a timestamp default now())").is_err());
+    }
+
+    #[test]
     fn parses_representative_expressions() {
         let stmt = parse(
             "select -id + 2 * 3, not active, name || 'x', id is not null, \

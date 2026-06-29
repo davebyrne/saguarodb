@@ -54,6 +54,7 @@ mod tests {
             data_type: DataType::Integer,
             nullable,
             max_length: None,
+            default: None,
         }
     }
 
@@ -70,6 +71,7 @@ mod tests {
                         data_type: DataType::Text,
                         nullable: true,
                         max_length: None,
+                        default: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -90,12 +92,14 @@ mod tests {
                         data_type: DataType::Integer,
                         nullable: true,
                         max_length: None,
+                        default: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
                         max_length: None,
+                        default: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -131,6 +135,40 @@ mod tests {
     }
 
     #[test]
+    fn create_table_carries_column_defaults_into_schema() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "t".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "n".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: Some(common::Value::Integer(42)),
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(schema.columns[0].default, None);
+        assert_eq!(schema.columns[1].default, Some(common::Value::Integer(42)));
+
+        // The default survives a serialize/restore round trip.
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+        let restored_schema = restored.get_table_by_name("t").unwrap().unwrap();
+        assert_eq!(
+            restored_schema.columns[1].default,
+            Some(common::Value::Integer(42))
+        );
+    }
+
+    #[test]
     fn duplicate_column_is_rejected() {
         let catalog = MemoryCatalog::empty();
 
@@ -144,6 +182,7 @@ mod tests {
                         data_type: DataType::Text,
                         nullable: true,
                         max_length: None,
+                        default: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -182,6 +221,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         };
@@ -211,6 +251,7 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     max_length: None,
+                    default: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -218,6 +259,7 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     max_length: None,
+                    default: None,
                 },
             ],
             primary_key: vec![0, 1],
@@ -246,6 +288,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: true,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         };
@@ -273,6 +316,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![1],
         };
@@ -331,6 +375,7 @@ mod tests {
                         data_type: DataType::Integer,
                         nullable: false,
                         max_length: None,
+                        default: None,
                     },
                 ],
                 vec!["id".to_string(), "tenant".to_string()],
@@ -425,6 +470,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         };
@@ -746,6 +792,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         };
@@ -782,6 +829,7 @@ mod tests {
                 data_type: DataType::Integer,
                 nullable: false,
                 max_length: None,
+                default: None,
             }],
             primary_key: vec![0],
         };

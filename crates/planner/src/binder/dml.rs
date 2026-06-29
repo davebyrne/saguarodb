@@ -413,7 +413,11 @@ fn insert_columns(table: &TableSchema, column_names: &[String]) -> Result<Vec<Co
 fn validate_insert_omissions(table: &TableSchema, columns: &[ColumnId]) -> Result<()> {
     let provided: HashSet<_> = columns.iter().copied().collect();
     for column in &table.columns {
-        if !column.nullable && !provided.contains(&column.id) {
+        // A NOT NULL column may be omitted only when it supplies a non-NULL
+        // DEFAULT; otherwise the omitted value would be NULL.
+        let has_usable_default =
+            matches!(&column.default, Some(value) if !matches!(value, common::Value::Null));
+        if !column.nullable && !has_usable_default && !provided.contains(&column.id) {
             return Err(plan_error(
                 SqlState::NotNullViolation,
                 format!("column {} cannot be omitted", column.name),

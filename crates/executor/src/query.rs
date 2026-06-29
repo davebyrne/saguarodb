@@ -388,7 +388,13 @@ pub(crate) fn build_insert_row(
     values: Vec<Value>,
 ) -> Result<Row> {
     debug_assert_eq!(values.len(), columns.len());
-    let mut full = vec![Value::Null; schema.columns.len()];
+    // Omitted columns take their DEFAULT value (NULL when none is declared); the
+    // provided columns then overwrite their slots.
+    let mut full: Vec<Value> = schema
+        .columns
+        .iter()
+        .map(|column| column.default.clone().unwrap_or(Value::Null))
+        .collect();
     for (column, value) in columns.iter().zip(values) {
         let slot = column_slot(schema, *column)?;
         validate_value_type(&schema.columns[slot], &value)?;

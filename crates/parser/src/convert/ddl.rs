@@ -1,9 +1,11 @@
-use common::{ParsedColumnDef, Result};
+use common::{ParsedColumnDef, Result, Value};
 use sqlparser::ast as sql;
 
-use crate::Statement;
+use crate::{Expr, Statement, UnaryOp};
 
-use super::{column_char_length, convert_data_type, ident_name, object_name, unsupported};
+use super::{
+    column_char_length, convert_data_type, convert_expr, ident_name, object_name, unsupported,
+};
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
     let sql::CreateIndex {
@@ -221,6 +223,7 @@ fn convert_column_def(
     primary_key: &mut Vec<String>,
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
+    let mut default = None;
 
     for option in &column.options {
         if option.name.is_some() {
@@ -230,6 +233,12 @@ fn convert_column_def(
         match &option.option {
             sql::ColumnOption::Null => nullable = true,
             sql::ColumnOption::NotNull => nullable = false,
+            sql::ColumnOption::Default(expr) => {
+                if default.is_some() {
+                    return unsupported("column has more than one DEFAULT");
+                }
+                default = Some(fold_constant_default(expr)?);
+            }
             sql::ColumnOption::Unique {
                 is_primary,
                 characteristics,
@@ -253,7 +262,29 @@ fn convert_column_def(
         data_type: convert_data_type(&column.data_type)?,
         nullable,
         max_length: column_char_length(&column.data_type)?,
+        default,
     })
+}
+
+/// Fold a column `DEFAULT` expression into a constant [`Value`]. v1 supports
+/// constant defaults only: a literal (including `NULL`) or a unary-minus applied
+/// to a numeric literal. The value's type is checked against the column type by
+/// the binder. Anything else (column references, function calls, arithmetic) is
+/// rejected as unsupported.
+fn fold_constant_default(expr: &sql::Expr) -> Result<Value> {
+    match convert_expr(expr)? {
+        Expr::Literal(value) => Ok(value),
+        Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            expr,
+        } => match *expr {
+            Expr::Literal(Value::Integer(value)) => Ok(Value::Integer(-value)),
+            Expr::Literal(Value::Float(value)) => Ok(Value::Float((-value.0).into())),
+            Expr::Literal(Value::Numeric(value)) => Ok(Value::Numeric(-value)),
+            _ => unsupported("DEFAULT must be a constant expression"),
+        },
+        _ => unsupported("DEFAULT must be a constant expression"),
+    }
 }
 
 fn set_primary_key(primary_key: &mut Vec<String>, columns: Vec<String>) -> Result<()> {
