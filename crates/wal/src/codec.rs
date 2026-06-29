@@ -26,6 +26,8 @@ const TYPE_HEAP_UPDATE_HEADER: u8 = 12;
 const TYPE_COMMIT_WITH_SUBXIDS: u8 = 13;
 const TYPE_CREATE_SEQUENCE: u8 = 14;
 const TYPE_DROP_SEQUENCE: u8 = 15;
+const TYPE_SEQUENCE_ADVANCE: u8 = 16;
+const TYPE_SET_SEQUENCE_VALUE: u8 = 17;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -150,6 +152,8 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
         WalRecordKind::CreateSequence { .. } => TYPE_CREATE_SEQUENCE,
         WalRecordKind::DropSequence { .. } => TYPE_DROP_SEQUENCE,
+        WalRecordKind::SequenceAdvance { .. } => TYPE_SEQUENCE_ADVANCE,
+        WalRecordKind::SetSequenceValue { .. } => TYPE_SET_SEQUENCE_VALUE,
         WalRecordKind::Commit => TYPE_COMMIT,
         WalRecordKind::CommitWithSubxids { .. } => TYPE_COMMIT_WITH_SUBXIDS,
         WalRecordKind::Abort => TYPE_ABORT,
@@ -409,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_logical_index_records() {
+    fn round_trips_logical_schema_and_sequence_records() {
         let kinds = [
             WalRecordKind::CreateIndex {
                 schema: common::IndexSchema {
@@ -436,6 +440,15 @@ mod tests {
                 },
             },
             WalRecordKind::DropSequence { sequence: 4 },
+            WalRecordKind::SequenceAdvance {
+                sequence: 4,
+                value: 11,
+            },
+            WalRecordKind::SetSequenceValue {
+                sequence: 4,
+                value: 20,
+                is_called: false,
+            },
         ];
         for kind in kinds {
             let record = WalRecord {

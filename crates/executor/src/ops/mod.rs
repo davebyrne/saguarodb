@@ -22,11 +22,18 @@ pub use scan::{IndexScanOp, SeqScanOp};
 pub use sort::SortOp;
 pub use values::ValuesOp;
 
-use common::{Result, Value};
+use common::{Result, StatementContext, Value};
 use planner::BoundExpr;
 
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 
-pub(crate) fn predicate_matches(expr: &BoundExpr, row: &common::ExecRow) -> Result<bool> {
-    Ok(matches!(eval_expr(expr, row)?, Value::Boolean(true)))
+pub(crate) fn predicate_matches(
+    ctx: &StatementContext,
+    expr: &BoundExpr,
+    row: &common::ExecRow,
+) -> Result<bool> {
+    Ok(matches!(
+        eval_expr_with_context(ctx, expr, row)?,
+        Value::Boolean(true)
+    ))
 }

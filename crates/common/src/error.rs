@@ -36,6 +36,9 @@ pub enum SqlState {
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,
+    /// `22023`: a validly typed argument or option has an invalid value, e.g.
+    /// `CREATE SEQUENCE INCREMENT BY 0`.
+    InvalidParameterValue,
     NumericValueOutOfRange,
     /// `22001`: a value is too long for a bounded character type, e.g. a string
     /// longer than `n` assigned to a `VARCHAR(n)` / `CHAR(n)` column.
@@ -51,6 +54,13 @@ pub enum SqlState {
     /// `21000`: a subquery used as an expression returned more than one row where
     /// at most one was expected (a scalar subquery).
     CardinalityViolation,
+    /// `2BP01`: an object cannot be dropped because another object depends on it,
+    /// e.g. a column default still references a sequence.
+    DependentObjectsStillExist,
+    /// `55000`: the object is not in the prerequisite state for the requested
+    /// operation, e.g. `currval` before this session has called `nextval`/`setval`
+    /// for that sequence.
+    ObjectNotInPrerequisiteState,
     QueryCanceled,
     FeatureNotSupported,
     /// `25P02`: a statement other than `COMMIT`/`ROLLBACK` was issued inside a

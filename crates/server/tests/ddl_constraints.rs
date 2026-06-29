@@ -173,6 +173,60 @@ async fn sequence_ddl_create_drop_and_if_exists() {
 }
 
 #[tokio::test]
+async fn invalid_sequence_definition_uses_invalid_parameter_value() {
+    let server = TestServer::start().await.unwrap();
+
+    let err = server
+        .simple_query("create sequence bad_seq increment by 0")
+        .await
+        .err()
+        .expect("invalid sequence definition should fail");
+    assert!(
+        err.message.contains("22023"),
+        "expected InvalidParameterValue: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn drop_sequence_referenced_by_default_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create sequence users_id_seq")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "create table users (id integer primary key default nextval('users_id_seq'), name text)",
+        )
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("referenced sequence drop should fail");
+    assert!(
+        err.message.contains("2BP01"),
+        "expected DependentObjectsStillExist: {}",
+        err.message
+    );
+
+    server
+        .simple_query("insert into users (name) values ('Ada')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
 async fn sequence_ddl_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
@@ -264,6 +318,68 @@ async fn prepared_drop_sequence_if_exists_resolves_at_execute_time() {
         missing.message.contains("42P01"),
         "expected UndefinedTable: {}",
         missing.message
+    );
+}
+
+#[tokio::test]
+async fn prepared_currval_errors_after_sequence_drop() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    assert!(
+        conn.ok("create sequence users_id_seq").await.result.is_ok(),
+        "create sequence failed"
+    );
+    assert!(
+        conn.ok("create table seq_probe (id integer primary key)")
+            .await
+            .result
+            .is_ok(),
+        "create probe table failed"
+    );
+    assert!(
+        conn.ok("insert into seq_probe (id) values (1)")
+            .await
+            .result
+            .is_ok(),
+        "insert probe row failed"
+    );
+    let prepare = conn
+        .prepare(
+            "current_seq",
+            "select currval('users_id_seq') from seq_probe",
+        )
+        .await
+        .unwrap();
+    assert!(prepare.result.is_ok(), "prepare failed");
+    assert!(
+        conn.ok("select nextval('users_id_seq') from seq_probe")
+            .await
+            .result
+            .is_ok(),
+        "nextval failed"
+    );
+    let first = conn.execute_prepared("current_seq").await.unwrap();
+    assert_eq!(
+        first.result.unwrap().unwrap_rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    assert!(
+        conn.ok("drop sequence users_id_seq").await.result.is_ok(),
+        "drop sequence failed"
+    );
+    let err = conn
+        .execute_prepared("current_seq")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("prepared currval should fail after the sequence is dropped");
+    assert!(
+        err.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        err.message
     );
 }
 

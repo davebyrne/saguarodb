@@ -1,7 +1,23 @@
-use common::{DataType, DbError, ExecRow, Result, SqlState, Value};
+use common::{DataType, DbError, ExecRow, Result, SqlState, StatementContext, Value};
 use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 
 pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
+    eval_expr_inner(None, expr, row)
+}
+
+pub fn eval_expr_with_context(
+    ctx: &StatementContext,
+    expr: &BoundExpr,
+    row: &ExecRow,
+) -> Result<Value> {
+    eval_expr_inner(Some(ctx), expr, row)
+}
+
+fn eval_expr_inner(
+    ctx: Option<&StatementContext>,
+    expr: &BoundExpr,
+    row: &ExecRow,
+) -> Result<Value> {
     match expr {
         BoundExpr::Literal { value, .. } => Ok(value.clone()),
         // Parameters are replaced with literals by substitution before execution.
@@ -17,18 +33,27 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             .ok_or_else(|| DbError::internal(format!("input slot {slot} is out of bounds"))),
         BoundExpr::BinaryOp {
             left, op, right, ..
-        } => eval_binary(left, *op, right, row),
-        BoundExpr::UnaryOp { op, expr, .. } => eval_unary(*op, expr, row),
-        BoundExpr::Function { name, args, .. } => eval_function(name, args, row),
+        } => eval_binary(ctx, left, *op, right, row),
+        BoundExpr::UnaryOp { op, expr, .. } => eval_unary(ctx, *op, expr, row),
+        BoundExpr::Function { name, args, .. } => eval_function(ctx, name, args, row),
+        BoundExpr::Nextval { sequence, .. } => eval_nextval(ctx, *sequence),
+        BoundExpr::Currval { sequence, .. } => eval_currval(ctx, *sequence),
+        BoundExpr::Setval {
+            sequence,
+            value,
+            is_called,
+            ..
+        } => eval_setval(ctx, *sequence, value, is_called.as_deref(), row),
         BoundExpr::AggregateCall { func, .. } => Err(DbError::internal(format!(
             "aggregate {} reached executor scalar evaluation",
             aggregate_name(*func)
         ))),
-        BoundExpr::IsNull { expr, .. } => {
-            Ok(Value::Boolean(matches!(eval_expr(expr, row)?, Value::Null)))
-        }
+        BoundExpr::IsNull { expr, .. } => Ok(Value::Boolean(matches!(
+            eval_expr_inner(ctx, expr, row)?,
+            Value::Null
+        ))),
         BoundExpr::IsNotNull { expr, .. } => Ok(Value::Boolean(!matches!(
-            eval_expr(expr, row)?,
+            eval_expr_inner(ctx, expr, row)?,
             Value::Null
         ))),
         BoundExpr::InList {
@@ -37,7 +62,7 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             negated,
             ..
         } => {
-            let result = eval_in_list(expr, list, row)?;
+            let result = eval_in_list(ctx, expr, list, row)?;
             if *negated {
                 sql_not(result)
             } else {
@@ -51,9 +76,9 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             negated,
             ..
         } => {
-            let value = eval_expr(expr, row)?;
-            let low = eval_expr(low, row)?;
-            let high = eval_expr(high, row)?;
+            let value = eval_expr_inner(ctx, expr, row)?;
+            let low = eval_expr_inner(ctx, low, row)?;
+            let high = eval_expr_inner(ctx, high, row)?;
             let lower = compare_values(&value, BinOp::GtEq, &low)?;
             let upper = compare_values(&value, BinOp::LtEq, &high)?;
             let result = sql_and(lower, upper)?;
@@ -71,8 +96,8 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             escape,
             ..
         } => {
-            let value = eval_expr(expr, row)?;
-            let pattern = eval_expr(pattern, row)?;
+            let value = eval_expr_inner(ctx, expr, row)?;
+            let pattern = eval_expr_inner(ctx, pattern, row)?;
             let result = eval_like(value, pattern, *case_insensitive, *escape)?;
             if *negated {
                 sql_not(result)
@@ -86,6 +111,7 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             else_clause,
             ..
         } => eval_case(
+            ctx,
             operand.as_deref(),
             when_clauses,
             else_clause.as_deref(),
@@ -93,7 +119,7 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
         ),
         BoundExpr::Cast {
             expr, data_type, ..
-        } => cast_value(eval_expr(expr, row)?, data_type),
+        } => cast_value(eval_expr_inner(ctx, expr, row)?, data_type),
         // Subqueries are resolved to literals (or an `IN` list) by the executor's
         // pre-pass before any row is evaluated; reaching here is a routing bug.
         BoundExpr::ScalarSubquery { .. }
@@ -104,9 +130,15 @@ pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
     }
 }
 
-fn eval_binary(left: &BoundExpr, op: BinOp, right: &BoundExpr, row: &ExecRow) -> Result<Value> {
-    let left = eval_expr(left, row)?;
-    let right = eval_expr(right, row)?;
+fn eval_binary(
+    ctx: Option<&StatementContext>,
+    left: &BoundExpr,
+    op: BinOp,
+    right: &BoundExpr,
+    row: &ExecRow,
+) -> Result<Value> {
+    let left = eval_expr_inner(ctx, left, row)?;
+    let right = eval_expr_inner(ctx, right, row)?;
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
             arithmetic_values(left, op, right)
@@ -138,8 +170,13 @@ fn eval_is_distinct(left: Value, right: Value, not: bool) -> Result<Value> {
     Ok(Value::Boolean(if not { equal } else { !equal }))
 }
 
-fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
-    let value = eval_expr(expr, row)?;
+fn eval_unary(
+    ctx: Option<&StatementContext>,
+    op: UnaryOp,
+    expr: &BoundExpr,
+    row: &ExecRow,
+) -> Result<Value> {
+    let value = eval_expr_inner(ctx, expr, row)?;
     match op {
         UnaryOp::Neg => match value {
             Value::Null => Ok(Value::Null),
@@ -158,6 +195,72 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
         },
         UnaryOp::Not => sql_not(value),
     }
+}
+
+fn require_eval_context<'a>(
+    ctx: Option<&'a StatementContext>,
+    function: &str,
+) -> Result<&'a StatementContext> {
+    ctx.ok_or_else(|| {
+        DbError::internal(format!("{function} requires a statement execution context"))
+    })
+}
+
+fn eval_nextval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
+    let ctx = require_eval_context(ctx, "nextval")?;
+    let value = ctx.sequence_manager.nextval(ctx.txn_id, sequence)?;
+    ctx.session_sequences.record_currval(sequence, value)?;
+    Ok(Value::Integer(value))
+}
+
+fn eval_currval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
+    let ctx = require_eval_context(ctx, "currval")?;
+    if !ctx.sequence_manager.sequence_exists(sequence)? {
+        return Err(DbError::execute(
+            SqlState::UndefinedTable,
+            format!("sequence id {sequence} does not exist"),
+        ));
+    }
+    let Some(value) = ctx.session_sequences.currval(sequence)? else {
+        return Err(DbError::execute(
+            SqlState::ObjectNotInPrerequisiteState,
+            "currval is not yet defined in this session",
+        ));
+    };
+    Ok(Value::Integer(value))
+}
+
+fn eval_setval(
+    ctx: Option<&StatementContext>,
+    sequence: common::SequenceId,
+    value: &BoundExpr,
+    is_called: Option<&BoundExpr>,
+    row: &ExecRow,
+) -> Result<Value> {
+    let ctx = require_eval_context(ctx, "setval")?;
+    let value = eval_expr_inner(Some(ctx), value, row)?;
+    let Value::Integer(value) = value else {
+        return if matches!(value, Value::Null) {
+            Ok(Value::Null)
+        } else {
+            datatype_mismatch("setval value must be an integer")
+        };
+    };
+    let is_called = match is_called {
+        Some(expr) => match eval_expr_inner(Some(ctx), expr, row)? {
+            Value::Boolean(value) => value,
+            Value::Null => return Ok(Value::Null),
+            _ => return datatype_mismatch("setval is_called argument must be boolean"),
+        },
+        None => true,
+    };
+    let value = ctx
+        .sequence_manager
+        .setval(ctx.txn_id, sequence, value, is_called)?;
+    if is_called {
+        ctx.session_sequences.record_currval(sequence, value)?;
+    }
+    Ok(Value::Integer(value))
 }
 
 fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
@@ -392,10 +495,15 @@ fn concat_values(left: Value, right: Value) -> Result<Value> {
     }
 }
 
-fn eval_function(name: &str, args: &[BoundExpr], row: &ExecRow) -> Result<Value> {
+fn eval_function(
+    ctx: Option<&StatementContext>,
+    name: &str,
+    args: &[BoundExpr],
+    row: &ExecRow,
+) -> Result<Value> {
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
-        values.push(eval_expr(arg, row)?);
+        values.push(eval_expr_inner(ctx, arg, row)?);
     }
     // CONCAT ignores NULL arguments rather than propagating them, so it is handled
     // before the blanket NULL short-circuit below.
@@ -718,15 +826,20 @@ pub(crate) fn sql_not(value: Value) -> Result<Value> {
     }
 }
 
-fn eval_in_list(expr: &BoundExpr, list: &[BoundExpr], row: &ExecRow) -> Result<Value> {
-    let left = eval_expr(expr, row)?;
+fn eval_in_list(
+    ctx: Option<&StatementContext>,
+    expr: &BoundExpr,
+    list: &[BoundExpr],
+    row: &ExecRow,
+) -> Result<Value> {
+    let left = eval_expr_inner(ctx, expr, row)?;
     if matches!(left, Value::Null) {
         return Ok(Value::Null);
     }
 
     let mut saw_null = false;
     for item in list {
-        let right = eval_expr(item, row)?;
+        let right = eval_expr_inner(ctx, item, row)?;
         if matches!(right, Value::Null) {
             saw_null = true;
             continue;
@@ -846,22 +959,25 @@ fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> bool {
 }
 
 fn eval_case(
+    ctx: Option<&StatementContext>,
     operand: Option<&BoundExpr>,
     when_clauses: &[(BoundExpr, BoundExpr)],
     else_clause: Option<&BoundExpr>,
     row: &ExecRow,
 ) -> Result<Value> {
-    let operand_value = operand.map(|expr| eval_expr(expr, row)).transpose()?;
+    let operand_value = operand
+        .map(|expr| eval_expr_inner(ctx, expr, row))
+        .transpose()?;
 
     for (when, then) in when_clauses {
         let condition = if let Some(operand_value) = &operand_value {
-            let when_value = eval_expr(when, row)?;
+            let when_value = eval_expr_inner(ctx, when, row)?;
             compare_values(operand_value, BinOp::Eq, &when_value)?
         } else {
-            eval_expr(when, row)?
+            eval_expr_inner(ctx, when, row)?
         };
         if matches!(condition, Value::Boolean(true)) {
-            return eval_expr(then, row);
+            return eval_expr_inner(ctx, then, row);
         }
         if !matches!(condition, Value::Boolean(false) | Value::Null) {
             return datatype_mismatch("CASE condition must be boolean");
@@ -869,7 +985,7 @@ fn eval_case(
     }
 
     match else_clause {
-        Some(expr) => eval_expr(expr, row),
+        Some(expr) => eval_expr_inner(ctx, expr, row),
         None => Ok(Value::Null),
     }
 }

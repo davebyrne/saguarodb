@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL` and constant `DEFAULT` constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms. Sequence functions (`nextval`/`currval`/`setval`) and `SERIAL` are tracked in `docs/specs/sequences.md` but are not part of the implemented subset until their later tasks land.
+- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, and `DEFAULT nextval('<sequence>')` constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms. `SERIAL` is tracked in `docs/specs/sequences.md` but is not part of the implemented subset until its later task lands.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -251,10 +251,13 @@ pub enum SqlState {
     DuplicateTable,             // 42P07
     DatatypeMismatch,           // 42804
     DivisionByZero,             // 22012
+    InvalidParameterValue,      // 22023
     NumericValueOutOfRange,     // 22003
     StringDataRightTruncation,  // 22001
     NotNullViolation,           // 23502
     UniqueViolation,            // 23505
+    DependentObjectsStillExist,  // 2BP01
+    ObjectNotInPrerequisiteState, // 55000
     QueryCanceled,              // 57014
     FeatureNotSupported,        // 0A000
     InFailedSqlTransaction,     // 25P02
@@ -1440,7 +1443,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index/sequence IDs so orphan page files or catalog IDs cannot be reused. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index/sequence IDs so orphan page files or catalog IDs cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1596,7 +1599,7 @@ With MVCC (Milestone D1, `docs/specs/mvcc.md` §4 Decision 3) abort is purely st
 1. `write_page(file, page, txn_id)` — marks the page dirty
 2. ... (statement fails mid-execution) ...
 3. Append an `Abort` record (CLOG → `Aborted`; not fsynced) and deregister the txn from the active-transaction registry only after that append succeeds
-4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index schema shadow state; sequence DDL has no storage-owned state); it does NOT touch heap/index page content
+4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index/sequence schema shadow state); it does NOT touch heap/index page content or roll back sequence value advances
 5. `buffer_pool.rollback(txn_id)` — no-op bookkeeping clear (the dirty pages stay, hidden by the CLOG)
 6. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
 7. WAL records for this `txn_id` remain but have no `Commit` — recovery replays them (redo-all) and the CLOG hides them
@@ -1642,10 +1645,14 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, index: IndexId) -> Result<()>;
+    fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()>;
+    fn apply_drop_sequence(&self, sequence: SequenceId) -> Result<()>;
+    fn apply_sequence_advance(&self, sequence: SequenceId, value: i64) -> Result<()>;
+    fn apply_set_sequence_value(&self, sequence: SequenceId, value: i64, is_called: bool) -> Result<()>;
 }
 ```
 
-Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Table/index DDL replays through `RecoveryOperations`; sequence DDL has no storage-owned state in phase 2 and replays directly against the catalog. Recovery replay must not append WAL.
+Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Table/index/sequence DDL replays through `RecoveryOperations` when committed. Sequence value records replay through `RecoveryOperations` unconditionally because sequence advancement is non-transactional. Recovery replay must not append WAL.
 
 Concrete storage is opened with:
 
@@ -1659,14 +1666,14 @@ impl PageBackedStorageEngine {
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` after loading the catalog snapshot.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table/index/sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas`, `install_index_schemas`, and `install_sequences` after loading the catalog snapshot.
 
 **Recovery procedure** (driven by the server startup sequence):
 
 1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
-2. Initialize storage in recovery mode and the catalog; `install_schemas`.
+2. Initialize storage in recovery mode and the catalog; install table, index, and sequence schemas from the catalog snapshot.
 3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
-4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — committed table/index DDL via `RecoveryOperations`, committed sequence DDL directly against the catalog, with allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` IDs. The CLOG (rebuilt from `Commit`/`Abort`) decides visibility; aborted/in-flight versions are invisible.
+4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — committed table/index/sequence DDL through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` IDs, and unconditional sequence value records through `RecoveryOperations`. The CLOG (rebuilt from `Commit`/`Abort`) decides tuple visibility; aborted/in-flight versions are invisible.
 5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
 6. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
@@ -1808,9 +1815,9 @@ The `server` crate is the binary entry point.
 4. Initialize buffer pool with configured frames, the `WalFlushPolicy`, and the heap page store
 5. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if absent)
 6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
-7. Initialize catalog from the control catalog bytes (or empty); `storage.install_schemas(catalog.list_tables()?)`
+7. Initialize catalog from the control catalog bytes (or empty); install table, index, and sequence schemas into storage from the catalog snapshot
 8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
-9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, committed table/index DDL via `RecoveryOperations`, committed sequence DDL directly against the catalog, and allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` IDs — the CLOG decides visibility; no WAL appended in recovery mode
+9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, committed table/index/sequence DDL through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` IDs, and unconditional sequence value records through `RecoveryOperations` — the CLOG decides tuple visibility; no WAL appended in recovery mode
 10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water).
 11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
 12. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)

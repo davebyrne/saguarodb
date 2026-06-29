@@ -382,7 +382,7 @@ mod tests {
             let err = catalog
                 .create_sequence("bad_seq".to_string(), options, false)
                 .unwrap_err();
-            assert_eq!(err.code, SqlState::DatatypeMismatch);
+            assert_eq!(err.code, SqlState::InvalidParameterValue);
         }
     }
 
@@ -477,7 +477,19 @@ mod tests {
     }
 
     #[test]
-    fn try_from_snapshot_rejects_sequence_default_until_nextval_is_supported() {
+    fn try_from_snapshot_accepts_valid_sequence_default() {
+        let sequence = SequenceSchema {
+            id: 1,
+            name: "users_id_seq".to_string(),
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start: 1,
+            cycle: false,
+            owned: false,
+            last_value: 1,
+            is_called: false,
+        };
         let schema = TableSchema {
             id: 3,
             name: "users".to_string(),
@@ -498,16 +510,20 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
-            ..CatalogSnapshot::default()
+            sequences_by_name: HashMap::from([("users_id_seq".to_string(), 1)]),
+            sequences_by_id: HashMap::from([(1, sequence)]),
+            next_sequence_id: 2,
         };
 
-        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
-        assert_eq!(err.code, SqlState::InternalError);
-        assert!(err.message.contains("unsupported sequence default"));
+        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            catalog.get_table_by_name("users").unwrap().unwrap().columns[0].default,
+            Some(ColumnDefault::Nextval(1))
+        );
     }
 
     #[test]
-    fn apply_create_table_rejects_sequence_default_until_nextval_is_supported() {
+    fn apply_create_table_rejects_missing_sequence_default() {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 3,
@@ -525,8 +541,69 @@ mod tests {
 
         let err = catalog.apply_create_table(schema).unwrap_err();
         assert_eq!(err.code, SqlState::InternalError);
-        assert!(err.message.contains("unsupported sequence default"));
+        assert!(err.message.contains("references missing sequence"));
         assert_eq!(catalog.get_table_by_name("users").unwrap(), None);
+    }
+
+    #[test]
+    fn create_table_resolves_parsed_nextval_default() {
+        let catalog = MemoryCatalog::empty();
+        let sequence = catalog
+            .create_sequence(
+                "users_id_seq".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                }],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            schema.columns[0].default,
+            Some(ColumnDefault::Nextval(sequence.id))
+        );
+    }
+
+    #[test]
+    fn drop_sequence_rejects_referenced_default() {
+        let catalog = MemoryCatalog::empty();
+        let sequence = catalog
+            .create_sequence(
+                "users_id_seq".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+        catalog
+            .create_table(
+                "users".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                }],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+
+        let err = catalog.drop_sequence(sequence.id).unwrap_err();
+
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert!(catalog.get_sequence(sequence.id).unwrap().is_some());
     }
 
     #[test]

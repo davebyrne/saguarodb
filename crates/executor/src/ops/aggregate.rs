@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{ColumnInfo, DataType, DbError, Decimal, ExecRow, Result, Row, SqlState, Value};
+use common::{
+    ColumnInfo, DataType, DbError, Decimal, ExecRow, Result, Row, SqlState, StatementContext, Value,
+};
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 use crate::expr::integer_overflow;
 use crate::query::{PlanExecutor, collect_all};
 
 pub struct AggregateOp<'a> {
+    ctx: StatementContext,
     source: Box<dyn PlanExecutor + 'a>,
     group_by: Vec<BoundExpr>,
     aggregates: Vec<AggregateExpr>,
@@ -18,12 +21,14 @@ pub struct AggregateOp<'a> {
 
 impl<'a> AggregateOp<'a> {
     pub fn new(
+        ctx: StatementContext,
         source: Box<dyn PlanExecutor + 'a>,
         group_by: Vec<BoundExpr>,
         aggregates: Vec<AggregateExpr>,
         output_schema: Vec<ColumnInfo>,
     ) -> Self {
         Self {
+            ctx,
             source,
             group_by,
             aggregates,
@@ -43,11 +48,11 @@ impl PlanExecutor for AggregateOp<'_> {
         self.rows.clear();
         self.index = 0;
         let input = collect_all(self.source.as_mut())?;
-        let groups = build_groups(&self.group_by, input)?;
+        let groups = build_groups(&self.ctx, &self.group_by, input)?;
         for (group_key, rows) in groups {
             let mut values = group_key;
             for aggregate in &self.aggregates {
-                values.push(evaluate_aggregate(aggregate, &rows)?);
+                values.push(evaluate_aggregate(&self.ctx, aggregate, &rows)?);
             }
             self.rows.push(ExecRow {
                 row: Row { values },
@@ -73,6 +78,7 @@ impl PlanExecutor for AggregateOp<'_> {
 }
 
 fn build_groups(
+    ctx: &StatementContext,
     group_by: &[BoundExpr],
     input: Vec<ExecRow>,
 ) -> Result<Vec<(Vec<Value>, Vec<ExecRow>)>> {
@@ -84,26 +90,34 @@ fn build_groups(
     for row in input {
         let key = group_by
             .iter()
-            .map(|expr| eval_expr(expr, &row))
+            .map(|expr| eval_expr_with_context(ctx, expr, &row))
             .collect::<Result<Vec<_>>>()?;
         groups.entry(key).or_default().push(row);
     }
     Ok(groups.into_iter().collect())
 }
 
-fn evaluate_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Value> {
+fn evaluate_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+) -> Result<Value> {
     match aggregate.func {
-        AggregateFunc::Count => count_aggregate(aggregate, rows),
-        AggregateFunc::Sum => fold_aggregate(aggregate, rows, FoldKind::Sum),
-        AggregateFunc::Avg => fold_aggregate(aggregate, rows, FoldKind::Avg),
-        AggregateFunc::Min => min_max_aggregate(aggregate, rows, true),
-        AggregateFunc::Max => min_max_aggregate(aggregate, rows, false),
-        AggregateFunc::StddevSamp => variance_aggregate(aggregate, rows, Spread::Sample, true),
-        AggregateFunc::StddevPop => variance_aggregate(aggregate, rows, Spread::Population, true),
-        AggregateFunc::VarSamp => variance_aggregate(aggregate, rows, Spread::Sample, false),
-        AggregateFunc::VarPop => variance_aggregate(aggregate, rows, Spread::Population, false),
-        AggregateFunc::BoolAnd => bool_aggregate(aggregate, rows, true),
-        AggregateFunc::BoolOr => bool_aggregate(aggregate, rows, false),
+        AggregateFunc::Count => count_aggregate(ctx, aggregate, rows),
+        AggregateFunc::Sum => fold_aggregate(ctx, aggregate, rows, FoldKind::Sum),
+        AggregateFunc::Avg => fold_aggregate(ctx, aggregate, rows, FoldKind::Avg),
+        AggregateFunc::Min => min_max_aggregate(ctx, aggregate, rows, true),
+        AggregateFunc::Max => min_max_aggregate(ctx, aggregate, rows, false),
+        AggregateFunc::StddevSamp => variance_aggregate(ctx, aggregate, rows, Spread::Sample, true),
+        AggregateFunc::StddevPop => {
+            variance_aggregate(ctx, aggregate, rows, Spread::Population, true)
+        }
+        AggregateFunc::VarSamp => variance_aggregate(ctx, aggregate, rows, Spread::Sample, false),
+        AggregateFunc::VarPop => {
+            variance_aggregate(ctx, aggregate, rows, Spread::Population, false)
+        }
+        AggregateFunc::BoolAnd => bool_aggregate(ctx, aggregate, rows, true),
+        AggregateFunc::BoolOr => bool_aggregate(ctx, aggregate, rows, false),
     }
 }
 
@@ -118,13 +132,14 @@ enum Spread {
 /// inputs (or its square root for stddev). Returns NULL when there are too few
 /// values (no rows for population; fewer than two for sample).
 fn variance_aggregate(
+    ctx: &StatementContext,
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
     spread: Spread,
     stddev: bool,
 ) -> Result<Value> {
     let mut data = Vec::new();
-    for value in aggregate_values(aggregate, rows)? {
+    for value in aggregate_values(ctx, aggregate, rows)? {
         match value {
             Value::Null => {}
             Value::Integer(value) => data.push(value as f64),
@@ -155,10 +170,15 @@ fn variance_aggregate(
 
 /// `BOOL_AND` (all) / `BOOL_OR` (any) over the non-NULL boolean inputs; NULL when
 /// there are no non-NULL inputs.
-fn bool_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], all: bool) -> Result<Value> {
+fn bool_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    all: bool,
+) -> Result<Value> {
     let mut seen = false;
     let mut acc = all;
-    for value in aggregate_values(aggregate, rows)? {
+    for value in aggregate_values(ctx, aggregate, rows)? {
         match value {
             Value::Null => {}
             Value::Boolean(value) => {
@@ -180,12 +200,16 @@ fn bool_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], all: bool) -> Res
     }
 }
 
-fn count_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Value> {
+fn count_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+) -> Result<Value> {
     if aggregate.arg.is_none() {
         return Ok(Value::Integer(rows.len() as i64));
     }
 
-    let values = aggregate_values(aggregate, rows)?;
+    let values = aggregate_values(ctx, aggregate, rows)?;
     Ok(Value::Integer(
         values
             .into_iter()
@@ -200,23 +224,29 @@ enum FoldKind {
     Avg,
 }
 
-/// Dispatch SUM/AVG to the integer, double, or numeric fold based on the bound
+/// Dispatch SUM/AVG to the integer, real, double, or numeric fold based on the bound
 /// result type.
-fn fold_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], kind: FoldKind) -> Result<Value> {
-    match aggregate.data_type {
-        DataType::Double => float_fold_aggregate(aggregate, rows, kind),
-        DataType::Real => real_fold_aggregate(aggregate, rows, kind),
-        DataType::Numeric { .. } => numeric_fold_aggregate(aggregate, rows, kind),
-        _ => integer_fold_aggregate(aggregate, rows, kind),
-    }
-}
-
-fn integer_fold_aggregate(
+fn fold_aggregate(
+    ctx: &StatementContext,
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
     kind: FoldKind,
 ) -> Result<Value> {
-    let values = aggregate_values(aggregate, rows)?;
+    match aggregate.data_type {
+        DataType::Double => float_fold_aggregate(ctx, aggregate, rows, kind),
+        DataType::Real => real_fold_aggregate(ctx, aggregate, rows, kind),
+        DataType::Numeric { .. } => numeric_fold_aggregate(ctx, aggregate, rows, kind),
+        _ => integer_fold_aggregate(ctx, aggregate, rows, kind),
+    }
+}
+
+fn integer_fold_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    kind: FoldKind,
+) -> Result<Value> {
+    let values = aggregate_values(ctx, aggregate, rows)?;
     let mut sum = 0_i64;
     let mut count = 0_i64;
     for value in values {
@@ -246,11 +276,12 @@ fn integer_fold_aggregate(
 }
 
 fn float_fold_aggregate(
+    ctx: &StatementContext,
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
     kind: FoldKind,
 ) -> Result<Value> {
-    let values = aggregate_values(aggregate, rows)?;
+    let values = aggregate_values(ctx, aggregate, rows)?;
     let mut sum = 0.0_f64;
     let mut count = 0_i64;
     for value in values {
@@ -280,11 +311,12 @@ fn float_fold_aggregate(
 }
 
 fn real_fold_aggregate(
+    ctx: &StatementContext,
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
     kind: FoldKind,
 ) -> Result<Value> {
-    let values = aggregate_values(aggregate, rows)?;
+    let values = aggregate_values(ctx, aggregate, rows)?;
     let mut sum = 0.0_f32;
     let mut count = 0_i64;
     for value in values {
@@ -314,11 +346,12 @@ fn real_fold_aggregate(
 }
 
 fn numeric_fold_aggregate(
+    ctx: &StatementContext,
     aggregate: &AggregateExpr,
     rows: &[ExecRow],
     kind: FoldKind,
 ) -> Result<Value> {
-    let values = aggregate_values(aggregate, rows)?;
+    let values = aggregate_values(ctx, aggregate, rows)?;
     let mut sum = Decimal::ZERO;
     let mut count = 0_i64;
     for value in values {
@@ -355,8 +388,13 @@ fn numeric_overflow() -> DbError {
     DbError::execute(SqlState::NumericValueOutOfRange, "numeric field overflow")
 }
 
-fn min_max_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], min: bool) -> Result<Value> {
-    let values = aggregate_values(aggregate, rows)?;
+fn min_max_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+    min: bool,
+) -> Result<Value> {
+    let values = aggregate_values(ctx, aggregate, rows)?;
     let mut best: Option<Value> = None;
     for value in values {
         if matches!(value, Value::Null) {
@@ -370,7 +408,11 @@ fn min_max_aggregate(aggregate: &AggregateExpr, rows: &[ExecRow], min: bool) -> 
     Ok(best.unwrap_or(Value::Null))
 }
 
-fn aggregate_values(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Vec<Value>> {
+fn aggregate_values(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+) -> Result<Vec<Value>> {
     let Some(arg) = &aggregate.arg else {
         return Ok(Vec::new());
     };
@@ -378,7 +420,7 @@ fn aggregate_values(aggregate: &AggregateExpr, rows: &[ExecRow]) -> Result<Vec<V
     let mut values = Vec::with_capacity(rows.len());
     let mut distinct = BTreeSet::new();
     for row in rows {
-        let value = eval_expr(arg, row)?;
+        let value = eval_expr_with_context(ctx, arg, row)?;
         if aggregate.distinct && !distinct.insert(value.clone()) {
             continue;
         }

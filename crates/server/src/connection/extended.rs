@@ -39,6 +39,7 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
+        let session_sequences = self.session_sequences.clone();
 
         // When an explicit transaction is open on this session, the extended-
         // protocol `Execute` participates in THAT transaction rather than starting
@@ -63,12 +64,13 @@ impl Session {
             let txn = self.txn.take();
             let default_isolation = self.default_isolation;
             let task = tokio::task::spawn_blocking(move || {
-                service.execute_prepared_in_session(
+                service.execute_prepared_in_session_with_session_sequences(
                     &statement,
                     &params,
                     txn,
                     default_isolation,
                     &cancel,
+                    session_sequences,
                 )
             })
             .await;
@@ -91,7 +93,12 @@ impl Session {
         } else {
             let result = query_task_result(
                 tokio::task::spawn_blocking(move || {
-                    service.execute_prepared_cancelable(&statement, &params, &cancel)
+                    service.execute_prepared_cancelable_with_session_sequences(
+                        &statement,
+                        &params,
+                        &cancel,
+                        session_sequences,
+                    )
                 })
                 .await,
             );

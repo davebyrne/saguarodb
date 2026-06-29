@@ -18,13 +18,15 @@ pub use traits::{RecoveryOperations, RowIterator, SchemaOperations, StorageEngin
 #[cfg(test)]
 mod tests {
     use std::ops::Bound;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
         ColumnDef, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key, KeyRange, Lsn, Result,
-        Row, SqlState, StatementContext, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+        Row, SequenceManager, SequenceSchema, SqlState, StatementContext, TableSchema, TxnId,
+        TxnStatus, TxnStatusView, Value,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -122,10 +124,143 @@ mod tests {
             .storage
             .apply_create_index(name_index(false))
             .unwrap();
+        harness
+            .storage
+            .apply_create_sequence(sequence_schema(7, "users_id_seq", 1, 1, 10, 1, false))
+            .unwrap();
+        harness.storage.apply_sequence_advance(7, 3).unwrap();
+        harness
+            .storage
+            .apply_set_sequence_value(7, 5, false)
+            .unwrap();
         harness.storage.apply_drop_index(1).unwrap();
+        harness.storage.apply_drop_sequence(7).unwrap();
         harness.storage.apply_drop_table(1).unwrap();
 
         assert_eq!(harness.wal.record_count(), 0);
+    }
+
+    #[test]
+    fn nextval_logs_advances_and_keeps_gaps_after_rollback() {
+        let harness = StorageHarness::new();
+        harness
+            .storage
+            .create_sequence(
+                &StatementContext::new(1),
+                &sequence_schema(7, "users_id_seq", 1, 1, 3, 1, false),
+            )
+            .unwrap();
+
+        assert_eq!(harness.wal.record_count(), 1);
+        assert_eq!(harness.storage.nextval(2, 7).unwrap(), 1);
+        assert_eq!(harness.storage.nextval(2, 7).unwrap(), 2);
+
+        harness.storage.rollback_txn(2).unwrap();
+
+        assert_eq!(harness.storage.nextval(3, 7).unwrap(), 3);
+        assert_eq!(harness.wal.record_count(), 4);
+    }
+
+    #[test]
+    fn nextval_flushes_sequence_wal_before_returning() {
+        let harness = StorageHarness::new();
+        harness
+            .storage
+            .create_sequence(
+                &StatementContext::new(1),
+                &sequence_schema(7, "users_id_seq", 1, 1, 10, 1, false),
+            )
+            .unwrap();
+
+        assert_eq!(harness.wal.flush_count(), 0);
+        assert_eq!(harness.storage.nextval(2, 7).unwrap(), 1);
+
+        assert_eq!(harness.wal.flush_count(), 1);
+        assert_eq!(harness.wal.flushed_lsn(), harness.wal.record_count() as Lsn);
+    }
+
+    #[test]
+    fn sequence_wal_flush_does_not_hold_global_storage_lock() {
+        let buffer = Arc::new(MemoryBufferPool::empty(64));
+        let wal = Arc::new(CountingWal::default());
+        let storage = Arc::new(
+            PageBackedStorageEngine::open(buffer, wal.clone(), StorageMode::Normal).unwrap(),
+        );
+        storage
+            .create_sequence(
+                &StatementContext::new(1),
+                &sequence_schema(7, "users_id_seq", 1, 1, 10, 1, false),
+            )
+            .unwrap();
+        let (flush_entered, release_flush) = wal.block_next_flush();
+
+        let nextval_storage = storage.clone();
+        let nextval = std::thread::spawn(move || nextval_storage.nextval(2, 7));
+        flush_entered
+            .recv_timeout(Duration::from_secs(1))
+            .expect("nextval did not reach the sequence WAL flush");
+
+        let (metadata_done_tx, metadata_done_rx) = mpsc::channel();
+        let metadata_storage = storage.clone();
+        let metadata = std::thread::spawn(move || {
+            metadata_storage.set_mode(StorageMode::Normal).unwrap();
+            metadata_done_tx.send(()).unwrap();
+        });
+        metadata_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("sequence WAL flush held the global storage lock");
+
+        release_flush.send(()).unwrap();
+        assert_eq!(nextval.join().unwrap().unwrap(), 1);
+        metadata.join().unwrap();
+    }
+
+    #[test]
+    fn sequences_enforce_bounds_cycle_and_setval_false() {
+        let harness = StorageHarness::new();
+        harness
+            .storage
+            .create_sequence(
+                &StatementContext::new(1),
+                &sequence_schema(8, "bounded", 1, 1, 2, 1, false),
+            )
+            .unwrap();
+        assert_eq!(harness.storage.nextval(2, 8).unwrap(), 1);
+        assert_eq!(harness.storage.nextval(2, 8).unwrap(), 2);
+        let err = harness.storage.nextval(2, 8).unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+
+        harness
+            .storage
+            .create_sequence(
+                &StatementContext::new(3),
+                &sequence_schema(9, "cycling", 1, 1, 2, 1, true),
+            )
+            .unwrap();
+        assert_eq!(harness.storage.nextval(4, 9).unwrap(), 1);
+        assert_eq!(harness.storage.nextval(4, 9).unwrap(), 2);
+        assert_eq!(harness.storage.nextval(4, 9).unwrap(), 1);
+
+        harness
+            .storage
+            .create_sequence(
+                &StatementContext::new(5),
+                &sequence_schema(10, "settable", 5, 1, 20, 1, false),
+            )
+            .unwrap();
+        assert_eq!(harness.storage.setval(6, 10, 11, false).unwrap(), 11);
+        assert_eq!(harness.storage.nextval(7, 10).unwrap(), 11);
+        assert_eq!(harness.storage.nextval(7, 10).unwrap(), 12);
+
+        let settable = harness
+            .storage
+            .sequence_schemas_for_checkpoint()
+            .unwrap()
+            .into_iter()
+            .find(|sequence| sequence.id == 10)
+            .unwrap();
+        assert_eq!(settable.last_value, 12);
+        assert!(settable.is_called);
     }
 
     #[test]
@@ -1244,7 +1379,10 @@ mod tests {
     #[derive(Default)]
     struct CountingWal {
         count: AtomicUsize,
+        flushed: AtomicUsize,
+        flushes: AtomicUsize,
         fail_at: AtomicUsize,
+        block_next_flush: std::sync::Mutex<Option<FlushGate>>,
         fail_next_fpi: std::sync::atomic::AtomicBool,
         fail_next_heap_update_header: std::sync::atomic::AtomicBool,
         fpi_count_by_file: std::sync::Mutex<std::collections::HashMap<FileId, usize>>,
@@ -1260,8 +1398,22 @@ mod tests {
             self.count.load(Ordering::SeqCst)
         }
 
+        fn flush_count(&self) -> usize {
+            self.flushes.load(Ordering::SeqCst)
+        }
+
         fn fail_on_append_number(&self, append_number: usize) {
             self.fail_at.store(append_number, Ordering::SeqCst);
+        }
+
+        fn block_next_flush(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *self.block_next_flush.lock().unwrap() = Some(FlushGate {
+                entered: entered_tx,
+                release: release_rx,
+            });
+            (entered_rx, release_tx)
         }
 
         fn fail_next_full_page_image(&self) {
@@ -1287,6 +1439,11 @@ mod tests {
         fn mark_aborted(&self, txn_id: TxnId) {
             self.aborted.lock().unwrap().insert(txn_id);
         }
+    }
+
+    struct FlushGate {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
     }
 
     impl WalManager for CountingWal {
@@ -1320,7 +1477,14 @@ mod tests {
         }
 
         fn flush(&self) -> Result<Lsn> {
-            Ok(self.count.load(Ordering::SeqCst) as Lsn)
+            if let Some(gate) = self.block_next_flush.lock().unwrap().take() {
+                let _ = gate.entered.send(());
+                let _ = gate.release.recv();
+            }
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            let count = self.count.load(Ordering::SeqCst);
+            self.flushed.store(count, Ordering::SeqCst);
+            Ok(count as Lsn)
         }
 
         fn replay_from(&self, _lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
@@ -1332,7 +1496,7 @@ mod tests {
         }
 
         fn flushed_lsn(&self) -> Lsn {
-            0
+            self.flushed.load(Ordering::SeqCst) as Lsn
         }
 
         fn bytes_after(&self, _lsn: Lsn) -> Result<u64> {
@@ -1414,6 +1578,29 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+        }
+    }
+
+    fn sequence_schema(
+        id: u32,
+        name: &str,
+        start: i64,
+        min_value: i64,
+        max_value: i64,
+        increment: i64,
+        cycle: bool,
+    ) -> SequenceSchema {
+        SequenceSchema {
+            id,
+            name: name.to_string(),
+            increment,
+            min_value,
+            max_value,
+            start,
+            cycle,
+            owned: false,
+            last_value: start,
+            is_called: false,
         }
     }
 

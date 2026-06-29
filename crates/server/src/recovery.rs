@@ -57,6 +57,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
     }
     storage.install_schemas(tables)?;
     storage.install_index_schemas(indexes)?;
+    storage.install_sequences(catalog.list_sequences()?)?;
 
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
     // record after the checkpoint LSN onto the heap and index pages, regardless of
@@ -287,8 +288,22 @@ fn apply_redo(
             catalog.apply_drop_index(*index)?;
             storage.apply_drop_index(*index)
         }
-        WalRecordKind::CreateSequence { schema } => catalog.apply_create_sequence(schema.clone()),
-        WalRecordKind::DropSequence { sequence } => catalog.apply_drop_sequence(*sequence),
+        WalRecordKind::CreateSequence { schema } => {
+            catalog.apply_create_sequence(schema.clone())?;
+            storage.apply_create_sequence(schema.clone())
+        }
+        WalRecordKind::DropSequence { sequence } => {
+            catalog.apply_drop_sequence(*sequence)?;
+            storage.apply_drop_sequence(*sequence)
+        }
+        WalRecordKind::SequenceAdvance { sequence, value } => {
+            storage.apply_sequence_advance(*sequence, *value)
+        }
+        WalRecordKind::SetSequenceValue {
+            sequence,
+            value,
+            is_called,
+        } => storage.apply_set_sequence_value(*sequence, *value, *is_called),
         WalRecordKind::HeapInit { file_id, page_num }
         | WalRecordKind::HeapInsert {
             file_id, page_num, ..

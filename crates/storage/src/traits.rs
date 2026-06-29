@@ -67,4 +67,13 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, index: IndexId) -> Result<()>;
+    fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()>;
+    fn apply_drop_sequence(&self, sequence: SequenceId) -> Result<()>;
+    fn apply_sequence_advance(&self, sequence: SequenceId, value: i64) -> Result<()>;
+    fn apply_set_sequence_value(
+        &self,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<()>;
 }

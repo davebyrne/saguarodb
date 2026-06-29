@@ -10,23 +10,69 @@ pub mod ops;
 pub mod test_support;
 
 pub use common::{ExecRow, RowIdentity};
-pub use expr::eval_expr;
+pub use expr::{eval_expr, eval_expr_with_context};
 pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine};
 pub use result::{CopyJob, ExecutionResult};
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         ColumnDef, ColumnDefault, ColumnInfo, CopyFormat, CopyOptions, DataType, ExecRow, Key,
-        ParsedColumnDef, Row, RowId, RowIdentity, SqlState, StatementContext, TableSchema, Value,
+        ParsedColumnDef, Result, Row, RowId, RowIdentity, SequenceManager, SessionSequenceState,
+        SqlState, StatementContext, TableSchema, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
     use crate::ops::{join_rows, project_row};
     use crate::test_support::{ExecutorHarness, MemoryStorage};
-    use crate::{ExecutionContext, ExecutionResult, QueryEngine, eval_expr};
+    use crate::{
+        ExecutionContext, ExecutionResult, QueryEngine, eval_expr, eval_expr_with_context,
+    };
     use storage::SchemaOperations;
+
+    #[derive(Debug, Default)]
+    struct TestSequenceManager {
+        next_values: Mutex<Vec<i64>>,
+        set_calls: Mutex<Vec<(u64, u32, i64, bool)>>,
+    }
+
+    impl TestSequenceManager {
+        fn with_next_values(values: Vec<i64>) -> Self {
+            Self {
+                next_values: Mutex::new(values.into_iter().rev().collect()),
+                set_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn set_calls(&self) -> Vec<(u64, u32, i64, bool)> {
+            self.set_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SequenceManager for TestSequenceManager {
+        fn sequence_exists(&self, _sequence: u32) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn nextval(&self, _txn_id: u64, _sequence: u32) -> Result<i64> {
+            self.next_values
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| common::DbError::internal("no next test sequence value"))
+        }
+
+        fn setval(&self, txn_id: u64, sequence: u32, value: i64, is_called: bool) -> Result<i64> {
+            self.set_calls
+                .lock()
+                .unwrap()
+                .push((txn_id, sequence, value, is_called));
+            Ok(value)
+        }
+    }
 
     #[test]
     fn boolean_and_uses_sql_null_semantics() {
@@ -423,7 +469,13 @@ mod tests {
             primary_key: vec![0],
         };
 
-        let row = crate::query::build_insert_row(&schema, &[0], vec![Value::Integer(9)]).unwrap();
+        let row = crate::query::build_insert_row(
+            &common::StatementContext::new(0),
+            &schema,
+            &[0],
+            vec![Value::Integer(9)],
+        )
+        .unwrap();
 
         assert_eq!(
             row,
@@ -431,6 +483,122 @@ mod tests {
                 values: vec![Value::Integer(9)]
             }
         );
+    }
+
+    #[test]
+    fn insert_row_evaluates_sequence_default_for_omitted_column() {
+        let manager = Arc::new(TestSequenceManager::with_next_values(vec![42]));
+        let session_sequences = Arc::new(SessionSequenceState::new());
+        let statement = StatementContext::new(7)
+            .with_sequence_manager(manager)
+            .with_session_sequences(session_sequences.clone());
+        let schema = TableSchema {
+            id: 1,
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: Some(ColumnDefault::Nextval(1)),
+            }],
+            primary_key: vec![0],
+        };
+
+        let row = crate::query::build_insert_row(&statement, &schema, &[], vec![]).unwrap();
+
+        assert_eq!(
+            row,
+            Row {
+                values: vec![Value::Integer(42)]
+            }
+        );
+        assert_eq!(session_sequences.currval(1).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn scalar_sequence_functions_use_context_and_session_state() {
+        let manager = Arc::new(TestSequenceManager::with_next_values(vec![5]));
+        let session_sequences = Arc::new(SessionSequenceState::new());
+        let statement = StatementContext::new(23)
+            .with_sequence_manager(manager.clone())
+            .with_session_sequences(session_sequences.clone());
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let nextval = BoundExpr::Nextval {
+            sequence: 1,
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+        let currval = BoundExpr::Currval {
+            sequence: 1,
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        let err = eval_expr_with_context(&statement, &currval, &row).unwrap_err();
+        assert_eq!(err.code, SqlState::ObjectNotInPrerequisiteState);
+        assert_eq!(
+            eval_expr_with_context(&statement, &nextval, &row).unwrap(),
+            Value::Integer(5)
+        );
+        assert_eq!(
+            eval_expr_with_context(&statement, &currval, &row).unwrap(),
+            Value::Integer(5)
+        );
+
+        let setval = BoundExpr::Setval {
+            sequence: 1,
+            value: Box::new(BoundExpr::Literal {
+                value: Value::Integer(9),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            is_called: Some(Box::new(BoundExpr::Literal {
+                value: Value::Boolean(false),
+                data_type: DataType::Boolean,
+                nullable: false,
+            })),
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+
+        assert_eq!(
+            eval_expr_with_context(&statement, &setval, &row).unwrap(),
+            Value::Integer(9)
+        );
+        assert_eq!(manager.set_calls(), vec![(23, 1, 9, false)]);
+        assert_eq!(session_sequences.currval(1).unwrap(), Some(5));
+
+        let fresh_session = Arc::new(SessionSequenceState::new());
+        let fresh_statement = StatementContext::new(24)
+            .with_sequence_manager(manager.clone())
+            .with_session_sequences(fresh_session.clone());
+        assert_eq!(
+            eval_expr_with_context(&fresh_statement, &setval, &row).unwrap(),
+            Value::Integer(9)
+        );
+        assert_eq!(fresh_session.currval(1).unwrap(), None);
+
+        let setval_called = BoundExpr::Setval {
+            sequence: 1,
+            value: Box::new(BoundExpr::Literal {
+                value: Value::Integer(11),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            is_called: None,
+            data_type: DataType::Integer,
+            nullable: false,
+        };
+        assert_eq!(
+            eval_expr_with_context(&fresh_statement, &setval_called, &row).unwrap(),
+            Value::Integer(11)
+        );
+        assert_eq!(fresh_session.currval(1).unwrap(), Some(11));
     }
 
     #[test]

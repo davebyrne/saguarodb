@@ -511,6 +511,15 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             }
             Ok(())
         }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            validate_grouped_expr(value, group_by)?;
+            if let Some(is_called) = is_called {
+                validate_grouped_expr(is_called, group_by)?;
+            }
+            Ok(())
+        }
         BoundExpr::InList { expr, list, .. } => {
             validate_grouped_expr(expr, group_by)?;
             for item in list {
@@ -554,6 +563,8 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => validate_grouped_expr(expr, group_by),
         BoundExpr::AggregateCall { .. } => Ok(()),
@@ -571,6 +582,9 @@ fn references_input(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => references_input(expr),
         BoundExpr::Function { args, .. } => args.iter().any(references_input),
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => references_input(value) || is_called.as_deref().is_some_and(references_input),
         BoundExpr::AggregateCall { arg, .. } => arg.as_deref().is_some_and(references_input),
         BoundExpr::InList { expr, list, .. } => {
             references_input(expr) || list.iter().any(references_input)
@@ -599,6 +613,8 @@ fn references_input(expr: &BoundExpr) -> bool {
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }

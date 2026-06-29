@@ -116,7 +116,7 @@ fn bind_inner(
                 ));
             }
             for column in columns {
-                validate_default_value(column)?;
+                validate_default_value(catalog, column)?;
             }
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
@@ -291,6 +291,9 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => contains_aggregate(value) || is_called.as_deref().is_some_and(contains_aggregate),
         BoundExpr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
@@ -320,6 +323,8 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }
@@ -329,15 +334,30 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
 /// is a constant folded by the parser; it must have the same type as the column
 /// (no implicit casts), except `NULL` is accepted only when the column is
 /// nullable (a `NULL` default on a `NOT NULL` column is rejected up front).
-fn validate_default_value(column: &ParsedColumnDef) -> Result<()> {
-    let Some(value) = &column.default else {
+fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef) -> Result<()> {
+    let Some(default) = &column.default else {
         return Ok(());
     };
-    let ParsedDefault::Const(value) = value else {
-        return Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "sequence defaults are not supported yet",
-        ));
+    let value = match default {
+        ParsedDefault::Const(value) => value,
+        ParsedDefault::Nextval(name) => {
+            if column.data_type != DataType::Integer {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "DEFAULT nextval for column {} requires INTEGER, got {:?}",
+                        column.name, column.data_type
+                    ),
+                ));
+            }
+            catalog.get_sequence_by_name(name)?.ok_or_else(|| {
+                plan_error(
+                    SqlState::UndefinedTable,
+                    format!("sequence {name} does not exist"),
+                )
+            })?;
+            return Ok(());
+        }
     };
     if matches!(value, Value::Null) {
         if column.nullable {

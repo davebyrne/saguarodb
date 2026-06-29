@@ -14,9 +14,11 @@
 ## 1. Overview
 
 Sequences are named, durable, monotonic number generators. They are the
-mechanism behind auto-incrementing keys: the `SERIAL` pseudo-type is sugar for
-an `INTEGER` column whose `DEFAULT` calls `nextval` on an owned sequence. This
-spec adds three things that build on each other:
+mechanism behind auto-incrementing keys: the planned `SERIAL` pseudo-type is
+sugar for an `INTEGER` column whose `DEFAULT` calls `nextval` on an owned
+sequence. This spec adds three things that build on each other; the current
+implemented subset covers explicit sequences, sequence functions, and
+`DEFAULT nextval('<existing-sequence>')`, while `SERIAL` remains the next task:
 
 1. **Generalize column `DEFAULT`** — the column default already exists as a
    constant (`ColumnDef.default: Option<Value>`, applied at `build_insert_row`).
@@ -44,19 +46,21 @@ binder/executor, and server wiring.
 - `DROP SEQUENCE [IF EXISTS] <name>`.
 - `nextval('<name>')` — advance and return the next value (BIGINT). Side
   effecting and **non-transactional**: its advance is never rolled back.
-- `currval('<name>')` — return the value most recently produced by `nextval`
-  for `<name>` **in the current session**. Errors if `nextval` has not been
-  called for `<name>` this session.
-- `setval('<name>', n [, is_called])` — reposition the sequence. Non-transactional.
+- `currval('<name>')` — return the session value most recently established by
+  `nextval('<name>')` or `setval('<name>', n, true)`. Errors if no such value
+  exists for `<name>` in the current session.
+- `setval('<name>', n [, is_called])` — reposition the sequence.
+  Non-transactional. With `is_called = false`, the next `nextval` returns `n`
+  and the session's `currval` state is not changed.
 - Column `DEFAULT <const>` (already shipped) and
   `DEFAULT nextval('<existing-sequence>')` in `CREATE TABLE`. Omitted columns are
   filled from the default at `INSERT` and `COPY ... FROM` via the existing
   `build_insert_row` funnel (so `RETURNING` and `ON CONFLICT` get it for free).
-- `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`)
-  column types in `CREATE TABLE`.
 
 ### Out of scope (v1 deferrals)
 
+- `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`)
+  column types in `CREATE TABLE`; §6 specifies the planned follow-up task.
 - The `DEFAULT` keyword as a value in `INSERT ... VALUES (DEFAULT, ...)` — no
   `Expr::Default` marker is added; omit the column from the column list to get
   its default instead. (Deferred; the earlier draft included it.)
@@ -79,11 +83,11 @@ These were settled during design and drive the rest of the spec.
    exists as `ColumnDef.default: Option<Value>`, we **generalize that field** to
    `Option<ColumnDefault>` (a bounded enum) rather than add a parallel
    sequence-only attribute — keeping one default mechanism.
-2. **WAL-logged advancement, no cache.** Each `nextval`/`setval` appends a
-   logical WAL record. No extra fsync per call — the record rides the
-   surrounding commit's WAL flush, so any value a committed transaction relied
-   on is durable and never reissued. Checkpoint-only durability was rejected
-   because it would reissue values after a crash (duplicate `SERIAL` keys).
+2. **WAL-logged advancement, no cache.** Each `nextval`/`setval` appends and
+   flushes a logical WAL record before updating live sequence state and
+   returning, so any value handed to a client is durable and never reissued.
+   Checkpoint-only durability was rejected because it would reissue values after
+   a crash (duplicate keys).
 3. **Function set: `nextval` + `currval` + `setval`.** `currval` requires new
    per-connection session state; `lastval` is deferred.
 4. **`CACHE` is a no-op.** Behavioral options (`INCREMENT`, `START`, `MINVALUE`,
@@ -229,18 +233,23 @@ depending on `storage`.
 nextval(id):
     lock sequence id
     compute next from (last_value, is_called, increment, min, max, cycle):
-        if !is_called: next = start          // first nextval returns START WITH
+        if !is_called: next = last_value     // initial last_value is START WITH;
+                                             // setval(..., false) makes nextval return n
         else:          next = last_value + increment, bounded by min/max
         if next overflows min/max:
             if cycle: wrap to max/min (per increment sign)
             else:     error (sequence exhausted)
+    append and flush WAL: SequenceAdvance { id, value: next }
     set last_value = next, is_called = true
-    append WAL: SequenceAdvance { id, value: next }   (no fsync here)
     unlock
     return next
 
 setval(id, n, is_called):
-    lock; set last_value = n, is_called; append WAL SetSequenceValue { id, n, is_called }; unlock
+    lock; validate n; append and flush WAL SetSequenceValue { id, n, is_called };
+    set last_value = n, is_called; unlock
+
+sequence_exists(id):
+    check the runtime sequence map without advancing or writing WAL
 ```
 
 The manager exposes the current `(last_value, is_called)` for every sequence to
@@ -272,10 +281,10 @@ operation; recovery never appends WAL (`docs/specs/crates/wal.md`).
 
 ### 4.4 Durability and recovery flow
 
-- **Steady state:** `nextval` advances in memory and appends `SequenceAdvance`.
-  No per-call fsync. When the enclosing statement commits (autocommit or
-  explicit), the server's existing `append_and_flush_commit` flushes the WAL,
-  making every advance ordered before that commit durable.
+- **Steady state:** `nextval`/`setval` append and flush their sequence-value WAL
+  records before updating live sequence state and returning. This makes a value
+  handed to a client durable even if the surrounding transaction later aborts or
+  the process crashes before another commit/checkpoint/shutdown flush.
 - **Checkpoint:** `run_checkpoint` (`server/src/checkpoint.rs`) already
   serializes the catalog under the exclusive guard. It additionally pulls each
   sequence's current `(last_value, is_called)` from the `SequenceManager` into
@@ -299,9 +308,10 @@ string literal resolved to a `SequenceId` at bind time (unknown name →
   (`autocommit_write`: writer guard + txn id + WAL commit flush), instead of the
   read path. Inside an explicit transaction they run on the existing write path;
   their advances are not rolled back on `ROLLBACK`.
-- **`currval` is a pure read** of per-connection session state — no guard, no
-  WAL. It reads the session's "last value produced by `nextval` for this
-  sequence" map; missing entry → object-not-in-prerequisite-state error.
+- **`currval` is a pure read** of per-connection session state after verifying
+  that the bound sequence ID still exists. It takes no writer guard and writes no
+  WAL. Dropped sequence → `42P01`; missing session entry →
+  object-not-in-prerequisite-state error.
 
 ### Session state and executor threading
 
@@ -309,11 +319,13 @@ Follow the pattern SSI already established: `StatementContext` carries the SSI
 tracker as a handle threaded into the executor (`crates/common/src/context.rs`).
 Add two handles there the same way:
 
-- a shared `Arc<dyn SequenceManager>` (for `nextval`/`setval`), defaulting to a
-  no-op/None for read-only contexts that never touch sequences; and
+- a shared `Arc<dyn SequenceManager>` (for `nextval`/`setval` and non-mutating
+  existence checks used by `currval`), defaulting to a no-op/None for read-only
+  contexts that never touch sequences; and
 - the per-connection `currval` state — a `SequenceId -> i64` map behind interior
   mutability (`Arc<Mutex<SessionSequenceState>>`) since `StatementContext` fields
-  are shared `Arc`s — updated by `nextval`, read by `currval`.
+  are shared `Arc`s — updated by `nextval` and `setval(..., true)`, read by
+  `currval`.
 
 This is the one place the otherwise-pure expression evaluator gains side effects;
 it is confined to these three functions and does not perturb SSI tracking (§12),
@@ -323,7 +335,10 @@ because sequence ops touch no heap tuples.
 values, `UPDATE` SET expressions, and column `DEFAULT`s. Their evaluation count
 and order in a `WHERE` clause are unspecified (volatile), matching PostgreSQL.
 
-## 6. SERIAL
+## 6. Planned SERIAL Desugaring
+
+This section specifies the follow-up `SERIAL` task. It is not part of the
+currently implemented SQL subset.
 
 `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`) are valid
 only as a column type in a `CREATE TABLE` column definition. All map to the same
@@ -385,30 +400,32 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 |---|---|
 | `nextval`/`currval`/`setval` on unknown sequence | `42P01` UndefinedTable |
 | `nextval` past MAXVALUE / below MINVALUE, `NO CYCLE` | sequence-exhausted (`2200H`) / `NumericValueOutOfRange` |
-| `currval` before `nextval` in this session | object-not-in-prerequisite-state (`55000`) |
-| `SERIAL` outside a `CREATE TABLE` column def | bind error (`FeatureNotSupported`/`SyntaxError`) |
+| `currval` before `nextval`/`setval(..., true)` in this session | object-not-in-prerequisite-state (`55000`) |
+| Planned `SERIAL` task: `SERIAL` outside a `CREATE TABLE` column def | bind error (`FeatureNotSupported`/`SyntaxError`) |
 | `DEFAULT` expr beyond literal/`nextval` | `FeatureNotSupported` |
 | `DEFAULT nextval('missing')` at `CREATE TABLE` | `42P01` UndefinedTable |
 | `CREATE`/`DROP SEQUENCE` inside a txn block | existing DDL-in-block error |
-| `DROP SEQUENCE` of a column-owned sequence | dependency error (`2BP01`-style) |
-| `INCREMENT BY 0`, or `MINVALUE > MAXVALUE`, etc. | invalid sequence definition (`22023`) |
+| `DROP SEQUENCE` of a sequence referenced by a column default | `2BP01` DependentObjectsStillExist |
+| `INCREMENT BY 0`, or `MINVALUE > MAXVALUE`, etc. | `22023` InvalidParameterValue |
 
 ## 9. Testing
 
-- **parser**: sequence grammar + every option, `SERIAL` family, `DEFAULT <const>`
-  and `DEFAULT nextval('s')` column options, rejection cases (incl. `DEFAULT` as a
-  `VALUES` item still being rejected, and non-`nextval` function defaults).
+- **parser**: sequence grammar + every option, `DEFAULT <const>` and
+  `DEFAULT nextval('s')` column options, rejection cases (incl. `DEFAULT` as a
+  `VALUES` item still being rejected, and non-`nextval` function defaults). The
+  planned `SERIAL` task adds the `SERIAL` family cases.
 - **catalog**: create/drop, id allocation high-water behavior, snapshot
   round-trip including sequences + baseline values, old-snapshot compatibility.
 - **storage / recovery**: crash after N `nextval`s → no value reissued; an
   aborted transaction's `nextval` keeps the gap; `setval` then crash; `CYCLE`
   wrap and `NO CYCLE` exhaustion; concurrent `nextval` from parallel writers
   yields all-unique values.
-- **server integration**: `SERIAL` end-to-end insert and id read-back via both
-  `INSERT ... RETURNING id` (primary idiom) and `currval`; `setval`
-  repositioning; `DROP TABLE` cascade-drops the owned sequence; `DROP SEQUENCE`
-  of an owned sequence errors; `SELECT nextval(...)` routes through the write path
-  and is durable; DDL-in-transaction rejection of `CREATE`/`DROP SEQUENCE`.
+- **server integration**: `setval` repositioning; `SELECT nextval(...)` routes
+  through the write path and is durable; DDL-in-transaction rejection of
+  `CREATE`/`DROP SEQUENCE`. The planned `SERIAL` task adds end-to-end insert and
+  id read-back via both `INSERT ... RETURNING id` (primary idiom) and `currval`,
+  `DROP TABLE` cascade-dropping the owned sequence, and `DROP SEQUENCE` of an
+  owned sequence erroring.
 - **interactions (§12)**: `INSERT ... ON CONFLICT DO NOTHING` on an existing key
   still consumes a sequence value (observable gap); `excluded.<serial_col>` sees
   the `nextval`-filled value; a `SERIALIZABLE` transaction that calls `nextval`

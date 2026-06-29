@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use crate::error::{DbError, Result};
-use crate::ids::{TableId, TxnId};
+use crate::ids::{SequenceId, TableId, TxnId};
 use crate::mvcc::{IsolationLevel, Snapshot};
 use crate::row::Key;
 
@@ -31,6 +33,81 @@ impl ConflictWaiter for NoConflictWaiter {
             "no conflict waiter configured: a write path reached a row-lock conflict \
              (waiter={waiter}, blocker={blocker}) without a lock manager"
         )))
+    }
+}
+
+/// Sequence value runtime used by the executor's `nextval` and `setval` scalar
+/// expressions. The storage crate provides the real implementation; the common
+/// trait keeps expression evaluation decoupled from storage internals.
+pub trait SequenceManager: Send + Sync + std::fmt::Debug {
+    fn sequence_exists(&self, sequence: SequenceId) -> Result<bool>;
+    fn nextval(&self, txn_id: TxnId, sequence: SequenceId) -> Result<i64>;
+    fn setval(
+        &self,
+        txn_id: TxnId,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64>;
+}
+
+#[derive(Debug)]
+struct NoSequenceManager;
+
+impl SequenceManager for NoSequenceManager {
+    fn sequence_exists(&self, sequence: SequenceId) -> Result<bool> {
+        Err(DbError::internal(format!(
+            "no sequence manager configured for sequence_exists({sequence})"
+        )))
+    }
+
+    fn nextval(&self, _txn_id: TxnId, sequence: SequenceId) -> Result<i64> {
+        Err(DbError::internal(format!(
+            "no sequence manager configured for nextval({sequence})"
+        )))
+    }
+
+    fn setval(
+        &self,
+        _txn_id: TxnId,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64> {
+        Err(DbError::internal(format!(
+            "no sequence manager configured for setval({sequence}, {value}, {is_called})"
+        )))
+    }
+}
+
+/// Per-session sequence state backing PostgreSQL's `currval` semantics. `nextval`
+/// and `setval` record the last value seen for a sequence on this connection;
+/// `currval` reads it and errors when the sequence has not been used in-session.
+#[derive(Debug, Default)]
+pub struct SessionSequenceState {
+    currvals: Mutex<HashMap<SequenceId, i64>>,
+}
+
+impl SessionSequenceState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_currval(&self, sequence: SequenceId, value: i64) -> Result<()> {
+        self.currvals
+            .lock()
+            .map_err(|_| DbError::internal("session sequence state lock poisoned"))?
+            .insert(sequence, value);
+        Ok(())
+    }
+
+    pub fn currval(&self, sequence: SequenceId) -> Result<Option<i64>> {
+        Ok(self
+            .currvals
+            .lock()
+            .map_err(|_| DbError::internal("session sequence state lock poisoned"))?
+            .get(&sequence)
+            .copied())
     }
 }
 
@@ -88,8 +165,8 @@ impl SsiTracker for NoSsiTracker {
 /// capture from Milestone C (Read Committed = fresh per statement, Repeatable Read =
 /// captured once); the storage engine does not consult it.
 /// `PartialEq`/`Eq` are hand-rolled below (not derived) because `conflict_waiter`,
-/// `cancel`, and `ssi_tracker` are not comparable; equality compares the value fields
-/// only.
+/// `cancel`, `ssi_tracker`, `sequence_manager`, and `session_sequences` are not
+/// comparable; equality compares the value fields only.
 #[derive(Clone, Debug)]
 pub struct StatementContext {
     pub txn_id: u64,
@@ -126,6 +203,13 @@ pub struct StatementContext {
     /// Read Committed / Repeatable Read are untouched; the server installs the real
     /// serializable-conflict manager only on SERIALIZABLE contexts.
     pub ssi_tracker: Arc<dyn SsiTracker>,
+    /// Runtime sequence implementation used by `nextval`/`setval`. Defaults to a
+    /// loud error so a sequence-mutating expression cannot accidentally run without
+    /// the server wiring the storage engine into the context.
+    pub sequence_manager: Arc<dyn SequenceManager>,
+    /// Per-connection `currval` memory. The server installs a connection-owned
+    /// handle; tests and non-session helpers get a fresh empty state by default.
+    pub session_sequences: Arc<SessionSequenceState>,
 }
 
 impl StatementContext {
@@ -144,6 +228,8 @@ impl StatementContext {
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
             ssi_tracker: Arc::new(NoSsiTracker),
+            sequence_manager: Arc::new(NoSequenceManager),
+            session_sequences: Arc::new(SessionSequenceState::new()),
         }
     }
 
@@ -161,6 +247,8 @@ impl StatementContext {
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
             ssi_tracker: Arc::new(NoSsiTracker),
+            sequence_manager: Arc::new(NoSequenceManager),
+            session_sequences: Arc::new(SessionSequenceState::new()),
         }
     }
 
@@ -180,6 +268,8 @@ impl StatementContext {
             conflict_waiter: Arc::new(NoConflictWaiter),
             cancel: Arc::new(AtomicBool::new(false)),
             ssi_tracker: Arc::new(NoSsiTracker),
+            sequence_manager: Arc::new(NoSequenceManager),
+            session_sequences: Arc::new(SessionSequenceState::new()),
         }
     }
 
@@ -220,11 +310,24 @@ impl StatementContext {
         self.ssi_tracker = ssi_tracker;
         self
     }
+
+    /// Install the runtime sequence manager used by `nextval`/`setval`.
+    #[must_use]
+    pub fn with_sequence_manager(mut self, sequence_manager: Arc<dyn SequenceManager>) -> Self {
+        self.sequence_manager = sequence_manager;
+        self
+    }
+
+    /// Install the per-session sequence state used by `currval`.
+    #[must_use]
+    pub fn with_session_sequences(mut self, session_sequences: Arc<SessionSequenceState>) -> Self {
+        self.session_sequences = session_sequences;
+        self
+    }
 }
 
-// Hand-rolled to exclude `conflict_waiter`, `cancel`, and `ssi_tracker` (none is
-// comparable); two contexts are equal when their value fields match, as before the
-// deadlock-waiter and SSI-tracker fields were added.
+// Hand-rolled to exclude handles that are not comparable; two contexts are equal
+// when their value fields match, as before these runtime handles were added.
 impl PartialEq for StatementContext {
     fn eq(&self, other: &Self) -> bool {
         self.txn_id == other.txn_id

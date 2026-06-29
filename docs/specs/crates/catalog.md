@@ -111,8 +111,10 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 `create_sequence` validates and normalizes sequence options, assigns a
 `SequenceId`, stores a `SequenceSchema`, and returns it. A duplicate sequence
 name or ID returns `SqlState::DuplicateTable`; a missing sequence on drop returns
-`SqlState::UndefinedTable`. `apply_create_sequence` / `apply_drop_sequence` are
-the recovery-only APIs for historical sequence schemas, and
+`SqlState::UndefinedTable`; dropping a sequence still referenced by a column
+`ColumnDefault::Nextval` returns `SqlState::DependentObjectsStillExist` (`2BP01`).
+`apply_create_sequence` / `apply_drop_sequence` are the recovery-only APIs for
+historical sequence schemas, and
 `reserve_sequence_id(id)` advances `next_sequence_id` to at least `id + 1`
 without installing a schema.
 
@@ -126,7 +128,7 @@ without installing a schema.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
-- A column's constant `default` is converted from `ParsedDefault::Const(Value)` on `ParsedColumnDef` to `ColumnDefault::Const(Value)` on the stored `ColumnDef`. The binder type-checks it before the catalog sees it; the executor applies it to omitted columns at write time. `ParsedDefault::Nextval` / `ColumnDefault::Nextval` are reserved for the later sequence-runtime task and are rejected in phase 2 even though standalone sequence catalog objects exist.
+- A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 - `UNIQUE` column / table constraints are not stored on the table schema; the executor creates a unique index per constraint immediately after the table (PostgreSQL-style auto name `<table>_<col...>_key`), reusing the normal `create_index` path (catalog + storage + `CreateIndex` WAL record). Recovery replays the `CreateTable` then `CreateIndex` records in order.
 
@@ -141,7 +143,8 @@ without installing a schema.
 - For descending sequences (`increment < 0`), omitted `MINVALUE` defaults to
   `i64::MIN`, omitted `MAXVALUE` defaults to `-1`, and omitted `START` defaults
   to the resolved maximum.
-- `MINVALUE <= MAXVALUE`, and `START` must be within that closed range.
+- `INCREMENT BY 0`, `MINVALUE > MAXVALUE`, and `START` outside the effective
+  min/max range are rejected with `SqlState::InvalidParameterValue` (`22023`).
 - `last_value` is initialized to `START` and `is_called` to `false`.
 - `CACHE` is parser input only and is ignored by the catalog.
 
@@ -215,5 +218,6 @@ Recovery apply methods must update catalog state consistently with storage state
 - Serialization round-trip preserves indexes and `next_index_id`; a snapshot without index fields loads as an empty index set.
 - Snapshot validation rejects an index that references a missing table, uses the reserved primary-key index ID, or carries a stale `next_index_id`.
 - Create/drop sequence assigns monotonically increasing sequence IDs, validates
-  sequence options, persists through snapshot round-trip, and a snapshot without
-  sequence fields loads as an empty sequence set.
+  sequence options, rejects drops while a column default references the sequence,
+  persists through snapshot round-trip, and a snapshot without sequence fields
+  loads as an empty sequence set.

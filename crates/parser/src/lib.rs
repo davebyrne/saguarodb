@@ -906,7 +906,7 @@ mod tests {
         let Statement::CreateTable { columns, .. } = parse(
             "create table t (id integer primary key, n integer default 7, \
              m integer default -3, s text default 'hi', b boolean default true, \
-             x text default null)",
+             x text default null, seq integer default nextval('users_id_seq'))",
         )
         .unwrap() else {
             panic!("expected create table");
@@ -931,6 +931,10 @@ mod tests {
         assert_eq!(
             columns[5].default,
             Some(common::ParsedDefault::Const(Value::Null))
+        );
+        assert_eq!(
+            columns[6].default,
+            Some(common::ParsedDefault::Nextval("users_id_seq".to_string()))
         );
         assert_eq!(columns[0].default, None);
     }
@@ -966,8 +970,9 @@ mod tests {
         // A column reference / arithmetic default is not a foldable constant.
         let err = parse("create table t (a integer, b integer default a + 1)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
-        // A function-call default is likewise rejected in v1.
+        // Non-nextval function defaults remain unsupported.
         assert!(parse("create table t (a timestamp default now())").is_err());
+        assert!(parse("create table t (a integer default nextval(42))").is_err());
     }
 
     #[test]

@@ -232,10 +232,12 @@ pub struct SequenceSchema {
 
 `SequenceOptions` is parser/planner input for `CREATE SEQUENCE`; absent
 start/min/max values mean "use the direction-dependent defaults." `SequenceSchema`
-is the catalog-owned durable sequence metadata. Phase 2 stores sequence objects
-and DDL only; `last_value`/`is_called`, `ColumnDefault::Nextval`, sequence
-functions, and owned SERIAL sequences are reserved for the later sequence-runtime
-tasks.
+is the catalog-owned durable sequence metadata. `last_value`/`is_called` are the
+checkpoint baseline for the storage runtime's current sequence state.
+`ColumnDefault::Nextval(SequenceId)` is the stored form of
+`DEFAULT nextval('<sequence>')` and is evaluated by the executor through the
+statement's sequence manager. Owned SERIAL sequences are reserved for the later
+SERIAL task.
 
 ## Error Model
 
@@ -268,12 +270,15 @@ pub enum SqlState {
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,
+    InvalidParameterValue,
     NumericValueOutOfRange,
     StringDataRightTruncation,
     InvalidTextRepresentation,
     BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
+    DependentObjectsStillExist,
+    ObjectNotInPrerequisiteState,
     QueryCanceled,
     FeatureNotSupported,
     InFailedSqlTransaction,
@@ -320,6 +325,18 @@ not be parsed into its target type. `SqlState::BadCopyFileFormat` maps to SQLSTA
 or an unterminated CSV quote). Both are raised on the `COPY` import path; see
 `docs/specs/copy.md` §7.
 
+`SqlState::InvalidParameterValue` maps to SQLSTATE `22023`; sequence DDL uses it
+for semantically invalid options such as `INCREMENT BY 0`, `MINVALUE > MAXVALUE`,
+or `START` outside the min/max bounds.
+
+`SqlState::ObjectNotInPrerequisiteState` maps to SQLSTATE `55000`; sequence
+`currval` uses it when a connection has not yet called `nextval` or
+`setval(..., true)` for that sequence.
+
+`SqlState::DependentObjectsStillExist` maps to SQLSTATE `2BP01`; catalog DDL uses
+it when a sequence is still referenced by a column default and cannot be dropped
+without a cascade/default-removal feature.
+
 `DbError` exposes convenience constructors used consistently across crates: `DbError::parse(code, message)`, `DbError::plan(code, message)`, `DbError::execute(code, message)`, `DbError::storage(code, message)`, `DbError::wal(code, message)`, `DbError::protocol(code, message)`, `DbError::io(message)`, and `DbError::internal(message)`. Constructors set `kind`, `code`, and `message`; `io` uses `SqlState::IoError`, and `internal` uses `SqlState::InternalError`.
 
 `DbError` derives `thiserror::Error` with `#[error("{message}")]`, so it is a real `std::error::Error` whose `Display` renders the `message` field.
@@ -332,6 +349,12 @@ pub struct StatementContext {
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
     pub gc_horizon: u64,
+    pub conflict_waiter: Arc<dyn ConflictWaiter>,
+    pub cancel: Arc<AtomicBool>,
+    pub live_txns: Arc<[TxnId]>,
+    pub ssi_tracker: Arc<dyn SsiTracker>,
+    pub sequence_manager: Arc<dyn SequenceManager>,
+    pub session_sequences: Arc<SessionSequenceState>,
 }
 ```
 
@@ -356,7 +379,14 @@ the server captured for the statement; it is consumed ONLY by the storage engine
 HOT update-path prune (`docs/specs/mvcc.md` §10 Milestone H3) and defaults to `0`
 (prune nothing committed-dead) for read/pre-capture/test contexts, set on write paths
 via `StatementContext::with_gc_horizon(gc_horizon)`. A stale/smaller horizon only
-prunes less, never unsafely. `StatementContext` is `Clone` but not `Copy`.
+prunes less, never unsafely. `conflict_waiter`, `cancel`, `live_txns`, and
+`ssi_tracker` carry the server-owned concurrency services documented in
+`docs/specs/deadlock.md`, `docs/specs/savepoints.md`, and `docs/specs/ssi.md`.
+`sequence_manager` is the runtime sequence implementation used by
+`nextval`/`setval` and by `currval`'s execution-time existence check;
+`session_sequences` is the per-connection map storing `currval`'s last returned
+values. Default contexts install loud/no-op test implementations where
+appropriate. `StatementContext` is `Clone` but not `Copy`.
 
 ## MVCC Types
 

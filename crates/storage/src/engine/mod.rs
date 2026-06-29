@@ -43,9 +43,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
-    Result, Row, RowId, Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema,
-    TxnStatusView, UniqueConflict, Value, WriteConflict, classify_unique_conflict, is_visible,
-    write_conflict,
+    Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema, Snapshot, SqlState,
+    StatementContext, StoredRow, TableId, TableSchema, TxnStatusView, UniqueConflict, Value,
+    WriteConflict, classify_unique_conflict, is_visible, write_conflict,
 };
 use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -143,16 +143,41 @@ struct IndexState {
     dropped: bool,
 }
 
+#[derive(Clone)]
+struct SequenceState {
+    schema: Arc<Mutex<SequenceSchema>>,
+}
+
+impl SequenceState {
+    fn new(schema: SequenceSchema) -> Self {
+        Self {
+            schema: Arc::new(Mutex::new(schema)),
+        }
+    }
+
+    fn lock_schema(&self) -> Result<MutexGuard<'_, SequenceSchema>> {
+        self.schema
+            .lock()
+            .map_err(|_| DbError::internal("sequence lock poisoned"))
+    }
+
+    fn snapshot(&self) -> Result<Self> {
+        Ok(Self::new(self.lock_schema()?.clone()))
+    }
+}
+
 #[derive(Default)]
 struct TxnRollback {
     tables: BTreeMap<TableId, Option<TableState>>,
     indexes: BTreeMap<IndexId, Option<IndexState>>,
+    sequences: BTreeMap<SequenceId, Option<SequenceState>>,
 }
 
 struct StorageState {
     mode: StorageMode,
     tables: BTreeMap<TableId, TableState>,
     indexes: BTreeMap<IndexId, IndexState>,
+    sequences: BTreeMap<SequenceId, SequenceState>,
     rollback: BTreeMap<u64, TxnRollback>,
 }
 
@@ -169,6 +194,13 @@ pub struct PageBackedStorageEngine {
     structural_latches: Mutex<HashMap<FileId, Arc<PlMutex<()>>>>,
 }
 
+impl std::fmt::Debug for PageBackedStorageEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageBackedStorageEngine")
+            .finish_non_exhaustive()
+    }
+}
+
 impl PageBackedStorageEngine {
     pub fn open(
         buffer_pool: Arc<dyn BufferPool>,
@@ -182,6 +214,7 @@ impl PageBackedStorageEngine {
                 mode,
                 tables: BTreeMap::new(),
                 indexes: BTreeMap::new(),
+                sequences: BTreeMap::new(),
                 rollback: BTreeMap::new(),
             }),
             structural_latches: Mutex::new(HashMap::new()),
@@ -237,6 +270,28 @@ impl PageBackedStorageEngine {
             );
         }
         Ok(())
+    }
+
+    pub fn install_sequences(&self, schemas: Vec<SequenceSchema>) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.sequences.clear();
+        for schema in schemas {
+            state
+                .sequences
+                .insert(schema.id, SequenceState::new(schema));
+        }
+        Ok(())
+    }
+
+    pub fn sequence_schemas_for_checkpoint(&self) -> Result<Vec<SequenceSchema>> {
+        let sequences = {
+            let state = self.lock_state()?;
+            state.sequences.values().cloned().collect::<Vec<_>>()
+        };
+        sequences
+            .iter()
+            .map(|sequence| Ok(sequence.lock_schema()?.clone()))
+            .collect()
     }
 
     pub fn set_mode(&self, mode: StorageMode) -> Result<()> {
@@ -338,6 +393,33 @@ impl PageBackedStorageEngine {
         } else {
             Ok(0)
         }
+    }
+
+    fn append_and_flush_sequence_wal(
+        &self,
+        mode: StorageMode,
+        ctx: &StatementContext,
+        kind: WalRecordKind,
+    ) -> Result<()> {
+        if mode == StorageMode::Normal {
+            self.wal.append(WalRecord {
+                lsn: 0,
+                txn_id: ctx.txn_id,
+                kind,
+            })?;
+            self.wal.flush()?;
+        }
+        Ok(())
+    }
+
+    fn sequence_handle(&self, sequence: SequenceId) -> Result<(StorageMode, SequenceState)> {
+        let state = self.lock_state()?;
+        let sequence_state = state
+            .sequences
+            .get(&sequence)
+            .cloned()
+            .ok_or_else(|| undefined_sequence(sequence))?;
+        Ok((state.mode, sequence_state))
     }
 }
 
@@ -715,6 +797,16 @@ impl StorageEngine for PageBackedStorageEngine {
                 }
             }
         }
+        for (sequence_id, previous) in rollback.sequences.into_iter().rev() {
+            match previous {
+                Some(sequence) => {
+                    state.sequences.insert(sequence_id, sequence);
+                }
+                None => {
+                    state.sequences.remove(&sequence_id);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -911,7 +1003,7 @@ impl SchemaOperations for PageBackedStorageEngine {
         ctx: &StatementContext,
         schema: &common::SequenceSchema,
     ) -> Result<()> {
-        let state = self.lock_state()?;
+        let mut state = self.lock_state()?;
         self.append_wal(
             &state,
             ctx,
@@ -919,13 +1011,72 @@ impl SchemaOperations for PageBackedStorageEngine {
                 schema: schema.clone(),
             },
         )?;
+        record_sequence_before(&mut state, ctx.txn_id, schema.id)?;
+        state
+            .sequences
+            .insert(schema.id, SequenceState::new(schema.clone()));
         Ok(())
     }
 
     fn drop_sequence(&self, ctx: &StatementContext, sequence: common::SequenceId) -> Result<()> {
-        let state = self.lock_state()?;
+        let mut state = self.lock_state()?;
+        if !state.sequences.contains_key(&sequence) {
+            return Ok(());
+        }
         self.append_wal(&state, ctx, WalRecordKind::DropSequence { sequence })?;
+        record_sequence_before(&mut state, ctx.txn_id, sequence)?;
+        state.sequences.remove(&sequence);
         Ok(())
+    }
+}
+
+impl SequenceManager for PageBackedStorageEngine {
+    fn sequence_exists(&self, sequence: SequenceId) -> Result<bool> {
+        let state = self.lock_state()?;
+        Ok(state.sequences.contains_key(&sequence))
+    }
+
+    fn nextval(&self, txn_id: u64, sequence: SequenceId) -> Result<i64> {
+        let ctx = StatementContext::new(txn_id);
+        let (mode, sequence_state) = self.sequence_handle(sequence)?;
+        let mut schema = sequence_state.lock_schema()?;
+        let next = next_sequence_value(&schema)?;
+        self.append_and_flush_sequence_wal(
+            mode,
+            &ctx,
+            WalRecordKind::SequenceAdvance {
+                sequence,
+                value: next,
+            },
+        )?;
+        schema.last_value = next;
+        schema.is_called = true;
+        Ok(next)
+    }
+
+    fn setval(
+        &self,
+        txn_id: u64,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64> {
+        let ctx = StatementContext::new(txn_id);
+        let (mode, sequence_state) = self.sequence_handle(sequence)?;
+        let mut schema = sequence_state.lock_schema()?;
+        validate_sequence_value(&schema, value)?;
+        self.append_and_flush_sequence_wal(
+            mode,
+            &ctx,
+            WalRecordKind::SetSequenceValue {
+                sequence,
+                value,
+                is_called,
+            },
+        )?;
+        schema.last_value = value;
+        schema.is_called = is_called;
+        Ok(value)
     }
 }
 
@@ -1007,6 +1158,47 @@ fn live_table(state: &StorageState, table: TableId) -> Result<&TableState> {
     Ok(table_state)
 }
 
+fn next_sequence_value(schema: &SequenceSchema) -> Result<i64> {
+    if !schema.is_called {
+        return Ok(schema.last_value);
+    }
+    let Some(next) = schema.last_value.checked_add(schema.increment) else {
+        return sequence_exhausted(schema);
+    };
+    if next >= schema.min_value && next <= schema.max_value {
+        return Ok(next);
+    }
+    sequence_exhausted(schema)
+}
+
+fn sequence_exhausted(schema: &SequenceSchema) -> Result<i64> {
+    if schema.cycle {
+        if schema.increment > 0 {
+            Ok(schema.min_value)
+        } else {
+            Ok(schema.max_value)
+        }
+    } else {
+        Err(DbError::storage(
+            SqlState::NumericValueOutOfRange,
+            format!("sequence {} reached its limit", schema.name),
+        ))
+    }
+}
+
+fn validate_sequence_value(schema: &SequenceSchema, value: i64) -> Result<()> {
+    if value < schema.min_value || value > schema.max_value {
+        return Err(DbError::storage(
+            SqlState::NumericValueOutOfRange,
+            format!(
+                "value {value} is out of bounds for sequence {}",
+                schema.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn record_table_before(state: &mut StorageState, txn_id: u64, table: TableId) {
     if txn_id == 0 {
         return;
@@ -1033,6 +1225,29 @@ fn record_index_before(state: &mut StorageState, txn_id: u64, index: IndexId) {
         .indexes
         .entry(index)
         .or_insert(previous);
+}
+
+fn record_sequence_before(
+    state: &mut StorageState,
+    txn_id: u64,
+    sequence: SequenceId,
+) -> Result<()> {
+    if txn_id == 0 {
+        return Ok(());
+    }
+    let previous = state
+        .sequences
+        .get(&sequence)
+        .map(SequenceState::snapshot)
+        .transpose()?;
+    state
+        .rollback
+        .entry(txn_id)
+        .or_default()
+        .sequences
+        .entry(sequence)
+        .or_insert(previous);
+    Ok(())
 }
 
 /// Mark every live secondary index on `table` dropped (with rollback tracking
@@ -1081,6 +1296,13 @@ fn undefined_index(index: IndexId) -> DbError {
     DbError::storage(
         SqlState::UndefinedTable,
         format!("index id {index} does not exist"),
+    )
+}
+
+fn undefined_sequence(sequence: SequenceId) -> DbError {
+    DbError::storage(
+        SqlState::UndefinedTable,
+        format!("sequence id {sequence} does not exist"),
     )
 }
 

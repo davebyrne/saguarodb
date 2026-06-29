@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
-use common::{ColumnInfo, ExecRow, Result, Row, Value};
+use common::{ColumnInfo, ExecRow, Result, Row, StatementContext, Value};
 use planner::BoundExpr;
 
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 use crate::query::PlanExecutor;
 
 /// Streaming de-duplication for `SELECT DISTINCT`. Emits the first row of each
@@ -12,6 +12,7 @@ use crate::query::PlanExecutor;
 /// occurrence preserves the requested ordering. NULL keys collapse together
 /// (two NULLs are not distinct from each other), matching SQL `DISTINCT`.
 pub struct DistinctOp<'a> {
+    ctx: StatementContext,
     source: Box<dyn PlanExecutor + 'a>,
     on_keys: Vec<BoundExpr>,
     output_schema: Vec<ColumnInfo>,
@@ -19,9 +20,14 @@ pub struct DistinctOp<'a> {
 }
 
 impl<'a> DistinctOp<'a> {
-    pub fn new(source: Box<dyn PlanExecutor + 'a>, on_keys: Vec<BoundExpr>) -> Self {
+    pub fn new(
+        ctx: StatementContext,
+        source: Box<dyn PlanExecutor + 'a>,
+        on_keys: Vec<BoundExpr>,
+    ) -> Self {
         let output_schema = source.output_schema().to_vec();
         Self {
+            ctx,
             source,
             on_keys,
             output_schema,
@@ -45,7 +51,7 @@ impl PlanExecutor for DistinctOp<'_> {
             let key = self
                 .on_keys
                 .iter()
-                .map(|expr| eval_expr(expr, &row))
+                .map(|expr| eval_expr_with_context(&self.ctx, expr, &row))
                 .collect::<Result<Vec<_>>>()?;
             if self.seen.insert(key) {
                 // De-duplication collapses several source rows into one, so the

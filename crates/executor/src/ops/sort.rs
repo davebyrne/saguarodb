@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 
-use common::{ColumnInfo, ExecRow, Result, Value};
+use common::{ColumnInfo, ExecRow, Result, StatementContext, Value};
 use planner::BoundOrderByItem;
 
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 use crate::query::{PlanExecutor, collect_all};
 
 pub struct SortOp<'a> {
+    ctx: StatementContext,
     source: Box<dyn PlanExecutor + 'a>,
     order_by: Vec<BoundOrderByItem>,
     output_schema: Vec<ColumnInfo>,
@@ -15,9 +16,14 @@ pub struct SortOp<'a> {
 }
 
 impl<'a> SortOp<'a> {
-    pub fn new(source: Box<dyn PlanExecutor + 'a>, order_by: Vec<BoundOrderByItem>) -> Self {
+    pub fn new(
+        ctx: StatementContext,
+        source: Box<dyn PlanExecutor + 'a>,
+        order_by: Vec<BoundOrderByItem>,
+    ) -> Self {
         let output_schema = source.output_schema().to_vec();
         Self {
+            ctx,
             source,
             order_by,
             output_schema,
@@ -40,7 +46,7 @@ impl PlanExecutor for SortOp<'_> {
             let keys = self
                 .order_by
                 .iter()
-                .map(|item| eval_expr(&item.expr, &row))
+                .map(|item| eval_expr_with_context(&self.ctx, &item.expr, &row))
                 .collect::<Result<Vec<_>>>()?;
             keyed.push((row, keys));
         }

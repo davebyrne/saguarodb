@@ -11,7 +11,7 @@ use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
     ProjectionOp, SeqScanOp, SortOp, ValuesOp,
@@ -184,6 +184,7 @@ pub(crate) fn build_executor<'a>(
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
             Ok(Box::new(NestedLoopJoinOp::new(
+                ctx.statement.clone(),
                 left,
                 right,
                 condition.clone(),
@@ -206,6 +207,7 @@ pub(crate) fn build_executor<'a>(
             )))
         }
         PhysicalPlan::Filter { source, predicate } => Ok(Box::new(FilterOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             predicate.clone(),
         ))),
@@ -214,15 +216,18 @@ pub(crate) fn build_executor<'a>(
             expressions,
             output_schema,
         } => Ok(Box::new(ProjectionOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             expressions.clone(),
             output_schema.clone(),
         ))),
         PhysicalPlan::Distinct { source, on_keys } => Ok(Box::new(DistinctOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             on_keys.clone(),
         ))),
         PhysicalPlan::Sort { source, order_by } => Ok(Box::new(SortOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             order_by.clone(),
         ))),
@@ -241,6 +246,7 @@ pub(crate) fn build_executor<'a>(
             aggregates,
             output_schema,
         } => Ok(Box::new(AggregateOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             group_by.clone(),
             aggregates.clone(),
@@ -249,7 +255,11 @@ pub(crate) fn build_executor<'a>(
         PhysicalPlan::Values {
             rows,
             output_schema,
-        } => Ok(Box::new(ValuesOp::new(rows.clone(), output_schema.clone()))),
+        } => Ok(Box::new(ValuesOp::new(
+            ctx.statement.clone(),
+            rows.clone(),
+            output_schema.clone(),
+        ))),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::CreateIndex { .. }
@@ -305,7 +315,7 @@ fn execute_insert(
                 "INSERT source produced the wrong number of values",
             ));
         }
-        let row = build_insert_row(&schema, columns, source_row.row.values)?;
+        let row = build_insert_row(&ctx.statement, &schema, columns, source_row.row.values)?;
 
         // ON CONFLICT: the arbiter is the primary key. Probe the visible row at the
         // proposed primary key; on a conflict, take the action (skip for DO NOTHING,
@@ -340,7 +350,7 @@ fn execute_insert(
                 {
                     count += 1;
                     if let Some(returning) = returning {
-                        returned.push(eval_returning(returning, &updated)?);
+                        returned.push(eval_returning(ctx, returning, &updated)?);
                     }
                 }
                 // DO NOTHING (or a DO UPDATE skipped by its WHERE) inserts no row.
@@ -349,7 +359,7 @@ fn execute_insert(
         }
 
         if let Some(returning) = returning {
-            returned.push(eval_returning(returning, &row.values)?);
+            returned.push(eval_returning(ctx, returning, &row.values)?);
         }
         ctx.storage.insert(&ctx.statement, table, row)?;
         count += 1;
@@ -395,7 +405,10 @@ fn apply_conflict_update(
     };
 
     if let Some(filter) = filter
-        && !matches!(eval_expr(filter, &combined_row)?, Value::Boolean(true))
+        && !matches!(
+            eval_expr_with_context(&ctx.statement, filter, &combined_row)?,
+            Value::Boolean(true)
+        )
     {
         // The DO UPDATE WHERE did not pass (false or NULL): no insert, no update.
         return Ok(None);
@@ -404,7 +417,7 @@ fn apply_conflict_update(
     let mut new_values = existing.values.clone();
     for (column, expr) in assignments {
         let slot = column_slot(schema, *column)?;
-        new_values[slot] = eval_expr(expr, &combined_row)?;
+        new_values[slot] = eval_expr_with_context(&ctx.statement, expr, &combined_row)?;
     }
     coerce_numeric_columns(schema, &mut new_values)?;
     validate_row_constraints(schema, &new_values)?;
@@ -424,6 +437,7 @@ fn apply_conflict_update(
 /// Shared by INSERT, INSERT ... ON CONFLICT, and COPY FROM. Callers guarantee
 /// `values.len() == columns.len()`.
 pub(crate) fn build_insert_row(
+    statement: &StatementContext,
     schema: &TableSchema,
     columns: &[ColumnId],
     values: Vec<Value>,
@@ -437,7 +451,7 @@ pub(crate) fn build_insert_row(
     }
     for (slot, column) in schema.columns.iter().enumerate() {
         if !columns.contains(&column.id) {
-            full[slot] = evaluate_column_default(column)?;
+            full[slot] = evaluate_column_default(statement, column)?;
         }
     }
     coerce_numeric_columns(schema, &mut full)?;
@@ -445,12 +459,21 @@ pub(crate) fn build_insert_row(
     Ok(Row { values: full })
 }
 
-fn evaluate_column_default(column: &common::ColumnDef) -> Result<Value> {
+fn evaluate_column_default(
+    statement: &StatementContext,
+    column: &common::ColumnDef,
+) -> Result<Value> {
     match &column.default {
         Some(ColumnDefault::Const(value)) => Ok(value.clone()),
-        Some(ColumnDefault::Nextval(_)) => Err(DbError::internal(
-            "sequence defaults are not supported by this executor",
-        )),
+        Some(ColumnDefault::Nextval(sequence)) => {
+            let value = statement
+                .sequence_manager
+                .nextval(statement.txn_id, *sequence)?;
+            statement
+                .session_sequences
+                .record_currval(*sequence, value)?;
+            Ok(Value::Integer(value))
+        }
         None => Ok(Value::Null),
     }
 }
@@ -464,7 +487,7 @@ pub(crate) fn map_and_insert_row(
     columns: &[ColumnId],
     values: Vec<Value>,
 ) -> Result<()> {
-    let row = build_insert_row(schema, columns, values)?;
+    let row = build_insert_row(&ctx.statement, schema, columns, values)?;
     ctx.storage.insert(&ctx.statement, table, row)?;
     Ok(())
 }
@@ -472,7 +495,11 @@ pub(crate) fn map_and_insert_row(
 /// Evaluate a `RETURNING` projection over an affected full table row (in catalog
 /// slot order). The expressions reference table columns by slot, so the
 /// constructed `ExecRow` carries the row's values with no storage identity.
-fn eval_returning(returning: &BoundReturning, full_row: &[Value]) -> Result<Row> {
+fn eval_returning(
+    ctx: &ExecutionContext<'_>,
+    returning: &BoundReturning,
+    full_row: &[Value],
+) -> Result<Row> {
     let exec_row = ExecRow {
         row: Row {
             values: full_row.to_vec(),
@@ -482,7 +509,7 @@ fn eval_returning(returning: &BoundReturning, full_row: &[Value]) -> Result<Row>
     let values = returning
         .exprs
         .iter()
-        .map(|expr| eval_expr(expr, &exec_row))
+        .map(|expr| eval_expr_with_context(&ctx.statement, expr, &exec_row))
         .collect::<Result<Vec<_>>>()?;
     Ok(Row { values })
 }
@@ -662,14 +689,14 @@ fn execute_update(
             }
             for (column, expr) in assignments {
                 let slot = column_slot(&schema, *column)?;
-                values[slot] = eval_expr(expr, &source_row)?;
+                values[slot] = eval_expr_with_context(&ctx.statement, expr, &source_row)?;
             }
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
             // Evaluate RETURNING over the NEW row before it is moved into storage;
             // only keep it if the update actually affected a row.
             let returned_row = returning
-                .map(|returning| eval_returning(returning, &values))
+                .map(|returning| eval_returning(ctx, returning, &values))
                 .transpose()?;
             if ctx
                 .storage
@@ -703,7 +730,7 @@ fn execute_delete(
             // RETURNING on DELETE projects the OLD (deleted) row; evaluate it
             // before consuming the row's identity for the delete.
             let returned_row = returning
-                .map(|returning| eval_returning(returning, &source_row.row.values))
+                .map(|returning| eval_returning(ctx, returning, &source_row.row.values))
                 .transpose()?;
             let identity = source_row.identity.ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
@@ -849,8 +876,11 @@ fn execute_drop_sequence(
             format!("sequence {name} does not exist"),
         ));
     };
-    ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
     ctx.catalog.drop_sequence(sequence.id)?;
+    if let Err(err) = ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id) {
+        let _ = ctx.catalog.apply_create_sequence(sequence);
+        return Err(err);
+    }
     Ok(ExecutionResult::Modified {
         command: "DROP SEQUENCE".to_string(),
         count: 0,

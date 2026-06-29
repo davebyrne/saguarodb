@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, DbError, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID,
-    ParsedColumnDef, ParsedDefault, Result, SequenceId, SequenceOptions, SequenceSchema, SqlState,
-    TableId, TableSchema,
+    ColumnDef, ColumnDefault, ColumnId, DataType, DbError, IndexId, IndexSchema,
+    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, Result, SequenceId, SequenceOptions,
+    SequenceSchema, SqlState, TableId, TableSchema,
 };
 
 use crate::CatalogManager;
@@ -149,8 +149,8 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
-        validate_schema(&schema)?;
         let mut snapshot = self.write_snapshot()?;
+        validate_schema(&schema, &snapshot.sequences_by_id)?;
         reject_duplicate_table_name(&snapshot, &schema.name)?;
         reject_duplicate_table_id(&snapshot, schema.id)?;
 
@@ -190,7 +190,7 @@ impl CatalogManager for MemoryCatalog {
         let next_table_id = table_id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
-        let schema = build_schema(table_id, name, columns, primary_key)?;
+        let schema = build_schema(&snapshot, table_id, name, columns, primary_key)?;
 
         snapshot
             .tables_by_name
@@ -379,11 +379,19 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn drop_sequence(&self, id: SequenceId) -> Result<()> {
-        self.apply_drop_sequence(id)
+        let mut snapshot = self.write_snapshot()?;
+        reject_referenced_sequence(&snapshot, id)?;
+        let schema = snapshot
+            .sequences_by_id
+            .remove(&id)
+            .ok_or_else(|| undefined_sequence_id(id))?;
+        snapshot.sequences_by_name.remove(&schema.name);
+        Ok(())
     }
 }
 
 fn build_schema(
+    snapshot: &CatalogSnapshot,
     table_id: TableId,
     name: String,
     columns: Vec<ParsedColumnDef>,
@@ -405,13 +413,25 @@ fn build_schema(
             .try_into()
             .map_err(|_| DbError::internal("catalog column id overflow"))?;
         column_ids_by_name.insert(column.name.clone(), column_id);
+        let default = convert_column_default(snapshot, column.default)?;
+        if matches!(default, Some(ColumnDefault::Nextval(_)))
+            && column.data_type != DataType::Integer
+        {
+            return Err(DbError::plan(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "DEFAULT nextval for column {} requires INTEGER, got {:?}",
+                    column.name, column.data_type
+                ),
+            ));
+        }
         assigned_columns.push(ColumnDef {
             id: column_id,
             name: column.name,
             data_type: column.data_type,
             nullable: column.nullable,
             max_length: column.max_length,
-            default: convert_column_default(column.default)?,
+            default,
         });
     }
 
@@ -455,15 +475,45 @@ fn build_schema(
     })
 }
 
-fn convert_column_default(default: Option<ParsedDefault>) -> Result<Option<ColumnDefault>> {
+fn convert_column_default(
+    snapshot: &CatalogSnapshot,
+    default: Option<ParsedDefault>,
+) -> Result<Option<ColumnDefault>> {
     match default {
         Some(ParsedDefault::Const(value)) => Ok(Some(ColumnDefault::Const(value))),
-        Some(ParsedDefault::Nextval(_)) => Err(DbError::plan(
-            SqlState::FeatureNotSupported,
-            "sequence defaults are not supported yet",
-        )),
+        Some(ParsedDefault::Nextval(name)) => {
+            let id = snapshot.sequences_by_name.get(&name).ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedTable,
+                    format!("sequence {name} does not exist"),
+                )
+            })?;
+            if !snapshot.sequences_by_id.contains_key(id) {
+                return Err(DbError::internal(format!(
+                    "catalog sequence name {name} points to missing sequence id {id}",
+                )));
+            }
+            Ok(Some(ColumnDefault::Nextval(*id)))
+        }
         None => Ok(None),
     }
+}
+
+fn reject_referenced_sequence(snapshot: &CatalogSnapshot, sequence: SequenceId) -> Result<()> {
+    for table in snapshot.tables_by_id.values() {
+        for column in &table.columns {
+            if matches!(&column.default, Some(ColumnDefault::Nextval(id)) if *id == sequence) {
+                return Err(DbError::plan(
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot drop sequence {sequence} because table {} column {} depends on it",
+                        table.name, column.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_sequence_schema(
@@ -474,7 +524,7 @@ fn build_sequence_schema(
 ) -> Result<SequenceSchema> {
     if options.increment == 0 {
         return Err(DbError::plan(
-            SqlState::DatatypeMismatch,
+            SqlState::InvalidParameterValue,
             "INCREMENT BY 0 is not allowed",
         ));
     }
@@ -488,7 +538,7 @@ fn build_sequence_schema(
         .unwrap_or(if descending { -1 } else { i64::MAX });
     if min_value > max_value {
         return Err(DbError::plan(
-            SqlState::DatatypeMismatch,
+            SqlState::InvalidParameterValue,
             "MINVALUE cannot be greater than MAXVALUE",
         ));
     }
@@ -498,7 +548,7 @@ fn build_sequence_schema(
         .unwrap_or(if descending { max_value } else { min_value });
     if start < min_value || start > max_value {
         return Err(DbError::plan(
-            SqlState::DatatypeMismatch,
+            SqlState::InvalidParameterValue,
             "START value must be between MINVALUE and MAXVALUE",
         ));
     }
@@ -519,6 +569,7 @@ fn build_sequence_schema(
 
 fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     let mut max_table_id = 0;
+    validate_sequences(snapshot)?;
 
     for (name, id) in &snapshot.tables_by_name {
         let schema = snapshot.tables_by_id.get(id).ok_or_else(|| {
@@ -546,7 +597,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
                 schema.name
             )));
         }
-        validate_schema(schema)?;
+        validate_schema(schema, &snapshot.sequences_by_id)?;
         max_table_id = max_table_id.max(*id);
     }
 
@@ -561,8 +612,6 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     }
 
     validate_indexes(snapshot)?;
-    validate_sequences(snapshot)?;
-
     Ok(())
 }
 
@@ -728,7 +777,10 @@ fn validate_sequence_schema(schema: &SequenceSchema) -> Result<()> {
     Ok(())
 }
 
-fn validate_schema(schema: &TableSchema) -> Result<()> {
+fn validate_schema(
+    schema: &TableSchema,
+    sequences_by_id: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
     let mut column_ids = HashSet::new();
     let mut column_names = HashSet::new();
     for (expected_id, column) in schema.columns.iter().enumerate() {
@@ -756,7 +808,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
                 schema.name, column.name
             )));
         }
-        validate_column_default(&schema.name, column)?;
+        validate_column_default(&schema.name, column, sequences_by_id)?;
     }
 
     if schema.primary_key.is_empty() {
@@ -790,12 +842,24 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
-fn validate_column_default(table_name: &str, column: &ColumnDef) -> Result<()> {
+fn validate_column_default(
+    table_name: &str,
+    column: &ColumnDef,
+    sequences_by_id: &HashMap<SequenceId, SequenceSchema>,
+) -> Result<()> {
     match &column.default {
-        Some(ColumnDefault::Nextval(_)) => Err(DbError::internal(format!(
-            "catalog snapshot table {table_name} column {} has unsupported sequence default",
-            column.name
-        ))),
+        Some(ColumnDefault::Nextval(_)) if column.data_type != DataType::Integer => {
+            Err(DbError::internal(format!(
+                "catalog snapshot table {table_name} column {} has sequence default on non-INTEGER column",
+                column.name
+            )))
+        }
+        Some(ColumnDefault::Nextval(sequence)) if !sequences_by_id.contains_key(sequence) => {
+            Err(DbError::internal(format!(
+                "catalog snapshot table {table_name} column {} references missing sequence {}",
+                column.name, sequence
+            )))
+        }
         _ => Ok(()),
     }
 }

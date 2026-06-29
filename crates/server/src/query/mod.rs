@@ -4,13 +4,13 @@ use std::sync::atomic::AtomicBool;
 
 use common::{
     CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, Result,
-    Snapshot, SqlState, Value, WriteGuard,
+    SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine};
 use parser::Statement;
 use planner::{
-    BoundStatement, bind_parameterized, format_explain, logical_plan, physical_plan,
-    substitute_params,
+    BoundStatement, bind_parameterized, format_explain, logical_plan, mutates_sequences,
+    physical_plan, substitute_params,
 };
 
 use crate::app::ServerComponents;
@@ -22,6 +22,7 @@ mod txn;
 mod vacuum;
 
 pub use copy::CopyInChunk;
+use txn::StatementRuntime;
 pub(crate) use vacuum::full_vacuum_pass;
 
 pub struct QueryService {
@@ -185,6 +186,23 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        self.execute_simple_with_session_sequences(
+            sql,
+            slot,
+            default_isolation,
+            cancel,
+            Arc::new(SessionSequenceState::new()),
+        )
+    }
+
+    pub fn execute_simple_with_session_sequences(
+        &self,
+        sql: &str,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let parsed = match parser::parse(sql) {
             Ok(parsed) => parsed,
             // A syntax error inside an open transaction poisons the block to the
@@ -193,7 +211,7 @@ impl QueryService {
             // session default is unchanged by a failed parse.
             Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
         };
-        self.dispatch(parsed, slot, default_isolation, cancel)
+        self.dispatch(parsed, slot, default_isolation, cancel, session_sequences)
     }
 
     /// Backwards-compatible autocommit entry point: run one SQL string with no
@@ -308,6 +326,21 @@ impl QueryService {
         params: &[Value],
         cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
+        self.execute_prepared_cancelable_with_session_sequences(
+            prepared,
+            params,
+            cancel,
+            Arc::new(SessionSequenceState::new()),
+        )
+    }
+
+    pub fn execute_prepared_cancelable_with_session_sequences(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+    ) -> Result<ExecutionResult> {
         // Maintenance does not bind/plan; run it before parameter substitution. The
         // connection routes maintenance through `execute_prepared_in_session`, so this
         // arm is reached only if a caller bypasses that routing — keep it total.
@@ -315,10 +348,17 @@ impl QueryService {
             return self.run_prepared_vacuum(prepared);
         }
         let bound = self.substitute_prepared_params(prepared, params)?;
+        let class = classify_bound(prepared.class, &bound);
         match prepared.class {
-            StatementClass::Read => self.autocommit_read(bound, cancel),
+            StatementClass::Read => match class {
+                StatementClass::Read => self.autocommit_read(bound, cancel, session_sequences),
+                StatementClass::Write => {
+                    self.autocommit_bound_write(bound, cancel, session_sequences)
+                }
+                _ => unreachable!("classify_bound only promotes reads to writes"),
+            },
             StatementClass::Write | StatementClass::Ddl => {
-                self.autocommit_bound_write(bound, cancel)
+                self.autocommit_bound_write(bound, cancel, session_sequences)
             }
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
@@ -363,6 +403,25 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        self.execute_prepared_in_session_with_session_sequences(
+            prepared,
+            params,
+            slot,
+            default_isolation,
+            cancel,
+            Arc::new(SessionSequenceState::new()),
+        )
+    }
+
+    pub fn execute_prepared_in_session_with_session_sequences(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
             return self.handle_transaction_control(kind, slot, default_isolation, cancel);
         }
@@ -394,11 +453,13 @@ impl QueryService {
 
         match slot {
             Some(txn) => {
+                let class = classify_bound(prepared.class, &bound);
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
-                    prepared.class,
+                    class,
                     BindSource::Bound(bound),
                     cancel,
+                    session_sequences,
                 );
                 (slot, default_isolation, result)
             }
@@ -407,9 +468,20 @@ impl QueryService {
             // the contract holds regardless of caller).
             None => {
                 let result = match prepared.class {
-                    StatementClass::Read => self.autocommit_read(bound, cancel),
+                    StatementClass::Read => {
+                        let class = classify_bound(prepared.class, &bound);
+                        match class {
+                            StatementClass::Read => {
+                                self.autocommit_read(bound, cancel, session_sequences)
+                            }
+                            StatementClass::Write => {
+                                self.autocommit_bound_write(bound, cancel, session_sequences)
+                            }
+                            _ => unreachable!("classify_bound only promotes reads to writes"),
+                        }
+                    }
                     StatementClass::Write | StatementClass::Ddl => {
-                        self.autocommit_bound_write(bound, cancel)
+                        self.autocommit_bound_write(bound, cancel, session_sequences)
                     }
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
@@ -729,6 +801,14 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
     }
 }
 
+fn classify_bound(class: StatementClass, bound: &BoundStatement) -> StatementClass {
+    if matches!(class, StatementClass::Read) && mutates_sequences(bound) {
+        StatementClass::Write
+    } else {
+        class
+    }
+}
+
 #[cfg(test)]
 impl QueryService {
     /// Test-only thin wrapper over [`QueryService::execute_simple`] that supplies the
@@ -762,8 +842,8 @@ mod tests {
     use common::{
         ConcurrencyController, DataType, DbError, FlushPolicy, IndexId, IndexSchema,
         IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, Result, RwLockConcurrencyController,
-        SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, TxnId,
-        TxnStatus, TxnStatusView, Value,
+        SequenceId, SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId,
+        TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -1625,6 +1705,235 @@ mod tests {
             ExecutionResult::Query { rows, .. } => rows.len(),
             other => panic!("expected query result, got {other:?}"),
         }
+    }
+
+    fn result_values(result: Result<ExecutionResult>) -> Vec<Vec<Value>> {
+        match result.unwrap() {
+            ExecutionResult::Query { rows, .. }
+            | ExecutionResult::ModifiedReturning { rows, .. } => {
+                rows.into_iter().map(|row| row.values).collect()
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    fn single_integer(result: Result<ExecutionResult>) -> i64 {
+        let rows = result_values(result);
+        match rows.as_slice() {
+            [row] => match row.as_slice() {
+                [Value::Integer(value)] => *value,
+                other => panic!("expected one integer column, got {other:?}"),
+            },
+            other => panic!("expected one row, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_functions_use_session_state_and_write_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let begin_writer_calls = Arc::new(AtomicUsize::new(0));
+        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
+            begin_writer_calls.clone(),
+            begin_checkpoint_calls,
+        ));
+        let config = Config {
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            concurrency,
+        );
+        app.query_service
+            .execute_sql("create sequence users_id_seq")
+            .unwrap();
+        assert!(
+            app.components
+                .catalog
+                .get_sequence_by_name("users_id_seq")
+                .unwrap()
+                .is_some()
+        );
+        app.query_service
+            .execute_sql("create table seq_probe (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into seq_probe (id) values (1)")
+            .unwrap();
+        begin_writer_calls.store(0, Ordering::SeqCst);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let session_sequences = Arc::new(SessionSequenceState::new());
+        let (_slot, iso, err) = app.query_service.execute_simple_with_session_sequences(
+            "select currval('users_id_seq') from seq_probe",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(
+            err.unwrap_err().code,
+            SqlState::ObjectNotInPrerequisiteState
+        );
+
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select nextval('users_id_seq') from seq_probe",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 1);
+        assert_eq!(
+            begin_writer_calls.load(Ordering::SeqCst),
+            1,
+            "SELECT nextval must route through the write guard"
+        );
+
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select currval('users_id_seq') from seq_probe",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 1);
+        assert_eq!(
+            begin_writer_calls.load(Ordering::SeqCst),
+            1,
+            "currval is session-local and should not take the write guard"
+        );
+
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select setval('users_id_seq', 10, false) from seq_probe",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 10);
+        assert_eq!(begin_writer_calls.load(Ordering::SeqCst), 2);
+
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select currval('users_id_seq') from seq_probe",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 1);
+
+        let (_slot, _iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select nextval('users_id_seq') from seq_probe",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 10);
+
+        let fresh_session_sequences = Arc::new(SessionSequenceState::new());
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select setval('users_id_seq', 20, false) from seq_probe",
+            None,
+            iso,
+            &cancel,
+            fresh_session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 20);
+
+        let (_slot, _iso, err) = app.query_service.execute_simple_with_session_sequences(
+            "select currval('users_id_seq') from seq_probe",
+            None,
+            iso,
+            &cancel,
+            fresh_session_sequences,
+        );
+        assert_eq!(
+            err.unwrap_err().code,
+            SqlState::ObjectNotInPrerequisiteState
+        );
+    }
+
+    #[tokio::test]
+    async fn default_nextval_fills_omitted_columns_and_keeps_rollback_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create sequence users_id_seq")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table users (\
+                 id integer primary key default nextval('users_id_seq'), \
+                 name text)",
+            )
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let session_sequences = Arc::new(SessionSequenceState::new());
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "insert into users (name) values ('Ada') returning id",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 1);
+
+        let (slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "begin",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        result.unwrap();
+        let (slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "insert into users (name) values ('Rolled') returning id",
+            slot,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 2);
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "rollback",
+            slot,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        result.unwrap();
+
+        let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "insert into users (name) values ('Grace') returning id",
+            None,
+            iso,
+            &cancel,
+            session_sequences.clone(),
+        );
+        assert_eq!(single_integer(result), 3);
+
+        let (_slot, _iso, result) = app.query_service.execute_simple_with_session_sequences(
+            "select id from users order by id",
+            None,
+            iso,
+            &cancel,
+            session_sequences,
+        );
+        assert_eq!(
+            result_values(result),
+            vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+        );
     }
 
     #[tokio::test]

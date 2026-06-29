@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{DbError, IsolationLevel, Result, Snapshot, SqlState, StatementContext};
+use common::{
+    DbError, IsolationLevel, Result, SequenceManager, SessionSequenceState, Snapshot, SqlState,
+    StatementContext,
+};
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
 use storage::StorageEngine;
@@ -13,6 +16,23 @@ use super::{
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::AdvertisedSnapshot;
+
+pub(super) struct StatementRuntime<'a> {
+    cancel: &'a Arc<AtomicBool>,
+    session_sequences: Arc<SessionSequenceState>,
+}
+
+impl<'a> StatementRuntime<'a> {
+    pub(super) fn new(
+        cancel: &'a Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+    ) -> Self {
+        Self {
+            cancel,
+            session_sequences,
+        }
+    }
+}
 
 /// The `25P02` error for a statement issued in a failed (`'E'`) transaction block
 /// (matching `run_bound_in_transaction`'s gate). `SAVEPOINT`/`RELEASE` hit this;
@@ -580,7 +600,7 @@ impl QueryService {
         isolation: IsolationLevel,
         gc_horizon: u64,
         live_txns: Arc<[u64]>,
-        cancel: &'a Arc<AtomicBool>,
+        runtime: StatementRuntime<'a>,
     ) -> ExecutionContext<'a> {
         // A SERIALIZABLE statement registers its transaction with the SSI manager
         // (idempotent; canonicalized to the top-level id) and installs the real SSI
@@ -594,14 +614,17 @@ impl QueryService {
                 .ssi_manager
                 .register(txn_id, snapshot.clone());
         }
+        let sequence_manager: Arc<dyn SequenceManager> = self.components.storage.clone();
         let mut statement =
             StatementContext::with_snapshot_and_isolation(txn_id, snapshot, isolation)
                 .with_gc_horizon(gc_horizon)
                 .with_live_txns(live_txns)
+                .with_sequence_manager(sequence_manager)
+                .with_session_sequences(runtime.session_sequences)
                 // Install the lock manager (so an in-progress row-lock conflict blocks
                 // instead of failing fast) and the connection's cancel flag (so a
                 // blocked writer is interruptible) — `docs/specs/deadlock.md`.
-                .with_conflict_waiter(self.components.lock_manager.clone(), cancel.clone());
+                .with_conflict_waiter(self.components.lock_manager.clone(), runtime.cancel.clone());
         if serializable {
             statement = statement.with_ssi_tracker(self.components.ssi_manager.clone());
         }
@@ -611,7 +634,7 @@ impl QueryService {
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,
-            cancel: cancel.as_ref(),
+            cancel: runtime.cancel.as_ref(),
         }
     }
 

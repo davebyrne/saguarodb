@@ -1,19 +1,25 @@
-use common::{ColumnInfo, ExecRow, Result};
+use common::{ColumnInfo, ExecRow, Result, StatementContext};
 use planner::BoundExpr;
 
 use crate::ops::predicate_matches;
 use crate::query::PlanExecutor;
 
 pub struct FilterOp<'a> {
+    ctx: StatementContext,
     source: Box<dyn PlanExecutor + 'a>,
     predicate: BoundExpr,
     output_schema: Vec<ColumnInfo>,
 }
 
 impl<'a> FilterOp<'a> {
-    pub fn new(source: Box<dyn PlanExecutor + 'a>, predicate: BoundExpr) -> Self {
+    pub fn new(
+        ctx: StatementContext,
+        source: Box<dyn PlanExecutor + 'a>,
+        predicate: BoundExpr,
+    ) -> Self {
         let output_schema = source.output_schema().to_vec();
         Self {
+            ctx,
             source,
             predicate,
             output_schema,
@@ -32,7 +38,7 @@ impl PlanExecutor for FilterOp<'_> {
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
         while let Some(row) = self.source.next()? {
-            if predicate_matches(&self.predicate, &row)? {
+            if predicate_matches(&self.ctx, &self.predicate, &row)? {
                 return Ok(Some(row));
             }
         }

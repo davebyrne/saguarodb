@@ -31,6 +31,20 @@ pub enum WalRecordKind {
     DropSequence {
         sequence: SequenceId,
     },
+    /// Non-transactional sequence advance produced by `nextval`. Recovery replays
+    /// it regardless of the writer transaction's eventual outcome so rolled-back
+    /// statements still leave sequence gaps.
+    SequenceAdvance {
+        sequence: SequenceId,
+        value: i64,
+    },
+    /// Non-transactional sequence state change produced by `setval`. Recovery
+    /// replays it regardless of the writer transaction's eventual outcome.
+    SetSequenceValue {
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    },
     Commit,
     /// Commit of a transaction that had savepoint subtransactions: marks the
     /// top-level transaction (`txn_id` in the header) AND every committed (live or

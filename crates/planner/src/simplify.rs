@@ -364,6 +364,19 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             data_type,
             nullable,
         },
+        BoundExpr::Setval {
+            sequence,
+            value,
+            is_called,
+            data_type,
+            nullable,
+        } => BoundExpr::Setval {
+            sequence,
+            value: Box::new(fold_expr(*value)),
+            is_called: is_called.map(|inner| Box::new(fold_expr(*inner))),
+            data_type,
+            nullable,
+        },
         BoundExpr::AggregateCall {
             func,
             arg,
@@ -472,6 +485,8 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::InSubquery { .. }) => leaf,

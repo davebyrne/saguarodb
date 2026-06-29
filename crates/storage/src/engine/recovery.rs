@@ -46,4 +46,52 @@ impl PageBackedStorageEngine {
         }
         Ok(())
     }
+    pub(crate) fn apply_create_sequence_without_wal(&self, schema: SequenceSchema) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state
+            .sequences
+            .insert(schema.id, SequenceState::new(schema));
+        Ok(())
+    }
+    pub(crate) fn apply_drop_sequence_without_wal(&self, sequence: SequenceId) -> Result<()> {
+        self.lock_state()?.sequences.remove(&sequence);
+        Ok(())
+    }
+    pub(crate) fn apply_sequence_advance_without_wal(
+        &self,
+        sequence: SequenceId,
+        value: i64,
+    ) -> Result<()> {
+        let sequence_state = {
+            let state = self.lock_state()?;
+            state.sequences.get(&sequence).cloned()
+        };
+        let Some(sequence_state) = sequence_state else {
+            return Ok(());
+        };
+        let mut schema = sequence_state.lock_schema()?;
+        validate_sequence_value(&schema, value)?;
+        schema.last_value = value;
+        schema.is_called = true;
+        Ok(())
+    }
+    pub(crate) fn apply_set_sequence_value_without_wal(
+        &self,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<()> {
+        let sequence_state = {
+            let state = self.lock_state()?;
+            state.sequences.get(&sequence).cloned()
+        };
+        let Some(sequence_state) = sequence_state else {
+            return Ok(());
+        };
+        let mut schema = sequence_state.lock_schema()?;
+        validate_sequence_value(&schema, value)?;
+        schema.last_value = value;
+        schema.is_called = is_called;
+        Ok(())
+    }
 }

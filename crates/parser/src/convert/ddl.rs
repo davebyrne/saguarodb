@@ -298,11 +298,22 @@ fn convert_column_def(
 }
 
 /// Convert a column `DEFAULT` expression into the bounded parse-time default
-/// representation. Phase 1 still supports constants only; `nextval` is added
-/// when sequence binding exists.
+/// representation. Most defaults are constants folded at parse time; the one
+/// volatile form accepted here is `nextval('sequence')`, which the catalog later
+/// resolves to a durable sequence id.
 fn convert_column_default(expr: &sql::Expr) -> Result<ParsedDefault> {
     match convert_expr(expr)? {
         Expr::Literal(value) => Ok(ParsedDefault::Const(value)),
+        Expr::Function {
+            name,
+            args,
+            distinct: false,
+        } if name.eq_ignore_ascii_case("nextval") => match args.as_slice() {
+            [crate::FunctionArg::Expr(Expr::Literal(Value::Text(sequence)))] => {
+                Ok(ParsedDefault::Nextval(sequence.clone()))
+            }
+            _ => unsupported("DEFAULT nextval requires one string literal argument"),
+        },
         Expr::UnaryOp {
             op: UnaryOp::Neg,
             expr,

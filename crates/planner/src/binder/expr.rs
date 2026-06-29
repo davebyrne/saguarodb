@@ -519,11 +519,96 @@ fn bind_function(
         ));
     }
     match name.as_str() {
+        "nextval" => return bind_nextval(ctx, args),
+        "currval" => return bind_currval(ctx, args),
+        "setval" => return bind_setval(ctx, args),
         "coalesce" => return bind_coalesce(ctx, args),
         "nullif" => return bind_nullif(ctx, args),
         _ => {}
     }
     bind_scalar_function(ctx, &name, args)
+}
+
+fn bind_nextval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let sequence = resolve_sequence_arg(ctx, "nextval", args)?;
+    Ok(BoundExpr::Nextval {
+        sequence,
+        data_type: DataType::Integer,
+        nullable: false,
+    })
+}
+
+fn bind_currval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let sequence = resolve_sequence_arg(ctx, "currval", args)?;
+    Ok(BoundExpr::Currval {
+        sequence,
+        data_type: DataType::Integer,
+        nullable: false,
+    })
+}
+
+fn bind_setval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let exprs = expr_args("setval", args)?;
+    if exprs.len() != 2 && exprs.len() != 3 {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "setval expects two or three arguments",
+        ));
+    }
+    let sequence = resolve_sequence_name(ctx, "setval", exprs[0])?;
+    let value = bind_expr(ctx, exprs[1], Some(DataType::Integer))?;
+    require_type(&value, DataType::Integer)?;
+    let is_called = exprs
+        .get(2)
+        .map(|expr| {
+            let arg = bind_expr(ctx, expr, Some(DataType::Boolean))?;
+            require_type(&arg, DataType::Boolean)?;
+            Ok(Box::new(arg))
+        })
+        .transpose()?;
+    let nullable = value.nullable() || is_called.as_deref().is_some_and(BoundExpr::nullable);
+    Ok(BoundExpr::Setval {
+        sequence,
+        value: Box::new(value),
+        is_called,
+        data_type: DataType::Integer,
+        nullable,
+    })
+}
+
+fn resolve_sequence_arg(
+    ctx: &BindContext,
+    function: &str,
+    args: &[FunctionArg],
+) -> Result<common::SequenceId> {
+    let exprs = expr_args(function, args)?;
+    let [name] = exprs.as_slice() else {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("{function} expects exactly one argument"),
+        ));
+    };
+    resolve_sequence_name(ctx, function, name)
+}
+
+fn resolve_sequence_name(
+    ctx: &BindContext,
+    function: &str,
+    expr: &Expr,
+) -> Result<common::SequenceId> {
+    let Expr::Literal(Value::Text(name)) = expr else {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            format!("{function} requires a string literal sequence name"),
+        ));
+    };
+    let sequence = ctx.catalog.get_sequence_by_name(name)?.ok_or_else(|| {
+        plan_error(
+            SqlState::UndefinedTable,
+            format!("sequence {name} does not exist"),
+        )
+    })?;
+    Ok(sequence.id)
 }
 
 /// Extract the plain expression arguments of a call, rejecting `*` wildcards.

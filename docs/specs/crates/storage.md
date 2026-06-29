@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`storage` owns table files, row serialization, page-backed row storage, the durable on-disk primary-key and secondary B-tree indexes, normal data operations, schema file operations, and recovery apply operations.
+`storage` owns table files, row serialization, page-backed row storage, the durable on-disk primary-key and secondary B-tree indexes, normal data operations, sequence runtime state, schema file operations, and recovery apply operations.
 
 ## Depends On
 
@@ -49,10 +49,19 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, index: IndexId) -> Result<()>;
+    fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()>;
+    fn apply_drop_sequence(&self, sequence: SequenceId) -> Result<()>;
+    fn apply_sequence_advance(&self, sequence: SequenceId, value: i64) -> Result<()>;
+    fn apply_set_sequence_value(
+        &self,
+        sequence: SequenceId,
+        value: i64,
+        is_called: bool,
+    ) -> Result<()>;
 }
 ```
 
-`RecoveryOperations` carries only storage-owned DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL has no storage-owned physical state in phase 2, so `SchemaOperations::create_sequence` / `drop_sequence` append only the logical WAL records and recovery applies them through the catalog. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RecoveryOperations` carries storage-owned logical replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
 ## Table Storage
 
@@ -849,6 +858,21 @@ used for a secondary index.
   durable by the `CreateIndex` / `DropIndex` WAL records — replayed into both
   catalog and storage — plus the catalog snapshot at each checkpoint.
 
+## Sequence Runtime
+
+The page-backed engine implements `common::SequenceManager`. `create_sequence`
+installs a `SequenceSchema` in storage's sequence map; `drop_sequence` removes
+it. `nextval(txn_id, sequence)` validates that the sequence exists, computes the
+next value from `(last_value, is_called, increment, min_value, max_value, cycle)`,
+appends and flushes `SequenceAdvance { sequence, value }`, updates the live
+state, and returns the value. `setval(txn_id, sequence, value, is_called)`
+range-checks the value, appends and flushes `SetSequenceValue`, updates live
+state, and returns the supplied value. `sequence_exists(sequence)` checks the
+runtime sequence map without advancing the sequence or writing WAL; executor
+`currval` uses it so prepared statements do not return values for dropped
+sequences. These value changes are non-transactional and are not restored by
+`rollback_txn`.
+
 ## Heap Page Store
 
 `HeapPageStore` is the mutable page home for in-place dirty-page flushing. It
@@ -878,8 +902,12 @@ Normal data operations append physiological redo records as they mutate pages, s
 - Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
 - `SchemaOperations::create_sequence` / `drop_sequence` log `CreateSequence` /
-  `DropSequence`. Recovery applies them to catalog only because sequences have
-  no storage-owned physical state in phase 2.
+  `DropSequence`. Recovery applies them to both catalog and storage sequence
+  metadata when the DDL transaction committed.
+- `SequenceManager::nextval` / `setval` log `SequenceAdvance` /
+  `SetSequenceValue` and flush that WAL before the live value changes. Recovery
+  replays these value records unconditionally against storage's installed
+  sequence state.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
 
@@ -889,6 +917,8 @@ The storage engine can be initialized in recovery mode. In recovery mode:
 
 - Normal `StorageEngine` methods are not used.
 - Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations` only when their transaction is committed.
+- Sequence value records replay via `RecoveryOperations` regardless of CLOG
+  status because sequence advancement is non-transactional.
 - No WAL append occurs.
 - The primary-key and secondary indexes are durable on disk, so their pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild. Which indexes exist is reinstalled from the catalog at startup (`install_index_schemas`).
 
@@ -909,15 +939,17 @@ impl PageBackedStorageEngine {
 
     pub fn install_schemas(&self, schemas: Vec<TableSchema>) -> Result<()>;
     pub fn install_index_schemas(&self, schemas: Vec<IndexSchema>) -> Result<()>;
+    pub fn install_sequences(&self, schemas: Vec<SequenceSchema>) -> Result<()>;
+    pub fn sequence_schemas_for_checkpoint(&self) -> Result<Vec<SequenceSchema>>;
     pub fn set_mode(&self, mode: StorageMode) -> Result<()>;
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables) and `install_index_schemas` (secondary indexes) after loading the catalog snapshot, so DML maintains the indexes.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables), `install_index_schemas` (secondary indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
 
-`PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods and query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`.
+`PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
-`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`) defined on `PageBackedStorageEngine` in `engine.rs`.
+`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 
 ## Structural Write Latches (Milestone E2a)
 

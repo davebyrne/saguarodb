@@ -418,7 +418,7 @@ fn validate_insert_omissions(table: &TableSchema, columns: &[ColumnId]) -> Resul
         let has_usable_default = matches!(
             &column.default,
             Some(ColumnDefault::Const(value)) if !matches!(value, common::Value::Null)
-        );
+        ) || matches!(&column.default, Some(ColumnDefault::Nextval(_)));
         if !column.nullable && !has_usable_default && !provided.contains(&column.id) {
             return Err(plan_error(
                 SqlState::NotNullViolation,

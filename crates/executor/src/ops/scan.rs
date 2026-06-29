@@ -62,7 +62,7 @@ impl PlanExecutor for SeqScanOp<'_> {
             if self
                 .filter
                 .as_ref()
-                .map(|filter| predicate_matches(filter, &row))
+                .map(|filter| predicate_matches(&self.ctx, filter, &row))
                 .transpose()?
                 .unwrap_or(true)
             {
@@ -147,7 +147,7 @@ impl PlanExecutor for IndexScanOp<'_> {
             if self
                 .filter
                 .as_ref()
-                .map(|filter| predicate_matches(filter, &row))
+                .map(|filter| predicate_matches(&self.ctx, filter, &row))
                 .transpose()?
                 .unwrap_or(true)
             {

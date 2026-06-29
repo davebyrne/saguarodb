@@ -1,18 +1,24 @@
-use common::{ColumnInfo, ExecRow, Result, Row};
+use common::{ColumnInfo, ExecRow, Result, Row, StatementContext};
 use planner::BoundExpr;
 
-use crate::eval_expr;
+use crate::eval_expr_with_context;
 use crate::query::PlanExecutor;
 
 pub struct ValuesOp {
+    ctx: StatementContext,
     rows: Vec<Vec<BoundExpr>>,
     output_schema: Vec<ColumnInfo>,
     index: usize,
 }
 
 impl ValuesOp {
-    pub fn new(rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo>) -> Self {
+    pub fn new(
+        ctx: StatementContext,
+        rows: Vec<Vec<BoundExpr>>,
+        output_schema: Vec<ColumnInfo>,
+    ) -> Self {
         Self {
+            ctx,
             rows,
             output_schema,
             index: 0,
@@ -41,7 +47,7 @@ impl PlanExecutor for ValuesOp {
         };
         let values = expressions
             .iter()
-            .map(|expr| eval_expr(expr, &empty))
+            .map(|expr| eval_expr_with_context(&self.ctx, expr, &empty))
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(ExecRow {
             row: Row { values },

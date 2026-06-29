@@ -1,4 +1,4 @@
-use common::{BindingId, ColumnId, DataType, Value};
+use common::{BindingId, ColumnId, DataType, SequenceId, Value};
 
 use crate::BoundSelect;
 
@@ -39,6 +39,23 @@ pub enum BoundExpr {
     Function {
         name: String,
         args: Vec<BoundExpr>,
+        data_type: DataType,
+        nullable: bool,
+    },
+    Nextval {
+        sequence: SequenceId,
+        data_type: DataType,
+        nullable: bool,
+    },
+    Currval {
+        sequence: SequenceId,
+        data_type: DataType,
+        nullable: bool,
+    },
+    Setval {
+        sequence: SequenceId,
+        value: Box<BoundExpr>,
+        is_called: Option<Box<BoundExpr>>,
         data_type: DataType,
         nullable: bool,
     },
@@ -216,6 +233,9 @@ impl BoundExpr {
             | BoundExpr::BinaryOp { data_type, .. }
             | BoundExpr::UnaryOp { data_type, .. }
             | BoundExpr::Function { data_type, .. }
+            | BoundExpr::Nextval { data_type, .. }
+            | BoundExpr::Currval { data_type, .. }
+            | BoundExpr::Setval { data_type, .. }
             | BoundExpr::AggregateCall { data_type, .. }
             | BoundExpr::LocalRef { data_type, .. }
             | BoundExpr::IsNull { data_type, .. }
@@ -239,6 +259,9 @@ impl BoundExpr {
             | BoundExpr::BinaryOp { nullable, .. }
             | BoundExpr::UnaryOp { nullable, .. }
             | BoundExpr::Function { nullable, .. }
+            | BoundExpr::Nextval { nullable, .. }
+            | BoundExpr::Currval { nullable, .. }
+            | BoundExpr::Setval { nullable, .. }
             | BoundExpr::AggregateCall { nullable, .. }
             | BoundExpr::LocalRef { nullable, .. }
             | BoundExpr::IsNull { nullable, .. }

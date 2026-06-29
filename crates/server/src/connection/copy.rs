@@ -43,8 +43,9 @@ impl Session {
         let service = self.app.query_service.clone();
         let txn = self.txn.take();
         let cancel = self.begin_cancelable();
+        let session_sequences = self.session_sequences.clone();
         let task = tokio::task::spawn_blocking(move || {
-            service.run_copy_in_stream(job, txn, &cancel, receiver)
+            service.run_copy_in_stream(job, txn, &cancel, receiver, session_sequences)
         });
         self.copy_in = Some(CopyInSession {
             sender,
@@ -171,8 +172,9 @@ impl Session {
         let service = self.app.query_service.clone();
         let txn = self.txn.take();
         let cancel = self.begin_cancelable();
+        let session_sequences = self.session_sequences.clone();
         let task = tokio::task::spawn_blocking(move || {
-            service.run_copy_out_stream(job, txn, &cancel, frame_tx)
+            service.run_copy_out_stream(job, txn, &cancel, frame_tx, session_sequences)
         });
 
         let mut write_err = None;

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use catalog::serialize_catalog;
-use common::{Result, TableId};
+use common::{DbError, Result, TableId};
 use wal::{WalRecord, WalRecordKind};
 
 use crate::app::ServerComponents;
@@ -102,7 +102,18 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         .map(|table| table.id)
         .collect();
     tables.sort_unstable();
-    let catalog_bytes = serialize_catalog(&components.catalog.snapshot()?)?;
+    let mut snapshot = components.catalog.snapshot()?;
+    for live in components.storage.sequence_schemas_for_checkpoint()? {
+        let Some(sequence) = snapshot.sequences_by_id.get_mut(&live.id) else {
+            return Err(DbError::internal(format!(
+                "storage sequence {} is missing from catalog checkpoint snapshot",
+                live.id
+            )));
+        };
+        sequence.last_value = live.last_value;
+        sequence.is_called = live.is_called;
+    }
+    let catalog_bytes = serialize_catalog(&snapshot)?;
     components
         .control
         .store(checkpoint_lsn, &tables, &catalog_bytes)?;

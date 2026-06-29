@@ -444,6 +444,14 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
                 collect_aggregates(arg, output);
             }
         }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            collect_aggregates(value, output);
+            if let Some(is_called) = is_called {
+                collect_aggregates(is_called, output);
+            }
+        }
         BoundExpr::InList { expr, list, .. } => {
             collect_aggregates(expr, output);
             for item in list {
@@ -485,6 +493,8 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => {}
     }
@@ -565,6 +575,22 @@ fn rewrite_aggregate_expr(
                 .iter()
                 .map(|arg| rewrite_aggregate_expr(arg, group_by, aggregates))
                 .collect::<Result<Vec<_>>>()?,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::Setval {
+            sequence,
+            value,
+            is_called,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::Setval {
+            sequence: *sequence,
+            value: Box::new(rewrite_aggregate_expr(value, group_by, aggregates)?),
+            is_called: is_called
+                .as_deref()
+                .map(|expr| rewrite_aggregate_expr(expr, group_by, aggregates).map(Box::new))
+                .transpose()?,
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
@@ -689,6 +715,8 @@ fn rewrite_aggregate_expr(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => Ok(expr.clone()),
         BoundExpr::AggregateCall { .. } => Err(DbError::internal(
@@ -708,6 +736,9 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => contains_aggregate(value) || is_called.as_deref().is_some_and(contains_aggregate),
         BoundExpr::InList { expr, list, .. } => {
             contains_aggregate(expr) || list.iter().any(contains_aggregate)
         }
@@ -734,6 +765,8 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => false,
     }

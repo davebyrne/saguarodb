@@ -28,6 +28,8 @@ pub enum WalRecordKind {
     DropIndex { index: IndexId },
     CreateSequence { schema: SequenceSchema },
     DropSequence { sequence: SequenceId },
+    SequenceAdvance { sequence: SequenceId, value: i64 },
+    SetSequenceValue { sequence: SequenceId, value: i64, is_called: bool },
     Commit,
     CommitWithSubxids { subxids: Vec<u64> },
     Abort,
@@ -46,6 +48,8 @@ pub enum WalRecordKind {
 `Commit` and `Abort` carry no payload; the `txn_id` is in the header. `Commit` marks a transaction durably committed; `Abort` marks it aborted. Together they are the durable source of truth for transaction outcome and the input to CLOG reconstruction during recovery (see the MVCC plan, `docs/specs/mvcc.md` §5.4, §8). The CLOG is reconstructed at recovery; a durable CLOG snapshot (`clog.dat`, Milestone F — see "Durable CLOG snapshot" below) now seeds it and lets recovery fold only the post-snapshot `Commit`/`Abort` records, with the full in-memory rebuild from these records as the no-snapshot fallback.
 
 `CommitWithSubxids` is the commit record for a transaction that had savepoint subtransactions (`docs/specs/savepoints.md` §5). It is identical to `Commit` except it carries the JSON `subxids` payload — the set of committed (live or released, not-rolled-back) subxids. Recovery and the runtime flush mark the header `txn_id` AND every `subxids` entry `Committed`, in one atomic durable record (so a concurrent crash never leaves a released subxid committed while its parent is not). A rolled-back subxid is recorded by its own `Abort` record (header `txn_id` = the subxid; `ROLLBACK TO SAVEPOINT` appends one per rolled-back subxid) and is absent from `subxids`. A no-savepoint commit still uses the plain `Commit` record, so its on-disk format is unchanged. The transaction-id allocator's recovery scan folds in `subxids` too, so a committed read-only subxid (present only in this payload) is never reissued.
+
+`SequenceAdvance` and `SetSequenceValue` are non-transactional logical runtime records produced by `nextval` and `setval`. Recovery replays them unconditionally against the storage sequence runtime, after the checkpoint catalog snapshot has installed the baseline sequence set. They are not CLOG-gated DDL records: a sequence value handed out by an aborted transaction still creates a gap and is not reissued.
 
 The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) describe page-level changes. The storage mutation path produces them (stamping the page-LSN), and recovery replays them PageLSN-gated; `FullPageImage` provides torn-page recovery.
 

@@ -2,14 +2,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use common::{CopyDirection, DbError, IsolationLevel, Result, SqlState};
+use common::{CopyDirection, DbError, IsolationLevel, Result, SessionSequenceState, SqlState};
 use executor::{CopyJob, ExecutionResult};
 use parser::Statement;
 use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
 
 use super::{
-    BindSource, QueryService, StatementClass, Transaction, WriteUnitGuard, dead_versions_in,
-    mark_failed_on_error, run_plan, statement_class,
+    BindSource, QueryService, StatementClass, StatementRuntime, Transaction, WriteUnitGuard,
+    classify_bound, dead_versions_in, mark_failed_on_error, run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -24,6 +24,7 @@ impl QueryService {
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let class = match statement_class(&statement) {
             Ok(class) => class,
@@ -76,12 +77,13 @@ impl QueryService {
         match slot {
             // A data statement with an open explicit transaction runs inside it.
             Some(txn) => {
-                let (slot, result) = self.run_in_transaction(txn, class, statement, cancel);
+                let (slot, result) =
+                    self.run_in_transaction(txn, class, statement, cancel, session_sequences);
                 (slot, default_isolation, result)
             }
             // No open transaction: this is an autocommit unit.
             None => {
-                let result = self.run_autocommit(class, statement, cancel);
+                let result = self.run_autocommit(class, statement, cancel, session_sequences);
                 (None, default_isolation, result)
             }
         }
@@ -146,8 +148,15 @@ impl QueryService {
         class: StatementClass,
         statement: Statement,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
-        self.run_bound_in_transaction(txn, class, BindSource::Unbound(statement), cancel)
+        self.run_bound_in_transaction(
+            txn,
+            class,
+            BindSource::Unbound(statement),
+            cancel,
+            session_sequences,
+        )
     }
 
     /// Run a data statement inside an open explicit transaction. The statement is
@@ -162,6 +171,7 @@ impl QueryService {
         class: StatementClass,
         source: BindSource,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
         // `handle_transaction_control`, never reaching here).
@@ -203,6 +213,7 @@ impl QueryService {
             }
             BindSource::Bound(bound) => bound,
         };
+        let class = classify_bound(class, &bound);
 
         let is_write = matches!(class, StatementClass::Write);
         if is_write && txn.write_guard.is_none() {
@@ -244,7 +255,7 @@ impl QueryService {
             txn.isolation,
             gc_horizon,
             txn.live_txns(),
-            cancel,
+            StatementRuntime::new(cancel, session_sequences),
         );
 
         let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
@@ -284,13 +295,22 @@ impl QueryService {
         class: StatementClass,
         statement: Statement,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         match class {
             StatementClass::Read => {
                 let bound = bind(&statement, self.components.catalog.as_ref())?;
-                self.autocommit_read(bound, cancel)
+                match classify_bound(class, &bound) {
+                    StatementClass::Read => self.autocommit_read(bound, cancel, session_sequences),
+                    StatementClass::Write => {
+                        self.autocommit_bound_write(bound, cancel, session_sequences)
+                    }
+                    _ => unreachable!("classify_bound only promotes reads to writes"),
+                }
             }
-            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(statement, cancel),
+            StatementClass::Write | StatementClass::Ddl => {
+                self.autocommit_write(statement, cancel, session_sequences)
+            }
             // Maintenance (VACUUM) never reaches here: `dispatch` runs it via
             // `run_vacuum` before the autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
@@ -322,6 +342,7 @@ impl QueryService {
         &self,
         bound: BoundStatement,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         if let BoundStatement::Explain(inner) = &bound {
             return self.explain(inner.as_ref());
@@ -346,7 +367,7 @@ impl QueryService {
             IsolationLevel::default(),
             0,
             Arc::from([0]),
-            cancel,
+            StatementRuntime::new(cancel, session_sequences),
         );
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
@@ -369,6 +390,7 @@ impl QueryService {
         &self,
         statement: Statement,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         let needs_exclusive = statement_needs_exclusive_guard(&statement);
         let guard = if needs_exclusive {
@@ -377,13 +399,14 @@ impl QueryService {
             WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
         };
         let bound = bind(&statement, self.components.catalog.as_ref())?;
-        self.autocommit_bound_write_with_guard(bound, guard, cancel)
+        self.autocommit_bound_write_with_guard(bound, guard, cancel, session_sequences)
     }
 
     pub(super) fn autocommit_bound_write(
         &self,
         bound: BoundStatement,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         // Prepared statements are already bound; no catalog name resolution happens
         // here. Acquire the write/checkpoint guard before planning/execution.
@@ -393,7 +416,7 @@ impl QueryService {
         } else {
             WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
         };
-        self.autocommit_bound_write_with_guard(bound, guard, cancel)
+        self.autocommit_bound_write_with_guard(bound, guard, cancel, session_sequences)
     }
 
     fn autocommit_bound_write_with_guard(
@@ -401,6 +424,7 @@ impl QueryService {
         bound: BoundStatement,
         guard: WriteUnitGuard,
         cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
@@ -435,7 +459,7 @@ impl QueryService {
             IsolationLevel::default(),
             gc_horizon,
             Arc::from([txn_id]),
-            cancel,
+            StatementRuntime::new(cancel, session_sequences),
         );
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));

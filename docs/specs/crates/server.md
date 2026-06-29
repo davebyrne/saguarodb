@@ -81,8 +81,8 @@ The binary parses flags with `std::env::args`; do not add a CLI parser dependenc
 6. Load the control record (`control.load()`): the redo boundary `checkpoint_lsn` and catalog bytes (none if no control record exists yet).
 7. Initialize catalog from the control catalog bytes, or empty catalog if no control record exists.
 8. Initialize storage engine in recovery mode with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`.
-9. Call `storage.install_schemas(catalog.list_tables()?)` and `storage.install_index_schemas(indexes)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain the secondary indexes.
-10. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them), regardless of the dirtying transaction's outcome — the CLOG (rebuilt at WAL open) decides visibility afterward, and an aborted/in-flight transaction's replayed versions are invisible (`mvcc.md` §8). Heap, primary-key-index, and secondary-index pages replay the same way. The `Commit`/`Abort`/`Checkpoint` markers are skipped (they are not page mutations). DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence`) replay **only when their transaction is committed** (they mutate the durable catalog directly, not idempotent PageLSN-gated pages, so an aborted DDL's catalog change must not take effect). Table/index records also replay through `RecoveryOperations`; sequence records update catalog only. For skipped aborted/in-flight create records, recovery still reserves the table/index/sequence ID so any replayed orphan page files or catalog IDs cannot be reused by a later object.
+9. Call `storage.install_schemas(catalog.list_tables()?)`, `storage.install_index_schemas(indexes)`, and `storage.install_sequences(catalog.list_sequences()?)`, where `indexes` is gathered via `catalog.list_indexes_for_table` for each table, so recovery replay and later DML maintain secondary indexes and runtime sequence state.
+10. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`) via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` re-establishes them), regardless of the dirtying transaction's outcome — the CLOG (rebuilt at WAL open) decides visibility afterward, and an aborted/in-flight transaction's replayed versions are invisible (`mvcc.md` §8). Heap, primary-key-index, and secondary-index pages replay the same way. The `Commit`/`Abort`/`Checkpoint` markers are skipped (they are not page mutations). DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence`) replay **only when their transaction is committed** (they mutate the durable catalog directly, not idempotent PageLSN-gated pages, so an aborted DDL's catalog change must not take effect). Table/index/sequence DDL records also replay through `RecoveryOperations`. `SequenceAdvance` and `SetSequenceValue` replay unconditionally into storage's sequence state because sequence values are non-transactional. For skipped aborted/in-flight create records, recovery still reserves the table/index/sequence ID so any replayed orphan page files or catalog IDs cannot be reused by a later object.
 11. Create `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water), and an empty `active_txns` registry (the WAL manager reconstructed its CLOG on `open` — seeded from the durable `clog.dat` snapshot when present plus a fold of the post-snapshot `Commit`/`Abort` records, else rebuilt from those records).
 12. If records were replayed, run `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary.
 13. Switch storage engine to normal mode with `storage.set_mode(StorageMode::Normal)`.
@@ -137,13 +137,15 @@ physical_plan(logical, catalog)
 engine.execute(execution_context, physical)
 ```
 
-The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `QueryEngine` receives the server-allocated `StatementContext` and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
+The server constructs `ExecutionContext { statement, catalog, storage, schema_ops, cancel }` for each physical plan. The `StatementContext` carries the server-allocated transaction id, snapshot, lock/SSI/cancel handles, the concrete storage engine as `Arc<dyn SequenceManager>`, and the connection-owned session sequence state for `currval`. The `QueryEngine` receives that context and never allocates transaction IDs, appends commit records, flushes WAL, or calls storage/buffer commit or rollback.
 
 For autocommit write and DDL statements, `bind(statement, catalog)` runs after
 the statement has acquired its statement guard: the shared writer guard for DML,
-or the exclusive checkpoint guard for DDL. Read statements still bind lock-free.
-This keeps write-side catalog resolution inside the same exclusion window as
-planning and execution.
+or the exclusive checkpoint guard for DDL. Read statements still bind lock-free,
+then the server inspects the bound tree; if it contains `nextval` or `setval`,
+it is re-routed through the shared writer path so sequence advancement is WAL
+logged and committed like other writes. This keeps write-side catalog resolution
+inside the same exclusion window as planning and execution.
 
 ### Transaction lifecycle (Milestone C)
 
@@ -182,8 +184,8 @@ Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistentl
 
 Statement guard policy:
 
-- No guard: SELECT and EXPLAIN (lock-free readers), and a read-only explicit transaction.
-- Shared writer guard (`begin_writer`, held for the whole write-transaction, many concurrent): INSERT, UPDATE, DELETE, and an explicit transaction once its first write runs. Acquired lazily.
+- No guard: SELECT and EXPLAIN that do not mutate sequences (lock-free readers), and a read-only explicit transaction.
+- Shared writer guard (`begin_writer`, held for the whole write-transaction, many concurrent): INSERT, UPDATE, DELETE, `SELECT` statements whose bound expressions contain `nextval` or `setval`, and an explicit transaction once its first write runs. Acquired lazily.
 - Exclusive checkpoint guard (`begin_checkpoint`, per statement): CREATE TABLE,
   DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE (DDL is
   non-transactional and rejected inside a block).
@@ -205,7 +207,7 @@ Write statement protocol (autocommit; an explicit write transaction is the same 
 10. Call best-effort `record_commit_and_maybe_checkpoint(&components)`. A failure here is logged after the commit is already durable and cleaned up; it is not returned as a normal SQL error and is not a rollback signal.
 11. Return success.
 
-DDL follows the same allocate/execute/commit-or-abort sequence as an autocommit write, but it acquires the exclusive checkpoint guard instead of the shared writer guard. Catalog and storage mutations are part of the same statement-level commit. `CreateTable` and `DropTable` WAL replay must update both catalog and storage; `CreateSequence` and `DropSequence` update catalog only. Normal DDL execution must restore the previous catalog state if storage mutation, WAL append, or WAL flush fails before the commit record is durable; DML rollback does not restore a catalog snapshot.
+DDL follows the same allocate/execute/commit-or-abort sequence as an autocommit write, but it acquires the exclusive checkpoint guard instead of the shared writer guard. Catalog and storage mutations are part of the same statement-level commit. `CreateTable`, `DropTable`, `CreateSequence`, and `DropSequence` WAL replay update both catalog and storage; `CreateIndex` and `DropIndex` update catalog, storage metadata, and index pages through their normal recovery paths. Normal DDL execution must restore the previous catalog state if storage mutation, WAL append, or WAL flush fails before the commit record is durable; DML rollback does not restore a catalog snapshot.
 
 If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails before the commit record is durable, the server treats that as fatal. It logs the rollback failure, attempts to flush WAL, and exits instead of returning to service with possibly visible partial statement state.
 
@@ -213,7 +215,7 @@ If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails be
 
 Checkpoint may run after successful writes according to configured thresholds. It is called after the statement/transaction guard is released because `run_checkpoint` acquires the exclusive checkpoint guard, which must drain all writers (including this connection's, were it still held). If the triggered checkpoint fails, the write remains committed and the query/COPY/COMMIT path still returns success; surfacing the failure as a normal SQL error would invite clients to retry a transaction that already committed. The server logs the checkpoint failure and leaves the commit accounting in a state that lets a later write retry the checkpoint.
 
-`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>`. Startup uses it for `install_schemas` and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine` and to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
+`ServerComponents.storage` is the concrete `Arc<PageBackedStorageEngine>`. Startup uses it for `install_schemas`, `install_index_schemas`, `install_sequences`, and `set_mode`. Query execution passes `components.storage.as_ref()` to `ExecutionContext.storage` as `&dyn StorageEngine`, to `ExecutionContext.schema_ops` as `&dyn SchemaOperations`, and to `StatementContext.sequence_manager` as `Arc<dyn SequenceManager>`. Recovery passes the same concrete value as `&dyn RecoveryOperations`.
 
 ## Query Results
 
@@ -299,7 +301,7 @@ shared writers and runs alone:
 3. `buffer_pool.flush_dirty_pages()` — write every flushable dirty page to the heap `PageStore`. With the relaxed flush gate (Milestone D1, `mvcc.md` §8) this spills committed, aborted, and — under Stage 2 — in-flight dirty pages alike; all are WAL-durable after (2), and the CLOG hides the non-committed tuples.
 4. `store.sync_all()` — fsync the heap before advancing the redo boundary.
 5. `checkpoint_lsn = wal.flushed_lsn()`.
-6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point.
+6. `control.store(checkpoint_lsn, sorted_table_ids, catalog_bytes)` — the durable commit point. Before serializing `catalog_bytes`, checkpoint overlays storage's live sequence `(last_value, is_called)` values into the catalog snapshot so the control record contains the current sequence baseline.
 6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` (every transaction outcome plus both floors) **before** truncating, so it remembers every outcome the truncation is about to drop (`mvcc.md` §5.4).
 7. Append the `Checkpoint { redo_lsn }` WAL marker stamped with the transaction-id high-water mark (`txn_id = next_txn_id - 1`, so the allocator boundary survives truncation; see `wal.md`), `wal.flush()`, `wal.truncate_before(checkpoint_lsn)`. Truncation is **unconditional**: it drops every record below `checkpoint_lsn`. It is safe because `persist_clog` (6b) durably recorded every aborted outcome, and under the exclusive guard no writer is in flight, so all transactions below `checkpoint_lsn` are settled and captured by the snapshot (`wal.md`, `mvcc.md` §5.4/§8). **F4c:** the **vacuum floor** (advanced by the full VACUUM in 1a) bounds `clog.dat` pruning — `persist_clog` drops the explicit `Aborted` entry of a reclaimed aborted transaction below the floor; WAL truncation does not consult it.
 8. `buffer_pool.mark_all_clean()` (clears dirty flags, re-arms `needs_fpi`).

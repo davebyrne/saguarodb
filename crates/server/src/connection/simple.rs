@@ -43,6 +43,7 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
+        let session_sequences = self.session_sequences.clone();
         // Move the session's transaction slot AND default isolation into the blocking
         // task so the whole statement (including any owned write guard) runs on one
         // thread, then take them both back along with the result. The default is
@@ -51,7 +52,13 @@ impl Session {
         let txn = self.txn.take();
         let default_isolation = self.default_isolation;
         let task = tokio::task::spawn_blocking(move || {
-            service.execute_simple(&sql, txn, default_isolation, &cancel)
+            service.execute_simple_with_session_sequences(
+                &sql,
+                txn,
+                default_isolation,
+                &cancel,
+                session_sequences,
+            )
         })
         .await;
         // `guard` (the in-flight-query guard) is dropped per result arm below: the

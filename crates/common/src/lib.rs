@@ -18,7 +18,9 @@ pub mod value;
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };
-pub use context::{ConflictWaiter, SsiTracker, StatementContext};
+pub use context::{
+    ConflictWaiter, SequenceManager, SessionSequenceState, SsiTracker, StatementContext,
+};
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use float::{OrderedF32, OrderedF64};

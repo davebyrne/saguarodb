@@ -389,6 +389,8 @@ fn for_each_child(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Result<()>
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => Ok(()),
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -402,6 +404,15 @@ fn for_each_child(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Result<()>
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 f(arg)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            f(value)?;
+            if let Some(is_called) = is_called {
+                f(is_called)?;
             }
             Ok(())
         }
@@ -460,6 +471,8 @@ fn for_each_child_mut(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => Ok(()),
         BoundExpr::BinaryOp { left, right, .. } => {
@@ -473,6 +486,15 @@ fn for_each_child_mut(
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 f(arg)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            f(value)?;
+            if let Some(is_called) = is_called {
+                f(is_called)?;
             }
             Ok(())
         }

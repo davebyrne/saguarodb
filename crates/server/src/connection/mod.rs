@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{DbError, IsolationLevel, Result, Row, SqlState, Value};
+use common::{DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value};
 use executor::ExecutionResult;
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -234,6 +234,10 @@ struct Session {
     /// updates it. It persists across transactions on this connection and resets to
     /// `ReadCommitted` for each new connection (this field is per-`Session`).
     default_isolation: IsolationLevel,
+    /// Per-connection sequence state for `currval`. `nextval` and
+    /// `setval(..., true)` record into this map; `currval` reads it and errors
+    /// before any value is recorded on this connection.
+    session_sequences: Arc<SessionSequenceState>,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -326,6 +330,7 @@ impl Session {
             // regardless of any other connection's session setting (`docs/specs/mvcc.md`
             // §10 Milestone G2).
             default_isolation: IsolationLevel::default(),
+            session_sequences: Arc::new(SessionSequenceState::new()),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
             copy_in: None,
@@ -539,6 +544,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::DuplicateTable => "42P07",
         SqlState::DatatypeMismatch => "42804",
         SqlState::DivisionByZero => "22012",
+        SqlState::InvalidParameterValue => "22023",
         SqlState::NumericValueOutOfRange => "22003",
         SqlState::StringDataRightTruncation => "22001",
         SqlState::InvalidTextRepresentation => "22P02",
@@ -546,6 +552,8 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
         SqlState::CardinalityViolation => "21000",
+        SqlState::DependentObjectsStillExist => "2BP01",
+        SqlState::ObjectNotInPrerequisiteState => "55000",
         SqlState::QueryCanceled => "57014",
         SqlState::FeatureNotSupported => "0A000",
         SqlState::InFailedSqlTransaction => "25P02",

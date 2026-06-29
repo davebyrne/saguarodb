@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
-use common::{ColumnInfo, DbError, ExecRow, Result, Row, Value};
+use common::{ColumnInfo, DbError, ExecRow, Result, Row, StatementContext, Value};
 use planner::{BoundExpr, JoinType};
 
 use crate::ops::predicate_matches;
 use crate::query::{PlanExecutor, collect_all};
 
 pub struct NestedLoopJoinOp<'a> {
+    ctx: StatementContext,
     left: Box<dyn PlanExecutor + 'a>,
     right: Box<dyn PlanExecutor + 'a>,
     condition: Option<BoundExpr>,
@@ -20,6 +21,7 @@ pub struct NestedLoopJoinOp<'a> {
 
 impl<'a> NestedLoopJoinOp<'a> {
     pub fn new(
+        ctx: StatementContext,
         left: Box<dyn PlanExecutor + 'a>,
         right: Box<dyn PlanExecutor + 'a>,
         condition: Option<BoundExpr>,
@@ -30,6 +32,7 @@ impl<'a> NestedLoopJoinOp<'a> {
         let mut output_schema = left.output_schema().to_vec();
         output_schema.extend_from_slice(right.output_schema());
         Self {
+            ctx,
             left,
             right,
             condition,
@@ -61,7 +64,7 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
             for (right_index, right) in right_rows.iter().enumerate() {
                 let joined = join_row_refs(left, right);
                 if self.join_type == JoinType::Cross
-                    || join_condition_matches(&self.condition, &joined)?
+                    || join_condition_matches(&self.ctx, &self.condition, &joined)?
                 {
                     matched_left = true;
                     matched_right[right_index] = true;
@@ -109,9 +112,13 @@ pub fn join_rows(left: ExecRow, right: ExecRow) -> ExecRow {
     }
 }
 
-fn join_condition_matches(condition: &Option<BoundExpr>, row: &ExecRow) -> Result<bool> {
+fn join_condition_matches(
+    ctx: &StatementContext,
+    condition: &Option<BoundExpr>,
+    row: &ExecRow,
+) -> Result<bool> {
     match condition {
-        Some(condition) => predicate_matches(condition, row),
+        Some(condition) => predicate_matches(ctx, condition, row),
         None => Ok(true),
     }
 }

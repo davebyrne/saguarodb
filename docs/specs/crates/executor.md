@@ -105,6 +105,7 @@ The evaluator handles:
 - `IN`, `BETWEEN`, `LIKE`.
 - `CASE`.
 - `CAST`.
+- Sequence expressions: `nextval(sequence_id)` calls `StatementContext.sequence_manager.nextval`, records the returned value in the session sequence state, and returns it as `Value::Integer`; `currval(sequence_id)` first checks that the sequence still exists (`SqlState::UndefinedTable` if it was dropped), then reads the session sequence state and returns `SqlState::ObjectNotInPrerequisiteState` if the sequence has not been used on this connection; `setval(sequence_id, value[, is_called])` evaluates its arguments, returns `NULL` with no side effect when any argument is `NULL`, otherwise calls `SequenceManager::setval`, records the returned value in session state only when `is_called` is true, and returns it.
 - Scalar functions `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), and `SUBSTRING(text, start[, length])`, the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, and `MOD`, and the string functions `REPLACE`, `POSITION`, `LEFT`, and `RIGHT`. These are NULL-propagating (any NULL argument yields NULL). `CONCAT` is the exception: it ignores NULL arguments and returns the empty string (never NULL) when every argument is NULL. `REPLACE` leaves the string unchanged for an empty `from` (unlike Rust's `str::replace`); `POSITION` is the 1-based character index (0 if absent, 1 for an empty substring); `LEFT`/`RIGHT` count characters and treat a negative count as removing characters from the far end (PostgreSQL semantics). `EXTRACT(field FROM source)` returns the `year`/`month`/`day`/`hour`/`minute`/`second` of a `DATE` or `TIMESTAMP` as `DOUBLE PRECISION` (a DATE has zero-valued time components; `second` includes the fractional part). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`. `FLOOR`/`CEIL`/`ROUND` leave an integer unchanged and round a double (`ROUND` is round-half-to-even, matching PostgreSQL's `round(double precision)`); `ABS` of `i64::MIN` returns `SqlState::NumericValueOutOfRange`; `SQRT` of a negative number and a non-finite `POWER` result return `NumericValueOutOfRange`; `MOD` by zero returns `SqlState::DivisionByZero`.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
@@ -143,7 +144,7 @@ Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and e
 `INSERT` (from `VALUES` or `SELECT`):
 
 - Materialize the source plan fully before inserting any row, so that `INSERT ... SELECT` reading the target table observes only pre-insert rows.
-- For each source row, build row values in table column order.
+- For each source row, build row values in table column order. Omitted columns use their catalog default: `ColumnDefault::Const(value)` clones the constant, `ColumnDefault::Nextval(sequence_id)` advances the sequence through `StatementContext.sequence_manager` and records the value for `currval`; no default yields `NULL`.
 - Validate runtime values match destination column types. `NULL` is accepted at this step and checked by row-constraint validation.
 - Coerce `NUMERIC(p, s)` column values to the column scale (`coerce_numeric_columns`): each `Value::Numeric` is rounded to `s` (half away from zero) and rejected with `SqlState::NumericValueOutOfRange` when the integer part exceeds `p - s` digits. Bare `NUMERIC` columns and non-numeric values are unchanged. Runs before constraint validation, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, and `COPY ... FROM`.
 - Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
@@ -221,16 +222,18 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 - Resolve the sequence name at execution time. A missing sequence returns
   `SqlState::UndefinedTable` unless `IF EXISTS` was present.
-- For an existing sequence, call `SchemaOperations::drop_sequence`, then
-  `CatalogManager::drop_sequence`. `SchemaOperations::drop_sequence` appends the
-  `DropSequence` WAL operation record.
+- For an existing sequence, call `CatalogManager::drop_sequence` first so a
+  referenced sequence is rejected with `SqlState::DependentObjectsStillExist`
+  before storage changes. Then call `SchemaOperations::drop_sequence`, which
+  appends the `DropSequence` WAL operation record; if storage fails, restore the
+  catalog sequence before returning the error.
 - For `IF EXISTS` and a missing sequence, perform no catalog or WAL mutation and
   return the normal command tag.
 - Return `Modified { command: "DROP SEQUENCE", count: 0 }`.
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: SELECT and EXPLAIN are lock-free readers and take **no** `ConcurrencyController` guard; INSERT, UPDATE, and DELETE acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. SELECT runs bind, plan, and `QueryEngine::execute` lock-free. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

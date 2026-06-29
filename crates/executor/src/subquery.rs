@@ -263,7 +263,9 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
-        | BoundExpr::LocalRef { .. } => Ok(expr.clone()),
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. } => Ok(expr.clone()),
         BoundExpr::BinaryOp {
             left,
             op,
@@ -296,6 +298,22 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
         } => Ok(BoundExpr::Function {
             name: name.clone(),
             args: resolve_vec(ctx, args)?,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::Setval {
+            sequence,
+            value,
+            is_called,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::Setval {
+            sequence: *sequence,
+            value: Box::new(resolve_expr(ctx, value)?),
+            is_called: is_called
+                .as_deref()
+                .map(|expr| resolve_expr(ctx, expr).map(Box::new))
+                .transpose()?,
             data_type: data_type.clone(),
             nullable: *nullable,
         }),

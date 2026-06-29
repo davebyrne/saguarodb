@@ -20,12 +20,172 @@ pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_types, substitute_params};
 pub use physical::{PhysicalPlan, physical_plan};
 
+pub fn mutates_sequences(statement: &BoundStatement) -> bool {
+    match statement {
+        BoundStatement::CreateTable { .. }
+        | BoundStatement::DropTable { .. }
+        | BoundStatement::CreateIndex { .. }
+        | BoundStatement::DropIndex { .. }
+        | BoundStatement::CreateSequence { .. }
+        | BoundStatement::DropSequence { .. }
+        | BoundStatement::Copy { .. }
+        | BoundStatement::Explain(_) => false,
+        BoundStatement::Select(select) => select_mutates_sequences(select),
+        BoundStatement::Insert {
+            source,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            insert_source_mutates_sequences(source)
+                || on_conflict
+                    .as_ref()
+                    .is_some_and(on_conflict_mutates_sequences)
+                || returning.as_ref().is_some_and(returning_mutates_sequences)
+        }
+        BoundStatement::Update {
+            assignments,
+            source,
+            returning,
+            ..
+        } => {
+            assignments
+                .iter()
+                .any(|(_, expr)| expr_mutates_sequences(expr))
+                || select_mutates_sequences(source)
+                || returning.as_ref().is_some_and(returning_mutates_sequences)
+        }
+        BoundStatement::Delete {
+            source, returning, ..
+        } => {
+            select_mutates_sequences(source)
+                || returning.as_ref().is_some_and(returning_mutates_sequences)
+        }
+    }
+}
+
+fn returning_mutates_sequences(returning: &BoundReturning) -> bool {
+    returning.exprs.iter().any(expr_mutates_sequences)
+}
+
+fn on_conflict_mutates_sequences(on_conflict: &BoundOnConflict) -> bool {
+    match on_conflict {
+        BoundOnConflict::DoNothing => false,
+        BoundOnConflict::DoUpdate {
+            assignments,
+            filter,
+        } => {
+            assignments
+                .iter()
+                .any(|(_, expr)| expr_mutates_sequences(expr))
+                || filter.as_ref().is_some_and(expr_mutates_sequences)
+        }
+    }
+}
+
+fn insert_source_mutates_sequences(source: &BoundInsertSource) -> bool {
+    match source {
+        BoundInsertSource::Values { rows, .. } => rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(expr_mutates_sequences),
+        BoundInsertSource::Query(select) => select_mutates_sequences(select),
+    }
+}
+
+fn select_mutates_sequences(select: &BoundSelect) -> bool {
+    select
+        .columns
+        .iter()
+        .any(|item| expr_mutates_sequences(&item.expr))
+        || from_mutates_sequences(&select.from)
+        || select.filter.as_ref().is_some_and(expr_mutates_sequences)
+        || select.group_by.iter().any(expr_mutates_sequences)
+        || select.having.as_ref().is_some_and(expr_mutates_sequences)
+        || select
+            .order_by
+            .iter()
+            .any(|item| expr_mutates_sequences(&item.expr))
+        || match &select.distinct {
+            Some(BoundDistinct::On(exprs)) => exprs.iter().any(expr_mutates_sequences),
+            Some(BoundDistinct::All) | None => false,
+        }
+}
+
+fn from_mutates_sequences(from: &BoundFrom) -> bool {
+    match from {
+        BoundFrom::Table { .. } => false,
+        BoundFrom::Derived { select, .. } => select_mutates_sequences(select),
+        BoundFrom::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            from_mutates_sequences(left)
+                || from_mutates_sequences(right)
+                || condition.as_ref().is_some_and(expr_mutates_sequences)
+        }
+    }
+}
+
+fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Nextval { .. } | BoundExpr::Setval { .. } => true,
+        BoundExpr::BinaryOp { left, right, .. } => {
+            expr_mutates_sequences(left) || expr_mutates_sequences(right)
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::IsNotNull { expr, .. }
+        | BoundExpr::Cast { expr, .. } => expr_mutates_sequences(expr),
+        BoundExpr::Function { args, .. } => args.iter().any(expr_mutates_sequences),
+        BoundExpr::AggregateCall { arg, .. } => arg.as_deref().is_some_and(expr_mutates_sequences),
+        BoundExpr::InList { expr, list, .. } => {
+            expr_mutates_sequences(expr) || list.iter().any(expr_mutates_sequences)
+        }
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mutates_sequences(expr)
+                || expr_mutates_sequences(low)
+                || expr_mutates_sequences(high)
+        }
+        BoundExpr::Like { expr, pattern, .. } => {
+            expr_mutates_sequences(expr) || expr_mutates_sequences(pattern)
+        }
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_mutates_sequences)
+                || when_clauses.iter().any(|(when, then)| {
+                    expr_mutates_sequences(when) || expr_mutates_sequences(then)
+                })
+                || else_clause.as_deref().is_some_and(expr_mutates_sequences)
+        }
+        BoundExpr::InSubquery { expr, select, .. } => {
+            expr_mutates_sequences(expr) || select_mutates_sequences(select)
+        }
+        BoundExpr::ScalarSubquery { select, .. } | BoundExpr::Exists { select, .. } => {
+            select_mutates_sequences(select)
+        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::Currval { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, PRIMARY_KEY_INDEX_ID,
-        ParsedColumnDef, SqlState, Value,
+        ParsedColumnDef, SequenceOptions, SqlState, Value,
     };
     use parser::parse;
 
@@ -53,6 +213,18 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+            )
+            .unwrap();
+        catalog
+    }
+
+    fn catalog_with_users_and_sequence() -> MemoryCatalog {
+        let catalog = catalog_with_users();
+        catalog
+            .create_sequence(
+                "users_id_seq".to_string(),
+                SequenceOptions::default(),
+                false,
             )
             .unwrap();
         catalog
@@ -390,6 +562,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn binder_binds_sequence_functions_and_mutation_classifier() {
+        let catalog = catalog_with_users_and_sequence();
+        let sequence = catalog
+            .get_sequence_by_name("users_id_seq")
+            .unwrap()
+            .unwrap();
+        let stmt = parse(
+            "select nextval('users_id_seq'), currval('users_id_seq'), \
+             setval('users_id_seq', 9, false) from users",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Select(select) = &bound else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            &select.columns[0].expr,
+            BoundExpr::Nextval {
+                sequence: id,
+                data_type,
+                nullable
+            } if *id == sequence.id && *data_type == DataType::Integer && !*nullable
+        ));
+        assert!(matches!(
+            &select.columns[1].expr,
+            BoundExpr::Currval {
+                sequence: id,
+                data_type,
+                nullable
+            } if *id == sequence.id && *data_type == DataType::Integer && !*nullable
+        ));
+        assert!(matches!(
+            &select.columns[2].expr,
+            BoundExpr::Setval {
+                sequence: id,
+                is_called: Some(_),
+                data_type,
+                nullable,
+                ..
+            } if *id == sequence.id && *data_type == DataType::Integer && !*nullable
+        ));
+        assert!(mutates_sequences(&bound));
+
+        let currval_only = bind(
+            &parse("select currval('users_id_seq') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        assert!(!mutates_sequences(&currval_only));
+    }
+
+    #[test]
+    fn binder_validates_sequence_function_and_default_arguments() {
+        let catalog = catalog_with_users_and_sequence();
+
+        let err = bind(
+            &parse("select nextval('missing_seq') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+
+        let err = bind(
+            &parse("select setval('users_id_seq', 'not-an-integer') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+
+        let stmt = parse("create table t (id integer primary key default nextval('users_id_seq'))")
+            .unwrap();
+        assert!(bind(&stmt, &catalog).is_ok());
+
+        let err = bind(
+            &parse("create table bad (id text primary key default nextval('users_id_seq'))")
+                .unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+
+        let err = bind(
+            &parse("create table missing (id integer primary key default nextval('missing_seq'))")
+                .unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
     }
 
     #[test]
