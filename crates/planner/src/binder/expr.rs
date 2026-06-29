@@ -264,6 +264,29 @@ fn numeric_family(data_type: &DataType) -> Option<u8> {
     }
 }
 
+/// Result type for arithmetic involving `INTERVAL` and/or temporal types (which
+/// sit outside the numeric families). Returns `None` for unsupported
+/// combinations, which then fall through to numeric-family resolution. `DATE +/-
+/// INTERVAL` yields a `TIMESTAMP` (PostgreSQL semantics); `INTERVAL + <temporal>`
+/// is the commutative `Add` only. `TIME +/- INTERVAL` uses only the interval's
+/// time component (wrapping mod 24h).
+fn interval_arith_result(left: &DataType, op: BinOp, right: &DataType) -> Option<DataType> {
+    use DataType::{Date, Integer, Interval, Time, Timestamp, TimestampTz};
+    match (left, op, right) {
+        (Interval, BinOp::Add | BinOp::Sub, Interval) => Some(Interval),
+        (Interval, BinOp::Mul, Integer) | (Integer, BinOp::Mul, Interval) => Some(Interval),
+        (Date, BinOp::Add | BinOp::Sub, Interval) | (Interval, BinOp::Add, Date) => Some(Timestamp),
+        (Timestamp, BinOp::Add | BinOp::Sub, Interval) | (Interval, BinOp::Add, Timestamp) => {
+            Some(Timestamp)
+        }
+        (TimestampTz, BinOp::Add | BinOp::Sub, Interval) | (Interval, BinOp::Add, TimestampTz) => {
+            Some(TimestampTz)
+        }
+        (Time, BinOp::Add | BinOp::Sub, Interval) | (Interval, BinOp::Add, Time) => Some(Time),
+        _ => None,
+    }
+}
+
 fn bind_binary_op(
     ctx: &mut BindContext,
     left: &Expr,
@@ -291,6 +314,26 @@ fn bind_binary_op(
             };
             let left_res = bind_expr(ctx, left, None);
             let right_res = bind_expr(ctx, right, None);
+
+            // INTERVAL / temporal arithmetic takes precedence over numeric-family
+            // resolution. Both sides must bind to a concrete type to qualify.
+            let interval_result = match (&left_res, &right_res) {
+                (Ok(l), Ok(r)) => interval_arith_result(&l.data_type(), op, &r.data_type()),
+                _ => None,
+            };
+            if let Some(data_type) = interval_result {
+                let left = left_res.expect("left bound above");
+                let right = right_res.expect("right bound above");
+                let nullable = left.nullable() || right.nullable();
+                return Ok(BoundExpr::BinaryOp {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                    data_type,
+                    nullable,
+                });
+            }
+
             let family = left_res
                 .as_ref()
                 .ok()
@@ -425,14 +468,14 @@ fn bind_unary_op(ctx: &mut BindContext, op: parser::UnaryOp, expr: &Expr) -> Res
     let op = convert_unary_op(op);
     match op {
         UnaryOp::Neg => {
-            // Negation applies to any numeric type; an untyped NULL defaults to
-            // INTEGER (matching the arithmetic operators).
+            // Negation applies to any numeric type or INTERVAL; an untyped NULL
+            // defaults to INTEGER (matching the arithmetic operators).
             let bound = bind_expr(ctx, expr, None);
             let operand_type = bound
                 .as_ref()
                 .ok()
                 .map(|e| e.data_type())
-                .filter(|t| numeric_family(t).is_some())
+                .filter(|t| numeric_family(t).is_some() || matches!(t, DataType::Interval))
                 .unwrap_or(DataType::Integer);
             let expr = match bound {
                 Ok(expr) => expr,

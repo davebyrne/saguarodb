@@ -44,6 +44,42 @@ impl Interval {
         micros: 0,
     };
 
+    /// Component-wise `self + other`, or `None` on any component overflow.
+    pub fn checked_add(self, other: Interval) -> Option<Interval> {
+        Some(Interval {
+            months: self.months.checked_add(other.months)?,
+            days: self.days.checked_add(other.days)?,
+            micros: self.micros.checked_add(other.micros)?,
+        })
+    }
+
+    /// Component-wise `self - other`, or `None` on any component overflow.
+    pub fn checked_sub(self, other: Interval) -> Option<Interval> {
+        Some(Interval {
+            months: self.months.checked_sub(other.months)?,
+            days: self.days.checked_sub(other.days)?,
+            micros: self.micros.checked_sub(other.micros)?,
+        })
+    }
+
+    /// Component-wise negation, or `None` if a component is `MIN`.
+    pub fn checked_neg(self) -> Option<Interval> {
+        Some(Interval {
+            months: self.months.checked_neg()?,
+            days: self.days.checked_neg()?,
+            micros: self.micros.checked_neg()?,
+        })
+    }
+
+    /// Scale every component by an integer factor, or `None` on overflow.
+    pub fn checked_mul_int(self, factor: i64) -> Option<Interval> {
+        Some(Interval {
+            months: i32::try_from(i64::from(self.months).checked_mul(factor)?).ok()?,
+            days: i32::try_from(i64::from(self.days).checked_mul(factor)?).ok()?,
+            micros: self.micros.checked_mul(factor)?,
+        })
+    }
+
     /// The canonical comparison value in microseconds (month = 30 days, day = 24
     /// hours), as `i128` so the products cannot overflow.
     fn estimate(&self) -> i128 {
@@ -125,7 +161,8 @@ pub fn format_interval(iv: &Interval) -> String {
 }
 
 fn plural(n: i32) -> &'static str {
-    if n.abs() == 1 { "" } else { "s" }
+    // PostgreSQL uses the singular only for exactly 1 (so -1 is "mons"/"days").
+    if n == 1 { "" } else { "s" }
 }
 
 /// Format the microsecond component as `[-]HH:MM:SS[.ffffff]`; hours are not
@@ -346,6 +383,24 @@ mod tests {
         assert_eq!(format_interval(&iv(0, 1, 0)), "1 day");
         assert_eq!(format_interval(&iv(0, 0, -MICROS_PER_SEC)), "-00:00:01");
         assert_eq!(format_interval(&iv(0, 0, 500_000)), "00:00:00.5");
+    }
+
+    #[test]
+    fn arithmetic_is_component_wise_and_checked() {
+        assert_eq!(
+            iv(1, 2, 3).checked_add(iv(10, 20, 30)),
+            Some(iv(11, 22, 33))
+        );
+        assert_eq!(
+            iv(11, 22, 33).checked_sub(iv(1, 2, 3)),
+            Some(iv(10, 20, 30))
+        );
+        assert_eq!(iv(1, -2, 3).checked_neg(), Some(iv(-1, 2, -3)));
+        assert_eq!(iv(1, 2, 3).checked_mul_int(3), Some(iv(3, 6, 9)));
+        // Overflow yields None rather than panicking.
+        assert_eq!(iv(i32::MAX, 0, 0).checked_add(iv(1, 0, 0)), None);
+        assert_eq!(iv(i32::MAX, 0, 0).checked_mul_int(2), None);
+        assert_eq!(iv(0, 0, i64::MAX).checked_mul_int(2), None);
     }
 
     #[test]

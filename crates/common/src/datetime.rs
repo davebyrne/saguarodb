@@ -175,6 +175,50 @@ fn parse_tz_offset(text: &str) -> Option<i64> {
     Some(sign * (hours * 3_600 + minutes * 60) * MICROS_PER_SEC)
 }
 
+/// Number of days in a given proleptic-Gregorian month (handles leap Februaries).
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let first = days_from_civil(year, month, 1);
+    let next = if month == 12 {
+        days_from_civil(year + 1, 1, 1)
+    } else {
+        days_from_civil(year, month + 1, 1)
+    };
+    (next - first) as u32
+}
+
+/// Add a (signed) number of months to a day count, clamping the day-of-month to
+/// the target month's length (PostgreSQL semantics: Jan 31 + 1 month = Feb 28/29).
+fn add_months_to_days(days: i64, months: i32) -> i64 {
+    let (year, month, day) = civil_from_days(days);
+    let total = year * 12 + (month as i64 - 1) + i64::from(months);
+    let new_year = total.div_euclid(12);
+    let new_month = (total.rem_euclid(12) + 1) as u32;
+    let new_day = day.min(days_in_month(new_year, new_month));
+    days_from_civil(new_year, new_month, new_day)
+}
+
+/// Add an interval to a timestamp (microseconds from the Unix epoch),
+/// calendar-aware: months are applied first (with day clamping), then whole
+/// days, then the microsecond part. Returns `None` on overflow.
+pub fn add_interval_to_timestamp(micros: i64, iv: &crate::Interval) -> Option<i64> {
+    let days0 = micros.div_euclid(MICROS_PER_DAY);
+    let time_of_day = micros.rem_euclid(MICROS_PER_DAY);
+    let days1 = add_months_to_days(days0, iv.months);
+    let days2 = days1.checked_add(i64::from(iv.days))?;
+    days2
+        .checked_mul(MICROS_PER_DAY)?
+        .checked_add(time_of_day)?
+        .checked_add(iv.micros)
+}
+
+/// Add an interval to a `TIME` (microseconds since midnight). Only the
+/// microsecond component applies (PostgreSQL ignores months/days for `TIME`),
+/// wrapping into `[0, 24h)`.
+pub fn add_interval_to_time(time_micros: i64, iv: &crate::Interval) -> i64 {
+    ((i128::from(time_micros) + i128::from(iv.micros)).rem_euclid(i128::from(MICROS_PER_DAY)))
+        as i64
+}
+
 /// Format microseconds-from-epoch (UTC) as `YYYY-MM-DD HH:MM:SS[.ffffff]+00`.
 /// Always rendered in UTC (there is no session time zone).
 pub fn format_timestamptz(micros: i64) -> String {
@@ -249,6 +293,37 @@ mod tests {
         // A multibyte offset body is rejected, not a panic (no UTF-8 boundary at byte 2).
         assert_eq!(parse_timestamptz("2024-01-01 12:00:00+€"), None);
         assert_eq!(parse_timestamptz("2024-01-01 12:00:00+1é"), None);
+    }
+
+    #[test]
+    fn interval_timestamp_arithmetic_is_calendar_aware() {
+        use crate::Interval;
+        let at = |s: &str| parse_timestamp(s).unwrap();
+        // Jan 31 + 1 month clamps to Feb 28 (non-leap) / Feb 29 (leap).
+        assert_eq!(
+            add_interval_to_timestamp(at("2023-01-31 12:00:00"), &Interval::new(1, 0, 0)),
+            Some(at("2023-02-28 12:00:00"))
+        );
+        assert_eq!(
+            add_interval_to_timestamp(at("2024-01-31 12:00:00"), &Interval::new(1, 0, 0)),
+            Some(at("2024-02-29 12:00:00"))
+        );
+        // Months then days then micros; crossing a year boundary.
+        assert_eq!(
+            add_interval_to_timestamp(at("2024-11-15 10:00:00"), &Interval::new(2, 3, 0)),
+            Some(at("2025-01-18 10:00:00"))
+        );
+        // Negative interval (subtraction path negates first).
+        assert_eq!(
+            add_interval_to_timestamp(at("2024-03-31 00:00:00"), &Interval::new(-1, 0, 0)),
+            Some(at("2024-02-29 00:00:00"))
+        );
+        // TIME wraps mod 24h and ignores months/days.
+        let noon = parse_time("12:00:00").unwrap();
+        assert_eq!(
+            add_interval_to_time(noon, &Interval::new(5, 9, 14 * 3_600 * MICROS_PER_SEC)),
+            parse_time("02:00:00").unwrap()
+        );
     }
 
     #[test]

@@ -2030,6 +2030,66 @@ async fn e2e_interval_round_trips_orders_by_estimate_and_casts() {
 }
 
 #[tokio::test]
+async fn e2e_interval_arithmetic_is_calendar_aware() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table d (id integer primary key, dt date, ts timestamp, \
+             tt time, tz timestamptz, sp interval)",
+        )
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into d (id, dt, ts, tt, tz, sp) values \
+             (1, DATE '2024-01-31', TIMESTAMP '2024-01-31 12:00:00', TIME '23:00:00', \
+              TIMESTAMPTZ '2024-01-31 12:00:00+00', INTERVAL '1 mon')",
+        )
+        .await
+        .unwrap();
+
+    let one = |expr: &str| {
+        let server = &server;
+        let sql = format!("select cast(({expr}) as text) from d where id = 1");
+        async move {
+            server.simple_query(&sql).await.unwrap().unwrap_rows()[0][0]
+                .clone()
+                .unwrap()
+        }
+    };
+
+    // DATE + INTERVAL -> TIMESTAMP; month add clamps and respects leap year.
+    assert_eq!(one("dt + INTERVAL '1 month'").await, "2024-02-29 00:00:00");
+    // TIMESTAMP +/- INTERVAL (calendar-aware).
+    assert_eq!(one("ts + INTERVAL '1 month'").await, "2024-02-29 12:00:00");
+    assert_eq!(one("ts - INTERVAL '1 day'").await, "2024-01-30 12:00:00");
+    // TIMESTAMPTZ + INTERVAL stays UTC.
+    assert_eq!(one("tz + INTERVAL '1 day'").await, "2024-02-01 12:00:00+00");
+    // TIME + INTERVAL wraps mod 24h (and ignores the day component).
+    assert_eq!(one("tt + INTERVAL '1 day 2 hours'").await, "01:00:00");
+    // TIME ignores months/days even when subtracting a huge (i32::MIN) month count.
+    assert_eq!(one("tt - INTERVAL '-2147483648 mons'").await, "23:00:00");
+    // INTERVAL +/- INTERVAL, * integer, unary minus.
+    assert_eq!(one("sp + INTERVAL '15 days'").await, "1 mon 15 days");
+    assert_eq!(one("sp * 3").await, "3 mons");
+    assert_eq!(one("- sp").await, "-1 mons");
+
+    // Unsupported combinations are rejected (no implicit numeric coercion).
+    for bad in ["ts + 1", "sp + 1", "sp * sp"] {
+        let err = server
+            .simple_query(&format!("select ({bad}) from d where id = 1"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected `{bad}` to be rejected"));
+        assert!(
+            err.message.contains("42804"),
+            "`{bad}` should be a datatype mismatch, got: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

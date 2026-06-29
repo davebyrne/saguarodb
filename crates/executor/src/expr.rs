@@ -150,7 +150,11 @@ fn eval_unary(op: UnaryOp, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
             Value::Float(value) => Ok(Value::Float((-value.0).into())),
             Value::Real(value) => Ok(Value::Real((-value.0).into())),
             Value::Numeric(value) => Ok(Value::Numeric(-value)),
-            _ => datatype_mismatch("unary minus requires a numeric operand"),
+            Value::Interval(value) => value
+                .checked_neg()
+                .map(Value::Interval)
+                .ok_or_else(interval_overflow),
+            _ => datatype_mismatch("unary minus requires a numeric or interval operand"),
         },
         UnaryOp::Not => sql_not(value),
     }
@@ -239,8 +243,103 @@ fn arithmetic_values(left: Value, op: BinOp, right: Value) -> Result<Value> {
             };
             result.map(Value::Numeric).ok_or_else(numeric_overflow)
         }
+        // INTERVAL arithmetic: interval +/- interval, interval * integer.
+        (Value::Interval(left), Value::Interval(right)) => match op {
+            BinOp::Add => left
+                .checked_add(right)
+                .map(Value::Interval)
+                .ok_or_else(interval_overflow),
+            BinOp::Sub => left
+                .checked_sub(right)
+                .map(Value::Interval)
+                .ok_or_else(interval_overflow),
+            _ => datatype_mismatch("operator is not defined for two intervals"),
+        },
+        (Value::Interval(iv), Value::Integer(n)) | (Value::Integer(n), Value::Interval(iv))
+            if matches!(op, BinOp::Mul) =>
+        {
+            iv.checked_mul_int(n)
+                .map(Value::Interval)
+                .ok_or_else(interval_overflow)
+        }
+        // <temporal> +/- INTERVAL (and INTERVAL + <temporal>). DATE + INTERVAL
+        // yields a TIMESTAMP, matching PostgreSQL.
+        (Value::Timestamp(micros), Value::Interval(iv)) => {
+            shift_timestamp(micros, iv, op).map(Value::Timestamp)
+        }
+        (Value::Interval(iv), Value::Timestamp(micros)) if matches!(op, BinOp::Add) => {
+            shift_timestamp(micros, iv, BinOp::Add).map(Value::Timestamp)
+        }
+        (Value::TimestampTz(micros), Value::Interval(iv)) => {
+            shift_timestamp(micros, iv, op).map(Value::TimestampTz)
+        }
+        (Value::Interval(iv), Value::TimestampTz(micros)) if matches!(op, BinOp::Add) => {
+            shift_timestamp(micros, iv, BinOp::Add).map(Value::TimestampTz)
+        }
+        (Value::Date(days), Value::Interval(iv)) => {
+            shift_timestamp(date_to_micros(days)?, iv, op).map(Value::Timestamp)
+        }
+        (Value::Interval(iv), Value::Date(days)) if matches!(op, BinOp::Add) => {
+            shift_timestamp(date_to_micros(days)?, iv, BinOp::Add).map(Value::Timestamp)
+        }
+        (Value::Time(time), Value::Interval(iv)) => shift_time(time, iv, op).map(Value::Time),
+        (Value::Interval(iv), Value::Time(time)) if matches!(op, BinOp::Add) => {
+            shift_time(time, iv, BinOp::Add).map(Value::Time)
+        }
         _ => datatype_mismatch("arithmetic operands must be the same numeric type"),
     }
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// Convert a `DATE` (days from epoch) to microseconds-from-epoch.
+fn date_to_micros(days: i64) -> Result<i64> {
+    days.checked_mul(MICROS_PER_DAY)
+        .ok_or_else(datetime_overflow)
+}
+
+/// Apply `+/- interval` to a timestamp-like microsecond value (calendar-aware).
+fn shift_timestamp(micros: i64, iv: common::Interval, op: BinOp) -> Result<i64> {
+    let iv = signed_interval(iv, op)?;
+    common::datetime::add_interval_to_timestamp(micros, &iv).ok_or_else(datetime_overflow)
+}
+
+/// Apply `+/- interval` to a `TIME` (wraps mod 24h; months/days ignored).
+fn shift_time(time: i64, iv: common::Interval, op: BinOp) -> Result<i64> {
+    // TIME uses only the interval's microsecond component (months/days are ignored
+    // and wrap away). Reduce mod a day before negating so no value can overflow —
+    // notably an `i32::MIN` month count, which `signed_interval`'s full negation
+    // would reject even though months don't affect a TIME.
+    let micros = iv.micros.rem_euclid(MICROS_PER_DAY);
+    let signed = match op {
+        BinOp::Add => micros,
+        BinOp::Sub => -micros, // safe: micros is in [0, MICROS_PER_DAY)
+        _ => return datatype_mismatch("operator is not defined for time and interval"),
+    };
+    Ok(common::datetime::add_interval_to_time(
+        time,
+        &common::Interval::new(0, 0, signed),
+    ))
+}
+
+/// `interval` for `Add`, its negation for `Sub`; any other operator is invalid.
+fn signed_interval(iv: common::Interval, op: BinOp) -> Result<common::Interval> {
+    match op {
+        BinOp::Add => Ok(iv),
+        BinOp::Sub => iv.checked_neg().ok_or_else(interval_overflow),
+        _ => Err(DbError::execute(
+            SqlState::DatatypeMismatch,
+            "operator is not defined for this temporal type and interval",
+        )),
+    }
+}
+
+fn interval_overflow() -> DbError {
+    DbError::execute(SqlState::NumericValueOutOfRange, "interval out of range")
+}
+
+fn datetime_overflow() -> DbError {
+    DbError::execute(SqlState::NumericValueOutOfRange, "timestamp out of range")
 }
 
 fn checked_integer(value: Option<i64>) -> Result<Value> {
