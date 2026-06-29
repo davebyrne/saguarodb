@@ -362,13 +362,10 @@ impl StorageEngine for PageBackedStorageEngine {
         // structurally, so reject only when an alive-or-potentially-alive version
         // already holds the key (dead/aborted versions do not block a re-insert). A
         // committed-live duplicate is a definite `UniqueViolation`; a key held only by
-        // another in-progress inserter is undecidable ⇒ `SerializationFailure` (retry
-        // — §7.3). Holding the latch across BOTH the scan and the insert (incl. any
+        // another in-progress inserter is undecidable, so we drop the latch, wait, and
+        // re-check. Holding the latch across BOTH the scan and the insert (incl. any
         // leaf/parent/root split + `set_root`) is what stops two concurrent inserts of
-        // the same key from both passing the check and both inserting. As of E2b
-        // (concurrent writers) this is load-bearing: the loser of a same-key race sees
-        // the winner's entry and gets `UniqueViolation` (committed) or
-        // `SerializationFailure` (in-flight), never a silent double-insert.
+        // the same key from both passing the check and both inserting.
         {
             let latch = self.structural_latch(index_fid);
             loop {
@@ -551,8 +548,8 @@ impl StorageEngine for PageBackedStorageEngine {
         // old one. The uniqueness check now sees the old version as own-deleted
         // (`xmax == ctx.txn_id` ⇒ `UniqueConflict::None`), so the unchanged PK does not
         // falsely self-conflict; a collision with a *different* committed-live row is a
-        // `UniqueViolation`, and one with another in-progress inserter is a
-        // `SerializationFailure` (retry — §7.3). The latch is taken AFTER the
+        // `UniqueViolation`, and one with another in-progress inserter waits and
+        // re-checks. The latch is taken AFTER the
         // `stamp_xmax_logged` above (which holds only a frame latch, no structural
         // latch) and wraps the whole `insert` incl. any split/root-split; it is
         // released before the secondary inserts each take their own latch (rule 1).

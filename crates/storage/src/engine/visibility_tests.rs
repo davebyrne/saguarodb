@@ -687,16 +687,15 @@ fn unique_secondary_aborted_creator_does_not_conflict() {
     assert_eq!(err.code, common::SqlState::UniqueViolation);
 }
 
-// --- E1c: concurrent-inserter unique conflicts as 40001 vs 23505 (mvcc.md §7.3) ---
+// --- Concurrent-inserter unique conflicts: wait, then 23505 or success ---
 //
 // A key held by another transaction's still-uncommitted insert is undecidable:
 // the inserter cannot tell whether it is a true duplicate (that txn may yet
-// abort), so it returns `SerializationFailure` (40001, retry) rather than the
-// definite `UniqueViolation` (23505). These are planted with the existing
-// CLOG-driving fixture: insert under a creator txn and leave it in-progress
-// (no Commit/Abort) to model the concurrent uncommitted inserter, then commit or
-// abort it to settle the outcome. Under serialized writers this case cannot
-// arise at runtime (E2b), so the engine tests plant it directly.
+// abort), so the racer blocks on that transaction, then re-checks: commit becomes
+// a definite `UniqueViolation` (23505), abort frees the key. These are planted
+// with the CLOG-driving fixture: insert under a creator txn and leave it
+// in-progress (no Commit/Abort) to model the concurrent uncommitted inserter, then
+// commit or abort it from the waiter to settle the outcome.
 
 /// A committed table with a (non-unique by default) `users_name` secondary index.
 fn fixture_with_table_and_name_index() -> Fixture {
@@ -1633,9 +1632,8 @@ fn update_proceeds_when_deleter_aborted() {
     );
 }
 
-/// The no-op-under-serialized-writers case: a plain DELETE/UPDATE of a row whose
-/// `xmax = INVALID` (no prior lock) proceeds normally — the conflict check returns
-/// `Proceed` and behavior is unchanged.
+/// Plain DELETE/UPDATE of a row whose `xmax = INVALID` (no prior lock) proceeds
+/// normally — the conflict check returns `Proceed`.
 #[test]
 fn delete_and_update_of_unlocked_row_proceed() {
     let (fixture, _rid) = fixture_with_one_row_and_index();

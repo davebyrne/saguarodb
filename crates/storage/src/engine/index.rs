@@ -9,10 +9,10 @@ impl PageBackedStorageEngine {
     /// conflicts only with an alive-or-potentially-alive version; dead/aborted
     /// versions are ignored). A committed-live duplicate raises
     /// [`SqlState::UniqueViolation`] (`23505`); a value held only by another
-    /// in-progress inserter raises [`SqlState::SerializationFailure`] (`40001`,
-    /// retry — §7.3). A NULL indexed value never participates in a unique constraint
-    /// (SQL treats NULLs as distinct), so the check is skipped when `has_null`;
-    /// distinct NULL rows coexist because their heap TIDs differ.
+    /// in-progress inserter makes the caller drop the structural latch, wait on
+    /// that transaction, and re-check. A NULL indexed value never participates in a
+    /// unique constraint (SQL treats NULLs as distinct), so the check is skipped
+    /// when `has_null`; distinct NULL rows coexist because their heap TIDs differ.
     pub(super) fn insert_secondary_entry(
         &self,
         ctx: &StatementContext,
@@ -91,12 +91,9 @@ impl PageBackedStorageEngine {
     /// another candidate is only in-flight; only when no candidate is a definite
     /// duplicate but at least one is in-flight do we return `WouldBlock`.
     ///
-    /// While writers are serialized (Stage 1) no concurrent uncommitted inserter
-    /// exists, so this never returns `WouldBlock` at runtime and every index entry is
-    /// a committed, non-deleted tuple — it returns `Violation` exactly when the old
-    /// presence-probe / boolean check did, so existing uniqueness behavior is
-    /// unchanged. The `WouldBlock` arm becomes load-bearing once writers run
-    /// concurrently (Milestone E2b).
+    /// Under the current shared-writer model, `WouldBlock` is a normal concurrent
+    /// uniqueness outcome: callers must not hold an index structural latch while
+    /// waiting, because the blocker may need that latch to finish.
     pub(super) fn unique_conflict_kind(
         &self,
         index_btree: &BTree<'_, RowLocation>,

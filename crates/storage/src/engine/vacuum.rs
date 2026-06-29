@@ -47,9 +47,9 @@ impl PageBackedStorageEngine {
     /// **Latching (lock order: structural → frame → WAL).** Per page, takes the
     /// per-heap structural latch then the frame write latch, releasing both before the
     /// next page (never held across pages). VACUUM runs under the exclusive
-    /// concurrency guard today (no concurrent writers, §10 Milestone F), so these
-    /// uncontended latches are forward-looking: a future concurrent VACUUM is then a
-    /// guard change, not a rewrite of this method.
+    /// checkpoint guard, so no writer runs during the pass; using the same latch
+    /// order here keeps the page-level primitive consistent with normal heap
+    /// mutations.
     ///
     /// **`vacuum_txn` = 0 (the recovery/maintenance convention).** Pages are dirtied
     /// and logged under txn id `0`, the same id recovery uses for non-transactional
@@ -77,18 +77,22 @@ impl PageBackedStorageEngine {
         let mut reclaimed: Vec<RowLocation> = Vec::new();
         let mut freed_count: usize = 0;
         for page_num in 0..page_count {
+            if self.buffer_pool.is_page_abandoned(file_id, page_num) {
+                continue;
+            }
+            {
+                let guard = self.buffer_pool.read_page(file_id, page_num)?;
+                if !page::is_initialized(guard.data()) {
+                    continue;
+                }
+            }
+
             // Lock order: structural latch → frame write latch → (WAL mutex inside the
             // append). Both are released at the end of each iteration so no latch is
             // held across pages (rule 1: never two structural latches; forward-looking
             // for a concurrent VACUUM).
             let _heap_guard = latch.lock();
             let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
-
-            // An uninitialized frame (e.g. a never-written page in the extent) carries
-            // no tuples to classify.
-            if !page::is_initialized(guard.data()) {
-                continue;
-            }
 
             // Chain-aware classification (H3): compute, for THIS page, the line-pointer
             // rewrites (root → REDIRECT / DEAD, heap-only member → UNUSED) and the

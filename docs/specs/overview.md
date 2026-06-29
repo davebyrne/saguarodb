@@ -307,21 +307,21 @@ pub trait FlushPolicy: Send + Sync {
 
 ```rust
 /// Coarse concurrency control. Server query orchestration acquires a guard
-/// before executing any statement. `begin_read()` yields a shared read guard
-/// (lock-free concurrent readers); `begin_writer()` yields a SHARED writer
-/// guard (concurrent writers run simultaneously); `begin_checkpoint()` yields
-/// an EXCLUSIVE guard used by both checkpoint and `VACUUM`, which drains
-/// in-flight writers while readers stay lock-free.
+/// before executing DML, DDL, checkpoint, or maintenance statements. Readers are
+/// lock-free and take no guard; `begin_writer()` yields a SHARED writer guard
+/// (concurrent DML writers run simultaneously); `begin_checkpoint()` yields
+/// an EXCLUSIVE guard used by checkpoint, `VACUUM`, and autocommit DDL, which
+/// drains in-flight writers while readers stay lock-free.
 ///
 /// Guards are owned types (no lifetime parameter) that hold Arc references
 /// internally and release the guard on Drop. This keeps the trait object-safe
 /// (usable as Box<dyn ConcurrencyController>) and avoids GAT complexity.
-/// The concrete controller uses an RwLock internally: readers and writers
-/// share it; checkpoint/VACUUM take it exclusively.
+/// The concrete controller uses an RwLock internally: DML writers share it;
+/// checkpoint/VACUUM/autocommit DDL take it exclusively. Readers take no guard.
 pub trait ConcurrencyController: Send + Sync {
-    fn begin_read(&self) -> Result<ReadGuard>;
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
+    fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
 }
 
 pub struct RwLockConcurrencyController { /* parking_lot::RwLock<()> */ }
@@ -330,16 +330,12 @@ impl RwLockConcurrencyController {
     pub fn new() -> Self;
 }
 
-/// Owned read guard. Holds an Arc to the lock internally.
-/// Releases the shared lock on Drop. Send + Sync safe.
-pub struct ReadGuard { /* Arc<RwLock<...>> + guard state */ }
-
 /// Owned shared writer guard. Holds an Arc to the lock internally.
 /// Concurrent writers hold it simultaneously; releases on Drop. Send safe.
 pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
-/// Owned exclusive guard for checkpoint and VACUUM. Drains in-flight writers
-/// (readers stay lock-free) and releases on Drop. Send safe.
+/// Owned exclusive guard for checkpoint, VACUUM, and autocommit DDL. Drains
+/// in-flight writers (readers stay lock-free) and releases on Drop. Send safe.
 pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
 ```
 
@@ -1026,7 +1022,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 
 ### EXPLAIN
 
-`Statement::Explain` is handled by server `QueryService`, not by the executor. The server acquires a read guard, binds the inner statement to `BoundStatement::Explain(inner_bound)`, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
+`Statement::Explain` is handled by server `QueryService`, not by the executor. The server binds the inner statement lock-free to `BoundStatement::Explain(inner_bound)`, plans the inner bound statement only, formats the resulting `PhysicalPlan` with planner-owned `format_explain`, and returns `ExecutionResult::Explanation`. `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly. Each plan node implements a `Display`-like method that shows the operator type, table/index involved, and any filter predicates.
 
 ### Planner Non-Goals
 
@@ -1299,6 +1295,15 @@ pub trait BufferPool: Send + Sync {
     /// The returned PageWriteGuard exposes page_num() for row-location tracking.
     fn new_page(&self, file_id: FileId, txn_id: u64) -> Result<PageWriteGuard>;
 
+    /// Abandon an unpublished fresh page whose first redo append failed before
+    /// any bytes were published; consumes the new-page guard and removes/reuses
+    /// the allocation instead of leaving a phantom page in the full extent.
+    fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()>;
+
+    /// True for an interior abandoned fresh-page hole that full-extent maintenance
+    /// should skip.
+    fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool;
+
     /// Insert an exact clean page into the pool (does not mark it dirty).
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()>;
 
@@ -1349,7 +1354,7 @@ impl PageWriteGuard {
 }
 ```
 
-`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The fresh-page insertion path rejects an already resident `(file_id, page_num)` with an internal error instead of overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, dirty transaction ID, and rollback metadata unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback of a new page removes the page but does not need to reuse its page number.
+`new_page(file_id, txn_id)` allocates the next unused page number for that file and returns a guard whose `page_num()` identifies the new page. The fresh-page insertion path rejects an already resident `(file_id, page_num)` with an internal error instead of overwriting it. The pool tracks `next_page_num_by_file`; `load_page(file_id, page_num, data)` inserts `data` as a clean frame when the page is not resident. If `(file_id, page_num)` is already resident, `load_page` leaves resident bytes, dirty state, and dirty transaction ID unchanged, still advances the next-page counter to at least `page_num + 1`, and returns `Ok(())`. Rollback does not remove fresh pages. Only `abandon_unpublished_new_page(guard)` removes or marks reusable an unpublished fresh page, and callers use it only when the first redo append for that page failed before any page image was published. The API consumes the still-held `new_page` guard and refuses abandonment after mutable bytes have been exposed.
 
 Guards are owned types (no lifetime parameter) — same rationale as the concurrency controller guards. They hold `Arc` references to the buffer pool frame internally, which keeps `BufferPool` object-safe. The Arc overhead is one reference count per page access, negligible compared to the I/O it represents.
 
@@ -1427,7 +1432,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records replay only for committed transactions. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`) and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index IDs so orphan page files cannot be reused. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -1547,27 +1552,27 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full
 
 ### Write Protocol
 
-Writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple writers run concurrently; write-write safety comes from first-updater-wins conflict detection (`SqlState::SerializationFailure`, `40001`) plus per-index and per-heap structural latches (lock order: structural → frame → WAL). The protocol for a single autocommit statement:
+Data writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple DML writers run concurrently; write-write safety comes from first-updater-wins conflict detection (`SqlState::SerializationFailure`, `40001`) plus per-index and per-heap structural latches (lock order: structural → frame → WAL). DDL is non-transactional and instead takes the **exclusive** guard for its autocommit statement so catalog rollback cannot race another committed DDL change. The protocol for a single autocommit DML statement:
 
 1. Acquire a shared writer guard via `controller.begin_writer()` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers)
 2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
-4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the CLOG; not fsynced) and deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore when needed; return error to client and drop write guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If cleanup fails before the commit record is durable, log the failure, attempt to flush WAL, and exit.
+4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the in-memory CLOG; not fsynced) and only then deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore when the failed statement was DDL), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore only for catalog-mutating DDL; return error to client and drop the statement guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If the Abort append fails before the commit record is durable, log the failure, attempt to flush WAL, and exit without deregistering the transaction. If post-abort cleanup fails, normal query paths also exit fatally rather than returning with uncertain DDL metadata; direct internal callers surface the cleanup error for tests.
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
 8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — cleanup-only (the buffer pool tracks no rollback metadata under status-based abort); deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
 9. Drop the shared writer guard
-10. Call `record_commit_and_maybe_checkpoint(&components)`; it may acquire the exclusive checkpoint guard for a checkpoint
-11. Return success to the client
+10. Call best-effort `record_commit_and_maybe_checkpoint(&components)`; it may acquire the exclusive checkpoint guard for a checkpoint
+11. Return success to the client once the commit is durable and cleanup has completed. If this post-commit checkpoint step fails, log the checkpoint failure and leave the transaction committed; the server must not roll it back or report a normal SQL error for a transaction that already committed.
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback. It logs the fatal internal error, flushes WAL, and terminates because recovery will replay the durable commit.
 
-Reads acquire a shared read guard via `controller.begin_read()` and proceed concurrently with each other and with writers (readers are lock-free and never block writers). Only the exclusive checkpoint/VACUUM guard drains in-flight writers; readers stay lock-free throughout.
+Reads take no `ConcurrencyController` guard and proceed concurrently with each other and with writers. Only the exclusive checkpoint/VACUUM/DDL guard drains in-flight writers; readers stay lock-free throughout.
 
 ### Failed Statement Rollback
 
-If a write statement errors after mutating pages but before commit (e.g., a constraint violation mid-batch INSERT, or an internal error after allocating a page), dirty pages from that `txn_id` must be rolled back — they must not be visible to subsequent reads or included in the next checkpoint.
+If a write statement errors after mutating pages but before commit (e.g., a constraint violation mid-batch INSERT, or an internal error after allocating a page), dirty pages from that `txn_id` are not physically undone under MVCC. They must instead be made invisible by recording `CLOG[txn_id] = Aborted` before the transaction is deregistered, and any fresh unreachable page without a redo record must not be left dirty for checkpoint/steal to flush.
 
 **Policy (MVCC): status-based abort, no page undo.**
 
@@ -1582,7 +1587,7 @@ With MVCC (Milestone D1, `docs/specs/mvcc.md` §4 Decision 3) abort is purely st
 **Failure path:**
 1. `write_page(file, page, txn_id)` — marks the page dirty
 2. ... (statement fails mid-execution) ...
-3. Append an `Abort` record (CLOG → `Aborted`; not fsynced) and deregister the txn from the active-transaction registry
+3. Append an `Abort` record (CLOG → `Aborted`; not fsynced) and deregister the txn from the active-transaction registry only after that append succeeds
 4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index schema shadow state); it does NOT touch heap/index page content
 5. `buffer_pool.rollback(txn_id)` — no-op bookkeeping clear (the dirty pages stay, hidden by the CLOG)
 6. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
@@ -1615,11 +1620,11 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 - Crash between steps 6 and 7: the new control record is durable and the heap is consistent; the un-truncated WAL tail replays idempotently under PageLSN gating.
 - Crash after step 7: consistent.
 
-**Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O.
+**Checkpoint frequency:** Triggered by configurable thresholds — every N committed statements or M bytes of WAL. `CheckpointState.last_checkpoint_lsn` starts from the loaded manifest checkpoint LSN, and `CheckpointState.commits_since_checkpoint` starts at `0`. After each successful write statement and after its statement guard is dropped, server calls best-effort `record_commit_and_maybe_checkpoint(&components)`, which increments the commit counter and triggers `run_checkpoint(&components)` when `commits_since_checkpoint >= config.checkpoint_every_n_commits` or `wal.bytes_after(last_checkpoint_lsn)? >= config.checkpoint_wal_bytes`. A successful checkpoint stores the new checkpoint LSN and resets the commit counter to `0`. If a post-commit checkpoint attempt fails, the failure is logged and the non-reset counter lets a later write retry. Checkpoint is also triggered on clean shutdown. More frequent checkpoints mean shorter WAL replay on startup but more I/O.
 
 ### Crash Recovery (REDO)
 
-The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records replay only for committed transactions.
+The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index IDs so orphan page files are not reused.
 
 **Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
@@ -1651,7 +1656,7 @@ impl PageBackedStorageEngine {
 1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
 2. Initialize storage in recovery mode and the catalog; `install_schemas`.
 3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
-4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — DDL via `RecoveryOperations` only for committed transactions. The CLOG (rebuilt from `Commit`/`Abort`) decides visibility; aborted/in-flight versions are invisible.
+4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — DDL via `RecoveryOperations` only for committed transactions, with allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` IDs. The CLOG (rebuilt from `Commit`/`Abort`) decides visibility; aborted/in-flight versions are invisible.
 5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
 6. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
@@ -1672,6 +1677,9 @@ pub struct Catalog {
     tables_by_name: HashMap<String, TableId>,
     tables_by_id: HashMap<TableId, TableSchema>,
     next_table_id: TableId,
+    indexes_by_name: HashMap<String, IndexId>,
+    indexes_by_id: HashMap<IndexId, IndexSchema>,
+    next_index_id: IndexId,
 }
 
 pub struct TableSchema {
@@ -1684,7 +1692,7 @@ pub struct TableSchema {
 
 `ColumnDef` (with `id`, `name`, `data_type`, `nullable`) and `DataType` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only.
 
-The catalog is the authority for name-to-ID resolution. IDs are stable and never reused (monotonically increasing). The binder resolves all names to IDs so that the planner, executor, and storage engine work exclusively with IDs.
+The catalog is the authority for name-to-ID resolution. Table IDs and secondary-index IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts. The binder resolves all names to IDs so that the planner, executor, and storage engine work exclusively with IDs.
 
 ### Catalog Trait
 
@@ -1701,6 +1709,7 @@ pub trait CatalogManager: Send + Sync {
 
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
+    fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
 
@@ -1715,6 +1724,20 @@ pub trait CatalogManager: Send + Sync {
 
     /// Remove a table
     fn drop_table(&self, id: TableId) -> Result<()>;
+
+    fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
+    fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
+    fn reserve_index_id(&self, id: IndexId) -> Result<()>;
+    fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_drop_index(&self, id: IndexId) -> Result<()>;
+    fn create_index(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<IndexSchema>;
+    fn drop_index(&self, id: IndexId) -> Result<()>;
 }
 ```
 
@@ -1723,10 +1746,13 @@ pub struct CatalogSnapshot {
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
+    pub indexes_by_name: HashMap<String, IndexId>,
+    pub indexes_by_id: HashMap<IndexId, IndexSchema>,
+    pub next_index_id: IndexId,
 }
 ```
 
-Empty catalogs start with `next_table_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing IDs and advances `next_table_id` past that schema ID; `apply_drop_table` removes by ID without assigning IDs.
+Empty catalogs start with `next_table_id = 1` and `next_index_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing IDs and advances `next_table_id` past that schema ID; `reserve_table_id` advances the table allocator past an ID without installing a schema; `apply_drop_table` removes by ID without assigning IDs. `apply_create_index`/`apply_drop_index` do the same for secondary indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` WAL records so their IDs are not reused while their physical page records may have replayed as orphan files.
 
 ### Persistence
 
@@ -1734,7 +1760,7 @@ The catalog is stored in the control record (`data/manifest.dat`) at each checkp
 
 ### WAL Integration
 
-`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex` records.
+`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex` records. Aborted/in-flight `CreateTable` and `CreateIndex` records are not installed, but their IDs are reserved so later objects do not reuse file names whose orphan page records may have been replayed.
 
 ### Concurrency
 
@@ -1754,14 +1780,14 @@ The `server` crate is the binary entry point.
 6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
 7. Initialize catalog from the control catalog bytes (or empty); `storage.install_schemas(catalog.list_tables()?)`
 8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
-9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, DDL via `RecoveryOperations` only for committed transactions — the CLOG decides visibility; no WAL appended in recovery mode
-10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized to one greater than the maximum retained user WAL `txn_id`.
+9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, DDL via `RecoveryOperations` only for committed transactions, and allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` IDs — the CLOG decides visibility; no WAL appended in recovery mode
+10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water).
 11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
 12. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
 13. Construct `QueryService` from `components`
 14. Start Tokio runtime, bind TCP listener (default port 5433)
 
-Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(checkpoint_lsn)`, including committed operations, uncommitted operations, and `Commit` records, while ignoring `txn_id = 0` records. `next_txn_id` starts at `max_txn_id + 1`, or `1` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
+Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
 The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, and `30000`. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
 
@@ -1786,12 +1812,13 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
-- **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, calls `begin_read()`, receives a read guard, then binds and plans. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
-- **Read-write statements** (`INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. Writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
+- **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
+- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
+- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` also gets a stable physical chain view for backfill.
 - **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. See `docs/specs/mvcc.md` §9/§10 Milestone F for the orchestration (heap-prune → index-vacuum → line-pointer-reclaim) and the GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
-The concrete `ConcurrencyController` is an `RwLock`: `begin_read()` and `begin_writer()` take it shared (readers and writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint and VACUUM. This boundary keeps lock-free readers, concurrent writers, DDL, and redo-all recovery correct.
+The concrete `ConcurrencyController` is an `RwLock`: `begin_writer()` takes it shared (DML writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint, VACUUM, and DDL. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.
 
 **Other latches:**
 - **Buffer pool:** Frame-level read/write latches managed by page guards.

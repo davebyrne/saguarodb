@@ -50,7 +50,7 @@ pub trait RecoveryOperations: Send + Sync {
 }
 ```
 
-`RecoveryOperations` carries only DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. `rollback_txn` restores storage-owned table metadata; index and heap page bytes (including B-tree splits) are restored by `BufferPool::rollback` via its before-images and new-page tracking. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RecoveryOperations` carries only DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
 ## Table Storage
 
@@ -390,12 +390,14 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
 - **Full-extent scan.** It iterates `0..BufferPool::page_count(heap_file_id)`,
   faulting each page in (resident or from disk), rather than only the resident pages
   `iter_pages` reports — an evicted page holding dead tuples must still be vacuumed,
-  else GC is incomplete.
+  else GC is incomplete. It skips buffer-reported abandoned fresh-page holes and
+  reads a page before taking its write latch, so an uninitialized sparse page is
+  skipped without being dirtied or flushed.
 - **Latching.** Per page it takes the per-heap structural latch then the frame write
   latch (lock order structural → frame → WAL) and releases both before the next page
-  (never held across pages). VACUUM runs under the exclusive concurrency guard at
-  this milestone (no concurrent writers), so these uncontended latches are
-  forward-looking.
+  (never held across pages). VACUUM runs under the exclusive checkpoint guard, so
+  no writer runs during the pass; the latches keep the same lock ordering as normal
+  heap mutations and make the page-level primitive safe if reused elsewhere.
 - **Maintenance txn.** Pages are dirtied and logged under txn id `0` — the
   recovery/maintenance convention (shared with `fetch_for_redo`) — because VACUUM is
   non-transactional maintenance: its reclamation must not be undone by an abort or
@@ -522,22 +524,22 @@ rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
    **before** appending any WAL record or mutating the page — it re-reads the
    version's *current physical* header `xmax`/`infomask` and runs the first-updater-
    wins check `common::write_conflict` (`mvcc.md` §7.3, Milestone E1b). On
-   `Conflict` (another transaction has already claimed this version's `xmax` and is
-   committed or still in-flight) it fails fast with `SqlState::SerializationFailure`
-   (`40001`) **without appending the `HeapUpdateHeader` or stamping** — the winning
-   writer's `xmax` stands. On `Proceed` (no deleter, the deleter aborted, or it is
-   this txn's own lock) it appends a `HeapUpdateHeader { file_id, page_num, slot,
-   xmax = ctx.txn_id, t_ctid = INVALID_TID, infomask = unchanged }` (or a
-   `FullPageImage` on the page's first touch since the last checkpoint) and applies
+   `Conflict` (another committed transaction has already claimed this version's
+   `xmax`) it returns `SqlState::SerializationFailure` (`40001`) **without appending
+   the `HeapUpdateHeader` or stamping** — the winning writer's `xmax` stands. If the
+   holder is still in progress, the caller drops any higher-level latch, blocks on
+   that transaction, and rechecks the current header: committed ⇒ `40001`, aborted
+   ⇒ proceed. On `Proceed` (no deleter, the deleter aborted, or it is this txn's
+   own lock) it appends a `HeapUpdateHeader { file_id, page_num, slot, xmax =
+   ctx.txn_id, t_ctid = INVALID_TID, infomask = unchanged }` (or a `FullPageImage`
+   on the page's first touch since the last checkpoint) and applies
    `page::set_tuple_header` with that record's LSN. The read-classify-stamp sequence
    is atomic on the frame latch, so two concurrent writers racing for this version
-   serialize on the latch and the loser observes the winner's `xmax` (no TOCTOU). Under
-   the current serialized-writer model the located version's `xmax` is `INVALID_XID`
-   (or own), so the check is a runtime no-op; it becomes load-bearing under
-   concurrent writers (Milestone E2b). `t_ctid` stays `INVALID_TID` (a delete has no
-   successor) and `infomask` is carried through unchanged (no hint bits set here —
-   that is the optional commit 10). The line pointer **stays `NORMAL`**: the tuple is
-   physically present and is hidden purely by visibility once the deleter commits.
+   serialize on the latch and the loser observes the winner's `xmax` (no TOCTOU).
+   `t_ctid` stays `INVALID_TID` (a delete has no successor) and `infomask` is
+   carried through unchanged (no hint bits set here — that is the optional commit
+   10). The line pointer **stays `NORMAL`**: the tuple is physically present and is
+   hidden purely by visibility once the deleter commits.
 3. **Retain index entries.** No primary-key or secondary index entry is removed.
    The dead version and its entries linger until VACUUM (Milestone F) reclaims them.
 
@@ -546,11 +548,12 @@ deleted tuple and its index entries persist (the accepted interim cost). Externa
 SQL behavior is unchanged — a committed `DELETE` then `SELECT` does not see the row
 — and **delete-then-reinsert of the same key now succeeds**, because the
 committed-deleted version no longer blocks the re-insert (the uniqueness check
-ignores committed-deleted/aborted versions). On abort, the buffer pool's
-before-image undo restores the page (un-stamping `xmax`); since no index entry was
-removed, no index repair is needed. Recovery replays the `HeapUpdateHeader` redo
-(PageLSN-gated), so a committed delete stays hidden and an aborted one (no durable
-`Commit`) leaves the row visible.
+ignores committed-deleted/aborted versions). On abort, the page is not physically
+undone: the tuple may retain `xmax = aborting_txn`, but the CLOG reports that
+transaction as `Aborted`, so visibility treats the delete as non-effective and the
+row remains visible. Since no index entry was removed, no index repair is needed.
+Recovery replays the `HeapUpdateHeader` redo (PageLSN-gated), so a committed delete
+stays hidden and an aborted one (no durable `Commit`) leaves the row visible.
 
 ### MVCC Update
 
@@ -574,12 +577,13 @@ version carries the same PK as the old. The flow is ordered for correct uniquene
    version's header is stamped `xmax = ctx.txn_id` **and** `t_ctid = new_tid` in
    place via the same `stamp_xmax_logged` path as `delete`, so it runs the identical
    atomic first-updater-wins `write_conflict` check under the frame latch before any
-   WAL append (step 2 above): if another transaction already claimed the old
-   version's `xmax`, the update fails fast with `SqlState::SerializationFailure`
-   (`40001`). The line pointer stays `NORMAL`; `infomask` is carried through. This
-   stamping happens *before* the new version's uniqueness checks, so the old version
-   reads as own-deleted (`xmax == ctx.txn_id`) and does not falsely self-conflict.
-   Because the new version (step 2) was written *before* this stamp, a `40001` here
+   WAL append (step 2 above): if another committed transaction already claimed the
+   old version's `xmax`, the update returns `SqlState::SerializationFailure`
+   (`40001`); if the holder is still in progress, the caller waits and rechecks.
+   The line pointer stays `NORMAL`; `infomask` is carried through. This stamping
+   happens *before* the new version's uniqueness checks, so the old version reads as
+   own-deleted (`xmax == ctx.txn_id`) and does not falsely self-conflict. Because
+   the new version (step 2) was written *before* this stamp, a final `40001` here
    leaves a transient **orphan**: the new heap tuple (the per-version index entries
    of step 4 below have not run yet, so only the tuple is orphaned). No manual
    cleanup is needed — the error aborts the transaction, so the orphan (xmin = the
@@ -596,8 +600,9 @@ version carries the same PK as the old. The flow is ordered for correct uniquene
    Unique indexes (PK and unique secondary) run the visibility-aware
    `unique_conflict_kind` check: a value unchanged from the old version does not
    self-conflict (the old version is own-deleted), but a value colliding with a
-   *different* live row raises `UniqueViolation` (or `SerializationFailure` if that
-   row is held only by an in-progress inserter — §7.3, E1c).
+   *different* live row raises `UniqueViolation`; if the only holder is an
+   in-progress inserter, the writer waits for that transaction and rechecks
+   (§7.3).
 5. **Retain all old entries.** No old index entry — PK or secondary — is removed.
 
 After a committed `UPDATE`, both versions coexist in the heap: the old version
@@ -607,15 +612,16 @@ the dead version and its entries. External SQL is unchanged: a later snapshot se
 the new value via a sequential scan, an index scan on the changed column, and a
 scan on an unchanged secondary value (the new version's entry resolves all three).
 An older snapshot that predates the update still resolves the old version through
-its retained entries. On abort (statement error → autocommit rollback), the buffer
-pool's before-image undo restores every page the update touched — the new tuple's
-heap page and the index pages gain their new entries on a first `new_page`/
-`write_page` for the transaction, so the undo removes them, and the old version's
-header is un-stamped; combined with the `Abort` record (CLOG marks the txn
-aborted), no orphan new version is visible. Recovery replays the new tuple's
-`HeapInsert`/`FullPageImage`, the old version's `HeapUpdateHeader`, and the new
-index-entry page images (all PageLSN-gated), so a committed update's new value
-survives restart and an aborted one leaves the old value.
+its retained entries. On abort (statement error → autocommit rollback), the page
+bytes are not physically undone: the new tuple and its index entries may remain,
+and the old version may retain `xmax = aborting_txn`, but the CLOG reports that
+transaction as `Aborted`. Visibility therefore skips the new aborted version and
+treats the old version's aborted `xmax` as non-effective, leaving the old value
+visible; VACUUM later reclaims the orphaned aborted version and entries. Recovery
+replays the new tuple's `HeapInsert`/`FullPageImage`, the old version's
+`HeapUpdateHeader`, and the new index-entry page images (all PageLSN-gated), so a
+committed update's new value survives restart and an aborted one leaves the old
+value.
 
 ## Row Serialization
 
@@ -674,18 +680,20 @@ bytes (the `IndexValue::encode` form, compared as raw little-endian bytes — a
 stable total order, not necessarily numeric). The tree no longer rejects duplicate
 keys structurally; **primary-key uniqueness is now an engine-level check** (see
 Error Handling and the note below). This is the index-per-version substrate
-(`mvcc.md` §3.2 invariant 3): for now the primary-key index still stores exactly
-one `RowLocation` per key (single version).
+(`mvcc.md` §3.2 invariant 3): the primary-key index stores one `RowLocation` per
+physical tuple version, so old versions keep their entries until VACUUM removes
+the dangling TIDs.
 
 - **API.** `insert(txn_id, key, value)` inserts one `(key, value)` entry (duplicate
   keys allowed). `remove(txn_id, key, value)` removes the single matching
   `(key, value)` entry, leaving other entries that share the key intact.
   `scan_key(key)` returns every value whose key equals `key`, in `(key, value)`
-  order. `search(key)` returns the first (lowest-value) entry for a key — the sole
-  entry for the single-version primary-key index. `range(range)` walks keys in
-  order and may now yield multiple values per key. `update` (in-place value
-  overwrite) is removed; an engine row relocation is a `remove(old)` +
-  `insert(new)`.
+  order. `search(key)` returns the first (lowest-value) entry for a key and is
+  only a structural helper; MVCC lookup paths use `scan_key` plus visibility to
+  choose the visible version. `range(range)` walks keys in order and may yield
+  multiple values per key. The old in-place `update` operation is removed:
+  storage updates write a new tuple version, retain the old index entries, and
+  insert new per-version entries for the new TID.
 - **Pages.** Page 0 is a metapage holding the current root page number. Other
   pages are leaf or internal nodes sharing the standard page header (so they get
   the same PageLSN, checksum, and torn-page protection). A 5-byte node sub-header
@@ -710,16 +718,36 @@ one `RowLocation` per key (single version).
   and propagates a composite separator upward, growing the tree by a level on a
   root split. Routing descends to the left of the first separator strictly greater
   than the probe (a separator equal to the probe routes right, since a separator is
-  the right child's first `(key, value)`).
+  the right child's first `(key, value)`). Leaf inserts also verify the right
+  sibling when the chosen leaf's lower bound lands at the end; if a previously
+  failed parent/root separator append left a leaf split reachable only through the
+  leaf chain, the insert chases right rather than appending into the stale left
+  leaf and breaking key order.
 - **Delete.** Removes the specific `(key, value)` entry; underfull nodes are not
   merged (accepted bloat).
-- **Update.** A row update relocates its heap tuple, so the engine moves the
-  index entry by `remove(key, old_location)` then `insert(key, new_location)`. A
-  row update that would change the primary key itself is rejected by the engine
-  with `SqlState::DatatypeMismatch` (primary-key updates are not supported).
+- **Update.** MVCC row updates retain old index entries and insert a new
+  per-version entry for the new heap TID in every relevant index. The B-tree
+  `remove(key, value)` primitive remains available for maintenance/VACUUM-style
+  exact-entry removal, but normal DML does not call it. A row update that would
+  change the primary key itself is rejected by the engine with
+  `SqlState::DatatypeMismatch` (primary-key updates are not supported).
 - **Crash safety.** Every node mutation logs a `FullPageImage` and stamps the
   page-LSN, so the index is recovered by the same redo path as the heap and needs
-  no rebuild. The node layout is unchanged, so recovery replays these full-page
+  no rebuild. Mutations are staged in scratch page images and copied into the
+  live frame only after the matching WAL append succeeds, so a failed append does
+  not leave unlogged index bytes in memory. If a fresh node's first image append
+  fails before bytes are published, the unpublished page allocation is abandoned in
+  the buffer pool: its resident frame is removed, tail high-water rolls back when
+  possible, and an interior abandoned page number is reused before the file grows.
+  During an internal split, the new right node is logged first, then the old
+  internal node is logged with a fence separator that points at the new right node
+  before any parent (or root/metapage) separator is exposed. If the parent/root
+  update later fails, the stale parent still routes into the old node and that
+  fence reaches the new right subtree; if the parent/root update succeeds, the
+  fence is redundant but harmless because probes at or beyond the separator route
+  directly to the right node from the parent. That ordering keeps every committed
+  prefix of the split sequence searchable without any post-parent deferred page
+  rewrite. The node layout is unchanged, so recovery replays these full-page
   images exactly as before. Page allocation is seeded from each file's on-disk
   extent so a new node never reuses an existing page after recovery.
 - **Keys.** Keys are stored in a self-describing byte form and ordered by decoding
@@ -742,23 +770,18 @@ state. The three-way classification (Milestone E1c, `mvcc.md` §7.3):
 - **`Violation` ⇒ `SqlState::UniqueViolation` (`23505`)** — the version is alive
   *and* a definite duplicate: its creator is committed, is `current_txn` itself (a
   live version I already hold), or is frozen/reserved.
-- **`InFlight` ⇒ `SqlState::SerializationFailure` (`40001`)** — the version is
-  alive but only *potentially* a duplicate: its creator is **another in-progress
-  transaction** that has not committed and may yet abort. Under the fail-fast
-  first-updater-wins policy (§7.3) uniqueness is undecidable, so the inserter fails
-  fast for the client to retry rather than blocking; if the other inserter aborts,
-  the retry succeeds.
+- **`WouldBlock(txn)` ⇒ wait and recheck** — the version is alive but only
+  *potentially* a duplicate: its creator is **another in-progress transaction**
+  that has not committed and may yet abort. Uniqueness is undecidable until that
+  transaction finishes, so the writer drops the structural latch, waits on the
+  creator (`docs/specs/deadlock.md`), then rechecks: committed ⇒ `23505`, aborted
+  ⇒ no conflict.
 
 `unique_conflict_kind` returns the **strongest** conflict across all candidates
-(precedence `Violation > InFlight > None`): a single committed-live duplicate is a
+(precedence `Violation > WouldBlock > None`): a single committed-live duplicate is a
 definite `23505` even if another candidate is only in-flight. A DEAD/UNUSED line
-pointer contributes no conflict. This replaces the earlier temporary
-presence-probe; **under serialized writers (Stage 1) no concurrent uncommitted
-inserter exists, so the `InFlight` arm never fires at runtime and the check rejects
-exactly the same inputs with `23505` as before** — it becomes load-bearing once
-writers run concurrently (Milestone E2b). Once versioning (Milestone B4) stamps
-`xmax`/writes aborted versions, a dead version with the same key no longer blocks a
-re-insert.
+pointer contributes no conflict. Once versioning stamps `xmax`/writes aborted
+versions, a dead version with the same key no longer blocks a re-insert.
 
 The B-tree is generic over its leaf value type, but every index — primary-key and
 secondary — now stores a fixed-width `RowLocation` (heap TID), so all indexes are
@@ -788,15 +811,12 @@ used for a secondary index.
   with an alive-or-potentially-alive version of the key, ignoring dead
   (creator-aborted) and committed-deleted versions. For a non-NULL indexed value it
   returns `SqlState::UniqueViolation` (`23505`) when a committed/own/frozen-live
-  duplicate exists, and `SqlState::SerializationFailure` (`40001`, retry — §7.3,
-  Milestone E1c) when the only conflicting version was created by another
-  in-progress transaction (undecidable). The check is **skipped for a NULL indexed
-  value**: SQL treats NULLs as distinct, so NULL never participates in a unique
-  constraint (neither `23505` nor `40001`), and distinct NULL rows coexist naturally
-  via their differing heap TIDs. This replaces the earlier temporary presence-probe;
-  under serialized writers the `40001` arm never fires and single-version behavior
-  is unchanged — it becomes load-bearing once writers run concurrently (Milestone
-  E2b).
+  duplicate exists. If the only conflicting non-NULL value is held by another
+  in-progress inserter, the writer waits for that transaction and rechecks instead
+  of returning a duplicate verdict from an undecidable state. The check is
+  **skipped for a NULL indexed value**: SQL treats NULLs as distinct, so NULL never
+  participates in a unique constraint, and distinct NULL rows coexist naturally via
+  their differing heap TIDs.
 - **Lookup / range.** `index_scan(table, index, range)` constrains the leading
   indexed columns; the range bounds hold exactly those columns, and comparison
   ignores each stored key's trailing TID tiebreaker (the leaf value). An equality
@@ -806,12 +826,12 @@ used for a secondary index.
   row's primary key.
 - **Maintenance.** `insert` adds an entry to every index. `delete` removes **no**
   entry — it stamps the deleted version's `xmax` in place and retains its entries
-  (VACUUM reclaims them; see MVCC Delete). `update` removes the old entries and
-  inserts the new ones (all removals before any insertion, so an unchanged unique
-  value is not seen as a duplicate). A unique-index conflict during `insert` or
-  `update` returns `SqlState::UniqueViolation` for a committed-live duplicate, or
-  `SqlState::SerializationFailure` (`40001`) when the key is held only by another
-  in-progress inserter (Milestone E1c, §7.3).
+  (VACUUM reclaims them; see MVCC Delete). `update` likewise removes no old index
+  entry; it inserts a new per-version entry into every index for the new heap TID,
+  while old entries linger until VACUUM. A unique-index conflict during `insert` or
+  `update` returns `SqlState::UniqueViolation` for a committed-live duplicate; when
+  the key is held only by another in-progress inserter, the writer waits for that
+  transaction and rechecks (§7.3).
 - **Create / drop.** `create_index` registers the index, builds an empty tree,
   and backfills it by scanning the live rows through the primary-key index
   (a duplicate value for a unique index fails the build with `UniqueViolation`).
@@ -843,15 +863,16 @@ file's on-disk extent in pages, used to seed page allocation after recovery.
 (`HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`) onto a page buffer, gated by
 the page-LSN: a record whose effect is already present (`page_lsn(page) >= lsn`) is
 skipped, making replay idempotent. `FullPageImage` is validated to be exactly
-`PAGE_SIZE` bytes before install. Recovery uses it to redo committed records after
-the checkpoint LSN.
+`PAGE_SIZE` bytes before install. Recovery uses it to redo every physical page
+mutation after the checkpoint LSN, regardless of the dirtying transaction's
+outcome; the CLOG decides whether replayed versions are visible.
 
 ## WAL Interaction
 
 Normal data operations append physiological redo records as they mutate pages, stamping the page-LSN with each record's LSN:
 
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
-- An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). `HeapDelete { file_id, page_num, slot }` is still logged by `update`'s relocate path (an update is a delete followed by an insert), retired in Milestone B4.9.
+- An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
 - Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
 
@@ -862,7 +883,7 @@ Server query orchestration appends `Commit` and flushes WAL after the statement 
 The storage engine can be initialized in recovery mode. In recovery mode:
 
 - Normal `StorageEngine` methods are not used.
-- Row recovery is physiological page redo: the server drives `apply_physical_redo` over committed records, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations`.
+- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations` only when their transaction is committed.
 - No WAL append occurs.
 - The primary-key and secondary indexes are durable on disk, so their pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild. Which indexes exist is reinstalled from the catalog at startup (`install_index_schemas`).
 
@@ -949,10 +970,9 @@ operation closes both windows.
      acquires a structural latch. The E1b `stamp_xmax_logged` takes only a frame latch
      (no structural latch), so it does not participate in this ordering.
 
-These latches are **uncontended** until E2b removes the global exclusive writer lock:
-under serialized writers only one writer runs at a time, so this commit installs the
-substrate with zero runtime behavior change. Real contention/atomicity stress tests
-arrive in E2b once writers overlap.
+These latches are load-bearing under the current shared-writer model: writers on
+the same heap or index serialize structural mutations here, while writers touching
+different files can proceed concurrently.
 
 ## Page-Backed Simplifications
 
@@ -964,15 +984,15 @@ arrive in E2b once writers overlap.
 - The primary-key index is durable on disk, so nothing is rebuilt after recovery.
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
-- New pages allocated during a statement must be tracked by buffer rollback through `new_page(file, txn_id)`.
-- Index and heap page changes (including B-tree splits) are rolled back by the buffer pool's before-images and new-page tracking, so `rollback_txn(txn_id)` only restores storage-owned table and index metadata.
+- New pages allocated during a statement are not reclaimed on rollback; their page numbers remain consumed so runtime state matches redo-all recovery.
+- Index and heap page changes (including B-tree splits) are not physically undone on rollback. `rollback_txn(txn_id)` only restores storage-owned table and index metadata; row/index versions written by the aborted transaction stay on pages and are hidden by the CLOG until VACUUM.
 - `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. Storage does not physically delete heap or index pages; committed drops are reflected by omitting the table or index from later checkpoints.
 
 ## Error Handling
 
 - Duplicate primary key (committed-live duplicate): `SqlState::UniqueViolation`.
 - Duplicate value in a unique secondary index (insert, update, or backfill, committed-live duplicate): `SqlState::UniqueViolation`.
-- Unique key (primary or secondary) held only by another in-progress inserter — undecidable: `SqlState::SerializationFailure` (`40001`, retry — §7.3, Milestone E1c).
+- Unique key (primary or secondary) held only by another in-progress inserter — undecidable until that transaction finishes; wait and recheck, surfacing `UniqueViolation` only if the holder commits.
 - Update that changes the primary key: `SqlState::DatatypeMismatch` (primary-key updates are not supported).
 - `index_scan` on a dropped or unknown index: `SqlState::UndefinedTable`.
 - Missing update/delete key: return `Ok(false)`.

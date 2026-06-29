@@ -60,11 +60,17 @@ impl PageBackedStorageEngine {
         // page never needs a separate full-page image.
         let mut writable = self.buffer_pool.new_page(file_id, txn_id)?;
         let page_num = writable.page_num();
-        let init_lsn = self.wal.append(WalRecord {
+        let init_lsn = match self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::HeapInit { file_id, page_num },
-        })?;
+        }) {
+            Ok(lsn) => lsn,
+            Err(err) => {
+                self.buffer_pool.abandon_unpublished_new_page(writable)?;
+                return Err(err);
+            }
+        };
         page::init_page(writable.data_mut(), page_num);
         page::set_page_lsn(writable.data_mut(), init_lsn);
         let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;
@@ -86,28 +92,36 @@ impl PageBackedStorageEngine {
         row_bytes: &[u8],
     ) -> Result<u16> {
         if guard.take_needs_fpi() {
-            let slot_num = page::insert_row(guard.data_mut(), row_bytes)?;
-            let lsn = self.wal.append(WalRecord {
+            let mut image = *guard.data();
+            let slot_num = match page::insert_row(&mut image, row_bytes) {
+                Ok(slot_num) => slot_num,
+                Err(err) => {
+                    guard.restore_needs_fpi();
+                    return Err(err);
+                }
+            };
+            let record = WalRecord {
                 lsn: 0,
                 txn_id,
                 kind: WalRecordKind::FullPageImage {
                     file_id,
                     page_num,
-                    image: guard.data().to_vec(),
+                    image: image.to_vec(),
                 },
-            })?;
-            page::set_page_lsn(guard.data_mut(), lsn);
+            };
+            let lsn = match self.wal.append(record) {
+                Ok(lsn) => lsn,
+                Err(err) => {
+                    guard.restore_needs_fpi();
+                    return Err(err);
+                }
+            };
+            page::set_page_lsn(&mut image, lsn);
+            *guard.data_mut() = image;
             Ok(slot_num)
         } else {
-            // Insert into the buffer FIRST, then log the slot id it actually landed
-            // in. `insert_row` recycles an UNUSED slot id before appending (F3b), so
-            // the produced slot is no longer predictable as `next_slot`; logging the
-            // real slot keeps the `HeapInsert` redo exact (its redo re-runs
-            // `insert_row` and asserts the same slot id is reproduced). Mutating the
-            // buffer before appending the record mirrors the FPI arm above and is
-            // WAL-safe: the page-LSN is stamped with the record's LSN below, so the
-            // dirty page cannot be flushed ahead of its WAL record.
-            let slot_num = page::insert_row(guard.data_mut(), row_bytes)?;
+            let mut image = *guard.data();
+            let slot_num = page::insert_row(&mut image, row_bytes)?;
             let lsn = self.wal.append(WalRecord {
                 lsn: 0,
                 txn_id,
@@ -118,7 +132,8 @@ impl PageBackedStorageEngine {
                     row_bytes: row_bytes.to_vec(),
                 },
             })?;
-            page::set_page_lsn(guard.data_mut(), lsn);
+            page::set_page_lsn(&mut image, lsn);
+            *guard.data_mut() = image;
             Ok(slot_num)
         }
     }
@@ -268,29 +283,47 @@ impl PageBackedStorageEngine {
         }
 
         if guard.take_needs_fpi() {
-            // Mutate the header first, then capture the page in a full-page image.
-            // Keep the existing page-LSN on this in-place stamp; the FPI append
-            // below assigns the record's LSN as the new page-LSN.
-            let current_lsn = page::page_lsn(guard.data());
-            page::set_tuple_header(
-                guard.data_mut(),
+            let mut image = *guard.data();
+            let current_lsn = page::page_lsn(&image);
+            if let Err(err) = page::set_tuple_header(
+                &mut image,
                 location.slot_num,
                 txn_id,
                 t_ctid,
                 infomask,
                 current_lsn,
-            )?;
-            let lsn = self.wal.append(WalRecord {
+            ) {
+                guard.restore_needs_fpi();
+                return Err(err);
+            }
+            let record = WalRecord {
                 lsn: 0,
                 txn_id,
                 kind: WalRecordKind::FullPageImage {
                     file_id: location.file_id,
                     page_num: location.page_num,
-                    image: guard.data().to_vec(),
+                    image: image.to_vec(),
                 },
-            })?;
-            page::set_page_lsn(guard.data_mut(), lsn);
+            };
+            let lsn = match self.wal.append(record) {
+                Ok(lsn) => lsn,
+                Err(err) => {
+                    guard.restore_needs_fpi();
+                    return Err(err);
+                }
+            };
+            page::set_page_lsn(&mut image, lsn);
+            *guard.data_mut() = image;
         } else {
+            let mut image = *guard.data();
+            page::set_tuple_header(
+                &mut image,
+                location.slot_num,
+                txn_id,
+                t_ctid,
+                infomask,
+                page::page_lsn(guard.data()),
+            )?;
             let lsn = self.wal.append(WalRecord {
                 lsn: 0,
                 txn_id,
@@ -303,14 +336,8 @@ impl PageBackedStorageEngine {
                     infomask,
                 },
             })?;
-            page::set_tuple_header(
-                guard.data_mut(),
-                location.slot_num,
-                txn_id,
-                t_ctid,
-                infomask,
-                lsn,
-            )?;
+            page::set_page_lsn(&mut image, lsn);
+            *guard.data_mut() = image;
         }
         Ok(StampOutcome::Stamped)
     }

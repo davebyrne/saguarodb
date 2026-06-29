@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -53,6 +53,8 @@ pub struct PageWriteGuard {
     page_num: PageNum,
     frame: Arc<Frame>,
     guard: PageWriteLatch,
+    unpublished_new: bool,
+    bytes_published: bool,
 }
 
 impl PageWriteGuard {
@@ -69,6 +71,7 @@ impl PageWriteGuard {
     }
 
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        self.bytes_published = true;
         &mut self.guard.0
     }
 
@@ -77,6 +80,13 @@ impl PageWriteGuard {
     /// caller logs a `FullPageImage` when true, else a delta record.
     pub fn take_needs_fpi(&self) -> bool {
         self.frame.needs_fpi.swap(false, Ordering::AcqRel)
+    }
+
+    /// Restore the "needs full-page image" flag after a failed first-touch WAL
+    /// attempt. Callers hold this page's write latch, so no other writer can have
+    /// completed the first post-checkpoint modification in between.
+    pub fn restore_needs_fpi(&self) {
+        self.frame.needs_fpi.store(true, Ordering::Release);
     }
 }
 
@@ -112,12 +122,12 @@ pub trait BufferPool: Send + Sync {
     /// [`BufferPool::read_page`]/[`BufferPool::write_page`], so an evicted dead tuple
     /// is never missed.
     fn page_count(&self, file_id: FileId) -> Result<PageNum>;
+    fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()>;
+    fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool;
     fn mark_all_clean(&self) -> Result<()>;
-    /// Release the pages an aborting transaction freshly *allocated* but never
-    /// durably committed (drop their frames, restore the allocation counter). Abort
-    /// is status-based (`docs/specs/mvcc.md` §4 Decision 3): pages the transaction
-    /// merely modified are NOT undone — they stay dirty-but-evictable and the CLOG
-    /// hides their tuples. Clears the transaction's dirty bookkeeping.
+    /// Abort cleanup is status-based (`docs/specs/mvcc.md` §4 Decision 3): no
+    /// page bytes are undone and freshly allocated pages are not reclaimed. Clears
+    /// only per-transaction bookkeeping.
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
 
@@ -133,7 +143,7 @@ pub trait BufferPool: Send + Sync {
     /// post-recovery checkpoint.
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
 
-    /// Allow eviction to flush+evict committed dirty pages (steal). Disabled until
+    /// Allow eviction to flush+evict WAL-durable dirty pages (steal). Disabled until
     /// the server enables it during startup (before redo).
     fn enable_stealing(&self);
 }
@@ -143,7 +153,7 @@ pub struct MemoryBufferPool {
     flush_policy: Box<dyn FlushPolicy>,
     store: Arc<dyn PageStore>,
     state: Mutex<PoolState>,
-    /// When true, eviction may flush a committed dirty page to its home and evict
+    /// When true, eviction may flush a WAL-durable dirty page to its home and evict
     /// it (steal). Off until the server enables it during startup.
     stealing: AtomicBool,
 }
@@ -187,7 +197,7 @@ impl MemoryBufferPool {
     }
 
     /// Run `attempt` under the pool lock. `Ok(Some)` succeeds; `Ok(None)` means the
-    /// pool is full, so free one frame (flushing a committed dirty victim outside
+    /// pool is full, so free one frame (flushing a WAL-durable dirty victim outside
     /// the lock when stealing is enabled) and retry.
     fn with_room<T>(
         &self,
@@ -462,10 +472,12 @@ impl BufferPool for MemoryBufferPool {
             if state.frames.len() >= self.frame_count {
                 return Ok(None);
             }
-            let page_num = state.next_page_num(file_id);
+            let page_num = state
+                .reusable_page(file_id)
+                .unwrap_or_else(|| state.next_page_num(file_id));
             let frame = state.insert_fresh_frame(file_id, page_num)?;
             frame.mark_dirty(txn_id);
-            state.advance_next_page_num(file_id, page_num);
+            state.mark_page_allocated(file_id, page_num);
             // Under status-based abort (`docs/specs/mvcc.md` §4 Decision 3) a
             // freshly allocated page is NOT reclaimed on rollback: it carries the
             // aborting transaction's (now-invisible) tuples and matching WAL records
@@ -476,7 +488,7 @@ impl BufferPool for MemoryBufferPool {
             frame.pin();
             Ok(Some((page_num, frame)))
         })?;
-        Ok(write_guard(file_id, page_num, frame))
+        Ok(new_page_write_guard(file_id, page_num, frame))
     }
 
     fn load_page(&self, file_id: FileId, page_num: PageNum, data: PageData) -> Result<()> {
@@ -516,6 +528,41 @@ impl BufferPool for MemoryBufferPool {
         let on_disk = self.store.page_count(file_id)?;
         let in_memory = self.state.lock().next_page_num(file_id);
         Ok(on_disk.max(in_memory))
+    }
+
+    fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()> {
+        let file_id = guard.file_id;
+        let page_num = guard.page_num;
+        if !guard.unpublished_new {
+            return Err(Self::storage_internal_error(format!(
+                "cannot abandon page that was not returned by new_page: file_id={file_id}, page_num={page_num}"
+            )));
+        }
+        if guard.bytes_published {
+            return Err(Self::storage_internal_error(format!(
+                "cannot abandon page after mutable bytes were published: file_id={file_id}, page_num={page_num}"
+            )));
+        }
+        let mut state = self.state.lock();
+        let key = (file_id, page_num);
+        let Some(frame) = state.frames.get(&key).cloned() else {
+            return Err(Self::storage_internal_error(format!(
+                "cannot abandon non-resident page: file_id={file_id}, page_num={page_num}"
+            )));
+        };
+        let pins = frame.pin_count.load(Ordering::Acquire);
+        if pins > 1 {
+            return Err(Self::storage_internal_error(format!(
+                "cannot abandon page with other pins: file_id={file_id}, page_num={page_num}"
+            )));
+        }
+        state.remove_frame(key);
+        state.abandon_allocated_page(file_id, page_num);
+        Ok(())
+    }
+
+    fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool {
+        self.state.lock().is_page_abandoned(file_id, page_num)
     }
 
     fn mark_all_clean(&self) -> Result<()> {
@@ -617,6 +664,7 @@ struct PoolState {
     clock_order: Vec<PageKey>,
     clock_hand: usize,
     next_page_num_by_file: HashMap<FileId, PageNum>,
+    abandoned_pages_by_file: HashMap<FileId, BTreeSet<PageNum>>,
     /// Files whose allocation counter has been seeded from the on-disk extent.
     extent_seeded: HashSet<FileId>,
 }
@@ -642,6 +690,59 @@ impl PoolState {
             .entry(file_id)
             .and_modify(|current| *current = (*current).max(next))
             .or_insert(next);
+    }
+
+    fn reusable_page(&self, file_id: FileId) -> Option<PageNum> {
+        self.abandoned_pages_by_file
+            .get(&file_id)
+            .and_then(|pages| pages.iter().next().copied())
+    }
+
+    fn mark_page_allocated(&mut self, file_id: FileId, page_num: PageNum) {
+        if let Some(pages) = self.abandoned_pages_by_file.get_mut(&file_id) {
+            pages.remove(&page_num);
+            if pages.is_empty() {
+                self.abandoned_pages_by_file.remove(&file_id);
+            }
+        }
+        self.advance_next_page_num(file_id, page_num);
+    }
+
+    fn abandon_allocated_page(&mut self, file_id: FileId, page_num: PageNum) {
+        self.abandoned_pages_by_file
+            .entry(file_id)
+            .or_default()
+            .insert(page_num);
+        self.trim_abandoned_tail(file_id);
+    }
+
+    fn trim_abandoned_tail(&mut self, file_id: FileId) {
+        while let Some(next) = self.next_page_num_by_file.get(&file_id).copied() {
+            if next == 0 {
+                break;
+            }
+            let tail = next - 1;
+            let Some(pages) = self.abandoned_pages_by_file.get_mut(&file_id) else {
+                break;
+            };
+            if !pages.remove(&tail) {
+                break;
+            }
+            if pages.is_empty() {
+                self.abandoned_pages_by_file.remove(&file_id);
+            }
+            if tail == 0 {
+                self.next_page_num_by_file.remove(&file_id);
+            } else {
+                self.next_page_num_by_file.insert(file_id, tail);
+            }
+        }
+    }
+
+    fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool {
+        self.abandoned_pages_by_file
+            .get(&file_id)
+            .is_some_and(|pages| pages.contains(&page_num))
     }
 
     /// Return the resident frame for `(file_id, page_num)`, or insert `data` as a
@@ -788,7 +889,7 @@ enum ResidentLookup {
 enum ReclaimOutcome {
     /// A clean frame was removed under the lock; room is available.
     FreedClean,
-    /// A committed dirty frame was pinned for an out-of-lock flush, then eviction.
+    /// A WAL-durable dirty frame was pinned for an out-of-lock flush, then eviction.
     ReservedDirty(Arc<Frame>),
     /// No frame can be evicted (all pinned or unflushable dirty).
     NoVictim,
@@ -878,6 +979,20 @@ fn write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageWri
         page_num,
         frame,
         guard,
+        unpublished_new: false,
+        bytes_published: false,
+    }
+}
+
+fn new_page_write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageWriteGuard {
+    let guard = frame.data.write_arc();
+    PageWriteGuard {
+        file_id,
+        page_num,
+        frame,
+        guard,
+        unpublished_new: true,
+        bytes_published: false,
     }
 }
 
@@ -1002,6 +1117,54 @@ mod tests {
         // The next allocation gets a fresh page number (2), not a reused 0/1.
         let page = pool.new_page(1, 8).unwrap();
         assert_eq!(page.page_num(), 2);
+    }
+
+    #[test]
+    fn abandon_unpublished_new_page_reuses_tail_page_number() {
+        let pool = MemoryBufferPool::empty(8);
+
+        let page = pool.new_page(1, 7).unwrap();
+        let page_num = page.page_num();
+        pool.abandon_unpublished_new_page(page).unwrap();
+
+        assert_eq!(pool.page_count(1).unwrap(), 0);
+        assert!(!pool.is_page_abandoned(1, page_num));
+
+        let reused = pool.new_page(1, 8).unwrap();
+        assert_eq!(reused.page_num(), page_num);
+    }
+
+    #[test]
+    fn abandon_unpublished_new_page_reuses_interior_hole_before_growing_extent() {
+        let pool = MemoryBufferPool::empty(8);
+
+        let page0 = pool.new_page(1, 7).unwrap();
+        let page0_num = page0.page_num();
+        let page1 = pool.new_page(1, 7).unwrap();
+        assert_eq!(page1.page_num(), page0_num + 1);
+
+        pool.abandon_unpublished_new_page(page0).unwrap();
+        assert_eq!(pool.page_count(1).unwrap(), 2);
+        assert!(pool.is_page_abandoned(1, page0_num));
+
+        let reused = pool.new_page(1, 8).unwrap();
+        assert_eq!(reused.page_num(), page0_num);
+        assert!(!pool.is_page_abandoned(1, page0_num));
+        assert_eq!(pool.page_count(1).unwrap(), 2);
+    }
+
+    #[test]
+    fn abandon_unpublished_new_page_rejects_after_bytes_are_published() {
+        let pool = MemoryBufferPool::empty(8);
+
+        let mut page = pool.new_page(1, 7).unwrap();
+        let page_num = page.page_num();
+        page.data_mut()[0] = 42;
+
+        let err = pool.abandon_unpublished_new_page(page).unwrap_err();
+        assert!(err.message.contains("mutable bytes were published"));
+        assert_eq!(pool.read_page(1, page_num).unwrap().data()[0], 42);
+        assert!(!pool.is_page_abandoned(1, page_num));
     }
 
     #[test]
@@ -1456,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn stealing_flushes_committed_dirty_page_on_eviction() {
+    fn stealing_flushes_wal_durable_dirty_page_on_eviction() {
         let store = Arc::new(MemStore::default());
         let pool = MemoryBufferPool::new(1, Box::new(FlushAll), store.clone());
         pool.enable_stealing();

@@ -52,6 +52,7 @@ pub trait CatalogManager: Send + Sync {
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
+    fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
     fn create_table(
@@ -64,6 +65,7 @@ pub trait CatalogManager: Send + Sync {
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
+    fn reserve_index_id(&self, id: IndexId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, id: IndexId) -> Result<()>;
     fn create_index(
@@ -77,13 +79,13 @@ pub trait CatalogManager: Send + Sync {
 }
 ```
 
-Methods return owned schema copies. The catalog is stored behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success.
+Methods return owned schema copies. The catalog is stored behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success. `restore` reinstalls the snapshot's object maps but must not lower `next_table_id` or `next_index_id` below the current in-memory high-water mark; failed DDL can leave aborted page/index artifacts behind, so future IDs are still monotonically assigned and never reused. `reserve_table_id` / `reserve_index_id` advance only the allocator high-water marks and install no object maps; recovery uses them for skipped aborted/in-flight `CreateTable` / `CreateIndex` WAL records whose physical page records may still replay.
 
 The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
 
-`apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting names or IDs, and advances `next_table_id` to at least `schema.id + 1`. It must not reassign table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs; a missing ID returns `SqlState::UndefinedTable`.
+`apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting names or IDs, and advances `next_table_id` to at least `schema.id + 1`. `reserve_table_id(id)` advances `next_table_id` to at least `id + 1` without installing a schema. Neither method reassigns table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs; a missing ID returns `SqlState::UndefinedTable`.
 
-`create_index` resolves the table and column names, assigns an `IndexId`, and returns the stored `IndexSchema`; `drop_index` removes an index by ID, returning `SqlState::UndefinedTable` for a missing ID (indexes share the relation namespace, so there is no dedicated SQLSTATE). `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs: `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects conflicting names or IDs, and advances `next_index_id` to at least `schema.id + 1`; `apply_drop_index` removes an existing index by ID. `list_indexes_for_table` returns a table's indexes ordered by ID and is how storage learns which indexes to maintain on DML.
+`create_index` resolves the table and column names, assigns an `IndexId`, and returns the stored `IndexSchema`; `drop_index` removes an index by ID, returning `SqlState::UndefinedTable` for a missing ID (indexes share the relation namespace, so there is no dedicated SQLSTATE). `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs: `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects conflicting names or IDs, and advances `next_index_id` to at least `schema.id + 1`; `reserve_index_id(id)` advances `next_index_id` to at least `id + 1` without installing a schema; `apply_drop_index` removes an existing index by ID. `list_indexes_for_table` returns a table's indexes ordered by ID and is how storage learns which indexes to maintain on DML.
 
 ## Create Table Rules
 
@@ -118,11 +120,11 @@ On startup:
 
 1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
-3. Recovery replays post-checkpoint `CreateTable`, `DropTable`, `CreateIndex`, and `DropIndex` records into both catalog and storage using `apply_create_table` / `apply_drop_table` / `apply_create_index` / `apply_drop_index`.
+3. Recovery replays committed post-checkpoint `CreateTable`, `DropTable`, `CreateIndex`, and `DropIndex` records into both catalog and storage using `apply_create_table` / `apply_drop_table` / `apply_create_index` / `apply_drop_index`. Aborted or in-flight `CreateTable` / `CreateIndex` records are not installed, but recovery still calls `reserve_table_id` / `reserve_index_id` so their IDs are never reused while their physical page records may have replayed as orphan files.
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, at least one primary key column, every primary key column ID to exist, every primary key column to be non-null, no duplicate primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, at least one primary key column, every primary key column ID to exist, every primary key column to be non-null, no duplicate primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values; startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
 
 ## WAL Interaction
 

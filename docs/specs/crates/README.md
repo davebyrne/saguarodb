@@ -32,7 +32,7 @@ This directory decomposes the overview spec into crate-level contracts for the i
 - Cargo package names use the `saguarodb-*` prefix, but internal `Cargo.toml` dependencies use short aliases such as `common`, `storage`, and `wal`.
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.
-- Eviction can steal committed dirty pages (flush, then evict) once stealing is enabled (the server enables it at startup, before redo); checkpoint also flushes dirty pages in place to the heap.
+- Eviction can steal any WAL-durable dirty page (flush, then evict) once stealing is enabled (the server enables it at startup, before redo); checkpoint also flushes dirty pages in place to the heap. The CLOG hides uncommitted or aborted versions that reach disk.
 - SaguaroDB uses a physiological redo WAL with per-page LSNs, in-place heap files, and eviction-flush-on-steal, with PostgreSQL-style in-heap MVCC layered on top (snapshot isolation, concurrent readers and writers, VACUUM; see `../mvcc.md`).
 
 ## Test Strategy

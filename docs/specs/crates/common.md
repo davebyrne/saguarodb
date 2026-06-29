@@ -420,13 +420,13 @@ pub trait FlushPolicy: Send + Sync {
 
 ## Concurrency Controller
 
-The controller is the **writer-vs-checkpoint** coordination primitive. As of Milestone E2b (`mvcc.md` §7.1 Stage 2, §10 E2b) the lock is **inverted**: writers take the SHARED side and the checkpoint takes the EXCLUSIVE side, so many write-transactions run concurrently while a checkpoint drains them and runs alone.
+The controller is the **writer-vs-exclusive-maintenance/DDL** coordination primitive. As of Milestone E2b (`mvcc.md` §7.1 Stage 2, §10 E2b) the lock is **inverted**: DML writers take the SHARED side, while checkpoint, VACUUM, and autocommit DDL take the EXCLUSIVE side. Many write-transactions run concurrently while an exclusive operation drains them and runs alone.
 
 ```rust
 pub trait ConcurrencyController: Send + Sync {
-    /// SHARED writer guard — many concurrent writers; blocks only behind a checkpoint.
+    /// SHARED writer guard — many concurrent DML writers; blocks behind exclusive operations.
     fn begin_writer(&self) -> Result<WriteGuard>;
-    /// EXCLUSIVE checkpoint guard — drains all writers, then runs alone.
+    /// EXCLUSIVE guard — drains all writers, then runs alone.
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
     /// SHARED guard for a non-writing exclusion participant (default = begin_writer).
     fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
@@ -444,7 +444,7 @@ pub struct WriteGuard { /* owned ArcRwLockReadGuard — the SHARED side */ }
 pub struct CheckpointGuard { /* owned ArcRwLockWriteGuard — the EXCLUSIVE side */ }
 ```
 
-The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. **Writers** acquire the SHARED side (`begin_writer` → `read_arc()`): many run at once, relying on per-row conflict detection (E1) and the per-index / per-heap structural latches (E2a) — not this lock — for write-write safety. The **checkpoint** acquires the EXCLUSIVE side (`begin_checkpoint` → `write_arc()`): it blocks until every in-flight writer has drained, then holds off any new writer until it returns, so the checkpoint body runs with **no in-flight writer** (preserving the recovery / truncation invariant: every transaction below the truncation boundary is settled and captured by `persist_clog`'s snapshot — `mvcc.md` §5.4, §8). The shared side is re-entrant (a connection re-acquiring it cannot self-deadlock), so the "at most one writer guard per transaction" rule is a correctness assertion at the transaction layer, not a deadlock guard. **Readers take no guard at all** and run lock-free. Guards are owned to keep the trait object-safe. (Pre-E2b the lock was the other way around — `begin_read`/`begin_write` with a single exclusive writer; the inversion is the only API/behavior change.)
+The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. **DML writers** acquire the SHARED side (`begin_writer` → `read_arc()`): many run at once, relying on per-row conflict detection (E1) and the per-index / per-heap structural latches (E2a) — not this lock — for write-write safety. **Exclusive operations** acquire the EXCLUSIVE side (`begin_checkpoint` → `write_arc()`): checkpoint and VACUUM run with no in-flight writer for recovery/GC safety, and autocommit DDL runs with no concurrent writer so whole-catalog rollback and file creation cannot race another DDL change. The shared side is re-entrant (a connection re-acquiring it cannot self-deadlock), so the "at most one writer guard per transaction" rule is a correctness assertion at the transaction layer, not a deadlock guard. **Readers take no guard at all** and run lock-free. Guards are owned to keep the trait object-safe. (Pre-E2b the lock was the other way around — `begin_read`/`begin_write` with a single exclusive writer; the inversion is the only API/behavior change.)
 
 ## Invariants
 

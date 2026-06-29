@@ -43,6 +43,8 @@ const META_PAGE: PageNum = 0;
 const LOCATION_LEN: usize = 10;
 const CHILD_LEN: usize = 4;
 
+type PageImage = [u8; buffer::PAGE_SIZE];
+
 /// A value stored in a B-tree leaf. Every index (primary-key and secondary) stores
 /// a fixed-width `RowLocation` (heap TID); the trait keeps the value encoding
 /// pluggable. The tree itself treats values as opaque bytes; this trait is the only
@@ -94,6 +96,13 @@ enum InsertOutcome {
     },
 }
 
+struct PendingInsert<'a> {
+    pos: u16,
+    key_bytes: &'a [u8],
+    value: &'a [u8],
+    leaf: bool,
+}
+
 /// A search probe ordered against stored entries by `(key, value)`. The optional
 /// value is the tiebreaker among equal user-keys: `None` is a lower bound (sorts
 /// before every entry sharing the key), `Some(bytes)` targets one exact entry.
@@ -119,16 +128,21 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// Create an empty index: a metapage (page 0) pointing at a fresh empty root
     /// leaf (page 1).
     pub(crate) fn create(&self, txn_id: u64) -> Result<()> {
-        let mut meta = self.buffer.new_page(self.file_id, txn_id)?;
+        let meta = self.buffer.new_page(self.file_id, txn_id)?;
         let meta_num = meta.page_num();
-        let mut root = self.buffer.new_page(self.file_id, txn_id)?;
+        let root = self.buffer.new_page(self.file_id, txn_id)?;
         let root_num = root.page_num();
 
-        index_page::init(root.data_mut(), root_num, true);
-        self.log_full_page(txn_id, &mut root)?;
+        let mut root_image = *root.data();
+        index_page::init(&mut root_image, root_num, true);
+        if let Err(err) = self.log_new_full_page(txn_id, root, root_image) {
+            self.abandon_unpublished_new_page(meta)?;
+            return Err(err);
+        }
 
-        index_page::meta_init(meta.data_mut(), meta_num, root_num);
-        self.log_full_page(txn_id, &mut meta)?;
+        let mut meta_image = *meta.data();
+        index_page::meta_init(&mut meta_image, meta_num, root_num);
+        self.log_new_full_page(txn_id, meta, meta_image)?;
         Ok(())
     }
 
@@ -213,12 +227,18 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         {
             // The root split: grow the tree by one level with a new internal
             // root whose leftmost child is the old root.
-            let mut new_root = self.buffer.new_page(self.file_id, txn_id)?;
+            let new_root = self.buffer.new_page(self.file_id, txn_id)?;
             let new_root_num = new_root.page_num();
-            index_page::init(new_root.data_mut(), new_root_num, false);
-            index_page::set_link(new_root.data_mut(), root);
-            index_page::insert_entry(new_root.data_mut(), 0, &sep_key, &encode_child(right_page))?;
-            self.log_full_page(txn_id, &mut new_root)?;
+            let mut image = *new_root.data();
+            index_page::init(&mut image, new_root_num, false);
+            index_page::set_link(&mut image, root);
+            if let Err(err) =
+                index_page::insert_entry(&mut image, 0, &sep_key, &encode_child(right_page))
+            {
+                self.abandon_unpublished_new_page(new_root)?;
+                return Err(err);
+            }
+            self.log_new_full_page(txn_id, new_root, image)?;
             self.set_root(txn_id, new_root_num)?;
         }
         Ok(())
@@ -249,8 +269,9 @@ impl<'a, V: IndexValue> BTree<'a, V> {
             if pos < count {
                 let (entry_key, entry_value) = leaf_key_value(data, pos)?;
                 if &entry_key == key && entry_value == value.as_slice() {
-                    index_page::remove_entry(guard.data_mut(), pos)?;
-                    self.log_full_page(txn_id, &mut guard)?;
+                    let mut image = *guard.data();
+                    index_page::remove_entry(&mut image, pos)?;
+                    self.log_full_page(txn_id, &mut guard, image)?;
                     return Ok(true);
                 }
                 // The lower bound landed before the target but it is not a match,
@@ -328,14 +349,40 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         value: &[u8],
     ) -> Result<InsertOutcome> {
         if self.node_is_leaf(page_num)? {
-            let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
-            let pos = self.lower_bound(guard.data(), true, probe)?;
-            if index_page::has_space(guard.data(), key_bytes.len(), value.len()) {
-                index_page::insert_entry(guard.data_mut(), pos, key_bytes, value)?;
-                self.log_full_page(txn_id, &mut guard)?;
-                return Ok(InsertOutcome::Inserted);
+            let mut page_num = page_num;
+            loop {
+                let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+                let mut pos = self.lower_bound(guard.data(), true, probe)?;
+                if pos == index_page::entry_count(guard.data()) {
+                    let right = index_page::link(guard.data());
+                    if right != 0 {
+                        drop(guard);
+                        if let Some(next) = self.right_leaf_for_probe(right, probe)? {
+                            page_num = next;
+                            continue;
+                        }
+                        guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+                        pos = self.lower_bound(guard.data(), true, probe)?;
+                    }
+                }
+
+                if index_page::has_space(guard.data(), key_bytes.len(), value.len()) {
+                    let mut image = *guard.data();
+                    index_page::insert_entry(&mut image, pos, key_bytes, value)?;
+                    self.log_full_page(txn_id, &mut guard, image)?;
+                    return Ok(InsertOutcome::Inserted);
+                }
+                return self.split_node(
+                    txn_id,
+                    &mut guard,
+                    PendingInsert {
+                        pos,
+                        key_bytes,
+                        value,
+                        leaf: true,
+                    },
+                );
             }
-            return self.split_node(txn_id, &mut guard, pos, key_bytes, value, true);
         }
 
         let child = {
@@ -358,11 +405,21 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 let pos = self.lower_bound(guard.data(), false, &sep_probe)?;
                 let child_bytes = encode_child(right_page);
                 if index_page::has_space(guard.data(), sep_key.len(), child_bytes.len()) {
-                    index_page::insert_entry(guard.data_mut(), pos, &sep_key, &child_bytes)?;
-                    self.log_full_page(txn_id, &mut guard)?;
+                    let mut image = *guard.data();
+                    index_page::insert_entry(&mut image, pos, &sep_key, &child_bytes)?;
+                    self.log_full_page(txn_id, &mut guard, image)?;
                     Ok(InsertOutcome::Inserted)
                 } else {
-                    self.split_node(txn_id, &mut guard, pos, &sep_key, &child_bytes, false)
+                    self.split_node(
+                        txn_id,
+                        &mut guard,
+                        PendingInsert {
+                            pos,
+                            key_bytes: &sep_key,
+                            value: &child_bytes,
+                            leaf: false,
+                        },
+                    )
                 }
             }
             outcome => Ok(outcome),
@@ -378,30 +435,33 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         &self,
         txn_id: u64,
         guard: &mut PageWriteGuard,
-        pos: u16,
-        key_bytes: &[u8],
-        value: &[u8],
-        leaf: bool,
+        insert: PendingInsert<'_>,
     ) -> Result<InsertOutcome> {
-        let entries = entries_with_insertion(guard.data(), pos, key_bytes, value);
+        let entries =
+            entries_with_insertion(guard.data(), insert.pos, insert.key_bytes, insert.value);
         let leftmost = index_page::link(guard.data());
         let old_right_link = leftmost; // for a leaf, link is the right sibling
 
-        let mut right = self.buffer.new_page(self.file_id, txn_id)?;
-        let right_num = right.page_num();
         let page_num = guard.page_num();
         let mid = split_point(&entries);
 
-        if leaf {
-            index_page::init(right.data_mut(), right_num, true);
-            append_entries(right.data_mut(), &entries[mid..])?;
-            index_page::set_link(right.data_mut(), old_right_link);
-            self.log_full_page(txn_id, &mut right)?;
+        if insert.leaf {
+            let right = self.buffer.new_page(self.file_id, txn_id)?;
+            let right_num = right.page_num();
+            let mut right_image = *right.data();
+            index_page::init(&mut right_image, right_num, true);
+            if let Err(err) = append_entries(&mut right_image, &entries[mid..]) {
+                self.abandon_unpublished_new_page(right)?;
+                return Err(err);
+            }
+            index_page::set_link(&mut right_image, old_right_link);
+            self.log_new_full_page(txn_id, right, right_image)?;
 
-            index_page::init(guard.data_mut(), page_num, true);
-            append_entries(guard.data_mut(), &entries[..mid])?;
-            index_page::set_link(guard.data_mut(), right_num);
-            self.log_full_page(txn_id, guard)?;
+            let mut left_image = *guard.data();
+            index_page::init(&mut left_image, page_num, true);
+            append_entries(&mut left_image, &entries[..mid])?;
+            index_page::set_link(&mut left_image, right_num);
+            self.log_full_page(txn_id, guard, left_image)?;
 
             // The separator is the composite `(key ++ value)` of the right half's
             // first leaf entry, so the parent can route equal user-keys that
@@ -415,18 +475,34 @@ impl<'a, V: IndexValue> BTree<'a, V> {
             // The middle internal entry's composite key is already
             // `(key ++ value)`; push it up verbatim and hand its child to the
             // right node as its new leftmost child.
+            let mid = internal_split_point(&entries, mid).ok_or_else(|| {
+                corrupt("internal index split cannot fit a prefix-safe separator")
+            })?;
             let push_key = entries[mid].0.clone();
             let right_leftmost = decode_child(&entries[mid].1)?;
 
-            index_page::init(right.data_mut(), right_num, false);
-            index_page::set_link(right.data_mut(), right_leftmost);
-            append_entries(right.data_mut(), &entries[mid + 1..])?;
-            self.log_full_page(txn_id, &mut right)?;
+            let right = self.buffer.new_page(self.file_id, txn_id)?;
+            let right_num = right.page_num();
+            let mut right_image = *right.data();
+            index_page::init(&mut right_image, right_num, false);
+            index_page::set_link(&mut right_image, right_leftmost);
+            if let Err(err) = append_entries(&mut right_image, &entries[mid + 1..]) {
+                self.abandon_unpublished_new_page(right)?;
+                return Err(err);
+            }
+            self.log_new_full_page(txn_id, right, right_image)?;
 
-            index_page::init(guard.data_mut(), page_num, false);
-            index_page::set_link(guard.data_mut(), leftmost);
-            append_entries(guard.data_mut(), &entries[..mid])?;
-            self.log_full_page(txn_id, guard)?;
+            let mut left_image = *guard.data();
+            index_page::init(&mut left_image, page_num, false);
+            index_page::set_link(&mut left_image, leftmost);
+            append_entries(&mut left_image, &entries[..mid])?;
+            index_page::insert_entry(
+                &mut left_image,
+                mid as u16,
+                &push_key,
+                &encode_child(right_num),
+            )?;
+            self.log_full_page(txn_id, guard, left_image)?;
 
             Ok(InsertOutcome::Split {
                 sep_key: push_key,
@@ -442,8 +518,9 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
     fn set_root(&self, txn_id: u64, root: PageNum) -> Result<()> {
         let mut guard = self.buffer.write_page(self.file_id, META_PAGE, txn_id)?;
-        index_page::meta_set_root(guard.data_mut(), root);
-        self.log_full_page(txn_id, &mut guard)
+        let mut image = *guard.data();
+        index_page::meta_set_root(&mut image, root);
+        self.log_full_page(txn_id, &mut guard, image)
     }
 
     fn node_is_leaf(&self, page_num: PageNum) -> Result<bool> {
@@ -559,6 +636,27 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         }
     }
 
+    fn right_leaf_for_probe(
+        &self,
+        mut next: PageNum,
+        probe: &Probe<'_>,
+    ) -> Result<Option<PageNum>> {
+        while next != 0 {
+            let guard = self.buffer.read_page(self.file_id, next)?;
+            let next_data = guard.data();
+            if index_page::entry_count(next_data) == 0 {
+                next = index_page::link(next_data);
+                continue;
+            }
+
+            return match self.entry_cmp(next_data, true, 0, probe)? {
+                Ordering::Less | Ordering::Equal => Ok(Some(next)),
+                Ordering::Greater => Ok(None),
+            };
+        }
+        Ok(None)
+    }
+
     fn start_leaf(&self, range: &KeyRange) -> Result<PageNum> {
         match range_start_key(range) {
             Some(key) => self.descend_to_leaf(&Probe {
@@ -579,18 +677,43 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         }
     }
 
-    fn log_full_page(&self, txn_id: u64, guard: &mut PageWriteGuard) -> Result<()> {
+    fn log_full_page(
+        &self,
+        txn_id: u64,
+        guard: &mut PageWriteGuard,
+        mut image: PageImage,
+    ) -> Result<()> {
         let lsn = self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::FullPageImage {
                 file_id: self.file_id,
                 page_num: guard.page_num(),
-                image: guard.data().to_vec(),
+                image: image.to_vec(),
             },
         })?;
-        crate::page::set_page_lsn(guard.data_mut(), lsn);
+        crate::page::set_page_lsn(&mut image, lsn);
+        *guard.data_mut() = image;
         Ok(())
+    }
+
+    fn log_new_full_page(
+        &self,
+        txn_id: u64,
+        mut guard: PageWriteGuard,
+        image: PageImage,
+    ) -> Result<()> {
+        match self.log_full_page(txn_id, &mut guard, image) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.abandon_unpublished_new_page(guard)?;
+                Err(err)
+            }
+        }
+    }
+
+    fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()> {
+        self.buffer.abandon_unpublished_new_page(guard)
     }
 }
 
@@ -637,23 +760,24 @@ impl<'a> BTree<'a, RowLocation> {
         let mut removed = 0usize;
         loop {
             let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+            let mut image = *guard.data();
             // Walk entries from the end so each `remove_entry` shift never disturbs the
             // index of an entry still to be examined.
             let mut changed = false;
-            let mut pos = index_page::entry_count(guard.data());
+            let mut pos = index_page::entry_count(&image);
             while pos > 0 {
                 pos -= 1;
-                let value = RowLocation::decode(index_page::entry_value(guard.data(), pos))?;
+                let value = RowLocation::decode(index_page::entry_value(&image, pos))?;
                 if dead.contains(&value) {
-                    index_page::remove_entry(guard.data_mut(), pos)?;
+                    index_page::remove_entry(&mut image, pos)?;
                     removed += 1;
                     changed = true;
                 }
             }
+            let next = index_page::link(&image);
             if changed {
-                self.log_full_page(txn_id, &mut guard)?;
+                self.log_full_page(txn_id, &mut guard, image)?;
             }
-            let next = index_page::link(guard.data());
             drop(guard);
             if next == 0 {
                 return Ok(removed);
@@ -725,6 +849,39 @@ fn append_entries(
         index_page::insert_entry(data, index as u16, key, value)?;
     }
     Ok(())
+}
+
+fn entries_fit_as_internal_node(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    let mut data = [0; buffer::PAGE_SIZE];
+    index_page::init(&mut data, 1, false);
+    append_entries(&mut data, entries).is_ok()
+}
+
+fn internal_split_point(entries: &[(Vec<u8>, Vec<u8>)], preferred: usize) -> Option<usize> {
+    if entries.is_empty() {
+        return None;
+    }
+
+    let preferred = preferred.min(entries.len() - 1);
+    for distance in 0..entries.len() {
+        if let Some(left) = preferred.checked_sub(distance)
+            && entries_fit_as_internal_node(&entries[..=left])
+            && entries_fit_as_internal_node(&entries[left + 1..])
+        {
+            return Some(left);
+        }
+
+        let right = preferred + distance;
+        if distance != 0
+            && right < entries.len()
+            && entries_fit_as_internal_node(&entries[..=right])
+            && entries_fit_as_internal_node(&entries[right + 1..])
+        {
+            return Some(right);
+        }
+    }
+
+    None
 }
 
 /// The number of entries the left node keeps after a split, chosen so each side
@@ -831,10 +988,11 @@ fn corrupt(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-    use buffer::{MemoryBufferPool, PageStore};
-    use common::{Key, KeyRange, Value};
-    use wal::FileWalManager;
+    use buffer::{BufferPool, MemoryBufferPool, PageStore};
+    use common::{DbError, Key, KeyRange, Lsn, TxnId, TxnStatus, TxnStatusView, Value};
+    use wal::{FileWalManager, WalManager, WalRecord};
 
     use super::*;
     use crate::HeapPageStore;
@@ -842,6 +1000,7 @@ mod tests {
 
     const INDEX_FILE: FileId = 0x8000_0001;
     const SECONDARY_FILE: FileId = 0xC000_0001;
+    const NO_FAIL_PAGE: PageNum = u32::MAX;
 
     struct Fixture {
         buffer: Arc<MemoryBufferPool>,
@@ -880,8 +1039,107 @@ mod tests {
         }
     }
 
+    struct FailingWal {
+        next_lsn: AtomicU64,
+        fail_at: AtomicU64,
+        fail_page: AtomicU32,
+    }
+
+    impl Default for FailingWal {
+        fn default() -> Self {
+            Self {
+                next_lsn: AtomicU64::new(1),
+                fail_at: AtomicU64::new(0),
+                fail_page: AtomicU32::new(NO_FAIL_PAGE),
+            }
+        }
+    }
+
+    impl FailingWal {
+        fn fail_next_append(&self) {
+            self.fail_at
+                .store(self.next_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+
+        fn fail_next_full_page_for_page(&self, page_num: PageNum) {
+            self.fail_page.store(page_num, Ordering::SeqCst);
+        }
+    }
+
+    impl WalManager for FailingWal {
+        fn append(&self, record: WalRecord) -> common::Result<Lsn> {
+            let next = self.next_lsn.load(Ordering::SeqCst);
+            if self.fail_at.load(Ordering::SeqCst) == next {
+                self.fail_at.store(0, Ordering::SeqCst);
+                return Err(DbError::io("injected WAL append failure"));
+            }
+            if let WalRecordKind::FullPageImage { page_num, .. } = record.kind
+                && self.fail_page.load(Ordering::SeqCst) == page_num
+            {
+                self.fail_page.store(NO_FAIL_PAGE, Ordering::SeqCst);
+                return Err(DbError::io("injected WAL append failure"));
+            }
+            Ok(self.next_lsn.fetch_add(1, Ordering::SeqCst))
+        }
+
+        fn flush(&self) -> common::Result<Lsn> {
+            Ok(self.next_lsn.load(Ordering::SeqCst).saturating_sub(1))
+        }
+
+        fn replay_from(
+            &self,
+            _lsn: Lsn,
+        ) -> common::Result<Box<dyn Iterator<Item = common::Result<WalRecord>>>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn truncate_before(&self, _lsn: Lsn) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn flushed_lsn(&self) -> Lsn {
+            self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)
+        }
+
+        fn bytes_after(&self, _lsn: Lsn) -> common::Result<u64> {
+            Ok(0)
+        }
+
+        fn persist_clog(&self, _clog_lsn: Lsn) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn set_vacuum_floor(&self, _boundary: TxnId) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn establish_recovery_committed_floor(
+            &self,
+            _allocation_boundary: u64,
+        ) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn resolve_in_flight_as_aborted(
+            &self,
+            _writer_xids: &std::collections::HashSet<u64>,
+        ) -> common::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TxnStatusView for FailingWal {
+        fn status(&self, _txn_id: TxnId) -> TxnStatus {
+            TxnStatus::Committed
+        }
+    }
+
     fn key(value: i64) -> Key {
         Key(vec![Value::Integer(value)])
+    }
+
+    fn fat_key(value: i64) -> Key {
+        Key(vec![Value::Text(format!("{value:04}{}", "x".repeat(2600)))])
     }
 
     fn location(page_num: PageNum, slot_num: u16) -> RowLocation {
@@ -890,6 +1148,30 @@ mod tests {
             page_num,
             slot_num,
         }
+    }
+
+    fn root_shape(buffer: &dyn BufferPool, file_id: FileId) -> (PageNum, bool, u16) {
+        let root = index_page::meta_root(buffer.read_page(file_id, META_PAGE).unwrap().data());
+        let guard = buffer.read_page(file_id, root).unwrap();
+        (
+            root,
+            index_page::is_leaf(guard.data()),
+            index_page::entry_count(guard.data()),
+        )
+    }
+
+    fn next_insert_would_split_root_leaf(
+        buffer: &dyn BufferPool,
+        file_id: FileId,
+        key: &Key,
+        value: &RowLocation,
+    ) -> bool {
+        let (root, is_leaf, _) = root_shape(buffer, file_id);
+        assert!(is_leaf, "expected root to still be a leaf");
+        let guard = buffer.read_page(file_id, root).unwrap();
+        let key_bytes = encode_key(key).unwrap();
+        let value_bytes = value.encode().unwrap();
+        !index_page::has_space(guard.data(), key_bytes.len(), value_bytes.len())
     }
 
     #[test]
@@ -946,6 +1228,276 @@ mod tests {
         assert!(tree.remove(1, &key(7), &location(0, 9)).unwrap());
         assert!(tree.scan_key(&key(7)).unwrap().is_empty());
         assert_eq!(tree.search(&key(7)).unwrap(), None);
+    }
+
+    #[test]
+    fn failed_btree_insert_wal_append_does_not_leave_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        tree.create(1).unwrap();
+
+        wal.fail_next_append();
+        let err = tree.insert(1, &key(9), &location(0, 9)).unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            tree.search(&key(9)).unwrap(),
+            None,
+            "failed WAL append left an unlogged index entry in the B-tree"
+        );
+    }
+
+    #[test]
+    fn failed_btree_create_root_append_does_not_leave_dirty_zero_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+
+        wal.fail_next_append();
+        let err = tree.create(1).unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let dirty_zero_pages: Vec<_> = buffer
+            .iter_pages()
+            .unwrap()
+            .filter(|page| {
+                page.file_id == INDEX_FILE && page.is_dirty && !crate::page::is_valid(&page.data.0)
+            })
+            .map(|page| page.page_num)
+            .collect();
+        assert!(
+            dirty_zero_pages.is_empty(),
+            "failed create left dirty zero index pages: {dirty_zero_pages:?}"
+        );
+        assert_eq!(
+            buffer.page_count(INDEX_FILE).unwrap(),
+            0,
+            "failed create advertised index pages with no redo base"
+        );
+    }
+
+    #[test]
+    fn failed_split_new_page_append_does_not_leave_dirty_invalid_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        tree.create(1).unwrap();
+
+        let mut value = 0i64;
+        while !next_insert_would_split_root_leaf(
+            buffer.as_ref(),
+            INDEX_FILE,
+            &fat_key(value),
+            &location(value as PageNum, 0),
+        ) {
+            tree.insert(1, &fat_key(value), &location(value as PageNum, 0))
+                .unwrap();
+            value += 1;
+            assert!(value < 20, "root leaf did not fill quickly");
+        }
+        buffer.mark_all_clean().unwrap();
+
+        wal.fail_next_append();
+        let err = tree
+            .insert(1, &fat_key(value), &location(value as PageNum, 0))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let dirty_invalid: Vec<_> = buffer
+            .iter_pages()
+            .unwrap()
+            .filter(|page| {
+                page.file_id == INDEX_FILE && page.is_dirty && !crate::page::is_valid(&page.data.0)
+            })
+            .map(|page| page.page_num)
+            .collect();
+        assert!(
+            dirty_invalid.is_empty(),
+            "failed split left dirty invalid index pages: {dirty_invalid:?}"
+        );
+    }
+
+    #[test]
+    fn insert_after_failed_leaf_root_split_preserves_leaf_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        tree.create(1).unwrap();
+
+        let mut value = 0i64;
+        while !next_insert_would_split_root_leaf(
+            buffer.as_ref(),
+            INDEX_FILE,
+            &fat_key(value),
+            &location(value as PageNum, 0),
+        ) {
+            tree.insert(1, &fat_key(value), &location(value as PageNum, 0))
+                .unwrap();
+            value += 1;
+            assert!(value < 20, "root leaf did not fill quickly");
+        }
+
+        wal.fail_next_full_page_for_page(META_PAGE);
+        let err = tree
+            .insert(1, &fat_key(value), &location(value as PageNum, 0))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let later = value + 10;
+        tree.insert(1, &fat_key(later), &location(later as PageNum, 0))
+            .unwrap();
+
+        let entries = tree.range(&KeyRange::All).unwrap();
+        assert!(
+            entries.iter().any(|(entry_key, value)| {
+                entry_key == &fat_key(later) && *value == location(later as PageNum, 0)
+            }),
+            "later insert should remain reachable"
+        );
+        for pair in entries.windows(2) {
+            assert!(
+                pair[0].0 <= pair[1].0,
+                "leaf chain order regressed after failed root split: {:?} before {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn failed_internal_root_split_metapage_append_preserves_existing_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(128, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        tree.create(1).unwrap();
+
+        let mut inserted = Vec::new();
+        let mut value = 0i64;
+        loop {
+            tree.insert(1, &fat_key(value), &location(value as PageNum, 0))
+                .unwrap();
+            inserted.push(value);
+            let (_, is_leaf, entry_count) = root_shape(buffer.as_ref(), INDEX_FILE);
+            if !is_leaf && entry_count >= 2 {
+                break;
+            }
+            value += 1;
+            assert!(value < 100, "root did not become an internal node quickly");
+        }
+
+        wal.fail_next_full_page_for_page(META_PAGE);
+        let failed_value = loop {
+            value += 1;
+            match tree.insert(1, &fat_key(value), &location(value as PageNum, 0)) {
+                Ok(()) => inserted.push(value),
+                Err(err) => {
+                    assert!(
+                        err.message.contains("injected WAL append failure"),
+                        "unexpected error: {err:?}"
+                    );
+                    break value;
+                }
+            }
+            assert!(
+                value < 200,
+                "expected an internal root split to rewrite the metapage"
+            );
+        };
+
+        for existing in inserted {
+            assert_eq!(
+                tree.search(&fat_key(existing)).unwrap(),
+                Some(location(existing as PageNum, 0)),
+                "lost key {existing} after failed root split while inserting {failed_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_internal_root_left_append_preserves_existing_searches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
+        let buffer = Arc::new(MemoryBufferPool::new(128, Box::new(AlwaysFlush), store));
+        let wal = FailingWal::default();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        tree.create(1).unwrap();
+
+        let mut inserted = Vec::new();
+        let mut value = 0i64;
+        let root_to_fail = loop {
+            tree.insert(1, &fat_key(value), &location(value as PageNum, 0))
+                .unwrap();
+            inserted.push(value);
+
+            let (root, is_leaf, _) = root_shape(buffer.as_ref(), INDEX_FILE);
+            if !is_leaf {
+                let guard = buffer.read_page(INDEX_FILE, root).unwrap();
+                let next_key = encode_key(&fat_key(value + 1)).unwrap();
+                let next_value = location((value + 1) as PageNum, 0).encode().unwrap();
+                let next_separator_len = next_key.len() + next_value.len();
+                if !index_page::has_space(guard.data(), next_separator_len, CHILD_LEN) {
+                    break root;
+                }
+            }
+
+            value += 1;
+            assert!(value < 200, "root did not become full quickly");
+        };
+
+        wal.fail_next_full_page_for_page(root_to_fail);
+        let failed_value = loop {
+            value += 1;
+            match tree.insert(1, &fat_key(value), &location(value as PageNum, 0)) {
+                Ok(()) => inserted.push(value),
+                Err(err) => {
+                    assert!(
+                        err.message.contains("injected WAL append failure"),
+                        "unexpected error: {err:?}"
+                    );
+                    break value;
+                }
+            }
+            assert!(
+                value < 300,
+                "expected an internal root split to rewrite the old root"
+            );
+        };
+
+        for existing in inserted {
+            assert_eq!(
+                tree.search(&fat_key(existing)).unwrap(),
+                Some(location(existing as PageNum, 0)),
+                "lost key {existing} after old-root rewrite failed while inserting {failed_value}"
+            );
+        }
     }
 
     #[test]
@@ -1055,7 +1607,6 @@ mod tests {
         // we *prove* a target sits in the 2nd/3rd leaf of the run rather than the
         // first, so the test genuinely exercises the cross-leaf point path.
         let leaves_of_key = || -> Vec<(PageNum, Vec<RowLocation>)> {
-            use buffer::BufferPool;
             let buffer = fixture.buffer.as_ref();
             // Descend the leftmost spine to the first leaf, then follow links.
             let mut page_num = {

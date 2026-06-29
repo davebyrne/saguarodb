@@ -12,6 +12,7 @@ pub trait CatalogManager: Send + Sync {
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
+    fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
     fn create_table(
@@ -24,6 +25,7 @@ pub trait CatalogManager: Send + Sync {
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
+    fn reserve_index_id(&self, id: IndexId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, id: IndexId) -> Result<()>;
     fn create_index(
@@ -191,6 +193,77 @@ mod tests {
 
         assert_eq!(err.kind, ErrorKind::Plan);
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn restore_does_not_rewind_allocators() {
+        let catalog = catalog_with_users();
+        let before_failed_ddl = catalog.snapshot().unwrap();
+
+        let failed_table = catalog
+            .create_table(
+                "orders".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let failed_index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        catalog.restore(before_failed_ddl).unwrap();
+        assert_eq!(catalog.get_table_by_name("orders").unwrap(), None);
+        assert_eq!(catalog.get_index_by_name("users_name").unwrap(), None);
+
+        let recreated_table = catalog
+            .create_table(
+                "orders".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let recreated_index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(recreated_table.id, failed_table.id + 1);
+        assert_eq!(recreated_index.id, failed_index.id + 1);
+    }
+
+    #[test]
+    fn reserve_ids_advance_allocators_without_installing_objects() {
+        let catalog = MemoryCatalog::empty();
+
+        catalog.reserve_table_id(9).unwrap();
+        catalog.reserve_index_id(42).unwrap();
+
+        assert!(
+            catalog.list_tables().unwrap().is_empty(),
+            "reserving a table id must not install a table"
+        );
+        let table = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        assert_eq!(table.id, 10);
+
+        let index = catalog
+            .create_index("users_id".to_string(), "users", &["id".to_string()], false)
+            .unwrap();
+        assert_eq!(index.id, 43);
     }
 
     #[test]

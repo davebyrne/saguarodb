@@ -23,10 +23,10 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, DataType, IndexSchema, Key, KeyRange, Lsn, Result, Row, SqlState,
-        StatementContext, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+        ColumnDef, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key, KeyRange, Lsn, Result,
+        Row, SqlState, StatementContext, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
     };
-    use wal::{WalManager, WalRecord};
+    use wal::{WalManager, WalRecord, WalRecordKind};
 
     use crate::{
         PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
@@ -126,6 +126,266 @@ mod tests {
         harness.storage.apply_drop_table(1).unwrap();
 
         assert_eq!(harness.wal.record_count(), 0);
+    }
+
+    #[test]
+    fn failed_heap_insert_wal_append_does_not_leave_tuple_bytes() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+
+        // A first insert into an empty heap appends HeapInit, initializes the page,
+        // inserts the tuple bytes, then appends HeapInsert. Fail that second append:
+        // the correct behavior is that the failed statement leaves no tuple behind.
+        harness
+            .wal
+            .fail_on_append_number(harness.wal.record_count() + 2);
+
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let page = harness.buffer.read_page(1, 0).unwrap();
+        assert_eq!(
+            crate::page::next_slot(page.data()).unwrap(),
+            0,
+            "failed WAL append left an unlogged tuple slot on the heap page"
+        );
+    }
+
+    #[test]
+    fn failed_heap_init_append_does_not_leave_dirty_zero_page() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness.buffer.mark_all_clean().unwrap();
+
+        harness
+            .wal
+            .fail_on_append_number(harness.wal.record_count() + 1);
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let dirty_zero_pages: Vec<_> = harness
+            .buffer
+            .iter_pages()
+            .unwrap()
+            .filter(|page| {
+                page.file_id == 1 && page.is_dirty && !crate::page::is_valid(&page.data.0)
+            })
+            .map(|page| page.page_num)
+            .collect();
+        assert!(
+            dirty_zero_pages.is_empty(),
+            "failed HeapInit append left dirty zero heap pages: {dirty_zero_pages:?}"
+        );
+        assert_eq!(
+            harness.buffer.page_count(1).unwrap(),
+            0,
+            "failed HeapInit append advertised a heap page with no redo base"
+        );
+        assert_eq!(
+            harness.storage.vacuum(&users_schema(), 100).unwrap(),
+            0,
+            "VACUUM should ignore the abandoned failed-allocation page"
+        );
+
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, 1, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Ada", true))
+        );
+    }
+
+    #[test]
+    fn failed_heap_insert_fpi_append_restores_page_and_fpi_flag() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness.create_users_table(&ctx).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness.buffer.mark_all_clean().unwrap();
+
+        harness.wal.fail_next_full_page_image();
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Grace", true))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+        let page = harness.buffer.read_page(1, 0).unwrap();
+        assert_eq!(
+            crate::page::next_slot(page.data()).unwrap(),
+            1,
+            "failed FPI append left the second tuple on the heap page"
+        );
+        drop(page);
+
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(3, "Hopper", true))
+            .unwrap();
+        assert_eq!(
+            harness.wal.full_page_image_count(1),
+            1,
+            "failed FPI append consumed the page's first-touch FPI flag"
+        );
+    }
+
+    #[test]
+    fn failed_xmax_fpi_append_does_not_stamp_header_and_restores_fpi_flag() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        harness.create_users_table(&insert_ctx).unwrap();
+        harness
+            .storage
+            .insert(&insert_ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness.buffer.mark_all_clean().unwrap();
+
+        harness.wal.fail_next_full_page_image();
+        let delete_ctx = StatementContext::new(2);
+        let err = harness
+            .storage
+            .delete(&delete_ctx, 1, &Key(vec![Value::Integer(1)]))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let page = harness.buffer.read_page(1, 0).unwrap();
+        let tuple = crate::page::read_row(page.data(), 0)
+            .unwrap()
+            .expect("original tuple remains");
+        let decoded = decode_row(&users_schema(), &tuple).unwrap();
+        assert_eq!(
+            decoded.xmax, INVALID_XID,
+            "failed FPI append left an unlogged xmax stamp in the heap tuple"
+        );
+        drop(page);
+
+        let retry_ctx = StatementContext::new(3);
+        assert!(
+            harness
+                .storage
+                .delete(&retry_ctx, 1, &Key(vec![Value::Integer(1)]))
+                .unwrap()
+        );
+        assert_eq!(
+            harness.wal.full_page_image_count(1),
+            1,
+            "failed xmax FPI append consumed the page's first-touch FPI flag"
+        );
+    }
+
+    #[test]
+    fn failed_xmax_delta_append_does_not_stamp_header() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        harness.create_users_table(&insert_ctx).unwrap();
+        harness
+            .storage
+            .insert(&insert_ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&insert_ctx, 1, user_row(2, "Grace", true))
+            .unwrap();
+
+        harness.wal.fail_next_heap_update_header();
+        let delete_ctx = StatementContext::new(2);
+        let err = harness
+            .storage
+            .delete(&delete_ctx, 1, &Key(vec![Value::Integer(1)]))
+            .unwrap_err();
+        assert!(
+            err.message.contains("injected WAL append failure"),
+            "unexpected error: {err:?}"
+        );
+
+        let page = harness.buffer.read_page(1, 0).unwrap();
+        let tuple = crate::page::read_row(page.data(), 0)
+            .unwrap()
+            .expect("original tuple remains");
+        let decoded = decode_row(&users_schema(), &tuple).unwrap();
+        assert_eq!(
+            decoded.xmax, INVALID_XID,
+            "failed HeapUpdateHeader append left an unlogged xmax stamp in the heap tuple"
+        );
+    }
+
+    #[test]
+    fn failed_xmax_preflight_restores_fpi_flag_without_wal() {
+        let harness = StorageHarness::new();
+        let setup_ctx = StatementContext::new(1);
+        harness.create_users_table(&setup_ctx).unwrap();
+
+        let mut page = harness.buffer.new_page(1, setup_ctx.txn_id).unwrap();
+        let page_num = page.page_num();
+        crate::page::init_page(page.data_mut(), page_num);
+        let slot =
+            crate::page::insert_row(page.data_mut(), &legacy_user_row(1, "Ada", true)).unwrap();
+        let location = crate::engine::RowLocation {
+            file_id: 1,
+            page_num,
+            slot_num: slot,
+        };
+        drop(page);
+        crate::btree::BTree::new(
+            harness.buffer.as_ref(),
+            harness.wal.as_ref(),
+            crate::heap::index_file_id(1),
+        )
+        .insert(setup_ctx.txn_id, &Key(vec![Value::Integer(1)]), &location)
+        .unwrap();
+        harness.buffer.mark_all_clean().unwrap();
+
+        let before = harness.wal.record_count();
+        let err = harness
+            .storage
+            .delete(&StatementContext::new(2), 1, &Key(vec![Value::Integer(1)]))
+            .unwrap_err();
+        assert!(
+            err.message.contains("cannot mutate header"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            harness.wal.record_count(),
+            before,
+            "legacy-tuple header preflight failure appended WAL"
+        );
+
+        harness
+            .storage
+            .insert(&StatementContext::new(3), 1, user_row(2, "Grace", true))
+            .unwrap();
+        assert_eq!(
+            harness.wal.full_page_image_count(1),
+            1,
+            "failed header preflight consumed the page's first-touch FPI flag"
+        );
     }
 
     #[test]
@@ -984,6 +1244,10 @@ mod tests {
     #[derive(Default)]
     struct CountingWal {
         count: AtomicUsize,
+        fail_at: AtomicUsize,
+        fail_next_fpi: std::sync::atomic::AtomicBool,
+        fail_next_heap_update_header: std::sync::atomic::AtomicBool,
+        fpi_count_by_file: std::sync::Mutex<std::collections::HashMap<FileId, usize>>,
         /// Transactions the test has explicitly aborted. Status-based abort
         /// (`docs/specs/mvcc.md` §4 Decision 3) hides a rolled-back txn's rows via
         /// the CLOG rather than by physical undo, so a test that rolls a txn back
@@ -996,6 +1260,28 @@ mod tests {
             self.count.load(Ordering::SeqCst)
         }
 
+        fn fail_on_append_number(&self, append_number: usize) {
+            self.fail_at.store(append_number, Ordering::SeqCst);
+        }
+
+        fn fail_next_full_page_image(&self) {
+            self.fail_next_fpi.store(true, Ordering::SeqCst);
+        }
+
+        fn full_page_image_count(&self, file_id: FileId) -> usize {
+            self.fpi_count_by_file
+                .lock()
+                .unwrap()
+                .get(&file_id)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn fail_next_heap_update_header(&self) {
+            self.fail_next_heap_update_header
+                .store(true, Ordering::SeqCst);
+        }
+
         /// Model `CLOG[txn] = Aborted` so the visibility predicate hides the txn's
         /// (physically retained, no-undo) rows.
         fn mark_aborted(&self, txn_id: TxnId) {
@@ -1004,7 +1290,32 @@ mod tests {
     }
 
     impl WalManager for CountingWal {
-        fn append(&self, _record: WalRecord) -> Result<Lsn> {
+        fn append(&self, record: WalRecord) -> Result<Lsn> {
+            let next = self.count.load(Ordering::SeqCst) + 1;
+            if self.fail_at.load(Ordering::SeqCst) == next {
+                self.fail_at.store(0, Ordering::SeqCst);
+                return Err(DbError::io("injected WAL append failure"));
+            }
+            if matches!(record.kind, WalRecordKind::FullPageImage { .. })
+                && self.fail_next_fpi.swap(false, Ordering::SeqCst)
+            {
+                return Err(DbError::io("injected WAL append failure"));
+            }
+            if matches!(record.kind, WalRecordKind::HeapUpdateHeader { .. })
+                && self
+                    .fail_next_heap_update_header
+                    .swap(false, Ordering::SeqCst)
+            {
+                return Err(DbError::io("injected WAL append failure"));
+            }
+            if let WalRecordKind::FullPageImage { file_id, .. } = &record.kind {
+                *self
+                    .fpi_count_by_file
+                    .lock()
+                    .unwrap()
+                    .entry(*file_id)
+                    .or_insert(0) += 1;
+            }
             Ok(self.count.fetch_add(1, Ordering::SeqCst) as Lsn + 1)
         }
 
@@ -1126,6 +1437,15 @@ mod tests {
                 Value::Null,
             ],
         }
+    }
+
+    fn legacy_user_row(id: i64, name: &str, active: bool) -> Vec<u8> {
+        let mut bytes = vec![1u8, 1 << 3];
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(u8::from(active));
+        bytes
     }
 
     fn big_text_schema() -> TableSchema {

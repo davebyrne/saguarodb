@@ -324,17 +324,20 @@ dropped. It is written atomically (temp file + fsync + rename + parent-dir fsync
   `checkpoint_lsn`); the vacuum floor now gates only `clog.dat` pruning, not WAL
   retention. See the floor invariant below.
 
-- Rebuilt at recovery from durable `Commit`/`Abort` WAL records (supersedes the
-  single-bit `committed_txns` set in `crates/wal/src/file.rs` as the authoritative
-  status source). `FileWalManager::is_committed` is now `clog.status(txn) ==
-  Committed`, so the redo-committed-only flush/replay gate is behavior-identical.
+- The CLOG is the authoritative status source. At recovery it is seeded from
+  `clog.dat` plus post-snapshot `Commit`/`Abort` records, or rebuilt from all
+  retained status records when no snapshot exists; the old single-bit
+  `committed_txns` model and redo-committed-only replay are retired.
 - Reserved ids below `FIRST_NORMAL_XID` (including `FROZEN_XID`) read as
   `Committed`/visible; an unrecorded normal id reads as `InProgress`.
 - An **implicit-committed floor**: an unrecorded normal id strictly below the
   floor reads as `Committed`, covering a *committed* transaction whose `Commit`
   record a checkpoint truncated. An explicit recorded status (e.g. `Aborted`) is
   checked first and always wins over the floor.
-- Consulted by the visibility predicate (B3) and the flush policy at runtime.
+- Consulted by visibility and uniqueness checks. The flush policy no longer
+  consults transaction status; it admits any dirty page whose page-LSN is
+  WAL-durable, and the CLOG hides non-committed versions after the page reaches
+  disk or is replayed.
 
 **Unconditional truncation + the durable CLOG (the floor invariant).** Once the
 relaxed flush gate (§8) lets an aborted/in-flight transaction's pages reach the
@@ -486,7 +489,9 @@ Committed**.
 - `COMMIT` appends a `Commit` record, flushes (fsync), sets `CLOG[t] = Committed`,
   and deregisters the transaction.
 - `ROLLBACK` (or any statement error) appends an `Abort` record, sets
-  `CLOG[t] = Aborted`, and deregisters; versions become invisible (no page undo).
+  `CLOG[t] = Aborted`, deregisters, and runs metadata/bookkeeping cleanup; versions
+  become invisible (no page undo). The transaction is not deregistered if the
+  `Abort` append fails.
 - **Autocommit** is an implicit `BEGIN ... COMMIT` around one statement, routed
   through the same machinery (generalizing today's `execute_write_bound` in
   `crates/server/src/query.rs`).
@@ -592,9 +597,10 @@ becomes load-bearing once writers run concurrently (E2b).
     `DropIndex`) are the one exception: they mutate the durable catalog directly
     (not idempotent PageLSN-gated page bytes), so redo gates them by the rebuilt
     CLOG — only a *committed* DDL replays. DDL is non-transactional and commits
-    immediately (§4 Decision 6), so an aborted/in-flight DDL is skipped; its
-    index/heap pages may still replay harmlessly as unreferenced, invisible orphan
-    pages.
+    immediately (§4 Decision 6), so an aborted/in-flight DDL is skipped; skipped
+    `CreateTable` / `CreateIndex` records still reserve their IDs, because their
+    index/heap pages may replay as unreferenced, invisible orphan files that a later
+    object must not reuse.
 - **Checkpoint** ordering (`crates/server/src/checkpoint.rs`):
   `wal.flush` → `flush_dirty_pages` → `store.sync_all` → control record →
   `persist_clog` → `Checkpoint` marker → `truncate_before` → `mark_all_clean`.
@@ -937,8 +943,13 @@ reference current files.
     inside the block share that `txn_id`; writes are stamped with it and reads use
     the transaction's snapshot. `COMMIT` = append `Commit` → `flush` (fsync) →
     `CLOG=Committed` (set at flush) → post-durable cleanup → deregister → `'I'`.
-    `ROLLBACK` (or any statement error) = append `Abort` → `CLOG=Aborted` →
-    before-image undo → deregister. A statement error poisons the block to the
+    `ROLLBACK` (or an autocommit statement error) = append `Abort` →
+    `CLOG=Aborted` → deregister → metadata/bookkeeping cleanup
+    (`storage.rollback_txn` for DDL metadata, `buffer_pool.rollback` as a no-op
+    clear). There is no
+    page-content undo; aborted versions stay physically present, hidden by the
+    CLOG, and are reclaimed by VACUUM. A statement error inside an explicit block
+    poisons the block to the
     `'E'` failed state; while `'E'`, every statement except `COMMIT`/`ROLLBACK` is
     rejected with `25P02` (`SqlState::InFailedSqlTransaction`). `COMMIT` of an
     `'E'` block issues `ROLLBACK` (Postgres behavior). `BEGIN` inside a block is a
@@ -965,9 +976,10 @@ reference current files.
     the start of each statement; Repeatable Read captures one snapshot at the first
     statement and reuses it. The snapshot is shared via `Arc` so the executor does
     not deep-clone the (now-possibly-non-empty) `xip` vector per scan operator.
-  - **Before-image undo is retained through C3** (see §11 and D1 below): `ROLLBACK`
-    /abort still uses `buffer_pool.rollback(txn)` plus the `Abort` record +
-    `CLOG=Aborted`. Retiring it requires the relaxed flush gate, so it moves to D1.
+  - **Historical sequencing note:** the original C3 staging retained
+    before-image undo until D1 because retiring it required the relaxed flush gate.
+    The current implemented contract is post-D1: `buffer_pool.rollback(txn)` is a
+    no-op bookkeeping clear and abort is status-based invisibility.
 
 ### Milestone D — Recovery & durability rework *(implemented; D1 + D2 in one commit)*
 
@@ -1553,9 +1565,10 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
      supersedes but must conflict with other live rows. Stamping the old version's
      `xmax = txn` *before* the new entries' uniqueness checks makes the MVCC
      `unique_conflict_kind` treat it as own-deleted (non-conflicting); a changed
-     unique secondary value colliding with a different live row raises
-     `UniqueViolation` (the statement error → txn abort → before-image undo restores
-     everything).
+    unique secondary value colliding with a different live row raises
+    `UniqueViolation`; abort records the transaction as `Aborted`, making the new
+    version invisible and the old version's own `xmax` stamp non-effective through
+    the CLOG. VACUUM later reclaims the aborted version and its index entries.
    - *Touches:* `storage/src/engine.rs` (`update`).
    - *Tests:* update+select sees the new value (seq scan, index scan on the changed
      column, and a scan on an *unchanged* secondary column — the all-indexes check);
@@ -1581,12 +1594,11 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
   accepted interim cost).
 - **No-regression window** is avoided by landing visibility-aware uniqueness (7)
   before delete/update (8–9).
-- **Recovery is unaffected during B:** under autocommit single-writer every
-  statement is its own committed transaction, so the existing
-  `replay_committed_from` redo model replays the new
-  `HeapUpdateHeader`/`HeapInsert`/index records correctly and the flush policy still
-  never flushes uncommitted pages. Redo-all (Milestone D) is needed only once
-  multi-statement / concurrent writers arrive.
+- **Current recovery contract:** recovery is redo-all. It replays every physical
+  `HeapUpdateHeader`/`HeapInsert`/index page record under PageLSN gating and uses
+  the CLOG to hide aborted or in-flight-at-crash versions. The earlier B-only
+  `replay_committed_from` sequencing assumption is retired by Milestone D and is
+  not a valid implementation model.
 - **Reads do not walk `t_ctid` (through Milestone G):** with index-per-version
   every version is independently indexed, so a scan collects all candidate TIDs
   from the index and visibility-checks each; the forward `t_ctid` chain is

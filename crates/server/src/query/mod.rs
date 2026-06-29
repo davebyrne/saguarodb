@@ -29,10 +29,11 @@ pub struct QueryService {
     engine: QueryEngine,
 }
 
-/// The concurrency guard an autocommit write/DDL unit holds for its lifetime. Most
-/// writes take the SHARED writer guard (concurrent with other writers); CREATE INDEX
-/// takes the EXCLUSIVE guard so its HOT broken-chain backfill sees a stable physical
-/// view (`docs/specs/mvcc.md` §10 Milestone H2). Dropping this drops the inner guard
+/// The concurrency guard an autocommit write/DDL unit holds for its lifetime. DML
+/// takes the SHARED writer guard (concurrent with other writers); DDL takes the
+/// EXCLUSIVE guard because catalog rollback restores whole object maps and CREATE
+/// INDEX also needs a stable physical view for its HOT broken-chain backfill
+/// (`docs/specs/mvcc.md` §10 Milestone H2). Dropping this drops the inner guard
 /// either way, so the autocommit path holds one variable across execution + commit.
 /// The inner guards are held purely for their RAII `Drop` (they own the lock), never
 /// read — like `WriteGuard`/`CheckpointGuard`'s own `_guard` fields.
@@ -316,7 +317,9 @@ impl QueryService {
         let bound = self.substitute_prepared_params(prepared, params)?;
         match prepared.class {
             StatementClass::Read => self.autocommit_read(bound, cancel),
-            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            StatementClass::Write | StatementClass::Ddl => {
+                self.autocommit_bound_write(bound, cancel)
+            }
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
             }
@@ -406,7 +409,7 @@ impl QueryService {
                 let result = match prepared.class {
                     StatementClass::Read => self.autocommit_read(bound, cancel),
                     StatementClass::Write | StatementClass::Ddl => {
-                        self.autocommit_write(bound, cancel)
+                        self.autocommit_bound_write(bound, cancel)
                     }
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
@@ -746,15 +749,588 @@ impl QueryService {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use catalog::CatalogSnapshot;
-    use common::{DataType, IsolationLevel, Result, SqlState, Value};
+    use buffer::{BufferPool, MemoryBufferPool, PageStore};
+    use catalog::{CatalogManager, CatalogSnapshot, MemoryCatalog};
+    use common::{
+        ConcurrencyController, DataType, DbError, FlushPolicy, IndexId, IndexSchema,
+        IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, Result, RwLockConcurrencyController,
+        SqlState, TableId, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+    };
+    use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
+    use storage::{HeapPageStore, PageBackedStorageEngine, StorageMode};
+    use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     use super::SessionTxnStatus;
-    use crate::app::AppState;
+    use crate::app::{AppState, ServerComponents};
+    use crate::checkpoint::CheckpointState;
+    use crate::config::Config;
+    use crate::registry::ActiveTxnRegistry;
+    use crate::shutdown::ShutdownState;
+
+    struct TestFlushPolicy;
+
+    impl FlushPolicy for TestFlushPolicy {
+        fn can_flush(&self, _info: &PageFlushInfo) -> bool {
+            true
+        }
+    }
+
+    fn app_with_parts(
+        data_dir: &Path,
+        mut config: Config,
+        catalog: Arc<dyn CatalogManager>,
+        wal: Arc<dyn WalManager>,
+        control: Arc<dyn ControlStore>,
+        concurrency: Arc<dyn ConcurrencyController>,
+    ) -> AppState {
+        config.data_dir = data_dir.to_path_buf();
+        let store: Arc<dyn PageStore> =
+            Arc::new(HeapPageStore::open(data_dir.join("heap")).unwrap());
+        let buffer_pool: Arc<dyn BufferPool> = Arc::new(MemoryBufferPool::new(
+            config.buffer_pool_frames,
+            Box::new(TestFlushPolicy),
+            store.clone(),
+        ));
+        buffer_pool.enable_stealing();
+        let storage = Arc::new(
+            PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Normal)
+                .unwrap(),
+        );
+        let active_txns = ActiveTxnRegistry::new();
+        let lock_manager = Arc::new(crate::lock_manager::LockManager::new(
+            active_txns.clone(),
+            Duration::from_millis(config.deadlock_timeout_ms),
+        ));
+        let components = Arc::new(ServerComponents {
+            config,
+            catalog,
+            storage,
+            buffer_pool,
+            wal,
+            control,
+            store,
+            concurrency,
+            checkpoint: CheckpointState {
+                last_checkpoint_lsn: AtomicU64::new(0),
+                commits_since_checkpoint: AtomicU64::new(0),
+                checkpoints: AtomicU64::new(0),
+            },
+            shutdown: Arc::new(ShutdownState::new()),
+            next_txn_id: AtomicU64::new(common::ids::FIRST_NORMAL_XID),
+            dead_rows_since_vacuum: AtomicU64::new(0),
+            active_txns,
+            lock_manager,
+            tls: None,
+            cancel_registry: crate::cancel::CancelRegistry::new(),
+        });
+        AppState {
+            components: components.clone(),
+            query_service: Arc::new(super::QueryService::new(components)),
+        }
+    }
+
+    struct FailingControlStore {
+        fail_store: AtomicBool,
+        stored: Mutex<Option<ControlData>>,
+    }
+
+    impl FailingControlStore {
+        fn fail_store() -> Self {
+            Self {
+                fail_store: AtomicBool::new(true),
+                stored: Mutex::new(None),
+            }
+        }
+    }
+
+    impl ControlStore for FailingControlStore {
+        fn load(&self) -> Result<Option<ControlData>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+
+        fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()> {
+            if self.fail_store.load(Ordering::SeqCst) {
+                return Err(DbError::io("injected control store failure"));
+            }
+            *self.stored.lock().unwrap() = Some(ControlData {
+                checkpoint_lsn,
+                tables: tables.to_vec(),
+                catalog: catalog.to_vec(),
+            });
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingAbortWal {
+        next_lsn: AtomicU64,
+        fail_abort: AtomicBool,
+        statuses: Mutex<HashMap<TxnId, TxnStatus>>,
+    }
+
+    impl FailingAbortWal {
+        fn new_fail_abort() -> Self {
+            Self {
+                next_lsn: AtomicU64::new(1),
+                fail_abort: AtomicBool::new(true),
+                statuses: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl WalManager for FailingAbortWal {
+        fn append(&self, record: WalRecord) -> Result<Lsn> {
+            if matches!(record.kind, WalRecordKind::Abort) && self.fail_abort.load(Ordering::SeqCst)
+            {
+                return Err(DbError::io("injected abort append failure"));
+            }
+            match record.kind {
+                WalRecordKind::Commit => {
+                    self.statuses
+                        .lock()
+                        .unwrap()
+                        .insert(record.txn_id, TxnStatus::Committed);
+                }
+                WalRecordKind::Abort => {
+                    self.statuses
+                        .lock()
+                        .unwrap()
+                        .insert(record.txn_id, TxnStatus::Aborted);
+                }
+                WalRecordKind::CommitWithSubxids { subxids } => {
+                    let mut statuses = self.statuses.lock().unwrap();
+                    statuses.insert(record.txn_id, TxnStatus::Committed);
+                    for subxid in subxids {
+                        statuses.insert(subxid, TxnStatus::Committed);
+                    }
+                }
+                _ => {}
+            }
+            Ok(self.next_lsn.fetch_add(1, Ordering::SeqCst))
+        }
+
+        fn flush(&self) -> Result<Lsn> {
+            Ok(self.next_lsn.load(Ordering::SeqCst).saturating_sub(1))
+        }
+
+        fn replay_from(&self, _lsn: Lsn) -> Result<Box<dyn Iterator<Item = Result<WalRecord>>>> {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn truncate_before(&self, _lsn: Lsn) -> Result<()> {
+            Ok(())
+        }
+
+        fn flushed_lsn(&self) -> Lsn {
+            self.next_lsn.load(Ordering::SeqCst).saturating_sub(1)
+        }
+
+        fn bytes_after(&self, _lsn: Lsn) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn persist_clog(&self, _clog_lsn: Lsn) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_vacuum_floor(&self, _boundary: TxnId) -> Result<()> {
+            Ok(())
+        }
+
+        fn establish_recovery_committed_floor(&self, _allocation_boundary: u64) -> Result<()> {
+            Ok(())
+        }
+
+        fn resolve_in_flight_as_aborted(&self, _writer_xids: &HashSet<u64>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TxnStatusView for FailingAbortWal {
+        fn status(&self, txn_id: TxnId) -> TxnStatus {
+            if txn_id < common::ids::FIRST_NORMAL_XID {
+                return TxnStatus::Committed;
+            }
+            self.statuses
+                .lock()
+                .unwrap()
+                .get(&txn_id)
+                .copied()
+                .unwrap_or(TxnStatus::InProgress)
+        }
+    }
+
+    struct RecordingConcurrency {
+        inner: RwLockConcurrencyController,
+        begin_writer_calls: Arc<AtomicUsize>,
+        begin_checkpoint_calls: Arc<AtomicUsize>,
+    }
+
+    impl RecordingConcurrency {
+        fn new(
+            begin_writer_calls: Arc<AtomicUsize>,
+            begin_checkpoint_calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: RwLockConcurrencyController::new(),
+                begin_writer_calls,
+                begin_checkpoint_calls,
+            }
+        }
+    }
+
+    impl ConcurrencyController for RecordingConcurrency {
+        fn begin_writer(&self) -> Result<common::WriteGuard> {
+            self.begin_writer_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.begin_writer()
+        }
+
+        fn begin_checkpoint(&self) -> Result<common::CheckpointGuard> {
+            self.begin_checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.begin_checkpoint()
+        }
+    }
+
+    struct RecordingCatalog {
+        inner: MemoryCatalog,
+        begin_writer_calls: Arc<AtomicUsize>,
+        unguarded_lookup: Arc<AtomicBool>,
+        restore_calls: Arc<AtomicUsize>,
+    }
+
+    impl RecordingCatalog {
+        fn new(
+            begin_writer_calls: Arc<AtomicUsize>,
+            unguarded_lookup: Arc<AtomicBool>,
+            restore_calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner: MemoryCatalog::empty(),
+                begin_writer_calls,
+                unguarded_lookup,
+                restore_calls,
+            }
+        }
+    }
+
+    impl CatalogManager for RecordingCatalog {
+        fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>> {
+            if self.begin_writer_calls.load(Ordering::SeqCst) == 0 {
+                self.unguarded_lookup.store(true, Ordering::SeqCst);
+            }
+            self.inner.get_table_by_name(name)
+        }
+
+        fn get_table(&self, id: TableId) -> Result<Option<TableSchema>> {
+            self.inner.get_table(id)
+        }
+
+        fn list_tables(&self) -> Result<Vec<TableSchema>> {
+            self.inner.list_tables()
+        }
+
+        fn snapshot(&self) -> Result<CatalogSnapshot> {
+            self.inner.snapshot()
+        }
+
+        fn restore(&self, snapshot: CatalogSnapshot) -> Result<()> {
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.restore(snapshot)
+        }
+
+        fn reserve_table_id(&self, id: TableId) -> Result<()> {
+            self.inner.reserve_table_id(id)
+        }
+
+        fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
+            self.inner.apply_create_table(schema)
+        }
+
+        fn apply_drop_table(&self, id: TableId) -> Result<()> {
+            self.inner.apply_drop_table(id)
+        }
+
+        fn create_table(
+            &self,
+            name: String,
+            columns: Vec<ParsedColumnDef>,
+            primary_key: Vec<String>,
+        ) -> Result<TableSchema> {
+            self.inner.create_table(name, columns, primary_key)
+        }
+
+        fn drop_table(&self, id: TableId) -> Result<()> {
+            self.inner.drop_table(id)
+        }
+
+        fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
+            self.inner.get_index_by_name(name)
+        }
+
+        fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>> {
+            self.inner.list_indexes_for_table(table)
+        }
+
+        fn reserve_index_id(&self, id: IndexId) -> Result<()> {
+            self.inner.reserve_index_id(id)
+        }
+
+        fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {
+            self.inner.apply_create_index(schema)
+        }
+
+        fn apply_drop_index(&self, id: IndexId) -> Result<()> {
+            self.inner.apply_drop_index(id)
+        }
+
+        fn create_index(
+            &self,
+            name: String,
+            table: &str,
+            columns: &[String],
+            unique: bool,
+        ) -> Result<IndexSchema> {
+            self.inner.create_index(name, table, columns, unique)
+        }
+
+        fn drop_index(&self, id: IndexId) -> Result<()> {
+            self.inner.drop_index(id)
+        }
+    }
+
+    #[test]
+    fn rollback_pre_durable_does_not_swallow_abort_append_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal: Arc<dyn WalManager> = Arc::new(FailingAbortWal::new_fail_abort());
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        let service = super::QueryService::new(app.components.clone());
+        let txn_id = 77;
+        app.components.active_txns.register(txn_id);
+
+        let result = service.rollback_pre_durable(txn_id, None);
+
+        assert!(
+            result.is_err(),
+            "abort WAL append failure was swallowed; dirty aborted data can lose its Aborted status"
+        );
+        assert!(
+            app.components.active_txns.active_ids().contains(&txn_id),
+            "transaction was deregistered even though its Abort record was not recorded"
+        );
+    }
+
+    #[test]
+    fn autocommit_write_does_not_report_post_commit_checkpoint_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            checkpoint_every_n_commits: 1,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(FailingControlStore::fail_store()),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+
+        let result = app
+            .query_service
+            .execute_sql("create table users (id integer primary key)");
+
+        assert!(
+            result.is_ok(),
+            "post-commit checkpoint failure was reported as a normal statement error"
+        );
+        assert!(
+            app.components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .is_some(),
+            "the committed DDL should remain installed even when its post-commit checkpoint fails"
+        );
+    }
+
+    #[test]
+    fn autocommit_write_binds_after_acquiring_writer_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let begin_writer_calls = Arc::new(AtomicUsize::new(0));
+        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let unguarded_lookup = Arc::new(AtomicBool::new(false));
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
+            begin_writer_calls.clone(),
+            unguarded_lookup.clone(),
+            restore_calls,
+        ));
+        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
+            begin_writer_calls.clone(),
+            begin_checkpoint_calls,
+        ));
+        let config = Config {
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            catalog,
+            wal,
+            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            concurrency,
+        );
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+
+        begin_writer_calls.store(0, Ordering::SeqCst);
+        unguarded_lookup.store(false, Ordering::SeqCst);
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+
+        assert!(
+            !unguarded_lookup.load(Ordering::SeqCst),
+            "catalog name resolution for a write ran before the writer guard was acquired"
+        );
+    }
+
+    #[test]
+    fn autocommit_ddl_uses_exclusive_guard_and_dml_uses_shared_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let begin_writer_calls = Arc::new(AtomicUsize::new(0));
+        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let unguarded_lookup = Arc::new(AtomicBool::new(false));
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
+            begin_writer_calls.clone(),
+            unguarded_lookup,
+            restore_calls,
+        ));
+        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
+            begin_writer_calls.clone(),
+            begin_checkpoint_calls.clone(),
+        ));
+        let config = Config {
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            catalog,
+            wal,
+            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            concurrency,
+        );
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        assert_eq!(
+            begin_checkpoint_calls.load(Ordering::SeqCst),
+            1,
+            "DDL must take the exclusive guard so catalog rollback cannot race committed DDL"
+        );
+        assert_eq!(
+            begin_writer_calls.load(Ordering::SeqCst),
+            0,
+            "DDL should not take the shared writer guard"
+        );
+
+        begin_checkpoint_calls.store(0, Ordering::SeqCst);
+        begin_writer_calls.store(0, Ordering::SeqCst);
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+        assert_eq!(
+            begin_writer_calls.load(Ordering::SeqCst),
+            1,
+            "DML should still take the shared writer guard"
+        );
+        assert_eq!(
+            begin_checkpoint_calls.load(Ordering::SeqCst),
+            0,
+            "DML should not serialize through the exclusive guard"
+        );
+    }
+
+    #[test]
+    fn failed_autocommit_dml_does_not_restore_catalog_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let begin_writer_calls = Arc::new(AtomicUsize::new(0));
+        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let unguarded_lookup = Arc::new(AtomicBool::new(false));
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
+            begin_writer_calls.clone(),
+            unguarded_lookup,
+            restore_calls.clone(),
+        ));
+        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
+            begin_writer_calls,
+            begin_checkpoint_calls,
+        ));
+        let config = Config {
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            catalog,
+            wal,
+            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            concurrency,
+        );
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap();
+        restore_calls.store(0, Ordering::SeqCst);
+
+        let err = app
+            .query_service
+            .execute_sql("insert into users (id) values (1)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+        assert_eq!(
+            restore_calls.load(Ordering::SeqCst),
+            0,
+            "DML rollback must not restore a whole catalog snapshot"
+        );
+    }
 
     #[tokio::test]
     async fn execute_sql_aborts_when_cancellation_requested() {
@@ -1493,6 +2069,18 @@ mod tests {
         app.query_service
             .execute_sql("create index users_name on users (name)")
             .unwrap();
+
+        let executor::ExecutionResult::Query { rows, .. } = app
+            .query_service
+            .execute_sql("select id from users where name = 'Ada' order by id")
+            .unwrap()
+        else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            rows.into_iter().map(|row| row.values).collect::<Vec<_>>(),
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
     }
 
     #[tokio::test]

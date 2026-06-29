@@ -104,9 +104,21 @@ impl CatalogManager for MemoryCatalog {
         Ok(self.read_snapshot()?.clone())
     }
 
-    fn restore(&self, snapshot: CatalogSnapshot) -> Result<()> {
+    fn restore(&self, mut snapshot: CatalogSnapshot) -> Result<()> {
         validate_snapshot(&snapshot)?;
-        *self.write_snapshot()? = snapshot;
+        let mut current = self.write_snapshot()?;
+        snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
+        snapshot.next_index_id = snapshot.next_index_id.max(current.next_index_id);
+        *current = snapshot;
+        Ok(())
+    }
+
+    fn reserve_table_id(&self, id: TableId) -> Result<()> {
+        let next_after_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog table id overflow while reserving id"))?;
+        let mut snapshot = self.write_snapshot()?;
+        snapshot.next_table_id = snapshot.next_table_id.max(next_after_id);
         Ok(())
     }
 
@@ -184,6 +196,15 @@ impl CatalogManager for MemoryCatalog {
             .collect();
         indexes.sort_by_key(|index| index.id);
         Ok(indexes)
+    }
+
+    fn reserve_index_id(&self, id: IndexId) -> Result<()> {
+        let next_after_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog index id overflow while reserving id"))?;
+        let mut snapshot = self.write_snapshot()?;
+        snapshot.next_index_id = snapshot.next_index_id.max(next_after_id);
+        Ok(())
     }
 
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {

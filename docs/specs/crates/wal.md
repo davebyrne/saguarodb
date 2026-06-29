@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`wal` owns the append-only write-ahead log. It records committed operations — physiological page redo plus DDL — so recovery can replay them after the latest checkpoint.
+`wal` owns the append-only write-ahead log. It records physiological page redo, logical DDL, and transaction status markers so recovery can replay page changes after the latest checkpoint and use the CLOG to decide visibility.
 
 ## Depends On
 
@@ -99,7 +99,7 @@ The redo-committed-only `replay_committed_from` is **retired** (Milestone D2): r
 
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `decode_record` decodes exactly one record from a buffer: it returns an error on a partial buffer (`"incomplete WAL record"`) and on a buffer with bytes left over after the record (`"WAL buffer contains trailing bytes"`). `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery passes the control record `checkpoint_lsn`, so replay starts after the last WAL record whose effects are already reflected in the heap. Recovery (redo-all, Milestone D2) iterates `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation` — `HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`), skipping the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers, and applying DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) only for committed transactions (the server gates those by the rebuilt CLOG; see `server.md`). The CLOG decides visibility afterward.
+`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery uses it for two separate purposes. Redo passes the control record `checkpoint_lsn`, so page replay starts after the last WAL record whose effects are already reflected in the heap. The transaction-id allocator seed passes `0` and scans every retained record, so it can recover the allocation high-water from pre-boundary records when a crash happens after the manifest/CLOG checkpoint is durable but before the `Checkpoint` marker is appended; after a completed truncation, the retained marker carries the boundary instead. Redo-all (Milestone D2) iterates `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation` — `HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`), skipping the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers. DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) install catalog/storage objects only for committed transactions (the server gates those by the rebuilt CLOG; see `server.md`), while skipped aborted/in-flight create records still reserve their table/index IDs. The CLOG decides visibility afterward.
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Unconditional truncation:** truncation drops every record below `lsn` — it does NOT pin aborted/in-flight transactions and does NOT touch the in-memory CLOG or floors. It is safe because the checkpoint calls `persist_clog` (which durably records every aborted outcome in `clog.dat`) *before* `truncate_before`, and under the exclusive checkpoint guard no write transaction is in flight, so every transaction below `lsn` is settled and captured by that snapshot (see "Durable CLOG snapshot" and `mvcc.md` §5.4/§8). **Precondition:** a caller must persist the CLOG snapshot covering `lsn` before truncating; the no-snapshot fallback (a pre-durable-CLOG data directory) instead relies on the WAL having been conservatively truncated by the older build.
 
@@ -124,11 +124,11 @@ If cleanup fails after step 3, the server treats it as fatal and exits after flu
 
 For failed write statements:
 
-1. Server query orchestration does not append `Commit`. It appends an `Abort` record (which records the transaction `Aborted` in the CLOG) without flushing — abort durability is not critical, since a transaction with no durable `Commit` is recovered as aborted regardless.
-2. Server query orchestration calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`. (The buffer-pool before-image undo is retained in Milestone A; it is retired in Milestone C3 when abort becomes purely status-based.)
-3. Uncommitted WAL records remain but are ignored by recovery.
+1. Server query orchestration does not append `Commit`. It appends an `Abort` record (which records the transaction `Aborted` in the CLOG) before deregistering the transaction. Abort is not fsync-gated; a transaction with no durable `Commit` is recovered as aborted regardless.
+2. Server query orchestration calls `storage.rollback_txn(txn_id)` and `buffer_pool.rollback(txn_id)`. These are metadata/bookkeeping cleanup only under status-based abort: heap and index page bytes are not undone.
+3. Uncommitted or aborted physical WAL records remain and are still replayed by redo-all recovery. Their versions stay invisible because the CLOG reports the transaction as aborted or in-flight-at-crash. Logical DDL records are the exception: recovery installs them only for committed transactions, but still reserves IDs from skipped aborted/in-flight create records so orphan page files are not reused.
 
-If rollback cleanup fails before the commit record is durable, the server treats the process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits. Uncommitted WAL records remain ignored by recovery because no durable `Commit` record exists.
+If rollback cleanup fails before the commit record is durable, the server treats the process state as unsafe: it logs the rollback failure, attempts to flush WAL, and exits. Recovery may replay that transaction's physical page records, but no durable `Commit` exists, so the CLOG hides them.
 
 ## Checkpoint Interaction
 
@@ -156,8 +156,9 @@ After heap pages are flushed + fsynced and the control record is stored:
 Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
-- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records replay only for committed transactions (server-gated by the CLOG).
+- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index IDs.
 - Reconstructs the CLOG at `open`: seeded from the durable CLOG snapshot (`clog.dat`) plus a fold of the post-`clog_lsn` `Commit`/`Abort` records, or fully rebuilt from those records when no snapshot exists (see "Durable CLOG snapshot"). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
+- Seeds `next_txn_id` by scanning `replay_from(0)` over all retained records (including `CommitWithSubxids.subxids` and the `Checkpoint` marker's high-water), not just the post-checkpoint redo range.
 
 The replay iterator stops cleanly at EOF. A partial final record after crash is ignored if CRC/header indicates incomplete trailing write; a corrupt record before EOF returns `ErrorKind::Wal`. On `open`, an incomplete trailing record is not merely ignored in memory — the WAL file is physically truncated to the last complete record's end and fsynced, so the torn tail is removed on disk. After such a truncation (and after `truncate_before`), `next_lsn` is derived from the maximum LSN among the retained records, so newly appended records continue monotonically past the highest retained LSN.
 

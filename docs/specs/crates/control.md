@@ -33,11 +33,16 @@ data/
 
 ```rust
 pub struct ControlData {
-    pub checkpoint_lsn: Lsn,   // redo boundary: heap reflects all committed work <= this LSN
+    pub checkpoint_lsn: Lsn,   // redo boundary: heap reflects flushed page effects <= this LSN
     pub tables: Vec<TableId>,  // sorted, no duplicates
     pub catalog: Vec<u8>,      // serialized catalog snapshot
 }
 ```
+
+With MVCC's relaxed flush gate, the heap may include page effects from committed,
+aborted, and in-flight-at-checkpoint transactions at or below the boundary. The
+CLOG, persisted separately by the checkpoint before WAL truncation, decides which
+versions are visible.
 
 The control record uses a versioned binary envelope:
 

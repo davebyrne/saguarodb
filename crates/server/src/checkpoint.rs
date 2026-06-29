@@ -174,3 +174,9 @@ pub fn record_commit_and_maybe_checkpoint(components: &ServerComponents) -> Resu
     }
     Ok(())
 }
+
+pub fn record_commit_and_maybe_checkpoint_after_durable_commit(components: &ServerComponents) {
+    if let Err(err) = record_commit_and_maybe_checkpoint(components) {
+        eprintln!("checkpoint trigger failed after durable commit: {err}");
+    }
+}

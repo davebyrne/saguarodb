@@ -502,7 +502,7 @@ pub enum PhysicalPlan {
 - Binder emits `BoundStatement::Explain(inner_bound)`.
 - `logical_plan` and `physical_plan` do not accept `BoundStatement::Explain` directly; callers must unwrap and plan the inner bound statement.
 - The planner crate exposes `format_explain(plan: &PhysicalPlan) -> String`.
-- The server `QueryService` handles the outer `EXPLAIN` statement by acquiring a read guard, binding the inner statement, building logical and physical plans for that inner statement, formatting the physical plan with `format_explain`, and returning `ExecutionResult::Explanation`.
+- The server `QueryService` handles the outer `EXPLAIN` statement lock-free by binding the inner statement, building logical and physical plans for that inner statement, formatting the physical plan with `format_explain`, and returning `ExecutionResult::Explanation`.
 
 The executor crate is not called for `EXPLAIN`.
 

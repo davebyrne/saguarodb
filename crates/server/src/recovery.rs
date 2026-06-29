@@ -75,8 +75,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // PageLSN-gated page bytes), so an aborted DDL's catalog record must NOT take
     // effect. DDL is non-transactional and commits immediately (§4 Decision 6), so
     // a committed DDL replays and an aborted/in-flight one is skipped — gated by the
-    // rebuilt CLOG. Its index/heap pages (physical records) may still replay
-    // harmlessly as orphan pages; they are unreferenced and invisible.
+    // rebuilt CLOG. Skipped CreateTable/CreateIndex records still reserve their IDs:
+    // their index/heap page records may replay as orphan files, and a future object
+    // must not reuse those file names.
     let mut replay_applied = false;
     // Writers whose page mutations were replayed: any of these left InProgress (no
     // durable Commit/Abort) is a crashed in-flight transaction whose versions are on
@@ -96,7 +97,12 @@ pub fn open_app(config: Config) -> Result<AppState> {
         if is_logical_catalog_record(&record.kind) && !wal.is_committed(record.txn_id) {
             // An aborted/in-flight DDL's catalog mutation must not be applied
             // (redo-all does not hide a non-idempotent catalog change behind the
-            // CLOG the way it hides per-tuple versions).
+            // CLOG the way it hides per-tuple versions). Its allocated object ID
+            // must still stay burned, because physical page records for that ID
+            // may have replayed and future objects map IDs to the same file names.
+            if reserve_catalog_id(catalog.as_ref(), &record.kind)? {
+                replay_applied = true;
+            }
             continue;
         }
         apply_redo(
@@ -109,7 +115,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         replay_applied = true;
     }
 
-    let next_txn_id = next_txn_id(wal.as_ref(), checkpoint_lsn)?;
+    let next_txn_id = next_txn_id(wal.as_ref())?;
     // Establish the CLOG implicit-committed floor (`docs/specs/mvcc.md` §5.4, §8).
     // When the WAL loaded a durable `clog.dat` snapshot its floor is authoritative and
     // this is a no-op. Otherwise (no snapshot — a fresh database, or a pre-durable-CLOG
@@ -233,6 +239,21 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
     )
 }
 
+fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Result<bool> {
+    match kind {
+        WalRecordKind::CreateTable { schema } => {
+            catalog.reserve_table_id(schema.id)?;
+            Ok(true)
+        }
+        WalRecordKind::CreateIndex { schema } => {
+            catalog.reserve_index_id(schema.id)?;
+            Ok(true)
+        }
+        WalRecordKind::DropTable { .. } | WalRecordKind::DropIndex { .. } => Ok(false),
+        _ => Ok(false),
+    }
+}
+
 fn apply_redo(
     catalog: &dyn CatalogManager,
     storage: &dyn RecoveryOperations,
@@ -288,13 +309,15 @@ fn apply_redo(
     }
 }
 
-fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
+fn next_txn_id(wal: &dyn WalManager) -> Result<u64> {
     let mut max_txn_id = 0;
-    // Records with `LSN > checkpoint_lsn` include the retained `Checkpoint` marker
-    // (appended after the boundary), which carries the transaction-id high-water
-    // mark — recovering the allocator boundary even when every data record below
-    // the checkpoint was truncated.
-    for record in wal.replay_from(checkpoint_lsn)? {
+    // Seed the allocator from every retained WAL record, not only records after the
+    // control record's checkpoint LSN. This intentionally covers the crash window
+    // where the manifest and CLOG snapshot are durable but the checkpoint marker
+    // carrying the transaction-id high-water has not yet been appended/flushed. If a
+    // completed checkpoint later truncates below the boundary, the retained
+    // Checkpoint marker still carries that high-water mark.
+    for record in wal.replay_from(0)? {
         let record = record?;
         if record.txn_id != 0 {
             max_txn_id = max_txn_id.max(record.txn_id);
@@ -302,9 +325,9 @@ fn next_txn_id(wal: &dyn WalManager, checkpoint_lsn: u64) -> Result<u64> {
         // A committed savepoint subxid lives only in the `CommitWithSubxids`
         // payload, not a record header (e.g. a released read-only savepoint).
         // Fold it in so the allocator never reissues a committed subxid. (Records
-        // truncated below the checkpoint are covered by the retained `Checkpoint`
-        // marker's high-water mark, which already includes subxids — they are
-        // allocated from the same counter.)
+        // truncated below a completed checkpoint are covered by the retained
+        // `Checkpoint` marker's high-water mark, which already includes subxids —
+        // they are allocated from the same counter.
         if let WalRecordKind::CommitWithSubxids { subxids } = &record.kind
             && let Some(max_sub) = subxids.iter().copied().max()
         {
@@ -326,6 +349,21 @@ mod tests {
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    fn table_schema(id: common::TableId, name: &str) -> common::TableSchema {
+        common::TableSchema {
+            id,
+            name: name.to_string(),
+            columns: vec![common::ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: common::DataType::Integer,
+                nullable: false,
+                max_length: None,
+            }],
+            primary_key: vec![0],
+        }
+    }
 
     #[tokio::test]
     async fn recovery_replays_committed_records_after_snapshot_lsn() {
@@ -351,6 +389,171 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn recovery_preserves_txn_allocator_when_manifest_lsn_has_no_checkpoint_marker() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let expected_next_txn_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            for id in 0..5 {
+                app.query_service
+                    .execute_sql(&format!(
+                        "insert into users (id, name) values ({id}, 'Ada')"
+                    ))
+                    .unwrap();
+            }
+            expected_next_txn_id = app.components.next_txn_id.load(Ordering::Acquire);
+
+            // Simulate the checkpoint crash window: heap pages, manifest/control, and
+            // CLOG snapshot are durable at checkpoint_lsn, but the Checkpoint marker
+            // carrying the transaction-id high-water mark was never appended/flushed.
+            app.components.wal.flush().unwrap();
+            app.components.buffer_pool.flush_dirty_pages().unwrap();
+            app.components.store.sync_all().unwrap();
+            let checkpoint_lsn = app.components.wal.flushed_lsn();
+            let mut tables: Vec<_> = app
+                .components
+                .catalog
+                .list_tables()
+                .unwrap()
+                .iter()
+                .map(|table| table.id)
+                .collect();
+            tables.sort_unstable();
+            let catalog_bytes =
+                catalog::serialize_catalog(&app.components.catalog.snapshot().unwrap()).unwrap();
+            app.components
+                .control
+                .store(checkpoint_lsn, &tables, &catalog_bytes)
+                .unwrap();
+            app.components.wal.persist_clog(checkpoint_lsn).unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let recovered_next_txn_id = reopened.components.next_txn_id.load(Ordering::Acquire);
+        assert!(
+            recovered_next_txn_id >= expected_next_txn_id,
+            "recovery reused transaction ids after a manifest/CLOG checkpoint without a retained \
+             Checkpoint marker: recovered next={recovered_next_txn_id}, expected at least \
+             {expected_next_txn_id}"
+        );
+    }
+
+    #[test]
+    fn recovery_reserves_table_id_from_skipped_create_table_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let skipped_schema = table_schema(41, "aborted_table");
+        {
+            let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            wal.append(WalRecord {
+                lsn: 0,
+                txn_id: 3,
+                kind: WalRecordKind::CreateTable {
+                    schema: skipped_schema.clone(),
+                },
+            })
+            .unwrap();
+            wal.append(WalRecord {
+                lsn: 0,
+                txn_id: 3,
+                kind: WalRecordKind::Abort,
+            })
+            .unwrap();
+            wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_table_by_name("aborted_table")
+                .unwrap(),
+            None,
+            "an aborted CreateTable record must not install a catalog table"
+        );
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_table_id,
+            skipped_schema.id + 1,
+            "recovery must still burn the skipped table id so its storage files are never reused"
+        );
+
+        reopened
+            .query_service
+            .execute_sql("create table live (id integer primary key)")
+            .unwrap();
+        let live = reopened
+            .components
+            .catalog
+            .get_table_by_name("live")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.id, skipped_schema.id + 1);
+    }
+
+    #[test]
+    fn recovery_reserves_index_id_from_skipped_create_index_record() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (1, 'Ada')")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (2, 'Ada')")
+                .unwrap();
+            let err = app
+                .query_service
+                .execute_sql("create unique index users_name on users (name)")
+                .unwrap_err();
+            assert_eq!(err.code, common::SqlState::UniqueViolation);
+            assert_eq!(
+                app.components
+                    .catalog
+                    .get_index_by_name("users_name")
+                    .unwrap(),
+                None
+            );
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_index_id,
+            common::PRIMARY_KEY_INDEX_ID + 2,
+            "recovery must burn the aborted index id even though the index catalog record is skipped"
+        );
+
+        reopened
+            .query_service
+            .execute_sql("create index users_id on users (id)")
+            .unwrap();
+        let index = reopened
+            .components
+            .catalog
+            .get_index_by_name("users_id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 2);
     }
 
     #[test]
@@ -771,7 +974,7 @@ mod tests {
         .unwrap();
         wal.flush().unwrap();
 
-        let err = super::next_txn_id(&wal, 0).unwrap_err();
+        let err = super::next_txn_id(&wal).unwrap_err();
         assert!(err.message.contains("transaction id overflow"));
     }
 
@@ -790,6 +993,6 @@ mod tests {
         .unwrap();
         wal.flush().unwrap();
 
-        assert_eq!(super::next_txn_id(&wal, 0).unwrap(), 10);
+        assert_eq!(super::next_txn_id(&wal).unwrap(), 10);
     }
 }

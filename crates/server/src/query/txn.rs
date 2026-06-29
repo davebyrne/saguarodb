@@ -11,7 +11,7 @@ use super::{
     QueryService, SavepointLevel, Transaction, TransactionControl, begin_complete, commit_complete,
     release_complete, rollback_complete, savepoint_complete, set_complete,
 };
-use crate::checkpoint::record_commit_and_maybe_checkpoint;
+use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::AdvertisedSnapshot;
 
 /// The `25P02` error for a statement issued in a failed (`'E'`) transaction block
@@ -449,9 +449,7 @@ impl QueryService {
         // commit reaches here, so an aborted transaction never advances the counter.
         self.components.add_dead_versions(dead_versions);
 
-        if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
-            eprintln!("checkpoint failed after committed transaction: {err}");
-        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
         Ok(())
     }
 
@@ -504,7 +502,9 @@ impl QueryService {
                 txn_id: subxid,
                 kind: WalRecordKind::Abort,
             }) {
-                eprintln!("failed to append Abort record for subxid {subxid}: {err}");
+                self.fatal_pre_durable_rollback_failure(DbError::internal(format!(
+                    "failed to append Abort record for subxid {subxid}: {err}"
+                )));
             }
         }
         self.components.active_txns.deregister_all(subxids);
@@ -699,23 +699,16 @@ impl QueryService {
         txn_id: u64,
         catalog_before: Option<catalog::CatalogSnapshot>,
     ) -> Result<()> {
-        // Record the abort: append an `Abort` record (which sets the CLOG to
-        // `Aborted`) and drop the transaction from the active set. The abort is not
-        // fsynced here — a transaction with no durable `Commit` is recovered as
-        // aborted regardless: recovery's `resolve_in_flight_as_aborted` marks every
-        // replayed-but-unresolved writer `Aborted` (redo-all + in-flight = aborted,
-        // `docs/specs/mvcc.md` §8). The next checkpoint's `persist_clog` durably records
-        // the `Aborted` status in `clog.dat`, so the aborted txn's flushed pages stay
-        // hidden across a checkpoint even though truncation drops the `Abort` record
-        // (§5.4). A failure to append it is logged but not fatal: the txn is still
-        // recovered as aborted.
-        if let Err(err) = self.components.wal.append(WalRecord {
+        // Record the abort before dropping the transaction from the active set. The
+        // abort is not fsynced here — a transaction with no durable `Commit` is
+        // recovered as aborted — but the append must succeed while the server keeps
+        // running. Otherwise runtime visibility can observe a deregistered writer
+        // whose CLOG state is still `InProgress`.
+        self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::Abort,
-        }) {
-            eprintln!("failed to append Abort record for txn {txn_id}: {err}");
-        }
+        })?;
         self.components.active_txns.deregister(txn_id);
         // Wake any writer blocked on this aborted transaction's row locks.
         self.components.lock_manager.on_txn_finished();

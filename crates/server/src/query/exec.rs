@@ -11,7 +11,7 @@ use super::{
     BindSource, QueryService, StatementClass, Transaction, WriteUnitGuard, dead_versions_in,
     mark_failed_on_error, run_plan, statement_class,
 };
-use crate::checkpoint::record_commit_and_maybe_checkpoint;
+use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
 impl QueryService {
     /// Route a parsed simple-query statement through the transaction lifecycle.
@@ -285,10 +285,12 @@ impl QueryService {
         statement: Statement,
         cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
-        let bound = bind(&statement, self.components.catalog.as_ref())?;
         match class {
-            StatementClass::Read => self.autocommit_read(bound, cancel),
-            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(bound, cancel),
+            StatementClass::Read => {
+                let bound = bind(&statement, self.components.catalog.as_ref())?;
+                self.autocommit_read(bound, cancel)
+            }
+            StatementClass::Write | StatementClass::Ddl => self.autocommit_write(statement, cancel),
             // Maintenance (VACUUM) never reaches here: `dispatch` runs it via
             // `run_vacuum` before the autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
@@ -354,10 +356,10 @@ impl QueryService {
     /// Execute a write/DDL statement as an autocommit unit, committing durably on
     /// success and aborting on error.
     ///
-    /// Most writes (and most DDL) take the SHARED writer guard (E2b,
-    /// `docs/specs/mvcc.md` §10 E2b), running concurrently with other writers; only a
-    /// checkpoint (the exclusive guard) excludes them. **CREATE INDEX is the
-    /// exception:** it takes the EXCLUSIVE guard (like VACUUM) so its backfill sees a
+    /// DML takes the SHARED writer guard (E2b, `docs/specs/mvcc.md` §10 E2b),
+    /// running concurrently with other writers. DDL takes the EXCLUSIVE guard (like
+    /// VACUUM): catalog rollback restores whole object maps, so no other DDL may
+    /// commit between the rollback snapshot and restore; CREATE INDEX also needs a
     /// stable physical chain view with no concurrent writer (HOT updates) mutating a
     /// chain mid-scan, which its HOT broken-chain safety check requires
     /// (`docs/specs/mvcc.md` §10 Milestone H2). The GC horizon, threaded into the
@@ -365,17 +367,41 @@ impl QueryService {
     /// writer cannot advance it mid-build), mirroring `run_vacuum`.
     pub(super) fn autocommit_write(
         &self,
-        bound: BoundStatement,
+        statement: Statement,
         cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
-        // CREATE INDEX takes the exclusive guard (stable chain view for the HOT
-        // broken-chain check); every other write/DDL takes the shared writer guard.
-        let needs_exclusive = matches!(bound, BoundStatement::CreateIndex { .. });
+        let needs_exclusive = statement_needs_exclusive_guard(&statement);
         let guard = if needs_exclusive {
             WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
         } else {
             WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
         };
+        let bound = bind(&statement, self.components.catalog.as_ref())?;
+        self.autocommit_bound_write_with_guard(bound, guard, cancel)
+    }
+
+    pub(super) fn autocommit_bound_write(
+        &self,
+        bound: BoundStatement,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<ExecutionResult> {
+        // Prepared statements are already bound; no catalog name resolution happens
+        // here. Acquire the write/checkpoint guard before planning/execution.
+        let needs_exclusive = bound_needs_exclusive_guard(&bound);
+        let guard = if needs_exclusive {
+            WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
+        } else {
+            WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
+        };
+        self.autocommit_bound_write_with_guard(bound, guard, cancel)
+    }
+
+    fn autocommit_bound_write_with_guard(
+        &self,
+        bound: BoundStatement,
+        guard: WriteUnitGuard,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<ExecutionResult> {
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // The autocommit unit begins: allocate the transaction id and register it
@@ -383,7 +409,11 @@ impl QueryService {
         // CLOG status is `InProgress` implicitly until a `Commit`/`Abort` record
         // settles it.
         let txn_id = self.register_active_txn();
-        let catalog_before = self.components.catalog.snapshot()?;
+        let catalog_before = if bound_mutates_catalog(&bound) {
+            Some(self.components.catalog.snapshot()?)
+        } else {
+            None
+        };
         // Capture the snapshot after registering, excluding the own id so own
         // writes are seen via the predicate's `current_txn` path. Advertise its
         // `xmin` to the GC horizon and hold `_advertised` across execution and the
@@ -412,18 +442,18 @@ impl QueryService {
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+                self.rollback_pre_durable_or_die(txn_id, catalog_before.clone());
                 return Err(err);
             }
             Err(_) => {
-                self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+                self.rollback_pre_durable_or_die(txn_id, catalog_before.clone());
                 return Err(DbError::internal("statement execution panicked"));
             }
         };
 
         // An autocommit unit has no savepoints, so no committed subxids.
         if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
-            self.rollback_pre_durable_or_die(txn_id, Some(catalog_before));
+            self.rollback_pre_durable_or_die(txn_id, catalog_before);
             return Err(err);
         }
 
@@ -444,9 +474,7 @@ impl QueryService {
         // counting.
         self.components.add_dead_versions(dead_versions_in(&result));
 
-        if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
-            eprintln!("checkpoint failed after committed statement: {err}");
-        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
 
         Ok(result)
     }
@@ -464,4 +492,28 @@ impl QueryService {
             text: format_explain(&physical),
         })
     }
+}
+
+fn statement_needs_exclusive_guard(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::CreateTable { .. }
+            | Statement::DropTable { .. }
+            | Statement::CreateIndex { .. }
+            | Statement::DropIndex { .. }
+    )
+}
+
+fn bound_needs_exclusive_guard(bound: &BoundStatement) -> bool {
+    bound_mutates_catalog(bound)
+}
+
+fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
+    matches!(
+        bound,
+        BoundStatement::CreateTable { .. }
+            | BoundStatement::DropTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::DropIndex { .. }
+    )
 }

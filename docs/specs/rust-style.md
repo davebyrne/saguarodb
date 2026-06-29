@@ -80,7 +80,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - Parser, planner, executor, storage, buffer, WAL, control, and catalog crates are synchronous.
 - Tokio belongs at the server and connection boundary.
 - Use `std::sync::{Arc, Mutex, RwLock}` in core crates by default.
-- Use `parking_lot` where SaguaroDB needs owned lock guards, such as `ReadGuard`, `WriteGuard`, `PageReadGuard`, and `PageWriteGuard`. `std::sync` guard lifetimes are not suitable for these object-safe owned guard types.
+- Use `parking_lot` where SaguaroDB needs owned lock guards, such as `WriteGuard`, `CheckpointGuard`, `PageReadGuard`, and `PageWriteGuard`. `std::sync` guard lifetimes are not suitable for these object-safe owned guard types.
 - Use Tokio synchronization primitives only where async code would otherwise block the runtime.
 - Server shared components should be held as `Arc<dyn Trait + Send + Sync>` when they are accessed across owned services or tasks.
 - Prefer references to trait objects for short-lived API calls, such as `&dyn CatalogManager`.

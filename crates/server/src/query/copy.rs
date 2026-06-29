@@ -7,7 +7,7 @@ use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext};
 use tokio::sync::mpsc;
 
 use super::{QueryService, Transaction, WriteUnitGuard};
-use crate::checkpoint::record_commit_and_maybe_checkpoint;
+use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
 /// One inbound COPY-from-stdin event, sent by the connection loop to the blocking
 /// COPY transaction task. `Done` (clean end-of-input) commits; `Fail` (client
@@ -89,9 +89,7 @@ impl QueryService {
         drop(guard);
         // COPY FROM only inserts, so it produces no committed dead versions; still
         // count the commit toward the checkpoint trigger.
-        if let Err(err) = record_commit_and_maybe_checkpoint(&self.components) {
-            eprintln!("checkpoint failed after committed COPY: {err}");
-        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
         Ok(count)
     }
 
