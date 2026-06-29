@@ -307,10 +307,10 @@ fn build_schema(
         primary_key_ids.push(column_id);
     }
 
-    if primary_key_ids.len() != 1 {
+    if primary_key_ids.is_empty() {
         return Err(DbError::plan(
             SqlState::DatatypeMismatch,
-            "v1 requires exactly one primary key column",
+            "a table requires a primary key",
         ));
     }
 
@@ -488,9 +488,9 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         }
     }
 
-    if schema.primary_key.len() != 1 {
+    if schema.primary_key.is_empty() {
         return Err(DbError::internal(format!(
-            "catalog snapshot table {} must have exactly one primary key column in v1",
+            "catalog snapshot table {} must have a primary key",
             schema.name
         )));
     }

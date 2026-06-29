@@ -709,7 +709,7 @@ The binder:
 - Assigns a unique `BindingId` to each table occurrence in FROM (critical for self-joins and aliases)
 - Resolves column references to `BoundExpr::InputRef` with physical slot positions
 - Validates types (e.g., `WHERE` clause is boolean, arithmetic operands are numeric)
-- Rejects unsupported features (e.g., composite primary keys, unknown functions)
+- Rejects unsupported features (e.g., unknown functions)
 - Expands `SELECT *` into explicit column lists
 
 ```rust

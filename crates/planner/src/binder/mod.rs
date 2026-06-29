@@ -108,10 +108,10 @@ fn bind_inner(
                     ));
                 }
             }
-            if primary_key.len() != 1 {
+            if primary_key.is_empty() {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
-                    "v1 requires exactly one primary key column",
+                    "a table requires a primary key",
                 ));
             }
             for column in columns {

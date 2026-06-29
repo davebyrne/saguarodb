@@ -91,7 +91,7 @@ The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCa
 - Column names must be unique within table; duplicate column definitions return `SqlState::SyntaxError`.
 - Primary key column names must exist.
 - Duplicate primary-key column names return `SqlState::SyntaxError`.
-- Exactly one primary-key column is required; an empty or composite primary key returns `SqlState::DatatypeMismatch`.
+- At least one primary-key column is required; an empty primary key returns `SqlState::DatatypeMismatch`. Composite (multi-column) primary keys are supported — every named column must exist, in declared order, and uniqueness is enforced over the whole tuple at the storage layer.
 - Primary key columns are implicitly non-null.
 - `ColumnId`s are assigned in declared column order starting at zero.
 - A column's `max_length` (the `VARCHAR(n)`/`CHAR(n)` length constraint) is copied from `ParsedColumnDef` to the stored `ColumnDef` unchanged. The catalog does not enforce it; the executor enforces it at write time.
@@ -121,7 +121,7 @@ On startup:
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, exactly one primary key column, a primary key column ID that exists, a non-null primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, at least one primary key column, every primary key column ID to exist, every primary key column to be non-null, no duplicate primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption.
 
 ## WAL Interaction
 

@@ -556,13 +556,16 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_composite_primary_key_for_v1() {
+    fn binder_accepts_composite_primary_key() {
         let catalog = catalog_with_users();
         let stmt =
             parse("create table teams (id integer, org integer, primary key (id, org))").unwrap();
-        let err = bind(&stmt, &catalog).unwrap_err();
+        let bound = bind(&stmt, &catalog).unwrap();
 
-        assert_eq!(err.kind, ErrorKind::Plan);
+        let BoundStatement::CreateTable { primary_key, .. } = bound else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(primary_key, vec!["id".to_string(), "org".to_string()]);
     }
 
     #[test]

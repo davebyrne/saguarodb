@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_snapshot_rejects_composite_primary_key() {
+    fn try_from_snapshot_accepts_composite_primary_key() {
         let schema = TableSchema {
             id: 3,
             name: "users".to_string(),
@@ -273,8 +273,15 @@ mod tests {
             next_index_id: 1,
         };
 
-        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
-        assert!(err.message.contains("primary key"));
+        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .primary_key,
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -362,10 +369,10 @@ mod tests {
     }
 
     #[test]
-    fn create_table_rejects_composite_primary_key() {
+    fn create_table_accepts_composite_primary_key() {
         let catalog = MemoryCatalog::empty();
 
-        let err = catalog
+        let schema = catalog
             .create_table(
                 "users".to_string(),
                 vec![
@@ -380,10 +387,13 @@ mod tests {
                 ],
                 vec!["id".to_string(), "tenant".to_string()],
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        // Both columns are recorded as the composite key, in declared order, and
+        // each is forced non-null.
+        assert_eq!(schema.primary_key, vec![0, 1]);
+        assert!(!schema.columns[0].nullable);
+        assert!(!schema.columns[1].nullable);
     }
 
     #[test]

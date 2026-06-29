@@ -102,7 +102,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - `NULL` may be accepted where the target column or expression is nullable.
 - SQL three-valued logic belongs in executor expression evaluation, not in `Value` ordering.
 - `Value::Ord` is storage key ordering only: `Null < Boolean < Integer < Text`.
-- Composite primary key APIs stay in place, but the implementation may assume a single-column primary key unless a task explicitly expands scope.
+- Composite (multi-column) primary keys are supported end to end: the catalog records the ordered key column list, the storage key encoding (`Key(Vec<Value>)`) covers all key columns, and a leading-column equality uses the prefix-matching primary-key range scan.
 
 ## Modules and File Size
 
