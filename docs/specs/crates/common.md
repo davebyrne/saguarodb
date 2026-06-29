@@ -63,6 +63,7 @@ pub enum Value {
     Text(String),
     Date(i64),       // days from the Unix epoch (1970-01-01)
     Timestamp(i64),  // microseconds from the Unix epoch (no time zone)
+    Time(i64),       // microseconds since midnight (no time zone)
     Bytes(Vec<u8>),  // BYTEA, raw bytes
     Uuid([u8; 16]),  // UUID, 16 bytes
 }
@@ -79,7 +80,7 @@ grouping. `Value::Real` wraps `f32` the same way in `OrderedF32` (with
 `format_real`/`parse_real`). The `datetime` module provides the proleptic Gregorian calendar
 conversions and the `YYYY-MM-DD` / `YYYY-MM-DD HH:MM:SS[.ffffff]` parse/format
 helpers (`days_from_civil`, `civil_from_days`, `parse_date`, `format_date`,
-`parse_timestamp`, `format_timestamp`); the `bytea` module provides the hex
+`parse_timestamp`, `format_timestamp`, `parse_time`, `format_time`); the `bytea` module provides the hex
 `\x...` parse/format helpers (`parse_hex`, `format_hex`, hex-only — no legacy
 escape); the `uuid` module provides the canonical `8-4-4-4-12` parse/format
 helpers (`parse_uuid` lenient, `format_uuid` canonical lowercase); the `float`
@@ -135,6 +136,7 @@ pub enum DataType {
     Boolean,
     Date,
     Timestamp,
+    Time,
     Bytea,
     Uuid,
     Double,

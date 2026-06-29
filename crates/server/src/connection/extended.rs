@@ -230,6 +230,7 @@ fn oid_to_data_type(oid: i32) -> Result<Option<DataType>> {
         2950 => Ok(Some(DataType::Uuid)),
         701 => Ok(Some(DataType::Double)),
         700 => Ok(Some(DataType::Real)),
+        1083 => Ok(Some(DataType::Time)),
         1700 => Ok(Some(DataType::Numeric {
             precision: None,
             scale: 0,

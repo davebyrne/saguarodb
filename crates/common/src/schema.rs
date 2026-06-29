@@ -12,6 +12,9 @@ pub enum DataType {
     /// `TIMESTAMP` (without time zone), value carried as `Value::Timestamp`
     /// (microseconds from epoch).
     Timestamp,
+    /// `TIME` (without time zone), value carried as `Value::Time` (microseconds
+    /// since midnight).
+    Time,
     /// `BYTEA` — raw byte string, value carried as `Value::Bytes`.
     Bytea,
     /// `UUID` — 128-bit identifier, value carried as `Value::Uuid` (16 bytes).

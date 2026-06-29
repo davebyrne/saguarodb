@@ -114,16 +114,20 @@ fn parse_fraction_micros(fraction: &str) -> Option<i64> {
     Some(value * 10_i64.pow(6 - take as u32))
 }
 
-/// Format microseconds-from-epoch as `YYYY-MM-DD HH:MM:SS[.ffffff]` (the
-/// fractional part is shown only when non-zero, with trailing zeros trimmed).
-pub fn format_timestamp(micros: i64) -> String {
-    let days = micros.div_euclid(MICROS_PER_DAY);
-    let rest = micros.rem_euclid(MICROS_PER_DAY);
-    let (year, month, day) = civil_from_days(days);
+/// Parse a `TIME` literal `HH:MM:SS[.ffffff]` into microseconds since midnight
+/// (`0..MICROS_PER_DAY`). Surrounding whitespace is ignored.
+pub fn parse_time(text: &str) -> Option<i64> {
+    parse_time_of_day(text.trim())
+}
+
+/// Format microseconds-since-midnight as `HH:MM:SS[.ffffff]` (the fractional part
+/// is shown only when non-zero, with trailing zeros trimmed).
+pub fn format_time(micros_of_day: i64) -> String {
+    let rest = micros_of_day.rem_euclid(MICROS_PER_DAY);
     let seconds = rest / MICROS_PER_SEC;
     let fraction = rest % MICROS_PER_SEC;
     let (hours, minutes, secs) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
-    let mut out = format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{secs:02}");
+    let mut out = format!("{hours:02}:{minutes:02}:{secs:02}");
     if fraction != 0 {
         out.push('.');
         out.push_str(format!("{fraction:06}").trim_end_matches('0'));
@@ -131,9 +135,37 @@ pub fn format_timestamp(micros: i64) -> String {
     out
 }
 
+/// Format microseconds-from-epoch as `YYYY-MM-DD HH:MM:SS[.ffffff]` (the
+/// fractional part is shown only when non-zero, with trailing zeros trimmed).
+pub fn format_timestamp(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let rest = micros.rem_euclid(MICROS_PER_DAY);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {}", format_time(rest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_parse_format_round_trip() {
+        let micros = parse_time("13:45:30.5").unwrap();
+        assert_eq!(
+            micros,
+            (13 * 3_600 + 45 * 60 + 30) * MICROS_PER_SEC + 500_000
+        );
+        assert_eq!(format_time(micros), "13:45:30.5");
+        assert_eq!(parse_time("  00:00:00 "), Some(0));
+        assert_eq!(format_time(0), "00:00:00");
+        assert_eq!(
+            format_time(parse_time("23:59:59.999999").unwrap()),
+            "23:59:59.999999"
+        );
+        assert_eq!(parse_time("25:00:00"), None); // hour out of range
+        assert_eq!(parse_time("12:60:00"), None); // minute out of range
+        assert_eq!(parse_time("noon"), None);
+    }
 
     #[test]
     fn epoch_and_neighbors() {

@@ -891,6 +891,7 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
             | (DataType::Boolean, Value::Boolean(_))
             | (DataType::Date, Value::Date(_))
             | (DataType::Timestamp, Value::Timestamp(_))
+            | (DataType::Time, Value::Time(_))
             | (DataType::Bytea, Value::Bytes(_))
             | (DataType::Uuid, Value::Uuid(_))
     );
@@ -943,6 +944,7 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Boolean => "BOOLEAN",
         DataType::Date => "DATE",
         DataType::Timestamp => "TIMESTAMP",
+        DataType::Time => "TIME",
         DataType::Bytea => "BYTEA",
         DataType::Uuid => "UUID",
         DataType::Double => "DOUBLE PRECISION",

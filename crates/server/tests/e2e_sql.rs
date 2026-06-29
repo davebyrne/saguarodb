@@ -1775,6 +1775,84 @@ async fn e2e_real_round_trips_arithmetic_aggregates_and_casts() {
 }
 
 #[tokio::test]
+async fn e2e_time_round_trips_orders_casts_and_indexes() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, tm time)")
+        .await
+        .unwrap();
+    for (id, lit) in [(1, "13:45:30"), (2, "08:00:00"), (3, "23:59:59.5")] {
+        server
+            .simple_query(&format!(
+                "insert into t (id, tm) values ({id}, TIME '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Round-trip + ordering (fractional seconds trimmed).
+    let rows = server
+        .simple_query("select tm from t order by tm")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("08:00:00".to_string())],
+            vec![Some("13:45:30".to_string())],
+            vec![Some("23:59:59.5".to_string())],
+        ]
+    );
+
+    // Comparison + CAST to text.
+    let rows = server
+        .simple_query("select cast(tm as text) from t where tm < TIME '12:00:00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("08:00:00".to_string())]]);
+
+    // TIME primary key uses an index.
+    server
+        .simple_query("create table k (tm time primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into k (tm, note) values (TIME '09:30:00', 'open')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from k where tm = TIME '09:30:00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "TIME primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+
+    // No implicit cast (string into a TIME column); WITH TIME ZONE unsupported.
+    let err = server
+        .simple_query("insert into t (id, tm) values (9, '12:00:00')")
+        .await
+        .err()
+        .expect("string into time column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
+    let err = server
+        .simple_query("create table tz (id integer primary key, tm time with time zone)")
+        .await
+        .err()
+        .expect("TIME WITH TIME ZONE should be rejected");
+    assert!(
+        err.message.to_lowercase().contains("data type"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn protocol_decode_error_sends_error_and_closes_connection() {
     let server = TestServer::start().await.unwrap();
     let mut stream = server.connect_raw().await.unwrap();

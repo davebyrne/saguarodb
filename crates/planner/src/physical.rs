@@ -659,6 +659,7 @@ fn literal_key(expr: &BoundExpr) -> Option<Value> {
                 | Value::Boolean(_)
                 | Value::Date(_)
                 | Value::Timestamp(_)
+                | Value::Time(_)
                 | Value::Bytes(_)
                 | Value::Uuid(_),
             ..

@@ -150,6 +150,9 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Real => common::float::parse_real(text)
             .map(|value| Value::Real(value.into()))
             .ok_or_else(|| invalid_value(format!("invalid input syntax for real: \"{text}\""))),
+        DataType::Time => common::datetime::parse_time(text)
+            .map(Value::Time)
+            .ok_or_else(|| invalid_value(format!("invalid input syntax for time: \"{text}\""))),
     }
 }
 
@@ -391,6 +394,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Float(value) => Some(common::float::format_double(value.0)),
         Value::Numeric(value) => Some(common::numeric::format_numeric(value)),
         Value::Real(value) => Some(common::float::format_real(value.0)),
+        Value::Time(micros) => Some(common::datetime::format_time(*micros)),
     }
 }
 

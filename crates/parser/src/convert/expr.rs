@@ -296,6 +296,11 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
         sql::DataType::Real | sql::DataType::Float4 => common::float::parse_real(text)
             .map(|v| Expr::Literal(Value::Real(v.into())))
             .ok_or_else(|| parse_error(format!("invalid real literal: \"{text}\""))),
+        sql::DataType::Time(None, sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone) => {
+            common::datetime::parse_time(text)
+                .map(|micros| Expr::Literal(Value::Time(micros)))
+                .ok_or_else(|| parse_error(format!("invalid time literal: \"{text}\"")))
+        }
         sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => {
             let parsed = common::numeric::parse_numeric(text)
                 .ok_or_else(|| parse_error(format!("invalid numeric literal: \"{text}\"")))?;

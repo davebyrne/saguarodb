@@ -565,6 +565,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
                 .to_be_bytes()
                 .to_vec(),
         },
+        Value::Time(micros) => match format {
+            ValueFormat::Text => common::datetime::format_time(*micros).into_bytes(),
+            // PostgreSQL binary `time` is an i64 microsecond count since midnight.
+            ValueFormat::Binary => micros.to_be_bytes().to_vec(),
+        },
         Value::Bytes(raw) => match format {
             // PostgreSQL text `bytea` is the hex format `\x...`; binary is the raw bytes.
             ValueFormat::Text => common::bytea::format_hex(raw).into_bytes(),
@@ -635,6 +640,18 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .try_into()
                 .map_err(|_| protocol_error("binary real parameter must be 4 bytes"))?;
             Ok(Value::Real(f32::from_be_bytes(array).into()))
+        }
+        (DataType::Time, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "time parameter")?;
+            common::datetime::parse_time(text)
+                .map(Value::Time)
+                .ok_or_else(|| protocol_error("invalid time parameter"))
+        }
+        (DataType::Time, ValueFormat::Binary) => {
+            let array: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary time parameter must be 8 bytes"))?;
+            Ok(Value::Time(i64::from_be_bytes(array)))
         }
         (DataType::Numeric { .. }, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "numeric parameter")?;
@@ -730,6 +747,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Uuid => (2950, 16),
         DataType::Double => (701, 8),
         DataType::Real => (700, 4),
+        DataType::Time => (1083, 8),
         DataType::Numeric { .. } => (1700, -1),
     }
 }
@@ -1026,5 +1044,35 @@ mod real_value_tests {
     fn invalid_real_is_rejected() {
         assert!(decode_value(b"not-a-number", DataType::Real, 0).is_err());
         assert!(decode_value(&[0u8; 8], DataType::Real, 1).is_err()); // wrong length
+    }
+}
+
+#[cfg(test)]
+mod time_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    // 13:45:30.5 in microseconds since midnight.
+    const T: i64 = (13 * 3_600 + 45 * 60 + 30) * 1_000_000 + 500_000;
+
+    #[test]
+    fn time_text_round_trips() {
+        let value = Value::Time(T);
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"13:45:30.5");
+        assert_eq!(decode_value(&text, DataType::Time, 0).unwrap(), value);
+    }
+
+    #[test]
+    fn time_binary_is_i64_micros_of_day() {
+        let value = Value::Time(T);
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(binary, T.to_be_bytes());
+        assert_eq!(decode_value(&binary, DataType::Time, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn invalid_time_text_is_rejected() {
+        assert!(decode_value(b"25:00:00", DataType::Time, 0).is_err());
     }
 }

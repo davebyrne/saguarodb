@@ -74,6 +74,7 @@ const KEY_TAG_UUID: u8 = 7;
 const KEY_TAG_DOUBLE: u8 = 8;
 const KEY_TAG_NUMERIC: u8 = 9;
 const KEY_TAG_REAL: u8 = 10;
+const KEY_TAG_TIME: u8 = 11;
 
 /// Serialize a `NUMERIC` value as its exact `i128` mantissa (16 bytes LE) plus
 /// `u32` scale (4 bytes LE) — a fixed 20 bytes that preserves value and scale.
@@ -124,6 +125,10 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             }
             Value::Timestamp(value) => {
                 bytes.push(KEY_TAG_TIMESTAMP);
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Time(value) => {
+                bytes.push(KEY_TAG_TIME);
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             Value::Bytes(value) => {
@@ -207,6 +212,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
             KEY_TAG_TIMESTAMP => {
                 let raw = read_exact(bytes, &mut offset, 8)?;
                 Value::Timestamp(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
+            }
+            KEY_TAG_TIME => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                Value::Time(i64::from_le_bytes(raw.try_into().expect("8 bytes")))
             }
             KEY_TAG_BYTEA => {
                 let len = u32::from_le_bytes(
@@ -315,6 +324,9 @@ pub(crate) fn encode_row_with_infomask(
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             Value::Timestamp(value) if column.data_type == DataType::Timestamp => {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Time(value) if column.data_type == DataType::Time => {
                 bytes.extend_from_slice(&value.to_le_bytes());
             }
             Value::Bytes(value) if column.data_type == DataType::Bytea => {
@@ -435,6 +447,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 let mut array = [0; 8];
                 array.copy_from_slice(raw);
                 Value::Timestamp(i64::from_le_bytes(array))
+            }
+            DataType::Time => {
+                let raw = read_exact(bytes, &mut offset, 8)?;
+                let mut array = [0; 8];
+                array.copy_from_slice(raw);
+                Value::Time(i64::from_le_bytes(array))
             }
             DataType::Bytea => {
                 let raw_len = read_exact(bytes, &mut offset, 4)?;
@@ -636,6 +654,7 @@ mod tests {
                 Value::Boolean(value) => bytes.push(u8::from(*value)),
                 Value::Date(value) => bytes.extend_from_slice(&value.to_le_bytes()),
                 Value::Timestamp(value) => bytes.extend_from_slice(&value.to_le_bytes()),
+                Value::Time(value) => bytes.extend_from_slice(&value.to_le_bytes()),
                 Value::Bytes(value) => {
                     bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
                     bytes.extend_from_slice(value);
