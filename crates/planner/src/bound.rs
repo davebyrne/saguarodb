@@ -1,5 +1,6 @@
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, IndexId, ParsedColumnDef, TableId,
+    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, IndexId, ParsedColumnDef,
+    SequenceOptions, TableId,
 };
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
@@ -25,6 +26,14 @@ pub enum BoundStatement {
     },
     DropIndex {
         index: IndexId,
+    },
+    CreateSequence {
+        name: String,
+        options: SequenceOptions,
+    },
+    DropSequence {
+        name: String,
+        if_exists: bool,
     },
     Insert {
         table: TableId,

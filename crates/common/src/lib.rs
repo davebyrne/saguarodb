@@ -37,6 +37,6 @@ pub use numeric::{Decimal, RoundingStrategy};
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
     ColumnDef, ColumnDefault, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, ParsedDefault,
-    TableSchema,
+    SequenceOptions, SequenceSchema, TableSchema,
 };
 pub use value::{Value, parse_bool_text};

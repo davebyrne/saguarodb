@@ -70,14 +70,15 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // redo-committed-only filter (`replay_committed_from`), which could not handle
     // the flushed-but-uncommitted pages the relaxed flush gate (D1) now admits.
     //
-    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`)
-    // are the exception: they mutate the durable catalog directly (not idempotent
-    // PageLSN-gated page bytes), so an aborted DDL's catalog record must NOT take
-    // effect. DDL is non-transactional and commits immediately (§4 Decision 6), so
-    // a committed DDL replays and an aborted/in-flight one is skipped — gated by the
-    // rebuilt CLOG. Skipped CreateTable/CreateIndex records still reserve their IDs:
-    // their index/heap page records may replay as orphan files, and a future object
-    // must not reuse those file names.
+    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`
+    // and sequence DDL) are the exception: they mutate the durable catalog directly
+    // (not idempotent PageLSN-gated page bytes), so an aborted DDL's catalog record
+    // must NOT take effect. DDL is non-transactional and commits immediately (§4
+    // Decision 6), so a committed DDL replays and an aborted/in-flight one is
+    // skipped — gated by the rebuilt CLOG. Skipped CreateTable/CreateIndex/
+    // CreateSequence records still reserve their IDs: their index/heap page records
+    // may replay as orphan files, or their sequence IDs may have been observed in
+    // WAL, and a future object must not reuse those identifiers.
     let mut replay_applied = false;
     // Writers whose page mutations were replayed: any of these left InProgress (no
     // durable Commit/Abort) is a crashed in-flight transaction whose versions are on
@@ -225,7 +226,7 @@ impl FlushPolicy for WalFlushPolicy {
 }
 
 /// Whether `kind` is a logical catalog mutation (`CreateTable`/`DropTable`/
-/// `CreateIndex`/`DropIndex`). These directly mutate the durable catalog rather
+/// `CreateIndex`/`DropIndex`/sequence DDL). These directly mutate the durable catalog rather
 /// than being idempotent PageLSN-gated page writes, so redo-all gates them by
 /// transaction outcome (only a committed DDL replays); the physical heap/index
 /// page records are not gated.
@@ -236,6 +237,8 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::DropTable { .. }
             | WalRecordKind::CreateIndex { .. }
             | WalRecordKind::DropIndex { .. }
+            | WalRecordKind::CreateSequence { .. }
+            | WalRecordKind::DropSequence { .. }
     )
 }
 
@@ -249,7 +252,13 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
             catalog.reserve_index_id(schema.id)?;
             Ok(true)
         }
-        WalRecordKind::DropTable { .. } | WalRecordKind::DropIndex { .. } => Ok(false),
+        WalRecordKind::CreateSequence { schema } => {
+            catalog.reserve_sequence_id(schema.id)?;
+            Ok(true)
+        }
+        WalRecordKind::DropTable { .. }
+        | WalRecordKind::DropIndex { .. }
+        | WalRecordKind::DropSequence { .. } => Ok(false),
         _ => Ok(false),
     }
 }
@@ -278,6 +287,8 @@ fn apply_redo(
             catalog.apply_drop_index(*index)?;
             storage.apply_drop_index(*index)
         }
+        WalRecordKind::CreateSequence { schema } => catalog.apply_create_sequence(schema.clone()),
+        WalRecordKind::DropSequence { sequence } => catalog.apply_drop_sequence(*sequence),
         WalRecordKind::HeapInit { file_id, page_num }
         | WalRecordKind::HeapInsert {
             file_id, page_num, ..
@@ -555,6 +566,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 2);
+    }
+
+    #[test]
+    fn recovery_reserves_sequence_id_from_skipped_create_sequence_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let skipped_schema = common::SequenceSchema {
+            id: 41,
+            name: "aborted_seq".to_string(),
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start: 1,
+            cycle: false,
+            owned: false,
+            last_value: 1,
+            is_called: false,
+        };
+        {
+            let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+            wal.append(WalRecord {
+                lsn: 0,
+                txn_id: 3,
+                kind: WalRecordKind::CreateSequence {
+                    schema: skipped_schema.clone(),
+                },
+            })
+            .unwrap();
+            wal.append(WalRecord {
+                lsn: 0,
+                txn_id: 3,
+                kind: WalRecordKind::Abort,
+            })
+            .unwrap();
+            wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .get_sequence_by_name("aborted_seq")
+                .unwrap(),
+            None,
+            "an aborted CreateSequence record must not install a catalog sequence"
+        );
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_sequence_id,
+            skipped_schema.id + 1,
+            "recovery must still burn the skipped sequence id"
+        );
+
+        reopened
+            .query_service
+            .execute_sql("create sequence live_seq")
+            .unwrap();
+        let live = reopened
+            .components
+            .catalog
+            .get_sequence_by_name("live_seq")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.id, skipped_schema.id + 1);
     }
 
     #[test]

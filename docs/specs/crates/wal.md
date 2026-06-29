@@ -26,6 +26,8 @@ pub enum WalRecordKind {
     DropTable { table: TableId },
     CreateIndex { schema: IndexSchema },
     DropIndex { index: IndexId },
+    CreateSequence { schema: SequenceSchema },
+    DropSequence { sequence: SequenceId },
     Commit,
     CommitWithSubxids { subxids: Vec<u64> },
     Abort,
@@ -95,11 +97,11 @@ pub trait WalManager: Send + Sync + common::TxnStatusView {
 }
 ```
 
-The redo-committed-only `replay_committed_from` is **retired** (Milestone D2): recovery uses `replay_from` + the CLOG (redo-all). `is_redo_operation(kind)` (a free function, also re-exported) classifies a record as a replayable page mutation (everything except the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers); redo-all applies those and skips the markers.
+The redo-committed-only `replay_committed_from` is **retired** (Milestone D2): recovery uses `replay_from` + the CLOG (redo-all). `is_redo_operation(kind)` (a free function, also re-exported) classifies a record as a replayable operation (everything except the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers); redo-all applies those and skips the markers.
 
 `append` always assigns the next monotonically increasing LSN and writes that LSN into the encoded record. Callers may pass `record.lsn = 0`; `append` ignores the caller-provided LSN. `decode_record` and replay preserve the stored LSN from disk. `decode_record` decodes exactly one record from a buffer: it returns an error on a partial buffer (`"incomplete WAL record"`) and on a buffer with bytes left over after the record (`"WAL buffer contains trailing bytes"`). `flush` fsyncs all buffered records and returns the durable high-water mark.
 
-`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery uses it for two separate purposes. Redo passes the control record `checkpoint_lsn`, so page replay starts after the last WAL record whose effects are already reflected in the heap. The transaction-id allocator seed passes `0` and scans every retained record, so it can recover the allocation high-water from pre-boundary records when a crash happens after the manifest/CLOG checkpoint is durable but before the `Checkpoint` marker is appended; after a completed truncation, the retained marker carries the boundary instead. Redo-all (Milestone D2) iterates `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation` — `HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`), skipping the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers. DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`) install catalog/storage objects only for committed transactions (the server gates those by the rebuilt CLOG; see `server.md`), while skipped aborted/in-flight create records still reserve their table/index IDs. The CLOG decides visibility afterward.
+`replay_from(lsn)` is strictly exclusive: it inspects only records whose stored `record.lsn > lsn`. Recovery uses it for two separate purposes. Redo passes the control record `checkpoint_lsn`, so page replay starts after the last WAL record whose effects are already reflected in the heap. The transaction-id allocator seed passes `0` and scans every retained record, so it can recover the allocation high-water from pre-boundary records when a crash happens after the manifest/CLOG checkpoint is durable but before the `Checkpoint` marker is appended; after a completed truncation, the retained marker carries the boundary instead. Redo-all (Milestone D2) iterates `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation` — `HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`), skipping the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers. DDL records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence`) install catalog/storage objects only for committed transactions (the server gates those by the rebuilt CLOG; see `server.md`), while skipped aborted/in-flight create records still reserve their table/index/sequence IDs. The CLOG decides visibility afterward.
 
 `truncate_before(lsn)` is strictly exclusive in the opposite direction: it may remove records with `record.lsn < lsn` and must retain records with `record.lsn >= lsn`. Checkpoint calls `truncate_before(checkpoint_lsn)`, which may leave the boundary record in the WAL; recovery still ignores that boundary record because replay is strictly `> checkpoint_lsn`. **Unconditional truncation:** truncation drops every record below `lsn` — it does NOT pin aborted/in-flight transactions and does NOT touch the in-memory CLOG or floors. It is safe because the checkpoint calls `persist_clog` (which durably records every aborted outcome in `clog.dat`) *before* `truncate_before`, and under the exclusive checkpoint guard no write transaction is in flight, so every transaction below `lsn` is settled and captured by that snapshot (see "Durable CLOG snapshot" and `mvcc.md` §5.4/§8). **Precondition:** a caller must persist the CLOG snapshot covering `lsn` before truncating; the no-snapshot fallback (a pre-durable-CLOG data directory) instead relies on the WAL having been conservatively truncated by the older build.
 
@@ -113,7 +115,7 @@ Poisoning is not limited to truncation: the WAL manager is poisoned whenever it 
 
 For a successful write statement:
 
-1. Storage appends physiological redo records (`HeapInit`/`HeapInsert`/`HeapDelete`, or a `FullPageImage` on the first modification of a page since the last checkpoint); DDL appends `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`.
+1. Storage appends physiological redo records (`HeapInit`/`HeapInsert`/`HeapDelete`, or a `FullPageImage` on the first modification of a page since the last checkpoint); DDL appends `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence`.
 2. Server query orchestration appends `Commit`.
 3. Server query orchestration calls `wal.flush()`.
 4. The statement is durable and must not be rolled back.
@@ -156,7 +158,7 @@ After heap pages are flushed + fsynced and the control record is stored:
 Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
-- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index IDs.
+- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index/sequence IDs.
 - Reconstructs the CLOG at `open`: seeded from the durable CLOG snapshot (`clog.dat`) plus a fold of the post-`clog_lsn` `Commit`/`Abort` records, or fully rebuilt from those records when no snapshot exists (see "Durable CLOG snapshot"). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
 - Seeds `next_txn_id` by scanning `replay_from(0)` over all retained records (including `CommitWithSubxids.subxids` and the `Checkpoint` marker's high-water), not just the post-checkpoint redo range.
 

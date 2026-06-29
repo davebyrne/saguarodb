@@ -15,7 +15,9 @@
   (PostgreSQL `boolin` accept-set), reused by the `protocol` extended-query
   parameter path and the `COPY` import path so both share one accept-set; each
   caller maps `None` to its own SQLSTATE.
-- Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`, `ColumnInfo`, `TableSchema`, `IndexSchema`.
+- Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`,
+  `ColumnInfo`, `TableSchema`, `IndexSchema`, `SequenceOptions`, and
+  `SequenceSchema`.
 - Query access helpers: `KeyRange`.
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
 - Statement context and the transaction extension point.
@@ -201,11 +203,39 @@ pub struct IndexSchema {
     pub columns: Vec<ColumnId>,
     pub unique: bool,
 }
+
+pub struct SequenceOptions {
+    pub increment: i64,
+    pub start: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: bool,
+}
+
+pub struct SequenceSchema {
+    pub id: SequenceId,
+    pub name: String,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start: i64,
+    pub cycle: bool,
+    pub owned: bool,
+    pub last_value: i64,
+    pub is_called: bool,
+}
 ```
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
 
 `IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate non-NULL indexed values (NULLs are distinct); a non-unique index admits duplicates. On disk every index entry is disambiguated by the heap TID it points at (see `storage` Secondary Indexes), so no metadata distinguishes the two beyond the `unique` flag.
+
+`SequenceOptions` is parser/planner input for `CREATE SEQUENCE`; absent
+start/min/max values mean "use the direction-dependent defaults." `SequenceSchema`
+is the catalog-owned durable sequence metadata. Phase 2 stores sequence objects
+and DDL only; `last_value`/`is_called`, `ColumnDefault::Nextval`, sequence
+functions, and owned SERIAL sequences are reserved for the later sequence-runtime
+tasks.
 
 ## Error Model
 

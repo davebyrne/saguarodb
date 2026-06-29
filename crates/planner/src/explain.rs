@@ -30,6 +30,14 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
         PhysicalPlan::DropIndex { index } => {
             output.push_str(&format!("{padding}DropIndex index={index}\n"));
         }
+        PhysicalPlan::CreateSequence { name, .. } => {
+            output.push_str(&format!("{padding}CreateSequence {name}\n"));
+        }
+        PhysicalPlan::DropSequence { name, if_exists } => {
+            output.push_str(&format!(
+                "{padding}DropSequence {name} if_exists={if_exists}\n"
+            ));
+        }
         PhysicalPlan::Insert { table, source, .. } => {
             output.push_str(&format!("{padding}Insert table={table}\n"));
             format_node(source, indent + 1, output);

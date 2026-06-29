@@ -501,6 +501,8 @@ fn statement_needs_exclusive_guard(statement: &Statement) -> bool {
             | Statement::DropTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::DropIndex { .. }
+            | Statement::CreateSequence { .. }
+            | Statement::DropSequence { .. }
     )
 }
 
@@ -515,5 +517,7 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
             | BoundStatement::DropTable { .. }
             | BoundStatement::CreateIndex { .. }
             | BoundStatement::DropIndex { .. }
+            | BoundStatement::CreateSequence { .. }
+            | BoundStatement::DropSequence { .. }
     )
 }

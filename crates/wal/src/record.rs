@@ -1,4 +1,6 @@
-use common::{FileId, IndexId, IndexSchema, Lsn, PageNum, TableId, TableSchema};
+use common::{
+    FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId, SequenceSchema, TableId, TableSchema,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +24,12 @@ pub enum WalRecordKind {
     },
     DropIndex {
         index: IndexId,
+    },
+    CreateSequence {
+        schema: SequenceSchema,
+    },
+    DropSequence {
+        sequence: SequenceId,
     },
     Commit,
     /// Commit of a transaction that had savepoint subtransactions: marks the

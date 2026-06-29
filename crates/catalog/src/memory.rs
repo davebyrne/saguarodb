@@ -3,7 +3,8 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
     ColumnDef, ColumnDefault, ColumnId, DbError, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID,
-    ParsedColumnDef, ParsedDefault, Result, SqlState, TableId, TableSchema,
+    ParsedColumnDef, ParsedDefault, Result, SequenceId, SequenceOptions, SequenceSchema, SqlState,
+    TableId, TableSchema,
 };
 
 use crate::CatalogManager;
@@ -22,10 +23,36 @@ pub struct CatalogSnapshot {
     pub indexes_by_id: HashMap<IndexId, IndexSchema>,
     #[serde(default = "default_next_index_id")]
     pub next_index_id: IndexId,
+    #[serde(default)]
+    pub sequences_by_name: HashMap<String, SequenceId>,
+    #[serde(default)]
+    pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
+    #[serde(default = "default_next_sequence_id")]
+    pub next_sequence_id: SequenceId,
+}
+
+impl Default for CatalogSnapshot {
+    fn default() -> Self {
+        Self {
+            tables_by_name: HashMap::new(),
+            tables_by_id: HashMap::new(),
+            next_table_id: 1,
+            indexes_by_name: HashMap::new(),
+            indexes_by_id: HashMap::new(),
+            next_index_id: default_next_index_id(),
+            sequences_by_name: HashMap::new(),
+            sequences_by_id: HashMap::new(),
+            next_sequence_id: default_next_sequence_id(),
+        }
+    }
 }
 
 fn default_next_index_id() -> IndexId {
     PRIMARY_KEY_INDEX_ID + 1
+}
+
+fn default_next_sequence_id() -> SequenceId {
+    1
 }
 
 #[derive(Debug)]
@@ -39,9 +66,7 @@ impl MemoryCatalog {
             tables_by_name: HashMap::new(),
             tables_by_id: HashMap::new(),
             next_table_id: 1,
-            indexes_by_name: HashMap::new(),
-            indexes_by_id: HashMap::new(),
-            next_index_id: default_next_index_id(),
+            ..CatalogSnapshot::default()
         })
     }
 
@@ -109,6 +134,7 @@ impl CatalogManager for MemoryCatalog {
         let mut current = self.write_snapshot()?;
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
         snapshot.next_index_id = snapshot.next_index_id.max(current.next_index_id);
+        snapshot.next_sequence_id = snapshot.next_sequence_id.max(current.next_sequence_id);
         *current = snapshot;
         Ok(())
     }
@@ -270,6 +296,91 @@ impl CatalogManager for MemoryCatalog {
     fn drop_index(&self, id: IndexId) -> Result<()> {
         self.apply_drop_index(id)
     }
+
+    fn get_sequence_by_name(&self, name: &str) -> Result<Option<SequenceSchema>> {
+        let snapshot = self.read_snapshot()?;
+        Ok(snapshot
+            .sequences_by_name
+            .get(name)
+            .and_then(|id| snapshot.sequences_by_id.get(id))
+            .cloned())
+    }
+
+    fn get_sequence(&self, id: SequenceId) -> Result<Option<SequenceSchema>> {
+        Ok(self.read_snapshot()?.sequences_by_id.get(&id).cloned())
+    }
+
+    fn list_sequences(&self) -> Result<Vec<SequenceSchema>> {
+        let mut sequences: Vec<_> = self
+            .read_snapshot()?
+            .sequences_by_id
+            .values()
+            .cloned()
+            .collect();
+        sequences.sort_by_key(|sequence| sequence.id);
+        Ok(sequences)
+    }
+
+    fn reserve_sequence_id(&self, id: SequenceId) -> Result<()> {
+        let next_after_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog sequence id overflow while reserving id"))?;
+        let mut snapshot = self.write_snapshot()?;
+        snapshot.next_sequence_id = snapshot.next_sequence_id.max(next_after_id);
+        Ok(())
+    }
+
+    fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()> {
+        validate_sequence_schema(&schema)?;
+        let mut snapshot = self.write_snapshot()?;
+        reject_duplicate_sequence_name(&snapshot, &schema.name)?;
+        reject_duplicate_sequence_id(&snapshot, schema.id)?;
+        let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
+            DbError::internal("catalog sequence id overflow while applying create sequence")
+        })?;
+        snapshot
+            .sequences_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.next_sequence_id = snapshot.next_sequence_id.max(next_after_schema);
+        snapshot.sequences_by_id.insert(schema.id, schema);
+        Ok(())
+    }
+
+    fn apply_drop_sequence(&self, id: SequenceId) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot
+            .sequences_by_id
+            .remove(&id)
+            .ok_or_else(|| undefined_sequence_id(id))?;
+        snapshot.sequences_by_name.remove(&schema.name);
+        Ok(())
+    }
+
+    fn create_sequence(
+        &self,
+        name: String,
+        options: SequenceOptions,
+        owned: bool,
+    ) -> Result<SequenceSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        reject_duplicate_sequence_name(&snapshot, &name)?;
+        let id = snapshot.next_sequence_id;
+        reject_duplicate_sequence_id(&snapshot, id)?;
+        let next_sequence_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog sequence id overflow"))?;
+        let schema = build_sequence_schema(id, name, options, owned)?;
+        snapshot
+            .sequences_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.sequences_by_id.insert(schema.id, schema.clone());
+        snapshot.next_sequence_id = next_sequence_id;
+        Ok(schema)
+    }
+
+    fn drop_sequence(&self, id: SequenceId) -> Result<()> {
+        self.apply_drop_sequence(id)
+    }
 }
 
 fn build_schema(
@@ -355,6 +466,57 @@ fn convert_column_default(default: Option<ParsedDefault>) -> Result<Option<Colum
     }
 }
 
+fn build_sequence_schema(
+    id: SequenceId,
+    name: String,
+    options: SequenceOptions,
+    owned: bool,
+) -> Result<SequenceSchema> {
+    if options.increment == 0 {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            "INCREMENT BY 0 is not allowed",
+        ));
+    }
+
+    let descending = options.increment < 0;
+    let min_value = options
+        .min_value
+        .unwrap_or(if descending { i64::MIN } else { 1 });
+    let max_value = options
+        .max_value
+        .unwrap_or(if descending { -1 } else { i64::MAX });
+    if min_value > max_value {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            "MINVALUE cannot be greater than MAXVALUE",
+        ));
+    }
+
+    let start = options
+        .start
+        .unwrap_or(if descending { max_value } else { min_value });
+    if start < min_value || start > max_value {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            "START value must be between MINVALUE and MAXVALUE",
+        ));
+    }
+
+    Ok(SequenceSchema {
+        id,
+        name,
+        increment: options.increment,
+        min_value,
+        max_value,
+        start,
+        cycle: options.cycle,
+        owned,
+        last_value: start,
+        is_called: false,
+    })
+}
+
 fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     let mut max_table_id = 0;
 
@@ -399,6 +561,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     }
 
     validate_indexes(snapshot)?;
+    validate_sequences(snapshot)?;
 
     Ok(())
 }
@@ -488,6 +651,80 @@ fn validate_index_schema(
         }
     }
 
+    Ok(())
+}
+
+fn validate_sequences(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut max_sequence_id = 0;
+
+    for (name, id) in &snapshot.sequences_by_name {
+        let schema = snapshot.sequences_by_id.get(id).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog snapshot sequence name {name} points to missing sequence id {id}",
+            ))
+        })?;
+        if &schema.name != name || schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot sequence name/id mismatch for sequence {name}",
+            )));
+        }
+    }
+
+    for (id, schema) in &snapshot.sequences_by_id {
+        if schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot sequence id key {id} does not match schema id {}",
+                schema.id
+            )));
+        }
+        if snapshot.sequences_by_name.get(&schema.name) != Some(id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot sequence {} is missing from name index",
+                schema.name
+            )));
+        }
+        validate_sequence_schema(schema)?;
+        max_sequence_id = max_sequence_id.max(*id);
+    }
+
+    let required_next = max_sequence_id
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog snapshot sequence id overflow"))?;
+    if snapshot.next_sequence_id < required_next {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_sequence_id {} is less than required {required_next}",
+            snapshot.next_sequence_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_sequence_schema(schema: &SequenceSchema) -> Result<()> {
+    if schema.increment == 0 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot sequence {} has zero increment",
+            schema.name
+        )));
+    }
+    if schema.min_value > schema.max_value {
+        return Err(DbError::internal(format!(
+            "catalog snapshot sequence {} has MINVALUE greater than MAXVALUE",
+            schema.name
+        )));
+    }
+    if schema.start < schema.min_value || schema.start > schema.max_value {
+        return Err(DbError::internal(format!(
+            "catalog snapshot sequence {} has START outside MINVALUE/MAXVALUE",
+            schema.name
+        )));
+    }
+    if schema.last_value < schema.min_value || schema.last_value > schema.max_value {
+        return Err(DbError::internal(format!(
+            "catalog snapshot sequence {} has last_value outside MINVALUE/MAXVALUE",
+            schema.name
+        )));
+    }
     Ok(())
 }
 
@@ -583,6 +820,26 @@ fn reject_duplicate_table_id(snapshot: &CatalogSnapshot, id: TableId) -> Result<
     Ok(())
 }
 
+fn reject_duplicate_sequence_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
+    if snapshot.sequences_by_name.contains_key(name) {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("sequence {name} already exists"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_sequence_id(snapshot: &CatalogSnapshot, id: SequenceId) -> Result<()> {
+    if snapshot.sequences_by_id.contains_key(&id) {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("sequence id {id} already exists"),
+        ));
+    }
+    Ok(())
+}
+
 fn undefined_table(message: String) -> DbError {
     DbError::plan(SqlState::UndefinedTable, message)
 }
@@ -590,6 +847,13 @@ fn undefined_table(message: String) -> DbError {
 fn undefined_index(message: String) -> DbError {
     // Indexes share the relation namespace; v1 has no dedicated SQLSTATE.
     DbError::plan(SqlState::UndefinedTable, message)
+}
+
+fn undefined_sequence_id(id: SequenceId) -> DbError {
+    DbError::plan(
+        SqlState::UndefinedTable,
+        format!("sequence id {id} not found"),
+    )
 }
 
 fn build_index_schema(

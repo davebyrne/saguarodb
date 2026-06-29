@@ -15,7 +15,10 @@ pub fn parse(sql: &str) -> Result<Statement> {
 
 #[cfg(test)]
 mod tests {
-    use common::{CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, SqlState, Value};
+    use common::{
+        CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, SequenceOptions, SqlState,
+        Value,
+    };
 
     use crate::{
         BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, SelectItem, Statement, UnaryOp,
@@ -675,6 +678,56 @@ mod tests {
             "create index concurrently i on users (name)", // concurrently
             "create index if not exists i on users (name)", // if not exists
             "create index on users (name)",                // missing index name
+        ] {
+            assert!(parse(sql).is_err(), "expected `{sql}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_create_and_drop_sequence_forms() {
+        assert_eq!(
+            parse("create sequence users_id_seq").unwrap(),
+            Statement::CreateSequence {
+                name: "users_id_seq".to_string(),
+                options: SequenceOptions::default(),
+            }
+        );
+        assert_eq!(
+            parse(
+                "create sequence s increment by -2 start with 10 minvalue 0 maxvalue 20 cycle cache 5"
+            )
+            .unwrap(),
+            Statement::CreateSequence {
+                name: "s".to_string(),
+                options: SequenceOptions {
+                    increment: -2,
+                    start: Some(10),
+                    min_value: Some(0),
+                    max_value: Some(20),
+                    cycle: true,
+                },
+            }
+        );
+        assert_eq!(
+            parse("drop sequence if exists s").unwrap(),
+            Statement::DropSequence {
+                name: "s".to_string(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_create_sequence_forms() {
+        for sql in [
+            "create temporary sequence s",
+            "create sequence if not exists s",
+            "create sequence s as bigint",
+            "create sequence s owned by t.id",
+            "create sequence s increment by 1 increment by 2",
+            "create sequence s cache 1 cache 2",
+            "create sequence s cache 0",
+            "create sequence s start with 'x'",
         ] {
             assert!(parse(sql).is_err(), "expected `{sql}` to be rejected");
         }

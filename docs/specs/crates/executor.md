@@ -207,9 +207,30 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - `SchemaOperations::drop_index` appends the `DropIndex` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "DROP INDEX", count: 0 }`.
 
+`CREATE SEQUENCE`:
+
+- Server query orchestration acquires the DDL guard before execution.
+- Use `CatalogManager::create_sequence` to validate options and assign the
+  `SequenceId`.
+- Call `SchemaOperations::create_sequence`, which appends the `CreateSequence`
+  WAL operation record. On failure, remove the catalog sequence before returning
+  the error.
+- Return `Modified { command: "CREATE SEQUENCE", count: 0 }`.
+
+`DROP SEQUENCE`:
+
+- Resolve the sequence name at execution time. A missing sequence returns
+  `SqlState::UndefinedTable` unless `IF EXISTS` was present.
+- For an existing sequence, call `SchemaOperations::drop_sequence`, then
+  `CatalogManager::drop_sequence`. `SchemaOperations::drop_sequence` appends the
+  `DropSequence` WAL operation record.
+- For `IF EXISTS` and a missing sequence, perform no catalog or WAL mutation and
+  return the normal command tag.
+- Return `Modified { command: "DROP SEQUENCE", count: 0 }`.
+
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: SELECT and EXPLAIN are lock-free readers and take **no** `ConcurrencyController` guard; INSERT, UPDATE, and DELETE acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. SELECT runs bind, plan, and `QueryEngine::execute` lock-free. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: SELECT and EXPLAIN are lock-free readers and take **no** `ConcurrencyController` guard; INSERT, UPDATE, and DELETE acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. SELECT runs bind, plan, and `QueryEngine::execute` lock-free. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

@@ -905,6 +905,28 @@ impl SchemaOperations for PageBackedStorageEngine {
         index_state.dropped = true;
         Ok(())
     }
+
+    fn create_sequence(
+        &self,
+        ctx: &StatementContext,
+        schema: &common::SequenceSchema,
+    ) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(
+            &state,
+            ctx,
+            WalRecordKind::CreateSequence {
+                schema: schema.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn drop_sequence(&self, ctx: &StatementContext, sequence: common::SequenceId) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(&state, ctx, WalRecordKind::DropSequence { sequence })?;
+        Ok(())
+    }
 }
 
 struct PageRowIterator {

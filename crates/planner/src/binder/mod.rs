@@ -144,6 +144,14 @@ fn bind_inner(
             let index = require_index(catalog, name)?;
             Ok(BoundStatement::DropIndex { index: index.id })
         }
+        Statement::CreateSequence { name, options } => Ok(BoundStatement::CreateSequence {
+            name: name.clone(),
+            options: options.clone(),
+        }),
+        Statement::DropSequence { name, if_exists } => Ok(BoundStatement::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         Statement::Insert {
             table,
             columns,

@@ -1,7 +1,8 @@
-use common::{DataType, DbError, IsolationLevel, Result, SqlState};
+use common::{DataType, DbError, IsolationLevel, Result, SequenceOptions, SqlState};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::Statement;
 
@@ -23,6 +24,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     // to the parser (`docs/specs/crates/parser.md`). `VACUUM` is a maintenance
     // command, not a relational statement, and never reaches bind/plan.
     if let Some(statement) = try_parse_vacuum(sql)? {
+        return Ok(statement);
+    }
+    if let Some(statement) = try_parse_create_sequence(sql)? {
         return Ok(statement);
     }
 
@@ -61,13 +65,17 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             purge,
             temporary,
         } => {
-            if if_exists || names.len() != 1 || cascade || restrict || purge || temporary {
+            if names.len() != 1 || cascade || restrict || purge || temporary {
                 return unsupported("unsupported DROP form");
             }
             let name = object_name(&names.remove(0))?;
             match object_type {
-                sql::ObjectType::Table => Ok(Statement::DropTable { name }),
-                sql::ObjectType::Index => Ok(Statement::DropIndex { name }),
+                sql::ObjectType::Table if !if_exists => Ok(Statement::DropTable { name }),
+                sql::ObjectType::Index if !if_exists => Ok(Statement::DropIndex { name }),
+                sql::ObjectType::Sequence => Ok(Statement::DropSequence { name, if_exists }),
+                sql::ObjectType::Table | sql::ObjectType::Index => {
+                    unsupported("unsupported DROP form")
+                }
                 _ => unsupported("unsupported DROP object type"),
             }
         }
@@ -493,6 +501,190 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
         return unsupported("VACUUM target must be a simple table name in v1");
     }
     Ok(target.to_ascii_lowercase())
+}
+
+fn try_parse_create_sequence(sql: &str) -> Result<Option<Statement>> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens: Vec<_> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    if !matches_create_sequence_prefix(&tokens) {
+        return Ok(None);
+    }
+
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    if tokens.iter().any(|token| matches!(token, Token::SemiColon)) {
+        return Err(parse_error("expected exactly one SQL statement"));
+    }
+
+    let mut parser = SequenceParser { tokens, index: 0 };
+    parser.expect_word("create")?;
+    if parser.consume_word("temporary") || parser.consume_word("temp") {
+        return unsupported("unsupported CREATE SEQUENCE form");
+    }
+    parser.expect_word("sequence")?;
+    if parser.consume_word("if") {
+        parser.expect_word("not")?;
+        parser.expect_word("exists")?;
+        return unsupported("unsupported CREATE SEQUENCE form");
+    }
+
+    let name = parser.parse_identifier()?;
+    if parser.consume_token(&Token::Period) {
+        return unsupported("qualified names are not supported in v1");
+    }
+
+    let mut options = SequenceOptions::default();
+    let mut increment_seen = false;
+    let mut min_seen = false;
+    let mut max_seen = false;
+    let mut start_seen = false;
+    let mut cache_seen = false;
+    let mut cycle_seen = false;
+
+    while !parser.is_at_end() {
+        if parser.consume_word("increment") {
+            reject_duplicate_sequence_option(&mut increment_seen, "INCREMENT")?;
+            parser.consume_word("by");
+            options.increment = parser.parse_i64()?;
+        } else if parser.consume_word("start") {
+            reject_duplicate_sequence_option(&mut start_seen, "START")?;
+            parser.consume_word("with");
+            options.start = Some(parser.parse_i64()?);
+        } else if parser.consume_word("minvalue") {
+            reject_duplicate_sequence_option(&mut min_seen, "MINVALUE")?;
+            options.min_value = Some(parser.parse_i64()?);
+        } else if parser.consume_word("maxvalue") {
+            reject_duplicate_sequence_option(&mut max_seen, "MAXVALUE")?;
+            options.max_value = Some(parser.parse_i64()?);
+        } else if parser.consume_word("cache") {
+            reject_duplicate_sequence_option(&mut cache_seen, "CACHE")?;
+            let cache = parser.parse_i64()?;
+            if cache <= 0 {
+                return unsupported("CACHE must be greater than zero");
+            }
+        } else if parser.consume_word("cycle") {
+            reject_duplicate_sequence_option(&mut cycle_seen, "CYCLE")?;
+            options.cycle = true;
+        } else if parser.consume_word("no") {
+            if parser.consume_word("minvalue") {
+                reject_duplicate_sequence_option(&mut min_seen, "MINVALUE")?;
+                options.min_value = None;
+            } else if parser.consume_word("maxvalue") {
+                reject_duplicate_sequence_option(&mut max_seen, "MAXVALUE")?;
+                options.max_value = None;
+            } else if parser.consume_word("cycle") {
+                reject_duplicate_sequence_option(&mut cycle_seen, "CYCLE")?;
+                options.cycle = false;
+            } else {
+                return unsupported("unsupported CREATE SEQUENCE form");
+            }
+        } else {
+            return unsupported("unsupported CREATE SEQUENCE form");
+        }
+    }
+
+    Ok(Some(Statement::CreateSequence { name, options }))
+}
+
+fn matches_create_sequence_prefix(tokens: &[Token]) -> bool {
+    let mut index = 0;
+    if !matches_word(tokens.get(index), "create") {
+        return false;
+    }
+    index += 1;
+    if matches_word(tokens.get(index), "temporary") || matches_word(tokens.get(index), "temp") {
+        index += 1;
+    }
+    matches_word(tokens.get(index), "sequence")
+}
+
+fn reject_duplicate_sequence_option(seen: &mut bool, option: &str) -> Result<()> {
+    if *seen {
+        return unsupported(format!("duplicate CREATE SEQUENCE {option} option"));
+    }
+    *seen = true;
+    Ok(())
+}
+
+struct SequenceParser {
+    tokens: Vec<Token>,
+    index: usize,
+}
+
+impl SequenceParser {
+    fn is_at_end(&self) -> bool {
+        self.index >= self.tokens.len()
+    }
+
+    fn consume_word(&mut self, expected: &str) -> bool {
+        if matches_word(self.tokens.get(self.index), expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_word(&mut self, expected: &str) -> Result<()> {
+        if self.consume_word(expected) {
+            Ok(())
+        } else {
+            Err(parse_error(format!("expected {expected}")))
+        }
+    }
+
+    fn consume_token(&mut self, expected: &Token) -> bool {
+        if self.tokens.get(self.index) == Some(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_identifier(&mut self) -> Result<String> {
+        match self.tokens.get(self.index) {
+            Some(Token::Word(word)) if word.quote_style.is_none() => {
+                self.index += 1;
+                Ok(word.value.to_ascii_lowercase())
+            }
+            Some(Token::Word(_)) => Err(parse_error("quoted identifiers are not supported")),
+            _ => Err(parse_error("expected sequence name")),
+        }
+    }
+
+    fn parse_i64(&mut self) -> Result<i64> {
+        let negative = self.consume_token(&Token::Minus);
+        let Some(Token::Number(text, _)) = self.tokens.get(self.index) else {
+            return unsupported("sequence option must be an integer literal");
+        };
+        self.index += 1;
+        let magnitude = text
+            .parse::<i128>()
+            .map_err(|_| parse_error("sequence option is out of range"))?;
+        let signed = if negative { -magnitude } else { magnitude };
+        i64::try_from(signed).map_err(|_| {
+            DbError::parse(
+                SqlState::NumericValueOutOfRange,
+                "sequence option is out of range",
+            )
+        })
+    }
+}
+
+fn matches_word(token: Option<&Token>, expected: &str) -> bool {
+    matches!(
+        token,
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)
+    )
 }
 
 fn parse_error(message: impl Into<String>) -> DbError {

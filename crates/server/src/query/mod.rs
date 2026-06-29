@@ -701,7 +701,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::CreateTable { .. }
         | Statement::DropTable { .. }
         | Statement::CreateIndex { .. }
-        | Statement::DropIndex { .. } => Ok(StatementClass::Ddl),
+        | Statement::DropIndex { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::DropSequence { .. } => Ok(StatementClass::Ddl),
         Statement::Begin { isolation } => Ok(StatementClass::TransactionControl(
             TransactionControl::Begin(*isolation),
         )),
@@ -760,7 +762,8 @@ mod tests {
     use common::{
         ConcurrencyController, DataType, DbError, FlushPolicy, IndexId, IndexSchema,
         IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, Result, RwLockConcurrencyController,
-        SqlState, TableId, TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+        SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, TxnId,
+        TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -1106,6 +1109,43 @@ mod tests {
 
         fn drop_index(&self, id: IndexId) -> Result<()> {
             self.inner.drop_index(id)
+        }
+
+        fn get_sequence_by_name(&self, name: &str) -> Result<Option<SequenceSchema>> {
+            self.inner.get_sequence_by_name(name)
+        }
+
+        fn get_sequence(&self, id: SequenceId) -> Result<Option<SequenceSchema>> {
+            self.inner.get_sequence(id)
+        }
+
+        fn list_sequences(&self) -> Result<Vec<SequenceSchema>> {
+            self.inner.list_sequences()
+        }
+
+        fn reserve_sequence_id(&self, id: SequenceId) -> Result<()> {
+            self.inner.reserve_sequence_id(id)
+        }
+
+        fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()> {
+            self.inner.apply_create_sequence(schema)
+        }
+
+        fn apply_drop_sequence(&self, id: SequenceId) -> Result<()> {
+            self.inner.apply_drop_sequence(id)
+        }
+
+        fn create_sequence(
+            &self,
+            name: String,
+            options: SequenceOptions,
+            owned: bool,
+        ) -> Result<SequenceSchema> {
+            self.inner.create_sequence(name, options, owned)
+        }
+
+        fn drop_sequence(&self, id: SequenceId) -> Result<()> {
+            self.inner.drop_sequence(id)
         }
     }
 
@@ -2274,6 +2314,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = service

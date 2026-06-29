@@ -158,7 +158,9 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
         ddl @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::CreateIndex { .. }
-        | LogicalPlan::DropIndex { .. }) => ddl,
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::DropSequence { .. }) => ddl,
     }
 }
 

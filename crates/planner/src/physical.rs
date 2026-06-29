@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use common::{
     ColumnId, ColumnInfo, DataType, IndexId, Key, KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
-    Result, TableId, Value,
+    Result, SequenceOptions, TableId, Value,
 };
 
 use crate::{
@@ -29,6 +29,14 @@ pub enum PhysicalPlan {
     },
     DropIndex {
         index: IndexId,
+    },
+    CreateSequence {
+        name: String,
+        options: SequenceOptions,
+    },
+    DropSequence {
+        name: String,
+        if_exists: bool,
     },
     Insert {
         table: TableId,
@@ -140,6 +148,14 @@ pub fn physical_plan(
             unique: *unique,
         }),
         LogicalPlan::DropIndex { index } => Ok(PhysicalPlan::DropIndex { index: *index }),
+        LogicalPlan::CreateSequence { name, options } => Ok(PhysicalPlan::CreateSequence {
+            name: name.clone(),
+            options: options.clone(),
+        }),
+        LogicalPlan::DropSequence { name, if_exists } => Ok(PhysicalPlan::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         LogicalPlan::Insert {
             table,
             columns,
@@ -389,6 +405,8 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(common::DbError::internal(

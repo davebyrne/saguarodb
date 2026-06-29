@@ -139,6 +139,41 @@ pub struct TableSchema {
     pub primary_key: Vec<ColumnId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceOptions {
+    pub increment: i64,
+    pub start: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: bool,
+}
+
+impl Default for SequenceOptions {
+    fn default() -> Self {
+        Self {
+            increment: 1,
+            start: None,
+            min_value: None,
+            max_value: None,
+            cycle: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceSchema {
+    pub id: SequenceId,
+    pub name: String,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start: i64,
+    pub cycle: bool,
+    pub owned: bool,
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
 /// A secondary index over one or more columns of a table. `unique` rejects
 /// duplicate indexed values; a non-unique index appends the primary key to make
 /// each entry distinct on disk.

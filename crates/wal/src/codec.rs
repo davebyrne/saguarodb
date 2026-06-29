@@ -24,6 +24,8 @@ const TYPE_DROP_INDEX: u8 = 10;
 const TYPE_ABORT: u8 = 11;
 const TYPE_HEAP_UPDATE_HEADER: u8 = 12;
 const TYPE_COMMIT_WITH_SUBXIDS: u8 = 13;
+const TYPE_CREATE_SEQUENCE: u8 = 14;
+const TYPE_DROP_SEQUENCE: u8 = 15;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -146,6 +148,8 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::DropTable { .. } => TYPE_DROP_TABLE,
         WalRecordKind::CreateIndex { .. } => TYPE_CREATE_INDEX,
         WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
+        WalRecordKind::CreateSequence { .. } => TYPE_CREATE_SEQUENCE,
+        WalRecordKind::DropSequence { .. } => TYPE_DROP_SEQUENCE,
         WalRecordKind::Commit => TYPE_COMMIT,
         WalRecordKind::CommitWithSubxids { .. } => TYPE_COMMIT_WITH_SUBXIDS,
         WalRecordKind::Abort => TYPE_ABORT,
@@ -417,6 +421,21 @@ mod tests {
                 },
             },
             WalRecordKind::DropIndex { index: 3 },
+            WalRecordKind::CreateSequence {
+                schema: common::SequenceSchema {
+                    id: 4,
+                    name: "users_id_seq".to_string(),
+                    increment: 1,
+                    min_value: 1,
+                    max_value: i64::MAX,
+                    start: 1,
+                    cycle: false,
+                    owned: false,
+                    last_value: 1,
+                    is_called: false,
+                },
+            },
+            WalRecordKind::DropSequence { sequence: 4 },
         ];
         for kind in kinds {
             let record = WalRecord {

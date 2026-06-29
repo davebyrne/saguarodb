@@ -31,7 +31,9 @@ pub(crate) fn resolve_plan_subqueries(
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::CreateIndex { .. }
-        | PhysicalPlan::DropIndex { .. } => plan.clone(),
+        | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. } => plan.clone(),
         PhysicalPlan::Insert {
             table,
             columns,

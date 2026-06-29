@@ -89,6 +89,12 @@ impl QueryEngine {
                 unique,
             } => execute_create_index(ctx, name, table, columns, *unique),
             PhysicalPlan::DropIndex { index } => execute_drop_index(ctx, *index),
+            PhysicalPlan::CreateSequence { name, options } => {
+                execute_create_sequence(ctx, name, options)
+            }
+            PhysicalPlan::DropSequence { name, if_exists } => {
+                execute_drop_sequence(ctx, name, *if_exists)
+            }
             PhysicalPlan::Insert {
                 table,
                 columns,
@@ -248,6 +254,8 @@ pub(crate) fn build_executor<'a>(
         | PhysicalPlan::DropTable { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
+        | PhysicalPlan::CreateSequence { .. }
+        | PhysicalPlan::DropSequence { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(DbError::internal(
@@ -801,6 +809,50 @@ fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<Exec
     ctx.catalog.drop_index(index)?;
     Ok(ExecutionResult::Modified {
         command: "DROP INDEX".to_string(),
+        count: 0,
+    })
+}
+
+fn execute_create_sequence(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    options: &common::SequenceOptions,
+) -> Result<ExecutionResult> {
+    let schema = ctx
+        .catalog
+        .create_sequence(name.to_string(), options.clone(), false)?;
+    if let Err(err) = ctx.schema_ops.create_sequence(&ctx.statement, &schema) {
+        let _ = ctx.catalog.drop_sequence(schema.id);
+        return Err(err);
+    }
+    Ok(ExecutionResult::Modified {
+        command: "CREATE SEQUENCE".to_string(),
+        count: 0,
+    })
+}
+
+fn execute_drop_sequence(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecutionResult> {
+    let sequence = ctx.catalog.get_sequence_by_name(name)?;
+    let Some(sequence) = sequence else {
+        if if_exists {
+            return Ok(ExecutionResult::Modified {
+                command: "DROP SEQUENCE".to_string(),
+                count: 0,
+            });
+        }
+        return Err(DbError::plan(
+            SqlState::UndefinedTable,
+            format!("sequence {name} does not exist"),
+        ));
+    };
+    ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
+    ctx.catalog.drop_sequence(sequence.id)?;
+    Ok(ExecutionResult::Modified {
+        command: "DROP SEQUENCE".to_string(),
         count: 0,
     })
 }

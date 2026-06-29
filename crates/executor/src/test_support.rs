@@ -183,6 +183,8 @@ fn is_read_plan(plan: &PhysicalPlan) -> bool {
             | PhysicalPlan::DropTable { .. }
             | PhysicalPlan::CreateIndex { .. }
             | PhysicalPlan::DropIndex { .. }
+            | PhysicalPlan::CreateSequence { .. }
+            | PhysicalPlan::DropSequence { .. }
             | PhysicalPlan::Insert { .. }
             | PhysicalPlan::Update { .. }
             | PhysicalPlan::Delete { .. }
@@ -468,6 +470,18 @@ impl SchemaOperations for MemoryStorage {
             .map_err(|_| DbError::internal("storage lock poisoned"))?;
         begin_txn(&mut state, ctx.txn_id);
         state.indexes.remove(&index);
+        Ok(())
+    }
+
+    fn create_sequence(
+        &self,
+        _ctx: &StatementContext,
+        _schema: &common::SequenceSchema,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn drop_sequence(&self, _ctx: &StatementContext, _sequence: common::SequenceId) -> Result<()> {
         Ok(())
     }
 }

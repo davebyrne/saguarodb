@@ -2,7 +2,7 @@ mod support;
 
 use std::path::Path;
 
-use support::TestServer;
+use support::{Connection, TestServer};
 
 /// A column `DEFAULT` is applied when an `INSERT` omits the column, including for
 /// a `NOT NULL` column with a non-NULL default.
@@ -129,6 +129,162 @@ async fn column_default_survives_restart() {
         .unwrap()
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("5".to_string())]]);
+}
+
+#[tokio::test]
+async fn sequence_ddl_create_drop_and_if_exists() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create sequence users_id_seq")
+        .await
+        .unwrap();
+
+    let duplicate = server
+        .simple_query("create sequence users_id_seq")
+        .await
+        .err()
+        .expect("duplicate sequence should fail");
+    assert!(
+        duplicate.message.contains("42P07"),
+        "expected DuplicateTable: {}",
+        duplicate.message
+    );
+
+    server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .unwrap();
+    server
+        .simple_query("drop sequence if exists users_id_seq")
+        .await
+        .unwrap();
+
+    let missing = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("missing sequence should fail without IF EXISTS");
+    assert!(
+        missing.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        missing.message
+    );
+}
+
+#[tokio::test]
+async fn sequence_ddl_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query(
+                "create sequence users_id_seq increment by 3 start with 7 minvalue 1 maxvalue 99 cycle",
+            )
+            .await
+            .unwrap();
+        // No checkpoint: force recovery to replay the CreateSequence WAL record.
+    }
+
+    let server = restart(&path).await;
+    server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .unwrap();
+    let missing = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("drop after recovery should have removed the sequence");
+    assert!(
+        missing.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        missing.message
+    );
+}
+
+#[tokio::test]
+async fn sequence_drop_replay_removes_checkpointed_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create sequence users_id_seq")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("drop sequence users_id_seq")
+            .await
+            .unwrap();
+        // No checkpoint after the drop: force recovery to replay DropSequence.
+    }
+
+    let server = restart(&path).await;
+    let missing = server
+        .simple_query("drop sequence users_id_seq")
+        .await
+        .err()
+        .expect("DropSequence replay should remove the checkpointed sequence");
+    assert!(
+        missing.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        missing.message
+    );
+}
+
+#[tokio::test]
+async fn prepared_drop_sequence_if_exists_resolves_at_execute_time() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let prepare = conn
+        .prepare("drop_seq", "drop sequence if exists users_id_seq")
+        .await
+        .unwrap();
+    assert!(prepare.result.is_ok(), "prepare failed");
+
+    assert!(
+        conn.ok("create sequence users_id_seq").await.result.is_ok(),
+        "create sequence failed"
+    );
+    let drop = conn.execute_prepared("drop_seq").await.unwrap();
+    assert!(drop.result.is_ok(), "execute failed");
+
+    let missing = conn
+        .query("drop sequence users_id_seq")
+        .await
+        .unwrap()
+        .result
+        .err()
+        .expect("prepared drop should have removed the sequence");
+    assert!(
+        missing.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        missing.message
+    );
+}
+
+#[tokio::test]
+async fn sequence_ddl_inside_transaction_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("begin").await;
+    let create = conn.ok("create sequence users_id_seq").await;
+    let err = create
+        .result
+        .err()
+        .expect("sequence DDL inside a transaction should fail");
+    assert!(
+        err.message.to_lowercase().contains("ddl"),
+        "message was: {}",
+        err.message
+    );
+    assert_eq!(create.status, b'E');
+    conn.ok("rollback").await;
 }
 
 /// A composite `PRIMARY KEY (a, b)` enforces uniqueness over the whole tuple, not

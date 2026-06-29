@@ -1,4 +1,6 @@
-use common::{CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, Value};
+use common::{
+    CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, SequenceOptions, Value,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
@@ -22,6 +24,14 @@ pub enum Statement {
     },
     DropIndex {
         name: String,
+    },
+    CreateSequence {
+        name: String,
+        options: SequenceOptions,
+    },
+    DropSequence {
+        name: String,
+        if_exists: bool,
     },
     Insert {
         table: String,

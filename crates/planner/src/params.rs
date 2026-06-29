@@ -52,6 +52,8 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         | BoundStatement::DropTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
+        | BoundStatement::CreateSequence { .. }
+        | BoundStatement::DropSequence { .. }
         | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert {
             source,
@@ -228,6 +230,8 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         | BoundStatement::DropTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
+        | BoundStatement::CreateSequence { .. }
+        | BoundStatement::DropSequence { .. }
         | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert {
             source,

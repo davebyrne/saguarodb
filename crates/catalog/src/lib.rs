@@ -4,7 +4,10 @@ mod serialize;
 pub use memory::{CatalogSnapshot, MemoryCatalog};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 
-use common::{IndexId, IndexSchema, ParsedColumnDef, Result, TableId, TableSchema};
+use common::{
+    IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema,
+    TableId, TableSchema,
+};
 
 pub trait CatalogManager: Send + Sync {
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
@@ -36,6 +39,20 @@ pub trait CatalogManager: Send + Sync {
         unique: bool,
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
+
+    fn get_sequence_by_name(&self, name: &str) -> Result<Option<SequenceSchema>>;
+    fn get_sequence(&self, id: SequenceId) -> Result<Option<SequenceSchema>>;
+    fn list_sequences(&self) -> Result<Vec<SequenceSchema>>;
+    fn reserve_sequence_id(&self, id: SequenceId) -> Result<()>;
+    fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()>;
+    fn apply_drop_sequence(&self, id: SequenceId) -> Result<()>;
+    fn create_sequence(
+        &self,
+        name: String,
+        options: SequenceOptions,
+        owned: bool,
+    ) -> Result<SequenceSchema>;
+    fn drop_sequence(&self, id: SequenceId) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -43,8 +60,8 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef, SqlState,
-        TableSchema,
+        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef,
+        SequenceOptions, SequenceSchema, SqlState, TableSchema,
     };
 
     use crate::{
@@ -250,6 +267,7 @@ mod tests {
 
         catalog.reserve_table_id(9).unwrap();
         catalog.reserve_index_id(42).unwrap();
+        catalog.reserve_sequence_id(11).unwrap();
 
         assert!(
             catalog.list_tables().unwrap().is_empty(),
@@ -268,6 +286,146 @@ mod tests {
             .create_index("users_id".to_string(), "users", &["id".to_string()], false)
             .unwrap();
         assert_eq!(index.id, 43);
+
+        let sequence = catalog
+            .create_sequence(
+                "users_id_seq".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(sequence.id, 12);
+    }
+
+    #[test]
+    fn create_sequence_assigns_defaults_and_drop_removes_it() {
+        let catalog = MemoryCatalog::empty();
+
+        let sequence = catalog
+            .create_sequence(
+                "users_id_seq".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(sequence.id, 1);
+        assert_eq!(sequence.increment, 1);
+        assert_eq!(sequence.min_value, 1);
+        assert_eq!(sequence.max_value, i64::MAX);
+        assert_eq!(sequence.start, 1);
+        assert_eq!(sequence.last_value, 1);
+        assert!(!sequence.is_called);
+        assert!(!sequence.cycle);
+        assert!(!sequence.owned);
+        assert_eq!(
+            catalog
+                .get_sequence_by_name("users_id_seq")
+                .unwrap()
+                .unwrap()
+                .id,
+            sequence.id
+        );
+        assert_eq!(catalog.list_sequences().unwrap().len(), 1);
+
+        catalog.drop_sequence(sequence.id).unwrap();
+        assert!(catalog.get_sequence(sequence.id).unwrap().is_none());
+        assert!(catalog.list_sequences().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_sequence_normalizes_descending_defaults() {
+        let catalog = MemoryCatalog::empty();
+
+        let sequence = catalog
+            .create_sequence(
+                "descending_seq".to_string(),
+                SequenceOptions {
+                    increment: -5,
+                    start: None,
+                    min_value: None,
+                    max_value: None,
+                    cycle: true,
+                },
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(sequence.increment, -5);
+        assert_eq!(sequence.min_value, i64::MIN);
+        assert_eq!(sequence.max_value, -1);
+        assert_eq!(sequence.start, -1);
+        assert_eq!(sequence.last_value, -1);
+        assert!(sequence.cycle);
+    }
+
+    #[test]
+    fn create_sequence_rejects_invalid_options() {
+        let catalog = MemoryCatalog::empty();
+
+        for options in [
+            SequenceOptions {
+                increment: 0,
+                ..SequenceOptions::default()
+            },
+            SequenceOptions {
+                min_value: Some(10),
+                max_value: Some(5),
+                ..SequenceOptions::default()
+            },
+            SequenceOptions {
+                start: Some(99),
+                max_value: Some(10),
+                ..SequenceOptions::default()
+            },
+        ] {
+            let err = catalog
+                .create_sequence("bad_seq".to_string(), options, false)
+                .unwrap_err();
+            assert_eq!(err.code, SqlState::DatatypeMismatch);
+        }
+    }
+
+    #[test]
+    fn sequence_snapshot_round_trips_and_preserves_allocator() {
+        let catalog = MemoryCatalog::empty();
+        let first = catalog
+            .create_sequence(
+                "s".to_string(),
+                SequenceOptions {
+                    increment: 2,
+                    start: Some(5),
+                    min_value: Some(1),
+                    max_value: Some(100),
+                    cycle: true,
+                },
+                false,
+            )
+            .unwrap();
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+
+        assert_eq!(
+            restored.get_sequence_by_name("s").unwrap().unwrap(),
+            SequenceSchema {
+                id: first.id,
+                name: "s".to_string(),
+                increment: 2,
+                min_value: 1,
+                max_value: 100,
+                start: 5,
+                cycle: true,
+                owned: false,
+                last_value: 5,
+                is_called: false,
+            }
+        );
+        let next = restored
+            .create_sequence("next_s".to_string(), SequenceOptions::default(), false)
+            .unwrap();
+        assert_eq!(next.id, first.id + 1);
     }
 
     #[test]
@@ -280,6 +438,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = catalog.restore(snapshot).unwrap_err();
@@ -309,6 +468,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -317,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_snapshot_rejects_sequence_default_until_sequences_exist() {
+    fn try_from_snapshot_rejects_sequence_default_until_nextval_is_supported() {
         let schema = TableSchema {
             id: 3,
             name: "users".to_string(),
@@ -338,6 +498,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -346,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_create_table_rejects_sequence_default_until_sequences_exist() {
+    fn apply_create_table_rejects_sequence_default_until_nextval_is_supported() {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 3,
@@ -400,6 +561,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
@@ -435,6 +597,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -463,6 +626,7 @@ mod tests {
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -913,6 +1077,7 @@ mod tests {
                 },
             )]),
             next_index_id: 2,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -951,6 +1116,7 @@ mod tests {
                 },
             )]),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -988,6 +1154,7 @@ mod tests {
                 },
             )]),
             next_index_id: 1,
+            ..CatalogSnapshot::default()
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
@@ -996,7 +1163,7 @@ mod tests {
 
     #[test]
     fn snapshot_without_index_fields_deserializes_to_empty_indexes() {
-        // A catalog persisted before secondary indexes existed.
+        // A catalog persisted before secondary indexes and sequences existed.
         let json = r#"{
             "tables_by_name": {"users": 1},
             "tables_by_id": {"1": {
@@ -1012,6 +1179,9 @@ mod tests {
         assert!(snapshot.indexes_by_id.is_empty());
         assert!(snapshot.indexes_by_name.is_empty());
         assert_eq!(snapshot.next_index_id, 1);
+        assert!(snapshot.sequences_by_id.is_empty());
+        assert!(snapshot.sequences_by_name.is_empty());
+        assert_eq!(snapshot.next_sequence_id, 1);
 
         // The validated load path accepts it.
         MemoryCatalog::try_from_snapshot(snapshot).unwrap();

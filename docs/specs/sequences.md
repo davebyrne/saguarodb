@@ -372,7 +372,7 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 ## 7. Server dispatch
 
 - `CREATE SEQUENCE` / `DROP SEQUENCE` are classified `StatementClass::Ddl`:
-  autocommit-only, take the shared writer guard, append their logical WAL
+  autocommit-only, take the exclusive DDL guard, append their logical WAL
   records, and are **rejected inside an explicit transaction block** by the
   existing DDL-in-block path.
 - Statements flagged `mutates_sequences` are routed to the write path even when

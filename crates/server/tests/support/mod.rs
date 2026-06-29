@@ -293,6 +293,31 @@ impl Connection {
         Ok(QueryOutcome { result, status })
     }
 
+    pub async fn prepare(&mut self, name: &str, sql: &str) -> Result<QueryOutcome> {
+        let mut seq = parse_bytes(name, sql, &[]);
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to send extended-protocol parse: {err}"))
+        })?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
+    pub async fn execute_prepared(&mut self, name: &str) -> Result<QueryOutcome> {
+        let mut seq = bind_bytes("", name);
+        seq.extend(execute_bytes(""));
+        seq.extend(sync_bytes());
+        self.stream.write_all(&seq).await.map_err(|err| {
+            common::DbError::io(format!("failed to send extended-protocol execute: {err}"))
+        })?;
+        let response = read_until_ready(&mut self.stream).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
     /// Abruptly close the connection (drop the socket), simulating a client that
     /// disconnects mid-transaction.
     pub async fn close(self) {

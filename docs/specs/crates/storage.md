@@ -40,6 +40,8 @@ pub trait SchemaOperations: Send + Sync {
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
     fn create_index(&self, ctx: &StatementContext, schema: &IndexSchema, gc_horizon: u64) -> Result<()>;
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
+    fn create_sequence(&self, ctx: &StatementContext, schema: &SequenceSchema) -> Result<()>;
+    fn drop_sequence(&self, ctx: &StatementContext, sequence: SequenceId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
@@ -50,7 +52,7 @@ pub trait RecoveryOperations: Send + Sync {
 }
 ```
 
-`RecoveryOperations` carries only DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RecoveryOperations` carries only storage-owned DDL replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL has no storage-owned physical state in phase 2, so `SchemaOperations::create_sequence` / `drop_sequence` append only the logical WAL records and recovery applies them through the catalog. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
 ## Table Storage
 
@@ -875,6 +877,9 @@ Normal data operations append physiological redo records as they mutate pages, s
 - An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
 - Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
+- `SchemaOperations::create_sequence` / `drop_sequence` log `CreateSequence` /
+  `DropSequence`. Recovery applies them to catalog only because sequences have
+  no storage-owned physical state in phase 2.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
 

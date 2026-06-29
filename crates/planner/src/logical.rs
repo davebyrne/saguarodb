@@ -1,4 +1,6 @@
-use common::{ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, TableId};
+use common::{
+    ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, SequenceOptions, TableId,
+};
 
 use crate::{
     AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
@@ -24,6 +26,14 @@ pub enum LogicalPlan {
     },
     DropIndex {
         index: IndexId,
+    },
+    CreateSequence {
+        name: String,
+        options: SequenceOptions,
+    },
+    DropSequence {
+        name: String,
+        if_exists: bool,
     },
     Insert {
         table: TableId,
@@ -121,6 +131,14 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             unique: *unique,
         }),
         BoundStatement::DropIndex { index } => Ok(LogicalPlan::DropIndex { index: *index }),
+        BoundStatement::CreateSequence { name, options } => Ok(LogicalPlan::CreateSequence {
+            name: name.clone(),
+            options: options.clone(),
+        }),
+        BoundStatement::DropSequence { name, if_exists } => Ok(LogicalPlan::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         BoundStatement::Insert {
             table,
             columns,

@@ -48,7 +48,7 @@ crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
 
 ## Binder Contract
 
-Binder output is fully resolved. No downstream phase performs name lookup. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
+Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP SEQUENCE` is the deliberate exception: it carries the normalized sequence name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op.
 
 Binder responsibilities:
 
@@ -68,6 +68,11 @@ Binder responsibilities:
 - Bind `ON CONFLICT` (`bind_on_conflict`): the arbiter is **always the primary key**. An explicit conflict target must name exactly the primary-key column(s) — any other column list (a secondary unique index) is rejected with `FeatureNotSupported`; a missing target is allowed for `DO NOTHING` but rejected for `DO UPDATE`. `DO NOTHING` binds to `BoundOnConflict::DoNothing`. `DO UPDATE SET ... [WHERE ...]` binds over **two** bindings — the target table (slots `0..n`, bare columns resolve here) and a `qualified_only` `excluded` pseudo-table (slots `n..2n`, only `excluded.<col>` resolves) — so a bare column means the existing row and `excluded.<col>` the proposed row (matching PostgreSQL, no ambiguity). The primary key cannot be assigned and duplicate assignments are rejected, as in `UPDATE`.
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
+- Bind `CREATE SEQUENCE` as a pass-through carrying the normalized
+  `SequenceOptions`. Bind `DROP SEQUENCE` as a pass-through carrying the
+  normalized sequence name and `IF EXISTS`; the executor resolves the sequence
+  at statement execution time so a prepared `DROP SEQUENCE IF EXISTS` does not
+  remain a no-op if the sequence is created after `Parse` and before `Execute`.
 - Validate aggregate usage and `GROUP BY` rules.
 - Validate `CASE` result typing: all non-`NULL` `THEN` and `ELSE` expressions must have the same `DataType`; `NULL` branches are allowed and make the output nullable; all-`NULL` result branches are rejected with `SqlState::DatatypeMismatch`.
 - Reject unsupported forms. Concretely, the binder rejects: an empty primary key (`SqlState::DatatypeMismatch`) and duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE` (a composite multi-column primary key is accepted); an `UPDATE` assigning the primary-key column (`SqlState::DatatypeMismatch`); and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
@@ -78,6 +83,8 @@ pub enum BoundStatement {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
+    CreateSequence { name: String, options: SequenceOptions },
+    DropSequence { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Select(BoundSelect),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
@@ -367,6 +374,8 @@ pub enum LogicalPlan {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
+    CreateSequence { name: String, options: SequenceOptions },
+    DropSequence { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
@@ -447,6 +456,8 @@ pub enum PhysicalPlan {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
+    CreateSequence { name: String, options: SequenceOptions },
+    DropSequence { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
@@ -506,7 +517,7 @@ pub enum PhysicalPlan {
 
 The executor crate is not called for `EXPLAIN`.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 

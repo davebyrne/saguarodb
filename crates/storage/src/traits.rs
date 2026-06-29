@@ -1,6 +1,6 @@
 use common::{
-    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, StatementContext,
-    StoredRow, TableId, TableSchema,
+    ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, SequenceId,
+    SequenceSchema, StatementContext, StoredRow, TableId, TableSchema,
 };
 
 pub trait RowIterator: Send {
@@ -58,6 +58,8 @@ pub trait SchemaOperations: Send + Sync {
         gc_horizon: u64,
     ) -> Result<()>;
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
+    fn create_sequence(&self, ctx: &StatementContext, schema: &SequenceSchema) -> Result<()>;
+    fn drop_sequence(&self, ctx: &StatementContext, sequence: SequenceId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
