@@ -175,32 +175,45 @@ SIREAD locks are attributed to the top-level transaction and are **retained acro
 partial `ROLLBACK TO`** (releasing them would be an optimization, and keeping them is
 safe — it can only over-conflict). This mirrors the deadlock graph's top-level keying.
 
-## 6. rw-edge formation (the write side)
+## 6. rw-edge formation
 
-At the storage write points — `stamp_xmax_logged` (the `UPDATE`/`DELETE` version
-stamp, `engine/dml.rs`) and the insert / `unique_conflict_kind` path
-(`engine/mod.rs`, `engine/index.rs`) — a `SERIALIZABLE` writer calls
-`note_write(table, key)`. The manager looks up SIREAD holders of that item and, for
-each holder `T_r` that is **a different transaction** and **concurrent with the
-writer** `T_w`, adds an edge `T_r →rw T_w`:
+An rw-antidependency edge `T_r →rw T_w` (`T_r` read an item, `T_w` wrote a later,
+concurrent version of it that `T_r` could not see) must be formed regardless of
+which transaction acted first. There are two orderings, and **both** must be caught
+(the write-side check alone — PostgreSQL's `CheckForSerializableConflictIn` — is *not*
+sufficient; the read-side `CheckForSerializableConflictOut` is equally required):
 
-- **`UPDATE`/`DELETE` of `(t, k)`** → holders in `relation_readers[t]` ∪
-  `tuple_readers[(t, k)]`.
-- **`INSERT` of key `k` into `t`** → holders in `relation_readers[t]` (this is the
-  phantom protection) ∪ `tuple_readers[(t, k)]` (a point reader that read "key `k`
-  absent" must conflict with its later insertion).
+- **Conflict-in (reader before writer).** At the storage write points —
+  `stamp_xmax_logged` (the `UPDATE`/`DELETE` version stamp, `engine/dml.rs`) and the
+  insert path (`engine/mod.rs`, `engine/index.rs`) — a `SERIALIZABLE` writer calls
+  `note_write(table, key)`. The manager forms `T_r →rw T_w` for each **already-recorded**
+  SIREAD holder `T_r` of that item: `relation_readers[t]` ∪ `tuple_readers[(t, k)]`
+  (for an insert, the `relation_readers[t]` hit is the phantom protection — a scan of
+  the table conflicts with a new row; the `tuple_readers[(t, k)]` hit covers a point
+  reader that read "key `k` absent" before its insertion).
+- **Conflict-out (writer before reader).** At read time — when a `SERIALIZABLE`
+  transaction records a SIREAD lock (§5.1, at the executor scan operators / COPY-TO) —
+  the manager forms `T_r →rw T_w` for each **already-recorded** *writer* `T_w` of the
+  item being read. This requires the dual of the reader table: a **writer table**
+  populated by `note_write`, `relation_writers[t]` and `tuple_writers[(t, k)]`. A
+  relation read consults `relation_writers[t]` (any concurrent writer of any row in
+  the scanned table); a tuple read consults `tuple_writers[(t, k)]`.
+
+Conflict-in and conflict-out are exact duals: both form the edge `T_r →rw T_w` and
+both use the same concurrency test.
 
 **Concurrency test.** An edge `T_r →rw T_w` is relevant only when `T_w` is *not
 visible* to `T_r`'s snapshot (`T_w` committed after `T_r`'s snapshot, or is still
 in-flight). If `T_w` were already visible to `T_r`, then `T_r` read `T_w`'s own
 version and there is no antidependency. The manager evaluates this from `T_r`'s stored
-snapshot. Self-edges (`T_r == T_w`) are never formed.
+snapshot. Self-edges (`T_r == T_w`) are never formed. Edges are formed only between
+`SERIALIZABLE` transactions (both endpoints tracked).
 
-Edge formation **records** the edge and updates both endpoints' flags
-(`T_r.has_out_conflict`, `T_w.has_in_conflict`); the abort decision is §7. This is
-purely additive to the write path: write-write conflicts continue to block and
-deadlock-detect exactly as in `docs/specs/deadlock.md`; SSI only adds rw-edges from
-the read side and never blocks.
+Edge formation **records** the edge in both endpoints' edge sets; the abort decision
+is §7. The writer table has the same lifetime and top-level keying as the SIREAD
+reader table (§5.3, §5.5). This is purely additive to the write/read paths: SSI never
+blocks, and write-write conflicts continue to block and deadlock-detect exactly as in
+`docs/specs/deadlock.md`.
 
 ## 7. Dangerous-structure detection and abort
 

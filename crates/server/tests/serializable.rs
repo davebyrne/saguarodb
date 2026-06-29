@@ -46,6 +46,45 @@ async fn write_skew_aborts_one_serializable_transaction() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
+/// Write-skew where one transaction WRITES before the other READS the affected row
+/// (the read-side "conflict-out" ordering). T1 reads + writes before T2 even reads, so
+/// the `t2 →rw t1` edge can only be formed at T2's READ (the writer's SIREAD scan ran
+/// before T2's lock existed). Must still abort exactly one (`docs/specs/ssi.md` §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_skew_with_write_before_read_is_detected() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, v integer)")
+        .await;
+    setup.ok("insert into t (id, v) values (1, 10)").await;
+    setup.ok("insert into t (id, v) values (2, 20)").await;
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level serializable").await;
+    t2.ok("begin isolation level serializable").await;
+    // T1 fully reads then writes BEFORE T2 reads.
+    t1.ok("select v from t").await;
+    t1.ok("update t set v = 100 where id = 1").await;
+    // T2 now reads the table — it sees the old row 1 (T1 is concurrent/invisible). This
+    // read must form t2 →rw t1.
+    t2.ok("select v from t").await;
+    t2.ok("update t set v = 200 where id = 2").await;
+    let r1 = t1.query("commit").await.unwrap().result;
+    let r2 = t2.query("commit").await.unwrap().result;
+    let failures = [&r1, &r2].into_iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        failures,
+        1,
+        "exactly one aborts (t1_err={}, t2_err={})",
+        r1.is_err(),
+        r2.is_err()
+    );
+    assert!(r1.err().or(r2.err()).unwrap().message.contains("C=40001"));
+    assert_eq!(server.active_txn_count(), 0);
+}
+
 /// The SAME workload under REPEATABLE READ commits BOTH transactions: snapshot
 /// isolation permits write skew. This proves SERIALIZABLE is strictly stronger — the
 /// SSI machinery (not the shared snapshot) is what aborts the cycle above.

@@ -42,6 +42,12 @@ struct SsiState {
     relation_readers: HashMap<TableId, HashSet<TxnId>>,
     /// `(table, key) → serializable readers` holding a tuple-granularity SIREAD lock.
     tuple_readers: HashMap<(TableId, Key), HashSet<TxnId>>,
+    /// `table → serializable writers` of any row in the table — the dual of
+    /// `relation_readers`, consulted at read time for conflict-out (`docs/specs/ssi.md`
+    /// §6). Populated by every `note_write`.
+    relation_writers: HashMap<TableId, HashSet<TxnId>>,
+    /// `(table, key) → serializable writers` of that row — the dual of `tuple_readers`.
+    tuple_writers: HashMap<(TableId, Key), HashSet<TxnId>>,
     /// Per top-level serializable transaction.
     txns: HashMap<TxnId, TxnSsi>,
     /// Monotonic commit-sequence counter assigned to a serializable transaction when
@@ -62,6 +68,11 @@ struct TxnSsi {
     /// Keys this transaction holds a tuple SIREAD lock on, grouped by table (reverse
     /// index for cleanup and the per-table cap).
     tuple_locks: HashMap<TableId, HashSet<Key>>,
+    /// Tables this transaction wrote a row in (reverse index into `relation_writers`).
+    relation_writes: HashSet<TableId>,
+    /// Keys this transaction wrote, grouped by table (reverse index into
+    /// `tuple_writers`).
+    tuple_writes: HashMap<TableId, HashSet<Key>>,
     /// rw-antidependency successors: `W` such that `self →rw W` (self read an item `W`
     /// then overwrote). Non-empty ⇒ this transaction has an *outgoing* conflict.
     out_edges: HashSet<TxnId>,
@@ -102,6 +113,8 @@ impl SerializableConflictManager {
             snapshot,
             relation_locks: HashSet::new(),
             tuple_locks: HashMap::new(),
+            relation_writes: HashSet::new(),
+            tuple_writes: HashMap::new(),
             out_edges: HashSet::new(),
             in_edges: HashSet::new(),
             commit_seq: None,
@@ -230,6 +243,14 @@ fn purge(st: &mut SsiState, top: TxnId, txn: TxnSsi) {
             remove_reader(&mut st.tuple_readers, &(table, key), top);
         }
     }
+    for table in txn.relation_writes {
+        remove_reader(&mut st.relation_writers, &table, top);
+    }
+    for (table, keys) in txn.tuple_writes {
+        for key in keys {
+            remove_reader(&mut st.tuple_writers, &(table, key), top);
+        }
+    }
     // `top →rw w` ⟹ `w.in_edges` holds `top`; `v →rw top` ⟹ `v.out_edges` holds `top`.
     for w in txn.out_edges {
         if let Some(wt) = st.txns.get_mut(&w) {
@@ -268,6 +289,33 @@ fn is_doomed_pivot(st: &SsiState, t: TxnId) -> bool {
         .any(|w| st.txns.get(w).is_some_and(|o| o.commit_seq.is_some()))
 }
 
+/// Form the rw-antidependency edge `reader →rw writer` if relevant: distinct
+/// transactions, the writer is a tracked serializable transaction, and the writer is
+/// concurrent with the reader (the reader did not see the writer's version, §6). The
+/// shared core of both conflict-in (`note_write`) and conflict-out (`record_*`).
+fn form_rw_edge(st: &mut SsiState, reader: TxnId, writer: TxnId) {
+    if reader == writer || !st.txns.contains_key(&writer) {
+        return;
+    }
+    let concurrent = match st.txns.get(&reader) {
+        Some(rt) => concurrent(&rt.snapshot, writer),
+        None => return,
+    };
+    if !concurrent {
+        return;
+    }
+    st.txns
+        .get_mut(&reader)
+        .expect("checked")
+        .out_edges
+        .insert(writer);
+    st.txns
+        .get_mut(&writer)
+        .expect("checked")
+        .in_edges
+        .insert(reader);
+}
+
 /// The `40001` raised when an SSI check aborts a transaction (matches PostgreSQL's
 /// message and reuses the `SerializationFailure` SQLSTATE — `docs/specs/ssi.md` §3).
 fn serialization_failure() -> DbError {
@@ -281,9 +329,22 @@ impl SsiTracker for SerializableConflictManager {
     fn record_tuple_read(&self, reader: TxnId, table: TableId, key: &Key) {
         let top = self.registry.top_of(reader);
         let mut st = self.lock();
-        let Some(txn) = st.txns.get_mut(&top) else {
+        if !st.txns.contains_key(&top) {
             return; // not a tracked serializable transaction
-        };
+        }
+        // Conflict-out (§6): a concurrent writer may have already written this exact
+        // row, so form `reader →rw writer` for each recorded writer of (table, key).
+        let writers: Vec<TxnId> = st
+            .tuple_writers
+            .get(&(table, key.clone()))
+            .map_or_else(Vec::new, |s| s.iter().copied().collect());
+        for w in writers {
+            form_rw_edge(&mut st, top, w);
+        }
+        // Record the tuple SIREAD lock (with the per-table cap collapse). Each tuple
+        // read already formed its own conflict-out above, so a later collapse to a
+        // relation lock loses no conflict-out edge (it only coarsens future conflict-in).
+        let txn = st.txns.get_mut(&top).expect("checked above");
         let table_keys = txn.tuple_locks.entry(table).or_default();
         if !table_keys.insert(key.clone()) {
             return; // already held
@@ -308,6 +369,18 @@ impl SsiTracker for SerializableConflictManager {
     fn record_relation_read(&self, reader: TxnId, table: TableId) {
         let top = self.registry.top_of(reader);
         let mut st = self.lock();
+        if !st.txns.contains_key(&top) {
+            return;
+        }
+        // Conflict-out (§6): a concurrent writer may have already written some row in
+        // this table, which a full scan read; form `reader →rw writer` for each.
+        let writers: Vec<TxnId> = st
+            .relation_writers
+            .get(&table)
+            .map_or_else(Vec::new, |s| s.iter().copied().collect());
+        for w in writers {
+            form_rw_edge(&mut st, top, w);
+        }
         Self::add_relation_lock(&mut st, top, table);
     }
 
@@ -317,39 +390,35 @@ impl SsiTracker for SerializableConflictManager {
         if !st.txns.contains_key(&writer_top) {
             return Ok(()); // not a tracked serializable writer
         }
-        // Concurrent readers of this exact item — relation readers of the table plus
-        // tuple readers of (table, key) — that are a different transaction and did not
-        // see this writer (§6). Each yields an edge `reader →rw writer`.
-        let mut candidates: Vec<TxnId> = Vec::new();
-        if let Some(s) = st.relation_readers.get(&table) {
-            candidates.extend(s.iter().copied());
-        }
-        if let Some(s) = st.tuple_readers.get(&(table, key.clone())) {
-            candidates.extend(s.iter().copied());
-        }
-        let readers: Vec<TxnId> = candidates
+        // Conflict-in (§6): form `reader →rw writer` for each already-recorded SIREAD
+        // holder of this item (relation readers of the table, tuple readers of the key).
+        let readers: Vec<TxnId> = st
+            .relation_readers
+            .get(&table)
             .into_iter()
-            .filter(|&r| r != writer_top) // a txn reading then writing an item is no self-conflict
-            .filter(|&r| {
-                st.txns
-                    .get(&r)
-                    .is_some_and(|rt| concurrent(&rt.snapshot, writer_top))
-            })
+            .chain(st.tuple_readers.get(&(table, key.clone())))
+            .flat_map(|s| s.iter().copied())
             .collect();
-        if readers.is_empty() {
-            return Ok(());
+        for reader in readers {
+            form_rw_edge(&mut st, reader, writer_top);
         }
-        for &reader in &readers {
-            if let Some(rt) = st.txns.get_mut(&reader) {
-                rt.out_edges.insert(writer_top);
-            }
-        }
-        st.txns
-            .get_mut(&writer_top)
-            .expect("tracked above")
-            .in_edges
-            .extend(readers.iter().copied());
-        // Edge-time detection (§7.1): the new inbound edges can make the writer a pivot
+        // Record this write in the writer tables (both grains) + reverse index, so a
+        // concurrent reader that reads the item LATER forms the conflict-out edge (§6).
+        let txn = st.txns.get_mut(&writer_top).expect("tracked above");
+        txn.relation_writes.insert(table);
+        txn.tuple_writes
+            .entry(table)
+            .or_default()
+            .insert(key.clone());
+        st.relation_writers
+            .entry(table)
+            .or_default()
+            .insert(writer_top);
+        st.tuple_writers
+            .entry((table, key.clone()))
+            .or_default()
+            .insert(writer_top);
+        // Edge-time detection (§7): the new inbound edges can make the writer a pivot
         // if it already had an outbound edge whose target committed first. The acting
         // writer is the participant aborted.
         if is_doomed_pivot(&st, writer_top) {
@@ -464,6 +533,36 @@ mod tests {
             xmax,
             xip: others.to_vec(),
         })
+    }
+
+    #[test]
+    fn conflict_out_tuple_read_after_concurrent_write_forms_edge() {
+        // Write-before-read ordering: the writer wrote the row BEFORE the reader read
+        // it, so the edge can only form at the read (conflict-out, `docs/specs/ssi.md` §6).
+        let mgr = manager();
+        mgr.register(10, snapshot_excluding(30, &[20])); // writer W=10
+        mgr.note_write(10, 1, &key(5)).unwrap();
+        mgr.register(20, snapshot_excluding(30, &[10])); // reader R=20, concurrent with W
+        mgr.record_tuple_read(20, 1, &key(5)); // reads the row W superseded
+        let st = mgr.lock();
+        assert!(
+            st.txns[&20].out_edges.contains(&10),
+            "conflict-out edge R→W formed at read time"
+        );
+        assert!(st.txns[&10].in_edges.contains(&20));
+    }
+
+    #[test]
+    fn conflict_out_relation_read_after_concurrent_write_forms_edge() {
+        let mgr = manager();
+        mgr.register(10, snapshot_excluding(30, &[20]));
+        mgr.note_write(10, 7, &key(5)).unwrap(); // W wrote some row in table 7
+        mgr.register(20, snapshot_excluding(30, &[10]));
+        mgr.record_relation_read(20, 7); // a full scan reads the row W superseded
+        assert!(
+            mgr.lock().txns[&20].out_edges.contains(&10),
+            "relation read forms the conflict-out edge against a prior concurrent writer"
+        );
     }
 
     #[test]
