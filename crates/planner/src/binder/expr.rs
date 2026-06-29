@@ -1142,6 +1142,11 @@ fn update_case_type(
 fn resolve_column(ctx: &BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
     let mut matches = Vec::new();
     for binding in &ctx.bindings {
+        // A `qualified_only` binding (the `excluded` pseudo-table) participates
+        // only when the reference is explicitly qualified with its name.
+        if table.is_none() && binding.qualified_only {
+            continue;
+        }
         if let Some(table) = table
             && binding.visible_name != table
             && (binding.visible_name != binding.table_name || binding.table_name != table)

@@ -93,6 +93,155 @@ async fn e2e_returning_for_insert_update_delete() {
 }
 
 #[tokio::test]
+async fn e2e_on_conflict_do_nothing_skips_duplicates() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada')")
+        .await
+        .unwrap();
+
+    // A conflicting key with DO NOTHING is skipped, not an error; the existing row
+    // is unchanged. A multi-row insert mixes a new key and a conflicting one.
+    server
+        .simple_query(
+            "insert into users (id, name) values (1, 'Duplicate'), (2, 'Grace') \
+             on conflict (id) do nothing",
+        )
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("Ada".to_string())],
+            vec![Some("2".to_string()), Some("Grace".to_string())],
+        ]
+    );
+
+    // DO NOTHING with no target works too, and RETURNING reports only the inserted
+    // (non-skipped) rows.
+    let rows = server
+        .simple_query(
+            "insert into users (id, name) values (2, 'Skip'), (3, 'Hopper') \
+             on conflict do nothing returning id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+}
+
+#[tokio::test]
+async fn e2e_on_conflict_do_update_upserts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table kv (k integer primary key, v integer, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into kv (k, v, note) values (1, 10, 'orig')")
+        .await
+        .unwrap();
+
+    // Upsert: the conflicting row is updated. `excluded` is the proposed row; a
+    // bare column is the existing row. RETURNING projects the updated row.
+    let rows = server
+        .simple_query(
+            "insert into kv (k, v, note) values (1, 5, 'new') \
+             on conflict (k) do update set v = kv.v + excluded.v, note = excluded.note \
+             returning k, v, note",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some("15".to_string()),
+            Some("new".to_string())
+        ]]
+    );
+
+    // A non-conflicting upsert inserts normally.
+    server
+        .simple_query(
+            "insert into kv (k, v, note) values (2, 20, 'two') \
+             on conflict (k) do update set v = excluded.v",
+        )
+        .await
+        .unwrap();
+
+    // DO UPDATE with a WHERE that fails leaves the row unchanged (no insert either).
+    server
+        .simple_query(
+            "insert into kv (k, v, note) values (1, 100, 'skip') \
+             on conflict (k) do update set v = excluded.v where kv.v > 1000",
+        )
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select k, v, note from kv order by k")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("15".to_string()),
+                Some("new".to_string())
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("20".to_string()),
+                Some("two".to_string())
+            ],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_on_conflict_secondary_unique_still_errors() {
+    // The arbiter is the primary key only; a conflict on a unique secondary index
+    // is not arbitrated by ON CONFLICT and still raises a unique violation.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, email text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create unique index users_email on users (email)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, email) values (1, 'a@x')")
+        .await
+        .unwrap();
+
+    // New primary key (2) but a duplicate email: ON CONFLICT (id) does not cover it.
+    let result = server
+        .simple_query("insert into users (id, email) values (2, 'a@x') on conflict (id) do nothing")
+        .await;
+    let err = match result {
+        Ok(_) => panic!("expected a unique violation on the secondary index"),
+        Err(err) => err,
+    };
+    assert!(err.message.contains("C=23505") || err.message.contains("unique"));
+}
+
+#[tokio::test]
 async fn e2e_returning_over_extended_protocol() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

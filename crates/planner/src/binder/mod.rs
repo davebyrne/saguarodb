@@ -23,6 +23,12 @@ struct Binding {
     visible_name: String,
     columns: Vec<ColumnDef>,
     slot_start: usize,
+    /// When true, this binding participates in column resolution ONLY for a
+    /// reference qualified with its `visible_name` (an unqualified column never
+    /// resolves to it). Used for the `excluded` pseudo-table in `INSERT ... ON
+    /// CONFLICT DO UPDATE`, so a bare column there resolves to the target row
+    /// (matching PostgreSQL) instead of being ambiguous with `excluded`.
+    qualified_only: bool,
 }
 
 struct BindContext<'a> {
@@ -134,12 +140,14 @@ fn bind_inner(
             table,
             columns,
             source,
+            on_conflict,
             returning,
         } => bind_insert(
             catalog,
             table,
             columns,
             source,
+            on_conflict.as_ref(),
             returning.as_deref(),
             declared,
         ),

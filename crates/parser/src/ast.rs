@@ -23,9 +23,12 @@ pub enum Statement {
         table: String,
         columns: Vec<String>,
         source: InsertSource,
+        /// `INSERT ... ON CONFLICT ...`. `None` when absent. The arbiter is the
+        /// primary key (validated by the binder); see [`OnConflict`].
+        on_conflict: Option<OnConflict>,
         /// `INSERT ... RETURNING <items>`. `None` when no `RETURNING` clause is
         /// present; `Some(items)` carries the projection list (expressions, `*`,
-        /// or `table.*`) evaluated over each inserted row.
+        /// or `table.*`) evaluated over each inserted (or upserted) row.
         returning: Option<Vec<SelectItem>>,
     },
     Select(SelectStatement),
@@ -114,6 +117,34 @@ pub enum Statement {
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     Query(Box<SelectStatement>),
+}
+
+/// `ON CONFLICT [target] DO NOTHING | DO UPDATE SET ... [WHERE ...]`. `target`
+/// names the arbiter columns (only the primary key is supported, validated by the
+/// binder); `None` is allowed for `DO NOTHING` (any conflict) but the binder still
+/// treats the primary key as the arbiter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnConflict {
+    pub target: Option<ConflictTarget>,
+    pub action: ConflictAction,
+}
+
+/// The conflict arbiter. Only an explicit column list is parsed (`ON CONSTRAINT`
+/// is rejected); the binder requires it to be the primary-key column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictTarget {
+    Columns(Vec<String>),
+}
+
+/// The action taken on a conflict. `DoUpdate` assignments and `WHERE` may
+/// reference the special `excluded` pseudo-table (the row proposed for insertion).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

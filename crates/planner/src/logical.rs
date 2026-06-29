@@ -1,8 +1,8 @@
 use common::{ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, TableId};
 
 use crate::{
-    AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOrderByItem,
-    BoundReturning, BoundSelect, BoundStatement, JoinType,
+    AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
+    BoundOrderByItem, BoundReturning, BoundSelect, BoundStatement, JoinType,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +28,7 @@ pub enum LogicalPlan {
         table: TableId,
         columns: Vec<ColumnId>,
         source: Box<LogicalPlan>,
+        on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
     },
     Update {
@@ -121,6 +122,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             table,
             columns,
             source,
+            on_conflict,
             returning,
         } => {
             let source = match source {
@@ -137,6 +139,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 table: *table,
                 columns: columns.clone(),
                 source: Box::new(source),
+                on_conflict: on_conflict.clone(),
                 returning: returning.clone(),
             })
         }

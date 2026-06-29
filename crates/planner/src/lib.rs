@@ -9,8 +9,8 @@ mod simplify;
 
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
-    BoundDistinct, BoundFrom, BoundInsertSource, BoundReturning, BoundSelect, BoundSelectItem,
-    BoundStatement,
+    BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect,
+    BoundSelectItem, BoundStatement,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -234,6 +234,89 @@ mod tests {
         let stmt = parse("insert into users (id) values (1) returning missing").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn binder_binds_on_conflict() {
+        let catalog = catalog_with_users();
+
+        // ON CONFLICT DO NOTHING binds to BoundOnConflict::DoNothing.
+        let stmt =
+            parse("insert into users (id, name) values (1, 'Ada') on conflict do nothing").unwrap();
+        let BoundStatement::Insert {
+            on_conflict: Some(BoundOnConflict::DoNothing),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected insert with DO NOTHING");
+        };
+
+        // ON CONFLICT (id) DO UPDATE SET name = excluded.name binds an assignment
+        // whose value references the excluded (proposed) row at slot n+1.
+        let stmt = parse(
+            "insert into users (id, name) values (1, 'Ada') \
+             on conflict (id) do update set name = excluded.name",
+        )
+        .unwrap();
+        let BoundStatement::Insert {
+            on_conflict: Some(BoundOnConflict::DoUpdate { assignments, .. }),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected insert with DO UPDATE");
+        };
+        assert_eq!(assignments.len(), 1);
+        // users = (id slot 0, name slot 1); excluded.name is slot 2+1 = 3.
+        assert!(matches!(
+            assignments[0],
+            (1, BoundExpr::InputRef { slot: 3, .. })
+        ));
+
+        // A bare column in DO UPDATE resolves to the target row (slot 1), not
+        // ambiguously to excluded.
+        let stmt = parse(
+            "insert into users (id, name) values (1, 'Ada') \
+             on conflict (id) do update set name = name",
+        )
+        .unwrap();
+        let BoundStatement::Insert {
+            on_conflict: Some(BoundOnConflict::DoUpdate { assignments, .. }),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected DO UPDATE");
+        };
+        assert!(matches!(
+            assignments[0],
+            (1, BoundExpr::InputRef { slot: 1, .. })
+        ));
+
+        // A non-primary-key arbiter is rejected (only the PK is supported).
+        let stmt = parse(
+            "insert into users (id, name) values (1, 'Ada') \
+             on conflict (name) do update set name = excluded.name",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        // DO UPDATE requires a conflict target.
+        let stmt = parse(
+            "insert into users (id, name) values (1, 'Ada') \
+             on conflict do update set name = excluded.name",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        // The primary key cannot be assigned in DO UPDATE.
+        let stmt = parse(
+            "insert into users (id, name) values (1, 'Ada') \
+             on conflict (id) do update set id = excluded.id",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 
     #[test]

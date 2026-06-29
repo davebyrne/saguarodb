@@ -2,8 +2,9 @@ mod ast;
 mod convert;
 
 pub use ast::{
-    Assignment, BinOp, Distinct, Expr, FromItem, FunctionArg, InsertSource, JoinType, OrderByItem,
-    SelectItem, SelectStatement, Statement, UnaryOp,
+    Assignment, BinOp, ConflictAction, ConflictTarget, Distinct, Expr, FromItem, FunctionArg,
+    InsertSource, JoinType, OnConflict, OrderByItem, SelectItem, SelectStatement, Statement,
+    UnaryOp,
 };
 
 use common::Result;
@@ -336,6 +337,57 @@ mod tests {
             panic!("expected insert");
         };
         assert!(returning.is_none());
+    }
+
+    #[test]
+    fn parses_on_conflict_clause() {
+        use crate::{ConflictAction, ConflictTarget};
+
+        // ON CONFLICT DO NOTHING with no target.
+        let Statement::Insert { on_conflict, .. } =
+            parse("insert into t (id) values (1) on conflict do nothing").unwrap()
+        else {
+            panic!("expected insert");
+        };
+        let on_conflict = on_conflict.expect("on_conflict present");
+        assert!(on_conflict.target.is_none());
+        assert!(matches!(on_conflict.action, ConflictAction::DoNothing));
+
+        // ON CONFLICT (id) DO UPDATE SET ... WHERE, with an excluded reference.
+        let Statement::Insert { on_conflict, .. } = parse(
+            "insert into t (id, n) values (1, 'a') on conflict (id) \
+             do update set n = excluded.n where t.n <> excluded.n",
+        )
+        .unwrap() else {
+            panic!("expected insert");
+        };
+        let on_conflict = on_conflict.expect("on_conflict present");
+        assert!(matches!(
+            on_conflict.target,
+            Some(ConflictTarget::Columns(ref cols)) if cols == &["id".to_string()]
+        ));
+        let ConflictAction::DoUpdate {
+            assignments,
+            filter,
+        } = on_conflict.action
+        else {
+            panic!("expected DO UPDATE");
+        };
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].column, "n");
+        assert!(filter.is_some());
+
+        // ON CONSTRAINT is rejected as unsupported (no named constraints).
+        let err = parse("insert into t (id) values (1) on conflict on constraint t_pk do nothing")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        // No ON CONFLICT clause leaves the field None.
+        let Statement::Insert { on_conflict, .. } = parse("insert into t (id) values (1)").unwrap()
+        else {
+            panic!("expected insert");
+        };
+        assert!(on_conflict.is_none());
     }
 
     #[test]

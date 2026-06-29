@@ -175,6 +175,7 @@ pub(super) fn bind_table_from_schema(
         visible_name: alias.clone().unwrap_or_else(|| table.name.clone()),
         columns: table.columns.clone(),
         slot_start,
+        qualified_only: false,
     });
     BoundFrom::Table {
         table: table.id,
@@ -233,6 +234,7 @@ fn bind_derived_table(
         visible_name: alias.to_string(),
         columns: columns.clone(),
         slot_start,
+        qualified_only: false,
     });
 
     Ok(BoundFrom::Derived {
@@ -241,6 +243,29 @@ fn bind_derived_table(
         alias: alias.to_string(),
         schema: columns,
     })
+}
+
+/// Register the `excluded` pseudo-table binding for `INSERT ... ON CONFLICT DO
+/// UPDATE`: the row proposed for insertion, addressed as `excluded.<col>`. Its
+/// columns are the target table's, in the same slot order, but offset by the
+/// current `next_slot` so they sit after the target row. It is `qualified_only`,
+/// so a bare column resolves to the target row, not `excluded`. Returns the
+/// binding's `slot_start` (the offset of the proposed row in the combined tuple).
+pub(super) fn bind_excluded_binding(ctx: &mut BindContext, table: &TableSchema) -> usize {
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += table.columns.len();
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: Some(table.id),
+        table_name: "excluded".to_string(),
+        visible_name: "excluded".to_string(),
+        columns: table.columns.clone(),
+        slot_start,
+        qualified_only: true,
+    });
+    slot_start
 }
 
 /// Build the result-set column metadata for a bound projection list, deriving

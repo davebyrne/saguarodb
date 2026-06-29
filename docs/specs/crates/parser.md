@@ -27,7 +27,7 @@ pub enum Statement {
     DropTable { name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
-    Insert { table: String, columns: Vec<String>, source: InsertSource, returning: Option<Vec<SelectItem>> },
+    Insert { table: String, columns: Vec<String>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectItem>> },
     Select(SelectStatement),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
@@ -205,6 +205,7 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `CREATE [UNIQUE] INDEX name ON table (col, ...)`. The index name is required (SaguaroDB does not generate one). Index columns must be plain ascending column names; expressions, operator classes, `USING <method>`, partial `WHERE`, `INCLUDE`, `NULLS [NOT] DISTINCT`, `CONCURRENTLY`, and `IF NOT EXISTS` are rejected as unsupported.
 - `DROP INDEX name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
+- `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
 - `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
 - Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. The inner `SELECT` is converted with the same query rules; cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
 - Derived tables: `(SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived`. The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases and `LATERAL` are rejected).

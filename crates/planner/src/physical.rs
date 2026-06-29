@@ -6,7 +6,8 @@ use common::{
 };
 
 use crate::{
-    AggregateExpr, BinOp, BoundExpr, BoundOrderByItem, BoundReturning, JoinType, LogicalPlan,
+    AggregateExpr, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning, JoinType,
+    LogicalPlan,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub enum PhysicalPlan {
         table: TableId,
         columns: Vec<ColumnId>,
         source: Box<PhysicalPlan>,
+        on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
     },
     Update {
@@ -139,11 +141,13 @@ pub fn physical_plan(
             table,
             columns,
             source,
+            on_conflict,
             returning,
         } => Ok(PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(physical_plan(source, catalog)?),
+            on_conflict: on_conflict.clone(),
             returning: returning.clone(),
         }),
         LogicalPlan::Update {

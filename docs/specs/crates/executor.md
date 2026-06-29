@@ -154,6 +154,8 @@ Aggregate execution groups input rows by the `GROUP BY` expressions into ordered
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.
 
+`INSERT ... ON CONFLICT` (arbiter = primary key): for each source row, build the full insert row, then probe the visible row at the proposed primary key with `StorageEngine::get` (snapshot visibility, so the statement's own earlier inserts are seen — a duplicate key within one multi-row INSERT is caught). On a conflict: `DO NOTHING` skips the row (not counted, no `RETURNING` row); `DO UPDATE` evaluates the assignment values and optional `WHERE` over the combined `existing ++ proposed` row (`excluded.<col>` is the proposed row), and — when the `WHERE` passes — writes the new row via `StorageEngine::update` (counted toward `INSERT 0 n`, and projected by `RETURNING`). With no conflict the row is inserted normally. The arbiter is the primary key only: a conflict on a unique **secondary** index is not arbitrated here and surfaces as a `UniqueViolation` (`23505`) from `insert`, aborting the statement.
+
 `UPDATE`:
 
 - Build source executor.

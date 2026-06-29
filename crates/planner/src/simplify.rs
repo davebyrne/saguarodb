@@ -2,7 +2,27 @@ use std::cmp::Ordering;
 
 use common::{DataType, Value};
 
-use crate::{AggregateExpr, BinOp, BoundExpr, BoundOrderByItem, LogicalPlan, UnaryOp};
+use crate::{
+    AggregateExpr, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, LogicalPlan, UnaryOp,
+};
+
+/// Fold the expressions inside an `ON CONFLICT DO UPDATE` action (assignments and
+/// the optional `WHERE`); `DO NOTHING` carries no expressions.
+fn simplify_on_conflict(on_conflict: BoundOnConflict) -> BoundOnConflict {
+    match on_conflict {
+        BoundOnConflict::DoNothing => BoundOnConflict::DoNothing,
+        BoundOnConflict::DoUpdate {
+            assignments,
+            filter,
+        } => BoundOnConflict::DoUpdate {
+            assignments: assignments
+                .into_iter()
+                .map(|(column, expr)| (column, fold_expr(expr)))
+                .collect(),
+            filter: filter.map(fold_expr),
+        },
+    }
+}
 
 /// Result-preserving logical-plan rewrite: fold constant sub-expressions and
 /// simplify boolean operators in every embedded expression, then drop any
@@ -103,11 +123,13 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             table,
             columns,
             source,
+            on_conflict,
             returning,
         } => LogicalPlan::Insert {
             table,
             columns,
             source: Box::new(simplify_logical(*source)),
+            on_conflict: on_conflict.map(simplify_on_conflict),
             returning,
         },
         LogicalPlan::Update {

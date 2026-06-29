@@ -69,6 +69,9 @@ precedence.
   `FROM (SELECT ...) AS alias [(cols)]`), `UPDATE`, `DELETE`,
   `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (produces a result set
   over each affected row — new row for INSERT/UPDATE, old row for DELETE),
+  `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`
+  (upsert; the conflict arbiter is the primary key only — `excluded.<col>` is the
+  proposed row; `UPDATE ... FROM` and `DELETE ... USING` remain unsupported),
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped

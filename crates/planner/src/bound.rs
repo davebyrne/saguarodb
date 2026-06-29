@@ -27,6 +27,7 @@ pub enum BoundStatement {
         table: TableId,
         columns: Vec<ColumnId>,
         source: BoundInsertSource,
+        on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
     },
     Select(BoundSelect),
@@ -73,6 +74,20 @@ pub enum BoundInsertSource {
         output_schema: Vec<ColumnInfo>,
     },
     Query(Box<BoundSelect>),
+}
+
+/// A bound `INSERT ... ON CONFLICT` action. The arbiter is always the primary key
+/// (the binder validates the conflict target). For `DoUpdate`, the assignment
+/// value expressions and the optional `filter` are bound over a two-binding row —
+/// the existing target row in slots `0..n` and the proposed `excluded` row in
+/// slots `n..2n` — so the executor evaluates them over `existing ++ excluded`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundOnConflict {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<(ColumnId, BoundExpr)>,
+        filter: Option<BoundExpr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

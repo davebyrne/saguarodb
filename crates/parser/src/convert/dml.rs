@@ -1,11 +1,11 @@
 use common::{CopyDirection, CopyFormat, CopyOptions, Result};
 use sqlparser::ast as sql;
 
-use crate::{InsertSource, Statement};
+use crate::{ConflictAction, ConflictTarget, InsertSource, OnConflict, Statement};
 
 use super::expr::convert_expr;
 use super::query::{
-    convert_query_to_select, convert_returning, query_has_modifiers,
+    convert_assignment, convert_query_to_select, convert_returning, query_has_modifiers,
     table_name_from_table_with_joins,
 };
 use super::{feature_not_supported, ident_name, object_name, parse_error, unsupported};
@@ -41,7 +41,6 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
         || partitioned.is_some()
         || !after_columns.is_empty()
         || has_table_keyword
-        || on.is_some()
         || replace_into
         || priority.is_some()
         || insert_alias.is_some()
@@ -50,6 +49,7 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
     {
         return unsupported("unsupported INSERT form");
     }
+    let on_conflict = convert_on_insert(on)?;
 
     let sql::TableObject::TableName(table) = table else {
         return unsupported("unsupported INSERT target");
@@ -76,8 +76,48 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
         table: object_name(&table)?,
         columns: columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
         source,
+        on_conflict,
         returning: convert_returning(&returning)?,
     })
+}
+
+/// Convert the `ON CONFLICT` clause of an INSERT. MySQL's `ON DUPLICATE KEY
+/// UPDATE` and `ON CONSTRAINT <name>` arbiters are rejected; the supported form is
+/// `ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`.
+fn convert_on_insert(on: Option<sql::OnInsert>) -> Result<Option<OnConflict>> {
+    let Some(on) = on else {
+        return Ok(None);
+    };
+    let sql::OnInsert::OnConflict(conflict) = on else {
+        return unsupported("ON DUPLICATE KEY UPDATE is not supported; use ON CONFLICT");
+    };
+
+    let target = match conflict.conflict_target {
+        None => None,
+        Some(sql::ConflictTarget::Columns(columns)) => Some(ConflictTarget::Columns(
+            columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
+        )),
+        Some(sql::ConflictTarget::OnConstraint(_)) => {
+            return feature_not_supported("ON CONFLICT ON CONSTRAINT is not supported");
+        }
+    };
+
+    let action = match conflict.action {
+        sql::OnConflictAction::DoNothing => ConflictAction::DoNothing,
+        sql::OnConflictAction::DoUpdate(do_update) => ConflictAction::DoUpdate {
+            assignments: do_update
+                .assignments
+                .into_iter()
+                .map(convert_assignment)
+                .collect::<Result<Vec<_>>>()?,
+            filter: do_update
+                .selection
+                .map(|expr| convert_expr(&expr))
+                .transpose()?,
+        },
+    };
+
+    Ok(Some(OnConflict { target, action }))
 }
 
 pub(super) fn convert_copy(

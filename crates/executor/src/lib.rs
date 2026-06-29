@@ -343,6 +343,71 @@ mod tests {
     }
 
     #[test]
+    fn on_conflict_do_nothing_skips_within_statement_duplicate() {
+        // The conflict probe uses snapshot visibility including the statement's own
+        // earlier inserts, so a duplicate key within one multi-row INSERT is skipped.
+        let harness = ExecutorHarness::with_users();
+        let result = harness
+            .execute(
+                "insert into users (id, name) values (5, 'a'), (5, 'b'), (6, 'c') \
+                 on conflict (id) do nothing",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            ExecutionResult::Modified {
+                command: "INSERT".to_string(),
+                count: 2
+            }
+        );
+        let rows = harness
+            .select_rows("select id, name from users order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(5), Value::Text("a".to_string())]
+                },
+                Row {
+                    values: vec![Value::Integer(6), Value::Text("c".to_string())]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn on_conflict_do_update_upserts_existing_row() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        // The conflicting row is updated to excluded.name; the count is 1 (the upsert).
+        let result = harness
+            .execute(
+                "insert into users (id, name) values (1, 'Lovelace') \
+                 on conflict (id) do update set name = excluded.name",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            ExecutionResult::Modified {
+                command: "INSERT".to_string(),
+                count: 1
+            }
+        );
+        let rows = harness
+            .select_rows("select id, name from users order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1), Value::Text("Lovelace".to_string())]
+            }]
+        );
+    }
+
+    #[test]
     fn insert_rejects_runtime_value_type_mismatch() {
         let catalog = MemoryCatalog::empty();
         let schema = catalog
@@ -381,6 +446,7 @@ mod tests {
         let plan = PhysicalPlan::Insert {
             table: schema.id,
             columns: vec![0, 1],
+            on_conflict: None,
             returning: None,
             source: Box::new(PhysicalPlan::Values {
                 rows: vec![vec![

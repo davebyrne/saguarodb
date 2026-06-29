@@ -5,14 +5,21 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError, Result,
     SqlState, TableSchema,
 };
-use parser::{Assignment, Expr, InsertSource, SelectItem, SelectStatement};
+use parser::{
+    Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, SelectItem,
+    SelectStatement,
+};
 
 use crate::{
-    BoundExpr, BoundInsertSource, BoundReturning, BoundSelect, BoundSelectItem, BoundStatement,
+    BoundExpr, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect, BoundSelectItem,
+    BoundStatement,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
-use super::query::{bind_select, bind_select_item, bind_table_from_schema, select_output_schema};
+use super::query::{
+    bind_excluded_binding, bind_select, bind_select_item, bind_table_from_schema,
+    select_output_schema,
+};
 use super::{
     BindContext, Binding, input_ref, plan_error, reject_aggregate, require_table, require_type,
 };
@@ -45,6 +52,7 @@ pub(super) fn bind_insert(
     table_name: &str,
     column_names: &[String],
     source: &InsertSource,
+    on_conflict: Option<&OnConflict>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
@@ -61,13 +69,131 @@ pub(super) fn bind_insert(
         }
     };
 
-    let returning = bind_returning(&table, returning, declared)?;
+    let on_conflict = bind_on_conflict(catalog, &table, on_conflict, declared)?;
+    let returning = bind_returning(catalog, &table, returning, declared)?;
 
     Ok(BoundStatement::Insert {
         table: table.id,
         columns,
         source,
+        on_conflict,
         returning,
+    })
+}
+
+/// Bind an `ON CONFLICT` clause. The arbiter is always the primary key: an
+/// explicit conflict target must name exactly the primary-key column(s), and
+/// `DO UPDATE` requires a target (PostgreSQL does too). `DO UPDATE` assignments
+/// and `WHERE` bind over `target ++ excluded` (see [`bind_do_update`]).
+fn bind_on_conflict(
+    catalog: &dyn CatalogManager,
+    table: &TableSchema,
+    on_conflict: Option<&OnConflict>,
+    declared: &[Option<DataType>],
+) -> Result<Option<BoundOnConflict>> {
+    let Some(on_conflict) = on_conflict else {
+        return Ok(None);
+    };
+    let requires_target = matches!(on_conflict.action, ConflictAction::DoUpdate { .. });
+    validate_conflict_target(table, on_conflict.target.as_ref(), requires_target)?;
+
+    let action = match &on_conflict.action {
+        ConflictAction::DoNothing => BoundOnConflict::DoNothing,
+        ConflictAction::DoUpdate {
+            assignments,
+            filter,
+        } => bind_do_update(catalog, table, assignments, filter.as_ref(), declared)?,
+    };
+    Ok(Some(action))
+}
+
+/// Validate the `ON CONFLICT` arbiter. SaguaroDB arbitrates only on the primary
+/// key, so an explicit target must name exactly the primary-key column(s); any
+/// other column list (a secondary unique index) is rejected with
+/// `FeatureNotSupported`. A missing target is allowed for `DO NOTHING` but
+/// rejected for `DO UPDATE`.
+fn validate_conflict_target(
+    table: &TableSchema,
+    target: Option<&ConflictTarget>,
+    requires_target: bool,
+) -> Result<()> {
+    let Some(ConflictTarget::Columns(columns)) = target else {
+        if requires_target {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "ON CONFLICT DO UPDATE requires a conflict target (the primary key)",
+            ));
+        }
+        return Ok(());
+    };
+
+    // Each named column must exist; then the set must equal the primary key.
+    let mut named = Vec::with_capacity(columns.len());
+    for name in columns {
+        named.push(column_by_name(table, name)?.id);
+    }
+    named.sort_unstable();
+    let mut pk = table.primary_key.clone();
+    pk.sort_unstable();
+    if named != pk {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "ON CONFLICT arbiter must be the primary key; only the primary key is supported",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind an `ON CONFLICT ... DO UPDATE SET ... [WHERE ...]` action. Assignment
+/// value expressions and the optional `WHERE` are bound over two bindings: the
+/// existing target row (bare columns) and the proposed `excluded` row
+/// (`excluded.<col>`). The primary key cannot be assigned, and duplicate
+/// assignments are rejected — same as `UPDATE`.
+fn bind_do_update(
+    catalog: &dyn CatalogManager,
+    table: &TableSchema,
+    assignments: &[Assignment],
+    filter: Option<&Expr>,
+    declared: &[Option<DataType>],
+) -> Result<BoundOnConflict> {
+    let mut ctx = BindContext::new(catalog, declared);
+    // Target row first (slots 0..n; bare columns resolve here), then the
+    // qualified-only `excluded` row (slots n..2n).
+    bind_table_from_schema(&mut ctx, table.clone(), None);
+    bind_excluded_binding(&mut ctx, table);
+
+    let mut seen = HashSet::new();
+    let mut bound_assignments = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let column = column_by_name(table, &assignment.column)?;
+        if table.primary_key.contains(&column.id) {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!("cannot update primary key column {}", column.name),
+            ));
+        }
+        if !seen.insert(column.id) {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!("duplicate assignment for column {}", column.name),
+            ));
+        }
+        let value = bind_expr(&mut ctx, &assignment.value, Some(column.data_type.clone()))?;
+        reject_aggregate(&value)?;
+        validate_assignable(&value, column)?;
+        bound_assignments.push((column.id, value));
+    }
+
+    let filter = filter
+        .map(|expr| bind_boolean_expr(&mut ctx, expr))
+        .transpose()?;
+    if let Some(filter) = &filter {
+        reject_aggregate(filter)?;
+    }
+
+    Ok(BoundOnConflict::DoUpdate {
+        assignments: bound_assignments,
+        filter,
     })
 }
 
@@ -77,6 +203,7 @@ pub(super) fn bind_insert(
 /// NEW row or the deleted OLD row). Aggregates are rejected (PostgreSQL does not
 /// allow them in `RETURNING`).
 fn bind_returning(
+    catalog: &dyn CatalogManager,
     table: &TableSchema,
     items: Option<&[SelectItem]>,
     declared: &[Option<DataType>],
@@ -84,7 +211,7 @@ fn bind_returning(
     let Some(items) = items else {
         return Ok(None);
     };
-    let mut ctx = BindContext::new(declared);
+    let mut ctx = BindContext::new(catalog, declared);
     bind_table_from_schema(&mut ctx, table.clone(), None);
     let mut bound_items = Vec::new();
     for item in items {
@@ -176,7 +303,7 @@ pub(super) fn bind_update(
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let returning = bind_returning(&table, returning, declared)?;
+    let returning = bind_returning(catalog, &table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter
@@ -235,7 +362,7 @@ pub(super) fn bind_delete(
     declared: &[Option<DataType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
-    let returning = bind_returning(&table, returning, declared)?;
+    let returning = bind_returning(catalog, &table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
     let source_filter = filter

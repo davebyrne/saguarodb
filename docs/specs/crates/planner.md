@@ -64,6 +64,7 @@ Binder responsibilities:
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column.
+- Bind `ON CONFLICT` (`bind_on_conflict`): the arbiter is **always the primary key**. An explicit conflict target must name exactly the primary-key column(s) — any other column list (a secondary unique index) is rejected with `FeatureNotSupported`; a missing target is allowed for `DO NOTHING` but rejected for `DO UPDATE`. `DO NOTHING` binds to `BoundOnConflict::DoNothing`. `DO UPDATE SET ... [WHERE ...]` binds over **two** bindings — the target table (slots `0..n`, bare columns resolve here) and a `qualified_only` `excluded` pseudo-table (slots `n..2n`, only `excluded.<col>` resolves) — so a bare column means the existing row and `excluded.<col>` the proposed row (matching PostgreSQL, no ambiguity). The primary key cannot be assigned and duplicate assignments are rejected, as in `UPDATE`.
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
 - Validate aggregate usage and `GROUP BY` rules.
@@ -76,7 +77,7 @@ pub enum BoundStatement {
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, returning: Option<BoundReturning> },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Select(BoundSelect),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
     Delete { table: TableId, source: BoundSelect, returning: Option<BoundReturning> },
@@ -95,6 +96,14 @@ pub enum BoundInsertSource {
 // A bound RETURNING clause: the projection expressions evaluated over each
 // affected full row, and the result-set column metadata (the RowDescription).
 pub struct BoundReturning { exprs: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> }
+
+// A bound ON CONFLICT action (arbiter = primary key). DoUpdate's assignment value
+// expressions and the optional filter are bound over `target ++ excluded` — the
+// existing row in slots 0..n and the proposed row in slots n..2n.
+pub enum BoundOnConflict {
+    DoNothing,
+    DoUpdate { assignments: Vec<(ColumnId, BoundExpr)>, filter: Option<BoundExpr> },
+}
 
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,  // All | On(keys)

@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, ParsedColumnDef,
+    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key, ParsedColumnDef,
     Result, Row, SqlState, StatementContext, TableId, TableSchema, Value,
 };
-use planner::{BoundReturning, PhysicalPlan};
+use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -91,8 +91,16 @@ impl QueryEngine {
                 table,
                 columns,
                 source,
+                on_conflict,
                 returning,
-            } => execute_insert(ctx, *table, columns, source, returning.as_ref()),
+            } => execute_insert(
+                ctx,
+                *table,
+                columns,
+                source,
+                on_conflict.as_ref(),
+                returning.as_ref(),
+            ),
             PhysicalPlan::Update {
                 table,
                 assignments,
@@ -243,6 +251,7 @@ fn execute_insert(
     table: TableId,
     columns: &[ColumnId],
     source: &PhysicalPlan,
+    on_conflict: Option<&BoundOnConflict>,
     returning: Option<&BoundReturning>,
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
@@ -264,6 +273,40 @@ fn execute_insert(
             ));
         }
         let row = build_insert_row(&schema, columns, source_row.row.values)?;
+
+        // ON CONFLICT: the arbiter is the primary key. Probe the visible row at the
+        // proposed primary key; on a conflict, take the action (skip for DO NOTHING,
+        // update the existing row for DO UPDATE) instead of inserting. The probe uses
+        // snapshot visibility (including this statement's own earlier inserts), so a
+        // duplicate key within the same statement is also caught.
+        if let Some(on_conflict) = on_conflict {
+            let key = primary_key_for_row(&schema, &row.values)?;
+            if let Some(existing) = ctx.storage.get(&ctx.statement, table, &key)? {
+                if let BoundOnConflict::DoUpdate {
+                    assignments,
+                    filter,
+                } = on_conflict
+                    && let Some(updated) = apply_conflict_update(
+                        ctx,
+                        table,
+                        &schema,
+                        &key,
+                        &existing,
+                        &row,
+                        assignments,
+                        filter.as_ref(),
+                    )?
+                {
+                    count += 1;
+                    if let Some(returning) = returning {
+                        returned.push(eval_returning(returning, &updated)?);
+                    }
+                }
+                // DO NOTHING (or a DO UPDATE skipped by its WHERE) inserts no row.
+                continue;
+            }
+        }
+
         if let Some(returning) = returning {
             returned.push(eval_returning(returning, &row.values)?);
         }
@@ -272,6 +315,67 @@ fn execute_insert(
     }
 
     Ok(modified_result("INSERT", count, returning, returned))
+}
+
+/// Build the primary-key [`Key`] for a full table row (catalog slot order),
+/// matching the storage engine's `key_for_row` ordering (primary-key column
+/// order). Used by `INSERT ... ON CONFLICT` to probe the arbiter (the PK).
+fn primary_key_for_row(schema: &TableSchema, values: &[Value]) -> Result<Key> {
+    let mut key = Vec::with_capacity(schema.primary_key.len());
+    for column in &schema.primary_key {
+        let slot = column_slot(schema, *column)?;
+        key.push(values[slot].clone());
+    }
+    Ok(Key(key))
+}
+
+/// Apply an `ON CONFLICT ... DO UPDATE` to the conflicting `existing` row. The
+/// assignment values and optional `WHERE` evaluate over the combined
+/// `existing ++ proposed` row (so bare columns are the existing row and
+/// `excluded.<col>` is the proposed insert). Returns the new full row when the
+/// row was updated, or `None` when the `WHERE` excluded it (or the visible row
+/// vanished before the update).
+#[allow(clippy::too_many_arguments)]
+fn apply_conflict_update(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    schema: &TableSchema,
+    key: &Key,
+    existing: &Row,
+    proposed: &Row,
+    assignments: &[(ColumnId, BoundExpr)],
+    filter: Option<&BoundExpr>,
+) -> Result<Option<Vec<Value>>> {
+    let mut combined = existing.values.clone();
+    combined.extend(proposed.values.iter().cloned());
+    let combined_row = ExecRow {
+        row: Row { values: combined },
+        identity: None,
+    };
+
+    if let Some(filter) = filter
+        && !matches!(eval_expr(filter, &combined_row)?, Value::Boolean(true))
+    {
+        // The DO UPDATE WHERE did not pass (false or NULL): no insert, no update.
+        return Ok(None);
+    }
+
+    let mut new_values = existing.values.clone();
+    for (column, expr) in assignments {
+        let slot = column_slot(schema, *column)?;
+        new_values[slot] = eval_expr(expr, &combined_row)?;
+    }
+    coerce_numeric_columns(schema, &mut new_values)?;
+    validate_row_constraints(schema, &new_values)?;
+    let updated = new_values.clone();
+    if ctx
+        .storage
+        .update(&ctx.statement, table, key, Row { values: new_values })?
+    {
+        Ok(Some(updated))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Map a row's `columns`-ordered values onto a full table row (NULL for omitted

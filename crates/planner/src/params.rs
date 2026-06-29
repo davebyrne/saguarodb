@@ -4,7 +4,7 @@
 
 use common::{DataType, DbError, Result, SqlState, Value};
 
-use crate::bound::{BoundFrom, BoundInsertSource, BoundReturning};
+use crate::bound::{BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning};
 use crate::{BoundExpr, BoundSelect, BoundStatement};
 
 /// Resolve the parameter types for a bound statement, indexed by 0-based
@@ -54,7 +54,10 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         | BoundStatement::DropIndex { .. }
         | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert {
-            source, returning, ..
+            source,
+            on_conflict,
+            returning,
+            ..
         } => {
             match source {
                 BoundInsertSource::Values { rows, .. } => {
@@ -66,6 +69,7 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
                 }
                 BoundInsertSource::Query(select) => collect_select(select, used)?,
             }
+            collect_on_conflict(on_conflict, used)?;
             collect_returning(returning, used)
         }
         BoundStatement::Select(select) => collect_select(select, used),
@@ -89,6 +93,25 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         }
         BoundStatement::Explain(inner) => collect_statement(inner, used),
     }
+}
+
+fn collect_on_conflict(
+    on_conflict: &Option<BoundOnConflict>,
+    used: &mut Vec<Option<DataType>>,
+) -> Result<()> {
+    if let Some(BoundOnConflict::DoUpdate {
+        assignments,
+        filter,
+    }) = on_conflict
+    {
+        for (_, expr) in assignments {
+            collect_expr(expr, used)?;
+        }
+        if let Some(filter) = filter {
+            collect_expr(filter, used)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_returning(
@@ -207,7 +230,10 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         | BoundStatement::DropIndex { .. }
         | BoundStatement::Copy { .. } => Ok(()),
         BoundStatement::Insert {
-            source, returning, ..
+            source,
+            on_conflict,
+            returning,
+            ..
         } => {
             match source {
                 BoundInsertSource::Values { rows, .. } => {
@@ -219,6 +245,7 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
                 }
                 BoundInsertSource::Query(select) => substitute_select(select, params)?,
             }
+            substitute_on_conflict(on_conflict, params)?;
             substitute_returning(returning, params)
         }
         BoundStatement::Select(select) => substitute_select(select, params),
@@ -242,6 +269,25 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
         }
         BoundStatement::Explain(inner) => substitute_statement(inner, params),
     }
+}
+
+fn substitute_on_conflict(
+    on_conflict: &mut Option<BoundOnConflict>,
+    params: &[Value],
+) -> Result<()> {
+    if let Some(BoundOnConflict::DoUpdate {
+        assignments,
+        filter,
+    }) = on_conflict
+    {
+        for (_, expr) in assignments {
+            substitute_expr(expr, params)?;
+        }
+        if let Some(filter) = filter {
+            substitute_expr(filter, params)?;
+        }
+    }
+    Ok(())
 }
 
 fn substitute_returning(returning: &mut Option<BoundReturning>, params: &[Value]) -> Result<()> {
