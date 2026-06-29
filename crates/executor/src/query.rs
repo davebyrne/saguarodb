@@ -305,6 +305,14 @@ fn execute_insert(
         // duplicate key within the same statement is also caught.
         if let Some(on_conflict) = on_conflict {
             let key = primary_key_for_row(&schema, &row.values)?;
+            // SSI: the ON CONFLICT arbiter probe is a tuple read of `key` — record a
+            // SIREAD lock (even when no row matches, so a later insert of `key` is
+            // caught as a phantom, `docs/specs/ssi.md` §5.1). The IndexScan exact-key
+            // arm records this for ordinary point reads; this probe bypasses
+            // `build_executor`, so it must record here. No-op for non-SERIALIZABLE.
+            ctx.statement
+                .ssi_tracker
+                .record_tuple_read(ctx.statement.txn_id, table, &key);
             if let Some(existing) = ctx.storage.get(&ctx.statement, table, &key)? {
                 if let BoundOnConflict::DoUpdate {
                     assignments,

@@ -1,6 +1,6 @@
 # Serializable Snapshot Isolation (SSI)
 
-**Status:** Design (approved); implementation pending.
+**Status:** Implemented on `feat/serializable-ssi` (see §12 for the milestones).
 
 This document specifies SaguaroDB's `SERIALIZABLE` isolation level, implemented as
 Serializable Snapshot Isolation (SSI) layered on the existing snapshot-isolation
@@ -129,12 +129,21 @@ the same code already used for a committed-write conflict (`docs/specs/mvcc.md` 
 ### 5.1 What is recorded, and where
 
 SIREAD locks are recorded at the **executor's scan operators**, which know the access
-method (so they distinguish a point lookup from a scan) and run for `SELECT`, for the
-`WHERE`-scan of `UPDATE`/`DELETE`, and for `COPY ... TO`:
+method (so they distinguish a point lookup from a scan) and run for `SELECT` and the
+`WHERE`-scan of `UPDATE`/`DELETE`:
 
 - **`IndexScan` with an exact key** → `record_tuple_read(table, key)`. Recorded **even
   when no row matches**, so a later `INSERT` of that key is caught as a phantom.
 - **`SeqScan`, or `IndexScan` over a range** → `record_relation_read(table)`.
+
+Two reads do **not** flow through the scan operators and so record their SIREAD lock at
+their own site (a missed read here is a silent serializability hole):
+
+- **`COPY ... TO`** scans the whole relation → `record_relation_read(table)` in
+  `CopyOut::new`.
+- **The `INSERT ... ON CONFLICT` primary-key arbiter probe** is a point read of the
+  proposed key → `record_tuple_read(table, key)` (recorded even when the key is absent,
+  for phantom protection), right before the probe `get`.
 
 Recording at the scan operator (rather than in the storage `is_visible` path) is both
 cleaner — one site per access method — and correct for the chosen granularity: the
