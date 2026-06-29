@@ -220,6 +220,7 @@ fn bind_derived_table(
             data_type: item.expr.data_type(),
             nullable: item.expr.nullable(),
             max_length: None,
+            default: None,
         })
         .collect();
 
