@@ -231,6 +231,7 @@ fn oid_to_data_type(oid: i32) -> Result<Option<DataType>> {
         701 => Ok(Some(DataType::Double)),
         700 => Ok(Some(DataType::Real)),
         1083 => Ok(Some(DataType::Time)),
+        1184 => Ok(Some(DataType::TimestampTz)),
         1700 => Ok(Some(DataType::Numeric {
             precision: None,
             scale: 0,

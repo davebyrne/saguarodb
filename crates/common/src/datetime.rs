@@ -120,6 +120,67 @@ pub fn parse_time(text: &str) -> Option<i64> {
     parse_time_of_day(text.trim())
 }
 
+/// Parse a `TIMESTAMP WITH TIME ZONE` literal into microseconds-from-epoch in
+/// UTC. Accepts `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` with an optional trailing
+/// timezone offset `[+-]HH[:MM]` (or `[+-]HHMM`); the offset is subtracted to
+/// normalize to UTC. With no offset the value is taken as UTC (there is no
+/// session time zone).
+pub fn parse_timestamptz(text: &str) -> Option<i64> {
+    let text = text.trim();
+    // Split off the time part (after a space or `T`); the date part itself uses
+    // `-` separators, so a tz-offset sign can only appear in the time part.
+    let (date_part, time_rest) = match text.find([' ', 'T']) {
+        Some(idx) => (&text[..idx], text[idx + 1..].trim()),
+        None => (text, ""),
+    };
+    let (time_str, offset_micros) = match time_rest.find(['+', '-']) {
+        Some(idx) => (&time_rest[..idx], parse_tz_offset(&time_rest[idx..])?),
+        None => (time_rest, 0),
+    };
+    let naive = if time_str.is_empty() {
+        parse_timestamp(date_part)?
+    } else {
+        parse_timestamp(&format!("{date_part} {time_str}"))?
+    };
+    // `naive` is the wall-clock at the given offset; UTC = wall-clock - offset.
+    naive.checked_sub(offset_micros)
+}
+
+/// Parse a timezone offset `[+-]HH[:MM]` / `[+-]HHMM` into signed microseconds
+/// east of UTC (e.g. `+05:30` -> +19_800_000_000). Range is `±18:00`.
+fn parse_tz_offset(text: &str) -> Option<i64> {
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' => (1_i64, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hh, mm) = match rest.split_once(':') {
+        Some((h, m)) => (h, m),
+        None if rest.len() <= 2 => (rest, "0"),
+        // `split_at_checked` returns `None` (rejecting) rather than panicking when
+        // byte 2 is not a UTF-8 char boundary (e.g. a multibyte `+€`).
+        None => rest.split_at_checked(2)?,
+    };
+    // Require digit-only fields so a stray sign (e.g. `++05`) is rejected rather
+    // than swallowed by `i64::from_str`'s leading-sign acceptance.
+    if hh.is_empty() || !hh.bytes().chain(mm.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i64 = hh.parse().ok()?;
+    let minutes: i64 = mm.parse().ok()?;
+    // PostgreSQL's offset range is ±18:00 inclusive.
+    if hours > 18 || (hours == 18 && minutes > 0) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3_600 + minutes * 60) * MICROS_PER_SEC)
+}
+
+/// Format microseconds-from-epoch (UTC) as `YYYY-MM-DD HH:MM:SS[.ffffff]+00`.
+/// Always rendered in UTC (there is no session time zone).
+pub fn format_timestamptz(micros: i64) -> String {
+    format!("{}+00", format_timestamp(micros))
+}
+
 /// Format microseconds-since-midnight as `HH:MM:SS[.ffffff]` (the fractional part
 /// is shown only when non-zero, with trailing zeros trimmed).
 pub fn format_time(micros_of_day: i64) -> String {
@@ -147,6 +208,48 @@ pub fn format_timestamp(micros: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamptz_normalizes_offset_to_utc() {
+        // +05 wall clock 12:00 -> 07:00 UTC.
+        assert_eq!(
+            parse_timestamptz("2024-01-01 12:00:00+05"),
+            parse_timestamp("2024-01-01 07:00:00")
+        );
+        // -08:30 wall clock 12:00 -> 20:30 UTC.
+        assert_eq!(
+            parse_timestamptz("2024-01-01 12:00:00-08:30"),
+            parse_timestamp("2024-01-01 20:30:00")
+        );
+        // HHMM offset form.
+        assert_eq!(
+            parse_timestamptz("2024-01-01 12:00:00+0530"),
+            parse_timestamp("2024-01-01 06:30:00")
+        );
+        // No offset -> taken as UTC; date-only -> midnight UTC.
+        assert_eq!(
+            parse_timestamptz("2024-01-01 12:00:00"),
+            parse_timestamp("2024-01-01 12:00:00")
+        );
+        assert_eq!(
+            parse_timestamptz("2024-01-01"),
+            parse_timestamp("2024-01-01")
+        );
+        // Always displays in UTC.
+        let micros = parse_timestamptz("2024-01-01 12:00:00+05").unwrap();
+        assert_eq!(format_timestamptz(micros), "2024-01-01 07:00:00+00");
+        // Out-of-range offset and garbage reject.
+        assert_eq!(parse_timestamptz("2024-01-01 12:00:00+19"), None);
+        assert_eq!(parse_timestamptz("2024-01-01 25:00:00+00"), None);
+        // ±18:00 boundary: +18:00 accepted, +18:30 rejected.
+        assert!(parse_timestamptz("2024-01-01 12:00:00+18:00").is_some());
+        assert_eq!(parse_timestamptz("2024-01-01 12:00:00+18:30"), None);
+        // A stray sign in the offset body is rejected, not swallowed.
+        assert_eq!(parse_timestamptz("2024-01-01 12:00:00++05"), None);
+        // A multibyte offset body is rejected, not a panic (no UTF-8 boundary at byte 2).
+        assert_eq!(parse_timestamptz("2024-01-01 12:00:00+€"), None);
+        assert_eq!(parse_timestamptz("2024-01-01 12:00:00+1é"), None);
+    }
 
     #[test]
     fn time_parse_format_round_trip() {

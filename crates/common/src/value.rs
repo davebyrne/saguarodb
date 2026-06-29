@@ -29,6 +29,9 @@ pub enum Value {
     /// `TIME` (without time zone), stored as microseconds since midnight
     /// (`0..86_400_000_000`). i64-backed.
     Time(i64),
+    /// `TIMESTAMP WITH TIME ZONE`, stored as microseconds from the Unix epoch in
+    /// UTC (input offsets are normalized to UTC; always displayed in UTC).
+    TimestampTz(i64),
     /// `BYTEA` — a raw byte string. `Vec<u8>` ordering/hashing are lexicographic.
     Bytes(Vec<u8>),
     /// `UUID`, stored as its 16 bytes. `[u8; 16]` ordering is the canonical

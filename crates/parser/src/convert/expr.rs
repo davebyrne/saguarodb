@@ -301,6 +301,11 @@ fn convert_typed_string(data_type: &sql::DataType, value: &sql::Value) -> Result
                 .map(|micros| Expr::Literal(Value::Time(micros)))
                 .ok_or_else(|| parse_error(format!("invalid time literal: \"{text}\"")))
         }
+        sql::DataType::Timestamp(None, sql::TimezoneInfo::WithTimeZone | sql::TimezoneInfo::Tz) => {
+            common::datetime::parse_timestamptz(text)
+                .map(|micros| Expr::Literal(Value::TimestampTz(micros)))
+                .ok_or_else(|| parse_error(format!("invalid timestamptz literal: \"{text}\"")))
+        }
         sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => {
             let parsed = common::numeric::parse_numeric(text)
                 .ok_or_else(|| parse_error(format!("invalid numeric literal: \"{text}\"")))?;

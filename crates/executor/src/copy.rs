@@ -153,6 +153,11 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Time => common::datetime::parse_time(text)
             .map(Value::Time)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for time: \"{text}\""))),
+        DataType::TimestampTz => common::datetime::parse_timestamptz(text)
+            .map(Value::TimestampTz)
+            .ok_or_else(|| {
+                invalid_value(format!("invalid input syntax for timestamptz: \"{text}\""))
+            }),
     }
 }
 
@@ -395,6 +400,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Numeric(value) => Some(common::numeric::format_numeric(value)),
         Value::Real(value) => Some(common::float::format_real(value.0)),
         Value::Time(micros) => Some(common::datetime::format_time(*micros)),
+        Value::TimestampTz(micros) => Some(common::datetime::format_timestamptz(*micros)),
     }
 }
 

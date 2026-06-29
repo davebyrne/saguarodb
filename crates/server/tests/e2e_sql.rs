@@ -947,17 +947,18 @@ async fn e2e_timestamp_type_round_trips_orders_and_casts() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("2".to_string())]]);
 
-    // WITH TIME ZONE is unsupported.
-    let err = server
+    // WITH TIME ZONE is a distinct type (TIMESTAMPTZ); a plain TIMESTAMP value
+    // is therefore NOT assignable to a `timestamp with time zone` column.
+    server
         .simple_query("create table tz (id integer primary key, at timestamp with time zone)")
         .await
+        .unwrap();
+    let err = server
+        .simple_query("insert into tz (id, at) values (1, TIMESTAMP '2024-02-29 12:30:45')")
+        .await
         .err()
-        .expect("TIMESTAMP WITH TIME ZONE should be rejected");
-    assert!(
-        err.message.to_lowercase().contains("data type"),
-        "got: {}",
-        err.message
-    );
+        .expect("a plain TIMESTAMP into a TIMESTAMPTZ column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
 }
 
 #[tokio::test]
@@ -1850,6 +1851,96 @@ async fn e2e_time_round_trips_orders_casts_and_indexes() {
         "got: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn e2e_timestamptz_normalizes_to_utc_orders_casts_and_indexes() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table e (id integer primary key, at timestamptz)")
+        .await
+        .unwrap();
+    // Same wall clock, different offsets -> different UTC instants.
+    for (id, lit) in [
+        (1, "2024-01-01 12:00:00+05"), // 07:00 UTC
+        (2, "2024-01-01 12:00:00-05"), // 17:00 UTC
+        (3, "2024-01-01 12:00:00"),    // 12:00 UTC (no offset)
+    ] {
+        server
+            .simple_query(&format!(
+                "insert into e (id, at) values ({id}, TIMESTAMPTZ '{lit}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Ordered by UTC instant; always displayed in UTC (+00).
+    let rows = server
+        .simple_query("select id, cast(at as text) from e order by at")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("2024-01-01 07:00:00+00".to_string())
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("2024-01-01 12:00:00+00".to_string())
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("2024-01-01 17:00:00+00".to_string())
+            ],
+        ]
+    );
+
+    // CAST TIMESTAMPTZ <-> TIMESTAMP reinterprets the same instant (UTC wall clock).
+    let rows = server
+        .simple_query(
+            "select cast(at as timestamp), cast(cast(TIMESTAMP '2024-06-01 09:00:00' as timestamptz) as text) from e where id = 1",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2024-01-01 07:00:00".to_string()),
+            Some("2024-06-01 09:00:00+00".to_string()),
+        ]]
+    );
+
+    // The `TIMESTAMP WITH TIME ZONE` spelling and a TIMESTAMPTZ primary key.
+    server
+        .simple_query("create table k (at timestamp with time zone primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into k (at, note) values (TIMESTAMPTZ '2024-01-01 00:00:00+00', 'a')")
+        .await
+        .unwrap();
+    let explain = server
+        .simple_query("explain select note from k where at = TIMESTAMPTZ '2024-01-01 00:00:00+00'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "TIMESTAMPTZ primary-key lookup should use an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+
+    // No implicit cast: a plain string into a TIMESTAMPTZ column.
+    let err = server
+        .simple_query("insert into e (id, at) values (9, '2024-01-01 00:00:00')")
+        .await
+        .err()
+        .expect("string into timestamptz column should be rejected");
+    assert!(err.message.contains("42804"), "got: {}", err.message);
 }
 
 #[tokio::test]

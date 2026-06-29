@@ -302,6 +302,10 @@ fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
             None,
             sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone,
         ) => Ok(DataType::Timestamp),
+        // TIMESTAMP WITH TIME ZONE / TIMESTAMPTZ (UTC-normalized), no precision.
+        sql::DataType::Timestamp(None, sql::TimezoneInfo::WithTimeZone | sql::TimezoneInfo::Tz) => {
+            Ok(DataType::TimestampTz)
+        }
         // TIME without time zone, no fractional-seconds precision.
         sql::DataType::Time(None, sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone) => {
             Ok(DataType::Time)

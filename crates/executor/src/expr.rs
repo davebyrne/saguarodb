@@ -265,6 +265,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Date(left), Value::Date(right)) => left.cmp(right),
         (Value::Timestamp(left), Value::Timestamp(right)) => left.cmp(right),
         (Value::Time(left), Value::Time(right)) => left.cmp(right),
+        (Value::TimestampTz(left), Value::TimestampTz(right)) => left.cmp(right),
         (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
@@ -811,6 +812,20 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
         (Value::Text(value), DataType::Time) => common::datetime::parse_time(&value)
             .map(Value::Time)
             .ok_or_else(|| DbError::execute(SqlState::DatatypeMismatch, "invalid time cast")),
+        (Value::TimestampTz(micros), DataType::TimestampTz) => Ok(Value::TimestampTz(micros)),
+        (Value::TimestampTz(micros), DataType::Text) => {
+            Ok(Value::Text(common::datetime::format_timestamptz(micros)))
+        }
+        (Value::Text(value), DataType::TimestampTz) => common::datetime::parse_timestamptz(&value)
+            .map(Value::TimestampTz)
+            .ok_or_else(|| {
+                DbError::execute(SqlState::DatatypeMismatch, "invalid timestamptz cast")
+            }),
+        // TIMESTAMP <-> TIMESTAMPTZ reinterpret the same micros: a naive
+        // wall-clock is taken as UTC (no session time zone), so the instant is
+        // unchanged.
+        (Value::Timestamp(micros), DataType::TimestampTz) => Ok(Value::TimestampTz(micros)),
+        (Value::TimestampTz(micros), DataType::Timestamp) => Ok(Value::Timestamp(micros)),
         (Value::Bytes(raw), DataType::Bytea) => Ok(Value::Bytes(raw)),
         (Value::Bytes(raw), DataType::Text) => Ok(Value::Text(common::bytea::format_hex(&raw))),
         (Value::Text(value), DataType::Bytea) => common::bytea::parse_hex(&value)

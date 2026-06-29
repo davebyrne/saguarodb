@@ -570,6 +570,14 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             // PostgreSQL binary `time` is an i64 microsecond count since midnight.
             ValueFormat::Binary => micros.to_be_bytes().to_vec(),
         },
+        Value::TimestampTz(micros) => match format {
+            ValueFormat::Text => common::datetime::format_timestamptz(*micros).into_bytes(),
+            // PostgreSQL binary `timestamptz` is an i64 microsecond count from
+            // 2000-01-01 UTC (same wire form as `timestamp`).
+            ValueFormat::Binary => (micros - PG_TIMESTAMP_EPOCH_OFFSET_MICROS)
+                .to_be_bytes()
+                .to_vec(),
+        },
         Value::Bytes(raw) => match format {
             // PostgreSQL text `bytea` is the hex format `\x...`; binary is the raw bytes.
             ValueFormat::Text => common::bytea::format_hex(raw).into_bytes(),
@@ -652,6 +660,20 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .try_into()
                 .map_err(|_| protocol_error("binary time parameter must be 8 bytes"))?;
             Ok(Value::Time(i64::from_be_bytes(array)))
+        }
+        (DataType::TimestampTz, ValueFormat::Text) => {
+            let text = decode_utf8(bytes, "timestamptz parameter")?;
+            common::datetime::parse_timestamptz(text)
+                .map(Value::TimestampTz)
+                .ok_or_else(|| protocol_error("invalid timestamptz parameter"))
+        }
+        (DataType::TimestampTz, ValueFormat::Binary) => {
+            let array: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| protocol_error("binary timestamptz parameter must be 8 bytes"))?;
+            Ok(Value::TimestampTz(
+                i64::from_be_bytes(array) + PG_TIMESTAMP_EPOCH_OFFSET_MICROS,
+            ))
         }
         (DataType::Numeric { .. }, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "numeric parameter")?;
@@ -748,6 +770,7 @@ fn postgres_type(data_type: &DataType) -> (i32, i16) {
         DataType::Double => (701, 8),
         DataType::Real => (700, 4),
         DataType::Time => (1083, 8),
+        DataType::TimestampTz => (1184, 8),
         DataType::Numeric { .. } => (1700, -1),
     }
 }
@@ -1074,5 +1097,42 @@ mod time_value_tests {
     #[test]
     fn invalid_time_text_is_rejected() {
         assert!(decode_value(b"25:00:00", DataType::Time, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod timestamptz_value_tests {
+    use super::{decode_value, encode_value};
+    use common::{DataType, Value};
+
+    fn tz(s: &str) -> Value {
+        Value::TimestampTz(common::datetime::parse_timestamptz(s).unwrap())
+    }
+
+    #[test]
+    fn timestamptz_text_normalizes_offset_and_displays_utc() {
+        // 12:00+05 -> 07:00 UTC, displayed with +00.
+        let value = tz("2024-01-01 12:00:00+05");
+        let text = encode_value(&value, 0).unwrap().unwrap();
+        assert_eq!(text, b"2024-01-01 07:00:00+00");
+        assert_eq!(
+            decode_value(&text, DataType::TimestampTz, 0).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn timestamptz_binary_round_trips_via_2000_epoch() {
+        let value = tz("2024-01-01 07:00:00+00");
+        let binary = encode_value(&value, 1).unwrap().unwrap();
+        assert_eq!(
+            decode_value(&binary, DataType::TimestampTz, 1).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn invalid_timestamptz_text_is_rejected() {
+        assert!(decode_value(b"2024-01-01 25:00:00+00", DataType::TimestampTz, 0).is_err());
     }
 }
