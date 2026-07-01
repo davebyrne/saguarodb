@@ -178,7 +178,7 @@ Deferred from Milestone E (`mvcc.md` §12): a fully-concurrent / B-link writer p
 
 Snapshot capture (`capture_snapshot(own_txn)`) builds the `Snapshot` consistently with the registry and the id allocator under one registry latch (`ActiveTxnRegistry::capture`): it reads the active set, then reads `next_txn_id` as `xmax`, so a concurrently-begun writer can never be both absent from `xip` and `< xmax`. `xip = active_ids` minus `own_txn` (own writes are seen via the predicate's `current_txn` path), and `xmin = oldest active id` or `xmax` if none are active. A read uses `own_txn = 0`. Id allocation and registration are done together under the latch (`register_allocated`) to close the same torn-snapshot window. In the **same** latched section, capture advertises the snapshot's `xmin` to the GC horizon and returns an RAII `AdvertisedSnapshot` guard alongside the `Arc<Snapshot>`; the caller holds the guard for exactly the snapshot's usable lifetime (`mvcc.md` §9). The snapshot is shared via `Arc<Snapshot>` (`StatementContext.snapshot`), so the executor clones a `StatementContext` per scan operator by bumping a refcount rather than deep-cloning the now-possibly-non-empty `xip` vector. Isolation is the capture-timing knob: **Read Committed** (default) captures a fresh snapshot per statement (its advertisement released at statement end); **Repeatable Read** captures one snapshot at the transaction's first statement and reuses it (its advertisement held on the `Transaction` and released at commit/abort). The autocommit read and write paths each advertise their snapshot across the statement's execution; the autocommit read in particular **must** advertise, since it is not its own transaction and so is otherwise invisible to the horizon.
 
-`QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_simple` for simple queries and `execute_prepared_in_session`/`execute_prepared_cancelable` for extended `Execute` (in-transaction vs. autocommit, respectively), passing the connection's shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
+`QueryService::execute_sql`/`execute_prepared` run with no cancellation; the connection uses `execute_simple_with_session_sequences` for simple queries and `execute_prepared_in_session_with_session_sequences`/`execute_prepared_cancelable_with_session_sequences` for extended `Execute` (in-transaction vs. autocommit, respectively), threading the connection's persistent `SessionSequenceState` and passing its shared cancellation flag (an `Arc<AtomicBool>`) as `ExecutionContext.cancel`. The flag is cleared before each query and set when a `CancelRequest` for that backend arrives, so the in-flight query aborts with `SqlState::QueryCanceled` (SQLSTATE `57014`).
 
 `EXPLAIN` is a query-service exception to the uniform execution path. For `BoundStatement::Explain(inner)`, `QueryService` plans `inner` to a `PhysicalPlan`, calls planner `format_explain(&physical)`, and returns `ExecutionResult::Explanation { text }` without calling `QueryEngine::execute`.
 
@@ -353,7 +353,7 @@ thread pool, streaming `DataRow`s in the requested result formats followed by
 `CommandComplete` (no `RowDescription`, no `ReadyForQuery`); `max_rows` is
 treated as all rows. `Execute` participates in the session's CURRENT transaction:
 when an explicit transaction is open on the session (`Session.txn` is `Some`), the
-portal runs *inside* that transaction via `QueryService::execute_prepared_in_session`,
+portal runs *inside* that transaction via `QueryService::execute_prepared_in_session_with_session_sequences`,
 which routes through the same in-transaction machinery the simple-query path uses —
 the session's single write guard is reused (or lazily acquired once on the first
 write), the transaction's snapshot/isolation applies, the `'E'` failed-state gate
@@ -361,7 +361,7 @@ rejects non-control statements with `25P02`, and a transaction-control portal
 (BEGIN/COMMIT/ROLLBACK/SET TRANSACTION/SET SESSION CHARACTERISTICS) is dispatched
 through `handle_transaction_control` so it affects `Session.txn` and
 `Session.default_isolation` exactly like a simple-query control statement
-(`execute_prepared_in_session` takes and returns the session default alongside the
+(`execute_prepared_in_session_with_session_sequences` takes and returns the session default alongside the
 slot, like `execute_simple`; a `SET SESSION CHARACTERISTICS` portal routes through
 this session path even with no open transaction, so it updates the per-connection
 default). With no open transaction (`Session.txn` is `None`), a data `Execute` is

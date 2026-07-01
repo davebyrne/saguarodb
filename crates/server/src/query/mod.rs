@@ -179,6 +179,13 @@ impl QueryService {
     /// CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` updates it. The
     /// (possibly updated) default is returned so the connection persists it across
     /// statements.
+    ///
+    /// This convenience uses a fresh, throwaway [`SessionSequenceState`] per call, so
+    /// `currval` is only defined within the single statement that called `nextval` —
+    /// there is no cross-statement `currval` memory. It is for autocommit and tests.
+    /// A real connection that must persist `currval` across statements calls
+    /// [`Self::execute_simple_with_session_sequences`] with its own session state
+    /// (see `connection/simple.rs`).
     pub fn execute_simple(
         &self,
         sql: &str,
@@ -305,7 +312,8 @@ impl QueryService {
     }
 
     /// Execute a prepared statement with one value per parameter, in order. Each
-    /// call is its own autocommit unit, like a simple query.
+    /// call is its own autocommit unit, like a simple query, with a throwaway
+    /// session (see [`Self::execute_prepared_cancelable`]).
     pub fn execute_prepared(
         &self,
         prepared: &PreparedStatement,
@@ -318,8 +326,14 @@ impl QueryService {
     /// autocommit unit: the caller has no open explicit transaction (the session's
     /// transaction slot is `None`), so each `Execute` is its own implicit
     /// `BEGIN…COMMIT`. When a transaction IS open, the connection routes through
-    /// `execute_prepared_in_session` instead, so the autocommit write path here is
-    /// never reached while the session already holds the write guard.
+    /// [`Self::execute_prepared_in_session_with_session_sequences`] instead, so the
+    /// autocommit write path here is never reached while the session already holds
+    /// the write guard.
+    ///
+    /// Like [`Self::execute_simple`], this uses a fresh throwaway
+    /// [`SessionSequenceState`] (autocommit/tests). A real connection calls
+    /// [`Self::execute_prepared_cancelable_with_session_sequences`] with its own
+    /// session state (see `connection/extended.rs`).
     pub fn execute_prepared_cancelable(
         &self,
         prepared: &PreparedStatement,
@@ -342,7 +356,7 @@ impl QueryService {
         session_sequences: Arc<SessionSequenceState>,
     ) -> Result<ExecutionResult> {
         // Maintenance does not bind/plan; run it before parameter substitution. The
-        // connection routes maintenance through `execute_prepared_in_session`, so this
+        // connection routes maintenance through the in-session variant, so this
         // arm is reached only if a caller bypasses that routing — keep it total.
         if let StatementClass::Maintenance = prepared.class {
             return self.run_prepared_vacuum(prepared);
@@ -390,29 +404,12 @@ impl QueryService {
     /// write guard is reused — never re-acquired — and the transaction's
     /// snapshot/isolation and 'E' failed-state gating apply. Transaction-control
     /// statements are dispatched through `handle_transaction_control`, exactly like
-    /// a simple `BEGIN`/`COMMIT`/`ROLLBACK`.
+    /// a simple `BEGIN`/`COMMIT`/`ROLLBACK`. `session_sequences` is the connection's
+    /// persistent `currval` memory (see `connection/extended.rs`).
     ///
     /// Precondition: `slot` is `Some` (the connection only calls this with an open
     /// transaction; with no open transaction it uses the autocommit
-    /// `execute_prepared_cancelable`).
-    pub fn execute_prepared_in_session(
-        &self,
-        prepared: &PreparedStatement,
-        params: &[Value],
-        slot: Option<Transaction>,
-        default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
-    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
-        self.execute_prepared_in_session_with_session_sequences(
-            prepared,
-            params,
-            slot,
-            default_isolation,
-            cancel,
-            Arc::new(SessionSequenceState::new()),
-        )
-    }
-
+    /// `execute_prepared_cancelable_with_session_sequences`).
     pub fn execute_prepared_in_session_with_session_sequences(
         &self,
         prepared: &PreparedStatement,
