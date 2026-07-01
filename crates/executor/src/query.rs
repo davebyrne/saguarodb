@@ -467,15 +467,9 @@ fn evaluate_column_default(
 ) -> Result<Value> {
     match &column.default {
         Some(ColumnDefault::Const(value)) => Ok(value.clone()),
-        Some(ColumnDefault::Nextval(sequence)) => {
-            let value = statement
-                .sequence_manager
-                .nextval(statement.txn_id, *sequence)?;
-            statement
-                .session_sequences
-                .record_currval(*sequence, value)?;
-            Ok(Value::Integer(value))
-        }
+        Some(ColumnDefault::Nextval(sequence)) => Ok(Value::Integer(
+            statement.nextval_recording_currval(*sequence)?,
+        )),
         None => Ok(Value::Null),
     }
 }

@@ -324,6 +324,16 @@ impl StatementContext {
         self.session_sequences = session_sequences;
         self
     }
+
+    /// Advance `sequence` via [`SequenceManager::nextval`] and record the returned
+    /// value as this session's `currval`, returning the new value. Shared by the
+    /// `nextval(...)` expression and the INSERT/COPY `DEFAULT nextval` path so both
+    /// keep the `currval` bookkeeping identical.
+    pub fn nextval_recording_currval(&self, sequence: SequenceId) -> Result<i64> {
+        let value = self.sequence_manager.nextval(self.txn_id, sequence)?;
+        self.session_sequences.record_currval(sequence, value)?;
+        Ok(value)
+    }
 }
 
 // Hand-rolled to exclude handles that are not comparable; two contexts are equal

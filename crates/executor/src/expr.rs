@@ -208,9 +208,7 @@ fn require_eval_context<'a>(
 
 fn eval_nextval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
     let ctx = require_eval_context(ctx, "nextval")?;
-    let value = ctx.sequence_manager.nextval(ctx.txn_id, sequence)?;
-    ctx.session_sequences.record_currval(sequence, value)?;
-    Ok(Value::Integer(value))
+    Ok(Value::Integer(ctx.nextval_recording_currval(sequence)?))
 }
 
 fn eval_currval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
