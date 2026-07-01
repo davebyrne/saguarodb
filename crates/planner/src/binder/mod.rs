@@ -7,7 +7,7 @@ use common::{
 };
 use parser::Statement;
 
-use crate::{BoundExpr, BoundStatement, SerialColumn};
+use crate::{BoundExpr, BoundStatement};
 
 mod dml;
 mod expr;
@@ -118,13 +118,11 @@ fn bind_inner(
             for column in columns {
                 validate_default_value(catalog, column)?;
             }
-            let serial = bind_serial_columns(columns);
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
-                serial,
             })
         }
         Statement::DropTable { name } => {
@@ -404,20 +402,6 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
             column.name, column.data_type
         ),
     ))
-}
-
-fn bind_serial_columns(columns: &[ParsedColumnDef]) -> Vec<SerialColumn> {
-    let mut serial = Vec::new();
-    for (index, column) in columns.iter().enumerate() {
-        if !matches!(column.default, Some(ParsedDefault::Serial)) {
-            continue;
-        }
-        serial.push(SerialColumn {
-            column: column.name.clone(),
-            index,
-        });
-    }
-    serial
 }
 
 /// Whether a non-NULL `DEFAULT` constant's value matches the column type. Numeric

@@ -6,12 +6,6 @@ use common::{
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SerialColumn {
-    pub column: String,
-    pub index: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
     CreateTable {
         name: String,
@@ -20,9 +14,6 @@ pub enum BoundStatement {
         /// Column name lists for `UNIQUE` constraints; each becomes a unique
         /// index created together with the table.
         unique: Vec<Vec<String>>,
-        /// `SERIAL` family columns whose owned sequence names are generated
-        /// during DDL execution.
-        serial: Vec<SerialColumn>,
     },
     DropTable {
         table: TableId,

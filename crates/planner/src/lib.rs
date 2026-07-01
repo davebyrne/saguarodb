@@ -10,7 +10,7 @@ mod simplify;
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect,
-    BoundSelectItem, BoundStatement, SerialColumn,
+    BoundSelectItem, BoundStatement,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -375,20 +375,18 @@ mod tests {
     }
 
     #[test]
-    fn binder_records_serial_columns() {
+    fn binder_preserves_serial_marker_on_columns() {
         let catalog = MemoryCatalog::empty();
         let stmt = parse("create table users (id serial primary key, name text)").unwrap();
-        let BoundStatement::CreateTable { serial, .. } = bind(&stmt, &catalog).unwrap() else {
+        let BoundStatement::CreateTable { columns, .. } = bind(&stmt, &catalog).unwrap() else {
             panic!("expected create table");
         };
 
-        assert_eq!(
-            serial,
-            vec![SerialColumn {
-                column: "id".to_string(),
-                index: 0,
-            }]
-        );
+        // SERIAL-ness lives solely in the column's parsed default; CREATE TABLE
+        // execution derives the owned sequence from this marker.
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].default, Some(common::ParsedDefault::Serial));
+        assert_eq!(columns[1].default, None);
     }
 
     #[test]

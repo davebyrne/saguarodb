@@ -276,6 +276,49 @@ async fn serial_creates_owned_sequence_and_drop_table_removes_it() {
 }
 
 #[tokio::test]
+async fn multiple_serial_columns_at_non_zero_indices_get_independent_sequences() {
+    let server = TestServer::start().await.unwrap();
+
+    // A non-serial column first, then two SERIAL columns at indices 1 and 2. Each is
+    // derived straight from its own column marker and gets its own owned sequence —
+    // exercising the derive-from-columns path for serials past index 0.
+    server
+        .simple_query("create table t (name text, a serial, b serial primary key)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("insert into t (name) values ('x') returning a, b")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string()), Some("1".to_string())]]
+    );
+    assert_eq!(
+        server
+            .simple_query("insert into t (name) values ('y') returning a, b")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string()), Some("2".to_string())]]
+    );
+
+    // Each SERIAL owns a distinct, independently-named sequence.
+    for seq in ["t_a_seq", "t_b_seq"] {
+        let err = server
+            .simple_query(&format!("drop sequence {seq}"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("owned sequence {seq} drop should fail"));
+        assert!(
+            err.message.contains("2BP01"),
+            "expected DependentObjectsStillExist for {seq}: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
 async fn serial_uses_suffixed_sequence_name_when_default_collides() {
     let server = TestServer::start().await.unwrap();
 

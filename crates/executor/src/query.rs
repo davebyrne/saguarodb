@@ -7,7 +7,7 @@ use common::{
     KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions, SequenceSchema,
     SqlState, StatementContext, TableId, TableSchema, Value,
 };
-use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, SerialColumn};
+use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -81,8 +81,7 @@ impl QueryEngine {
                 columns,
                 primary_key,
                 unique,
-                serial,
-            } => execute_create_table(ctx, name, columns, primary_key, unique, serial),
+            } => execute_create_table(ctx, name, columns, primary_key, unique),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
                 name,
@@ -750,9 +749,8 @@ fn execute_create_table(
     columns: &[ParsedColumnDef],
     primary_key: &[String],
     unique: &[Vec<String>],
-    serial: &[SerialColumn],
 ) -> Result<ExecutionResult> {
-    let serial = resolve_serial_columns(ctx.catalog, name, serial)?;
+    let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
     let mut created_sequences = Vec::new();
     for serial_column in &serial {
         match create_owned_serial_sequence(ctx, &serial_column.sequence) {
@@ -797,26 +795,26 @@ fn execute_create_table(
 
 #[derive(Clone, Debug)]
 struct ResolvedSerialColumn {
-    column: String,
     index: usize,
     sequence: String,
 }
 
+/// Derive the `SERIAL` columns straight from the parsed column list (the single
+/// source of truth — each carries `ParsedDefault::Serial`), choosing a generated
+/// owned-sequence name for each. No parallel list is threaded through the plan.
 fn resolve_serial_columns(
     catalog: &dyn CatalogManager,
     table: &str,
-    serial: &[SerialColumn],
+    columns: &[ParsedColumnDef],
 ) -> Result<Vec<ResolvedSerialColumn>> {
     let mut generated = HashSet::new();
     let mut resolved = Vec::new();
-    for serial_column in serial {
-        let sequence =
-            choose_serial_sequence_name(catalog, &mut generated, table, &serial_column.column)?;
-        resolved.push(ResolvedSerialColumn {
-            column: serial_column.column.clone(),
-            index: serial_column.index,
-            sequence,
-        });
+    for (index, column) in columns.iter().enumerate() {
+        if !matches!(column.default, Some(ParsedDefault::Serial)) {
+            continue;
+        }
+        let sequence = choose_serial_sequence_name(catalog, &mut generated, table, &column.name)?;
+        resolved.push(ResolvedSerialColumn { index, sequence });
     }
     Ok(resolved)
 }
@@ -862,20 +860,15 @@ fn columns_with_serial_defaults(
 ) -> Result<Vec<ParsedColumnDef>> {
     let mut columns = columns.to_vec();
     for serial_column in serial {
+        // `index` was derived from this same column list (each `SERIAL` column carries
+        // `ParsedDefault::Serial`), so it always points at that column — guard
+        // defensively rather than index-panic.
         let column = columns.get_mut(serial_column.index).ok_or_else(|| {
             DbError::internal(format!(
-                "serial column {} index {} was not found in CREATE TABLE columns",
-                serial_column.column, serial_column.index
+                "serial column index {} out of range in CREATE TABLE columns",
+                serial_column.index
             ))
         })?;
-        if column.name != serial_column.column
-            || !matches!(column.default, Some(ParsedDefault::Serial))
-        {
-            return Err(DbError::internal(format!(
-                "serial column {} index {} did not carry a SERIAL marker",
-                serial_column.column, serial_column.index
-            )));
-        }
         column.default = Some(ParsedDefault::OwnedNextval(serial_column.sequence.clone()));
     }
     Ok(columns)
