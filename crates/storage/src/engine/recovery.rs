@@ -62,18 +62,9 @@ impl PageBackedStorageEngine {
         sequence: SequenceId,
         value: i64,
     ) -> Result<()> {
-        let sequence_state = {
-            let state = self.lock_state()?;
-            state.sequences.get(&sequence).cloned()
-        };
-        let Some(sequence_state) = sequence_state else {
-            return Ok(());
-        };
-        let mut schema = sequence_state.lock_schema()?;
-        validate_sequence_value(&schema, value)?;
-        schema.last_value = value;
-        schema.is_called = true;
-        Ok(())
+        // Replaying a `nextval` advance restores the same state as a `setval` to
+        // `value` with `is_called = true`.
+        self.apply_set_sequence_value_without_wal(sequence, value, true)
     }
     pub(crate) fn apply_set_sequence_value_without_wal(
         &self,
