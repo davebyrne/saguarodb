@@ -25,15 +25,12 @@ pub use values::ValuesOp;
 use common::{Result, StatementContext, Value};
 use planner::BoundExpr;
 
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 
 pub(crate) fn predicate_matches(
     ctx: &StatementContext,
     expr: &BoundExpr,
     row: &common::ExecRow,
 ) -> Result<bool> {
-    Ok(matches!(
-        eval_expr_with_context(ctx, expr, row)?,
-        Value::Boolean(true)
-    ))
+    Ok(matches!(eval_expr(ctx, expr, row)?, Value::Boolean(true)))
 }

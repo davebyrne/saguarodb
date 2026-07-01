@@ -1,23 +1,11 @@
 use common::{DataType, DbError, ExecRow, Result, SqlState, StatementContext, Value};
 use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 
-pub fn eval_expr(expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
-    eval_expr_inner(None, expr, row)
+pub fn eval_expr(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
+    eval_expr_inner(ctx, expr, row)
 }
 
-pub fn eval_expr_with_context(
-    ctx: &StatementContext,
-    expr: &BoundExpr,
-    row: &ExecRow,
-) -> Result<Value> {
-    eval_expr_inner(Some(ctx), expr, row)
-}
-
-fn eval_expr_inner(
-    ctx: Option<&StatementContext>,
-    expr: &BoundExpr,
-    row: &ExecRow,
-) -> Result<Value> {
+fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
     match expr {
         BoundExpr::Literal { value, .. } => Ok(value.clone()),
         // Parameters are replaced with literals by substitution before execution.
@@ -131,7 +119,7 @@ fn eval_expr_inner(
 }
 
 fn eval_binary(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     left: &BoundExpr,
     op: BinOp,
     right: &BoundExpr,
@@ -171,7 +159,7 @@ fn eval_is_distinct(left: Value, right: Value, not: bool) -> Result<Value> {
 }
 
 fn eval_unary(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     op: UnaryOp,
     expr: &BoundExpr,
     row: &ExecRow,
@@ -197,22 +185,11 @@ fn eval_unary(
     }
 }
 
-fn require_eval_context<'a>(
-    ctx: Option<&'a StatementContext>,
-    function: &str,
-) -> Result<&'a StatementContext> {
-    ctx.ok_or_else(|| {
-        DbError::internal(format!("{function} requires a statement execution context"))
-    })
-}
-
-fn eval_nextval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
-    let ctx = require_eval_context(ctx, "nextval")?;
+fn eval_nextval(ctx: &StatementContext, sequence: common::SequenceId) -> Result<Value> {
     Ok(Value::Integer(ctx.nextval_recording_currval(sequence)?))
 }
 
-fn eval_currval(ctx: Option<&StatementContext>, sequence: common::SequenceId) -> Result<Value> {
-    let ctx = require_eval_context(ctx, "currval")?;
+fn eval_currval(ctx: &StatementContext, sequence: common::SequenceId) -> Result<Value> {
     if !ctx.sequence_manager.sequence_exists(sequence)? {
         return Err(DbError::execute(
             SqlState::UndefinedTable,
@@ -229,14 +206,13 @@ fn eval_currval(ctx: Option<&StatementContext>, sequence: common::SequenceId) ->
 }
 
 fn eval_setval(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     sequence: common::SequenceId,
     value: &BoundExpr,
     is_called: Option<&BoundExpr>,
     row: &ExecRow,
 ) -> Result<Value> {
-    let ctx = require_eval_context(ctx, "setval")?;
-    let value = eval_expr_inner(Some(ctx), value, row)?;
+    let value = eval_expr_inner(ctx, value, row)?;
     let Value::Integer(value) = value else {
         return if matches!(value, Value::Null) {
             Ok(Value::Null)
@@ -245,7 +221,7 @@ fn eval_setval(
         };
     };
     let is_called = match is_called {
-        Some(expr) => match eval_expr_inner(Some(ctx), expr, row)? {
+        Some(expr) => match eval_expr_inner(ctx, expr, row)? {
             Value::Boolean(value) => value,
             Value::Null => return Ok(Value::Null),
             _ => return datatype_mismatch("setval is_called argument must be boolean"),
@@ -494,7 +470,7 @@ fn concat_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn eval_function(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     name: &str,
     args: &[BoundExpr],
     row: &ExecRow,
@@ -825,7 +801,7 @@ pub(crate) fn sql_not(value: Value) -> Result<Value> {
 }
 
 fn eval_in_list(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     expr: &BoundExpr,
     list: &[BoundExpr],
     row: &ExecRow,
@@ -957,7 +933,7 @@ fn like_matches(value: &str, pattern: &str, escape: Option<char>) -> bool {
 }
 
 fn eval_case(
-    ctx: Option<&StatementContext>,
+    ctx: &StatementContext,
     operand: Option<&BoundExpr>,
     when_clauses: &[(BoundExpr, BoundExpr)],
     else_clause: Option<&BoundExpr>,

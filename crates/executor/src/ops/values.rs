@@ -1,7 +1,7 @@
 use common::{ColumnInfo, ExecRow, Result, Row, StatementContext};
 use planner::BoundExpr;
 
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 use crate::query::PlanExecutor;
 
 pub struct ValuesOp {
@@ -47,7 +47,7 @@ impl PlanExecutor for ValuesOp {
         };
         let values = expressions
             .iter()
-            .map(|expr| eval_expr_with_context(&self.ctx, expr, &empty))
+            .map(|expr| eval_expr(&self.ctx, expr, &empty))
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(ExecRow {
             row: Row { values },

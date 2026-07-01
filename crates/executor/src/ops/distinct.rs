@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use common::{ColumnInfo, ExecRow, Result, Row, StatementContext, Value};
 use planner::BoundExpr;
 
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 use crate::query::PlanExecutor;
 
 /// Streaming de-duplication for `SELECT DISTINCT`. Emits the first row of each
@@ -51,7 +51,7 @@ impl PlanExecutor for DistinctOp<'_> {
             let key = self
                 .on_keys
                 .iter()
-                .map(|expr| eval_expr_with_context(&self.ctx, expr, &row))
+                .map(|expr| eval_expr(&self.ctx, expr, &row))
                 .collect::<Result<Vec<_>>>()?;
             if self.seen.insert(key) {
                 // De-duplication collapses several source rows into one, so the

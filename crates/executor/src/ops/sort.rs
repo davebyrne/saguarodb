@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use common::{ColumnInfo, ExecRow, Result, StatementContext, Value};
 use planner::BoundOrderByItem;
 
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 use crate::query::{PlanExecutor, collect_all};
 
 pub struct SortOp<'a> {
@@ -46,7 +46,7 @@ impl PlanExecutor for SortOp<'_> {
             let keys = self
                 .order_by
                 .iter()
-                .map(|item| eval_expr_with_context(&self.ctx, &item.expr, &row))
+                .map(|item| eval_expr(&self.ctx, &item.expr, &row))
                 .collect::<Result<Vec<_>>>()?;
             keyed.push((row, keys));
         }

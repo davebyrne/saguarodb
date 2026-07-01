@@ -10,7 +10,7 @@ pub mod ops;
 pub mod test_support;
 
 pub use common::{ExecRow, RowIdentity};
-pub use expr::{eval_expr, eval_expr_with_context};
+pub use expr::eval_expr;
 pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine};
 pub use result::{CopyJob, ExecutionResult};
 
@@ -28,9 +28,7 @@ mod tests {
 
     use crate::ops::{join_rows, project_row};
     use crate::test_support::{ExecutorHarness, MemoryStorage};
-    use crate::{
-        ExecutionContext, ExecutionResult, QueryEngine, eval_expr, eval_expr_with_context,
-    };
+    use crate::{ExecutionContext, ExecutionResult, QueryEngine, eval_expr};
     use storage::SchemaOperations;
 
     #[derive(Debug, Default)]
@@ -96,7 +94,10 @@ mod tests {
             nullable: true,
         };
 
-        assert_eq!(eval_expr(&expr, &row).unwrap(), Value::Boolean(false));
+        assert_eq!(
+            eval_expr(&StatementContext::new(0), &expr, &row).unwrap(),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
@@ -121,7 +122,7 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr(&expr, &row).unwrap_err();
+        let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 
@@ -147,7 +148,7 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr(&expr, &row).unwrap_err();
+        let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::DivisionByZero);
     }
 
@@ -173,7 +174,7 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr(&expr, &row).unwrap_err();
+        let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
@@ -194,7 +195,7 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr(&expr, &row).unwrap_err();
+        let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
@@ -214,6 +215,7 @@ mod tests {
         };
 
         let projected = project_row(
+            &StatementContext::new(0),
             input.clone(),
             &[BoundExpr::InputRef {
                 input: 1,
@@ -539,14 +541,14 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr_with_context(&statement, &currval, &row).unwrap_err();
+        let err = eval_expr(&statement, &currval, &row).unwrap_err();
         assert_eq!(err.code, SqlState::ObjectNotInPrerequisiteState);
         assert_eq!(
-            eval_expr_with_context(&statement, &nextval, &row).unwrap(),
+            eval_expr(&statement, &nextval, &row).unwrap(),
             Value::Integer(5)
         );
         assert_eq!(
-            eval_expr_with_context(&statement, &currval, &row).unwrap(),
+            eval_expr(&statement, &currval, &row).unwrap(),
             Value::Integer(5)
         );
 
@@ -567,7 +569,7 @@ mod tests {
         };
 
         assert_eq!(
-            eval_expr_with_context(&statement, &setval, &row).unwrap(),
+            eval_expr(&statement, &setval, &row).unwrap(),
             Value::Integer(9)
         );
         assert_eq!(manager.set_calls(), vec![(23, 1, 9, false)]);
@@ -578,7 +580,7 @@ mod tests {
             .with_sequence_manager(manager.clone())
             .with_session_sequences(fresh_session.clone());
         assert_eq!(
-            eval_expr_with_context(&fresh_statement, &setval, &row).unwrap(),
+            eval_expr(&fresh_statement, &setval, &row).unwrap(),
             Value::Integer(9)
         );
         assert_eq!(fresh_session.currval(1).unwrap(), None);
@@ -595,7 +597,7 @@ mod tests {
             nullable: false,
         };
         assert_eq!(
-            eval_expr_with_context(&fresh_statement, &setval_called, &row).unwrap(),
+            eval_expr(&fresh_statement, &setval_called, &row).unwrap(),
             Value::Integer(11)
         );
         assert_eq!(fresh_session.currval(1).unwrap(), Some(11));
@@ -1451,7 +1453,7 @@ mod tests {
             nullable: false,
         };
 
-        let err = eval_expr(&expr, &row).unwrap_err();
+        let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::NumericValueOutOfRange);
     }
 
@@ -1475,7 +1477,10 @@ mod tests {
             nullable: false,
         };
 
-        assert_eq!(eval_expr(&expr, &row).unwrap(), Value::Integer(0));
+        assert_eq!(
+            eval_expr(&StatementContext::new(0), &expr, &row).unwrap(),
+            Value::Integer(0)
+        );
     }
 
     #[test]

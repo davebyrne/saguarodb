@@ -12,7 +12,7 @@ use storage::{RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
     ProjectionOp, SeqScanOp, SortOp, ValuesOp,
@@ -408,7 +408,7 @@ fn apply_conflict_update(
 
     if let Some(filter) = filter
         && !matches!(
-            eval_expr_with_context(&ctx.statement, filter, &combined_row)?,
+            eval_expr(&ctx.statement, filter, &combined_row)?,
             Value::Boolean(true)
         )
     {
@@ -419,7 +419,7 @@ fn apply_conflict_update(
     let mut new_values = existing.values.clone();
     for (column, expr) in assignments {
         let slot = column_slot(schema, *column)?;
-        new_values[slot] = eval_expr_with_context(&ctx.statement, expr, &combined_row)?;
+        new_values[slot] = eval_expr(&ctx.statement, expr, &combined_row)?;
     }
     coerce_numeric_columns(schema, &mut new_values)?;
     validate_row_constraints(schema, &new_values)?;
@@ -505,7 +505,7 @@ fn eval_returning(
     let values = returning
         .exprs
         .iter()
-        .map(|expr| eval_expr_with_context(&ctx.statement, expr, &exec_row))
+        .map(|expr| eval_expr(&ctx.statement, expr, &exec_row))
         .collect::<Result<Vec<_>>>()?;
     Ok(Row { values })
 }
@@ -685,7 +685,7 @@ fn execute_update(
             }
             for (column, expr) in assignments {
                 let slot = column_slot(&schema, *column)?;
-                values[slot] = eval_expr_with_context(&ctx.statement, expr, &source_row)?;
+                values[slot] = eval_expr(&ctx.statement, expr, &source_row)?;
             }
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;

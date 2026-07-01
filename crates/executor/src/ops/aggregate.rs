@@ -5,7 +5,7 @@ use common::{
 };
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
-use crate::eval_expr_with_context;
+use crate::eval_expr;
 use crate::expr::integer_overflow;
 use crate::query::{PlanExecutor, collect_all};
 
@@ -90,7 +90,7 @@ fn build_groups(
     for row in input {
         let key = group_by
             .iter()
-            .map(|expr| eval_expr_with_context(ctx, expr, &row))
+            .map(|expr| eval_expr(ctx, expr, &row))
             .collect::<Result<Vec<_>>>()?;
         groups.entry(key).or_default().push(row);
     }
@@ -420,7 +420,7 @@ fn aggregate_values(
     let mut values = Vec::with_capacity(rows.len());
     let mut distinct = BTreeSet::new();
     for row in rows {
-        let value = eval_expr_with_context(ctx, arg, row)?;
+        let value = eval_expr(ctx, arg, row)?;
         if aggregate.distinct && !distinct.insert(value.clone()) {
             continue;
         }
