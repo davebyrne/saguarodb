@@ -140,12 +140,8 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn reserve_table_id(&self, id: TableId) -> Result<()> {
-        let next_after_id = id
-            .checked_add(1)
-            .ok_or_else(|| DbError::internal("catalog table id overflow while reserving id"))?;
         let mut snapshot = self.write_snapshot()?;
-        snapshot.next_table_id = snapshot.next_table_id.max(next_after_id);
-        Ok(())
+        reserve_id(&mut snapshot.next_table_id, id, "table")
     }
 
     fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
@@ -226,12 +222,8 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn reserve_index_id(&self, id: IndexId) -> Result<()> {
-        let next_after_id = id
-            .checked_add(1)
-            .ok_or_else(|| DbError::internal("catalog index id overflow while reserving id"))?;
         let mut snapshot = self.write_snapshot()?;
-        snapshot.next_index_id = snapshot.next_index_id.max(next_after_id);
-        Ok(())
+        reserve_id(&mut snapshot.next_index_id, id, "index")
     }
 
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {
@@ -322,12 +314,8 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn reserve_sequence_id(&self, id: SequenceId) -> Result<()> {
-        let next_after_id = id
-            .checked_add(1)
-            .ok_or_else(|| DbError::internal("catalog sequence id overflow while reserving id"))?;
         let mut snapshot = self.write_snapshot()?;
-        snapshot.next_sequence_id = snapshot.next_sequence_id.max(next_after_id);
-        Ok(())
+        reserve_id(&mut snapshot.next_sequence_id, id, "sequence")
     }
 
     fn apply_create_sequence(&self, schema: SequenceSchema) -> Result<()> {
@@ -398,6 +386,17 @@ impl CatalogManager for MemoryCatalog {
         snapshot.sequences_by_name.remove(&schema.name);
         Ok(())
     }
+}
+
+/// Advance a monotonic id allocator's high-water mark past `id`, so a later
+/// allocation never reuses it (the `reserve_*_id` path, used when recovery
+/// replays a create). `kind` names the object for the overflow error.
+fn reserve_id(next: &mut u32, id: u32, kind: &str) -> Result<()> {
+    let next_after_id = id.checked_add(1).ok_or_else(|| {
+        DbError::internal(format!("catalog {kind} id overflow while reserving id"))
+    })?;
+    *next = (*next).max(next_after_id);
+    Ok(())
 }
 
 fn build_schema(
