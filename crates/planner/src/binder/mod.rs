@@ -354,7 +354,7 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
             }
             return Ok(());
         }
-        ParsedDefault::Nextval(name) | ParsedDefault::OwnedNextval(name) => {
+        ParsedDefault::Nextval(name) => {
             if column.data_type != DataType::Integer {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
@@ -364,27 +364,25 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
                     ),
                 ));
             }
-            let sequence = catalog.get_sequence_by_name(name)?.ok_or_else(|| {
-                plan_error(
+            // Confirm the sequence exists. Its SERIAL-ownership rule (a plain
+            // `DEFAULT nextval` may not borrow a SERIAL-owned sequence) is validated
+            // authoritatively by the catalog at CREATE TABLE
+            // (`resolve_sequence_default`), so it is not duplicated here.
+            if catalog.get_sequence_by_name(name)?.is_none() {
+                return Err(plan_error(
                     SqlState::UndefinedTable,
                     format!("sequence {name} does not exist"),
-                )
-            })?;
-            match default {
-                ParsedDefault::Nextval(_) if sequence.owned => {
-                    return Err(plan_error(
-                        SqlState::DependentObjectsStillExist,
-                        format!("sequence {name} is owned by a SERIAL column"),
-                    ));
-                }
-                ParsedDefault::OwnedNextval(_) if !sequence.owned => {
-                    return Err(DbError::internal(format!(
-                        "SERIAL default {name} resolved to a non-owned sequence"
-                    )));
-                }
-                _ => {}
+                ));
             }
             return Ok(());
+        }
+        ParsedDefault::OwnedNextval(_) => {
+            // `OwnedNextval` is produced by CREATE TABLE execution
+            // (Serial -> OwnedNextval), never by the parser, so it never reaches
+            // bind-time default validation.
+            return Err(DbError::internal(
+                "OwnedNextval default reached bind-time validation",
+            ));
         }
     };
     if matches!(value, Value::Null) {
