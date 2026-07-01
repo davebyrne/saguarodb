@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::{ColumnId, IndexId, SequenceId, TableId, Value};
 
@@ -50,49 +50,17 @@ pub enum ParsedDefault {
     Serial,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A resolved column `DEFAULT`, persisted in the catalog snapshot. The
+/// externally-tagged serde form (`{"Const": ...}` / `{"Nextval": id}`) is durable;
+/// the enclosing `ColumnDef.default` is `#[serde(default)]`, so a pre-default
+/// catalog snapshot still loads (the field reads as `None`). The constant-`DEFAULT`
+/// shape landed unreleased on this branch, so no compatibility shim is kept for the
+/// brief bare-`Value` form it had before this enum (dev data is resettable per the
+/// runtime-data convention).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
-}
-
-#[derive(Serialize, Deserialize)]
-enum ColumnDefaultWire {
-    Const(Value),
-    Nextval(SequenceId),
-}
-
-impl Serialize for ColumnDefault {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Const(value) => ColumnDefaultWire::Const(value.clone()).serialize(serializer),
-            Self::Nextval(sequence) => ColumnDefaultWire::Nextval(*sequence).serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ColumnDefault {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Tagged(ColumnDefaultWire),
-            LegacyConst(Value),
-        }
-
-        match Wire::deserialize(deserializer)? {
-            Wire::Tagged(ColumnDefaultWire::Const(value)) | Wire::LegacyConst(value) => {
-                Ok(Self::Const(value))
-            }
-            Wire::Tagged(ColumnDefaultWire::Nextval(sequence)) => Ok(Self::Nextval(sequence)),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

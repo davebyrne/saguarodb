@@ -94,9 +94,13 @@ These were settled during design and drive the rest of the spec.
 5. **Widen the durable default field.** `ColumnDef.default` becomes
    `Option<ColumnDefault>` where `ColumnDefault = Const(Value) | Nextval(SequenceId)`.
    Constant `DEFAULT` landed unreleased on this branch, so changing its on-disk
-   shape is acceptable; we keep `#[serde(default)]` (pre-default catalogs still
-   load) and bump the catalog-snapshot version. A custom deserializer may accept
-   the brief legacy bare-`Value` form to avoid a dev-data reset (optional).
+   shape is acceptable. Forward compatibility for the catalog snapshot comes from
+   `#[serde(default)]` on the field (a pre-default catalog snapshot loads with
+   `default = None`), not a snapshot version number — the catalog snapshot is
+   plain unversioned JSON (`serialize_catalog`). `ColumnDefault` derives its serde
+   (externally tagged); no compatibility shim is kept for the brief bare-`Value`
+   form it had before this enum, since dev data is resettable (runtime-data
+   convention).
 6. **No `DEFAULT` keyword in `VALUES` for v1.** Reusing the existing
    omitted-column funnel is enough for SERIAL; adding `Expr::Default` is deferred.
 
@@ -219,9 +223,9 @@ The `catalog` crate gains a sequence map paralleling its table/index maps:
 object), mirroring the existing `reserve_table_id`/`reserve_index_id`.
 
 The manifest catalog snapshot (serialized as JSON into the control record) gains
-a `sequences` field. This is an additive change; the catalog-snapshot version is
-bumped and old snapshots deserialize with an empty sequence set
-(`#[serde(default)]`).
+a `sequences` field. This is an additive change carried by `#[serde(default)]` on
+the field (the snapshot is unversioned JSON): an old snapshot deserializes with an
+empty sequence set.
 
 ### 4.2 Runtime: `SequenceManager` (`storage`)
 
@@ -445,9 +449,10 @@ A single implementation plan, sequenced as independently testable commits:
    `ColumnDefault`/`ParsedDefault` enums, migrate `ParsedColumnDef.default` and
    `ColumnDef.default` to them with the `Const` variant preserving today's
    constant behavior, update `fold_constant_default`, `validate_default_value`,
-   the catalog snapshot (version bump + `#[serde(default)]`), and the
-   `build_insert_row` fill step to match on `Const`. Pure refactor — existing
-   DEFAULT tests stay green; `Nextval` has no producer yet.
+   the catalog snapshot (`#[serde(default)]` on the field for additive
+   compatibility — the snapshot is unversioned JSON), and the `build_insert_row`
+   fill step to match on `Const`. Pure refactor — existing DEFAULT tests stay
+   green; `Nextval` has no producer yet.
 2. **Sequence catalog object + DDL.** `SequenceId`/`SequenceSchema`, catalog
    map + allocator + recovery hooks, manifest field, `CreateSequence`/
    `DropSequence` WAL records, `CREATE`/`DROP SEQUENCE` parsing and server DDL
