@@ -398,13 +398,13 @@ impl PageBackedStorageEngine {
     fn append_and_flush_sequence_wal(
         &self,
         mode: StorageMode,
-        ctx: &StatementContext,
+        txn_id: u64,
         kind: WalRecordKind,
     ) -> Result<()> {
         if mode == StorageMode::Normal {
             self.wal.append(WalRecord {
                 lsn: 0,
-                txn_id: ctx.txn_id,
+                txn_id,
                 kind,
             })?;
             self.wal.flush()?;
@@ -1037,13 +1037,12 @@ impl SequenceManager for PageBackedStorageEngine {
     }
 
     fn nextval(&self, txn_id: u64, sequence: SequenceId) -> Result<i64> {
-        let ctx = StatementContext::new(txn_id);
         let (mode, sequence_state) = self.sequence_handle(sequence)?;
         let mut schema = sequence_state.lock_schema()?;
         let next = next_sequence_value(&schema)?;
         self.append_and_flush_sequence_wal(
             mode,
-            &ctx,
+            txn_id,
             WalRecordKind::SequenceAdvance {
                 sequence,
                 value: next,
@@ -1061,13 +1060,12 @@ impl SequenceManager for PageBackedStorageEngine {
         value: i64,
         is_called: bool,
     ) -> Result<i64> {
-        let ctx = StatementContext::new(txn_id);
         let (mode, sequence_state) = self.sequence_handle(sequence)?;
         let mut schema = sequence_state.lock_schema()?;
         validate_sequence_value(&schema, value)?;
         self.append_and_flush_sequence_wal(
             mode,
-            &ctx,
+            txn_id,
             WalRecordKind::SetSequenceValue {
                 sequence,
                 value,
