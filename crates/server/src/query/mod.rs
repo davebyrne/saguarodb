@@ -976,6 +976,13 @@ mod tests {
         fn append(&self, record: WalRecord) -> Result<Lsn> {
             if matches!(record.kind, WalRecordKind::Abort) && self.fail_abort.load(Ordering::SeqCst)
             {
+                // Mirror `FileWalManager::append`: the in-memory `Aborted` status is
+                // recorded even when the durable write fails, so a rollback whose
+                // durable append fails still leaves the writer hidden.
+                self.statuses
+                    .lock()
+                    .unwrap()
+                    .insert(record.txn_id, TxnStatus::Aborted);
                 return Err(DbError::io("injected abort append failure"));
             }
             match record.kind {
@@ -1230,14 +1237,14 @@ mod tests {
     }
 
     #[test]
-    fn rollback_pre_durable_does_not_swallow_abort_append_failure() {
+    fn rollback_pre_durable_survives_abort_append_failure_without_losing_aborted_status() {
         let dir = tempfile::tempdir().unwrap();
         let wal: Arc<dyn WalManager> = Arc::new(FailingAbortWal::new_fail_abort());
         let app = app_with_parts(
             dir.path(),
             Config::default(),
             Arc::new(MemoryCatalog::empty()),
-            wal,
+            wal.clone(),
             Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
             Arc::new(RwLockConcurrencyController::new()),
         );
@@ -1245,15 +1252,26 @@ mod tests {
         let txn_id = 77;
         app.components.active_txns.register(txn_id);
 
+        // A transient failure to append the *durable* Abort record must not take down
+        // the whole server: rollback logs it and completes (best-effort durability;
+        // recovery reconstructs the abort anyway).
         let result = service.rollback_pre_durable(txn_id, None);
-
         assert!(
-            result.is_err(),
-            "abort WAL append failure was swallowed; dirty aborted data can lose its Aborted status"
+            result.is_ok(),
+            "a failed durable Abort append should be logged, not propagated as a fatal rollback error"
         );
+
+        // ...but the transaction must still be recorded `Aborted` in the in-memory CLOG
+        // before it is deregistered, so its dirty (rolled-back) versions never float
+        // past the implicit-committed floor and read as committed.
         assert!(
-            app.components.active_txns.active_ids().contains(&txn_id),
-            "transaction was deregistered even though its Abort record was not recorded"
+            !app.components.active_txns.active_ids().contains(&txn_id),
+            "the rolled-back transaction should be deregistered"
+        );
+        assert_eq!(
+            wal.status(txn_id),
+            TxnStatus::Aborted,
+            "the abort must be recorded in the in-memory CLOG even when the durable append fails"
         );
     }
 

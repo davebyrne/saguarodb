@@ -478,9 +478,11 @@ impl QueryService {
     /// status-based (`docs/specs/mvcc.md` §4 Decision 3,
     /// Milestone D1): the transaction's modified tuples stay in the heap, hidden by
     /// the CLOG and reclaimed by VACUUM — there is NO before-image page undo.
-    /// Dropping `txn` releases the write guard. A pre-durable rollback failure is
-    /// fatal (the engine cannot guarantee consistency), matching the autocommit
-    /// path.
+    /// Dropping `txn` releases the write guard. A failed *durable* `Abort` append is
+    /// best-effort and logged, not fatal — the in-memory `Aborted` status is still
+    /// recorded (`WalManager::append`) and recovery reconstructs the abort. Only a
+    /// failure of the engine-state rollback (storage/buffer/catalog) is fatal, since
+    /// the engine can then no longer guarantee consistency.
     pub(super) fn abort_transaction(&self, txn: Transaction) {
         let txn_id = txn.txn_id;
         let isolation = txn.isolation;
@@ -522,9 +524,11 @@ impl QueryService {
                 txn_id: subxid,
                 kind: WalRecordKind::Abort,
             }) {
-                self.fatal_pre_durable_rollback_failure(DbError::internal(format!(
-                    "failed to append Abort record for subxid {subxid}: {err}"
-                )));
+                // Best-effort durable record (recovery aborts any subxid with no
+                // durable commit); the in-memory `Aborted` status is recorded by the
+                // append itself even on failure, so log and continue rather than
+                // taking down the whole server on a transient WAL write error.
+                eprintln!("failed to append Abort record for subxid {subxid}: {err}");
             }
         }
         self.components.active_txns.deregister_all(subxids);
@@ -722,16 +726,23 @@ impl QueryService {
         txn_id: u64,
         catalog_before: Option<catalog::CatalogSnapshot>,
     ) -> Result<()> {
-        // Record the abort before dropping the transaction from the active set. The
-        // abort is not fsynced here — a transaction with no durable `Commit` is
-        // recovered as aborted — but the append must succeed while the server keeps
-        // running. Otherwise runtime visibility can observe a deregistered writer
-        // whose CLOG state is still `InProgress`.
-        self.components.wal.append(WalRecord {
+        // Record the abort: append an `Abort` record and drop the transaction from
+        // the active set. The abort is not fsynced here — a transaction with no
+        // durable `Commit` is recovered as aborted regardless: recovery's
+        // `resolve_in_flight_as_aborted` marks every replayed-but-unresolved writer
+        // `Aborted` (redo-all + in-flight = aborted, `docs/specs/mvcc.md` §8). A
+        // failure to append the durable record is logged but not fatal — the WAL still
+        // records the `Aborted` status in the in-memory CLOG before returning the
+        // error (`FileWalManager::append`), so the deregistered writer stays hidden
+        // and never floats past the implicit-committed floor. Crashing the whole
+        // server on a transient WAL write error would drop every other connection.
+        if let Err(err) = self.components.wal.append(WalRecord {
             lsn: 0,
             txn_id,
             kind: WalRecordKind::Abort,
-        })?;
+        }) {
+            eprintln!("failed to append Abort record for txn {txn_id}: {err}");
+        }
         self.components.active_txns.deregister(txn_id);
         // Wake any writer blocked on this aborted transaction's row locks.
         self.components.lock_manager.on_txn_finished();

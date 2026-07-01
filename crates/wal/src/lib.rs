@@ -18,6 +18,20 @@ use common::{Lsn, Result, TxnId, TxnStatusView};
 /// predicate (`docs/specs/mvcc.md` §6) with no extra handle. Implementors satisfy
 /// it by exposing their CLOG status (`Clog: TxnStatusView` does the work).
 pub trait WalManager: Send + Sync + TxnStatusView {
+    /// Append `record` to the log and return its assigned LSN. The record is not
+    /// durable until [`WalManager::flush`].
+    ///
+    /// **`Abort` contract (load-bearing).** An `Abort` record MUST record the
+    /// in-memory `CLOG[txn] = Aborted` status *regardless of whether the durable
+    /// write succeeds* — i.e. even when this method returns `Err`. Abort durability
+    /// is best-effort (a transaction with no durable `Commit` recovers as aborted
+    /// anyway, `docs/specs/mvcc.md` §8), so rollback callers log-and-continue on
+    /// `Err` (`crates/server/src/query/txn.rs`). They rely on this contract: without
+    /// the eager in-memory `Aborted` mark, a deregistered writer whose dirty pages
+    /// reached disk would be unrecorded and a later checkpoint could float the
+    /// implicit-committed floor past it, making its rolled-back versions read as
+    /// committed (the `Clog::live_snapshot` precondition). `Commit` records, by
+    /// contrast, only affect the CLOG once durable (staged pending until `flush`).
     fn append(&self, record: WalRecord) -> Result<Lsn>;
     fn flush(&self) -> Result<Lsn>;
     /// Replay every retained record after `lsn`, in LSN order. Redo-all recovery

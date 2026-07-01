@@ -490,8 +490,12 @@ Committed**.
   and deregisters the transaction.
 - `ROLLBACK` (or any statement error) appends an `Abort` record, sets
   `CLOG[t] = Aborted`, deregisters, and runs metadata/bookkeeping cleanup; versions
-  become invisible (no page undo). The transaction is not deregistered if the
-  `Abort` append fails.
+  become invisible (no page undo). The `Abort` record is best-effort durability (a
+  transaction with no durable `Commit` recovers as aborted anyway, §8), so a failed
+  durable append is logged, not fatal — the whole server must not go down on a
+  transient WAL write error. The in-memory `CLOG[t] = Aborted` is recorded even when
+  that durable append fails, so the deregistered writer's rolled-back versions stay
+  hidden and never float past the implicit-committed floor (§5.4).
 - **Autocommit** is an implicit `BEGIN ... COMMIT` around one statement, routed
   through the same machinery (generalizing today's `execute_write_bound` in
   `crates/server/src/query.rs`).

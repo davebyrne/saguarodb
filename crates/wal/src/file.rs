@@ -174,6 +174,21 @@ impl WalManager for FileWalManager {
         record.lsn = assigned_lsn;
 
         let bytes = encode_record(&record)?;
+
+        // Record an `Abort` in the in-memory CLOG *before* the fallible durable write.
+        // Recording an abort eagerly is safe (a transaction with no durable `Commit`
+        // recovers as aborted anyway), and it is also required for correctness: a
+        // rollback whose durable `Abort` append fails still deregisters the writer
+        // (best-effort durability, `docs/specs/mvcc.md` §8). Without the in-memory
+        // `Aborted` status, that deregistered writer — whose dirty pages may already
+        // have been stolen to disk — is unrecorded, and a later checkpoint could float
+        // the implicit-committed floor past it so its rolled-back versions read as
+        // committed (the `Clog::live_snapshot` precondition). Marking it here keeps the
+        // status even when the write below returns `Err`.
+        if matches!(record.kind, WalRecordKind::Abort) {
+            state.clog.set_aborted(record.txn_id);
+        }
+
         let start_offset = state.file.stream_position().map_err(|err| {
             DbError::io(format!(
                 "failed to record WAL append offset {}: {err}",
@@ -236,12 +251,9 @@ impl WalManager for FileWalManager {
                     state.pending_commits.insert(*sub);
                 }
             }
-            // Abort is not fsync-gated: recording it eagerly is safe because a
-            // transaction with no durable commit is recovered as aborted anyway.
+            // `Abort` is recorded in the in-memory CLOG above, before the fallible
+            // write, so the status survives a failed durable append.
             // (`ROLLBACK TO` appends one Abort per rolled-back subxid this way.)
-            WalRecordKind::Abort => {
-                state.clog.set_aborted(record.txn_id);
-            }
             _ => {}
         }
         state.next_lsn += 1;
@@ -934,6 +946,31 @@ mod tests {
         // The reclaimed abort 11 (< 13) is now implicit-committed, not explicit.
         assert!(!snapshot.aborted.contains(&11));
         assert_eq!(snapshot.committed_floor, 13);
+    }
+
+    #[test]
+    fn abort_append_records_status_even_when_the_durable_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = FileWalManager::open(dir.path().join("wal.dat")).unwrap();
+
+        // Inject a failure in the append of the Abort record (best-effort durability).
+        wal.fail_next_post_write_seek_for_test("injected abort append failure");
+        let result = wal.append(WalRecord {
+            lsn: 0,
+            txn_id: 42,
+            kind: WalRecordKind::Abort,
+        });
+
+        assert!(
+            result.is_err(),
+            "the injected durable write failure surfaces"
+        );
+        // The in-memory CLOG must still record the abort: a rollback that logs this
+        // error and deregisters the writer relies on it staying hidden.
+        assert!(
+            wal.is_aborted(42),
+            "abort status must be recorded in the CLOG even when the durable append fails"
+        );
     }
 
     #[test]
