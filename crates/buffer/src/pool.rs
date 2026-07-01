@@ -54,7 +54,7 @@ pub struct PageWriteGuard {
     frame: Arc<Frame>,
     guard: PageWriteLatch,
     unpublished_new: bool,
-    bytes_published: bool,
+    published: bool,
 }
 
 impl PageWriteGuard {
@@ -70,9 +70,23 @@ impl PageWriteGuard {
         &self.guard.0
     }
 
+    /// Mutable access to the page's bytes. A pure accessor: it does NOT change the
+    /// page's published state. A freshly allocated (`new_page`) page must call
+    /// [`PageWriteGuard::publish`] once its existence is durably logged — writing
+    /// bytes here is not what makes it unabandonable.
     pub fn data_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
-        self.bytes_published = true;
         &mut self.guard.0
+    }
+
+    /// Mark a freshly allocated (`new_page`) page as durably referenced: call this
+    /// once the WAL record that makes the page real (`HeapInit`, or the page's first
+    /// `FullPageImage`) has been appended. After this,
+    /// [`BufferPool::abandon_unpublished_new_page`] rejects the page — its number can
+    /// no longer be reclaimed, because a durable record now points at it. Consulted
+    /// only for `new_page` pages (a `write_page` page is already not
+    /// `unpublished_new`, so abandon rejects it regardless).
+    pub fn publish(&mut self) {
+        self.published = true;
     }
 
     /// Atomically take the "needs full-page image" flag for this page, returning
@@ -538,9 +552,9 @@ impl BufferPool for MemoryBufferPool {
                 "cannot abandon page that was not returned by new_page: file_id={file_id}, page_num={page_num}"
             )));
         }
-        if guard.bytes_published {
+        if guard.published {
             return Err(Self::storage_internal_error(format!(
-                "cannot abandon page after mutable bytes were published: file_id={file_id}, page_num={page_num}"
+                "cannot abandon page after it was published: file_id={file_id}, page_num={page_num}"
             )));
         }
         let mut state = self.state.lock();
@@ -980,7 +994,7 @@ fn write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -> PageWri
         frame,
         guard,
         unpublished_new: false,
-        bytes_published: false,
+        published: false,
     }
 }
 
@@ -992,7 +1006,7 @@ fn new_page_write_guard(file_id: FileId, page_num: PageNum, frame: Arc<Frame>) -
         frame,
         guard,
         unpublished_new: true,
-        bytes_published: false,
+        published: false,
     }
 }
 
@@ -1154,17 +1168,39 @@ mod tests {
     }
 
     #[test]
-    fn abandon_unpublished_new_page_rejects_after_bytes_are_published() {
+    fn abandon_unpublished_new_page_rejects_after_publish() {
         let pool = MemoryBufferPool::empty(8);
 
         let mut page = pool.new_page(1, 7).unwrap();
         let page_num = page.page_num();
         page.data_mut()[0] = 42;
+        // Once published (its WAL record is logged), the page can no longer be
+        // abandoned — a durable record now references it.
+        page.publish();
 
         let err = pool.abandon_unpublished_new_page(page).unwrap_err();
-        assert!(err.message.contains("mutable bytes were published"));
+        assert!(err.message.contains("after it was published"));
         assert_eq!(pool.read_page(1, page_num).unwrap().data()[0], 42);
         assert!(!pool.is_page_abandoned(1, page_num));
+    }
+
+    #[test]
+    fn abandon_unpublished_new_page_allows_writing_bytes_before_publish() {
+        let pool = MemoryBufferPool::empty(8);
+
+        let mut page = pool.new_page(1, 7).unwrap();
+        let page_num = page.page_num();
+        // Touching the bytes (to inspect, zero, or edit in place) before the page is
+        // published must NOT forfeit abandonment: `data_mut` is a pure accessor with
+        // no hidden side effect. This is the allocation-rollback path — the WAL record
+        // that would publish the page never landed.
+        page.data_mut()[0] = 42;
+
+        // Abandon succeeds and the tail page number is reclaimed for reuse.
+        pool.abandon_unpublished_new_page(page).unwrap();
+        assert_eq!(pool.page_count(1).unwrap(), 0);
+        let reused = pool.new_page(1, 8).unwrap();
+        assert_eq!(reused.page_num(), page_num);
     }
 
     #[test]

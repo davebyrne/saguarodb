@@ -71,6 +71,9 @@ impl PageBackedStorageEngine {
                 return Err(err);
             }
         };
+        // The HeapInit record now durably references this page: it can no longer be
+        // abandoned, only reclaimed by VACUUM after its tuples die.
+        writable.publish();
         page::init_page(writable.data_mut(), page_num);
         page::set_page_lsn(writable.data_mut(), init_lsn);
         let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;

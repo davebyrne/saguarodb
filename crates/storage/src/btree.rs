@@ -704,7 +704,12 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         image: PageImage,
     ) -> Result<()> {
         match self.log_full_page(txn_id, &mut guard, image) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The FullPageImage now durably references this freshly allocated
+                // page: it can no longer be abandoned, only reclaimed by VACUUM.
+                guard.publish();
+                Ok(())
+            }
             Err(err) => {
                 self.abandon_unpublished_new_page(guard)?;
                 Err(err)
