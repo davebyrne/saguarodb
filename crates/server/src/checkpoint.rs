@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use catalog::serialize_catalog;
-use common::{DbError, Result, TableId};
+use common::{Result, TableId};
 use wal::{WalRecord, WalRecordKind};
 
 use crate::app::ServerComponents;
@@ -104,14 +104,31 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     tables.sort_unstable();
     let mut snapshot = components.catalog.snapshot()?;
     for live in components.storage.sequence_schemas_for_checkpoint()? {
-        let Some(sequence) = snapshot.sequences_by_id.get_mut(&live.id) else {
-            return Err(DbError::internal(format!(
-                "storage sequence {} is missing from catalog checkpoint snapshot",
-                live.id
-            )));
-        };
-        sequence.last_value = live.last_value;
-        sequence.is_called = live.is_called;
+        match snapshot.sequences_by_id.get_mut(&live.id) {
+            // Storage is authoritative for the runtime sequence value; fold it into
+            // the catalog snapshot's schema entry before it is persisted.
+            Some(sequence) => {
+                sequence.last_value = live.last_value;
+                sequence.is_called = live.is_called;
+            }
+            // A sequence tracked by storage but absent from the catalog snapshot
+            // should be impossible: CREATE/DROP SEQUENCE update both under the
+            // exclusive checkpoint guard. If they ever diverge, reconcile from
+            // storage (the authoritative source, `owned`/options included) rather
+            // than failing the whole checkpoint — a hard error here is swallowed by
+            // the post-commit trigger, which would silently stall checkpointing and
+            // grow the WAL without bound. All three coupled sequence fields must be
+            // kept consistent or the persisted snapshot fails `validate_snapshot` on
+            // reload (the name index and `next_sequence_id` high-water mark).
+            None => {
+                snapshot
+                    .sequences_by_name
+                    .insert(live.name.clone(), live.id);
+                snapshot.next_sequence_id =
+                    snapshot.next_sequence_id.max(live.id.saturating_add(1));
+                snapshot.sequences_by_id.insert(live.id, live);
+            }
+        }
     }
     let catalog_bytes = serialize_catalog(&snapshot)?;
     components

@@ -143,6 +143,62 @@ async fn serial_sequence_survives_restart_with_checkpoint_and_wal() {
 }
 
 #[tokio::test]
+async fn checkpoint_reconciles_a_storage_only_sequence_instead_of_failing() {
+    // A checkpoint must not hard-fail (only to be silently swallowed by the
+    // post-commit trigger, stalling checkpointing and growing the WAL) if storage
+    // tracks a sequence the catalog snapshot lacks. It reconciles from storage — and
+    // the reconciliation must keep all three coupled snapshot fields consistent, or
+    // the persisted catalog fails `validate_snapshot` and the server cannot reopen.
+    let dir = tempfile::tempdir().unwrap();
+    let config = saguarodb_server::config::Config {
+        data_dir: dir.path().to_path_buf(),
+        port: 0,
+        ..Default::default()
+    };
+
+    {
+        let app = saguarodb_server::recovery::open_app(config.clone()).unwrap();
+        // A one-row anchor table to evaluate `nextval` against after restart
+        // (SELECT requires a FROM in v1).
+        app.query_service
+            .execute_sql("create table anchor (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into anchor (id) values (1)")
+            .unwrap();
+        // Inject a sequence into storage only (no catalog entry) — the "impossible"
+        // divergence the checkpoint must tolerate.
+        app.components
+            .storage
+            .install_sequences(vec![common::SequenceSchema {
+                id: 5,
+                name: "ghost_seq".to_string(),
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                start: 1,
+                cycle: false,
+                owned: false,
+                last_value: 42,
+                is_called: true,
+            }])
+            .unwrap();
+        // Must succeed rather than hard-error on the divergence.
+        saguarodb_server::checkpoint::run_checkpoint(&app.components).unwrap();
+    }
+
+    // Reopen exercises `validate_snapshot` on the persisted catalog: an incomplete
+    // reconciliation (id index only) would reject it and refuse to start.
+    let app = saguarodb_server::recovery::open_app(config).unwrap();
+    // The reconciled sequence survives restart and is usable (nextval past 42 = 43).
+    let result = app
+        .query_service
+        .execute_sql("select nextval('ghost_seq') from anchor")
+        .expect("the reconciled storage-only sequence survives restart");
+    assert_eq!(result.row_count(), 1);
+}
+
+#[tokio::test]
 async fn committed_multi_statement_transaction_survives_restart() {
     // A committed explicit transaction's statements all share one txn_id with a
     // single durable Commit. Redo-all replays every record and the CLOG marks the
