@@ -10,6 +10,7 @@ pub mod ids;
 pub mod interval;
 pub mod mvcc;
 pub mod numeric;
+pub mod pg_type;
 pub mod row;
 pub mod schema;
 pub mod uuid;
@@ -36,6 +37,7 @@ pub use mvcc::{
     is_dead_to_all, is_visible, version_conflicts, write_conflict,
 };
 pub use numeric::{Decimal, RoundingStrategy};
+pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
     ColumnDef, ColumnDefault, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, ParsedDefault,

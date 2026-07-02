@@ -833,6 +833,50 @@ fn protocol_error(message: impl Into<String>) -> DbError {
 }
 
 #[cfg(test)]
+mod pg_type_mapping_tests {
+    use super::postgres_type;
+    use common::{DataType, PgType};
+
+    /// Guard against drift between the new `PgType` wire mapping and the legacy
+    /// `postgres_type` mapping while both coexist during the migration: the
+    /// label-free `PgType::from(&dt)` must report the same OID *and* `typlen` as
+    /// `postgres_type(&dt)` for every `DataType` (both halves feed
+    /// `RowDescription`). Once the codec routes through `PgType` and
+    /// `postgres_type` is removed, this simply pins that equivalence.
+    #[test]
+    fn pg_type_fallback_matches_legacy_postgres_type() {
+        let types = [
+            DataType::Integer,
+            DataType::Text,
+            DataType::Boolean,
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Time,
+            DataType::TimestampTz,
+            DataType::Interval,
+            DataType::Bytea,
+            DataType::Uuid,
+            DataType::Double,
+            DataType::Real,
+            DataType::Numeric {
+                precision: Some(10),
+                scale: 2,
+            },
+            DataType::Numeric {
+                precision: None,
+                scale: 0,
+            },
+        ];
+        for data_type in types {
+            let pg_type = PgType::from(&data_type);
+            let (oid, typlen) = postgres_type(&data_type);
+            assert_eq!(pg_type.oid(), oid, "OID drift for {data_type:?}");
+            assert_eq!(pg_type.typlen(), typlen, "typlen drift for {data_type:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod date_value_tests {
     use super::{decode_value, encode_value};
     use common::{DataType, Value};
