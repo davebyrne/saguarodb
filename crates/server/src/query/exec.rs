@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::{CopyDirection, DbError, IsolationLevel, Result, SessionSequenceState, SqlState};
-use executor::{CopyJob, ExecutionResult};
+use executor::{CopyJob, ExecutionResult, RowSink};
 use parser::Statement;
 use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
 
 use super::{
-    BindSource, QueryService, StatementClass, StatementRuntime, Transaction, WriteUnitGuard,
-    classify_bound, dead_versions_in, mark_failed_on_error, run_plan, statement_class,
+    BindSource, QueryService, StatementClass, StatementRuntime, StreamOutcome, Transaction,
+    WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream, mark_failed_on_error,
+    run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -25,7 +26,11 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        // `Some` streams a `SELECT`'s rows into the sink; `None` materializes.
+        // Only the data (read/write) arms consult it; every other arm ignores it
+        // and returns `StreamOutcome::Direct`.
+        sink: Option<&mut dyn RowSink>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let class = match statement_class(&statement) {
             Ok(class) => class,
             Err(err) => {
@@ -37,14 +42,18 @@ impl QueryService {
         };
 
         if let StatementClass::TransactionControl(kind) = class {
-            return self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            let (slot, default_isolation, result) =
+                self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         // Savepoints (SAVEPOINT / RELEASE / ROLLBACK TO) drive the session's
         // transaction lifecycle like transaction control; the op + name are read
         // from the parsed statement (`docs/specs/savepoints.md`).
         if let StatementClass::Savepoint = class {
-            return self.handle_savepoint(statement, slot, default_isolation);
+            let (slot, default_isolation, result) =
+                self.handle_savepoint(statement, slot, default_isolation);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         // VACUUM is a maintenance command: it does not bind/plan, and like DDL it is
@@ -63,7 +72,11 @@ impl QueryService {
                     )),
                 );
             }
-            return (None, default_isolation, self.run_vacuum(statement));
+            return (
+                None,
+                default_isolation,
+                self.run_vacuum(statement).map(StreamOutcome::Direct),
+            );
         }
 
         // COPY is bound here (resolve table/columns) but not executed: it returns a
@@ -71,19 +84,21 @@ impl QueryService {
         // the COPY sub-protocol. The transaction slot passes through unchanged; the
         // COPY's own transaction work happens in the streaming driver.
         if let StatementClass::Copy(direction) = class {
-            return self.dispatch_copy(direction, statement, slot, default_isolation);
+            let (slot, default_isolation, result) =
+                self.dispatch_copy(direction, statement, slot, default_isolation);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         match slot {
             // A data statement with an open explicit transaction runs inside it.
             Some(txn) => {
                 let (slot, result) =
-                    self.run_in_transaction(txn, class, statement, cancel, session_sequences);
+                    self.run_in_transaction(txn, class, statement, cancel, session_sequences, sink);
                 (slot, default_isolation, result)
             }
             // No open transaction: this is an autocommit unit.
             None => {
-                let result = self.run_autocommit(class, statement, cancel, session_sequences);
+                let result = self.run_autocommit(class, statement, cancel, session_sequences, sink);
                 (None, default_isolation, result)
             }
         }
@@ -149,13 +164,15 @@ impl QueryService {
         statement: Statement,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        sink: Option<&mut dyn RowSink>,
+    ) -> (Option<Transaction>, Result<StreamOutcome>) {
         self.run_bound_in_transaction(
             txn,
             class,
             BindSource::Unbound(statement),
             cancel,
             session_sequences,
+            sink,
         )
     }
 
@@ -172,7 +189,8 @@ impl QueryService {
         source: BindSource,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> (Option<Transaction>, Result<ExecutionResult>) {
+        sink: Option<&mut dyn RowSink>,
+    ) -> (Option<Transaction>, Result<StreamOutcome>) {
         // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
         // `handle_transaction_control`, never reaching here).
         if txn.failed {
@@ -258,22 +276,35 @@ impl QueryService {
             StatementRuntime::new(cancel, session_sequences),
         );
 
-        let result = run_plan(&self.engine, &ctx, bound, self.components.catalog.as_ref());
+        // Only a read (a plain `SELECT`) streams; a write is materialized, so the
+        // sink is withheld from `run_plan` for writes and the executor is never
+        // asked to stream a DML plan.
+        let read_sink = if is_write { None } else { sink };
+        let result = run_plan(
+            &self.engine,
+            &ctx,
+            bound,
+            self.components.catalog.as_ref(),
+            read_sink,
+        );
         // The snapshot can no longer be used to read once `run_plan` has returned;
         // drop the per-statement advertisement now (a no-op under Repeatable Read).
         drop(ctx);
         drop(advertised);
         match result {
-            Ok(result) => {
+            Ok(outcome) => {
                 // Accumulate this statement's dead-version count on the transaction
                 // (`docs/specs/mvcc.md` §9, F4b). It is folded into the server-wide
                 // auto-prune counter only when the transaction COMMITS durably; on
                 // ROLLBACK it is discarded (the dead versions then belong to this
                 // transaction's own aborted writes, not to committed deletes/updates).
-                txn.dead_versions_pending = txn
-                    .dead_versions_pending
-                    .saturating_add(dead_versions_in(&result));
-                (Some(txn), Ok(result))
+                // A streamed outcome is always a read, which leaves no dead versions.
+                let dead = match &outcome {
+                    StreamOutcome::Streamed => 0,
+                    StreamOutcome::Direct(result) => dead_versions_in(result),
+                };
+                txn.dead_versions_pending = txn.dead_versions_pending.saturating_add(dead);
+                (Some(txn), Ok(outcome))
             }
             Err(err) => {
                 // Any statement error poisons the transaction: it enters 'E' and
@@ -296,21 +327,26 @@ impl QueryService {
         statement: Statement,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> Result<ExecutionResult> {
+        sink: Option<&mut dyn RowSink>,
+    ) -> Result<StreamOutcome> {
         match class {
             StatementClass::Read => {
                 let bound = bind(&statement, self.components.catalog.as_ref())?;
                 match classify_bound(class, &bound) {
-                    StatementClass::Read => self.autocommit_read(bound, cancel, session_sequences),
-                    StatementClass::Write => {
-                        self.autocommit_bound_write(bound, cancel, session_sequences)
+                    StatementClass::Read => {
+                        self.autocommit_read(bound, cancel, session_sequences, sink)
                     }
+                    // A read promoted to a write (e.g. `SELECT nextval(...)`) is
+                    // materialized, not streamed.
+                    StatementClass::Write => self
+                        .autocommit_bound_write(bound, cancel, session_sequences)
+                        .map(StreamOutcome::Direct),
                     _ => unreachable!("classify_bound only promotes reads to writes"),
                 }
             }
-            StatementClass::Write | StatementClass::Ddl => {
-                self.autocommit_write(statement, cancel, session_sequences)
-            }
+            StatementClass::Write | StatementClass::Ddl => self
+                .autocommit_write(statement, cancel, session_sequences)
+                .map(StreamOutcome::Direct),
             // Maintenance (VACUUM) never reaches here: `dispatch` runs it via
             // `run_vacuum` before the autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
@@ -343,9 +379,10 @@ impl QueryService {
         bound: BoundStatement,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> Result<ExecutionResult> {
+        sink: Option<&mut dyn RowSink>,
+    ) -> Result<StreamOutcome> {
         if let BoundStatement::Explain(inner) = &bound {
-            return self.explain(inner.as_ref());
+            return self.explain(inner.as_ref()).map(StreamOutcome::Direct);
         }
         // A read is not its own transaction (txn_id 0 / INVALID_XID), so no own
         // txn is excluded; the snapshot sees all committed rows and skips any
@@ -371,7 +408,10 @@ impl QueryService {
         );
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
-        self.engine.execute(&ctx, &physical)
+        // `_advertised` is held across the drive (including any producer block on a
+        // full channel) and dropped when this returns, exactly as on the
+        // materializing path (`docs/specs/streaming.md` §5).
+        exec_or_stream(&self.engine, &ctx, &physical, sink)
     }
 
     /// Execute a write/DDL statement as an autocommit unit, committing durably on

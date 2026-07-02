@@ -1,8 +1,11 @@
-use common::{ColumnInfo, DataType, DbError, Result};
+use common::{ColumnInfo, DataType, DbError, Result, Row};
 use executor::ExecutionResult;
 use protocol::{PostgresCodec, ServerMessage};
 use std::ops::ControlFlow;
 use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
+
+use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
     Session, TransactionState, command_complete_tag, encode_row, error_response, write_messages,
@@ -44,32 +47,77 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session_sequences = self.session_sequences.clone();
+        // A SELECT streams its rows through this bounded channel: the blocking
+        // producer sends `Start` (columns) then `Rows` batches; this async task
+        // drains them to the socket while the producer runs, giving TCP
+        // backpressure and a bounded memory ceiling (`docs/specs/streaming.md` §4).
+        let (row_tx, mut row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
         // Move the session's transaction slot AND default isolation into the blocking
         // task so the whole statement (including any owned write guard) runs on one
-        // thread, then take them both back along with the result. The default is
+        // thread, then take them both back along with the outcome. The default is
         // threaded in/out like the slot so `SET SESSION CHARACTERISTICS` persists it
         // and a new `BEGIN` inherits it (`docs/specs/mvcc.md` §10 Milestone G2).
         let txn = self.txn.take();
         let default_isolation = self.default_isolation;
+        // Do NOT await the task yet: it must run while we drain `row_rx`, or a
+        // result larger than the channel would deadlock (producer blocked on a full
+        // channel, consumer not yet reading).
         let task = tokio::task::spawn_blocking(move || {
-            service.execute_simple_with_session_sequences(
+            service.execute_simple_streamed(
                 &sql,
                 txn,
                 default_isolation,
                 &cancel,
                 session_sequences,
+                row_tx,
             )
-        })
-        .await;
-        // `guard` (the in-flight-query guard) is dropped per result arm below: the
-        // normal arms drop it before writing the response (the query work is done);
-        // the COPY arms hand it to the streaming driver so the COPY keeps counting
-        // as in-flight for its whole lifetime (graceful-shutdown coordination).
-        let result = match task {
-            Ok((txn, default_isolation, result)) => {
+        });
+
+        // Stream rows to the socket as they arrive. `RowDescription` comes from the
+        // first `Start` message; a socket-write or encode failure stops the drain
+        // and is surfaced only after the task is joined (so the transaction slot is
+        // never lost).
+        let mut row_count: usize = 0;
+        let mut write_err: Option<DbError> = None;
+        while let Some(message) = row_rx.recv().await {
+            let write_result = match message {
+                StreamMessage::Start { columns } => {
+                    write_messages(
+                        stream,
+                        codec,
+                        &[ServerMessage::RowDescription {
+                            columns,
+                            formats: Vec::new(),
+                        }],
+                    )
+                    .await
+                }
+                StreamMessage::Rows(rows) => match encode_data_rows(&rows) {
+                    Ok(messages) => {
+                        row_count += rows.len();
+                        write_messages(stream, codec, &messages).await
+                    }
+                    Err(err) => Err(err),
+                },
+            };
+            if let Err(err) = write_result {
+                write_err = Some(err);
+                break;
+            }
+        }
+        // Drop the receiver so the producer's next `blocking_send` fails fast if we
+        // broke out early (matching the COPY-out driver).
+        drop(row_rx);
+
+        // `guard` (the in-flight-query guard) is held across the whole stream and
+        // released per arm below: the normal arms drop it before the terminal
+        // message; the COPY arms hand it to the streaming driver so the COPY keeps
+        // counting as in-flight for its whole lifetime (graceful-shutdown).
+        let outcome = match task.await {
+            Ok((txn, default_isolation, outcome)) => {
                 self.txn = txn;
                 self.default_isolation = default_isolation;
-                result
+                outcome
             }
             Err(join_err) => {
                 // The blocking task panicked and lost the transaction slot. Treat
@@ -83,18 +131,43 @@ impl Session {
         };
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
-        match result {
+
+        // A socket-write or encode failure while streaming means the connection is
+        // broken; surface it (closing the connection) rather than trying to write a
+        // terminal message the client cannot receive.
+        if let Some(err) = write_err {
+            drop(guard);
+            return Err(err);
+        }
+
+        match outcome {
+            // A streamed SELECT: `RowDescription` and `DataRow`s were already
+            // written above; finish with the command tag and status.
+            Ok(StreamOutcome::Streamed) => {
+                drop(guard);
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        ServerMessage::CommandComplete(format!("SELECT {row_count}")),
+                        ServerMessage::ReadyForQuery(status),
+                    ],
+                )
+                .await?
+            }
             // COPY enters its sub-protocol instead of returning a finished result:
             // `BeginCopyIn` spawns the streaming insert and routes subsequent
             // CopyData; `BeginCopyOut` streams the table out inline. Both recompute
             // the transaction status themselves, so the `status` above is unused here.
-            Ok(ExecutionResult::BeginCopyIn(job)) => {
+            Ok(StreamOutcome::Direct(ExecutionResult::BeginCopyIn(job))) => {
                 self.begin_copy_in(stream, codec, job, guard).await?
             }
-            Ok(ExecutionResult::BeginCopyOut(job)) => {
+            Ok(StreamOutcome::Direct(ExecutionResult::BeginCopyOut(job))) => {
                 self.run_copy_out(stream, codec, job, guard).await?
             }
-            Ok(result) => {
+            // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
+            // never lands here because reads stream when a sink is supplied.
+            Ok(StreamOutcome::Direct(result)) => {
                 drop(guard);
                 write_execution_result(stream, codec, result, status).await?
             }
@@ -110,6 +183,14 @@ impl Session {
         }
         Ok(ControlFlow::Continue(()))
     }
+}
+
+/// Encode a batch of result rows as `DataRow` messages in the simple-query
+/// protocol's default (text) format.
+fn encode_data_rows(rows: &[Row]) -> Result<Vec<ServerMessage>> {
+    rows.iter()
+        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, &[])?)))
+        .collect()
 }
 
 /// Write the result of a simple query, terminated by a `ReadyForQuery` carrying

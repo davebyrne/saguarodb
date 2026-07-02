@@ -6,22 +6,27 @@ use common::{
     CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, Result,
     SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
 };
-use executor::{ExecutionContext, ExecutionResult, QueryEngine};
+use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
 use planner::{
     BoundStatement, bind_parameterized, format_explain, logical_plan, mutates_sequences,
     physical_plan, substitute_params,
 };
 
+use tokio::sync::mpsc;
+
 use crate::app::ServerComponents;
 use crate::registry::AdvertisedSnapshot;
 
 mod copy;
 mod exec;
+mod stream;
 mod txn;
 mod vacuum;
 
 pub use copy::CopyInChunk;
+use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
+pub use stream::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 use txn::StatementRuntime;
 pub(crate) use vacuum::full_vacuum_pass;
 
@@ -218,7 +223,56 @@ impl QueryService {
             // session default is unchanged by a failed parse.
             Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
         };
-        self.dispatch(parsed, slot, default_isolation, cancel, session_sequences)
+        // No row sink: every SELECT materializes into `ExecutionResult::Query`, so
+        // the outcome is always `Direct`.
+        let (slot, default_isolation, result) = self.dispatch(
+            parsed,
+            slot,
+            default_isolation,
+            cancel,
+            session_sequences,
+            None,
+        );
+        (
+            slot,
+            default_isolation,
+            result.map(StreamOutcome::expect_direct),
+        )
+    }
+
+    /// The streaming counterpart of [`Self::execute_simple_with_session_sequences`]:
+    /// a `SELECT` streams its rows through `row_tx` (as `StreamMessage::Start`
+    /// followed by `StreamMessage::Rows` batches) and returns
+    /// [`StreamOutcome::Streamed`]; every other statement returns
+    /// [`StreamOutcome::Direct`] with its full result, untouched. The blocking
+    /// producer owns the executor and the channel sender for the whole call, so
+    /// the snapshot's GC-horizon advertisement and any transaction guard are held
+    /// across the stream, exactly as on the materializing path
+    /// (`docs/specs/streaming.md` §4, §5).
+    pub fn execute_simple_streamed(
+        &self,
+        sql: &str,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+        row_tx: mpsc::Sender<StreamMessage>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+        let parsed = match parser::parse(sql) {
+            Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
+            Ok(parsed) => parsed,
+        };
+        // The sink owns `row_tx` for the whole dispatch; when it drops (as this
+        // function returns) the channel closes, ending the consumer's drain loop.
+        let mut sink = ChannelRowSink::new(row_tx);
+        self.dispatch(
+            parsed,
+            slot,
+            default_isolation,
+            cancel,
+            session_sequences,
+            Some(&mut sink),
+        )
     }
 
     /// Backwards-compatible autocommit entry point: run one SQL string with no
@@ -365,7 +419,11 @@ impl QueryService {
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
             StatementClass::Read => match class {
-                StatementClass::Read => self.autocommit_read(bound, cancel, session_sequences),
+                // The extended protocol still materializes here; streaming its
+                // `Execute` is a later task, so no sink is supplied.
+                StatementClass::Read => self
+                    .autocommit_read(bound, cancel, session_sequences, None)
+                    .map(StreamOutcome::expect_direct),
                 StatementClass::Write => {
                     self.autocommit_bound_write(bound, cancel, session_sequences)
                 }
@@ -451,14 +509,20 @@ impl QueryService {
         match slot {
             Some(txn) => {
                 let class = classify_bound(prepared.class, &bound);
+                // Extended-protocol `Execute` still materializes; no sink.
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
                     class,
                     BindSource::Bound(bound),
                     cancel,
                     session_sequences,
+                    None,
                 );
-                (slot, default_isolation, result)
+                (
+                    slot,
+                    default_isolation,
+                    result.map(StreamOutcome::expect_direct),
+                )
             }
             // No open transaction: fall back to an autocommit unit (the connection
             // routes here only when a transaction is open, but keep this total so
@@ -468,9 +532,9 @@ impl QueryService {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
                         match class {
-                            StatementClass::Read => {
-                                self.autocommit_read(bound, cancel, session_sequences)
-                            }
+                            StatementClass::Read => self
+                                .autocommit_read(bound, cancel, session_sequences, None)
+                                .map(StreamOutcome::expect_direct),
                             StatementClass::Write => {
                                 self.autocommit_bound_write(bound, cancel, session_sequences)
                             }
@@ -548,7 +612,8 @@ fn run_plan(
     ctx: &ExecutionContext<'_>,
     bound: BoundStatement,
     catalog: &dyn catalog::CatalogManager,
-) -> Result<ExecutionResult> {
+    sink: Option<&mut dyn RowSink>,
+) -> Result<StreamOutcome> {
     if let BoundStatement::Explain(inner) = &bound {
         if !matches!(inner.as_ref(), BoundStatement::Query(_)) {
             return Err(DbError::plan(
@@ -558,16 +623,41 @@ fn run_plan(
         }
         let logical = logical_plan(inner.as_ref())?;
         let physical = physical_plan(&logical, catalog)?;
-        return Ok(ExecutionResult::Explanation {
+        return Ok(StreamOutcome::Direct(ExecutionResult::Explanation {
             text: format_explain(&physical),
-        });
+        }));
     }
     let logical = logical_plan(&bound)?;
     let physical = physical_plan(&logical, catalog)?;
-    let result = catch_unwind(AssertUnwindSafe(|| engine.execute(ctx, &physical)));
+    // The caller only supplies a sink for a read (a `SELECT`); a write plan is
+    // materialized (`sink` is `None`), so `exec_or_stream` never asks the executor
+    // to stream a DML plan. The panic firewall wraps both paths.
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        exec_or_stream(engine, ctx, &physical, sink)
+    }));
     match result {
         Ok(result) => result,
         Err(_) => Err(DbError::internal("statement execution panicked")),
+    }
+}
+
+/// Execute a resolved read plan either by materializing it into an
+/// `ExecutionResult::Query` (`sink` is `None`) or by streaming its rows into the
+/// sink (`docs/specs/streaming.md` §4.2). The two read-execution sites
+/// ([`run_plan`] and `autocommit_read`) share this so the stream/materialize
+/// choice lives in exactly one place.
+fn exec_or_stream(
+    engine: &QueryEngine,
+    ctx: &ExecutionContext<'_>,
+    physical: &planner::PhysicalPlan,
+    sink: Option<&mut dyn RowSink>,
+) -> Result<StreamOutcome> {
+    match sink {
+        Some(sink) => {
+            engine.execute_query_streamed(ctx, physical, sink, STREAM_BATCH_ROWS)?;
+            Ok(StreamOutcome::Streamed)
+        }
+        None => Ok(StreamOutcome::Direct(engine.execute(ctx, physical)?)),
     }
 }
 

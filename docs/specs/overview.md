@@ -428,28 +428,25 @@ pub trait ConnectionState: Send {
 
 ### Query Result Architecture
 
-The server materializes SELECT results inside `spawn_blocking`, returns them as an `ExecutionResult::Query`, and then the async connection task writes those rows to the socket. This keeps the server implementation simple while preserving the executor's pull-based `PlanExecutor` boundary for a future streaming bridge.
+A `SELECT` **streams** its rows: the `spawn_blocking` producer owns the `PlanExecutor` and pushes row batches through a bounded channel to the async connection task, which writes them to the socket as they arrive (`docs/specs/streaming.md`). This bounds server memory (the whole result is never materialized) and applies TCP backpressure — a slow client blocks the producer on a full channel rather than letting it run ahead. Every other statement (DML, DML `RETURNING`, DDL, EXPLAIN, and COPY requests) is still computed inside `spawn_blocking` and returned as a complete `ExecutionResult`.
 
 ```
-Async task (Tokio)                      Blocking thread (spawn_blocking)
-─────────────────                       ────────────────────────────────
+Async connection task (Tokio)           Blocking thread (spawn_blocking)
+─────────────────────────────          ────────────────────────────────
 1. Decode Query msg
-2. Call query_service.execute_sql(sql)
-                               ─────►   3. Parse → Bind → Plan
-                                        4. Build PlanExecutor
-                               ◄─────   5. Return ExecutionResult with
-                                            columns + materialized rows
+2. execute_simple_streamed(sql, tx) ─►  3. Parse → Bind → Plan
+                                        4. Build + open PlanExecutor
+                               ◄─────   5. send Start { columns }
 6. Send RowDescription
-7. Loop over rows:
-   encode DataRow
-   write to TcpStream
-8. Send CommandComplete
-9. Send ReadyForQuery
+                               ◄─────   7. send Rows(batch), … (blocks
+7'. Loop: recv batch,                      on a full channel)
+    encode + write DataRows
+                               ◄─────   8. return StreamOutcome::Streamed
+                                            (executor closed; slot returned)
+9. Send CommandComplete + ReadyForQuery
 ```
 
-**Future streaming:** A later implementation can replace materialized SELECT rows with a bounded channel of capacity 64. The producer would own `PlanExecutor` in a blocking task, and the async task would read rows from the receiver. That change does not affect the protocol crate or SQL semantics.
-
-All results are fully computed in `spawn_blocking` and returned as a complete `ExecutionResult`.
+The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream, exactly as the materializing path did, so MVCC visibility and transaction semantics are unchanged. Streaming does not affect the protocol crate or SQL behavior; it is the executor's pull-based `PlanExecutor` boundary put to use. See `docs/specs/streaming.md` §8 for how this positions incremental fetch (portal `max_rows` / cursors).
 
 This keeps the protocol layer testable without IO and keeps blocking work off Tokio threads.
 
