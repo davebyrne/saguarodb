@@ -3,9 +3,7 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
     Value,
 };
-use parser::{
-    Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
-};
+use parser::{Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
@@ -61,12 +59,6 @@ pub(super) fn bind_query(
             left,
             right,
         } => {
-            if *all && matches!(op, SetOp::Intersect | SetOp::Except) {
-                return Err(plan_error(
-                    SqlState::FeatureNotSupported,
-                    "INTERSECT ALL / EXCEPT ALL are not supported",
-                ));
-            }
             let left = bind_query(catalog, left, declared, &scope)?;
             let right = bind_query(catalog, right, declared, &scope)?;
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;

@@ -572,10 +572,20 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_intersect_all() {
+    fn binder_binds_intersect_all() {
         let catalog = catalog_with_users();
-        let err = bind(&parse("select 1 intersect all select 2").unwrap(), &catalog).unwrap_err();
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        // INTERSECT ALL / EXCEPT ALL now bind (multiset semantics run in the
+        // executor); `all` is carried on the bound set operation.
+        let BoundStatement::Query(query) =
+            bind(&parse("select 1 intersect all select 2").unwrap(), &catalog).unwrap()
+        else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::SetOp(set_op) = &query.body else {
+            panic!("expected a set operation");
+        };
+        assert!(matches!(set_op.op, SetOp::Intersect));
+        assert!(set_op.all);
     }
 
     #[test]

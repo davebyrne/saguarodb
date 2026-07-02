@@ -3550,17 +3550,36 @@ async fn e2e_set_operations() {
         err.message
     );
 
-    // INTERSECT ALL / EXCEPT ALL are not supported yet.
-    let err = server
-        .simple_query("select id from a intersect all select id from b")
+    // INTERSECT ALL: min(count_left, count_right) copies of each row (VALUES arms
+    // carry the duplicates that tables with a primary key cannot).
+    let rows = server
+        .simple_query("values (1), (1), (2), (3) intersect all values (1), (2), (2) order by 1")
         .await
-        .err()
-        .expect("INTERSECT ALL should be rejected");
-    assert!(
-        err.message.contains("0A000"),
-        "expected FeatureNotSupported: {}",
-        err.message
-    );
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("2")]);
+
+    // EXCEPT ALL: max(0, count_left - count_right) copies of each row.
+    let rows = server
+        .simple_query("values (1), (1), (1), (2), (3) except all values (1), (3) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("1"), n("2")]);
+
+    // The distinct forms still de-duplicate over duplicate inputs.
+    let rows = server
+        .simple_query("values (1), (1), (2) intersect values (1), (1) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1")]);
+    let rows = server
+        .simple_query("values (1), (1), (2) except values (2) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1")]);
 }
 
 /// Non-recursive CTEs (`WITH`). Each CTE is inlined as a named derived table, so
