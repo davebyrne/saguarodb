@@ -2,17 +2,19 @@ mod codec;
 mod messages;
 mod state;
 
-pub use codec::{PostgresCodec, ProtocolCodec, decode_value, encode_value, type_oid};
+pub use codec::{
+    PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type, type_oid,
+};
 pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnInfo, DataType, Value};
+    use common::{ColumnInfo, DataType, PgType, Value};
 
     use super::{
         ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
-        ServerMessage, StatementKind, decode_value, encode_value,
+        ServerMessage, StatementKind, decode_value, encode_value, encode_value_with_type,
     };
 
     fn ssl_request_bytes() -> Vec<u8> {
@@ -628,6 +630,96 @@ mod tests {
             assert_eq!(read_i16(&bytes, &mut offset), 0);
         }
         assert_eq!(offset, bytes.len());
+    }
+
+    #[test]
+    fn row_description_reports_declared_oid_typlen_and_typmod() {
+        let codec = PostgresCodec::new();
+        let labeled = |name: &str, data_type, pg_type| ColumnInfo {
+            name: name.to_string(),
+            data_type,
+            table_id: None,
+            column_id: None,
+            pg_type: Some(pg_type),
+        };
+        let bytes = codec.encode(&ServerMessage::RowDescription {
+            columns: vec![
+                labeled("small", DataType::Integer, PgType::Int2),
+                labeled("n", DataType::Integer, PgType::Int4),
+                labeled("code", DataType::Text, PgType::Varchar(Some(10))),
+                labeled(
+                    "amt",
+                    DataType::Numeric {
+                        precision: Some(10),
+                        scale: 2,
+                    },
+                    PgType::Numeric {
+                        precision: Some(10),
+                        scale: 2,
+                    },
+                ),
+            ],
+            formats: Vec::new(),
+        });
+
+        let mut offset = 5;
+        assert_eq!(read_i16(&bytes, &mut offset), 4);
+        // The declared width/kind/length is reported: int2/int4 OIDs, varchar with
+        // its length typmod (n + 4), and numeric with its packed precision/scale.
+        for (name, oid, typlen, typmod) in [
+            ("small", 21, 2, -1),
+            ("n", 23, 4, -1),
+            ("code", 1043, -1, 14),
+            ("amt", 1700, -1, ((10 << 16) | 2) + 4),
+        ] {
+            assert_eq!(read_cstr(&bytes, &mut offset), name);
+            assert_eq!(read_i32(&bytes, &mut offset), 0);
+            assert_eq!(read_i16(&bytes, &mut offset), 0);
+            assert_eq!(read_i32(&bytes, &mut offset), oid);
+            assert_eq!(read_i16(&bytes, &mut offset), typlen);
+            assert_eq!(read_i32(&bytes, &mut offset), typmod);
+            assert_eq!(read_i16(&bytes, &mut offset), 0);
+        }
+        assert_eq!(offset, bytes.len());
+    }
+
+    #[test]
+    fn binary_integer_encodes_to_declared_width() {
+        // Text encoding is width-independent (just the digits).
+        assert_eq!(
+            encode_value_with_type(&Value::Integer(1000), &PgType::Int2, 0)
+                .unwrap()
+                .unwrap(),
+            b"1000"
+        );
+        // Binary encoding honors the declared wire width.
+        assert_eq!(
+            encode_value_with_type(&Value::Integer(1000), &PgType::Int2, 1)
+                .unwrap()
+                .unwrap(),
+            1000i16.to_be_bytes()
+        );
+        assert_eq!(
+            encode_value_with_type(&Value::Integer(1000), &PgType::Int4, 1)
+                .unwrap()
+                .unwrap(),
+            1000i32.to_be_bytes()
+        );
+        assert_eq!(
+            encode_value_with_type(&Value::Integer(1000), &PgType::Int8, 1)
+                .unwrap()
+                .unwrap(),
+            1000i64.to_be_bytes()
+        );
+        // A value that does not fit its declared width is rejected, not truncated.
+        assert!(encode_value_with_type(&Value::Integer(40000), &PgType::Int2, 1).is_err());
+        // A non-integer ignores the wire type for width and delegates to encode_value.
+        assert_eq!(
+            encode_value_with_type(&Value::Text("hi".to_string()), &PgType::Text, 1)
+                .unwrap()
+                .unwrap(),
+            b"hi"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use bytes::BytesMut;
-use common::{ColumnInfo, DataType, DbError, Result, SqlState, Value};
+use common::{ColumnInfo, DataType, DbError, PgType, Result, SqlState, Value};
 
 use crate::{ClientMessage, ServerMessage, StatementKind};
 
@@ -489,13 +489,13 @@ fn encode_copy_response(overall_format: i8, column_formats: &[i16]) -> Vec<u8> {
 }
 
 fn encode_column_info(body: &mut Vec<u8>, column: &ColumnInfo, format: i16) {
-    let (type_oid, type_size) = postgres_type(&column.data_type);
+    let pg_type = column.wire_type();
     put_cstr(body, &column.name);
     put_i32(body, 0);
     put_i16(body, 0);
-    put_i32(body, type_oid);
-    put_i16(body, type_size);
-    put_i32(body, -1);
+    put_i32(body, pg_type.oid());
+    put_i16(body, pg_type.typlen());
+    put_i32(body, pg_type.typmod());
     put_i16(body, format);
 }
 
@@ -594,6 +594,45 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
         },
     };
     Ok(Some(bytes))
+}
+
+/// Encode a value for the wire like [`encode_value`], but honoring a column's
+/// declared wire type. A narrow integer (`int2`/`int4`) in binary format is
+/// encoded to its 2- or 4-byte width instead of the default 8-byte `int8`, so a
+/// client that requested binary results reads the width its `RowDescription`
+/// advertised. Every other value is fully determined by the value itself and
+/// delegates to [`encode_value`]. A value that does not fit its declared width —
+/// only reachable for data predating or bypassing the write-time range check —
+/// is rejected rather than silently truncated.
+pub fn encode_value_with_type(
+    value: &Value,
+    pg_type: &PgType,
+    format: i16,
+) -> Result<Option<Vec<u8>>> {
+    if let Value::Integer(int) = value
+        && ValueFormat::from_code(format)? == ValueFormat::Binary
+    {
+        let bytes = match pg_type {
+            PgType::Int2 => i16::try_from(*int)
+                .map_err(|_| integer_out_of_range(*int, "int2"))?
+                .to_be_bytes()
+                .to_vec(),
+            PgType::Int4 => i32::try_from(*int)
+                .map_err(|_| integer_out_of_range(*int, "int4"))?
+                .to_be_bytes()
+                .to_vec(),
+            _ => int.to_be_bytes().to_vec(),
+        };
+        return Ok(Some(bytes));
+    }
+    encode_value(value, format)
+}
+
+fn integer_out_of_range(value: i64, target: &str) -> DbError {
+    DbError::protocol(
+        SqlState::NumericValueOutOfRange,
+        format!("{value} is out of range for the binary {target} wire format"),
+    )
 }
 
 /// Days from the Unix epoch (1970-01-01) to the PostgreSQL date epoch
@@ -772,27 +811,11 @@ fn parse_bool_text(text: &str) -> Result<Value> {
         .ok_or_else(|| protocol_error("invalid boolean parameter"))
 }
 
-fn postgres_type(data_type: &DataType) -> (i32, i16) {
-    match data_type {
-        DataType::Integer => (20, 8),
-        DataType::Text => (25, -1),
-        DataType::Boolean => (16, 1),
-        DataType::Date => (1082, 4),
-        DataType::Timestamp => (1114, 8),
-        DataType::Bytea => (17, -1),
-        DataType::Uuid => (2950, 16),
-        DataType::Double => (701, 8),
-        DataType::Real => (700, 4),
-        DataType::Time => (1083, 8),
-        DataType::TimestampTz => (1184, 8),
-        DataType::Interval => (1186, 16),
-        DataType::Numeric { .. } => (1700, -1),
-    }
-}
-
-/// PostgreSQL type OID for a v1 data type (e.g. for `ParameterDescription`).
+/// PostgreSQL type OID for a `DataType` that carries no declared wire type (e.g.
+/// an extended-protocol parameter). Uses the collapsed default (`Integer` =>
+/// int8, `Text` => text); see [`PgType`] for the width/kind-aware mapping.
 pub fn type_oid(data_type: &DataType) -> i32 {
-    postgres_type(data_type).0
+    PgType::from(data_type).oid()
 }
 
 fn put_error_field(body: &mut Vec<u8>, field: u8, value: &str) {
@@ -830,50 +853,6 @@ fn checked_i32(value: usize, message: &'static str) -> i32 {
 
 fn protocol_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::SyntaxError, message)
-}
-
-#[cfg(test)]
-mod pg_type_mapping_tests {
-    use super::postgres_type;
-    use common::{DataType, PgType};
-
-    /// Guard against drift between the new `PgType` wire mapping and the legacy
-    /// `postgres_type` mapping while both coexist during the migration: the
-    /// label-free `PgType::from(&dt)` must report the same OID *and* `typlen` as
-    /// `postgres_type(&dt)` for every `DataType` (both halves feed
-    /// `RowDescription`). Once the codec routes through `PgType` and
-    /// `postgres_type` is removed, this simply pins that equivalence.
-    #[test]
-    fn pg_type_fallback_matches_legacy_postgres_type() {
-        let types = [
-            DataType::Integer,
-            DataType::Text,
-            DataType::Boolean,
-            DataType::Date,
-            DataType::Timestamp,
-            DataType::Time,
-            DataType::TimestampTz,
-            DataType::Interval,
-            DataType::Bytea,
-            DataType::Uuid,
-            DataType::Double,
-            DataType::Real,
-            DataType::Numeric {
-                precision: Some(10),
-                scale: 2,
-            },
-            DataType::Numeric {
-                precision: None,
-                scale: 0,
-            },
-        ];
-        for data_type in types {
-            let pg_type = PgType::from(&data_type);
-            let (oid, typlen) = postgres_type(&data_type);
-            assert_eq!(pg_type.oid(), oid, "OID drift for {data_type:?}");
-            assert_eq!(pg_type.typlen(), typlen, "typlen drift for {data_type:?}");
-        }
-    }
 }
 
 #[cfg(test)]

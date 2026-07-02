@@ -98,13 +98,22 @@ impl Session {
         // consumed without emitting one; `DataRow`s use the portal's result formats;
         // and no `ReadyForQuery` is sent here (`Sync` emits it).
         let mut write_err: Option<DbError> = None;
+        // `RowDescription` already came from `Describe`, but keep `Start`'s columns
+        // so each `Rows` batch can encode each value against its declared wire type
+        // (the portal's result formats may be binary).
+        let mut stream_columns: Vec<ColumnInfo> = Vec::new();
         while let Some(message) = row_rx.recv().await {
             let write_result = match message {
-                StreamMessage::Start { .. } => Ok(()),
-                StreamMessage::Rows(rows) => match encode_portal_rows(&rows, &result_formats) {
-                    Ok(messages) => write_messages(stream, codec, &messages).await,
-                    Err(err) => Err(err),
-                },
+                StreamMessage::Start { columns } => {
+                    stream_columns = columns;
+                    Ok(())
+                }
+                StreamMessage::Rows(rows) => {
+                    match encode_portal_rows(&rows, &stream_columns, &result_formats) {
+                        Ok(messages) => write_messages(stream, codec, &messages).await,
+                        Err(err) => Err(err),
+                    }
+                }
             };
             if let Err(err) = write_result {
                 write_err = Some(err);
@@ -325,10 +334,14 @@ fn resolve_formats(formats: &[i16], count: usize) -> Vec<i16> {
 }
 
 /// Encode a batch of streamed result rows as `DataRow` messages in the portal's
-/// result formats.
-fn encode_portal_rows(rows: &[Row], result_formats: &[i16]) -> Result<Vec<ServerMessage>> {
+/// result formats, using `columns` for each value's declared wire type.
+fn encode_portal_rows(
+    rows: &[Row],
+    columns: &[ColumnInfo],
+    result_formats: &[i16],
+) -> Result<Vec<ServerMessage>> {
     rows.iter()
-        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, result_formats)?)))
+        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, columns, result_formats)?)))
         .collect()
 }
 
@@ -346,10 +359,14 @@ where
     S: AsyncWrite + Unpin,
 {
     match result {
-        ExecutionResult::Query { rows, .. } => {
+        ExecutionResult::Query { columns, rows } => {
             let mut messages = Vec::with_capacity(rows.len() + 1);
             for row in &rows {
-                messages.push(ServerMessage::DataRow(encode_row(row, result_formats)?));
+                messages.push(ServerMessage::DataRow(encode_row(
+                    row,
+                    &columns,
+                    result_formats,
+                )?));
             }
             messages.push(ServerMessage::CommandComplete(format!(
                 "SELECT {}",
@@ -373,12 +390,16 @@ where
         ExecutionResult::ModifiedReturning {
             command,
             count,
+            columns,
             rows,
-            ..
         } => {
             let mut messages = Vec::with_capacity(rows.len() + 1);
             for row in &rows {
-                messages.push(ServerMessage::DataRow(encode_row(row, result_formats)?));
+                messages.push(ServerMessage::DataRow(encode_row(
+                    row,
+                    &columns,
+                    result_formats,
+                )?));
             }
             messages.push(ServerMessage::CommandComplete(command_complete_tag(
                 &command, count,

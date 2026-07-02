@@ -413,17 +413,22 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
         "binary-parameter row value"
     );
 
-    // Binary INTEGER result column: the value is the 8-byte big-endian
-    // encoding, distinguishing binary from text result encoding.
+    // Binary INTEGER result column: `id` is INTEGER (int4), so the value is the
+    // 4-byte big-endian encoding, distinguishing binary from text result encoding.
     let mut seq = parse_bytes("", "select id from users where id = $1", &[20]);
     seq.extend(bind_bytes("", "", &[1], &[Some(&id[..])], &[1]));
     seq.extend(execute_bytes(""));
     seq.extend(sync_bytes());
     client.write_all(&seq).await.unwrap();
     let response = read_until_ready(&mut client).await;
+    // The DataRow field is a 4-byte length prefix (int4 width) followed by the
+    // 4-byte value; asserting the pair distinguishes int4 from an int8 regression
+    // (whose length prefix would be 8), not merely binary from text.
+    let mut expected_field = 4i32.to_be_bytes().to_vec();
+    expected_field.extend_from_slice(&2i32.to_be_bytes());
     assert!(
-        response.windows(8).any(|w| w == 2i64.to_be_bytes()),
-        "binary int8 result value"
+        response.windows(8).any(|w| w == expected_field),
+        "binary int4 result value (length 4 + value)"
     );
 
     client.write_all(&terminate_bytes()).await.unwrap();

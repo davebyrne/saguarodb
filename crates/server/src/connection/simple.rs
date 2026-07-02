@@ -80,9 +80,13 @@ impl Session {
         // never lost). The `SELECT n` count is taken from the producer's outcome,
         // not re-derived here.
         let mut write_err: Option<DbError> = None;
+        // The `Start` message carries the result columns; keep them so each `Rows`
+        // batch can encode each value against its declared wire type.
+        let mut stream_columns: Vec<ColumnInfo> = Vec::new();
         while let Some(message) = row_rx.recv().await {
             let write_result = match message {
                 StreamMessage::Start { columns } => {
+                    stream_columns = columns.clone();
                     write_messages(
                         stream,
                         codec,
@@ -93,7 +97,7 @@ impl Session {
                     )
                     .await
                 }
-                StreamMessage::Rows(rows) => match encode_data_rows(&rows) {
+                StreamMessage::Rows(rows) => match encode_data_rows(&rows, &stream_columns) {
                     Ok(messages) => write_messages(stream, codec, &messages).await,
                     Err(err) => Err(err),
                 },
@@ -173,10 +177,11 @@ impl Session {
 }
 
 /// Encode a batch of result rows as `DataRow` messages in the simple-query
-/// protocol's default (text) format.
-fn encode_data_rows(rows: &[Row]) -> Result<Vec<ServerMessage>> {
+/// protocol's default (text) format, using `columns` for each value's declared
+/// wire type.
+fn encode_data_rows(rows: &[Row], columns: &[ColumnInfo]) -> Result<Vec<ServerMessage>> {
     rows.iter()
-        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, &[])?)))
+        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, columns, &[])?)))
         .collect()
 }
 
@@ -193,15 +198,17 @@ where
 {
     match result {
         ExecutionResult::Query { columns, rows } => {
-            let mut messages = Vec::with_capacity(rows.len() + 3);
+            let mut data_rows = Vec::with_capacity(rows.len());
+            for row in &rows {
+                data_rows.push(ServerMessage::DataRow(encode_row(row, &columns, &[])?));
+            }
+            let count = data_rows.len();
+            let mut messages = Vec::with_capacity(count + 3);
             messages.push(ServerMessage::RowDescription {
                 columns,
                 formats: Vec::new(),
             });
-            for row in rows {
-                messages.push(ServerMessage::DataRow(encode_row(&row, &[])?));
-            }
-            let count = messages.len().saturating_sub(1);
+            messages.extend(data_rows);
             messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
             messages.push(ServerMessage::ReadyForQuery(status));
             write_messages(socket, codec, &messages).await
@@ -226,14 +233,16 @@ where
             columns,
             rows,
         } => {
-            let mut messages = Vec::with_capacity(rows.len() + 3);
+            let mut data_rows = Vec::with_capacity(rows.len());
+            for row in &rows {
+                data_rows.push(ServerMessage::DataRow(encode_row(row, &columns, &[])?));
+            }
+            let mut messages = Vec::with_capacity(data_rows.len() + 3);
             messages.push(ServerMessage::RowDescription {
                 columns,
                 formats: Vec::new(),
             });
-            for row in rows {
-                messages.push(ServerMessage::DataRow(encode_row(&row, &[])?));
-            }
+            messages.extend(data_rows);
             messages.push(ServerMessage::CommandComplete(command_complete_tag(
                 &command, count,
             )));

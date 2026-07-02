@@ -3,7 +3,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value};
+use common::{
+    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value,
+};
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
     ServerMessage,
@@ -520,15 +522,23 @@ where
     Ok(())
 }
 
-/// Encode each column of a result row to its wire bytes in the given format
-/// code (`0` = text, `1` = binary), or `None` for SQL NULL.
 /// Encode each column of a result row to its wire bytes, choosing each column's
-/// format from the (text/binary) format-code array (empty = all text).
-fn encode_row(row: &Row, formats: &[i16]) -> Result<Vec<Option<Vec<u8>>>> {
+/// format from the (text/binary) format-code array (empty = all text). The
+/// column list supplies each value's declared wire type, so a narrow integer in
+/// binary format is encoded to its advertised 2-/4-byte width.
+fn encode_row(row: &Row, columns: &[ColumnInfo], formats: &[i16]) -> Result<Vec<Option<Vec<u8>>>> {
     row.values
         .iter()
         .enumerate()
-        .map(|(index, value)| protocol::encode_value(value, resolve_format(formats, index)))
+        .map(|(index, value)| {
+            let format = resolve_format(formats, index);
+            match columns.get(index) {
+                Some(column) => {
+                    protocol::encode_value_with_type(value, &column.wire_type(), format)
+                }
+                None => protocol::encode_value(value, format),
+            }
+        })
         .collect()
 }
 

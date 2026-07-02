@@ -150,28 +150,35 @@ The codec may return errors after buffering bytes. The server treats any decode 
 
 ## Type Encoding
 
-`ColumnInfo.data_type` maps to PostgreSQL type OIDs:
+A `RowDescription` field's type OID, `type_size`, and `type_modifier`
+(`atttypmod`) come from the column's declared PostgreSQL wire type
+`common::PgType`, obtained via `ColumnInfo::wire_type()` (an unlabeled column
+resolves to the collapsed default from its `DataType`: `Integer` -> `int8`,
+`Text` -> `text`). `PgType` reports the exact width, character kind, and length
+that `DataType` intentionally collapses:
 
-- `Integer` -> `INT8` (`type_oid = 20`, `type_size = 8`)
-- `Text` -> `TEXT` (`type_oid = 25`, `type_size = -1`)
-- `Boolean` -> `BOOL` (`type_oid = 16`, `type_size = 1`)
-- `Date` -> `DATE` (`type_oid = 1082`, `type_size = 4`)
-- `Timestamp` -> `TIMESTAMP` (`type_oid = 1114`, `type_size = 8`)
-- `Time` -> `TIME` (`type_oid = 1083`, `type_size = 8`)
-- `TimestampTz` -> `TIMESTAMP WITH TIME ZONE` (`type_oid = 1184`, `type_size = 8`)
-- `Interval` -> `INTERVAL` (`type_oid = 1186`, `type_size = 16`)
-- `Bytes` -> `BYTEA` (`type_oid = 17`, `type_size = -1`)
-- `Uuid` -> `UUID` (`type_oid = 2950`, `type_size = 16`)
-- `Float` -> `DOUBLE PRECISION` (`type_oid = 701`, `type_size = 8`)
-- `Real` -> `REAL` (`type_oid = 700`, `type_size = 4`)
-- `Numeric` -> `NUMERIC` (`type_oid = 1700`, `type_size = -1`)
+- integers: `Int2` (`21`, size `2`), `Int4` (`23`, size `4`), `Int8` (`20`, size `8`)
+- character: `Text` (`25`), `Varchar` (`1043`), `Bpchar` (`1042`), all size `-1`
+- `Bool` (`16`, `1`), `Bytea` (`17`, `-1`), `Uuid` (`2950`, `16`)
+- `Float4` (`700`, `4`), `Float8` (`701`, `8`), `Numeric` (`1700`, `-1`)
+- temporal: `Date` (`1082`, `4`), `Time` (`1083`, `8`), `Timestamp` (`1114`, `8`),
+  `Timestamptz` (`1184`, `8`), `Interval` (`1186`, `16`)
 
-The public helper `type_oid(data_type: &DataType) -> i32` returns the OID for a
-data type (used when building `RowDescription` and `ParameterDescription`).
+`type_modifier` (`atttypmod`) is `varchar(n)`/`char(n)` -> `n + 4`,
+`numeric(p, s)` -> `((p << 16) | s) + 4`, and `-1` otherwise.
+
+The public helper `type_oid(data_type: &DataType) -> i32` returns the collapsed
+default OID for a bare `DataType` with no declared wire type (used for an
+extended-protocol `ParameterDescription`); it is `PgType::from(data_type).oid()`.
 
 The simple query path sends text format for all columns. The extended protocol
 lets a client request binary format (code `1`) per column via `Bind`;
-`RowDescription` then reports the chosen format code per field.
+`RowDescription` then reports the chosen format code per field. Binary integer
+output honors the column's declared width: an `int2`/`int4` value is encoded to 2
+or 4 big-endian bytes (not the 8-byte `int8` form), via
+`encode_value_with_type`. A value that does not fit its declared width — only
+reachable for data that predates or bypasses the write-time range check — is
+rejected rather than silently truncated.
 
 ## PostgreSQL Wire Encoding Details
 
@@ -203,7 +210,7 @@ Server messages:
 - `BackendKeyData`: tag `b'K'`, length `12`, `int32 process_id`, `int32 secret_key`. Sent at startup so the client can later cancel an in-flight query.
 - `ParameterStatus`: tag `b'S'`, length, `key\0value\0`. Startup emits `server_version=16.0`, `server_encoding=UTF8`, `client_encoding=UTF8`, `DateStyle=ISO`, `integer_datetimes=on`, `standard_conforming_strings=on`, `TimeZone=UTC`, and `application_name` echoed from the client's startup parameters (empty when not supplied).
 - `ReadyForQuery(status)`: tag `b'Z'`, length `5`, transaction-status byte supplied by the caller. The protocol encodes whatever byte it is handed; the server sources it from the session's transaction state (`b'I'` idle, `b'T'` in a transaction block, `b'E'` failed transaction block). Outside an explicit transaction (autocommit) the byte is `b'I'`; inside an open `BEGIN` block it is `b'T'`, and `b'E'` once a statement in that block fails (see `docs/specs/crates/server.md`).
-- `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, mapped `int32 type_oid`, mapped `int16 type_size`, `int32 type_modifier = -1`, `int16 format_code` (`0` text, `1` binary).
+- `RowDescription`: tag `b'T'`, length, `int16 field_count`, then one field entry per column: `name\0`, `int32 table_oid = 0`, `int16 attr_num = 0`, `int32 type_oid`, `int16 type_size`, `int32 type_modifier` (the declared `atttypmod`, or `-1`), `int16 format_code` (`0` text, `1` binary). The OID/size/modifier come from the column's declared `PgType` (see Type Encoding).
 - `DataRow`: tag `b'D'`, length, `int16 column_count`, then each value as `int32 byte_length` plus its wire bytes (text or binary per the `RowDescription` format codes), or `int32 -1` for `NULL`.
 - `CommandComplete`: tag `b'C'`, length, nul-terminated command tag. Tags include `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `EXPLAIN`, `BEGIN`, `COMMIT`, `ROLLBACK`, `SET`, `VACUUM`, and `COPY n`.
 - `ParseComplete`: tag `b'1'`, length `4`.
