@@ -399,7 +399,9 @@ impl QueryService {
             params,
             cancel,
             Arc::new(SessionSequenceState::new()),
+            None,
         )
+        .map(StreamOutcome::expect_direct)
     }
 
     pub fn execute_prepared_cancelable_with_session_sequences(
@@ -408,30 +410,34 @@ impl QueryService {
         params: &[Value],
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> Result<ExecutionResult> {
+        // `Some` streams a SELECT's rows into the sink; `None` materializes.
+        sink: Option<&mut dyn RowSink>,
+    ) -> Result<StreamOutcome> {
         // Maintenance does not bind/plan; run it before parameter substitution. The
         // connection routes maintenance through the in-session variant, so this
         // arm is reached only if a caller bypasses that routing — keep it total.
         if let StatementClass::Maintenance = prepared.class {
-            return self.run_prepared_vacuum(prepared);
+            return self
+                .run_prepared_vacuum(prepared)
+                .map(StreamOutcome::Direct);
         }
         let bound = self.substitute_prepared_params(prepared, params)?;
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
             StatementClass::Read => match class {
-                // The extended protocol still materializes here; streaming its
-                // `Execute` is a later task, so no sink is supplied.
-                StatementClass::Read => self
-                    .autocommit_read(bound, cancel, session_sequences, None)
-                    .map(StreamOutcome::expect_direct),
-                StatementClass::Write => {
-                    self.autocommit_bound_write(bound, cancel, session_sequences)
+                StatementClass::Read => {
+                    self.autocommit_read(bound, cancel, session_sequences, sink)
                 }
+                // A read promoted to a write (e.g. `SELECT nextval(...)`) is
+                // materialized, not streamed.
+                StatementClass::Write => self
+                    .autocommit_bound_write(bound, cancel, session_sequences)
+                    .map(StreamOutcome::Direct),
                 _ => unreachable!("classify_bound only promotes reads to writes"),
             },
-            StatementClass::Write | StatementClass::Ddl => {
-                self.autocommit_bound_write(bound, cancel, session_sequences)
-            }
+            StatementClass::Write | StatementClass::Ddl => self
+                .autocommit_bound_write(bound, cancel, session_sequences)
+                .map(StreamOutcome::Direct),
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
             }
@@ -454,6 +460,29 @@ impl QueryService {
         }
     }
 
+    /// Streaming counterpart of
+    /// [`Self::execute_prepared_cancelable_with_session_sequences`]: a SELECT
+    /// streams its rows through `row_tx` and returns [`StreamOutcome::Streamed`];
+    /// everything else returns [`StreamOutcome::Direct`]. For the autocommit
+    /// extended-protocol `Execute` path (`connection/extended.rs`).
+    pub fn execute_prepared_cancelable_streamed(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+        row_tx: mpsc::Sender<StreamMessage>,
+    ) -> Result<StreamOutcome> {
+        let mut sink = ChannelRowSink::new(row_tx);
+        self.execute_prepared_cancelable_with_session_sequences(
+            prepared,
+            params,
+            cancel,
+            session_sequences,
+            Some(&mut sink),
+        )
+    }
+
     /// Execute a prepared statement against the session's open explicit
     /// transaction `slot`, returning the (possibly mutated) slot alongside the
     /// result. This is the extended-protocol counterpart of `execute_simple`: it
@@ -468,6 +497,7 @@ impl QueryService {
     /// Precondition: `slot` is `Some` (the connection only calls this with an open
     /// transaction; with no open transaction it uses the autocommit
     /// `execute_prepared_cancelable_with_session_sequences`).
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_prepared_in_session_with_session_sequences(
         &self,
         prepared: &PreparedStatement,
@@ -476,9 +506,13 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
-    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        // `Some` streams a SELECT's rows into the sink; `None` materializes.
+        sink: Option<&mut dyn RowSink>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
-            return self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            let (slot, default_isolation, result) =
+                self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
         // VACUUM does not bind/plan: dispatch it before parameter substitution.
@@ -496,7 +530,12 @@ impl QueryService {
                     )),
                 );
             }
-            return (None, default_isolation, self.run_prepared_vacuum(prepared));
+            return (
+                None,
+                default_isolation,
+                self.run_prepared_vacuum(prepared)
+                    .map(StreamOutcome::Direct),
+            );
         }
 
         let bound = match self.substitute_prepared_params(prepared, params) {
@@ -509,20 +548,15 @@ impl QueryService {
         match slot {
             Some(txn) => {
                 let class = classify_bound(prepared.class, &bound);
-                // Extended-protocol `Execute` still materializes; no sink.
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
                     class,
                     BindSource::Bound(bound),
                     cancel,
                     session_sequences,
-                    None,
+                    sink,
                 );
-                (
-                    slot,
-                    default_isolation,
-                    result.map(StreamOutcome::expect_direct),
-                )
+                (slot, default_isolation, result)
             }
             // No open transaction: fall back to an autocommit unit (the connection
             // routes here only when a transaction is open, but keep this total so
@@ -532,18 +566,18 @@ impl QueryService {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
                         match class {
-                            StatementClass::Read => self
-                                .autocommit_read(bound, cancel, session_sequences, None)
-                                .map(StreamOutcome::expect_direct),
-                            StatementClass::Write => {
-                                self.autocommit_bound_write(bound, cancel, session_sequences)
+                            StatementClass::Read => {
+                                self.autocommit_read(bound, cancel, session_sequences, sink)
                             }
+                            StatementClass::Write => self
+                                .autocommit_bound_write(bound, cancel, session_sequences)
+                                .map(StreamOutcome::Direct),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
-                    StatementClass::Write | StatementClass::Ddl => {
-                        self.autocommit_bound_write(bound, cancel, session_sequences)
-                    }
+                    StatementClass::Write | StatementClass::Ddl => self
+                        .autocommit_bound_write(bound, cancel, session_sequences)
+                        .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
                     }
@@ -562,6 +596,34 @@ impl QueryService {
                 (None, default_isolation, result)
             }
         }
+    }
+
+    /// Streaming counterpart of
+    /// [`Self::execute_prepared_in_session_with_session_sequences`]: a SELECT
+    /// streams its rows through `row_tx`; every other statement returns
+    /// [`StreamOutcome::Direct`]. For the in-transaction extended-protocol
+    /// `Execute` path (`connection/extended.rs`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_prepared_in_session_streamed(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        cancel: &Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+        row_tx: mpsc::Sender<StreamMessage>,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+        let mut sink = ChannelRowSink::new(row_tx);
+        self.execute_prepared_in_session_with_session_sequences(
+            prepared,
+            params,
+            slot,
+            default_isolation,
+            cancel,
+            session_sequences,
+            Some(&mut sink),
+        )
     }
 
     /// Validate the parameter count and substitute `params` into a prepared

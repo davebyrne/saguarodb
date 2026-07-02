@@ -1874,10 +1874,12 @@ Tokio listener (async)
        └─ spawn async task per connection
             └─ Protocol codec decodes client messages
             └─ For Query messages:
-                 └─ spawn_blocking: query_service.execute_sql(sql)
+                 └─ create bounded row channel; spawn_blocking:
+                      query_service.execute_simple_streamed(sql, row_tx)
                       → Bind → Plan → build PlanExecutor
-                      → pull rows from PlanExecutor into ExecutionResult::Query
-                 └─ async task: encode materialized rows, write to wire
+                      → SELECT: push row batches into the channel (backpressure);
+                        other statements return an ExecutionResult
+                 └─ async task: drain channel, encode + write DataRows to wire
             └─ For non-query messages: handle inline
 ```
 

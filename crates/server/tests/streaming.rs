@@ -7,22 +7,16 @@ mod support;
 
 use support::{Connection, TestServer};
 
-/// A result set far larger than the channel can buffer must come back complete
-/// and in order. With a bounded channel of 64 batches × 64 rows, the producer can
-/// buffer at most ~4096 rows before it blocks on `blocking_send`; 5000 rows forces
-/// that block, so this both checks multi-batch ordering and guards against a
-/// regression that awaited the producer task before draining (which would deadlock
-/// the moment the channel filled, tripping the ReadyForQuery timeout).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn large_select_streams_all_rows_in_order() {
-    let server = TestServer::start().await.unwrap();
-    let mut conn = Connection::connect(&server).await.unwrap();
-    conn.ok("create table t (id integer primary key)").await;
+/// Rows buffered before the producer blocks: capacity 64 batches × 64 rows/batch.
+/// A result larger than this forces the producer to block on `blocking_send`.
+const CHANNEL_ROW_CAPACITY: i64 = 64 * 64;
 
-    const N: i64 = 5000;
+/// Insert `id` values `1..=n` into a single-column table, in chunks to keep each
+/// statement's SQL a reasonable size.
+async fn insert_sequential_ids(conn: &mut Connection, n: i64) {
     let mut next = 1;
-    while next <= N {
-        let end = (next + 999).min(N);
+    while next <= n {
+        let end = (next + 999).min(n);
         let values = (next..=end)
             .map(|i| format!("({i})"))
             .collect::<Vec<_>>()
@@ -31,15 +25,33 @@ async fn large_select_streams_all_rows_in_order() {
             .await;
         next = end + 1;
     }
+}
 
-    let outcome = conn.ok("select id from t order by id").await;
-    assert_eq!(outcome.status, b'I');
-    let rows = outcome.rows();
-    assert_eq!(rows.len(), N as usize, "every streamed row must arrive");
-    // Order is preserved across every batch boundary.
+/// Assert `rows` is exactly `[[1], [2], … [n]]` as text.
+fn assert_ids_in_order(rows: &[Vec<Option<String>>], n: i64) {
+    assert_eq!(rows.len(), n as usize, "every streamed row must arrive");
     for (index, row) in rows.iter().enumerate() {
         assert_eq!(row.as_slice(), [Some((index as i64 + 1).to_string())]);
     }
+}
+
+/// A result set far larger than the channel can buffer must come back complete
+/// and in order. 5000 rows exceeds the buffer, so the producer blocks on
+/// `blocking_send` while the consumer drains — checking multi-batch ordering and
+/// guarding against a regression that awaited the producer task before draining
+/// (which would deadlock the moment the channel filled, tripping the timeout).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_select_streams_all_rows_in_order() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    let n = CHANNEL_ROW_CAPACITY + 904; // 5000
+    insert_sequential_ids(&mut conn, n).await;
+
+    let outcome = conn.ok("select id from t order by id").await;
+    assert_eq!(outcome.status, b'I');
+    assert_ids_in_order(&outcome.rows(), n);
 }
 
 /// An empty SELECT still streams a schema (RowDescription) and a `SELECT 0` tag,
@@ -130,4 +142,46 @@ async fn streamed_select_error_inside_transaction_poisons_block() {
     assert_eq!(rejected.status, b'E');
 
     assert_eq!(conn.ok("rollback").await.status, b'I');
+}
+
+/// The extended-protocol `Execute` streams a SELECT too: a result larger than the
+/// channel buffer comes back complete and in order over Parse/Bind/Execute/Sync,
+/// exercising the same backpressure/no-deadlock path as the simple protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_execute_streams_large_select() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+
+    let n = CHANNEL_ROW_CAPACITY + 904; // 5000
+    insert_sequential_ids(&mut conn, n).await;
+
+    let outcome = conn
+        .extended_execute("select id from t order by id")
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, b'I');
+    assert_ids_in_order(&outcome.rows(), n);
+}
+
+/// An extended-protocol SELECT inside an explicit transaction streams through the
+/// in-transaction path and keeps the block open ('T') until COMMIT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_execute_streams_select_in_transaction() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+    conn.ok("insert into t (id) values (1),(2),(3)").await;
+
+    assert_eq!(conn.extended_execute("begin").await.unwrap().status, b'T');
+    let outcome = conn
+        .extended_execute("select id from t order by id")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.status, b'T',
+        "block stays open after a streamed read"
+    );
+    assert_ids_in_order(&outcome.rows(), 3);
+    assert_eq!(conn.extended_execute("commit").await.unwrap().status, b'I');
 }

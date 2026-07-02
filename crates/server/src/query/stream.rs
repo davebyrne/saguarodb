@@ -30,6 +30,7 @@ pub enum StreamMessage {
 }
 
 /// The outcome of a (possibly streaming) statement execution.
+#[derive(Debug)]
 pub enum StreamOutcome {
     /// A SELECT whose rows were streamed through the channel. `count` is the
     /// authoritative number of rows produced by the drive (used for the

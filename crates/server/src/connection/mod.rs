@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value};
-use executor::ExecutionResult;
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
     ServerMessage,
@@ -17,7 +16,8 @@ use tokio::task::JoinHandle;
 use crate::app::AppState;
 use crate::cancel::BackendKey;
 use crate::query::{
-    CopyInChunk, PreparedStatement, SessionTxnStatus, Transaction, abort_session_transaction,
+    CopyInChunk, PreparedStatement, SessionTxnStatus, StreamOutcome, Transaction,
+    abort_session_transaction,
 };
 use crate::shutdown::InFlightQueryGuard;
 
@@ -478,15 +478,29 @@ fn protocol_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::SyntaxError, message)
 }
 
-/// Map the outcome of the query `spawn_blocking` task into a query result. A
-/// panic in parse/bind/plan/execute (or a cancelled task) surfaces as a
-/// `JoinError`; converting it to an internal error lets the caller report it and
-/// keep the connection open instead of dropping the socket silently. The wire
-/// codec buffer is unaffected and statement guards/page pins release on unwind.
-fn query_task_result(
-    join: std::result::Result<Result<ExecutionResult>, tokio::task::JoinError>,
-) -> Result<ExecutionResult> {
-    join.unwrap_or_else(|join_err| Err(DbError::internal(format!("query task failed: {join_err}"))))
+/// Resolve a streamed query `spawn_blocking` task's join result, shared by the
+/// simple- and extended-query paths. A panic in parse/bind/plan/execute (or a
+/// cancelled task) surfaces as a `JoinError`; mapping it to an internal error
+/// with no open transaction (`slot = None`, the default isolation unchanged) lets
+/// the caller report it and keep the connection open instead of dropping the
+/// socket silently. The wire codec buffer is unaffected and statement guards /
+/// page pins release on unwind. The lost transaction's guard/registry entry
+/// cannot be recovered here, so a panicked in-transaction statement is
+/// best-effort abandoned (matching the pre-streaming behavior).
+fn streamed_task_result(
+    join: std::result::Result<
+        (Option<Transaction>, IsolationLevel, Result<StreamOutcome>),
+        tokio::task::JoinError,
+    >,
+    fallback_default: IsolationLevel,
+) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+    join.unwrap_or_else(|join_err| {
+        (
+            None,
+            fallback_default,
+            Err(DbError::internal(format!("query task failed: {join_err}"))),
+        )
+    })
 }
 
 async fn write_messages<S>(

@@ -5,10 +5,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use common::{ErrorKind, Result};
-use executor::ExecutionResult;
+use common::{ErrorKind, IsolationLevel, Result};
 
-use super::{TransactionState, handle_connection, query_task_result};
+use super::{StreamOutcome, TransactionState, handle_connection, streamed_task_result};
 use crate::app::AppState;
 
 #[test]
@@ -21,15 +20,19 @@ fn transaction_state_maps_to_postgres_status_byte() {
 #[tokio::test]
 async fn panicked_query_task_becomes_internal_error() {
     // A panicked spawn_blocking task yields a real JoinError; the firewall
-    // must map it to an internal error (so the caller keeps the connection
-    // open) rather than letting it escape and drop the connection.
-    let join = tokio::task::spawn_blocking(|| -> Result<ExecutionResult> {
-        panic!("intentional test panic");
-    })
+    // must map it to an internal error with no open transaction (so the caller
+    // keeps the connection open) rather than letting it escape and drop the
+    // connection.
+    let join = tokio::task::spawn_blocking(
+        || -> (Option<super::Transaction>, IsolationLevel, Result<StreamOutcome>) {
+            panic!("intentional test panic");
+        },
+    )
     .await;
 
-    let err = query_task_result(join).unwrap_err();
-    assert_eq!(err.kind, ErrorKind::Internal);
+    let (slot, _default, result) = streamed_task_result(join, IsolationLevel::default());
+    assert!(slot.is_none(), "a panicked task leaves no open transaction");
+    assert_eq!(result.unwrap_err().kind, ErrorKind::Internal);
 }
 
 #[tokio::test]

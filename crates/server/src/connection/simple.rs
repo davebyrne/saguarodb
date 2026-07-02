@@ -8,7 +8,8 @@ use tokio::sync::mpsc;
 use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
-    Session, TransactionState, command_complete_tag, encode_row, error_response, write_messages,
+    Session, TransactionState, command_complete_tag, encode_row, error_response,
+    streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -110,22 +111,10 @@ impl Session {
         // released per arm below: the normal arms drop it before the terminal
         // message; the COPY arms hand it to the streaming driver so the COPY keeps
         // counting as in-flight for its whole lifetime (graceful-shutdown).
-        let outcome = match task.await {
-            Ok((txn, default_isolation, outcome)) => {
-                self.txn = txn;
-                self.default_isolation = default_isolation;
-                outcome
-            }
-            Err(join_err) => {
-                // The blocking task panicked and lost the transaction slot. Treat
-                // the connection as having no open transaction (the panic firewall
-                // surfaces an internal error); the guard/registry entry for a lost
-                // txn cannot be recovered here, so this is best-effort. The session
-                // default is left as-is (it never moved into a committed effect).
-                self.txn = None;
-                Err(DbError::internal(format!("query task failed: {join_err}")))
-            }
-        };
+        let (txn, default_isolation, outcome) =
+            streamed_task_result(task.await, self.default_isolation);
+        self.txn = txn;
+        self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
 

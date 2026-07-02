@@ -219,7 +219,7 @@ Checkpoint may run after successful writes according to configured thresholds. I
 
 ## Query Results
 
-A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`). The connection creates an `mpsc` channel and calls `execute_simple_streamed`, whose `spawn_blocking` producer owns the `PlanExecutor` and pushes a `StreamMessage::Start { columns }` then `StreamMessage::Rows` batches into it (via a `ChannelRowSink` implementing `executor::RowSink`); the async task drains the channel — emitting `RowDescription` from `Start` and `DataRow`s from each batch — concurrently while the producer runs, then finishes with `CommandComplete("SELECT n")` (n is the producer's authoritative row count, carried on `StreamOutcome::Streamed { count }`) and `ReadyForQuery`. The producer returns a `StreamOutcome`: `Streamed` for a SELECT, or `Direct(ExecutionResult)` for every other statement, which the connection writes exactly as before (DML/DDL/EXPLAIN/COPY). The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream and returns the transaction slot only when it finishes, so MVCC and transaction semantics are unchanged. `blocking_send` provides backpressure; a dropped receiver (client gone) turns the next push into a graceful stop. Streaming alters neither protocol message encoding nor physical operator semantics; the materializing path (`execute_simple_with_session_sequences`, still used by the extended protocol and tests) shares the same executor drive.
+A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`). The connection creates an `mpsc` channel and calls `execute_simple_streamed`, whose `spawn_blocking` producer owns the `PlanExecutor` and pushes a `StreamMessage::Start { columns }` then `StreamMessage::Rows` batches into it (via a `ChannelRowSink` implementing `executor::RowSink`); the async task drains the channel — emitting `RowDescription` from `Start` and `DataRow`s from each batch — concurrently while the producer runs, then finishes with `CommandComplete("SELECT n")` (n is the producer's authoritative row count, carried on `StreamOutcome::Streamed { count }`) and `ReadyForQuery`. The producer returns a `StreamOutcome`: `Streamed` for a SELECT, or `Direct(ExecutionResult)` for every other statement, which the connection writes exactly as before (DML/DDL/EXPLAIN/COPY). The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream and returns the transaction slot only when it finishes, so MVCC and transaction semantics are unchanged. `blocking_send` provides backpressure; a dropped receiver (client gone) turns the next push into a graceful stop. The extended-protocol `Execute` streams identically through `execute_prepared_cancelable_streamed` / `execute_prepared_in_session_streamed`, differing only in that its `RowDescription` comes from `Describe` (so `Start` is consumed without emitting one) and its `ReadyForQuery` comes from `Sync` (see Connection Handling). Streaming alters neither protocol message encoding nor physical operator semantics; the materializing path (`execute_simple_with_session_sequences` and the `execute_sql` / `execute_prepared` convenience helpers, used by tests) shares the same executor drive.
 
 A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the auto-prune dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
 
@@ -349,11 +349,15 @@ unspecified) and replies `ParseComplete`. `Bind` decodes each parameter value
 and replies `BindComplete`. `Describe` replies `ParameterDescription` +
 `RowDescription`/`NoData` for a statement, or `RowDescription`/`NoData` in the
 portal's result formats for a portal. `Execute` runs the portal on the blocking
-thread pool, streaming `DataRow`s in the requested result formats followed by
-`CommandComplete` (no `RowDescription`, no `ReadyForQuery`); `max_rows` is
+thread pool; a SELECT streams its `DataRow`s through the same bounded-channel
+bridge as the simple-query path (`docs/specs/streaming.md`) in the requested
+result formats, followed by `CommandComplete` (no `RowDescription`, that came from
+`Describe`; no `ReadyForQuery`, that comes from `Sync`); every other statement is
+returned whole as a `StreamOutcome::Direct` and written as before. `max_rows` is
 treated as all rows. `Execute` participates in the session's CURRENT transaction:
 when an explicit transaction is open on the session (`Session.txn` is `Some`), the
-portal runs *inside* that transaction via `QueryService::execute_prepared_in_session_with_session_sequences`,
+portal runs *inside* that transaction via `QueryService::execute_prepared_in_session_streamed`
+(a thin wrapper over `…_with_session_sequences` that installs the channel sink),
 which routes through the same in-transaction machinery the simple-query path uses —
 the session's single write guard is reused (or lazily acquired once on the first
 write), the transaction's snapshot/isolation applies, the `'E'` failed-state gate
@@ -365,7 +369,7 @@ through `handle_transaction_control` so it affects `Session.txn` and
 slot, like `execute_simple`; a `SET SESSION CHARACTERISTICS` portal routes through
 this session path even with no open transaction, so it updates the per-connection
 default). With no open transaction (`Session.txn` is `None`), a data `Execute` is
-its own autocommit unit via `QueryService::execute_prepared_cancelable`. Routing both protocols through the one
+its own autocommit unit via `QueryService::execute_prepared_cancelable_streamed`. Routing both protocols through the one
 transaction slot keeps the invariant that a connection acquires the (shared) writer
 guard at most once per transaction, so an extended write on a connection already
 inside a write transaction never acquires a second guard. Under E2b the shared guard

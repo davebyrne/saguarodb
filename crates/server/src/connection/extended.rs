@@ -1,14 +1,15 @@
-use common::{ColumnInfo, DataType, DbError, Result, Value};
+use common::{ColumnInfo, DataType, DbError, Result, Row, Value};
 use executor::ExecutionResult;
 use protocol::{PostgresCodec, ServerMessage, StatementKind};
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
 
-use crate::query::PreparedStatement;
+use crate::query::{PreparedStatement, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
     Portal, Session, TransactionState, command_complete_tag, encode_row, error_response,
-    protocol_error, query_task_result, resolve_format, write_messages,
+    protocol_error, resolve_format, streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -55,63 +56,93 @@ impl Session {
         // autocommit unit.
         let route_through_session =
             self.txn.is_some() || statement.is_transaction_control() || statement.is_maintenance();
-        let result = if route_through_session {
+
+        // A SELECT streams its rows through this bounded channel while the producer
+        // runs (`docs/specs/streaming.md` §4). Both routing branches return a
+        // unified `(slot, default_isolation, StreamOutcome)` so the drain + join
+        // below is shared; the autocommit branch simply carries `slot = None`.
+        let (row_tx, mut row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
+        let task = if route_through_session {
             // Move the transaction slot AND default isolation into the blocking task
             // (like the simple-query path) so the whole statement, including any owned
-            // write guard, runs on one thread; take them both back with the result. A
-            // transaction-control `Execute` (e.g. BEGIN, or SET SESSION CHARACTERISTICS
-            // routed via the session path) reads/updates the default here.
+            // write guard, runs on one thread; take them both back with the outcome.
             let txn = self.txn.take();
             let default_isolation = self.default_isolation;
-            let task = tokio::task::spawn_blocking(move || {
-                service.execute_prepared_in_session_with_session_sequences(
+            tokio::task::spawn_blocking(move || {
+                service.execute_prepared_in_session_streamed(
                     &statement,
                     &params,
                     txn,
                     default_isolation,
                     &cancel,
                     session_sequences,
+                    row_tx,
                 )
             })
-            .await;
-            drop(guard);
-            match task {
-                Ok((txn, default_isolation, result)) => {
-                    self.txn = txn;
-                    self.default_isolation = default_isolation;
-                    result
-                }
-                Err(join_err) => {
-                    // The blocking task panicked and lost the transaction slot; the
-                    // guard/registry entry for the lost txn cannot be recovered
-                    // here. Treat the session as having no open transaction (the
-                    // simple-query path makes the same best-effort choice).
-                    self.txn = None;
-                    Err(DbError::internal(format!("query task failed: {join_err}")))
-                }
-            }
         } else {
-            let result = query_task_result(
-                tokio::task::spawn_blocking(move || {
-                    service.execute_prepared_cancelable_with_session_sequences(
-                        &statement,
-                        &params,
-                        &cancel,
-                        session_sequences,
-                    )
-                })
-                .await,
-            );
-            drop(guard);
-            result
+            let default_isolation = self.default_isolation;
+            tokio::task::spawn_blocking(move || {
+                let result = service.execute_prepared_cancelable_streamed(
+                    &statement,
+                    &params,
+                    &cancel,
+                    session_sequences,
+                    row_tx,
+                );
+                (None, default_isolation, result)
+            })
         };
 
+        // Drain rows to the socket as they arrive. Unlike the simple-query path, the
+        // extended protocol's `RowDescription` came from `Describe`, so `Start` is
+        // consumed without emitting one; `DataRow`s use the portal's result formats;
+        // and no `ReadyForQuery` is sent here (`Sync` emits it).
+        let mut write_err: Option<DbError> = None;
+        while let Some(message) = row_rx.recv().await {
+            let write_result = match message {
+                StreamMessage::Start { .. } => Ok(()),
+                StreamMessage::Rows(rows) => match encode_portal_rows(&rows, &result_formats) {
+                    Ok(messages) => write_messages(stream, codec, &messages).await,
+                    Err(err) => Err(err),
+                },
+            };
+            if let Err(err) = write_result {
+                write_err = Some(err);
+                break;
+            }
+        }
+        drop(row_rx);
+
+        let (txn, default_isolation, outcome) =
+            streamed_task_result(task.await, self.default_isolation);
+        self.txn = txn;
+        self.default_isolation = default_isolation;
+        drop(guard);
         // Keep the reported transaction-block status in sync with the slot, so the
         // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
 
-        match result {
-            Ok(result) => write_portal_result(stream, codec, result, &result_formats).await,
+        // A socket-write failure while streaming means the connection is broken;
+        // surface it (closing the connection) rather than writing a terminal
+        // message the client cannot receive.
+        if let Some(err) = write_err {
+            return Err(err);
+        }
+
+        match outcome {
+            // A streamed SELECT: `DataRow`s were already written above; finish with
+            // the DML-less `SELECT n` tag (no `RowDescription`, no `ReadyForQuery`).
+            Ok(StreamOutcome::Streamed { count }) => {
+                write_messages(
+                    stream,
+                    codec,
+                    &[ServerMessage::CommandComplete(format!("SELECT {count}"))],
+                )
+                .await
+            }
+            Ok(StreamOutcome::Direct(result)) => {
+                write_portal_result(stream, codec, result, &result_formats).await
+            }
             Err(err) => {
                 self.failed = true;
                 write_messages(stream, codec, &[error_response(&err)]).await
@@ -290,6 +321,14 @@ fn row_description_or_no_data(columns: Option<&[ColumnInfo]>, formats: &[i16]) -
 fn resolve_formats(formats: &[i16], count: usize) -> Vec<i16> {
     (0..count)
         .map(|index| resolve_format(formats, index))
+        .collect()
+}
+
+/// Encode a batch of streamed result rows as `DataRow` messages in the portal's
+/// result formats.
+fn encode_portal_rows(rows: &[Row], result_formats: &[i16]) -> Result<Vec<ServerMessage>> {
+    rows.iter()
+        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, result_formats)?)))
         .collect()
 }
 
