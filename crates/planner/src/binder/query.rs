@@ -1,6 +1,7 @@
 use catalog::CatalogManager;
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, DataType, Result, SqlState, TableId, TableSchema, Value,
+    ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
+    Value,
 };
 use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
 
@@ -315,6 +316,7 @@ pub(super) fn select_output_schema(
             data_type: item.expr.data_type(),
             table_id: output_table_id(ctx, &item.expr),
             column_id: output_column_id(&item.expr),
+            pg_type: Some(output_pg_type(ctx, &item.expr)),
         })
         .collect()
 }
@@ -696,6 +698,31 @@ fn output_column_id(expr: &BoundExpr) -> Option<ColumnId> {
     match expr {
         BoundExpr::InputRef { column, .. } => Some(*column),
         _ => None,
+    }
+}
+
+/// The PostgreSQL wire type of an output column ("columns + casts" propagation):
+/// a bare column reference reports its source column's declared wire type, an
+/// explicit `CAST` reports its target wire type, and every other expression
+/// reports the natural wire type collapsed from its result `DataType`.
+fn output_pg_type(ctx: &BindContext, expr: &BoundExpr) -> PgType {
+    match expr {
+        // `column` is the dense index into the binding's columns (same value
+        // `output_column_id` returns), so resolve the source `ColumnDef` directly.
+        BoundExpr::InputRef {
+            input,
+            column,
+            data_type,
+            ..
+        } => ctx
+            .bindings
+            .iter()
+            .find(|binding| binding.id == *input)
+            .and_then(|binding| binding.columns.get(usize::from(*column)))
+            .map(ColumnDef::wire_type)
+            .unwrap_or_else(|| PgType::from(data_type)),
+        BoundExpr::Cast { pg_type, .. } => pg_type.clone(),
+        other => PgType::from(&other.data_type()),
     }
 }
 

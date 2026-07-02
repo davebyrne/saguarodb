@@ -421,10 +421,12 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
         BoundExpr::Cast {
             expr,
             data_type,
+            pg_type,
             nullable,
         } => Ok(BoundExpr::Cast {
             expr: resolve_boxed(ctx, expr)?,
             data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
             nullable: *nullable,
         }),
     }

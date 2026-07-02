@@ -433,6 +433,7 @@ fn aggregate_output_schema(
             data_type: expr.data_type(),
             table_id: None,
             column_id: None,
+            pg_type: None,
         });
     }
     for (index, aggregate) in aggregates.iter().enumerate() {
@@ -441,6 +442,7 @@ fn aggregate_output_schema(
             data_type: aggregate.data_type.clone(),
             table_id: None,
             column_id: None,
+            pg_type: None,
         });
     }
     output
@@ -725,10 +727,12 @@ fn rewrite_aggregate_expr(
         BoundExpr::Cast {
             expr,
             data_type,
+            pg_type,
             nullable,
         } => Ok(BoundExpr::Cast {
             expr: Box::new(rewrite_aggregate_expr(expr, group_by, aggregates)?),
             data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
             nullable: *nullable,
         }),
         // The subquery body is uncorrelated (its own scope), so it needs no

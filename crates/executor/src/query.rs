@@ -1168,6 +1168,7 @@ fn table_output_schema(catalog: &dyn CatalogManager, table: TableId) -> Result<V
             data_type: column.data_type,
             table_id: Some(table),
             column_id: Some(column.id),
+            pg_type: None,
         })
         .collect())
 }

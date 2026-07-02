@@ -495,5 +495,7 @@ fn column_info_for_column(table: &TableSchema, column: &ColumnDef) -> ColumnInfo
         data_type: column.data_type.clone(),
         table_id: Some(table.id),
         column_id: Some(column.id),
+        // A base-table column reports its declared wire type.
+        pg_type: Some(column.wire_type()),
     }
 }

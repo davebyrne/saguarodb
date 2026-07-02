@@ -194,7 +194,7 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, PRIMARY_KEY_INDEX_ID,
-        ParsedColumnDef, SequenceOptions, SqlState, Value,
+        ParsedColumnDef, PgType, SequenceOptions, SqlState, Value,
     };
     use parser::parse;
 
@@ -334,6 +334,77 @@ mod tests {
             Some(BoundExpr::BinaryOp { ref left, .. })
                 if matches!(left.as_ref(), BoundExpr::InputRef { column: 1, slot: 1, .. })
         ));
+    }
+
+    fn catalog_with_typed_columns() -> MemoryCatalog {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "t".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "small".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Int2),
+                    },
+                    ParsedColumnDef {
+                        name: "txt".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: Some(10),
+                        default: None,
+                        pg_type: Some(PgType::Varchar(Some(10))),
+                    },
+                    ParsedColumnDef {
+                        name: "big".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Int8),
+                    },
+                ],
+                vec!["small".to_string()],
+            )
+            .unwrap();
+        catalog
+    }
+
+    #[test]
+    fn output_schema_reports_column_reference_wire_types() {
+        let catalog = catalog_with_typed_columns();
+        let stmt = parse("select small, txt, big from t").unwrap();
+        let BoundStatement::Select(select) = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected bound select");
+        };
+
+        // A bare column reference reports its source column's declared wire type.
+        assert_eq!(select.output_schema[0].wire_type(), PgType::Int2);
+        assert_eq!(
+            select.output_schema[1].wire_type(),
+            PgType::Varchar(Some(10))
+        );
+        assert_eq!(select.output_schema[2].wire_type(), PgType::Int8);
+    }
+
+    #[test]
+    fn output_schema_reports_cast_and_expression_wire_types() {
+        let catalog = catalog_with_typed_columns();
+        let stmt =
+            parse("select cast(small as bigint), cast(txt as varchar), big + 1 from t").unwrap();
+        let BoundStatement::Select(select) = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected bound select");
+        };
+
+        // A CAST reports the target's wire type (character casts carry no length).
+        assert_eq!(select.output_schema[0].wire_type(), PgType::Int8);
+        assert_eq!(select.output_schema[1].wire_type(), PgType::Varchar(None));
+        // A computed expression falls back to the natural type collapsed from its
+        // result DataType (Integer => int8).
+        assert_eq!(select.output_schema[2].wire_type(), PgType::Int8);
     }
 
     #[test]

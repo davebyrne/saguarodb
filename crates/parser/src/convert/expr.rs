@@ -4,7 +4,7 @@ use sqlparser::ast as sql;
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
 use super::query::{convert_query, convert_set_expr_to_query};
-use super::{convert_data_type, ident_name, object_name, parse_error, unsupported};
+use super::{convert_pg_type, ident_name, object_name, parse_error, unsupported};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
     match expr {
@@ -124,9 +124,13 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             if *kind != sql::CastKind::Cast || format.is_some() {
                 return unsupported("unsupported CAST form");
             }
+            // A CAST reports the target's wire type but does not enforce a declared
+            // length, so character targets carry no typmod (kind only).
+            let pg_type = convert_pg_type(data_type)?;
             Ok(Expr::Cast {
                 expr: Box::new(convert_expr(expr)?),
-                data_type: convert_data_type(data_type)?,
+                data_type: pg_type.data_type(),
+                pg_type,
             })
         }
         sql::Expr::TypedString { data_type, value } => convert_typed_string(data_type, value),

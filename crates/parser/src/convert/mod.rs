@@ -1,4 +1,4 @@
-use common::{DataType, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState};
+use common::{DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -284,10 +284,10 @@ fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel 
 }
 
 /// Map a declared SQL type to its PostgreSQL wire type ([`PgType`]). This is the
-/// single source of truth for the SQL-spelling → type mapping; [`convert_data_type`]
-/// derives the collapsed storage [`DataType`] from it. Character types report their
-/// kind without a length here — the column path folds the declared length in (CAST
-/// targets report the kind only).
+/// single source of truth for the SQL-spelling → type mapping; callers derive the
+/// collapsed storage [`DataType`] via [`PgType::data_type`] so the two never drift.
+/// Character types report their kind without a length here — the column path folds
+/// the declared length in (CAST targets report the kind only).
 fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
     match data_type {
         // Integer widths report distinct OIDs (int2/int4/int8) but share one
@@ -343,12 +343,6 @@ fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
         }
         _ => unsupported("unsupported data type"),
     }
-}
-
-/// The collapsed storage [`DataType`] for a declared SQL type, derived from its
-/// wire type so the two never drift.
-fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
-    Ok(convert_pg_type(data_type)?.data_type())
 }
 
 /// The wire type of a `SERIAL`-family column, or `None` for any other type. The

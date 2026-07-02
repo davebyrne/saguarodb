@@ -1,4 +1,4 @@
-use common::{BindingId, ColumnId, DataType, SequenceId, Value};
+use common::{BindingId, ColumnId, DataType, PgType, SequenceId, Value};
 
 use crate::BoundQuery;
 
@@ -117,6 +117,9 @@ pub enum BoundExpr {
     Cast {
         expr: Box<BoundExpr>,
         data_type: DataType,
+        /// The declared wire type of the cast target, so a `CAST` output column
+        /// reports the right OID/typmod (e.g. `::varchar` vs `::text`).
+        pg_type: PgType,
         nullable: bool,
     },
     /// A scalar subquery `(SELECT ...)`: a single-column, at-most-one-row query

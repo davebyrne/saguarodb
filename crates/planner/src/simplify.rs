@@ -472,10 +472,12 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
         BoundExpr::Cast {
             expr,
             data_type,
+            pg_type,
             nullable,
         } => BoundExpr::Cast {
             expr: Box::new(fold_expr(*expr)),
             data_type,
+            pg_type,
             nullable,
         },
         // Subqueries are not folded here: the inner SELECT is planned and folded

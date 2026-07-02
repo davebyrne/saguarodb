@@ -79,12 +79,17 @@ pub(super) fn bind_expr(
             when_clauses,
             else_clause.as_deref(),
         ),
-        Expr::Cast { expr, data_type } => {
+        Expr::Cast {
+            expr,
+            data_type,
+            pg_type,
+        } => {
             let expr = Box::new(bind_expr(ctx, expr, Some(data_type.clone()))?);
             Ok(BoundExpr::Cast {
                 nullable: expr.nullable(),
                 expr,
                 data_type: data_type.clone(),
+                pg_type: pg_type.clone(),
             })
         }
     }

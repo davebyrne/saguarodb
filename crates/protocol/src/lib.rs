@@ -79,6 +79,7 @@ mod tests {
             data_type,
             table_id: None,
             column_id: None,
+            pg_type: None,
         }
     }
 

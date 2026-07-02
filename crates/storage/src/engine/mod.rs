@@ -1275,6 +1275,7 @@ fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {
             data_type: column.data_type.clone(),
             table_id: Some(schema.id),
             column_id: Some(column.id),
+            pg_type: None,
         })
         .collect()
 }

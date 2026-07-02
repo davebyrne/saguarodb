@@ -1,5 +1,6 @@
 use common::{
-    CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, SequenceOptions, Value,
+    CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, PgType, SequenceOptions,
+    Value,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,6 +328,9 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         data_type: DataType,
+        /// The declared wire type of the cast target (e.g. `varchar` vs `text`),
+        /// carried so a `CAST` output column reports the right OID/typmod.
+        pg_type: PgType,
     },
 }
 

@@ -901,6 +901,7 @@ fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
             data_type: DataType::Text,
             table_id: None,
             column_id: None,
+            pg_type: None,
         }]),
         _ => None,
     }

@@ -126,6 +126,22 @@ pub struct ColumnInfo {
     pub data_type: DataType,
     pub table_id: Option<TableId>,
     pub column_id: Option<ColumnId>,
+    /// The declared PostgreSQL wire type of this result column. `None` for a
+    /// synthetic/computed column, which resolves to the collapsed default from
+    /// `data_type`. Use [`ColumnInfo::wire_type`] rather than reading this directly.
+    #[serde(default)]
+    pub pg_type: Option<PgType>,
+}
+
+impl ColumnInfo {
+    /// The column's PostgreSQL wire type, resolving an unlabeled column (`None`) to
+    /// the collapsed default derived from its `DataType` (`Integer` => int8,
+    /// `Text` => text). This is what the protocol reports; it is always concrete.
+    pub fn wire_type(&self) -> PgType {
+        self.pg_type
+            .clone()
+            .unwrap_or_else(|| PgType::from(&self.data_type))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,10 +210,13 @@ mod tests {
             data_type: DataType::Integer,
             table_id: None,
             column_id: None,
+            pg_type: None,
         };
 
         assert_eq!(column.name, "count");
         assert_eq!(column.table_id, None);
+        // A synthetic column with no declared label resolves to the collapsed default.
+        assert_eq!(column.wire_type(), PgType::Int8);
     }
 
     #[test]
