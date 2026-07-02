@@ -78,7 +78,7 @@ Async connection task                    Blocking producer (spawn_blocking)
 mpsc::channel(64)                        owns snapshot + GC-horizon advert
 spawn producer(row_tx) ───────────────►  + ExecutionContext + PlanExecutor + txn
 recv() loop:                             open() → sink.start(columns)
-  Start{columns} → RowDescription        loop { next_batch(N) → sink.push(batch) }
+  Start{columns} → RowDescription        loop: pull ≤N rows → sink.push(batch)
   Rows(batch)    → DataRow*                    (blocking_send → backpressure)
                                          close(); drop advertisement; drop ctx
 (task.await) ◄──────────────────────────  return (txn, default_iso, Outcome)
@@ -108,7 +108,8 @@ pub trait RowSink {
 
 impl QueryEngine {
     /// Build + open the executor for a query plan, emit the schema to `sink`,
-    /// then drive `next_batch(batch_size)` into `sink.push` until exhausted or
+    /// then pull rows one at a time — polling cancellation between rows — into
+    /// batches of at most `batch_size`, pushing each to `sink`, until exhausted or
     /// `Break`. Closes the executor on every path (success, error, early stop).
     /// Returns the number of rows streamed.
     pub fn execute_query_streamed(
@@ -125,9 +126,10 @@ Notes:
 
 - `execute_query_streamed` performs the same uncorrelated-subquery resolution
   that `QueryEngine::execute` does before building the executor, and reuses the
-  existing `open_executor` / `close_after` / `check_canceled` helpers so open
-  failure, per-batch cancellation, and close-on-error behavior are identical to
-  the materializing path.
+  existing `open_executor` / `close_after` / per-row cancellation checks so open
+  failure, cancellation granularity, and close-on-error behavior are identical to
+  the materializing path (the drive pulls with `next`, not `next_batch`, so
+  cancellation stays per-row).
 - The existing materializing `execute_query` is re-expressed as
   `execute_query_streamed` driven by a `Vec`-collecting sink. This keeps every
   current caller and test that matches `ExecutionResult::Query { rows, .. }`
@@ -238,19 +240,22 @@ invariant holds exactly as it does for `copy_out_autocommit` /
 | Pre-stream error (parse/bind/plan/`open`) | No `Start` is sent; `task.await` yields `Err`. Simple path: `ErrorResponse` + `ReadyForQuery`. Extended path: `ErrorResponse`, session marked failed. No `RowDescription`. |
 | Mid-stream error (storage read, cancellation) | `RowDescription` + some `DataRow`s already sent; then `ErrorResponse` (+ `ReadyForQuery` on the simple path). Valid in the PostgreSQL protocol. Inside a transaction the block is poisoned (`txn.failed = true`). |
 | Client / socket write error | The consumer records the error, stops reading, and drops the receiver; the producer's next `blocking_send` fails, the sink returns `Break`, the executor is closed, and the producer returns. The connection then errors out. Mirrors COPY-out's `write_err` handling. |
-| Cancellation (`CancelRequest`) | `ctx.cancel` is polled per batch in the drive loop, producing `QueryCanceled` mid-stream. This is the foundation for responsive statement timeouts. |
+| Cancellation (`CancelRequest`) | `ctx.cancel` is polled per row in the drive loop, producing `QueryCanceled` mid-stream. This is the foundation for responsive statement timeouts. |
 | Zero-row SELECT | `sink.start` fires before the drive loop, so `RowDescription` is always emitted (matching current behavior). |
 
 ## 7. Backpressure, batching, and tuning
 
-- The channel is a **bounded** `tokio::sync::mpsc` with capacity **64** (the value
-  called out in `overview.md:450`). Bounding the channel is what provides
-  backpressure and the memory ceiling.
-- Channel items are **row batches**, produced by `PlanExecutor::next_batch(N)`.
-  The `(channel capacity, batch size N)` pair is a tuning knob: it trades channel
-  operations against peak buffered rows. The default keeps peak buffered rows
-  small (a few hundred) and is documented at the call site. It affects **neither
-  correctness nor the wire protocol** — only throughput and memory.
+- The channel is a **bounded** `tokio::sync::mpsc` with capacity
+  `STREAM_CHANNEL_CAPACITY` (**64**, matching `overview.md`). Bounding the channel
+  is what provides backpressure and the memory ceiling.
+- Channel items are **row batches**: the drive pulls rows one at a time (with
+  `next`, so cancellation stays per-row) and accumulates up to `STREAM_BATCH_ROWS`
+  (**64**) of them before pushing a batch. The `(capacity, batch size)` pair is a
+  tuning knob trading channel operations against peak buffered rows — at the
+  defaults, at most about `64 × 64 = 4096` rows are buffered before the producer
+  blocks (a bounded, constant ceiling regardless of result size, which is the
+  point). It affects **neither correctness nor the wire protocol** — only
+  throughput and memory.
 - Row identity is dropped at the sink boundary (the sink takes plain `Row`, as
   `execute_query` does today with `row.row`); SELECT output never needs
   `RowIdentity`.
@@ -270,7 +275,7 @@ additive change rather than a rework. None are implemented in this work.
   parked between fetches, holding the snapshot and advertisement. The `RowSink`
   batch drive and the `ControlFlow::Break` early-stop signal are already the
   fetch-*n*-then-stop primitive this needs.
-- **Responsive statement timeouts.** Cancellation is already observed per batch in
+- **Responsive statement timeouts.** Cancellation is already observed per row in
   the drive loop; a timeout simply sets `ctx.cancel` from a timer, and the stream
   stops at the next batch boundary.
 - **Homes that already exist.** The portal registry (`self.portals`) is where a
