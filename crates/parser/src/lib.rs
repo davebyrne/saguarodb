@@ -907,8 +907,9 @@ mod tests {
 
     #[test]
     fn integer_width_aliases_map_to_integer() {
-        // SMALLINT/INT2/INT4/INT8/BIGINT are all 64-bit integers in SaguaroDB
-        // (no distinct width); they parse to DataType::Integer like INTEGER/INT.
+        // All integer widths share one 64-bit storage type (DataType::Integer),
+        // but each reports its declared PostgreSQL wire width: SMALLINT/INT2 =>
+        // int2, INTEGER/INT/INT4 => int4, BIGINT/INT8 => int8.
         let Statement::CreateTable { columns, .. } = parse(
             "create table widths (a smallint, b int2, c int4, d int8, e bigint, f integer, g int)",
         )
@@ -916,14 +917,24 @@ mod tests {
             panic!("expected create table");
         };
 
-        assert_eq!(columns.len(), 7);
-        for column in &columns {
+        let expected = [
+            common::PgType::Int2, // smallint
+            common::PgType::Int2, // int2
+            common::PgType::Int4, // int4
+            common::PgType::Int8, // int8
+            common::PgType::Int8, // bigint
+            common::PgType::Int4, // integer
+            common::PgType::Int4, // int
+        ];
+        assert_eq!(columns.len(), expected.len());
+        for (column, pg_type) in columns.iter().zip(expected) {
             assert_eq!(
                 column.data_type,
                 DataType::Integer,
-                "column {} should map to Integer",
+                "column {}",
                 column.name
             );
+            assert_eq!(column.pg_type, Some(pg_type), "column {}", column.name);
         }
     }
 
@@ -936,11 +947,21 @@ mod tests {
             panic!("expected create table");
         };
 
-        assert_eq!(columns.len(), 6);
-        for column in &columns {
+        // Serial columns store a 64-bit integer but report their serial kind's width.
+        let expected = [
+            common::PgType::Int4, // serial
+            common::PgType::Int8, // bigserial
+            common::PgType::Int2, // smallserial
+            common::PgType::Int2, // serial2
+            common::PgType::Int4, // serial4
+            common::PgType::Int8, // serial8
+        ];
+        assert_eq!(columns.len(), expected.len());
+        for (column, pg_type) in columns.iter().zip(expected) {
             assert_eq!(column.data_type, DataType::Integer);
             assert!(!column.nullable);
             assert_eq!(column.default, Some(common::ParsedDefault::Serial));
+            assert_eq!(column.pg_type, Some(pg_type), "column {}", column.name);
         }
     }
 
@@ -968,11 +989,50 @@ mod tests {
         assert_eq!(columns[2].max_length, Some(3));
         assert_eq!(columns[3].max_length, None);
         assert_eq!(columns[4].max_length, None);
+        // The character kind and its length are reported on the wire: varchar =>
+        // varchar OID, char/character => bpchar OID, with the declared length.
+        assert_eq!(columns[0].pg_type, Some(common::PgType::Varchar(Some(10))));
+        assert_eq!(columns[1].pg_type, Some(common::PgType::Bpchar(Some(5))));
+        assert_eq!(columns[2].pg_type, Some(common::PgType::Bpchar(Some(3))));
+        assert_eq!(columns[3].pg_type, Some(common::PgType::Varchar(None)));
+        assert_eq!(columns[4].pg_type, Some(common::PgType::Text));
     }
 
     #[test]
     fn rejects_zero_length_character_type() {
         assert!(parse("create table t (a varchar(0))").is_err());
+    }
+
+    #[test]
+    fn declared_pg_types_are_captured_for_scalar_types() {
+        let Statement::CreateTable { columns, .. } = parse(
+            "create table t (a real, b double precision, c numeric(10, 2), d boolean, \
+             e date, f time, g timestamp, h timestamptz, i interval, j bytea, k uuid)",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+
+        let expected = [
+            common::PgType::Float4,
+            common::PgType::Float8,
+            common::PgType::Numeric {
+                precision: Some(10),
+                scale: 2,
+            },
+            common::PgType::Bool,
+            common::PgType::Date,
+            common::PgType::Time,
+            common::PgType::Timestamp,
+            common::PgType::Timestamptz,
+            common::PgType::Interval,
+            common::PgType::Bytea,
+            common::PgType::Uuid,
+        ];
+        assert_eq!(columns.len(), expected.len());
+        for (column, pg_type) in columns.iter().zip(expected) {
+            assert_eq!(column.pg_type, Some(pg_type), "column {}", column.name);
+        }
     }
 
     #[test]

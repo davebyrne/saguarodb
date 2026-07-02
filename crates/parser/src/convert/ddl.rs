@@ -1,10 +1,11 @@
-use common::{ParsedColumnDef, ParsedDefault, Result, Value};
+use common::{ParsedColumnDef, ParsedDefault, PgType, Result, Value};
 use sqlparser::ast as sql;
 
 use crate::{Expr, Statement, UnaryOp};
 
 use super::{
-    column_char_length, convert_data_type, convert_expr, ident_name, object_name, unsupported,
+    column_char_length, convert_expr, convert_pg_type, ident_name, object_name, serial_pg_type,
+    unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -253,7 +254,7 @@ fn convert_column_def(
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
     let mut default = None;
-    let serial = super::is_serial_type(&column.data_type)?;
+    let serial = serial_pg_type(&column.data_type)?;
 
     for option in &column.options {
         if option.name.is_some() {
@@ -264,7 +265,7 @@ fn convert_column_def(
             sql::ColumnOption::Null => nullable = true,
             sql::ColumnOption::NotNull => nullable = false,
             sql::ColumnOption::Default(expr) => {
-                if serial {
+                if serial.is_some() {
                     return unsupported("SERIAL columns cannot specify an explicit DEFAULT");
                 }
                 if default.is_some() {
@@ -292,25 +293,36 @@ fn convert_column_def(
         }
     }
 
+    let name = ident_name(&column.name)?;
+
+    // A SERIAL-family column stores a 64-bit integer with a sequence default but
+    // reports the wire width of its serial kind (serial => int4, etc.).
+    if let Some(pg_type) = serial {
+        return Ok(ParsedColumnDef {
+            name,
+            data_type: pg_type.data_type(),
+            nullable: false,
+            max_length: None,
+            default: Some(ParsedDefault::Serial),
+            pg_type: Some(pg_type),
+        });
+    }
+
+    // Otherwise derive the storage type from the declared wire type, folding the
+    // declared character length (if any) into `varchar(n)` / `char(n)`.
+    let max_length = column_char_length(&column.data_type)?;
+    let pg_type = match convert_pg_type(&column.data_type)? {
+        PgType::Varchar(_) => PgType::Varchar(max_length),
+        PgType::Bpchar(_) => PgType::Bpchar(max_length),
+        other => other,
+    };
     Ok(ParsedColumnDef {
-        name: ident_name(&column.name)?,
-        data_type: if serial {
-            common::DataType::Integer
-        } else {
-            convert_data_type(&column.data_type)?
-        },
-        nullable: if serial { false } else { nullable },
-        max_length: if serial {
-            None
-        } else {
-            column_char_length(&column.data_type)?
-        },
-        default: if serial {
-            Some(ParsedDefault::Serial)
-        } else {
-            default
-        },
-        pg_type: None,
+        name,
+        data_type: pg_type.data_type(),
+        nullable,
+        max_length,
+        default,
+        pg_type: Some(pg_type),
     })
 }
 

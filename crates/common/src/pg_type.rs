@@ -117,6 +117,32 @@ impl PgType {
         };
         i32::try_from(modifier).unwrap_or(-1)
     }
+
+    /// The storage/semantic [`DataType`] this wire type refines. The distinctions
+    /// `DataType` collapses are dropped here: every integer width maps to
+    /// `Integer` and every character kind to `Text`; all other types are 1:1.
+    /// This is the inverse of [`PgType::from`] on the collapsed families, so
+    /// `PgType::from(&dt).data_type() == dt` for every `DataType`.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            PgType::Int2 | PgType::Int4 | PgType::Int8 => DataType::Integer,
+            PgType::Bool => DataType::Boolean,
+            PgType::Float4 => DataType::Real,
+            PgType::Float8 => DataType::Double,
+            PgType::Numeric { precision, scale } => DataType::Numeric {
+                precision: *precision,
+                scale: *scale,
+            },
+            PgType::Text | PgType::Varchar(_) | PgType::Bpchar(_) => DataType::Text,
+            PgType::Bytea => DataType::Bytea,
+            PgType::Uuid => DataType::Uuid,
+            PgType::Date => DataType::Date,
+            PgType::Time => DataType::Time,
+            PgType::Timestamp => DataType::Timestamp,
+            PgType::Timestamptz => DataType::TimestampTz,
+            PgType::Interval => DataType::Interval,
+        }
+    }
 }
 
 /// The fallback wire type for a `DataType` with no declared label: the collapsed
@@ -260,5 +286,45 @@ mod tests {
             }
         );
         assert_eq!(PgType::from(&DataType::TimestampTz), PgType::Timestamptz);
+    }
+
+    #[test]
+    fn data_type_collapses_widths_and_char_kinds() {
+        // The refined wire types collapse back to the storage type.
+        for pg_type in [PgType::Int2, PgType::Int4, PgType::Int8] {
+            assert_eq!(pg_type.data_type(), DataType::Integer);
+        }
+        for pg_type in [
+            PgType::Text,
+            PgType::Varchar(Some(10)),
+            PgType::Bpchar(None),
+        ] {
+            assert_eq!(pg_type.data_type(), DataType::Text);
+        }
+        assert_eq!(PgType::Float4.data_type(), DataType::Real);
+        assert_eq!(PgType::Float8.data_type(), DataType::Double);
+
+        // `data_type()` is a left inverse of the label-free `From` for every type.
+        let all = [
+            DataType::Integer,
+            DataType::Text,
+            DataType::Boolean,
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Time,
+            DataType::TimestampTz,
+            DataType::Interval,
+            DataType::Bytea,
+            DataType::Uuid,
+            DataType::Double,
+            DataType::Real,
+            DataType::Numeric {
+                precision: Some(10),
+                scale: 2,
+            },
+        ];
+        for data_type in all {
+            assert_eq!(PgType::from(&data_type).data_type(), data_type);
+        }
     }
 }

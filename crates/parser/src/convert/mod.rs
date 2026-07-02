@@ -1,4 +1,4 @@
-use common::{DataType, DbError, IsolationLevel, Result, SequenceOptions, SqlState};
+use common::{DataType, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -283,76 +283,93 @@ fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel 
     }
 }
 
-fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
+/// Map a declared SQL type to its PostgreSQL wire type ([`PgType`]). This is the
+/// single source of truth for the SQL-spelling → type mapping; [`convert_data_type`]
+/// derives the collapsed storage [`DataType`] from it. Character types report their
+/// kind without a length here — the column path folds the declared length in (CAST
+/// targets report the kind only).
+fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
     match data_type {
-        // All integer widths are backed by a single 64-bit integer; SMALLINT/
-        // BIGINT and the `intN` aliases are accepted but not range-enforced.
-        sql::DataType::Integer(None)
-        | sql::DataType::Int(None)
-        | sql::DataType::Int2(None)
-        | sql::DataType::SmallInt(None)
-        | sql::DataType::Int4(None)
-        | sql::DataType::Int8(None)
-        | sql::DataType::BigInt(None) => Ok(DataType::Integer),
-        // Character types all map to the single unbounded TEXT value; any
-        // declared length is a column-level constraint, captured separately by
-        // `column_char_length` (CAST targets ignore the length).
-        sql::DataType::Text
-        | sql::DataType::Varchar(_)
-        | sql::DataType::Char(_)
-        | sql::DataType::Character(_) => Ok(DataType::Text),
-        sql::DataType::Boolean | sql::DataType::Bool => Ok(DataType::Boolean),
-        sql::DataType::Date => Ok(DataType::Date),
+        // Integer widths report distinct OIDs (int2/int4/int8) but share one
+        // 64-bit storage type; a display width like `INTEGER(5)` is not supported.
+        sql::DataType::SmallInt(None) | sql::DataType::Int2(None) => Ok(PgType::Int2),
+        sql::DataType::Integer(None) | sql::DataType::Int(None) | sql::DataType::Int4(None) => {
+            Ok(PgType::Int4)
+        }
+        sql::DataType::BigInt(None) | sql::DataType::Int8(None) => Ok(PgType::Int8),
+        // Character types share the single `TEXT` storage type but report distinct
+        // OIDs (text / varchar / bpchar). The declared length is applied by the
+        // column path, not here.
+        sql::DataType::Text => Ok(PgType::Text),
+        sql::DataType::Varchar(_) => Ok(PgType::Varchar(None)),
+        sql::DataType::Char(_) | sql::DataType::Character(_) => Ok(PgType::Bpchar(None)),
+        sql::DataType::Boolean | sql::DataType::Bool => Ok(PgType::Bool),
+        sql::DataType::Date => Ok(PgType::Date),
         // TIMESTAMP without time zone and without a fractional-seconds precision.
         // WITH TIME ZONE and an explicit precision are not supported.
         sql::DataType::Timestamp(
             None,
             sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone,
-        ) => Ok(DataType::Timestamp),
+        ) => Ok(PgType::Timestamp),
         // TIMESTAMP WITH TIME ZONE / TIMESTAMPTZ (UTC-normalized), no precision.
         sql::DataType::Timestamp(None, sql::TimezoneInfo::WithTimeZone | sql::TimezoneInfo::Tz) => {
-            Ok(DataType::TimestampTz)
+            Ok(PgType::Timestamptz)
         }
         // TIME without time zone, no fractional-seconds precision.
         sql::DataType::Time(None, sql::TimezoneInfo::None | sql::TimezoneInfo::WithoutTimeZone) => {
-            Ok(DataType::Time)
+            Ok(PgType::Time)
         }
-        sql::DataType::Interval => Ok(DataType::Interval),
-        sql::DataType::Bytea => Ok(DataType::Bytea),
-        sql::DataType::Uuid => Ok(DataType::Uuid),
+        sql::DataType::Interval => Ok(PgType::Interval),
+        sql::DataType::Bytea => Ok(PgType::Bytea),
+        sql::DataType::Uuid => Ok(PgType::Uuid),
         // DOUBLE PRECISION and its aliases (`FLOAT8`, bare `FLOAT`).
         sql::DataType::DoublePrecision
         | sql::DataType::Float8
-        | sql::DataType::Double(sql::ExactNumberInfo::None) => Ok(DataType::Double),
+        | sql::DataType::Double(sql::ExactNumberInfo::None) => Ok(PgType::Float8),
         // REAL / FLOAT4 (single precision).
-        sql::DataType::Real | sql::DataType::Float4 => Ok(DataType::Real),
+        sql::DataType::Real | sql::DataType::Float4 => Ok(PgType::Float4),
         // `FLOAT(p)`: PostgreSQL maps p in 1..=24 to REAL and 25..=53 to DOUBLE
         // PRECISION; bare `FLOAT` is DOUBLE PRECISION.
         sql::DataType::Float(precision) => match precision {
-            None => Ok(DataType::Double),
-            Some(p) if (1..=24).contains(p) => Ok(DataType::Real),
-            Some(p) if (25..=53).contains(p) => Ok(DataType::Double),
+            None => Ok(PgType::Float8),
+            Some(p) if (1..=24).contains(p) => Ok(PgType::Float4),
+            Some(p) if (25..=53).contains(p) => Ok(PgType::Float8),
             Some(_) => unsupported("float precision must be between 1 and 53"),
         },
         // NUMERIC / DECIMAL, optionally with (precision[, scale]).
-        sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => convert_numeric_typmod(info),
+        sql::DataType::Numeric(info) | sql::DataType::Decimal(info) => {
+            let (precision, scale) = numeric_typmod(info)?;
+            Ok(PgType::Numeric { precision, scale })
+        }
         _ => unsupported("unsupported data type"),
     }
 }
 
-pub(super) fn is_serial_type(data_type: &sql::DataType) -> Result<bool> {
+/// The collapsed storage [`DataType`] for a declared SQL type, derived from its
+/// wire type so the two never drift.
+fn convert_data_type(data_type: &sql::DataType) -> Result<DataType> {
+    Ok(convert_pg_type(data_type)?.data_type())
+}
+
+/// The wire type of a `SERIAL`-family column, or `None` for any other type. The
+/// column stores a 64-bit integer with a sequence-backed default, but reports the
+/// PostgreSQL width of its serial kind (`smallserial` => int2, `serial` => int4,
+/// `bigserial` => int8).
+pub(super) fn serial_pg_type(data_type: &sql::DataType) -> Result<Option<PgType>> {
     let sql::DataType::Custom(name, modifiers) = data_type else {
-        return Ok(false);
+        return Ok(None);
     };
     let name = object_name(name)?;
-    let serial = matches!(
-        name.as_str(),
-        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
-    );
-    if serial && !modifiers.is_empty() {
+    let pg_type = match name.as_str() {
+        "serial2" | "smallserial" => PgType::Int2,
+        "serial" | "serial4" => PgType::Int4,
+        "serial8" | "bigserial" => PgType::Int8,
+        _ => return Ok(None),
+    };
+    if !modifiers.is_empty() {
         return unsupported("SERIAL type modifiers are not supported");
     }
-    Ok(serial)
+    Ok(Some(pg_type))
 }
 
 /// Validate a NUMERIC/DECIMAL type modifier and return `(precision, scale)`:
@@ -376,12 +393,6 @@ pub(super) fn numeric_typmod(info: &sql::ExactNumberInfo) -> Result<(Option<u32>
         }
     }
     Ok((precision.map(|p| p as u32), scale as u32))
-}
-
-/// Convert a NUMERIC/DECIMAL type modifier into `DataType::Numeric`.
-fn convert_numeric_typmod(info: &sql::ExactNumberInfo) -> Result<DataType> {
-    let (precision, scale) = numeric_typmod(info)?;
-    Ok(DataType::Numeric { precision, scale })
 }
 
 /// Extract the declared maximum length (in characters) of a bounded character
