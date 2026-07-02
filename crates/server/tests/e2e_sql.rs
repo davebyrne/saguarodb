@@ -3405,3 +3405,134 @@ async fn e2e_values_query() {
         err.message
     );
 }
+
+/// Set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) end to end, including
+/// ORDER BY over the combined result, LIMIT, VALUES arms, derived-table use, NULL
+/// de-duplication, and the reconciliation/quantifier error cases.
+#[tokio::test]
+async fn e2e_set_operations() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table a (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table b (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into a values (1), (2), (3)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into b values (2), (3), (4)")
+        .await
+        .unwrap();
+
+    let ids = |rows: Vec<Vec<Option<String>>>| -> Vec<Option<String>> {
+        rows.into_iter().map(|mut r| r.remove(0)).collect()
+    };
+    let n = |v: &str| Some(v.to_string());
+
+    // UNION removes duplicates; ORDER BY (by output name) sorts the combined result.
+    let rows = server
+        .simple_query("select id from a union select id from b order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("2"), n("3"), n("4")]);
+
+    // UNION ALL keeps duplicates.
+    let rows = server
+        .simple_query("select id from a union all select id from b order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        ids(rows),
+        vec![n("1"), n("2"), n("2"), n("3"), n("3"), n("4")]
+    );
+
+    // INTERSECT: rows in both.
+    let rows = server
+        .simple_query("select id from a intersect select id from b order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("2"), n("3")]);
+
+    // EXCEPT: left rows not in right.
+    let rows = server
+        .simple_query("select id from a except select id from b order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1")]);
+
+    // ORDER BY DESC + LIMIT over the combined result.
+    let rows = server
+        .simple_query("select id from a union select id from b order by id desc limit 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("4"), n("3")]);
+
+    // VALUES arms, and a set operation as a derived table.
+    let rows = server
+        .simple_query("values (1), (2) union values (2), (3) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("2"), n("3")]);
+    let rows = server
+        .simple_query("select x from (select id from a union select id from b) as t(x) order by x")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("2"), n("3"), n("4")]);
+
+    // NULL de-duplicates against NULL in set operations (NULL == NULL here); NULLs
+    // sort last by default.
+    let rows = server
+        .simple_query("values (1), (null) union values (null), (2) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), n("2"), None]);
+
+    // Mismatched arm types are rejected (no implicit casts).
+    let err = server
+        .simple_query("select id from a union select 'x'")
+        .await
+        .err()
+        .expect("mismatched set-operation types should fail");
+    assert!(
+        err.message.contains("42804"),
+        "expected DatatypeMismatch: {}",
+        err.message
+    );
+
+    // Mismatched column counts are rejected.
+    let err = server
+        .simple_query("select id from a union select 1, 2")
+        .await
+        .err()
+        .expect("mismatched set-operation column counts should fail");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError: {}",
+        err.message
+    );
+
+    // INTERSECT ALL / EXCEPT ALL are not supported yet.
+    let err = server
+        .simple_query("select id from a intersect all select id from b")
+        .await
+        .err()
+        .expect("INTERSECT ALL should be rejected");
+    assert!(
+        err.message.contains("0A000"),
+        "expected FeatureNotSupported: {}",
+        err.message
+    );
+}

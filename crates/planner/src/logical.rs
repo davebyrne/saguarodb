@@ -5,7 +5,7 @@ use common::{
 use crate::{
     AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
     BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement,
-    JoinType,
+    JoinType, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +98,15 @@ pub enum LogicalPlan {
     Values {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
+    },
+    /// A set operation over two sub-plans. `all` keeps duplicates; otherwise the
+    /// combined result is de-duplicated. Both sides produce identically-typed rows
+    /// (the binder reconciled them), so the output schema is the left side's.
+    SetOp {
+        op: SetOp,
+        all: bool,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
     },
 }
 
@@ -215,6 +224,23 @@ fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
                 rows: values.rows.clone(),
                 output_schema: values.output_schema.clone(),
             };
+            Ok(apply_limit(plan, query.limit, query.offset))
+        }
+        // A set operation lowers each arm and combines them; the query-level
+        // `ORDER BY` (bound to output positions) and `LIMIT`/`OFFSET` stack above.
+        BoundQueryBody::SetOp(set_op) => {
+            let mut plan = LogicalPlan::SetOp {
+                op: set_op.op,
+                all: set_op.all,
+                left: Box::new(plan_query(&set_op.left)?),
+                right: Box::new(plan_query(&set_op.right)?),
+            };
+            if !query.order_by.is_empty() {
+                plan = LogicalPlan::Sort {
+                    source: Box::new(plan),
+                    order_by: query.order_by.clone(),
+                };
+            }
             Ok(apply_limit(plan, query.limit, query.offset))
         }
     }

@@ -10,7 +10,8 @@ mod simplify;
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
-    BoundReturning, BoundSelect, BoundSelectItem, BoundStatement, BoundValues, OutputColumn,
+    BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
+    OutputColumn,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -18,6 +19,7 @@ pub use expr::{
 };
 pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_types, substitute_params};
+pub use parser::SetOp;
 pub use physical::{PhysicalPlan, physical_plan};
 
 pub fn mutates_sequences(statement: &BoundStatement) -> bool {
@@ -99,6 +101,9 @@ fn query_mutates_sequences(query: &BoundQuery) -> bool {
     let body_mutates = match &query.body {
         BoundQueryBody::Select(select) => select_mutates_sequences(select),
         BoundQueryBody::Values(values) => values.rows.iter().flatten().any(expr_mutates_sequences),
+        BoundQueryBody::SetOp(set_op) => {
+            query_mutates_sequences(&set_op.left) || query_mutates_sequences(&set_op.right)
+        }
     };
     body_mutates
         || query
@@ -514,6 +519,65 @@ mod tests {
         // outer scope, so the projection resolves and is typed Integer.
         assert_eq!(query.output_schema()[0].name, "x");
         assert_eq!(query.output_schema()[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn binder_reconciles_set_operation_output_columns() {
+        let catalog = catalog_with_users();
+        let BoundStatement::Query(query) =
+            bind(&parse("select 1 as x union select 2").unwrap(), &catalog).unwrap()
+        else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::SetOp(set_op) = &query.body else {
+            panic!("expected a set operation");
+        };
+        assert!(matches!(set_op.op, SetOp::Union));
+        assert!(!set_op.all);
+        // The result column name comes from the left arm; the type is the shared
+        // Integer of both arms.
+        assert_eq!(query.output_schema()[0].name, "x");
+        assert_eq!(query.output_schema()[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn binder_rejects_set_operation_column_count_mismatch() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select 1 union select 1, 2").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_rejects_set_operation_type_mismatch() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select 1 union select 'x'").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_rejects_intersect_all() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select 1 intersect all select 2").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn binder_binds_set_operation_order_by_to_output_position() {
+        let catalog = catalog_with_users();
+        // `ORDER BY x` (an output-column name) binds to a LocalRef at that output
+        // slot, evaluated by the Sort above the set operation.
+        let BoundStatement::Query(query) = bind(
+            &parse("select 1 as x union select 2 order by x").unwrap(),
+            &catalog,
+        )
+        .unwrap() else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.order_by.len(), 1);
+        assert!(matches!(
+            query.order_by[0].expr,
+            BoundExpr::LocalRef { slot: 0, .. }
+        ));
     }
 
     #[test]

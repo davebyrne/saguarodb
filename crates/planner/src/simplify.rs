@@ -119,6 +119,17 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .collect(),
             output_schema,
         },
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => LogicalPlan::SetOp {
+            op,
+            all,
+            left: Box::new(simplify_logical(*left)),
+            right: Box::new(simplify_logical(*right)),
+        },
         LogicalPlan::Insert {
             table,
             columns,

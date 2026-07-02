@@ -3,7 +3,7 @@ mod convert;
 
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Distinct, Expr, FromItem, FunctionArg,
-    InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem,
+    InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
     Statement, UnaryOp,
 };
 
@@ -22,7 +22,7 @@ mod tests {
 
     use crate::{
         BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody, SelectItem,
-        Statement, UnaryOp, parse,
+        SetOp, Statement, UnaryOp, parse,
     };
 
     #[test]
@@ -212,6 +212,25 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].len(), 2);
         assert!(matches!(rows[0][0], Expr::Literal(Value::Integer(1))));
+    }
+
+    #[test]
+    fn parses_set_operation_with_outer_order_by() {
+        // The ORDER BY binds to the whole set operation (the outer Query wrapper),
+        // not to the right arm.
+        let stmt = parse("select id from a union all select id from b order by 1").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.order_by.len(), 1);
+        let QueryBody::SetOp { op, all, right, .. } = query.body else {
+            panic!("expected a set operation body");
+        };
+        assert_eq!(op, SetOp::Union);
+        assert!(all);
+        // The right arm is a plain SELECT with no ORDER BY of its own.
+        assert!(matches!(right.body, QueryBody::Select(_)));
+        assert!(right.order_by.is_empty());
     }
 
     #[test]

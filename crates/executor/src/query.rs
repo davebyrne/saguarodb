@@ -16,7 +16,7 @@ use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
-    ProjectionOp, SeqScanOp, SortOp, ValuesOp,
+    ProjectionOp, SeqScanOp, SetOpOp, SortOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -307,6 +307,17 @@ pub(crate) fn build_executor<'a>(
             ctx.statement.clone(),
             rows.clone(),
             output_schema.clone(),
+        ))),
+        PhysicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => Ok(Box::new(SetOpOp::new(
+            *op,
+            *all,
+            build_executor(ctx, left)?,
+            build_executor(ctx, right)?,
         ))),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }

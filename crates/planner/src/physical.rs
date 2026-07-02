@@ -7,7 +7,7 @@ use common::{
 
 use crate::{
     AggregateExpr, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning, JoinType,
-    LogicalPlan,
+    LogicalPlan, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +116,12 @@ pub enum PhysicalPlan {
     Values {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
+    },
+    SetOp {
+        op: SetOp,
+        all: bool,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
     },
 }
 
@@ -243,6 +249,17 @@ pub fn physical_plan(
         } => Ok(PhysicalPlan::Values {
             rows: rows.clone(),
             output_schema: output_schema.clone(),
+        }),
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => Ok(PhysicalPlan::SetOp {
+            op: *op,
+            all: *all,
+            left: Box::new(physical_plan(left, catalog)?),
+            right: Box::new(physical_plan(right, catalog)?),
         }),
     }
 }
@@ -398,6 +415,8 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Sort { source, .. }
         | PhysicalPlan::Distinct { source, .. }
         | PhysicalPlan::Limit { source, .. } => output_width(source, catalog),
+        // Both arms have equal width (the binder reconciled them); use the left.
+        PhysicalPlan::SetOp { left, .. } => output_width(left, catalog),
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
         | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),

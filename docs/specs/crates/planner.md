@@ -131,11 +131,24 @@ pub struct BoundQuery {
     pub offset: Option<u64>,
 }
 
-// The bound body of a query expression. Set operations attach here as a further
-// variant.
+// The bound body of a query expression. `Select` is boxed (it is far larger than
+// the other variants).
 pub enum BoundQueryBody {
-    Select(BoundSelect),
+    Select(Box<BoundSelect>),
     Values(BoundValues),
+    SetOp(BoundSetOp),
+}
+
+// A bound set operation. Both arms are bound in their own scopes and reconciled:
+// same column count and identical column types (strict, no implicit casts).
+// output_schema is the reconciled result (left arm's names, shared types). `all`
+// keeps duplicates (UNION ALL); otherwise the result is de-duplicated.
+pub struct BoundSetOp {
+    pub op: SetOp,            // Union | Intersect | Except (re-exported from parser)
+    pub all: bool,
+    pub left: Box<BoundQuery>,
+    pub right: Box<BoundQuery>,
+    pub output_schema: Vec<ColumnInfo>,
 }
 
 // A bound VALUES body: a literal row set. Every row has the same width as
@@ -202,7 +215,9 @@ A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `Bo
 
 A FROM-less `SELECT` (`SELECT 1`, `SELECT count(*)`) binds with `from = None`: no bindings are registered, so any column reference fails with `SqlState::UndefinedColumn`. Logical planning lowers a `None` source to a single unit row — a one-row, zero-column `LogicalPlan::Values` node (already supported by the physical planner and executor) — with the `WHERE` clause, if any, applied as a `Filter` above it; the projection and any aggregation stack on top unchanged. `UPDATE`/`DELETE` always bind a real table, so their `from` is always `Some`.
 
-A `VALUES` body binds each row's expressions (a leaf, with no bindings — column references inside cannot resolve) and infers each column's type from its first non-`NULL` entry under the strict no-implicit-cast rule: every other entry must match exactly (a bare `NULL` adopts the type), rows must all be the same width, and an all-`NULL` column has no inferable type — all violations are `DatatypeMismatch`/`SyntaxError`. It lowers directly to the existing `LogicalPlan::Values` node, with `LIMIT`/`OFFSET` on top; `ORDER BY` over a bare `VALUES` is rejected (`FeatureNotSupported`) until set-operation output ordering lands. Because a derived table and an `INSERT ... <query>` source read the query's columns through `output_columns()`, `FROM (VALUES ...)`, `x IN (VALUES ...)`, and a scalar `(VALUES ...)` all work with no further code.
+A `VALUES` body binds each row's expressions (a leaf, with no bindings — column references inside cannot resolve) and infers each column's type from its first non-`NULL` entry under the strict no-implicit-cast rule: every other entry must match exactly (a bare `NULL` adopts the type), rows must all be the same width, and an all-`NULL` column has no inferable type — all violations are `DatatypeMismatch`/`SyntaxError`. It lowers directly to the existing `LogicalPlan::Values` node, with `LIMIT`/`OFFSET` on top. Because a derived table and an `INSERT ... <query>` source read the query's columns through `output_columns()`, `FROM (VALUES ...)`, `x IN (VALUES ...)`, and a scalar `(VALUES ...)` all work with no further code.
+
+A **set operation** (`UNION`/`INTERSECT`/`EXCEPT`) binds both arms in their own scopes and reconciles them: the arms must have the same number of columns and — strictly, no implicit casts — identical column types (`SyntaxError` / `DatatypeMismatch` otherwise). The result columns take the left arm's names and the shared types, and are nullable if either arm's are. The query-level `ORDER BY` (which now applies to VALUES and set-op bodies too) resolves against the combined output by 1-based position or output-column name only — a set operation has no single input scope — and each item becomes a `LocalRef` to that output slot, evaluated by a `Sort` stacked above the set-operation node; `LIMIT`/`OFFSET` stack above that. Lowering produces `LogicalPlan::SetOp { op, all, left, right }` → `PhysicalPlan::SetOp`, executed by `SetOpOp`: it materializes both arms, then concatenates (`UNION ALL`), concatenates-and-de-duplicates (`UNION`), or returns the distinct left rows that are / are not present in the right arm (`INTERSECT`/`EXCEPT`). Row equality is structural over the whole row with `NULL == NULL` (a `BTreeSet<Vec<Value>>`, as `DistinctOp` uses), matching SQL set semantics; output rows carry no heap identity. `INTERSECT ALL`/`EXCEPT ALL` (multiset semantics) are rejected by the binder (`FeatureNotSupported`).
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
@@ -435,6 +450,7 @@ pub enum LogicalPlan {
         output_schema: Vec<ColumnInfo>,
     },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
+    SetOp { op: SetOp, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> },
 }
 ```
 
@@ -529,6 +545,7 @@ pub enum PhysicalPlan {
         output_schema: Vec<ColumnInfo>,
     },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
+    SetOp { op: SetOp, all: bool, left: Box<PhysicalPlan>, right: Box<PhysicalPlan> },
 }
 ```
 

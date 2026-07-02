@@ -83,15 +83,20 @@ pub struct Query {
     pub offset: Option<u64>,
 }
 
-// The body of a query expression. `SELECT` and `VALUES` are supported; set
-// operations (`UNION`/`INTERSECT`/`EXCEPT`) attach here as a further variant
-// without disturbing the wrapper or the conversion pipeline.
+// The body of a query expression: a single SELECT, a VALUES list, or a set
+// operation combining two query expressions.
 pub enum QueryBody {
     Select(Select),
     // A VALUES list (`VALUES (1,'a'), (2,'b')`): each inner Vec is one row; all
     // rows must be the same width. Output columns are unnamed (column1, column2, ...).
     Values(Vec<Vec<Expr>>),
+    // A set operation (`a UNION b`, `a INTERSECT b`, `a EXCEPT b`). `all` is the
+    // ALL quantifier. Each side is a full Query, so a parenthesized arm may carry
+    // its own ORDER BY/LIMIT; the enclosing Query's modifiers apply to the result.
+    SetOp { op: SetOp, all: bool, left: Box<Query>, right: Box<Query> },
 }
+
+pub enum SetOp { Union, Intersect, Except }
 
 // A single SELECT block, without the query-level ORDER BY/LIMIT/OFFSET (which
 // live on the enclosing Query). `from` may be empty — a FROM-less scalar
@@ -231,8 +236,9 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `DROP SEQUENCE [IF EXISTS] name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
-- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT` and `VALUES` bodies are supported; a set-operation body is rejected as unsupported for now. The `QueryBody` enum and the wrapper are the seam where `UNION`/`INTERSECT`/`EXCEPT` and CTEs (`WITH`) attach as new variants without disturbing the surrounding pipeline.
+- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT`, `VALUES`, and set-operation bodies are supported. The `QueryBody` enum and the wrapper are the seam where CTEs (`WITH`) attach next.
 - Standalone `VALUES (...), (...)` parses to `QueryBody::Values` — as a top-level statement, in `FROM` (as a derived table), and as a subquery body (`x IN (VALUES ...)`). All rows must be the same width; each column's type is checked and its columns are named `column1, column2, ...` by the binder, not the parser.
+- `a UNION [ALL] b`, `a INTERSECT b`, `a EXCEPT b` parse to `QueryBody::SetOp`. Each arm is converted to a full `Query` (through `convert_set_expr_to_query`), so a parenthesized arm may carry its own `ORDER BY`/`LIMIT`; an unparenthesized outer `ORDER BY`/`LIMIT` binds to the enclosing `Query` wrapper and applies to the combined result. `MINUS` and the `... BY NAME` quantifiers are rejected as unsupported; `INTERSECT ALL`/`EXCEPT ALL` parse but are rejected by the binder.
 - Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. Each subquery converts to a `Query` (so it may carry its own `ORDER BY`/`LIMIT`); cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
 - Derived tables: `(SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived`. The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases and `LATERAL` are rejected).
 - `UPDATE ... SET ... WHERE`.

@@ -6,6 +6,7 @@ mod join;
 mod limit;
 mod projection;
 mod scan;
+mod set_op;
 mod sort;
 mod values;
 
@@ -19,6 +20,7 @@ pub use limit::LimitOp;
 pub use projection::ProjectionOp;
 pub use projection::project_row;
 pub use scan::{IndexScanOp, SeqScanOp};
+pub use set_op::SetOpOp;
 pub use sort::SortOp;
 pub use values::ValuesOp;
 

@@ -151,6 +151,16 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
         PhysicalPlan::Values { rows, .. } => {
             output.push_str(&format!("{padding}Values rows={}\n", rows.len()));
         }
+        PhysicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            output.push_str(&format!("{padding}SetOp op={op:?} all={all}\n"));
+            format_node(left, indent + 1, output);
+            format_node(right, indent + 1, output);
+        }
     }
 }
 

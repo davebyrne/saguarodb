@@ -3,11 +3,11 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
     Value,
 };
-use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
+use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp};
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
-    BoundSelectItem, BoundValues, JoinType,
+    BoundSelectItem, BoundSetOp, BoundValues, JoinType, OutputColumn,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
@@ -53,7 +53,140 @@ pub(super) fn bind_query(
                 offset: query.offset,
             })
         }
+        QueryBody::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            if *all && matches!(op, SetOp::Intersect | SetOp::Except) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "INTERSECT ALL / EXCEPT ALL are not supported",
+                ));
+            }
+            let left = bind_query(catalog, left, declared)?;
+            let right = bind_query(catalog, right, declared)?;
+            let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
+            // `ORDER BY` over a set operation resolves against the combined output
+            // by position or name only (there is no single input scope).
+            let order_by = bind_set_op_order_by(&query.order_by, &output_columns)?;
+            Ok(BoundQuery {
+                body: BoundQueryBody::SetOp(BoundSetOp {
+                    op: *op,
+                    all: *all,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    output_schema,
+                }),
+                order_by,
+                limit: query.limit,
+                offset: query.offset,
+            })
+        }
     }
+}
+
+/// Reconcile the two arms of a set operation. They must have the same number of
+/// columns and — under the strict no-implicit-cast rule — identical column types.
+/// Returns the result `RowDescription` (the left arm's column names, the shared
+/// types) and the output columns (with nullability = either arm nullable), the
+/// latter used to bind the query-level `ORDER BY`.
+fn reconcile_set_op(
+    left: &BoundQuery,
+    right: &BoundQuery,
+) -> Result<(Vec<ColumnInfo>, Vec<OutputColumn>)> {
+    let left_columns = left.output_columns();
+    let right_columns = right.output_columns();
+    if left_columns.len() != right_columns.len() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!(
+                "each query of a set operation must have the same number of columns ({} vs {})",
+                left_columns.len(),
+                right_columns.len()
+            ),
+        ));
+    }
+
+    let mut output_schema = Vec::with_capacity(left_columns.len());
+    let mut output_columns = Vec::with_capacity(left_columns.len());
+    for (index, (left, right)) in left_columns.iter().zip(&right_columns).enumerate() {
+        if left.data_type != right.data_type {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "set operation column {} has mismatched types ({:?} vs {:?})",
+                    index + 1,
+                    left.data_type,
+                    right.data_type
+                ),
+            ));
+        }
+        output_schema.push(ColumnInfo {
+            name: left.name.clone(),
+            data_type: left.data_type.clone(),
+            table_id: None,
+            column_id: None,
+            // A set-operation result column is synthetic — it has no single
+            // declared wire type, so it reports the collapsed default for its
+            // reconciled `data_type` (matching PostgreSQL's base-OID/typmod -1).
+            pg_type: None,
+        });
+        output_columns.push(OutputColumn {
+            name: left.name.clone(),
+            data_type: left.data_type.clone(),
+            nullable: left.nullable || right.nullable,
+        });
+    }
+    Ok((output_schema, output_columns))
+}
+
+/// Bind the query-level `ORDER BY` of a set operation. Each item must reference an
+/// output column by 1-based position or by name (no arbitrary expressions — a set
+/// operation has no single input scope); it becomes a `LocalRef` to that output
+/// slot, which the `Sort` above the set operation evaluates over the result rows.
+fn bind_set_op_order_by(
+    order_by: &[OrderByItem],
+    output_columns: &[OutputColumn],
+) -> Result<Vec<BoundOrderByItem>> {
+    order_by
+        .iter()
+        .map(|item| {
+            let slot = match &item.expr {
+                Expr::Literal(Value::Integer(position)) => {
+                    order_by_position_index(*position, output_columns.len())?
+                }
+                Expr::ColumnRef {
+                    table: None,
+                    column,
+                } => output_columns
+                    .iter()
+                    .position(|output| &output.name == column)
+                    .ok_or_else(|| {
+                        plan_error(
+                            SqlState::InvalidColumnReference,
+                            format!("column {column} does not exist in the set operation output"),
+                        )
+                    })?,
+                _ => {
+                    return Err(plan_error(
+                        SqlState::FeatureNotSupported,
+                        "ORDER BY over a set operation must reference an output column by position or name",
+                    ));
+                }
+            };
+            Ok(BoundOrderByItem {
+                expr: BoundExpr::LocalRef {
+                    slot,
+                    data_type: output_columns[slot].data_type.clone(),
+                    nullable: output_columns[slot].nullable,
+                },
+                ascending: item.ascending,
+                nulls_first: item.nulls_first,
+            })
+        })
+        .collect()
 }
 
 /// Bind a `VALUES` body. Every row must have the same width. Each column's type is

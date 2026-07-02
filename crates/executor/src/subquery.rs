@@ -189,6 +189,17 @@ pub(crate) fn resolve_plan_subqueries(
                 .collect::<Result<Vec<_>>>()?,
             output_schema: output_schema.clone(),
         },
+        PhysicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => PhysicalPlan::SetOp {
+            op: *op,
+            all: *all,
+            left: Box::new(resolve_plan_subqueries(ctx, left)?),
+            right: Box::new(resolve_plan_subqueries(ctx, right)?),
+        },
     })
 }
 

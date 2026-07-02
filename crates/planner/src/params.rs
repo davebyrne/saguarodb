@@ -138,6 +138,10 @@ fn collect_query(query: &BoundQuery, used: &mut Vec<Option<DataType>>) -> Result
                 collect_expr(expr, used)?;
             }
         }
+        BoundQueryBody::SetOp(set_op) => {
+            collect_query(&set_op.left, used)?;
+            collect_query(&set_op.right, used)?;
+        }
     }
     for item in &query.order_by {
         collect_expr(&item.expr, used)?;
@@ -326,6 +330,10 @@ fn substitute_query(query: &mut BoundQuery, params: &[Value]) -> Result<()> {
             for expr in values.rows.iter_mut().flatten() {
                 substitute_expr(expr, params)?;
             }
+        }
+        BoundQueryBody::SetOp(set_op) => {
+            substitute_query(&mut set_op.left, params)?;
+            substitute_query(&mut set_op.right, params)?;
         }
     }
     for item in &mut query.order_by {

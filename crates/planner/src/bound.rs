@@ -2,6 +2,7 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, IndexId,
     ParsedColumnDef, SequenceOptions, TableId,
 };
+use parser::SetOp;
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
 
@@ -25,6 +26,7 @@ pub struct BoundQuery {
 pub enum BoundQueryBody {
     Select(Box<BoundSelect>),
     Values(BoundValues),
+    SetOp(BoundSetOp),
 }
 
 /// A bound `VALUES` body: a literal row set. Every row has the same width as
@@ -34,6 +36,20 @@ pub enum BoundQueryBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundValues {
     pub rows: Vec<Vec<BoundExpr>>,
+    pub output_schema: Vec<ColumnInfo>,
+}
+
+/// A bound set operation (`UNION`/`INTERSECT`/`EXCEPT`). Both arms are bound in
+/// their own scopes; the binder has already checked that they have the same number
+/// of columns and identical column types. `output_schema` is the reconciled result
+/// (the left arm's column names, the shared types). `all` keeps duplicates
+/// (`UNION ALL`); otherwise the result is de-duplicated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundSetOp {
+    pub op: SetOp,
+    pub all: bool,
+    pub left: Box<BoundQuery>,
+    pub right: Box<BoundQuery>,
     pub output_schema: Vec<ColumnInfo>,
 }
 
@@ -54,6 +70,7 @@ impl BoundQuery {
         match &self.body {
             BoundQueryBody::Select(select) => &select.output_schema,
             BoundQueryBody::Values(values) => &values.output_schema,
+            BoundQueryBody::SetOp(set_op) => &set_op.output_schema,
         }
     }
 
@@ -80,6 +97,19 @@ impl BoundQuery {
                     data_type: column.data_type.clone(),
                     // A VALUES column is nullable if any row's entry is.
                     nullable: values.rows.iter().any(|row| row[index].nullable()),
+                })
+                .collect(),
+            // A set-operation column takes the left arm's name and the shared type
+            // (the arms are identically typed); it is nullable if either arm's is.
+            BoundQueryBody::SetOp(set_op) => set_op
+                .left
+                .output_columns()
+                .into_iter()
+                .zip(set_op.right.output_columns())
+                .map(|(left, right)| OutputColumn {
+                    name: left.name,
+                    data_type: left.data_type,
+                    nullable: left.nullable || right.nullable,
                 })
                 .collect(),
         }

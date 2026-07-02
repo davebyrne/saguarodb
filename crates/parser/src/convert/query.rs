@@ -3,7 +3,7 @@ use sqlparser::ast as sql;
 
 use crate::{
     Assignment, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody, Select,
-    SelectItem,
+    SelectItem, SetOp,
 };
 
 use super::expr::convert_expr;
@@ -50,8 +50,46 @@ fn convert_query_body(set_expr: sql::SetExpr) -> Result<QueryBody> {
     match set_expr {
         sql::SetExpr::Select(select) => Ok(QueryBody::Select(convert_select(*select)?)),
         sql::SetExpr::Values(values) => Ok(QueryBody::Values(convert_values(values)?)),
+        sql::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => convert_set_operation(op, set_quantifier, *left, *right),
         _ => unsupported("unsupported SELECT body"),
     }
+}
+
+/// Convert a set operation. Each side is itself a query expression (a `SELECT`,
+/// `VALUES`, or a nested set operation, possibly a parenthesized query with its
+/// own `ORDER BY`/`LIMIT`), converted through [`convert_set_expr_to_query`].
+fn convert_set_operation(
+    op: sql::SetOperator,
+    set_quantifier: sql::SetQuantifier,
+    left: sql::SetExpr,
+    right: sql::SetExpr,
+) -> Result<QueryBody> {
+    let op = match op {
+        sql::SetOperator::Union => SetOp::Union,
+        sql::SetOperator::Intersect => SetOp::Intersect,
+        sql::SetOperator::Except => SetOp::Except,
+        sql::SetOperator::Minus => return unsupported("MINUS is not supported"),
+    };
+    let all = match set_quantifier {
+        sql::SetQuantifier::All => true,
+        sql::SetQuantifier::Distinct | sql::SetQuantifier::None => false,
+        sql::SetQuantifier::ByName
+        | sql::SetQuantifier::AllByName
+        | sql::SetQuantifier::DistinctByName => {
+            return unsupported("BY NAME set operations are not supported");
+        }
+    };
+    Ok(QueryBody::SetOp {
+        op,
+        all,
+        left: Box::new(convert_set_expr_to_query(left)?),
+        right: Box::new(convert_set_expr_to_query(right)?),
+    })
 }
 
 /// Convert a `VALUES` list's rows of expressions. The `explicit_row` (`VALUES

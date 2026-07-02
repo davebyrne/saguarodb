@@ -181,9 +181,8 @@ pub struct Query {
     pub offset: Option<u64>,
 }
 
-/// The body of a query expression. Set operations attach here as a further
-/// variant without disturbing the [`Query`] wrapper or the conversion/binding/
-/// planning pipeline.
+/// The body of a query expression: a single `SELECT`, a `VALUES` list, or a set
+/// operation combining two query expressions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryBody {
     Select(Select),
@@ -191,6 +190,25 @@ pub enum QueryBody {
     /// row set. Each inner `Vec` is one row; all rows must have the same width.
     /// Output columns are unnamed (`column1`, `column2`, ...).
     Values(Vec<Vec<Expr>>),
+    /// A set operation (`a UNION b`, `a INTERSECT b`, `a EXCEPT b`). `all` is the
+    /// `ALL` quantifier (keep duplicates); without it duplicate rows are removed.
+    /// Each side is a full [`Query`], so a parenthesized arm may carry its own
+    /// `ORDER BY`/`LIMIT`; the enclosing `Query`'s modifiers apply to the combined
+    /// result.
+    SetOp {
+        op: SetOp,
+        all: bool,
+        left: Box<Query>,
+        right: Box<Query>,
+    },
+}
+
+/// A set operator combining two query expressions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
 }
 
 /// A single `SELECT` block, without the query-level `ORDER BY`/`LIMIT`/`OFFSET`
