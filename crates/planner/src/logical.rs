@@ -358,7 +358,25 @@ fn apply_distinct_and_projection(
 }
 
 fn plan_select_source(select: &BoundSelect) -> Result<LogicalPlan> {
-    plan_from(&select.from, select.filter.clone())
+    match &select.from {
+        Some(from) => plan_from(from, select.filter.clone()),
+        // A FROM-less SELECT (`SELECT 1`) evaluates its projection over a single
+        // unit row: a one-row, zero-column `Values` node (already supported by the
+        // physical planner and executor). A `WHERE`, if present, filters that row.
+        None => {
+            let unit = LogicalPlan::Values {
+                rows: vec![vec![]],
+                output_schema: Vec::new(),
+            };
+            Ok(match select.filter.clone() {
+                Some(predicate) => LogicalPlan::Filter {
+                    source: Box::new(unit),
+                    predicate,
+                },
+                None => unit,
+            })
+        }
+    }
 }
 
 fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan> {

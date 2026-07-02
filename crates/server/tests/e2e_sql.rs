@@ -3170,3 +3170,101 @@ async fn e2e_extract_from_date_and_timestamp() {
         ]
     );
 }
+
+/// FROM-less scalar SELECT: a query with no FROM clause evaluates its projection
+/// over a single unit row. Exercises the generalized query representation end to
+/// end (parse -> bind -> plan -> execute) with a Values-backed unit source.
+#[tokio::test]
+async fn e2e_from_less_select() {
+    let server = TestServer::start().await.unwrap();
+
+    // A literal projection yields exactly one row.
+    let rows = server.simple_query("select 1").await.unwrap().unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Arithmetic, aliases, and multiple columns all work with no FROM.
+    let rows = server
+        .simple_query("select 1 + 1 as n, 'hello' as greeting")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string()), Some("hello".to_string())]]
+    );
+
+    // A FROM-less WHERE filters the single unit row: false -> no rows.
+    let rows = server
+        .simple_query("select 1 where false")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty(), "expected no rows, got {rows:?}");
+
+    // ... and true keeps the row.
+    let rows = server
+        .simple_query("select 42 where true")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("42".to_string())]]);
+
+    // count(*) with no FROM aggregates the single unit row, yielding 1.
+    let rows = server
+        .simple_query("select count(*)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // An aggregate over a FROM-less WHERE that filters the unit row away still
+    // emits one grouped row: count(*) over zero input rows is 0. This exercises
+    // the Aggregate(Filter(Values)) lowering shape distinct from the cases above.
+    let rows = server
+        .simple_query("select count(*) where false")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("0".to_string())]]);
+
+    // A scalar subquery over a real table drives a FROM-less projection.
+    server
+        .simple_query("create table t (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id) values (1), (2), (3)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select (select count(*) from t) as total")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // A bare column reference with no FROM has nothing to resolve against.
+    let err = server
+        .simple_query("select id")
+        .await
+        .err()
+        .expect("column reference without FROM should fail");
+    assert!(
+        err.message.contains("42703"),
+        "expected UndefinedColumn: {}",
+        err.message
+    );
+
+    // `SELECT *` with no FROM has nothing to expand to (matches PostgreSQL);
+    // it is a syntax error rather than a degenerate zero-column row.
+    let err = server
+        .simple_query("select *")
+        .await
+        .err()
+        .expect("SELECT * without FROM should fail");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError for SELECT * with no FROM: {}",
+        err.message
+    );
+}

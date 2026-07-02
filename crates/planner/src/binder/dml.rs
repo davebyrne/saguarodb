@@ -342,7 +342,7 @@ pub(super) fn bind_update(
         source: BoundSelect {
             distinct: None,
             columns: table_select_items(&table, &ctx.bindings[0]),
-            from,
+            from: Some(from),
             filter: source_filter,
             group_by: Vec::new(),
             having: None,
@@ -375,7 +375,7 @@ pub(super) fn bind_delete(
         source: BoundSelect {
             distinct: None,
             columns: table_select_items(&table, &ctx.bindings[0]),
-            from,
+            from: Some(from),
             filter: source_filter,
             group_by: Vec::new(),
             having: None,

@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`, `BIGINT`, `INT2`, `INT4`, `INT8` are accepted aliases for the same 64-bit integer — width is not enforced; `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')`), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, and `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
+- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, and `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance command `VACUUM [table]`, and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -577,15 +577,15 @@ pub enum Statement {
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
     Insert { table: String, columns: Vec<String>, source: InsertSource },
-    Select(SelectStatement),
+    Query(Query),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },
     Explain(Box<Statement>),
 }
 
 pub enum InsertSource {
-    Values(Vec<Vec<Expr>>),       // INSERT INTO t VALUES (...)
-    Query(Box<SelectStatement>),  // INSERT INTO t SELECT ...
+    Values(Vec<Vec<Expr>>),  // INSERT INTO t VALUES (...)
+    Query(Box<Query>),       // INSERT INTO t SELECT ...
 }
 
 pub struct Assignment {
@@ -593,16 +593,28 @@ pub struct Assignment {
     pub value: Expr,
 }
 
-pub struct SelectStatement {
-    pub distinct: Option<Distinct>,
-    pub columns: Vec<SelectItem>,
-    pub from: Vec<FromItem>,
-    pub filter: Option<Expr>,
-    pub group_by: Vec<Expr>,
-    pub having: Option<Expr>,
+// A query expression: a body plus the query-level ORDER BY/LIMIT/OFFSET (which sit
+// outside the body, so a future set operation orders/limits the combined result).
+// `QueryBody::Select` is the only variant today; UNION/INTERSECT/EXCEPT, CTEs, and
+// standalone VALUES attach as new QueryBody variants.
+pub struct Query {
+    pub body: QueryBody,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+pub enum QueryBody {
+    Select(Select),
+}
+
+pub struct Select {
+    pub distinct: Option<Distinct>,
+    pub columns: Vec<SelectItem>,
+    pub from: Vec<FromItem>,  // empty for a FROM-less SELECT (`SELECT 1`)
+    pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
 }
 
 pub enum Distinct {
@@ -683,7 +695,7 @@ pub enum UnaryOp {
 
 `FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 
-Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can carry it through (e.g. `COUNT(DISTINCT x)`). `SelectStatement.distinct` records the optional `SELECT DISTINCT` / `DISTINCT ON (...)` modifier.
+Function call parsing preserves aggregate syntax: `COUNT(*)` is `Function { name: "count", args: vec![FunctionArg::Wildcard], distinct: false }`; aggregate `DISTINCT` sets `distinct = true` so the binder can carry it through (e.g. `COUNT(DISTINCT x)`). `Select.distinct` records the optional `SELECT DISTINCT` / `DISTINCT ON (...)` modifier.
 
 ### Public API
 
@@ -738,7 +750,7 @@ pub enum BoundStatement {
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource },
-    Select(BoundSelect),
+    Query(BoundQuery),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
     Delete { table: TableId, source: BoundSelect },
     Explain(Box<BoundStatement>),
@@ -746,25 +758,35 @@ pub enum BoundStatement {
 
 pub enum BoundInsertSource {
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
-    Query(Box<BoundSelect>),
+    Query(Box<BoundQuery>),
 }
 
-/// A fully bound SELECT — all names resolved, types checked, slots assigned.
+/// A bound query expression: a body plus the query-level ORDER BY/LIMIT/OFFSET
+/// (mirrors the AST Query; the modifiers live here, not on BoundSelect).
+pub struct BoundQuery {
+    pub body: BoundQueryBody,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+pub enum BoundQueryBody {
+    Select(BoundSelect),
+}
+
 pub enum BoundDistinct {
     All,                  // SELECT DISTINCT
     On(Vec<BoundExpr>),   // SELECT DISTINCT ON (exprs)
 }
 
+/// A fully bound SELECT block — all names resolved, types checked, slots assigned.
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,
     pub columns: Vec<BoundSelectItem>,
-    pub from: BoundFrom,
+    pub from: Option<BoundFrom>,  // None for a FROM-less SELECT (`SELECT 1`)
     pub filter: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
     pub having: Option<BoundExpr>,
-    pub order_by: Vec<BoundOrderByItem>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
     pub output_schema: Vec<ColumnInfo>,
 }
 

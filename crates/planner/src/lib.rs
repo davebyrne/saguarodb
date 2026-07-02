@@ -111,7 +111,7 @@ fn select_mutates_sequences(select: &BoundSelect) -> bool {
         .columns
         .iter()
         .any(|item| expr_mutates_sequences(&item.expr))
-        || from_mutates_sequences(&select.from)
+        || select.from.as_ref().is_some_and(from_mutates_sequences)
         || select.filter.as_ref().is_some_and(expr_mutates_sequences)
         || select.group_by.iter().any(expr_mutates_sequences)
         || select.having.as_ref().is_some_and(expr_mutates_sequences)
@@ -328,6 +328,66 @@ mod tests {
             Some(BoundExpr::BinaryOp { ref left, .. })
                 if matches!(left.as_ref(), BoundExpr::InputRef { column: 1, slot: 1, .. })
         ));
+    }
+
+    #[test]
+    fn binder_binds_from_less_select() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select 1 + 1 as n").unwrap();
+
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected bound select");
+        };
+
+        // No FROM clause -> no source relation.
+        assert!(select.from.is_none());
+        assert_eq!(select.output_schema.len(), 1);
+        assert_eq!(select.output_schema[0].name, "n");
+        assert_eq!(select.output_schema[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn binder_rejects_column_reference_without_from() {
+        let catalog = catalog_with_users();
+        // With no FROM there are no bindings, so a bare column cannot resolve.
+        let err = bind(&parse("select id").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn binder_rejects_bare_wildcard_without_from() {
+        let catalog = catalog_with_users();
+        // `SELECT *` with no FROM has nothing to expand to (matches PostgreSQL);
+        // it must not silently produce a zero-column result.
+        let err = bind(&parse("select *").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn from_less_select_lowers_to_projection_over_unit_row() {
+        let catalog = catalog_with_users();
+        let bound = bind(&parse("select 1").unwrap(), &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        // A FROM-less projection lowers to a Projection over a single-row,
+        // zero-column Values node (the unit relation the executor already knows).
+        let LogicalPlan::Projection { source, .. } = &logical else {
+            panic!("expected projection, got {logical:?}");
+        };
+        let LogicalPlan::Values {
+            rows,
+            output_schema,
+        } = source.as_ref()
+        else {
+            panic!("expected a unit Values source, got {source:?}");
+        };
+        assert_eq!(rows.len(), 1, "exactly one unit row");
+        assert!(rows[0].is_empty(), "the unit row has zero columns");
+        assert!(output_schema.is_empty());
     }
 
     #[test]
@@ -1349,7 +1409,7 @@ mod tests {
         else {
             panic!("expected bound select");
         };
-        let BoundFrom::Join { left, right, .. } = select.from else {
+        let Some(BoundFrom::Join { left, right, .. }) = select.from else {
             panic!("expected join");
         };
         let BoundFrom::Table {
@@ -1701,11 +1761,11 @@ mod tests {
         };
         assert!(matches!(
             select.from,
-            BoundFrom::Join {
+            Some(BoundFrom::Join {
                 join_type: JoinType::Cross,
                 condition: None,
                 ..
-            }
+            })
         ));
     }
 

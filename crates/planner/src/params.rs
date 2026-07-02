@@ -144,7 +144,9 @@ fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Res
     for item in &select.columns {
         collect_expr(&item.expr, used)?;
     }
-    collect_from(&select.from, used)?;
+    if let Some(from) = &select.from {
+        collect_from(from, used)?;
+    }
     if let Some(filter) = &select.filter {
         collect_expr(filter, used)?;
     }
@@ -326,7 +328,9 @@ fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {
     for item in &mut select.columns {
         substitute_expr(&mut item.expr, params)?;
     }
-    substitute_from(&mut select.from, params)?;
+    if let Some(from) = &mut select.from {
+        substitute_from(from, params)?;
+    }
     if let Some(filter) = &mut select.filter {
         substitute_expr(filter, params)?;
     }

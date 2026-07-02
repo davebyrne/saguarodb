@@ -140,7 +140,9 @@ pub struct BoundSelect {
     /// The `DISTINCT` modifier, or `None` for no de-duplication.
     pub distinct: Option<BoundDistinct>,
     pub columns: Vec<BoundSelectItem>,
-    pub from: BoundFrom,
+    /// The source relation, or `None` for a FROM-less `SELECT` (`SELECT 1`),
+    /// which is evaluated over a single unit row.
+    pub from: Option<BoundFrom>,
     pub filter: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
     pub having: Option<BoundExpr>,

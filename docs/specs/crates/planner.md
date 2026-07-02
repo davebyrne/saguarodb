@@ -140,7 +140,7 @@ pub enum BoundQueryBody {
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,  // All | On(keys)
     pub columns: Vec<BoundSelectItem>,
-    pub from: BoundFrom,
+    pub from: Option<BoundFrom>,          // None for a FROM-less SELECT (`SELECT 1`)
     pub filter: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
     pub having: Option<BoundExpr>,
@@ -182,6 +182,8 @@ pub enum BoundFrom {
 A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
 A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `BoundQuery` binds its body (a `BoundSelect`) and, for a `SELECT` body, binds the query-level `ORDER BY` against that block's output columns (the `ORDER BY`/`DISTINCT` validation is coupled and stays together). Logical planning lowers the body, then applies the wrapper's `ORDER BY`/`LIMIT`/`OFFSET`; the aggregate-context `ORDER BY` rewrite stays with the body because it depends on the body's `group_by`/aggregates. `BoundSelect` (without the query-level modifiers) is also used directly as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
+
+A FROM-less `SELECT` (`SELECT 1`, `SELECT count(*)`) binds with `from = None`: no bindings are registered, so any column reference fails with `SqlState::UndefinedColumn`. Logical planning lowers a `None` source to a single unit row — a one-row, zero-column `LogicalPlan::Values` node (already supported by the physical planner and executor) — with the `WHERE` clause, if any, applied as a `Filter` above it; the projection and any aggregation stack on top unchanged. `UPDATE`/`DELETE` always bind a real table, so their `from` is always `Some`.
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 

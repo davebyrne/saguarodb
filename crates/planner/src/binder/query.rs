@@ -49,15 +49,14 @@ fn bind_select(
     order_by: &[OrderByItem],
     declared: &[Option<DataType>],
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
-    if select.from.is_empty() {
-        return Err(plan_error(
-            SqlState::UndefinedTable,
-            "SELECT requires FROM in v1",
-        ));
-    }
-
     let mut ctx = BindContext::new(catalog, declared);
-    let from = bind_from_items(catalog, &mut ctx, &select.from)?;
+    // A FROM-less SELECT (`SELECT 1`) has no source relation: no bindings are
+    // registered, so any column reference correctly fails to resolve.
+    let from = if select.from.is_empty() {
+        None
+    } else {
+        Some(bind_from_items(catalog, &mut ctx, &select.from)?)
+    };
     let filter = select
         .filter
         .as_ref()
@@ -326,6 +325,17 @@ pub(super) fn bind_select_item(
 ) -> Result<()> {
     match item {
         SelectItem::Wildcard => {
+            // `SELECT *` needs a FROM clause: with no bindings there is nothing to
+            // expand to, and expanding to zero columns would be a degenerate
+            // result. PostgreSQL rejects this (`SELECT * with no tables ...`).
+            // (`RETURNING *` always binds over the target table, so it is
+            // unaffected.)
+            if ctx.bindings.is_empty() {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "SELECT * with no tables specified is not valid",
+                ));
+            }
             for binding in &ctx.bindings {
                 for column in &binding.columns {
                     output.push(BoundSelectItem {
