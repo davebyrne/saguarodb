@@ -377,7 +377,11 @@ mod tests {
     fn output_schema_reports_column_reference_wire_types() {
         let catalog = catalog_with_typed_columns();
         let stmt = parse("select small, txt, big from t").unwrap();
-        let BoundStatement::Select(select) = bind(&stmt, &catalog).unwrap() else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bind(&stmt, &catalog).unwrap()
+        else {
             panic!("expected bound select");
         };
 
@@ -395,7 +399,11 @@ mod tests {
         let catalog = catalog_with_typed_columns();
         let stmt =
             parse("select cast(small as bigint), cast(txt as varchar), big + 1 from t").unwrap();
-        let BoundStatement::Select(select) = bind(&stmt, &catalog).unwrap() else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bind(&stmt, &catalog).unwrap()
+        else {
             panic!("expected bound select");
         };
 

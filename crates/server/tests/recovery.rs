@@ -1566,8 +1566,10 @@ async fn aborted_autocommit_statement_stays_invisible_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        // `val` is BIGINT so it holds i64::MAX; the abort under test comes from the
+        // i64 arithmetic overflow in the UPDATE, not a column-width range check.
         server
-            .simple_query("create table users (id integer primary key, val integer)")
+            .simple_query("create table users (id integer primary key, val bigint)")
             .await
             .unwrap();
         server

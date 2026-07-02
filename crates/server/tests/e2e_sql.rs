@@ -654,13 +654,13 @@ async fn e2e_scalar_functions_evaluate() {
 }
 
 #[tokio::test]
-async fn e2e_integer_width_aliases_behave_as_64bit_integers() {
+async fn e2e_integer_widths_store_as_i64_but_range_check_narrow_columns() {
     let server = TestServer::start().await.unwrap();
     server
         .simple_query("create table nums (id bigint primary key, small smallint, big int8)")
         .await
         .unwrap();
-    // Values beyond the 32-bit range prove all widths are backed by i64.
+    // BIGINT/INT8 store the full 64-bit range; a value beyond 32 bits round-trips.
     server
         .simple_query(
             "insert into nums (id, small, big) values (9000000000, 5, 9223372036854775807)",
@@ -680,6 +680,19 @@ async fn e2e_integer_width_aliases_behave_as_64bit_integers() {
             Some("5".to_string()),
             Some("9223372036854775807".to_string()),
         ]]
+    );
+
+    // A SMALLINT value outside its 16-bit range is rejected (not truncated), even
+    // though every integer width shares one 64-bit storage type.
+    let err = server
+        .simple_query("insert into nums (id, small, big) values (1, 40000, 0)")
+        .await
+        .err()
+        .expect("smallint out of range is rejected");
+    assert!(
+        err.message.to_lowercase().contains("out of range"),
+        "unexpected error: {}",
+        err.message
     );
 
     // BIGINT / INT4 are accepted CAST target types (all integer-typed).

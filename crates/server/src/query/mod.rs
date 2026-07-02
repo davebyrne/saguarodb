@@ -2742,8 +2742,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
+        // `val` is BIGINT so it can hold i64::MAX; the overflow under test is the
+        // i64 arithmetic `val + 1`, not a column-width range check.
         app.query_service
-            .execute_sql("create table nums (id integer primary key, val integer)")
+            .execute_sql("create table nums (id integer primary key, val bigint)")
             .unwrap();
         app.query_service
             .execute_sql("insert into nums (id, val) values (1, 1)")

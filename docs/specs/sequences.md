@@ -349,8 +349,11 @@ and order in a `WHERE` clause are unspecified (volatile), matching PostgreSQL.
 
 `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (and `SERIAL2`/`SERIAL4`/`SERIAL8`) are valid
 only as a column type in a `CREATE TABLE` column definition. All map to the same
-`INTEGER` (i64) storage — width is not enforced, consistent with the existing
-integer aliases.
+64-bit `INTEGER` storage but report their serial kind's PostgreSQL wire width
+(`serial` => `int4`, `smallserial` => `int2`, `bigserial` => `int8`), consistent
+with the integer aliases; the executor range-checks `int2`/`int4` values at write,
+so a `SMALLSERIAL` column rejects a value past the `int2` range (e.g. reaching
+32768).
 
 Desugaring is split across bind and execute because the owned sequence's
 `SequenceId` is not allocated until the statement runs. The dependency is now

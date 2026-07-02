@@ -1,4 +1,4 @@
-use common::{DataType, DbError, ExecRow, Result, SqlState, StatementContext, Value};
+use common::{DataType, DbError, ExecRow, PgType, Result, SqlState, StatementContext, Value};
 use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 
 pub fn eval_expr(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
@@ -106,8 +106,14 @@ fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> R
             row,
         ),
         BoundExpr::Cast {
-            expr, data_type, ..
-        } => cast_value(eval_expr_inner(ctx, expr, row)?, data_type),
+            expr,
+            data_type,
+            pg_type,
+            ..
+        } => {
+            let value = cast_value(eval_expr_inner(ctx, expr, row)?, data_type)?;
+            check_cast_int_width(value, pg_type)
+        }
         // Subqueries are resolved to literals (or an `IN` list) by the executor's
         // pre-pass before any row is evaluated; reaching here is a routing bug.
         BoundExpr::ScalarSubquery { .. }
@@ -962,6 +968,22 @@ fn eval_case(
         Some(expr) => eval_expr_inner(ctx, expr, row),
         None => Ok(Value::Null),
     }
+}
+
+/// Reject a cast result that does not fit an explicit narrow integer target
+/// (`CAST(... AS int2/int4)`), matching PostgreSQL — the storage type is a single
+/// 64-bit integer, so without this a `CAST(... AS int4)` could yield a value that
+/// misrepresents its advertised OID. Non-narrow targets pass through unchanged.
+fn check_cast_int_width(value: Value, pg_type: &PgType) -> Result<Value> {
+    if let Value::Integer(int) = value
+        && let Some(type_name) = pg_type.narrow_int_overflow(int)
+    {
+        return Err(DbError::execute(
+            SqlState::NumericValueOutOfRange,
+            format!("{type_name} out of range"),
+        ));
+    }
+    Ok(value)
 }
 
 fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {

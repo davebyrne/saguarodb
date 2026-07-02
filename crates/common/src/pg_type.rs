@@ -143,6 +143,19 @@ impl PgType {
             PgType::Interval => DataType::Interval,
         }
     }
+
+    /// If `value` does not fit this type's narrow integer width (`int2`/`int4`),
+    /// the PostgreSQL type name for the range error (e.g. `"smallint"`); `None`
+    /// if it fits or this is not a width-narrowed integer. The single 64-bit
+    /// integer storage is not itself range-enforced, so a write or cast into a
+    /// narrowed column uses this to keep the advertised OID truthful.
+    pub fn narrow_int_overflow(&self, value: i64) -> Option<&'static str> {
+        match self {
+            PgType::Int2 if i16::try_from(value).is_err() => Some("smallint"),
+            PgType::Int4 if i32::try_from(value).is_err() => Some("integer"),
+            _ => None,
+        }
+    }
 }
 
 /// The fallback wire type for a `DataType` with no declared label: the collapsed
@@ -286,6 +299,21 @@ mod tests {
             }
         );
         assert_eq!(PgType::from(&DataType::TimestampTz), PgType::Timestamptz);
+    }
+
+    #[test]
+    fn narrow_int_overflow_flags_out_of_range_values() {
+        // int2 range is i16, int4 range is i32; int8 and non-integers never overflow.
+        assert_eq!(PgType::Int2.narrow_int_overflow(32_767), None);
+        assert_eq!(PgType::Int2.narrow_int_overflow(32_768), Some("smallint"));
+        assert_eq!(PgType::Int2.narrow_int_overflow(-32_769), Some("smallint"));
+        assert_eq!(PgType::Int4.narrow_int_overflow(2_147_483_647), None);
+        assert_eq!(
+            PgType::Int4.narrow_int_overflow(2_147_483_648),
+            Some("integer")
+        );
+        assert_eq!(PgType::Int8.narrow_int_overflow(i64::MAX), None);
+        assert_eq!(PgType::Text.narrow_int_overflow(i64::MAX), None);
     }
 
     #[test]

@@ -720,6 +720,54 @@ mod tests {
     }
 
     #[test]
+    fn write_rejects_out_of_range_narrow_integer_columns() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("create table nums (id integer primary key, small smallint, medium integer)")
+            .unwrap();
+        // In-range values are accepted.
+        harness
+            .execute("insert into nums (id, small, medium) values (1, 100, 100000)")
+            .unwrap();
+        // A smallint value outside i16 is rejected (22003), not truncated.
+        let err = harness
+            .execute("insert into nums (id, small, medium) values (2, 40000, 1)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+        // An INTEGER (int4) value outside i32 is likewise rejected.
+        let err = harness
+            .execute("insert into nums (id, small, medium) values (3, 1, 5000000000)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+        // The same check applies to UPDATE.
+        let err = harness
+            .execute("update nums set small = 40000")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+    }
+
+    #[test]
+    fn cast_to_narrow_integer_rejects_out_of_range() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'a')")
+            .unwrap();
+        // An in-range cast succeeds.
+        harness
+            .execute("select cast(100 as smallint) from users")
+            .unwrap();
+        // A cast to a narrow width outside its range is rejected (22003).
+        let err = harness
+            .execute("select cast(40000 as smallint) from users")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+        let err = harness
+            .execute("select cast(5000000000 as integer) from users")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::NumericValueOutOfRange);
+    }
+
+    #[test]
     fn inner_join_returns_only_matching_rows() {
         let harness = ExecutorHarness::with_users();
         seed_users_and_accounts(&harness);

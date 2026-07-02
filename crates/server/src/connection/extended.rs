@@ -349,7 +349,13 @@ fn encode_portal_rows(
     result_formats: &[i16],
 ) -> Result<Vec<ServerMessage>> {
     rows.iter()
-        .map(|row| Ok(ServerMessage::DataRow(encode_row(row, columns, result_formats)?)))
+        .map(|row| {
+            Ok(ServerMessage::DataRow(encode_row(
+                row,
+                columns,
+                result_formats,
+            )?))
+        })
         .collect()
 }
 

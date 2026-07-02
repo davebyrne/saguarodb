@@ -2,9 +2,7 @@ mod codec;
 mod messages;
 mod state;
 
-pub use codec::{
-    PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type,
-};
+pub use codec::{PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type};
 pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
 

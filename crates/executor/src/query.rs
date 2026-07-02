@@ -1238,6 +1238,16 @@ fn validate_row_constraints(schema: &TableSchema, values: &[Value]) -> Result<()
             }
             _ => {}
         }
+        // A narrowed integer column (int2/int4) reports a distinct wire OID, so
+        // the value must fit its width even though storage is a single 64-bit int.
+        if let Value::Integer(int) = value
+            && let Some(type_name) = column.wire_type().narrow_int_overflow(*int)
+        {
+            return Err(DbError::execute(
+                SqlState::NumericValueOutOfRange,
+                format!("{type_name} out of range for column {}", column.name),
+            ));
+        }
     }
     Ok(())
 }
@@ -1355,6 +1365,7 @@ mod drive_tests {
                     data_type: DataType::Integer,
                     table_id: None,
                     column_id: None,
+                    pg_type: None,
                 }],
                 rows: rows.into_iter(),
                 fail_open: false,
