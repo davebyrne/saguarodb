@@ -38,7 +38,13 @@ pub struct ExecutionContext<'a> {
 /// Abort with `QueryCanceled` if a cancellation has been requested. Called
 /// between rows in the row-producing and write loops.
 fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {
-    if ctx.cancel.load(Ordering::Relaxed) {
+    check_canceled_flag(ctx.cancel)
+}
+
+/// The cancellation check on the bare flag, so the streaming drive can poll it
+/// without threading the whole `ExecutionContext`.
+fn check_canceled_flag(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
         return Err(DbError::execute(
             SqlState::QueryCanceled,
             "canceling statement due to user request",
@@ -334,9 +340,9 @@ fn execute_query(ctx: &ExecutionContext<'_>, plan: &PhysicalPlan) -> Result<Exec
     })
 }
 
-/// Build, open, and drive a *resolved* query `plan` into `sink`, closing the
-/// executor on every path. Shared by the materializing [`execute_query`] and the
-/// streaming [`QueryEngine::execute_query_streamed`].
+/// Build a *resolved* query `plan`'s executor, then open, drive, and close it.
+/// Shared by the materializing [`execute_query`] and the streaming
+/// [`QueryEngine::execute_query_streamed`].
 fn drive_query(
     ctx: &ExecutionContext<'_>,
     plan: &PhysicalPlan,
@@ -344,9 +350,22 @@ fn drive_query(
     batch_size: usize,
 ) -> Result<u64> {
     let mut executor = build_executor(ctx, plan)?;
-    open_executor(executor.as_mut())?;
-    let result = drive_into_sink(ctx, executor.as_mut(), sink, batch_size);
-    close_after(executor.as_mut(), result)
+    drive_open_executor(ctx.cancel, executor.as_mut(), sink, batch_size)
+}
+
+/// Open, drive into `sink`, and close a built `executor`, guaranteeing `close`
+/// runs on every path: an open failure closes and returns via [`open_executor`],
+/// and a drive error, early [`ControlFlow::Break`], or success all flow through
+/// [`close_after`].
+fn drive_open_executor(
+    cancel: &AtomicBool,
+    executor: &mut dyn PlanExecutor,
+    sink: &mut dyn RowSink,
+    batch_size: usize,
+) -> Result<u64> {
+    open_executor(executor)?;
+    let result = drive_into_sink(cancel, executor, sink, batch_size);
+    close_after(executor, result)
 }
 
 /// Emit the schema, then pull rows one at a time — polling cancellation between
@@ -354,16 +373,17 @@ fn drive_query(
 /// of at most `batch_size` before handing each to `sink`. Stops early when the
 /// sink returns [`ControlFlow::Break`]. Returns the number of rows produced.
 fn drive_into_sink(
-    ctx: &ExecutionContext<'_>,
+    cancel: &AtomicBool,
     executor: &mut dyn PlanExecutor,
     sink: &mut dyn RowSink,
     batch_size: usize,
 ) -> Result<u64> {
+    debug_assert!(batch_size >= 1, "batch_size must be at least 1");
     sink.start(executor.output_schema())?;
     let mut count: u64 = 0;
     let mut batch: Vec<Row> = Vec::with_capacity(batch_size);
     while let Some(row) = executor.next()? {
-        check_canceled(ctx)?;
+        check_canceled_flag(cancel)?;
         batch.push(row.row);
         count += 1;
         if batch.len() >= batch_size {
@@ -1298,5 +1318,179 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Double => "DOUBLE PRECISION",
         DataType::Numeric { .. } => "NUMERIC",
         DataType::Real => "REAL",
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+    use common::{ColumnInfo, ExecRow, Row, Value};
+    use std::sync::atomic::AtomicBool;
+
+    /// A `PlanExecutor` stub for exercising the drive/close plumbing directly:
+    /// it yields a fixed row sequence (optionally failing on `open` or on the
+    /// nth `next`), and counts `open`/`close`/`next` calls so tests can assert
+    /// the close invariant on every path.
+    struct MockExecutor {
+        schema: Vec<ColumnInfo>,
+        rows: std::vec::IntoIter<Row>,
+        fail_open: bool,
+        fail_next_after: Option<usize>,
+        opened: usize,
+        closed: usize,
+        yielded: usize,
+    }
+
+    impl MockExecutor {
+        fn with_rows(count: usize) -> Self {
+            let rows: Vec<Row> = (0..count)
+                .map(|i| Row {
+                    values: vec![Value::Integer(i as i64)],
+                })
+                .collect();
+            Self {
+                schema: vec![ColumnInfo {
+                    name: "n".to_string(),
+                    data_type: DataType::Integer,
+                    table_id: None,
+                    column_id: None,
+                }],
+                rows: rows.into_iter(),
+                fail_open: false,
+                fail_next_after: None,
+                opened: 0,
+                closed: 0,
+                yielded: 0,
+            }
+        }
+    }
+
+    impl PlanExecutor for MockExecutor {
+        fn output_schema(&self) -> &[ColumnInfo] {
+            &self.schema
+        }
+
+        fn open(&mut self) -> Result<()> {
+            self.opened += 1;
+            if self.fail_open {
+                return Err(DbError::internal("open failed"));
+            }
+            Ok(())
+        }
+
+        fn next(&mut self) -> Result<Option<ExecRow>> {
+            if self.fail_next_after == Some(self.yielded) {
+                return Err(DbError::internal("next failed"));
+            }
+            match self.rows.next() {
+                Some(row) => {
+                    self.yielded += 1;
+                    Ok(Some(ExecRow {
+                        row,
+                        identity: None,
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.closed += 1;
+            Ok(())
+        }
+    }
+
+    /// A sink that optionally stops the scan once it has collected `break_at`
+    /// rows.
+    struct TestSink {
+        break_at: Option<usize>,
+        rows: usize,
+    }
+
+    impl TestSink {
+        fn new() -> Self {
+            Self {
+                break_at: None,
+                rows: 0,
+            }
+        }
+
+        fn breaking_at(rows: usize) -> Self {
+            Self {
+                break_at: Some(rows),
+                rows: 0,
+            }
+        }
+    }
+
+    impl RowSink for TestSink {
+        fn start(&mut self, _columns: &[ColumnInfo]) -> Result<()> {
+            Ok(())
+        }
+
+        fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>> {
+            self.rows += rows.len();
+            match self.break_at {
+                Some(limit) if self.rows >= limit => Ok(ControlFlow::Break(())),
+                _ => Ok(ControlFlow::Continue(())),
+            }
+        }
+    }
+
+    #[test]
+    fn drive_closes_executor_after_normal_completion() {
+        let cancel = AtomicBool::new(false);
+        let mut executor = MockExecutor::with_rows(3);
+        let mut sink = TestSink::new();
+        let count = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(executor.opened, 1);
+        assert_eq!(executor.closed, 1);
+    }
+
+    #[test]
+    fn drive_closes_executor_when_sink_breaks() {
+        let cancel = AtomicBool::new(false);
+        let mut executor = MockExecutor::with_rows(5);
+        // One row per batch; break once two rows have been pushed.
+        let mut sink = TestSink::breaking_at(2);
+        let count = drive_open_executor(&cancel, &mut executor, &mut sink, 1).unwrap();
+        assert_eq!(count, 2, "returns the rows streamed before the break");
+        assert_eq!(executor.yielded, 2, "scan stopped early, not drained");
+        assert_eq!(executor.closed, 1, "close still runs after an early break");
+    }
+
+    #[test]
+    fn drive_closes_executor_on_next_error() {
+        let cancel = AtomicBool::new(false);
+        let mut executor = MockExecutor::with_rows(5);
+        executor.fail_next_after = Some(2);
+        let mut sink = TestSink::new();
+        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+        assert!(err.to_string().contains("next failed"));
+        assert_eq!(executor.closed, 1, "close runs after a mid-drive error");
+    }
+
+    #[test]
+    fn drive_closes_executor_on_open_failure() {
+        let cancel = AtomicBool::new(false);
+        let mut executor = MockExecutor::with_rows(3);
+        executor.fail_open = true;
+        let mut sink = TestSink::new();
+        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+        assert!(err.to_string().contains("open failed"));
+        assert_eq!(executor.opened, 1);
+        assert_eq!(executor.closed, 1, "open failure still closes the executor");
+        assert_eq!(executor.yielded, 0, "next is never called after open fails");
+    }
+
+    #[test]
+    fn drive_cancellation_aborts_and_closes() {
+        let cancel = AtomicBool::new(true);
+        let mut executor = MockExecutor::with_rows(3);
+        let mut sink = TestSink::new();
+        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        assert_eq!(executor.closed, 1, "cancellation still closes the executor");
     }
 }
