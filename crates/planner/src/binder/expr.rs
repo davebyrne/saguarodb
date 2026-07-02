@@ -1,9 +1,9 @@
 use common::{DataType, Result, SqlState, Value};
-use parser::{Expr, FunctionArg, SelectStatement};
+use parser::{Expr, FunctionArg, Query};
 
-use crate::{AggregateFunc, BinOp, BoundExpr, BoundSelect, UnaryOp};
+use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, UnaryOp};
 
-use super::query::bind_select;
+use super::query::bind_query;
 use super::{BindContext, input_ref, plan_error, reject_aggregate, require_type};
 
 pub(super) fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
@@ -90,18 +90,18 @@ pub(super) fn bind_expr(
     }
 }
 
-/// Bind a subquery's inner SELECT in its own fresh binding scope (uncorrelated
+/// Bind a subquery's inner query in its own fresh binding scope (uncorrelated
 /// semantics: it does not see the outer query's columns), reusing the outer
 /// parameter declarations so `$n` placeholders inside the subquery resolve the
 /// same way.
-fn bind_subquery_select(ctx: &BindContext, select: &SelectStatement) -> Result<BoundSelect> {
-    bind_select(ctx.catalog, select, &ctx.declared_params)
+fn bind_subquery(ctx: &BindContext, subquery: &Query) -> Result<BoundQuery> {
+    bind_query(ctx.catalog, subquery, &ctx.declared_params)
 }
 
 /// Require that a subquery used where a single value is expected (a scalar
 /// subquery, or the right side of `IN`) produces exactly one output column.
-fn single_subquery_column(select: &BoundSelect) -> Result<&common::ColumnInfo> {
-    match select.output_schema.as_slice() {
+fn single_subquery_column(query: &BoundQuery) -> Result<&common::ColumnInfo> {
+    match query.output_schema() {
         [column] => Ok(column),
         _ => Err(plan_error(
             SqlState::SyntaxError,
@@ -112,12 +112,12 @@ fn single_subquery_column(select: &BoundSelect) -> Result<&common::ColumnInfo> {
 
 /// `(SELECT ...)` as a scalar value: a single-column subquery whose row count is
 /// checked at run time. The result is always nullable (an empty result is NULL).
-fn bind_scalar_subquery(ctx: &mut BindContext, select: &SelectStatement) -> Result<BoundExpr> {
-    let bound = bind_subquery_select(ctx, select)?;
-    let column = single_subquery_column(&bound)?;
+fn bind_scalar_subquery(ctx: &mut BindContext, subquery: &Query) -> Result<BoundExpr> {
+    let query = bind_subquery(ctx, subquery)?;
+    let column = single_subquery_column(&query)?;
     let data_type = column.data_type.clone();
     Ok(BoundExpr::ScalarSubquery {
-        select: Box::new(bound),
+        query: Box::new(query),
         data_type,
         nullable: true,
     })
@@ -125,14 +125,10 @@ fn bind_scalar_subquery(ctx: &mut BindContext, select: &SelectStatement) -> Resu
 
 /// `[NOT] EXISTS (SELECT ...)`. Any number of output columns is allowed (they are
 /// ignored); the result is a non-null boolean.
-fn bind_exists(
-    ctx: &mut BindContext,
-    subquery: &SelectStatement,
-    negated: bool,
-) -> Result<BoundExpr> {
-    let select = bind_subquery_select(ctx, subquery)?;
+fn bind_exists(ctx: &mut BindContext, subquery: &Query, negated: bool) -> Result<BoundExpr> {
+    let query = bind_subquery(ctx, subquery)?;
     Ok(BoundExpr::Exists {
-        select: Box::new(select),
+        query: Box::new(query),
         negated,
         data_type: DataType::Boolean,
         nullable: false,
@@ -146,11 +142,11 @@ fn bind_exists(
 fn bind_in_subquery(
     ctx: &mut BindContext,
     expr: &Expr,
-    subquery: &SelectStatement,
+    subquery: &Query,
     negated: bool,
 ) -> Result<BoundExpr> {
-    let select = bind_subquery_select(ctx, subquery)?;
-    let column_type = single_subquery_column(&select)?.data_type.clone();
+    let query = bind_subquery(ctx, subquery)?;
+    let column_type = single_subquery_column(&query)?.data_type.clone();
     let left = if matches!(expr, Expr::Literal(Value::Null)) {
         bind_expr(ctx, expr, Some(column_type))?
     } else {
@@ -160,7 +156,7 @@ fn bind_in_subquery(
     };
     Ok(BoundExpr::InSubquery {
         expr: Box::new(left),
-        select: Box::new(select),
+        query: Box::new(query),
         negated,
         data_type: DataType::Boolean,
         nullable: true,

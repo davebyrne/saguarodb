@@ -5,7 +5,7 @@ use crate::{ConflictAction, ConflictTarget, InsertSource, OnConflict, Statement}
 
 use super::expr::convert_expr;
 use super::query::{
-    convert_assignment, convert_query_to_select, convert_returning, query_has_modifiers,
+    convert_assignment, convert_query, convert_returning, query_has_modifiers,
     table_name_from_table_with_joins,
 };
 use super::{feature_not_supported, ident_name, object_name, parse_error, unsupported};
@@ -67,7 +67,7 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
                 .collect::<Result<Vec<_>>>()?,
         )
     } else if matches!(source.body.as_ref(), sql::SetExpr::Select(_)) {
-        InsertSource::Query(Box::new(convert_query_to_select(*source)?))
+        InsertSource::Query(Box::new(convert_query(*source)?))
     } else {
         return unsupported("unsupported INSERT source");
     };

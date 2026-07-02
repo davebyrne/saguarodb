@@ -14,7 +14,7 @@ mod expr;
 mod query;
 
 use dml::{bind_copy, bind_delete, bind_insert, bind_update};
-use query::bind_select;
+use query::bind_query;
 
 #[derive(Clone, Debug)]
 struct Binding {
@@ -167,9 +167,7 @@ fn bind_inner(
             returning.as_deref(),
             declared,
         ),
-        Statement::Select(select) => {
-            bind_select(catalog, select, declared).map(BoundStatement::Select)
-        }
+        Statement::Query(query) => bind_query(catalog, query, declared).map(BoundStatement::Query),
         Statement::Update {
             table,
             assignments,

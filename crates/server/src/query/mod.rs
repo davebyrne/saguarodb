@@ -550,7 +550,7 @@ fn run_plan(
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<ExecutionResult> {
     if let BoundStatement::Explain(inner) = &bound {
-        if !matches!(inner.as_ref(), BoundStatement::Select(_)) {
+        if !matches!(inner.as_ref(), BoundStatement::Query(_)) {
             return Err(DbError::plan(
                 SqlState::SyntaxError,
                 "EXPLAIN supports SELECT only in v1",
@@ -736,7 +736,7 @@ impl PreparedStatement {
 
 fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
     match bound {
-        BoundStatement::Select(select) => Some(select.output_schema.clone()),
+        BoundStatement::Query(query) => Some(query.output_schema().to_vec()),
         // A DML statement with a RETURNING clause produces a result set; its
         // RowDescription is the RETURNING projection schema.
         BoundStatement::Insert { returning, .. }
@@ -756,9 +756,9 @@ fn result_columns(bound: &BoundStatement) -> Option<Vec<ColumnInfo>> {
 
 fn statement_class(statement: &Statement) -> Result<StatementClass> {
     match statement {
-        Statement::Select(_) => Ok(StatementClass::Read),
+        Statement::Query(_) => Ok(StatementClass::Read),
         Statement::Explain(inner) => match inner.as_ref() {
-            Statement::Select(_) => Ok(StatementClass::Read),
+            Statement::Query(_) => Ok(StatementClass::Read),
             _ => Err(DbError::plan(
                 SqlState::SyntaxError,
                 "EXPLAIN supports SELECT only in v1",

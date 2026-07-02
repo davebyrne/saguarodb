@@ -4,7 +4,8 @@ use common::{
 
 use crate::{
     AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
-    BoundOrderByItem, BoundReturning, BoundSelect, BoundStatement, JoinType,
+    BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement,
+    JoinType,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,7 +155,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                     rows: rows.clone(),
                     output_schema: output_schema.clone(),
                 },
-                BoundInsertSource::Query(select) => plan_select(select)?,
+                BoundInsertSource::Query(query) => plan_query(query)?,
             };
             Ok(LogicalPlan::Insert {
                 table: *table,
@@ -164,7 +165,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 returning: returning.clone(),
             })
         }
-        BoundStatement::Select(select) => plan_select(select),
+        BoundStatement::Query(query) => plan_query(query),
         BoundStatement::Update {
             table,
             assignments,
@@ -198,7 +199,27 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
     }
 }
 
-fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
+/// Lower a bound query: lower its body, then apply the query-level
+/// `ORDER BY`/`LIMIT`/`OFFSET`. Only a `SELECT` body exists today; a set-operation
+/// body adds an arm here that combines its arms' plans before those modifiers.
+fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
+    match &query.body {
+        BoundQueryBody::Select(select) => {
+            plan_select_body(select, &query.order_by, query.limit, query.offset)
+        }
+    }
+}
+
+/// Lower a `SELECT` block with the enclosing query's `ORDER BY`/`LIMIT`/`OFFSET`.
+/// The modifiers are passed in (rather than read from the block) because they live
+/// on the [`BoundQuery`] wrapper; the aggregate-context `ORDER BY` rewrite stays
+/// here because it depends on this block's `group_by`/aggregates.
+fn plan_select_body(
+    select: &BoundSelect,
+    order_by: &[BoundOrderByItem],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<LogicalPlan> {
     let mut plan = plan_select_source(select)?;
 
     let aggregate_context = !select.group_by.is_empty()
@@ -207,10 +228,7 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             .iter()
             .any(|item| contains_aggregate(&item.expr))
         || select.having.is_some()
-        || select
-            .order_by
-            .iter()
-            .any(|item| contains_aggregate(&item.expr));
+        || order_by.iter().any(|item| contains_aggregate(&item.expr));
 
     if aggregate_context {
         let mut aggregates = Vec::new();
@@ -220,7 +238,7 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
         if let Some(having) = &select.having {
             collect_aggregates(having, &mut aggregates);
         }
-        for item in &select.order_by {
+        for item in order_by {
             collect_aggregates(&item.expr, &mut aggregates);
         }
 
@@ -239,11 +257,10 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
             };
         }
 
-        if !select.order_by.is_empty() {
+        if !order_by.is_empty() {
             plan = LogicalPlan::Sort {
                 source: Box::new(plan),
-                order_by: select
-                    .order_by
+                order_by: order_by
                     .iter()
                     .map(|item| {
                         Ok(BoundOrderByItem {
@@ -279,10 +296,10 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
         };
         plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     } else {
-        if !select.order_by.is_empty() {
+        if !order_by.is_empty() {
             plan = LogicalPlan::Sort {
                 source: Box::new(plan),
-                order_by: select.order_by.clone(),
+                order_by: order_by.to_vec(),
             };
         }
 
@@ -299,13 +316,13 @@ fn plan_select(select: &BoundSelect) -> Result<LogicalPlan> {
         plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     }
 
-    if let Some(limit) = select.limit {
+    if let Some(limit) = limit {
         plan = LogicalPlan::Limit {
             source: Box::new(plan),
             count: limit,
-            offset: select.offset,
+            offset,
         };
-    } else if let Some(offset) = select.offset {
+    } else if let Some(offset) = offset {
         plan = LogicalPlan::Limit {
             source: Box::new(plan),
             count: u64::MAX,
@@ -350,12 +367,12 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
             table: *table,
             filter,
         }),
-        // A derived table lowers to its inner SELECT's plan. Its columns already
+        // A derived table lowers to its inner query's plan. Its columns already
         // sit at the derived binding's slots, so an outer WHERE (the standalone
         // case) is applied as a Filter above it — it cannot be pushed into the
         // inner scan.
-        BoundFrom::Derived { select, .. } => {
-            let plan = plan_select(select)?;
+        BoundFrom::Derived { query, .. } => {
+            let plan = plan_query(query)?;
             Ok(match filter {
                 Some(predicate) => LogicalPlan::Filter {
                     source: Box::new(plan),
@@ -700,13 +717,13 @@ fn rewrite_aggregate_expr(
         // grouped-expression rewrite; only `InSubquery`'s left operand does.
         BoundExpr::InSubquery {
             expr,
-            select,
+            query,
             negated,
             data_type,
             nullable,
         } => Ok(BoundExpr::InSubquery {
             expr: Box::new(rewrite_aggregate_expr(expr, group_by, aggregates)?),
-            select: select.clone(),
+            query: query.clone(),
             negated: *negated,
             data_type: data_type.clone(),
             nullable: *nullable,

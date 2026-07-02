@@ -30,7 +30,7 @@ pub enum Statement {
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
     Insert { table: String, columns: Vec<String>, source: InsertSource, on_conflict: Option<OnConflict>, returning: Option<Vec<SelectItem>> },
-    Select(SelectStatement),
+    Query(Query),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Explain(Box<Statement>),
@@ -64,7 +64,7 @@ pub enum Statement {
 
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
-    Query(Box<SelectStatement>),
+    Query(Box<Query>),
 }
 
 pub struct Assignment {
@@ -72,16 +72,34 @@ pub struct Assignment {
     pub value: Expr,
 }
 
-pub struct SelectStatement {
+// A query expression: a body plus the query-level modifiers that apply to its
+// whole result. `ORDER BY`/`LIMIT`/`OFFSET` (and later `WITH`) sit on the
+// wrapper, outside the body, mirroring the SQL grammar. Carried by the top-level
+// statement, derived tables, `INSERT ... SELECT`, and subquery expressions.
+pub struct Query {
+    pub body: QueryBody,
+    pub order_by: Vec<OrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+// The body of a query expression. Only a single `SELECT` is supported today; set
+// operations (`UNION`/`INTERSECT`/`EXCEPT`) and standalone `VALUES` attach here as
+// new variants without disturbing the wrapper or the conversion pipeline.
+pub enum QueryBody {
+    Select(Select),
+}
+
+// A single SELECT block, without the query-level ORDER BY/LIMIT/OFFSET (which
+// live on the enclosing Query). `from` may be empty — a FROM-less scalar
+// projection such as `SELECT 1`.
+pub struct Select {
     pub distinct: Option<Distinct>,
     pub columns: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
-    pub order_by: Vec<OrderByItem>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
 }
 
 pub enum Distinct {
@@ -108,7 +126,7 @@ pub enum SelectItem {
 pub enum FromItem {
     Table { name: String, alias: Option<String> },
     // Derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required.
-    Derived { subquery: Box<SelectStatement>, alias: String, column_aliases: Vec<String> },
+    Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -135,9 +153,9 @@ pub enum Expr {
     Literal(Value),
     Placeholder(u32), // extended-protocol parameter `$n` (1-based)
     ColumnRef { table: Option<String>, column: String },
-    Subquery(Box<SelectStatement>), // scalar subquery (SELECT ...) as a value
-    InSubquery { expr: Box<Expr>, subquery: Box<SelectStatement>, negated: bool }, // x [NOT] IN (SELECT ...)
-    Exists { subquery: Box<SelectStatement>, negated: bool }, // [NOT] EXISTS (SELECT ...)
+    Subquery(Box<Query>), // scalar subquery (SELECT ...) as a value
+    InSubquery { expr: Box<Expr>, subquery: Box<Query>, negated: bool }, // x [NOT] IN (SELECT ...)
+    Exists { subquery: Box<Query>, negated: bool }, // [NOT] EXISTS (SELECT ...)
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
@@ -210,8 +228,8 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `DROP SEQUENCE [IF EXISTS] name`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
-- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
-- Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. The inner `SELECT` is converted with the same query rules; cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
+- `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. Only a single `SELECT` body is supported today — a non-`SELECT` query body (a set operation, or a standalone top-level `VALUES`) is rejected as unsupported. The `QueryBody` enum and the wrapper are the seam where `UNION`/`INTERSECT`/`EXCEPT`, CTEs (`WITH`), and standalone `VALUES` attach as new variants without disturbing the surrounding pipeline.
+- Subquery expressions: a scalar subquery `(SELECT ...)` parses to `Expr::Subquery`, `expr [NOT] IN (SELECT ...)` parses to `Expr::InSubquery` (the subquery body is a `SetExpr`: a bare `SELECT`, or a parenthesized query with its own ORDER BY / LIMIT), and `[NOT] EXISTS (SELECT ...)` parses to `Expr::Exists`. Each subquery converts to a `Query` (so it may carry its own `ORDER BY`/`LIMIT`); cardinality and single-column shape are validated downstream (binder/executor), not in the parser.
 - Derived tables: `(SELECT ...) AS alias [(col, ...)]` in `FROM` parses to `FromItem::Derived`. The alias is required (a subquery in `FROM` without an alias is `SqlState::SyntaxError`); an optional parenthesized column-alias list renames the subquery's columns left to right (typed column aliases and `LATERAL` are rejected).
 - `UPDATE ... SET ... WHERE`.
 - `DELETE FROM ... WHERE`.

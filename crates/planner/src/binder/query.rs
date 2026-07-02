@@ -2,10 +2,11 @@ use catalog::CatalogManager;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, Result, SqlState, TableId, TableSchema, Value,
 };
-use parser::{Distinct, Expr, FromItem, OrderByItem, SelectItem, SelectStatement};
+use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
 
 use crate::{
-    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundSelect, BoundSelectItem, JoinType,
+    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
+    BoundSelectItem, JoinType,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
@@ -14,11 +15,40 @@ use super::{
     require_table,
 };
 
-pub(super) fn bind_select(
+/// Bind a query expression: bind the body, then attach the query-level
+/// `ORDER BY`/`LIMIT`/`OFFSET`. Only a `SELECT` body exists today; set operations
+/// and standalone `VALUES` add arms here without disturbing the callers (top-level
+/// statement, derived table, `INSERT ... SELECT`, subquery expression).
+pub(super) fn bind_query(
     catalog: &dyn CatalogManager,
-    select: &SelectStatement,
+    query: &Query,
     declared: &[Option<DataType>],
-) -> Result<BoundSelect> {
+) -> Result<BoundQuery> {
+    match &query.body {
+        QueryBody::Select(select) => {
+            let (bound_select, order_by) = bind_select(catalog, select, &query.order_by, declared)?;
+            Ok(BoundQuery {
+                body: BoundQueryBody::Select(bound_select),
+                order_by,
+                limit: query.limit,
+                offset: query.offset,
+            })
+        }
+    }
+}
+
+/// Bind a single `SELECT` block together with the query-level `order_by` (bound
+/// against this block's output columns). Returns the bound block and the bound
+/// `ORDER BY`; `LIMIT`/`OFFSET` are copied onto the wrapper by [`bind_query`].
+/// `ORDER BY` and `DISTINCT` are bound here because their validation is coupled
+/// (`SELECT DISTINCT` requires each `ORDER BY` expression to be in the select
+/// list, and `DISTINCT ON` keys must match the leading `ORDER BY`).
+fn bind_select(
+    catalog: &dyn CatalogManager,
+    select: &Select,
+    order_by: &[OrderByItem],
+    declared: &[Option<DataType>],
+) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
     if select.from.is_empty() {
         return Err(plan_error(
             SqlState::UndefinedTable,
@@ -57,7 +87,7 @@ pub(super) fn bind_select(
         .as_ref()
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
-    let order_by = bind_order_by(&mut ctx, &select.order_by, &columns)?;
+    let order_by = bind_order_by(&mut ctx, order_by, &columns)?;
     let distinct = bind_distinct(&mut ctx, select.distinct.as_ref(), &columns, &order_by)?;
 
     let distinct_on_keys = match &distinct {
@@ -74,18 +104,18 @@ pub(super) fn bind_select(
 
     let output_schema = select_output_schema(&ctx, &columns);
 
-    Ok(BoundSelect {
-        distinct,
-        columns,
-        from,
-        filter,
-        group_by,
-        having,
+    Ok((
+        BoundSelect {
+            distinct,
+            columns,
+            from,
+            filter,
+            group_by,
+            having,
+            output_schema,
+        },
         order_by,
-        limit: select.limit,
-        offset: select.offset,
-        output_schema,
-    })
+    ))
 }
 
 fn bind_from_items(
@@ -185,17 +215,18 @@ pub(super) fn bind_table_from_schema(
     }
 }
 
-/// Bind a derived table `(SELECT ...) AS alias [(cols)]`: bind the inner SELECT in
+/// Bind a derived table `(SELECT ...) AS alias [(cols)]`: bind the inner query in
 /// its own scope, derive the visible columns (optionally renamed by the column
 /// alias list), and register a binding that projects them into the outer scope.
 fn bind_derived_table(
     catalog: &dyn CatalogManager,
     ctx: &mut BindContext,
-    subquery: &SelectStatement,
+    subquery: &Query,
     alias: &str,
     column_aliases: &[String],
 ) -> Result<BoundFrom> {
-    let select = bind_select(catalog, subquery, &ctx.declared_params)?;
+    let query = bind_query(catalog, subquery, &ctx.declared_params)?;
+    let BoundQueryBody::Select(select) = &query.body;
     if column_aliases.len() > select.columns.len() {
         return Err(plan_error(
             SqlState::SyntaxError,
@@ -239,7 +270,7 @@ fn bind_derived_table(
     });
 
     Ok(BoundFrom::Derived {
-        select: Box::new(select),
+        query: Box::new(query),
         binding,
         alias: alias.to_string(),
         schema: columns,

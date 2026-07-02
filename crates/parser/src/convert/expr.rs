@@ -3,7 +3,7 @@ use sqlparser::ast as sql;
 
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
-use super::query::{convert_query_to_select, convert_set_expr_to_select};
+use super::query::{convert_query, convert_set_expr_to_query};
 use super::{convert_data_type, ident_name, object_name, parse_error, unsupported};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
@@ -65,11 +65,11 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             negated,
         } => Ok(Expr::InSubquery {
             expr: Box::new(convert_expr(expr)?),
-            subquery: Box::new(convert_set_expr_to_select((**subquery).clone())?),
+            subquery: Box::new(convert_set_expr_to_query((**subquery).clone())?),
             negated: *negated,
         }),
         sql::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
-            subquery: Box::new(convert_query_to_select((**subquery).clone())?),
+            subquery: Box::new(convert_query((**subquery).clone())?),
             negated: *negated,
         }),
         sql::Expr::Between {
@@ -130,9 +130,9 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
             })
         }
         sql::Expr::TypedString { data_type, value } => convert_typed_string(data_type, value),
-        sql::Expr::Subquery(query) => Ok(Expr::Subquery(Box::new(convert_query_to_select(
-            (**query).clone(),
-        )?))),
+        sql::Expr::Subquery(query) => {
+            Ok(Expr::Subquery(Box::new(convert_query((**query).clone())?)))
+        }
         sql::Expr::Ceil { expr, field } => convert_ceil_floor("ceil", expr, field),
         sql::Expr::Floor { expr, field } => convert_ceil_floor("floor", expr, field),
         sql::Expr::Extract { field, expr, .. } => convert_extract(field, expr),

@@ -5,7 +5,7 @@
 use common::{DataType, DbError, Result, SqlState, Value};
 
 use crate::bound::{BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning};
-use crate::{BoundExpr, BoundSelect, BoundStatement};
+use crate::{BoundExpr, BoundQuery, BoundQueryBody, BoundSelect, BoundStatement};
 
 /// Resolve the parameter types for a bound statement, indexed by 0-based
 /// position. Repeated uses of the same `$n` must agree on type; a position not
@@ -69,12 +69,12 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
                         }
                     }
                 }
-                BoundInsertSource::Query(select) => collect_select(select, used)?,
+                BoundInsertSource::Query(query) => collect_query(query, used)?,
             }
             collect_on_conflict(on_conflict, used)?;
             collect_returning(returning, used)
         }
-        BoundStatement::Select(select) => collect_select(select, used),
+        BoundStatement::Query(query) => collect_query(query, used),
         BoundStatement::Update {
             assignments,
             source,
@@ -128,6 +128,18 @@ fn collect_returning(
     Ok(())
 }
 
+/// Collect parameter types from a bound query: its body plus the query-level
+/// `ORDER BY` (which lives on the wrapper, not the `SELECT` body).
+fn collect_query(query: &BoundQuery, used: &mut Vec<Option<DataType>>) -> Result<()> {
+    match &query.body {
+        BoundQueryBody::Select(select) => collect_select(select, used)?,
+    }
+    for item in &query.order_by {
+        collect_expr(&item.expr, used)?;
+    }
+    Ok(())
+}
+
 fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Result<()> {
     for item in &select.columns {
         collect_expr(&item.expr, used)?;
@@ -142,16 +154,13 @@ fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Res
     if let Some(having) = &select.having {
         collect_expr(having, used)?;
     }
-    for item in &select.order_by {
-        collect_expr(&item.expr, used)?;
-    }
     Ok(())
 }
 
 fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()> {
     match from {
         BoundFrom::Table { .. } => Ok(()),
-        BoundFrom::Derived { select, .. } => collect_select(select, used),
+        BoundFrom::Derived { query, .. } => collect_query(query, used),
         BoundFrom::Join {
             left,
             right,
@@ -170,8 +179,8 @@ fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()
 
 fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<DataType>>) -> Result<()> {
     for_each_child(expr, &mut |child| collect_expr(child, used))?;
-    if let Some(select) = subquery_select(expr) {
-        collect_select(select, used)?;
+    if let Some(query) = subquery_query(expr) {
+        collect_query(query, used)?;
     }
     if let BoundExpr::Parameter {
         index, data_type, ..
@@ -182,22 +191,22 @@ fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<DataType>>) -> Result<()
     Ok(())
 }
 
-/// The inner SELECT of a subquery expression, if any. Parameter handling recurses
+/// The inner query of a subquery expression, if any. Parameter handling recurses
 /// into it so `$n` placeholders inside a subquery are collected and substituted.
-fn subquery_select(expr: &BoundExpr) -> Option<&BoundSelect> {
+fn subquery_query(expr: &BoundExpr) -> Option<&BoundQuery> {
     match expr {
-        BoundExpr::ScalarSubquery { select, .. }
-        | BoundExpr::Exists { select, .. }
-        | BoundExpr::InSubquery { select, .. } => Some(select),
+        BoundExpr::ScalarSubquery { query, .. }
+        | BoundExpr::Exists { query, .. }
+        | BoundExpr::InSubquery { query, .. } => Some(query),
         _ => None,
     }
 }
 
-fn subquery_select_mut(expr: &mut BoundExpr) -> Option<&mut BoundSelect> {
+fn subquery_query_mut(expr: &mut BoundExpr) -> Option<&mut BoundQuery> {
     match expr {
-        BoundExpr::ScalarSubquery { select, .. }
-        | BoundExpr::Exists { select, .. }
-        | BoundExpr::InSubquery { select, .. } => Some(select),
+        BoundExpr::ScalarSubquery { query, .. }
+        | BoundExpr::Exists { query, .. }
+        | BoundExpr::InSubquery { query, .. } => Some(query),
         _ => None,
     }
 }
@@ -247,12 +256,12 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
                         }
                     }
                 }
-                BoundInsertSource::Query(select) => substitute_select(select, params)?,
+                BoundInsertSource::Query(query) => substitute_query(query, params)?,
             }
             substitute_on_conflict(on_conflict, params)?;
             substitute_returning(returning, params)
         }
-        BoundStatement::Select(select) => substitute_select(select, params),
+        BoundStatement::Query(query) => substitute_query(query, params),
         BoundStatement::Update {
             assignments,
             source,
@@ -303,6 +312,16 @@ fn substitute_returning(returning: &mut Option<BoundReturning>, params: &[Value]
     Ok(())
 }
 
+fn substitute_query(query: &mut BoundQuery, params: &[Value]) -> Result<()> {
+    match &mut query.body {
+        BoundQueryBody::Select(select) => substitute_select(select, params)?,
+    }
+    for item in &mut query.order_by {
+        substitute_expr(&mut item.expr, params)?;
+    }
+    Ok(())
+}
+
 fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {
     for item in &mut select.columns {
         substitute_expr(&mut item.expr, params)?;
@@ -317,16 +336,13 @@ fn substitute_select(select: &mut BoundSelect, params: &[Value]) -> Result<()> {
     if let Some(having) = &mut select.having {
         substitute_expr(having, params)?;
     }
-    for item in &mut select.order_by {
-        substitute_expr(&mut item.expr, params)?;
-    }
     Ok(())
 }
 
 fn substitute_from(from: &mut BoundFrom, params: &[Value]) -> Result<()> {
     match from {
         BoundFrom::Table { .. } => Ok(()),
-        BoundFrom::Derived { select, .. } => substitute_select(select, params),
+        BoundFrom::Derived { query, .. } => substitute_query(query, params),
         BoundFrom::Join {
             left,
             right,
@@ -345,8 +361,8 @@ fn substitute_from(from: &mut BoundFrom, params: &[Value]) -> Result<()> {
 
 fn substitute_expr(expr: &mut BoundExpr, params: &[Value]) -> Result<()> {
     for_each_child_mut(expr, &mut |child| substitute_expr(child, params))?;
-    if let Some(select) = subquery_select_mut(expr) {
-        substitute_select(select, params)?;
+    if let Some(query) = subquery_query_mut(expr) {
+        substitute_query(query, params)?;
     }
 
     let BoundExpr::Parameter {

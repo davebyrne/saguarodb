@@ -6,18 +6,17 @@ use common::{
     Result, SqlState, TableSchema,
 };
 use parser::{
-    Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, SelectItem,
-    SelectStatement,
+    Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, Query, SelectItem,
 };
 
 use crate::{
-    BoundExpr, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect, BoundSelectItem,
-    BoundStatement,
+    BoundExpr, BoundInsertSource, BoundOnConflict, BoundQueryBody, BoundReturning, BoundSelect,
+    BoundSelectItem, BoundStatement,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::query::{
-    bind_excluded_binding, bind_select, bind_select_item, bind_table_from_schema,
+    bind_excluded_binding, bind_query, bind_select_item, bind_table_from_schema,
     select_output_schema,
 };
 use super::{
@@ -277,21 +276,23 @@ fn bind_insert_query(
     catalog: &dyn CatalogManager,
     table: &TableSchema,
     columns: &[ColumnId],
-    select: &SelectStatement,
+    subquery: &Query,
     declared: &[Option<DataType>],
 ) -> Result<BoundInsertSource> {
-    let bound = bind_select(catalog, select, declared)?;
-    if bound.columns.len() != columns.len() {
+    let query = bind_query(catalog, subquery, declared)?;
+    let BoundQueryBody::Select(select) = &query.body;
+    let source_columns = &select.columns;
+    if source_columns.len() != columns.len() {
         return Err(plan_error(
             SqlState::DatatypeMismatch,
             "INSERT ... SELECT query produces a different number of columns than the target",
         ));
     }
-    for (item, column_id) in bound.columns.iter().zip(columns) {
+    for (item, column_id) in source_columns.iter().zip(columns) {
         let column = column_by_id(table, *column_id)?;
         validate_assignable(&item.expr, column)?;
     }
-    Ok(BoundInsertSource::Query(Box::new(bound)))
+    Ok(BoundInsertSource::Query(Box::new(query)))
 }
 
 pub(super) fn bind_update(
@@ -345,9 +346,6 @@ pub(super) fn bind_update(
             filter: source_filter,
             group_by: Vec::new(),
             having: None,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
             output_schema: table_output_schema(&table),
         },
         returning,
@@ -381,9 +379,6 @@ pub(super) fn bind_delete(
             filter: source_filter,
             group_by: Vec::new(),
             having: None,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
             output_schema: table_output_schema(&table),
         },
         returning,

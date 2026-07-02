@@ -9,8 +9,8 @@ mod simplify;
 
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
-    BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect,
-    BoundSelectItem, BoundStatement,
+    BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
+    BoundReturning, BoundSelect, BoundSelectItem, BoundStatement,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -30,7 +30,7 @@ pub fn mutates_sequences(statement: &BoundStatement) -> bool {
         | BoundStatement::DropSequence { .. }
         | BoundStatement::Copy { .. }
         | BoundStatement::Explain(_) => false,
-        BoundStatement::Select(select) => select_mutates_sequences(select),
+        BoundStatement::Query(query) => query_mutates_sequences(query),
         BoundStatement::Insert {
             source,
             on_conflict,
@@ -89,8 +89,21 @@ fn insert_source_mutates_sequences(source: &BoundInsertSource) -> bool {
             .iter()
             .flat_map(|row| row.iter())
             .any(expr_mutates_sequences),
-        BoundInsertSource::Query(select) => select_mutates_sequences(select),
+        BoundInsertSource::Query(query) => query_mutates_sequences(query),
     }
+}
+
+/// Whether evaluating a bound query advances or sets a sequence — its body plus
+/// the query-level `ORDER BY` (which lives on the wrapper, not the `SELECT`).
+fn query_mutates_sequences(query: &BoundQuery) -> bool {
+    let body_mutates = match &query.body {
+        BoundQueryBody::Select(select) => select_mutates_sequences(select),
+    };
+    body_mutates
+        || query
+            .order_by
+            .iter()
+            .any(|item| expr_mutates_sequences(&item.expr))
 }
 
 fn select_mutates_sequences(select: &BoundSelect) -> bool {
@@ -102,10 +115,6 @@ fn select_mutates_sequences(select: &BoundSelect) -> bool {
         || select.filter.as_ref().is_some_and(expr_mutates_sequences)
         || select.group_by.iter().any(expr_mutates_sequences)
         || select.having.as_ref().is_some_and(expr_mutates_sequences)
-        || select
-            .order_by
-            .iter()
-            .any(|item| expr_mutates_sequences(&item.expr))
         || match &select.distinct {
             Some(BoundDistinct::On(exprs)) => exprs.iter().any(expr_mutates_sequences),
             Some(BoundDistinct::All) | None => false,
@@ -115,7 +124,7 @@ fn select_mutates_sequences(select: &BoundSelect) -> bool {
 fn from_mutates_sequences(from: &BoundFrom) -> bool {
     match from {
         BoundFrom::Table { .. } => false,
-        BoundFrom::Derived { select, .. } => select_mutates_sequences(select),
+        BoundFrom::Derived { query, .. } => query_mutates_sequences(query),
         BoundFrom::Join {
             left,
             right,
@@ -166,11 +175,11 @@ fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
                 })
                 || else_clause.as_deref().is_some_and(expr_mutates_sequences)
         }
-        BoundExpr::InSubquery { expr, select, .. } => {
-            expr_mutates_sequences(expr) || select_mutates_sequences(select)
+        BoundExpr::InSubquery { expr, query, .. } => {
+            expr_mutates_sequences(expr) || query_mutates_sequences(query)
         }
-        BoundExpr::ScalarSubquery { select, .. } | BoundExpr::Exists { select, .. } => {
-            select_mutates_sequences(select)
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            query_mutates_sequences(query)
         }
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
@@ -305,7 +314,11 @@ mod tests {
         let stmt = parse("select id from users where name = 'Ada'").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
 
@@ -323,22 +336,22 @@ mod tests {
         let stmt = parse("select name, id from users order by 2").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery { order_by, .. }) = bound else {
             panic!("expected bound select");
         };
 
-        assert_eq!(select.order_by.len(), 1);
+        assert_eq!(order_by.len(), 1);
         // Output column 2 is `id`, which resolves to InputRef column 0, slot 0 —
         // not the constant literal 2.
         assert!(matches!(
-            select.order_by[0].expr,
+            order_by[0].expr,
             BoundExpr::InputRef {
                 column: 0,
                 slot: 0,
                 ..
             }
         ));
-        assert!(select.order_by[0].ascending);
+        assert!(order_by[0].ascending);
     }
 
     #[test]
@@ -561,7 +574,11 @@ mod tests {
                 .unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         // upper(text)->text nullable (name is nullable); length(text)->int;
@@ -593,7 +610,11 @@ mod tests {
         .unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = &bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = &bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(
@@ -695,7 +716,11 @@ mod tests {
         let stmt = parse("select id from users where null in (1, 2)").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(
@@ -718,7 +743,11 @@ mod tests {
         let stmt = parse("select (select max(id) from accounts) as m from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         // A scalar subquery is always nullable (empty result is NULL), and its
@@ -748,7 +777,11 @@ mod tests {
         let stmt = parse("select name from users where id in (select id from accounts)").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(
@@ -787,7 +820,11 @@ mod tests {
             parse("select name from users where exists (select id, owner from accounts)").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(
@@ -807,7 +844,11 @@ mod tests {
         let stmt = parse("select d.x from (select id as x from users) as d").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.output_schema[0].name, "x");
@@ -820,7 +861,11 @@ mod tests {
         let stmt = parse("select d.y from (select id from users) as d(y)").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.output_schema[0].name, "y");
@@ -1098,7 +1143,11 @@ mod tests {
         let stmt = parse("select * from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected select");
         };
 
@@ -1113,7 +1162,11 @@ mod tests {
         let stmt = parse("select count(*) as c from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected select");
         };
 
@@ -1158,7 +1211,11 @@ mod tests {
             parse("select case when id = 1 then null else name end as display from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected select");
         };
 
@@ -1285,7 +1342,11 @@ mod tests {
         let stmt = parse("select a.id from users as a join users as b on a.id = b.id").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         let BoundFrom::Join { left, right, .. } = select.from else {
@@ -1317,7 +1378,11 @@ mod tests {
         let stmt = parse("select ID from USERS where NAME = 'Ada'").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.output_schema[0].name, "id");
@@ -1366,7 +1431,11 @@ mod tests {
         let stmt = parse("select name from users where id between 1 and 10").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(select.filter, Some(BoundExpr::Between { .. })));
@@ -1378,7 +1447,11 @@ mod tests {
         let stmt = parse("select id from users where name like 'A%'").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(select.filter, Some(BoundExpr::Like { .. })));
@@ -1389,7 +1462,11 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("select coalesce(name, 'fallback') from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         let expr = &select.columns[0].expr;
@@ -1404,7 +1481,11 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("select coalesce(name, name) from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(select.columns[0].expr.nullable());
@@ -1423,7 +1504,11 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("select nullif(id, 0) from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         let expr = &select.columns[0].expr;
@@ -1436,7 +1521,11 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("select id is distinct from 1 from users").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         let expr = &select.columns[0].expr;
@@ -1458,7 +1547,11 @@ mod tests {
         ];
         for (sql, expected) in cases {
             let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
-            let BoundStatement::Select(select) = bound else {
+            let BoundStatement::Query(BoundQuery {
+                body: BoundQueryBody::Select(select),
+                ..
+            }) = bound
+            else {
                 panic!("expected bound select for {sql}");
             };
             assert_eq!(select.columns[0].expr.data_type(), expected, "for `{sql}`");
@@ -1479,7 +1572,11 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.columns[0].expr.data_type(), DataType::Text);
@@ -1493,7 +1590,11 @@ mod tests {
         ];
         for (sql, expected) in cases {
             let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
-            let BoundStatement::Select(select) = bound else {
+            let BoundStatement::Query(BoundQuery {
+                body: BoundQueryBody::Select(select),
+                ..
+            }) = bound
+            else {
                 panic!("expected bound select for {sql}");
             };
             assert_eq!(select.columns[0].expr.data_type(), expected, "for `{sql}`");
@@ -1521,7 +1622,11 @@ mod tests {
             "select variance(id) from users",
         ] {
             let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
-            let BoundStatement::Select(select) = bound else {
+            let BoundStatement::Query(BoundQuery {
+                body: BoundQueryBody::Select(select),
+                ..
+            }) = bound
+            else {
                 panic!("expected bound select for {sql}");
             };
             assert_eq!(
@@ -1538,7 +1643,11 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.columns[0].expr.data_type(), DataType::Boolean);
@@ -1559,7 +1668,11 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert_eq!(select.columns[0].expr.data_type(), DataType::Double);
@@ -1579,7 +1692,11 @@ mod tests {
         let stmt = parse("select users.id from users, accounts").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::Select(select) = bound else {
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
             panic!("expected bound select");
         };
         assert!(matches!(

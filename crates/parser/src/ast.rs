@@ -45,7 +45,7 @@ pub enum Statement {
         /// or `table.*`) evaluated over each inserted (or upserted) row.
         returning: Option<Vec<SelectItem>>,
     },
-    Select(SelectStatement),
+    Query(Query),
     Update {
         table: String,
         assignments: Vec<Assignment>,
@@ -130,7 +130,7 @@ pub enum Statement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
-    Query(Box<SelectStatement>),
+    Query(Box<Query>),
 }
 
 /// `ON CONFLICT [target] DO NOTHING | DO UPDATE SET ... [WHERE ...]`. `target`
@@ -167,17 +167,38 @@ pub struct Assignment {
     pub value: Expr,
 }
 
+/// A complete query expression: a query body plus the query-level modifiers that
+/// apply to its whole result. In the SQL grammar `ORDER BY`/`LIMIT`/`OFFSET` sit
+/// outside the body (and a future `WITH` would too), so when the body becomes a
+/// set operation (`UNION`/`INTERSECT`/`EXCEPT`) they order and limit the combined
+/// result rather than a single `SELECT`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SelectStatement {
+pub struct Query {
+    pub body: QueryBody,
+    pub order_by: Vec<OrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// The body of a query expression. Only a single `SELECT` is supported today;
+/// set operations and standalone `VALUES` attach here as new variants without
+/// disturbing the [`Query`] wrapper or the conversion/binding/planning pipeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryBody {
+    Select(Select),
+}
+
+/// A single `SELECT` block, without the query-level `ORDER BY`/`LIMIT`/`OFFSET`
+/// (which live on the enclosing [`Query`]). `from` may be empty — a FROM-less
+/// scalar projection such as `SELECT 1`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Select {
     pub distinct: Option<Distinct>,
     pub columns: Vec<SelectItem>,
     pub from: Vec<FromItem>,
     pub filter: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
-    pub order_by: Vec<OrderByItem>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
 }
 
 /// The `DISTINCT` modifier on a `SELECT`. `All` is plain `SELECT DISTINCT`
@@ -206,7 +227,7 @@ pub enum FromItem {
     /// FROM clause. The alias is required; `column_aliases` optionally renames the
     /// subquery's output columns left to right.
     Derived {
-        subquery: Box<SelectStatement>,
+        subquery: Box<Query>,
         alias: String,
         column_aliases: Vec<String>,
     },
@@ -247,18 +268,18 @@ pub enum Expr {
     /// single column and at most one row; an empty result is `NULL`. The binder
     /// validates the single-column shape; the one-row cardinality is enforced at
     /// run time.
-    Subquery(Box<SelectStatement>),
+    Subquery(Box<Query>),
     /// `expr [NOT] IN (SELECT ...)`. The subquery must produce a single column;
     /// `negated` is `true` for `NOT IN`. Three-valued-logic NULL semantics apply.
     InSubquery {
         expr: Box<Expr>,
-        subquery: Box<SelectStatement>,
+        subquery: Box<Query>,
         negated: bool,
     },
     /// `[NOT] EXISTS (SELECT ...)`. `negated` is `true` for `NOT EXISTS`. The
     /// subquery's projected columns are ignored — only whether it produces a row.
     Exists {
-        subquery: Box<SelectStatement>,
+        subquery: Box<Query>,
         negated: bool,
     },
     BinaryOp {

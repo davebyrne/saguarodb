@@ -3,8 +3,8 @@ mod convert;
 
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Distinct, Expr, FromItem, FunctionArg,
-    InsertSource, JoinType, OnConflict, OrderByItem, SelectItem, SelectStatement, Statement,
-    UnaryOp,
+    InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem,
+    Statement, UnaryOp,
 };
 
 use common::Result;
@@ -21,8 +21,8 @@ mod tests {
     };
 
     use crate::{
-        BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, SelectItem, Statement, UnaryOp,
-        parse,
+        BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody, SelectItem,
+        Statement, UnaryOp, parse,
     };
 
     #[test]
@@ -51,7 +51,10 @@ mod tests {
         let stmt = parse("select users.*, name as n from users where id = 7").unwrap();
 
         match stmt {
-            Statement::Select(select) => {
+            Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) => {
                 assert_eq!(select.columns.len(), 2);
                 assert!(matches!(
                     select.columns[0],
@@ -74,16 +77,21 @@ mod tests {
     fn parses_scalar_subquery_in_projection() {
         let stmt = parse("select (select max(id) from accounts) from users").unwrap();
 
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         let SelectItem::Expression {
-            expr: Expr::Subquery(inner),
+            expr: Expr::Subquery(subquery),
             ..
         } = &select.columns[0]
         else {
             panic!("expected scalar subquery, got {:?}", select.columns[0]);
         };
+        let QueryBody::Select(inner) = &subquery.body;
         assert!(
             matches!(inner.from.as_slice(), [FromItem::Table { name, .. }] if name == "accounts")
         );
@@ -94,7 +102,11 @@ mod tests {
         let stmt =
             parse("select name from users where id = (select min(id) from accounts)").unwrap();
 
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -119,7 +131,11 @@ mod tests {
                 true,
             ),
         ] {
-            let Statement::Select(select) = parse(sql).unwrap() else {
+            let Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) = parse(sql).unwrap()
+            else {
                 panic!("expected select");
             };
             assert!(
@@ -144,7 +160,11 @@ mod tests {
                 true,
             ),
         ] {
-            let Statement::Select(select) = parse(sql).unwrap() else {
+            let Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) = parse(sql).unwrap()
+            else {
                 panic!("expected select");
             };
             assert!(
@@ -157,7 +177,11 @@ mod tests {
     #[test]
     fn parses_derived_table_with_column_aliases() {
         let stmt = parse("select d.x from (select id from users) as d(x)").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -177,7 +201,11 @@ mod tests {
     fn parses_count_star_and_aggregate_distinct_shape() {
         let stmt = parse("select count(*), count(distinct id) from users").unwrap();
 
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -200,7 +228,11 @@ mod tests {
     #[test]
     fn normalizes_trim_and_substring_into_function_calls() {
         let stmt = parse("select trim(name), substring(name, 2, 3) from users").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -224,7 +256,11 @@ mod tests {
     fn normalizes_substring_from_for_syntax_to_function_args() {
         let stmt =
             parse("select substring(name from 2 for 3), substring(name, 2) from users").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -276,7 +312,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("select * from users").unwrap(),
-            Statement::Select(_)
+            Statement::Query(_)
         ));
         assert!(matches!(
             parse("update users set name = 'bob' where id = 1").unwrap(),
@@ -736,7 +772,11 @@ mod tests {
     #[test]
     fn normalizes_unquoted_identifiers_and_rejects_quoted_identifiers() {
         let stmt = parse("select Users.ID as TheID from Users as U").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -773,7 +813,11 @@ mod tests {
     #[test]
     fn parses_select_wildcards_distinctly() {
         let stmt = parse("select *, users.* from users").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -791,7 +835,11 @@ mod tests {
              right join refunds on orders.id = refunds.order_id",
         )
         .unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -805,7 +853,11 @@ mod tests {
         ));
 
         let cross = parse("select * from users cross join orders").unwrap();
-        let Statement::Select(select) = cross else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = cross
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1009,7 +1061,13 @@ mod tests {
         )
         .unwrap();
 
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            order_by,
+            limit,
+            offset,
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -1067,10 +1125,10 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(select.limit, Some(10));
-        assert_eq!(select.offset, Some(5));
-        assert!(!select.order_by[0].ascending);
-        assert_eq!(select.order_by[0].nulls_first, Some(false));
+        assert_eq!(limit, Some(10));
+        assert_eq!(offset, Some(5));
+        assert!(!order_by[0].ascending);
+        assert_eq!(order_by[0].nulls_first, Some(false));
     }
 
     #[test]
@@ -1080,7 +1138,11 @@ mod tests {
              id is not distinct from 2 from users",
         )
         .unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         // COALESCE / NULLIF parse as ordinary function calls (the binder desugars
@@ -1124,7 +1186,11 @@ mod tests {
     #[test]
     fn parses_ilike_keeps_case_insensitive_flag() {
         let stmt = parse("select id from users where name ilike 'a%'").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1141,7 +1207,11 @@ mod tests {
     #[test]
     fn parses_like_escape_clause() {
         let stmt = parse("select id from users where name like 'x!%' escape '!'").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1155,7 +1225,11 @@ mod tests {
 
         // `ESCAPE ''` disables escaping.
         let empty = parse("select id from users where name like 'x' escape ''").unwrap();
-        let Statement::Select(select) = empty else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = empty
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1176,7 +1250,11 @@ mod tests {
             ("select ceiling(d) from m", "ceiling"),
             ("select floor(d) from m", "floor"),
         ] {
-            let Statement::Select(select) = parse(sql).unwrap() else {
+            let Statement::Query(Query {
+                body: QueryBody::Select(select),
+                ..
+            }) = parse(sql).unwrap()
+            else {
                 panic!("expected select");
             };
             assert!(
@@ -1197,7 +1275,11 @@ mod tests {
     #[test]
     fn normalizes_position_into_function_call() {
         let stmt = parse("select position('b' in name) from users").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1212,7 +1294,11 @@ mod tests {
     #[test]
     fn normalizes_extract_into_function_call() {
         let stmt = parse("select extract(year from d) from t").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         assert!(matches!(
@@ -1234,7 +1320,11 @@ mod tests {
     #[test]
     fn parses_literals() {
         let stmt = parse("select null, true, false, 42, 'text'").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
 
@@ -1278,7 +1368,11 @@ mod tests {
     #[test]
     fn parses_parameter_placeholder() {
         let stmt = parse("select id from users where id = $1").unwrap();
-        let Statement::Select(select) = stmt else {
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
             panic!("expected select");
         };
         let Some(Expr::BinaryOp { right, .. }) = select.filter else {

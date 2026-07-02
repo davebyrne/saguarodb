@@ -15,7 +15,7 @@
 
 use common::{DataType, DbError, Result, Row, SqlState, Value};
 use planner::{
-    AggregateExpr, BoundExpr, BoundOrderByItem, BoundSelect, BoundStatement, PhysicalPlan,
+    AggregateExpr, BoundExpr, BoundOrderByItem, BoundQuery, BoundStatement, PhysicalPlan,
     logical_plan, physical_plan,
 };
 
@@ -211,21 +211,21 @@ fn resolve_boxed(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<Box<Bou
 fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExpr> {
     match expr {
         BoundExpr::ScalarSubquery {
-            select,
+            query,
             data_type,
             nullable,
         } => Ok(BoundExpr::Literal {
-            value: run_scalar_subquery(ctx, select)?,
+            value: run_scalar_subquery(ctx, query)?,
             data_type: data_type.clone(),
             nullable: *nullable,
         }),
         BoundExpr::Exists {
-            select,
+            query,
             negated,
             data_type,
             nullable,
         } => {
-            let exists = !materialize_subquery(ctx, select)?.is_empty();
+            let exists = !materialize_subquery(ctx, query)?.is_empty();
             Ok(BoundExpr::Literal {
                 value: Value::Boolean(exists ^ *negated),
                 data_type: data_type.clone(),
@@ -234,14 +234,14 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
         }
         BoundExpr::InSubquery {
             expr: operand,
-            select,
+            query,
             negated,
             data_type,
             nullable,
         } => {
             let operand = resolve_boxed(ctx, operand)?;
-            let column_type = subquery_column_type(select)?;
-            let rows = materialize_subquery(ctx, select)?;
+            let column_type = subquery_column_type(query)?;
+            let rows = materialize_subquery(ctx, query)?;
             let list = rows
                 .into_iter()
                 .map(|row| {
@@ -432,8 +432,8 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
 
 /// Execute a scalar subquery: at most one row (else a `CardinalityViolation`),
 /// returning its single column value, or `NULL` when the result is empty.
-fn run_scalar_subquery(ctx: &ExecutionContext<'_>, select: &BoundSelect) -> Result<Value> {
-    let mut rows = materialize_subquery(ctx, select)?;
+fn run_scalar_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<Value> {
+    let mut rows = materialize_subquery(ctx, query)?;
     if rows.len() > 1 {
         return Err(DbError::execute(
             SqlState::CardinalityViolation,
@@ -446,9 +446,9 @@ fn run_scalar_subquery(ctx: &ExecutionContext<'_>, select: &BoundSelect) -> Resu
     }
 }
 
-/// Plan and run a subquery's bound SELECT, returning its materialized rows.
-fn materialize_subquery(ctx: &ExecutionContext<'_>, select: &BoundSelect) -> Result<Vec<Row>> {
-    let statement = BoundStatement::Select(select.clone());
+/// Plan and run a subquery's bound query, returning its materialized rows.
+fn materialize_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Result<Vec<Row>> {
+    let statement = BoundStatement::Query(query.clone());
     let logical = logical_plan(&statement)?;
     let physical = physical_plan(&logical, ctx.catalog)?;
     let resolved = resolve_plan_subqueries(ctx, &physical)?;
@@ -459,8 +459,8 @@ fn materialize_subquery(ctx: &ExecutionContext<'_>, select: &BoundSelect) -> Res
 
 /// The single column's type of a single-column subquery (validated by the
 /// binder; re-checked here so a malformed plan fails loudly).
-fn subquery_column_type(select: &BoundSelect) -> Result<DataType> {
-    match select.output_schema.as_slice() {
+fn subquery_column_type(query: &BoundQuery) -> Result<DataType> {
+    match query.output_schema() {
         [column] => Ok(column.data_type.clone()),
         _ => Err(DbError::internal(
             "subquery used as a value did not have exactly one output column",

@@ -92,7 +92,7 @@ pub enum BoundStatement {
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
-    Select(BoundSelect),
+    Query(BoundQuery),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
     Delete { table: TableId, source: BoundSelect, returning: Option<BoundReturning> },
     Explain(Box<BoundStatement>),
@@ -104,7 +104,7 @@ pub enum BoundStatement {
 
 pub enum BoundInsertSource {
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
-    Query(Box<BoundSelect>),
+    Query(Box<BoundQuery>),
 }
 
 // A bound RETURNING clause: the projection expressions evaluated over each
@@ -119,6 +119,24 @@ pub enum BoundOnConflict {
     DoUpdate { assignments: Vec<(ColumnId, BoundExpr)>, filter: Option<BoundExpr> },
 }
 
+// A bound query expression: a bound body plus the query-level ORDER BY/LIMIT/
+// OFFSET that apply to its whole result. Mirrors parser::Query; the modifiers live
+// here (not on BoundSelect) so a future set-operation body orders and limits the
+// combined result. `output_schema()` delegates to the body. Carried by the
+// top-level statement, derived tables, INSERT ... SELECT, and subquery exprs.
+pub struct BoundQuery {
+    pub body: BoundQueryBody,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+// The bound body of a query expression. Only a single SELECT is supported today;
+// set operations and standalone VALUES attach here as new variants.
+pub enum BoundQueryBody {
+    Select(BoundSelect),
+}
+
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,  // All | On(keys)
     pub columns: Vec<BoundSelectItem>,
@@ -126,10 +144,7 @@ pub struct BoundSelect {
     pub filter: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
     pub having: Option<BoundExpr>,
-    pub order_by: Vec<BoundOrderByItem>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
-    pub output_schema: Vec<ColumnInfo>,
+    pub output_schema: Vec<ColumnInfo>,   // this block's result-set columns
 }
 
 pub enum BoundDistinct {
@@ -150,7 +165,7 @@ pub enum BoundFrom {
         schema: Vec<ColumnDef>,
     },
     Derived {                     // (SELECT ...) AS alias [(cols)]
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         binding: BindingId,
         alias: String,
         schema: Vec<ColumnDef>,   // derived columns projected into the outer scope
@@ -164,9 +179,9 @@ pub enum BoundFrom {
 }
 ```
 
-A `BoundFrom::Derived` binds its inner `SELECT` in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner SELECT's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
+A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
-`BoundSelect` is also used as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
+A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `BoundQuery` binds its body (a `BoundSelect`) and, for a `SELECT` body, binds the query-level `ORDER BY` against that block's output columns (the `ORDER BY`/`DISTINCT` validation is coupled and stays together). Logical planning lowers the body, then applies the wrapper's `ORDER BY`/`LIMIT`/`OFFSET`; the aggregate-context `ORDER BY` rewrite stays with the body because it depends on the body's `group_by`/aggregates. `BoundSelect` (without the query-level modifiers) is also used directly as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
@@ -268,23 +283,23 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
-    // Subquery expressions. Each carries its inner SELECT as a `Box<BoundSelect>`
+    // Subquery expressions. Each carries its inner query as a `Box<BoundQuery>`
     // bound in its own (uncorrelated) scope, preserved unchanged through logical
     // and physical planning and evaluated by the executor.
     ScalarSubquery {              // (SELECT ...) used as a single value
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         data_type: DataType,      // the subquery's single output column type
         nullable: bool,           // always true (an empty result is NULL)
     },
     Exists {                      // [NOT] EXISTS (SELECT ...)
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         negated: bool,
         data_type: DataType,      // Boolean
         nullable: bool,           // false (EXISTS never yields NULL)
     },
     InSubquery {                  // expr [NOT] IN (SELECT ...)
         expr: Box<BoundExpr>,     // left operand (outer scope)
-        select: Box<BoundSelect>, // single-column subquery
+        query: Box<BoundQuery>,   // single-column subquery
         negated: bool,
         data_type: DataType,      // Boolean
         nullable: bool,
@@ -304,7 +319,7 @@ Expression metadata rules:
 - `Case`: binder-selected result type; nullable when any selected result expression is nullable or no `ELSE` exists.
 - `Cast`: target type; nullable matches the input expression.
 - `AggregateCall` and `LocalRef`: use the aggregate/group output metadata assigned by logical planning.
-- `ScalarSubquery`, `Exists`, `InSubquery`: the binder binds the inner SELECT in a fresh, uncorrelated scope (it does not see the outer query's columns). A scalar subquery and the right side of `IN` must produce exactly one output column (else `SqlState::SyntaxError`); a scalar subquery's type is that column's type and it is always nullable. `EXISTS` is a non-null boolean. For `IN`/`NOT IN`, the left operand is type-checked against the subquery's column type (no implicit casts; mismatch is `SqlState::DatatypeMismatch`). These variants are constants with respect to the outer query, so the outer aggregate/grouping analyses treat them as leaves (only `InSubquery`'s left operand participates in the outer scope). Logical/physical planning preserve the inner `BoundSelect` unchanged; the executor plans and runs it.
+- `ScalarSubquery`, `Exists`, `InSubquery`: the binder binds the inner SELECT in a fresh, uncorrelated scope (it does not see the outer query's columns). A scalar subquery and the right side of `IN` must produce exactly one output column (else `SqlState::SyntaxError`); a scalar subquery's type is that column's type and it is always nullable. `EXISTS` is a non-null boolean. For `IN`/`NOT IN`, the left operand is type-checked against the subquery's column type (no implicit casts; mismatch is `SqlState::DatatypeMismatch`). These variants are constants with respect to the outer query, so the outer aggregate/grouping analyses treat them as leaves (only `InSubquery`'s left operand participates in the outer scope). Logical/physical planning preserve the inner `BoundQuery` unchanged; the executor plans and runs it.
 
 ## Shared Plan Expression Types
 

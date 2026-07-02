@@ -2,13 +2,19 @@ use common::Result;
 use sqlparser::ast as sql;
 
 use crate::{
-    Assignment, Distinct, Expr, FromItem, JoinType, OrderByItem, SelectItem, SelectStatement,
+    Assignment, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody, Select,
+    SelectItem,
 };
 
 use super::expr::convert_expr;
 use super::{ident_name, object_name, parse_error, unsupported};
 
-pub(super) fn convert_query_to_select(query: sql::Query) -> Result<SelectStatement> {
+/// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
+/// query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's modifiers; the
+/// body dispatches on the `SetExpr`. Only a single `SELECT` (or a parenthesized
+/// query wrapping one) is supported today — set operations, `VALUES`, and other
+/// bodies fall through to `unsupported`, the seam where they attach later.
+pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
     if query.with.is_some()
         || query.fetch.is_some()
         || !query.locks.is_empty()
@@ -26,29 +32,44 @@ pub(super) fn convert_query_to_select(query: sql::Query) -> Result<SelectStateme
         .transpose()?
         .unwrap_or_default();
 
-    let sql::SetExpr::Select(select) = *query.body else {
-        return unsupported("unsupported SELECT body");
-    };
-    convert_select(*select, order_by, limit, offset)
+    let body = convert_query_body(*query.body)?;
+    Ok(Query {
+        body,
+        order_by,
+        limit,
+        offset,
+    })
+}
+
+/// Convert a query body (`SetExpr`) into a [`QueryBody`]. Only a single `SELECT`
+/// is supported today; set operations, standalone `VALUES`, and other bodies fall
+/// through to `unsupported` — the seam where a `QueryBody::SetOp`/`Values` variant
+/// and its arm attach later. A parenthesized nested query is handled only in the
+/// subquery path (`convert_set_expr_to_query`), matching prior behavior.
+fn convert_query_body(set_expr: sql::SetExpr) -> Result<QueryBody> {
+    match set_expr {
+        sql::SetExpr::Select(select) => Ok(QueryBody::Select(convert_select(*select)?)),
+        _ => unsupported("unsupported SELECT body"),
+    }
 }
 
 /// Convert a subquery body (`Box<SetExpr>`, as carried by `IN (subquery)`) into a
-/// `SelectStatement`. A bare `SELECT` has no ORDER BY / LIMIT of its own; a
-/// parenthesized query may, so it is routed through the full query converter.
-pub(super) fn convert_set_expr_to_select(set_expr: sql::SetExpr) -> Result<SelectStatement> {
+/// [`Query`]. A bare `SELECT` has no ORDER BY / LIMIT of its own; a parenthesized
+/// query may, so it is routed through the full query converter.
+pub(super) fn convert_set_expr_to_query(set_expr: sql::SetExpr) -> Result<Query> {
     match set_expr {
-        sql::SetExpr::Select(select) => convert_select(*select, Vec::new(), None, None),
-        sql::SetExpr::Query(query) => convert_query_to_select(*query),
+        sql::SetExpr::Select(select) => Ok(Query {
+            body: QueryBody::Select(convert_select(*select)?),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }),
+        sql::SetExpr::Query(query) => convert_query(*query),
         _ => unsupported("unsupported subquery body"),
     }
 }
 
-fn convert_select(
-    select: sql::Select,
-    order_by: Vec<OrderByItem>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-) -> Result<SelectStatement> {
+fn convert_select(select: sql::Select) -> Result<Select> {
     if select.top.is_some()
         || select.into.is_some()
         || !select.lateral_views.is_empty()
@@ -81,7 +102,7 @@ fn convert_select(
         )),
     };
 
-    Ok(SelectStatement {
+    Ok(Select {
         distinct,
         columns: select
             .projection
@@ -96,9 +117,6 @@ fn convert_select(
         filter: select.selection.as_ref().map(convert_expr).transpose()?,
         group_by,
         having: select.having.as_ref().map(convert_expr).transpose()?,
-        order_by,
-        limit,
-        offset,
     })
 }
 
@@ -243,7 +261,7 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 .map(table_alias_column_name)
                 .collect::<Result<Vec<_>>>()?;
             Ok(FromItem::Derived {
-                subquery: Box::new(convert_query_to_select((**subquery).clone())?),
+                subquery: Box::new(convert_query((**subquery).clone())?),
                 alias: ident_name(&alias.name)?,
                 column_aliases,
             })

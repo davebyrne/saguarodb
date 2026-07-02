@@ -504,7 +504,7 @@ impl QueryService {
     }
 
     fn explain(&self, inner: &BoundStatement) -> Result<ExecutionResult> {
-        if !matches!(inner, BoundStatement::Select(_)) {
+        if !matches!(inner, BoundStatement::Query(_)) {
             return Err(DbError::plan(
                 SqlState::SyntaxError,
                 "EXPLAIN supports SELECT only in v1",

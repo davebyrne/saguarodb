@@ -5,6 +5,36 @@ use common::{
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
 
+/// A bound query expression: a bound body plus the query-level `ORDER BY`/`LIMIT`/
+/// `OFFSET` that apply to its whole result. Mirrors the AST [`parser::Query`]; the
+/// modifiers live here (not on [`BoundSelect`]) so a future set-operation body
+/// orders and limits the combined result. Carried by the top-level statement, by
+/// derived tables, by `INSERT ... SELECT`, and by subquery expressions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundQuery {
+    pub body: BoundQueryBody,
+    pub order_by: Vec<BoundOrderByItem>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// The bound body of a query expression. Only a single `SELECT` is supported
+/// today; set operations and standalone `VALUES` attach here as new variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundQueryBody {
+    Select(BoundSelect),
+}
+
+impl BoundQuery {
+    /// The query's result-set column metadata (its `RowDescription`). Delegates to
+    /// the body; a future set-operation body reconciles its arms' columns here.
+    pub fn output_schema(&self) -> &[ColumnInfo] {
+        match &self.body {
+            BoundQueryBody::Select(select) => &select.output_schema,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
     CreateTable {
@@ -42,7 +72,7 @@ pub enum BoundStatement {
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
     },
-    Select(BoundSelect),
+    Query(BoundQuery),
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
@@ -85,7 +115,7 @@ pub enum BoundInsertSource {
         rows: Vec<Vec<BoundExpr>>,
         output_schema: Vec<ColumnInfo>,
     },
-    Query(Box<BoundSelect>),
+    Query(Box<BoundQuery>),
 }
 
 /// A bound `INSERT ... ON CONFLICT` action. The arbiter is always the primary key
@@ -102,6 +132,9 @@ pub enum BoundOnConflict {
     },
 }
 
+/// A bound `SELECT` block, without the query-level `ORDER BY`/`LIMIT`/`OFFSET`
+/// (those live on the enclosing [`BoundQuery`]). `output_schema` is this block's
+/// result-set column metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundSelect {
     /// The `DISTINCT` modifier, or `None` for no de-duplication.
@@ -111,9 +144,6 @@ pub struct BoundSelect {
     pub filter: Option<BoundExpr>,
     pub group_by: Vec<BoundExpr>,
     pub having: Option<BoundExpr>,
-    pub order_by: Vec<BoundOrderByItem>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
     pub output_schema: Vec<ColumnInfo>,
 }
 
@@ -143,7 +173,7 @@ pub enum BoundFrom {
     /// in its own scope; `schema` is the derived columns (renamed by the optional
     /// column-alias list) projected into the outer scope at `binding`'s slots.
     Derived {
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         binding: common::BindingId,
         alias: String,
         schema: Vec<ColumnDef>,

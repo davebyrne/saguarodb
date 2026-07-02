@@ -15,8 +15,7 @@ use ddl::{convert_create_index, convert_create_table};
 use dml::{convert_copy, convert_delete, convert_insert};
 use expr::convert_expr;
 use query::{
-    convert_assignment, convert_query_to_select, convert_returning,
-    table_name_from_table_with_joins,
+    convert_assignment, convert_query, convert_returning, table_name_from_table_with_joins,
 };
 
 pub fn parse_statement(sql: &str) -> Result<Statement> {
@@ -80,7 +79,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             }
         }
         sql::Statement::Insert(insert) => convert_insert(insert),
-        sql::Statement::Query(query) => Ok(Statement::Select(convert_query_to_select(*query)?)),
+        sql::Statement::Query(query) => Ok(Statement::Query(convert_query(*query)?)),
         sql::Statement::Update {
             table,
             assignments,
@@ -129,8 +128,8 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
                 return unsupported("unsupported EXPLAIN form");
             }
             match convert_statement(*statement)? {
-                Statement::Select(select) => {
-                    Ok(Statement::Explain(Box::new(Statement::Select(select))))
+                Statement::Query(query) => {
+                    Ok(Statement::Explain(Box::new(Statement::Query(query))))
                 }
                 _ => unsupported("EXPLAIN supports SELECT only in v1"),
             }

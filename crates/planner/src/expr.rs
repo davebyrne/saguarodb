@@ -1,6 +1,6 @@
 use common::{BindingId, ColumnId, DataType, SequenceId, Value};
 
-use crate::BoundSelect;
+use crate::BoundQuery;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundExpr {
@@ -119,29 +119,29 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
-    /// A scalar subquery `(SELECT ...)`: a single-column, at-most-one-row SELECT
-    /// used as a value. The sub-plan is carried as a bound SELECT (unchanged
+    /// A scalar subquery `(SELECT ...)`: a single-column, at-most-one-row query
+    /// used as a value. The sub-query is carried as a bound query (unchanged
     /// through logical and physical planning) and evaluated by the executor —
     /// an empty result yields `NULL`, more than one row is a runtime error.
-    /// Uncorrelated: the inner SELECT is its own binding scope.
+    /// Uncorrelated: the inner query is its own binding scope.
     ScalarSubquery {
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         data_type: DataType,
         nullable: bool,
     },
     /// `[NOT] EXISTS (SELECT ...)`. Yields a non-null boolean: whether the
-    /// sub-plan produces at least one row (negated for `NOT EXISTS`).
+    /// sub-query produces at least one row (negated for `NOT EXISTS`).
     Exists {
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         negated: bool,
         data_type: DataType,
         nullable: bool,
     },
-    /// `expr [NOT] IN (SELECT ...)` over a single-column sub-plan. The executor
+    /// `expr [NOT] IN (SELECT ...)` over a single-column sub-query. The executor
     /// materializes the column and applies SQL `IN`/`NOT IN` three-valued logic.
     InSubquery {
         expr: Box<BoundExpr>,
-        select: Box<BoundSelect>,
+        query: Box<BoundQuery>,
         negated: bool,
         data_type: DataType,
         nullable: bool,
