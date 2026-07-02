@@ -101,8 +101,15 @@ pub(super) fn bind_expr(
 /// same way.
 fn bind_subquery(ctx: &BindContext, subquery: &Query) -> Result<BoundQuery> {
     // A subquery is bound in its own binding scope but still sees the enclosing
-    // query's CTEs.
-    bind_query(ctx.catalog, subquery, &ctx.declared_params, &ctx.cte_scope)
+    // query's CTEs. A subquery result has no external type context, so no
+    // `expected` types are supplied.
+    bind_query(
+        ctx.catalog,
+        subquery,
+        &ctx.declared_params,
+        &ctx.cte_scope,
+        None,
+    )
 }
 
 /// Require that a subquery used where a single value is expected (a scalar

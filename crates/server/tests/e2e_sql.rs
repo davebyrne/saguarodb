@@ -3721,3 +3721,74 @@ async fn e2e_common_table_expressions() {
         err.message
     );
 }
+
+/// A bare NULL output column in one set-operation arm adopts the sibling arm's
+/// type (`NULL` alone has no type in this engine, so this is what makes
+/// `SELECT 1 UNION SELECT NULL` work). Non-NULL type mismatches stay strict, and a
+/// column that is NULL in *both* arms remains untyped (an explicit cast is needed).
+#[tokio::test]
+async fn e2e_set_operation_null_column_typing() {
+    let server = TestServer::start().await.unwrap();
+
+    let ids = |rows: Vec<Vec<Option<String>>>| -> Vec<Option<String>> {
+        rows.into_iter().map(|mut r| r.remove(0)).collect()
+    };
+    let n = |v: &str| Some(v.to_string());
+
+    // NULL in the right arm adopts the left arm's Integer; NULL sorts last (ASC).
+    let rows = server
+        .simple_query("select 1 union select null order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), None]);
+
+    // ... and symmetrically when the NULL is in the left arm.
+    let rows = server
+        .simple_query("select null union select 2 order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("2"), None]);
+
+    // Works with VALUES arms too (an all-NULL VALUES column adopts the sibling's).
+    let rows = server
+        .simple_query("values (1) union values (null) order by 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ids(rows), vec![n("1"), None]);
+
+    // Multi-column: each column resolves from the arm that types it.
+    let rows = server
+        .simple_query("select 1, 'a' union select null, 'b' order by 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![n("1"), n("a")], vec![None, n("b")],]);
+
+    // A non-NULL type mismatch is still rejected (strict, no implicit casts).
+    let err = server
+        .simple_query("select 1 union select 'x'")
+        .await
+        .err()
+        .expect("mismatched set-operation types should still fail");
+    assert!(
+        err.message.contains("42804"),
+        "expected DatatypeMismatch: {}",
+        err.message
+    );
+
+    // A column that is NULL in BOTH arms has no type in either — still an error
+    // (an explicit cast is required).
+    let err = server
+        .simple_query("select null union select null")
+        .await
+        .err()
+        .expect("a column NULL in both arms should have no type");
+    assert!(
+        err.message.contains("42804") || err.message.contains("42601"),
+        "expected a type-determination error: {}",
+        err.message
+    );
+}

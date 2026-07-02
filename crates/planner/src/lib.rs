@@ -589,6 +589,76 @@ mod tests {
     }
 
     #[test]
+    fn binder_types_null_set_operation_column_from_sibling_arm() {
+        let catalog = catalog_with_users();
+        // The right arm's bare NULL adopts the left arm's Integer, and the result
+        // column is nullable because that arm contributes a NULL.
+        let BoundStatement::Query(query) =
+            bind(&parse("select 1 union select null").unwrap(), &catalog).unwrap()
+        else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.output_schema()[0].data_type, DataType::Integer);
+        assert!(query.output_columns()[0].nullable);
+    }
+
+    #[test]
+    fn binder_rejects_set_operation_column_null_in_both_arms() {
+        let catalog = catalog_with_users();
+        // Neither arm can supply a type, so the NULL column stays untyped.
+        let err = bind(&parse("select null union select null").unwrap(), &catalog).unwrap_err();
+        assert!(matches!(
+            err.code,
+            SqlState::DatatypeMismatch | SqlState::SyntaxError
+        ));
+    }
+
+    #[test]
+    fn binder_set_operation_surfaces_a_real_arm_error_not_masked_by_null_typing() {
+        let catalog = catalog_with_users();
+        // The NULL-typing fallback re-binds an arm; a genuine error in that arm (an
+        // unknown column) must surface as itself, not be masked, since the expected
+        // types only ever type a bare NULL — this guards the fallback's safety
+        // invariant against a future change that widens what `expected` influences.
+        let err = bind(
+            &parse("select nonexistent_col union select 1").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn binder_rejects_deeply_nested_untypeable_set_operation_in_polynomial_time() {
+        let catalog = catalog_with_users();
+        // A never-typeable left-associative chain: the leftmost arm's second column
+        // is a bare NULL that no single-column sibling can type. The NULL-typing
+        // fallback re-binds an arm on failure; that re-bind must stay single-pass so
+        // total work is polynomial in the nesting depth. A prior version re-bound
+        // each nested arm on every level, doubling work per level (exponential); at
+        // this depth it rejected in ~4.5s (and minutes a little deeper) instead of
+        // microseconds. The wall-clock bound is what actually guards the fix: the
+        // correct code takes tens of microseconds, so a 1s bound leaves a ~10,000x
+        // margin (robust to CI noise) while the exponential regression blows past it.
+        let mut sql = String::from("select null, null");
+        for _ in 0..24 {
+            sql.push_str(" union select 1");
+        }
+        let statement = parse(&sql).unwrap();
+        let start = std::time::Instant::now();
+        let err = bind(&statement, &catalog).unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "binding took {:?} — the exponential re-bind blowup may have returned",
+            start.elapsed()
+        );
+        assert!(matches!(
+            err.code,
+            SqlState::DatatypeMismatch | SqlState::SyntaxError
+        ));
+    }
+
+    #[test]
     fn binder_binds_set_operation_order_by_to_output_position() {
         let catalog = catalog_with_users();
         // `ORDER BY x` (an output-column name) binds to a LocalRef at that output

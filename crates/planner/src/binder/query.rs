@@ -19,18 +19,22 @@ use super::{
 /// Bind a query expression: bind any `WITH` CTEs into a child scope, then bind the
 /// body and attach the query-level `ORDER BY`/`LIMIT`/`OFFSET`. `ctes` is the CTE
 /// scope inherited from an enclosing query (empty at the statement level), so a
-/// subquery or derived table sees the outer query's CTEs.
+/// subquery or derived table sees the outer query's CTEs. `expected` supplies a
+/// target type per output column, used only to type a bare `NULL` output column
+/// (from the sibling arm of an enclosing set operation); `None` when there is no
+/// such context.
 pub(super) fn bind_query(
     catalog: &dyn CatalogManager,
     query: &Query,
     declared: &[Option<DataType>],
     ctes: &CteScope,
+    expected: Option<&[DataType]>,
 ) -> Result<BoundQuery> {
     let scope = bind_ctes(catalog, &query.with, ctes, declared)?;
     match &query.body {
         QueryBody::Select(select) => {
             let (bound_select, order_by) =
-                bind_select(catalog, select, &query.order_by, declared, &scope)?;
+                bind_select(catalog, select, &query.order_by, declared, &scope, expected)?;
             Ok(BoundQuery {
                 body: BoundQueryBody::Select(Box::new(bound_select)),
                 order_by,
@@ -43,7 +47,7 @@ pub(super) fn bind_query(
             // VALUES output columns by position or name (like a set operation). The
             // CTE scope is threaded in because a subquery inside a VALUES row can
             // reference an enclosing CTE, even though VALUES itself has no FROM.
-            let values = bind_values(catalog, rows, declared, &scope)?;
+            let values = bind_values(catalog, rows, declared, &scope, expected)?;
             let mut bound = BoundQuery {
                 body: BoundQueryBody::Values(values),
                 order_by: Vec::new(),
@@ -59,8 +63,7 @@ pub(super) fn bind_query(
             left,
             right,
         } => {
-            let left = bind_query(catalog, left, declared, &scope)?;
-            let right = bind_query(catalog, right, declared, &scope)?;
+            let (left, right) = bind_set_op_arms(catalog, left, right, declared, &scope, expected)?;
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
             // `ORDER BY` over a set operation resolves against the combined output
             // by position or name only (there is no single input scope).
@@ -79,6 +82,67 @@ pub(super) fn bind_query(
             })
         }
     }
+}
+
+/// Bind the two arms of a set operation, resolving a bare-`NULL` output column in
+/// one arm to the sibling arm's type.
+///
+/// When the output types are already known — an enclosing set operation supplied
+/// `expected` — both arms bind directly against them: a bare `NULL` in either arm
+/// adopts the known type, so no sibling-derived retry is needed. Binding a subtree
+/// with concrete `expected` types is a single pass (this function does not retry),
+/// so nested set operations do not re-bind their subtrees per level.
+///
+/// Only at a set operation with no external type context does an arm need types
+/// from its sibling: one arm is bound to discover its column types, then the other
+/// is bound with those types as `expected` (so its `NULL` columns adopt them). If
+/// the left arm cannot bind on its own — typically a bare-`NULL` column needing the
+/// right arm's type — the right arm is bound first and the left is re-bound with
+/// its types (a genuine error in the left arm re-surfaces on that second attempt,
+/// since `expected` types only bare `NULL`s). Because the re-bind carries concrete
+/// `expected` types it is single-pass, so total work stays polynomial rather than
+/// doubling per nesting level. A column that is a bare `NULL` in *both* arms (or
+/// split across the arms so each needs the other) stays unresolved and is rejected;
+/// an explicit cast is required.
+fn bind_set_op_arms(
+    catalog: &dyn CatalogManager,
+    left: &Query,
+    right: &Query,
+    declared: &[Option<DataType>],
+    ctes: &CteScope,
+    expected: Option<&[DataType]>,
+) -> Result<(BoundQuery, BoundQuery)> {
+    if let Some(expected) = expected {
+        // Output types already known: bind both arms directly, no retry.
+        let left = bind_query(catalog, left, declared, ctes, Some(expected))?;
+        let right = bind_query(catalog, right, declared, ctes, Some(expected))?;
+        return Ok((left, right));
+    }
+    match bind_query(catalog, left, declared, ctes, None) {
+        Ok(left) => {
+            let types = output_column_types(&left);
+            let right = bind_query(catalog, right, declared, ctes, Some(&types))?;
+            Ok((left, right))
+        }
+        Err(left_err) => {
+            let Ok(right) = bind_query(catalog, right, declared, ctes, None) else {
+                return Err(left_err);
+            };
+            let types = output_column_types(&right);
+            let left = bind_query(catalog, left, declared, ctes, Some(&types))?;
+            Ok((left, right))
+        }
+    }
+}
+
+/// The output column types of a bound query, used as the `expected` types when
+/// binding a sibling set-operation arm.
+fn output_column_types(query: &BoundQuery) -> Vec<DataType> {
+    query
+        .output_columns()
+        .into_iter()
+        .map(|column| column.data_type)
+        .collect()
 }
 
 /// Extend the enclosing CTE scope with this query's `WITH` CTEs. Each CTE is bound
@@ -116,7 +180,7 @@ fn bind_cte(
     scope: &CteScope,
     declared: &[Option<DataType>],
 ) -> Result<CteBinding> {
-    let query = bind_query(catalog, &cte.query, declared, scope)?;
+    let query = bind_query(catalog, &cte.query, declared, scope, None)?;
     let columns = derive_alias_columns(&query.output_columns(), &cte.column_aliases, || {
         format!("CTE \"{}\"", cte.name)
     })?;
@@ -271,15 +335,18 @@ fn bind_output_order_by(
 /// Bind a `VALUES` body. Every row must have the same width. Each column's type is
 /// the common type of its entries under the strict no-implicit-cast rule: a bare
 /// `NULL` takes the inferred column type, and every non-`NULL` entry must match it
-/// exactly (else `DatatypeMismatch`); an all-`NULL` column has no inferable type
-/// and is rejected. Each entry binds in a fresh scope with no table bindings (so a
-/// bare column reference cannot resolve) but with the enclosing CTEs visible (a
-/// subquery in a row may reference one). Output columns are named `column1`, ...
+/// exactly (else `DatatypeMismatch`); an all-`NULL` column takes the type
+/// `expected` at its position (from a sibling set-operation arm) if any, else has
+/// no inferable type and is rejected. Each entry binds in a fresh scope with no
+/// table bindings (so a bare column reference cannot resolve) but with the
+/// enclosing CTEs visible (a subquery in a row may reference one). Output columns
+/// are named `column1`, ...
 fn bind_values(
     catalog: &dyn CatalogManager,
     rows: &[Vec<Expr>],
     declared: &[Option<DataType>],
     ctes: &CteScope,
+    expected: Option<&[DataType]>,
 ) -> Result<BoundValues> {
     let width = rows[0].len();
     for row in rows {
@@ -291,8 +358,9 @@ fn bind_values(
         }
     }
 
-    // Pass 1: infer each column's type from its first non-NULL entry. An all-NULL
-    // column has no inferable type and is rejected (the strict no-implicit-cast
+    // Pass 1: infer each column's type from its first non-NULL entry, falling back
+    // to the `expected` type at that position (a sibling set-operation arm). An
+    // all-NULL column with no expected type is rejected (the strict no-implicit-cast
     // rule gives no default type).
     let mut output_schema = Vec::with_capacity(width);
     for column in 0..width {
@@ -306,6 +374,7 @@ fn bind_values(
             data_type = Some(bind_expr(&mut ctx, &row[column], None)?.data_type());
             break;
         }
+        let data_type = data_type.or_else(|| expected.and_then(|types| types.get(column).cloned()));
         let Some(data_type) = data_type else {
             return Err(plan_error(
                 SqlState::DatatypeMismatch,
@@ -361,6 +430,7 @@ fn bind_select(
     order_by: &[OrderByItem],
     declared: &[Option<DataType>],
     ctes: &CteScope,
+    expected: Option<&[DataType]>,
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
     let mut ctx = BindContext::new(catalog, declared);
     ctx.cte_scope = ctes.clone();
@@ -392,7 +462,17 @@ fn bind_select(
 
     let mut columns = Vec::new();
     for item in &select.columns {
-        bind_select_item(&mut ctx, item, &mut columns)?;
+        // A bare-`NULL` output column adopts the type expected at its output
+        // position (supplied by a sibling set-operation arm), if any; every other
+        // projection expression types itself.
+        let expected_type = match item {
+            SelectItem::Expression {
+                expr: Expr::Literal(Value::Null),
+                ..
+            } => expected.and_then(|types| types.get(columns.len()).cloned()),
+            _ => None,
+        };
+        bind_select_item(&mut ctx, item, expected_type, &mut columns)?;
     }
 
     let having = select
@@ -581,7 +661,13 @@ fn bind_derived_table(
 ) -> Result<BoundFrom> {
     // The derived subquery is bound in its own binding scope but still sees the
     // enclosing query's CTEs.
-    let query = bind_query(catalog, subquery, &ctx.declared_params, &ctx.cte_scope)?;
+    let query = bind_query(
+        catalog,
+        subquery,
+        &ctx.declared_params,
+        &ctx.cte_scope,
+        None,
+    )?;
     let columns = derive_alias_columns(&query.output_columns(), column_aliases, || {
         format!("table \"{alias}\"")
     })?;
@@ -654,6 +740,7 @@ pub(super) fn select_output_schema(
 pub(super) fn bind_select_item(
     ctx: &mut BindContext,
     item: &SelectItem,
+    expected: Option<DataType>,
     output: &mut Vec<BoundSelectItem>,
 ) -> Result<()> {
     match item {
@@ -688,7 +775,7 @@ pub(super) fn bind_select_item(
             }
         }
         SelectItem::Expression { expr, alias } => {
-            let bound = bind_expr(ctx, expr, None)?;
+            let bound = bind_expr(ctx, expr, expected)?;
             let alias = alias.clone().unwrap_or_else(|| derive_alias(expr));
             output.push(BoundSelectItem { expr: bound, alias });
         }

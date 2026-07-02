@@ -195,9 +195,8 @@ fn bind_inner(
             returning.as_deref(),
             declared,
         ),
-        Statement::Query(query) => {
-            bind_query(catalog, query, declared, &CteScope::default()).map(BoundStatement::Query)
-        }
+        Statement::Query(query) => bind_query(catalog, query, declared, &CteScope::default(), None)
+            .map(BoundStatement::Query),
         Statement::Update {
             table,
             assignments,
