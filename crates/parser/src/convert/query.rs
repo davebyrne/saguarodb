@@ -2,7 +2,7 @@ use common::Result;
 use sqlparser::ast as sql;
 
 use crate::{
-    Assignment, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody, Select,
+    Assignment, Cte, Distinct, Expr, FromItem, JoinType, OrderByItem, Query, QueryBody, Select,
     SelectItem, SetOp,
 };
 
@@ -10,13 +10,10 @@ use super::expr::convert_expr;
 use super::{ident_name, object_name, parse_error, unsupported};
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
-/// query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's modifiers; the
-/// body dispatches on the `SetExpr`. Only a single `SELECT` (or a parenthesized
-/// query wrapping one) is supported today — set operations, `VALUES`, and other
-/// bodies fall through to `unsupported`, the seam where they attach later.
+/// `WITH` CTEs and query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's
+/// fields; the body dispatches on the `SetExpr`.
 pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
-    if query.with.is_some()
-        || query.fetch.is_some()
+    if query.fetch.is_some()
         || !query.locks.is_empty()
         || query.for_clause.is_some()
         || query.settings.is_some()
@@ -25,6 +22,7 @@ pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
         return unsupported("unsupported SELECT query form");
     }
 
+    let with = convert_with(query.with)?;
     let (limit, offset) = convert_limit_clause(query.limit_clause)?;
     let order_by = query
         .order_by
@@ -34,10 +32,46 @@ pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
 
     let body = convert_query_body(*query.body)?;
     Ok(Query {
+        with,
         body,
         order_by,
         limit,
         offset,
+    })
+}
+
+/// Convert an optional `WITH` clause into a list of CTEs. `WITH RECURSIVE` is not
+/// supported.
+fn convert_with(with: Option<sql::With>) -> Result<Vec<Cte>> {
+    let Some(with) = with else {
+        return Ok(Vec::new());
+    };
+    if with.recursive {
+        return unsupported("WITH RECURSIVE is not supported");
+    }
+    with.cte_tables.into_iter().map(convert_cte).collect()
+}
+
+/// Convert one CTE (`name [(cols)] AS (query)`). The `MATERIALIZED` hint (which we
+/// would not honor — CTEs are inlined), a `... AS name FROM` form, and typed column
+/// aliases are rejected.
+fn convert_cte(cte: sql::Cte) -> Result<Cte> {
+    if cte.materialized.is_some() {
+        return unsupported("MATERIALIZED CTEs are not supported");
+    }
+    if cte.from.is_some() {
+        return unsupported("unsupported CTE form");
+    }
+    let column_aliases = cte
+        .alias
+        .columns
+        .iter()
+        .map(table_alias_column_name)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Cte {
+        name: ident_name(&cte.alias.name)?,
+        column_aliases,
+        query: Box::new(convert_query(*cte.query)?),
     })
 }
 
@@ -110,6 +144,7 @@ pub(super) fn convert_set_expr_to_query(set_expr: sql::SetExpr) -> Result<Query>
     match set_expr {
         sql::SetExpr::Query(query) => convert_query(*query),
         other => Ok(Query {
+            with: Vec::new(),
             body: convert_query_body(other)?,
             order_by: Vec::new(),
             limit: None,

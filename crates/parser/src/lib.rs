@@ -2,7 +2,7 @@ mod ast;
 mod convert;
 
 pub use ast::{
-    Assignment, BinOp, ConflictAction, ConflictTarget, Distinct, Expr, FromItem, FunctionArg,
+    Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FromItem, FunctionArg,
     InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
     Statement, UnaryOp,
 };
@@ -231,6 +231,21 @@ mod tests {
         // The right arm is a plain SELECT with no ORDER BY of its own.
         assert!(matches!(right.body, QueryBody::Select(_)));
         assert!(right.order_by.is_empty());
+    }
+
+    #[test]
+    fn parses_with_clause() {
+        let stmt = parse("with a as (select 1), b(x) as (select 2) select x from b").unwrap();
+        let Statement::Query(query) = stmt else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.with.len(), 2);
+        assert_eq!(query.with[0].name, "a");
+        assert!(query.with[0].column_aliases.is_empty());
+        assert_eq!(query.with[1].name, "b");
+        assert_eq!(query.with[1].column_aliases, vec!["x".to_string()]);
+        // The CTE body is a full Query.
+        assert!(matches!(query.with[0].query.body, QueryBody::Select(_)));
     }
 
     #[test]
@@ -1162,6 +1177,7 @@ mod tests {
             order_by,
             limit,
             offset,
+            ..
         }) = stmt
         else {
             panic!("expected select");

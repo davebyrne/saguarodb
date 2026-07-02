@@ -19,7 +19,9 @@ use super::query::{
     bind_excluded_binding, bind_query, bind_select_item, bind_table_from_schema,
     select_output_schema,
 };
-use super::{BindContext, Binding, input_ref, plan_error, reject_aggregate, require_table};
+use super::{
+    BindContext, Binding, CteScope, input_ref, plan_error, reject_aggregate, require_table,
+};
 
 /// Bind `COPY <table> [(cols)] FROM STDIN | TO STDOUT`: resolve the table and the
 /// (possibly defaulted) column list to ids, reusing the INSERT column resolver.
@@ -277,7 +279,9 @@ fn bind_insert_query(
     subquery: &Query,
     declared: &[Option<DataType>],
 ) -> Result<BoundInsertSource> {
-    let query = bind_query(catalog, subquery, declared)?;
+    // The INSERT source is a top-level query; it carries its own `WITH` (if any)
+    // and has no enclosing CTE scope.
+    let query = bind_query(catalog, subquery, declared, &CteScope::default())?;
     let source_columns = query.output_columns();
     if source_columns.len() != columns.len() {
         return Err(plan_error(

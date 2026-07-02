@@ -168,17 +168,30 @@ pub struct Assignment {
     pub value: Expr,
 }
 
-/// A complete query expression: a query body plus the query-level modifiers that
-/// apply to its whole result. In the SQL grammar `ORDER BY`/`LIMIT`/`OFFSET` sit
-/// outside the body (and a future `WITH` would too), so when the body becomes a
-/// set operation (`UNION`/`INTERSECT`/`EXCEPT`) they order and limit the combined
-/// result rather than a single `SELECT`.
+/// A complete query expression: an optional `WITH` clause, a query body, and the
+/// query-level modifiers that apply to its whole result. In the SQL grammar
+/// `WITH` and `ORDER BY`/`LIMIT`/`OFFSET` sit outside the body, so when the body
+/// is a set operation they order and limit the combined result, and the `WITH`
+/// CTEs are visible to the whole body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query {
+    /// `WITH` common table expressions (non-recursive), in definition order. Empty
+    /// when there is no `WITH` clause. Each CTE is visible to the body and to later
+    /// CTEs; a reference is bound by inlining the CTE as a named derived table.
+    pub with: Vec<Cte>,
     pub body: QueryBody,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// A common table expression: `name [(col, ...)] AS (query)`. `column_aliases`
+/// optionally renames the CTE's output columns left to right.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cte {
+    pub name: String,
+    pub column_aliases: Vec<String>,
+    pub query: Box<Query>,
 }
 
 /// The body of a query expression: a single `SELECT`, a `VALUES` list, or a set

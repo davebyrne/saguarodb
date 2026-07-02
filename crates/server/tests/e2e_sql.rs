@@ -3536,3 +3536,143 @@ async fn e2e_set_operations() {
         err.message
     );
 }
+
+/// Non-recursive CTEs (`WITH`). Each CTE is inlined as a named derived table, so
+/// references work anywhere a table does (FROM, joins, subqueries), CTE bodies may
+/// be VALUES or set operations, later CTEs can reference earlier ones, and a CTE
+/// name shadows a catalog table. The error cases (RECURSIVE, duplicate name, self
+/// reference) are checked too.
+#[tokio::test]
+async fn e2e_common_table_expressions() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table nums (n integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into nums values (1), (2), (3), (4)")
+        .await
+        .unwrap();
+
+    let ns = |rows: Vec<Vec<Option<String>>>| -> Vec<Option<String>> {
+        rows.into_iter().map(|mut r| r.remove(0)).collect()
+    };
+    let n = |v: &str| Some(v.to_string());
+
+    // Basic CTE referenced in the body.
+    let rows = server
+        .simple_query("with big as (select n from nums where n >= 3) select n from big order by n")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("3"), n("4")]);
+
+    // Column-alias list renames the CTE's output columns.
+    let rows = server
+        .simple_query("with t(x) as (select n from nums) select x from t order by x")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("1"), n("2"), n("3"), n("4")]);
+
+    // A later CTE references an earlier one.
+    let rows = server
+        .simple_query(
+            "with a as (select n from nums where n >= 2), \
+                  b as (select n from a where n <= 3) \
+             select n from b order by n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("2"), n("3")]);
+
+    // The same CTE referenced twice (a self-join over the inlined derived table).
+    let rows = server
+        .simple_query(
+            "with t as (select n from nums where n <= 2) \
+             select t1.n from t as t1 join t as t2 on t1.n = t2.n order by t1.n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("1"), n("2")]);
+
+    // CTE bodies may be VALUES or set operations.
+    let rows = server
+        .simple_query("with v(x) as (values (10), (20)) select x from v order by x")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("10"), n("20")]);
+    let rows = server
+        .simple_query(
+            "with u as (select n from nums where n = 1 union select n from nums where n = 4) \
+             select n from u order by n",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("1"), n("4")]);
+
+    // A CTE is visible inside a nested subquery.
+    let rows = server
+        .simple_query("with t as (select n from nums) select (select count(*) from t) as c")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("4")]);
+
+    // ... including a subquery inside a VALUES row (VALUES has no FROM, but a row
+    // expression may still reference an enclosing CTE).
+    let rows = server
+        .simple_query("with t as (select n from nums) values ((select count(*) from t))")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("4")]);
+
+    // A CTE name shadows a catalog table of the same name.
+    let rows = server
+        .simple_query("with nums as (select 99 as n) select n from nums")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(ns(rows), vec![n("99")]);
+
+    // WITH RECURSIVE is not supported.
+    let err = server
+        .simple_query("with recursive t as (select 1) select * from t")
+        .await
+        .err()
+        .expect("WITH RECURSIVE should be rejected");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError: {}",
+        err.message
+    );
+
+    // A duplicate CTE name in one WITH is rejected.
+    let err = server
+        .simple_query("with t as (select 1), t as (select 2) select * from t")
+        .await
+        .err()
+        .expect("duplicate CTE name should be rejected");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError: {}",
+        err.message
+    );
+
+    // A self-reference is not recursive: the name is not yet in scope.
+    let err = server
+        .simple_query("with t as (select n from t) select * from t")
+        .await
+        .err()
+        .expect("self-referential (non-recursive) CTE should fail to resolve");
+    assert!(
+        err.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        err.message
+    );
+}

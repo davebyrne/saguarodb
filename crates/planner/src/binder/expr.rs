@@ -100,7 +100,9 @@ pub(super) fn bind_expr(
 /// parameter declarations so `$n` placeholders inside the subquery resolve the
 /// same way.
 fn bind_subquery(ctx: &BindContext, subquery: &Query) -> Result<BoundQuery> {
-    bind_query(ctx.catalog, subquery, &ctx.declared_params)
+    // A subquery is bound in its own binding scope but still sees the enclosing
+    // query's CTEs.
+    bind_query(ctx.catalog, subquery, &ctx.declared_params, &ctx.cte_scope)
 }
 
 /// Require that a subquery used where a single value is expected (a scalar

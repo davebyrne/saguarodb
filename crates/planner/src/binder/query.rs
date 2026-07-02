@@ -3,7 +3,9 @@ use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
     Value,
 };
-use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp};
+use parser::{
+    Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
+};
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
@@ -12,22 +14,25 @@ use crate::{
 
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::{
-    BindContext, Binding, contains_aggregate, input_ref, plan_error, reject_aggregate,
-    require_table, require_type,
+    BindContext, Binding, CteBinding, CteScope, contains_aggregate, input_ref, plan_error,
+    reject_aggregate, require_table, require_type,
 };
 
-/// Bind a query expression: bind the body, then attach the query-level
-/// `ORDER BY`/`LIMIT`/`OFFSET`. Set operations add an arm here without disturbing
-/// the callers (top-level statement, derived table, `INSERT ... SELECT`, subquery
-/// expression).
+/// Bind a query expression: bind any `WITH` CTEs into a child scope, then bind the
+/// body and attach the query-level `ORDER BY`/`LIMIT`/`OFFSET`. `ctes` is the CTE
+/// scope inherited from an enclosing query (empty at the statement level), so a
+/// subquery or derived table sees the outer query's CTEs.
 pub(super) fn bind_query(
     catalog: &dyn CatalogManager,
     query: &Query,
     declared: &[Option<DataType>],
+    ctes: &CteScope,
 ) -> Result<BoundQuery> {
+    let scope = bind_ctes(catalog, &query.with, ctes, declared)?;
     match &query.body {
         QueryBody::Select(select) => {
-            let (bound_select, order_by) = bind_select(catalog, select, &query.order_by, declared)?;
+            let (bound_select, order_by) =
+                bind_select(catalog, select, &query.order_by, declared, &scope)?;
             Ok(BoundQuery {
                 body: BoundQueryBody::Select(Box::new(bound_select)),
                 order_by,
@@ -38,14 +43,16 @@ pub(super) fn bind_query(
         QueryBody::Values(rows) => {
             // `ORDER BY` over a bare VALUES needs output-position ordering, which
             // arrives with set operations; until then it is rejected. `LIMIT`/
-            // `OFFSET` need no binding and pass through to the wrapper.
+            // `OFFSET` need no binding and pass through to the wrapper. The CTE
+            // scope is threaded in because a subquery inside a VALUES row can
+            // reference an enclosing CTE, even though VALUES itself has no FROM.
             if !query.order_by.is_empty() {
                 return Err(plan_error(
                     SqlState::FeatureNotSupported,
                     "ORDER BY over VALUES is not supported yet",
                 ));
             }
-            let values = bind_values(catalog, rows, declared)?;
+            let values = bind_values(catalog, rows, declared, &scope)?;
             Ok(BoundQuery {
                 body: BoundQueryBody::Values(values),
                 order_by: Vec::new(),
@@ -65,8 +72,8 @@ pub(super) fn bind_query(
                     "INTERSECT ALL / EXCEPT ALL are not supported",
                 ));
             }
-            let left = bind_query(catalog, left, declared)?;
-            let right = bind_query(catalog, right, declared)?;
+            let left = bind_query(catalog, left, declared, &scope)?;
+            let right = bind_query(catalog, right, declared, &scope)?;
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
             // `ORDER BY` over a set operation resolves against the combined output
             // by position or name only (there is no single input scope).
@@ -85,6 +92,91 @@ pub(super) fn bind_query(
             })
         }
     }
+}
+
+/// Extend the enclosing CTE scope with this query's `WITH` CTEs. Each CTE is bound
+/// once (inlined at each reference) and sees the scope so far — the enclosing CTEs
+/// and its earlier siblings, but not itself (non-recursive) or later siblings. A
+/// duplicate name within one `WITH` is rejected.
+fn bind_ctes(
+    catalog: &dyn CatalogManager,
+    with: &[Cte],
+    enclosing: &CteScope,
+    declared: &[Option<DataType>],
+) -> Result<CteScope> {
+    let mut scope = enclosing.clone();
+    let base = scope.ctes.len();
+    for cte in with {
+        if scope.ctes[base..]
+            .iter()
+            .any(|bound| bound.name == cte.name)
+        {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                format!("WITH query name \"{}\" specified more than once", cte.name),
+            ));
+        }
+        let bound = bind_cte(catalog, cte, &scope, declared)?;
+        scope.ctes.push(bound);
+    }
+    Ok(scope)
+}
+
+/// Bind one CTE and derive its output columns (renamed by its column-alias list).
+fn bind_cte(
+    catalog: &dyn CatalogManager,
+    cte: &Cte,
+    scope: &CteScope,
+    declared: &[Option<DataType>],
+) -> Result<CteBinding> {
+    let query = bind_query(catalog, &cte.query, declared, scope)?;
+    let columns = derive_alias_columns(&query.output_columns(), &cte.column_aliases, || {
+        format!("CTE \"{}\"", cte.name)
+    })?;
+    Ok(CteBinding {
+        name: cte.name.clone(),
+        query,
+        columns,
+    })
+}
+
+/// Build the column metadata a derived relation exposes — a subquery in `FROM`, or
+/// an inlined CTE reference — from its output columns: one `ColumnDef` per column,
+/// renamed left to right by the optional column-alias list. More aliases than
+/// columns is a `SyntaxError`; `describe` names the relation for that message
+/// (e.g. `table "d"`, `CTE "x"`) and is only evaluated on error.
+fn derive_alias_columns(
+    output: &[OutputColumn],
+    column_aliases: &[String],
+    describe: impl FnOnce() -> String,
+) -> Result<Vec<ColumnDef>> {
+    if column_aliases.len() > output.len() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!(
+                "{} has {} columns available but {} column aliases specified",
+                describe(),
+                output.len(),
+                column_aliases.len()
+            ),
+        ));
+    }
+    Ok(output
+        .iter()
+        .enumerate()
+        .map(|(index, column)| ColumnDef {
+            id: index as ColumnId,
+            name: column_aliases
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| column.name.clone()),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        })
+        .collect())
 }
 
 /// Reconcile the two arms of a set operation. They must have the same number of
@@ -193,12 +285,14 @@ fn bind_set_op_order_by(
 /// the common type of its entries under the strict no-implicit-cast rule: a bare
 /// `NULL` takes the inferred column type, and every non-`NULL` entry must match it
 /// exactly (else `DatatypeMismatch`); an all-`NULL` column has no inferable type
-/// and is rejected. VALUES is a leaf (no bindings), so column references inside it
-/// cannot resolve. Output columns are named `column1`, `column2`, ...
+/// and is rejected. Each entry binds in a fresh scope with no table bindings (so a
+/// bare column reference cannot resolve) but with the enclosing CTEs visible (a
+/// subquery in a row may reference one). Output columns are named `column1`, ...
 fn bind_values(
     catalog: &dyn CatalogManager,
     rows: &[Vec<Expr>],
     declared: &[Option<DataType>],
+    ctes: &CteScope,
 ) -> Result<BoundValues> {
     let width = rows[0].len();
     for row in rows {
@@ -221,6 +315,7 @@ fn bind_values(
                 continue;
             }
             let mut ctx = BindContext::new(catalog, declared);
+            ctx.cte_scope = ctes.clone();
             data_type = Some(bind_expr(&mut ctx, &row[column], None)?.data_type());
             break;
         }
@@ -252,6 +347,7 @@ fn bind_values(
         for (column, expr) in row.iter().enumerate() {
             let data_type = output_schema[column].data_type.clone();
             let mut ctx = BindContext::new(catalog, declared);
+            ctx.cte_scope = ctes.clone();
             let bound = bind_expr(&mut ctx, expr, Some(data_type.clone()))?;
             reject_aggregate(&bound)?;
             require_type(&bound, data_type)?;
@@ -277,8 +373,10 @@ fn bind_select(
     select: &Select,
     order_by: &[OrderByItem],
     declared: &[Option<DataType>],
+    ctes: &CteScope,
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
     let mut ctx = BindContext::new(catalog, declared);
+    ctx.cte_scope = ctes.clone();
     // A FROM-less SELECT (`SELECT 1`) has no source relation: no bindings are
     // registered, so any column reference correctly fails to resolve.
     let from = if select.from.is_empty() {
@@ -371,8 +469,16 @@ fn bind_from_item(
 ) -> Result<BoundFrom> {
     match item {
         FromItem::Table { name, alias } => {
-            let table = require_table(catalog, name)?;
-            Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            // A CTE name shadows a catalog table (matching PostgreSQL). Taking the
+            // binding out of the scope by value (the one unavoidable clone of the
+            // inlined plan) also ends the `ctx.cte_scope` borrow before `ctx` is
+            // mutated.
+            if let Some(cte) = ctx.cte_scope.lookup(name).cloned() {
+                Ok(bind_cte_reference(ctx, cte, alias.clone()))
+            } else {
+                let table = require_table(catalog, name)?;
+                Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            }
         }
         FromItem::Derived {
             subquery,
@@ -443,6 +549,39 @@ pub(super) fn bind_table_from_schema(
     }
 }
 
+/// Bind a reference to a CTE (`FROM cte [AS alias]`): inline the CTE's already-bound
+/// query as a derived table, exposing its columns under `alias` (or the CTE name).
+/// The CTE is bound once; each reference gets a clone of its plan, exactly like a
+/// derived table, so no new plan node or executor operator is needed. Takes the
+/// binding by value so the (already-cloned) plan is moved in, not cloned again.
+fn bind_cte_reference(ctx: &mut BindContext, cte: CteBinding, alias: Option<String>) -> BoundFrom {
+    let CteBinding {
+        name,
+        query,
+        columns,
+    } = cte;
+    let visible_name = alias.unwrap_or_else(|| name.clone());
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += columns.len();
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: None,
+        table_name: name,
+        visible_name: visible_name.clone(),
+        columns: columns.clone(),
+        slot_start,
+        qualified_only: false,
+    });
+    BoundFrom::Derived {
+        query: Box::new(query),
+        binding,
+        alias: visible_name,
+        schema: columns,
+    }
+}
+
 /// Bind a derived table `(SELECT ...) AS alias [(cols)]`: bind the inner query in
 /// its own scope, derive the visible columns (optionally renamed by the column
 /// alias list), and register a binding that projects them into the outer scope.
@@ -453,35 +592,12 @@ fn bind_derived_table(
     alias: &str,
     column_aliases: &[String],
 ) -> Result<BoundFrom> {
-    let query = bind_query(catalog, subquery, &ctx.declared_params)?;
-    let output = query.output_columns();
-    if column_aliases.len() > output.len() {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            format!(
-                "table \"{alias}\" has {} columns available but {} column aliases specified",
-                output.len(),
-                column_aliases.len()
-            ),
-        ));
-    }
-
-    let columns: Vec<ColumnDef> = output
-        .iter()
-        .enumerate()
-        .map(|(index, column)| ColumnDef {
-            id: index as ColumnId,
-            name: column_aliases
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| column.name.clone()),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
-            max_length: None,
-            default: None,
-            pg_type: None,
-        })
-        .collect();
+    // The derived subquery is bound in its own binding scope but still sees the
+    // enclosing query's CTEs.
+    let query = bind_query(catalog, subquery, &ctx.declared_params, &ctx.cte_scope)?;
+    let columns = derive_alias_columns(&query.output_columns(), column_aliases, || {
+        format!("table \"{alias}\"")
+    })?;
 
     let binding = ctx.next_binding;
     ctx.next_binding += 1;

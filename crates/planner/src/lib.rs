@@ -581,6 +581,54 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_cte_reference_as_inlined_derived_table() {
+        let catalog = catalog_with_users();
+        let bound = bind(
+            &parse("with t as (select id from users) select id from t").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = &bound
+        else {
+            panic!("expected a select query");
+        };
+        // The CTE reference resolves to an inlined derived table (no dedicated node).
+        assert!(matches!(select.from, Some(BoundFrom::Derived { .. })));
+        assert_eq!(select.output_schema[0].name, "id");
+    }
+
+    #[test]
+    fn binder_rejects_duplicate_cte_name() {
+        let catalog = catalog_with_users();
+        let err = bind(
+            &parse("with t as (select 1), t as (select 2) select 1").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_cte_shadows_catalog_table() {
+        let catalog = catalog_with_users();
+        // `users` here refers to the CTE, not the catalog table, so the single
+        // output column is the CTE's `x`, not the table's columns.
+        let bound = bind(
+            &parse("with users as (select 1 as x) select x from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.output_schema().len(), 1);
+        assert_eq!(query.output_schema()[0].name, "x");
+    }
+
+    #[test]
     fn from_less_select_lowers_to_projection_over_unit_row() {
         let catalog = catalog_with_users();
         let bound = bind(&parse("select 1").unwrap(), &catalog).unwrap();

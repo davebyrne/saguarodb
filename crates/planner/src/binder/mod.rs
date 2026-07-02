@@ -7,7 +7,7 @@ use common::{
 };
 use parser::Statement;
 
-use crate::{BoundExpr, BoundStatement};
+use crate::{BoundExpr, BoundQuery, BoundStatement};
 
 mod dml;
 mod expr;
@@ -34,6 +34,30 @@ struct Binding {
     qualified_only: bool,
 }
 
+/// A common table expression, bound once and inlined at each reference. `columns`
+/// is the CTE's output columns (renamed by its column-alias list); a reference
+/// registers a derived-table binding over them and inlines a clone of `query`.
+#[derive(Clone, Debug)]
+struct CteBinding {
+    name: String,
+    query: BoundQuery,
+    columns: Vec<ColumnDef>,
+}
+
+/// The CTEs visible at a point in binding, innermost last. A reference resolves to
+/// the last binding of a name, so an inner `WITH` shadows an outer one and a CTE
+/// shadows a catalog table of the same name.
+#[derive(Clone, Debug, Default)]
+struct CteScope {
+    ctes: Vec<CteBinding>,
+}
+
+impl CteScope {
+    fn lookup(&self, name: &str) -> Option<&CteBinding> {
+        self.ctes.iter().rev().find(|cte| cte.name == name)
+    }
+}
+
 struct BindContext<'a> {
     /// The catalog, carried so expression binding can resolve a subquery's tables
     /// (a subquery is bound in its own fresh scope — uncorrelated semantics).
@@ -44,6 +68,9 @@ struct BindContext<'a> {
     /// Parameter type OIDs declared by an extended-protocol `Parse` (mapped to
     /// `DataType`), 0-based and `None` when unspecified. Empty for simple queries.
     declared_params: Vec<Option<DataType>>,
+    /// The CTEs (`WITH`) in scope for `FROM` resolution. Empty unless the query or
+    /// an enclosing query has a `WITH` clause.
+    cte_scope: CteScope,
 }
 
 impl<'a> BindContext<'a> {
@@ -54,6 +81,7 @@ impl<'a> BindContext<'a> {
             next_binding: 0,
             next_slot: 0,
             declared_params: declared_params.to_vec(),
+            cte_scope: CteScope::default(),
         }
     }
 
@@ -167,7 +195,9 @@ fn bind_inner(
             returning.as_deref(),
             declared,
         ),
-        Statement::Query(query) => bind_query(catalog, query, declared).map(BoundStatement::Query),
+        Statement::Query(query) => {
+            bind_query(catalog, query, declared, &CteScope::default()).map(BoundStatement::Query)
+        }
         Statement::Update {
             table,
             assignments,
