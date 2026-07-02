@@ -101,6 +101,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: None,
+                    pg_type: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -109,6 +110,7 @@ mod tests {
                     nullable: true,
                     max_length: None,
                     default: None,
+                    pg_type: None,
                 },
             ],
             primary_key: vec![0],

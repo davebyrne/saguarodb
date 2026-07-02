@@ -310,6 +310,7 @@ fn convert_column_def(
         } else {
             default
         },
+        pg_type: None,
     })
 }
 

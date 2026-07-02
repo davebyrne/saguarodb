@@ -387,6 +387,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         }

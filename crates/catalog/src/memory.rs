@@ -441,6 +441,7 @@ fn build_schema(
             nullable: column.nullable,
             max_length: column.max_length,
             default,
+            pg_type: column.pg_type,
         });
     }
 

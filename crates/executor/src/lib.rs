@@ -467,6 +467,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: Some(ColumnDefault::Nextval(1)),
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -504,6 +505,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: Some(ColumnDefault::Nextval(1)),
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -616,6 +618,7 @@ mod tests {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
@@ -623,6 +626,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],

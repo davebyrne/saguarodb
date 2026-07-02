@@ -251,6 +251,7 @@ fn bind_derived_table(
             nullable: item.expr.nullable(),
             max_length: None,
             default: None,
+            pg_type: None,
         })
         .collect();
 

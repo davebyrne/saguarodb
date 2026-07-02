@@ -32,6 +32,7 @@ impl ExecutorHarness {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
@@ -39,6 +40,7 @@ impl ExecutorHarness {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],

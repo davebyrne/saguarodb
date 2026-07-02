@@ -212,6 +212,7 @@ mod tests {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
@@ -219,6 +220,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -266,6 +268,7 @@ mod tests {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "owner".to_string(),
@@ -273,6 +276,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -293,6 +297,7 @@ mod tests {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "label".to_string(),
@@ -300,6 +305,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["code".to_string()],

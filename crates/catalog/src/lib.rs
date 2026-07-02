@@ -60,7 +60,7 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef,
+        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef, PgType,
         SequenceOptions, SequenceSchema, SqlState, TableSchema,
     };
 
@@ -75,6 +75,7 @@ mod tests {
             nullable,
             max_length: None,
             default: None,
+            pg_type: None,
         }
     }
 
@@ -92,6 +93,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -113,6 +115,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                     ParsedColumnDef {
                         name: "name".to_string(),
@@ -120,6 +123,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -168,6 +172,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: Some(common::ParsedDefault::Const(common::Value::Integer(42))),
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -206,6 +211,7 @@ mod tests {
                         nullable: true,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string()],
@@ -458,6 +464,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -500,6 +507,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: Some(ColumnDefault::Nextval(1)),
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -535,6 +543,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: Some(ColumnDefault::Nextval(1)),
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -565,6 +574,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                    pg_type: None,
                 }],
                 vec!["id".to_string()],
             )
@@ -595,6 +605,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                    pg_type: None,
                 }],
                 vec!["id".to_string()],
             )
@@ -625,6 +636,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
+                    pg_type: None,
                 }],
                 vec!["id".to_string()],
             )
@@ -649,6 +661,7 @@ mod tests {
                     default: Some(common::ParsedDefault::OwnedNextval(
                         "users_id_seq".to_string(),
                     )),
+                    pg_type: None,
                 }],
                 vec!["id".to_string()],
             )
@@ -673,6 +686,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: None,
+                    pg_type: None,
                 },
                 ColumnDef {
                     id: 1,
@@ -681,6 +695,7 @@ mod tests {
                     nullable: false,
                     max_length: None,
                     default: None,
+                    pg_type: None,
                 },
             ],
             primary_key: vec![0, 1],
@@ -718,6 +733,7 @@ mod tests {
                 nullable: true,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -747,6 +763,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![1],
         };
@@ -807,6 +824,7 @@ mod tests {
                         nullable: false,
                         max_length: None,
                         default: None,
+                        pg_type: None,
                     },
                 ],
                 vec!["id".to_string(), "tenant".to_string()],
@@ -905,6 +923,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -1228,6 +1247,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -1266,6 +1286,7 @@ mod tests {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             }],
             primary_key: vec![0],
         };
@@ -1313,6 +1334,12 @@ mod tests {
         assert!(snapshot.sequences_by_id.is_empty());
         assert!(snapshot.sequences_by_name.is_empty());
         assert_eq!(snapshot.next_sequence_id, 1);
+
+        // A column persisted before the pg_type field loads as unlabeled and
+        // resolves to the collapsed default wire type (Integer => int8).
+        let column = &snapshot.tables_by_id[&1].columns[0];
+        assert_eq!(column.pg_type, None);
+        assert_eq!(column.wire_type(), PgType::Int8);
 
         // The validated load path accepts it.
         MemoryCatalog::try_from_snapshot(snapshot).unwrap();

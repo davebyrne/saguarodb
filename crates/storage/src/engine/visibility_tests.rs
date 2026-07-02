@@ -297,6 +297,7 @@ fn users_schema() -> TableSchema {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             },
             ColumnDef {
                 id: 1,
@@ -305,6 +306,7 @@ fn users_schema() -> TableSchema {
                 nullable: true,
                 max_length: None,
                 default: None,
+                pg_type: None,
             },
         ],
         primary_key: vec![0],
@@ -2011,6 +2013,7 @@ fn hot_schema() -> TableSchema {
                 nullable: false,
                 max_length: None,
                 default: None,
+                pg_type: None,
             },
             ColumnDef {
                 id: 1,
@@ -2019,6 +2022,7 @@ fn hot_schema() -> TableSchema {
                 nullable: true,
                 max_length: None,
                 default: None,
+                pg_type: None,
             },
             ColumnDef {
                 id: 2,
@@ -2027,6 +2031,7 @@ fn hot_schema() -> TableSchema {
                 nullable: true,
                 max_length: None,
                 default: None,
+                pg_type: None,
             },
         ],
         primary_key: vec![0],

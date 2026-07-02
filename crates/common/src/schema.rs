@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ColumnId, IndexId, SequenceId, TableId, Value};
+use crate::{ColumnId, IndexId, PgType, SequenceId, TableId, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -78,6 +78,12 @@ pub struct ParsedColumnDef {
     /// catalog resolves it to a durable id.
     #[serde(default)]
     pub default: Option<ParsedDefault>,
+    /// The declared PostgreSQL wire type (integer width, character kind, length),
+    /// captured by the parser so the protocol can report the exact OID/typmod.
+    /// `None` when the parser has not labeled the column; resolved to the collapsed
+    /// default (`Integer` => int8, `Text` => text) downstream.
+    #[serde(default)]
+    pub pg_type: Option<PgType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +101,23 @@ pub struct ColumnDef {
     /// Persisted with the catalog and replayed via the `CreateTable` WAL record.
     #[serde(default)]
     pub default: Option<ColumnDefault>,
+    /// The declared PostgreSQL wire type, persisted so the column reports the same
+    /// OID/typmod after a restart. `None` on catalogs written before this field
+    /// existed; use [`ColumnDef::wire_type`] rather than reading this directly.
+    #[serde(default)]
+    pub pg_type: Option<PgType>,
+}
+
+impl ColumnDef {
+    /// The column's PostgreSQL wire type, resolving an unlabeled column (`None`,
+    /// e.g. a pre-existing catalog snapshot) to the collapsed default derived from
+    /// its `DataType` (`Integer` => int8, `Text` => text). This is what the
+    /// protocol should report; it is always concrete.
+    pub fn wire_type(&self) -> PgType {
+        self.pg_type
+            .clone()
+            .unwrap_or_else(|| PgType::from(&self.data_type))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,7 +185,7 @@ pub struct IndexSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnInfo, DataType};
+    use super::{ColumnDef, ColumnInfo, DataType, PgType};
 
     #[test]
     fn column_info_can_describe_expression_output() {
@@ -175,5 +198,27 @@ mod tests {
 
         assert_eq!(column.name, "count");
         assert_eq!(column.table_id, None);
+    }
+
+    #[test]
+    fn column_def_wire_type_resolves_unlabeled_columns() {
+        let unlabeled = ColumnDef {
+            id: 0,
+            name: "n".to_string(),
+            data_type: DataType::Integer,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        };
+        // No declared label => the collapsed default from the DataType.
+        assert_eq!(unlabeled.wire_type(), PgType::Int8);
+
+        // A declared label is reported verbatim.
+        let labeled = ColumnDef {
+            pg_type: Some(PgType::Int4),
+            ..unlabeled
+        };
+        assert_eq!(labeled.wire_type(), PgType::Int4);
     }
 }
