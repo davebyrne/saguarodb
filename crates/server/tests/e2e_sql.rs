@@ -3393,12 +3393,38 @@ async fn e2e_values_query() {
         err.message
     );
 
-    // ORDER BY over a bare VALUES is not supported yet.
-    let err = server
+    // ORDER BY over a bare VALUES sorts the rows (by output position).
+    let rows = server
         .simple_query("values (3), (1), (2) order by 1")
         .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // ORDER BY by the synthetic output-column name, DESC, plus LIMIT.
+    let rows = server
+        .simple_query("values (3), (1), (2) order by column1 desc limit 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".to_string())], vec![Some("2".to_string())]]
+    );
+
+    // A non-position/name ORDER BY expression over VALUES is rejected.
+    let err = server
+        .simple_query("values (1), (2) order by column1 + 1")
+        .await
         .err()
-        .expect("ORDER BY over VALUES should be rejected for now");
+        .expect("arbitrary ORDER BY expression over VALUES should be rejected");
     assert!(
         err.message.contains("0A000"),
         "expected FeatureNotSupported: {}",

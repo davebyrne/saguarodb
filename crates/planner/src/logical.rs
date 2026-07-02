@@ -217,33 +217,57 @@ fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
             plan_select_body(select, &query.order_by, query.limit, query.offset)
         }
         // A VALUES body is a literal row set. It lowers directly to the existing
-        // `Values` node; `LIMIT`/`OFFSET` stack on top (`ORDER BY` over a bare
-        // VALUES is rejected in the binder for now).
+        // `Values` node; the query-level `ORDER BY` (bound to output positions) and
+        // `LIMIT`/`OFFSET` stack above.
         BoundQueryBody::Values(values) => {
             let plan = LogicalPlan::Values {
                 rows: values.rows.clone(),
                 output_schema: values.output_schema.clone(),
             };
-            Ok(apply_limit(plan, query.limit, query.offset))
+            Ok(apply_order_and_limit(
+                plan,
+                &query.order_by,
+                query.limit,
+                query.offset,
+            ))
         }
         // A set operation lowers each arm and combines them; the query-level
         // `ORDER BY` (bound to output positions) and `LIMIT`/`OFFSET` stack above.
         BoundQueryBody::SetOp(set_op) => {
-            let mut plan = LogicalPlan::SetOp {
+            let plan = LogicalPlan::SetOp {
                 op: set_op.op,
                 all: set_op.all,
                 left: Box::new(plan_query(&set_op.left)?),
                 right: Box::new(plan_query(&set_op.right)?),
             };
-            if !query.order_by.is_empty() {
-                plan = LogicalPlan::Sort {
-                    source: Box::new(plan),
-                    order_by: query.order_by.clone(),
-                };
-            }
-            Ok(apply_limit(plan, query.limit, query.offset))
+            Ok(apply_order_and_limit(
+                plan,
+                &query.order_by,
+                query.limit,
+                query.offset,
+            ))
         }
     }
+}
+
+/// Stack a `Sort` for the query-level `ORDER BY` (already bound to output-position
+/// keys) and then the `LIMIT`/`OFFSET`, above a body plan that carries no ordering
+/// of its own (a VALUES or set-operation body). Empty `order_by` skips the `Sort`.
+fn apply_order_and_limit(
+    plan: LogicalPlan,
+    order_by: &[BoundOrderByItem],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> LogicalPlan {
+    let plan = if order_by.is_empty() {
+        plan
+    } else {
+        LogicalPlan::Sort {
+            source: Box::new(plan),
+            order_by: order_by.to_vec(),
+        }
+    };
+    apply_limit(plan, limit, offset)
 }
 
 /// Stack a `Limit` node for the query-level `LIMIT`/`OFFSET`. A bare `OFFSET` with

@@ -505,6 +505,23 @@ mod tests {
     }
 
     #[test]
+    fn binder_binds_values_order_by_to_output_position() {
+        let catalog = catalog_with_users();
+        // `ORDER BY 1` over a VALUES binds to a LocalRef at that output slot,
+        // evaluated by a Sort above the Values node.
+        let BoundStatement::Query(query) =
+            bind(&parse("values (3), (1), (2) order by 1").unwrap(), &catalog).unwrap()
+        else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.order_by.len(), 1);
+        assert!(matches!(
+            query.order_by[0].expr,
+            BoundExpr::LocalRef { slot: 0, .. }
+        ));
+    }
+
+    #[test]
     fn binder_binds_values_derived_table_columns() {
         let catalog = catalog_with_users();
         let bound = bind(

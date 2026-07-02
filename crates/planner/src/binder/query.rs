@@ -41,24 +41,19 @@ pub(super) fn bind_query(
             })
         }
         QueryBody::Values(rows) => {
-            // `ORDER BY` over a bare VALUES needs output-position ordering, which
-            // arrives with set operations; until then it is rejected. `LIMIT`/
-            // `OFFSET` need no binding and pass through to the wrapper. The CTE
-            // scope is threaded in because a subquery inside a VALUES row can
+            // `LIMIT`/`OFFSET` need no binding. `ORDER BY` resolves against the
+            // VALUES output columns by position or name (like a set operation). The
+            // CTE scope is threaded in because a subquery inside a VALUES row can
             // reference an enclosing CTE, even though VALUES itself has no FROM.
-            if !query.order_by.is_empty() {
-                return Err(plan_error(
-                    SqlState::FeatureNotSupported,
-                    "ORDER BY over VALUES is not supported yet",
-                ));
-            }
             let values = bind_values(catalog, rows, declared, &scope)?;
-            Ok(BoundQuery {
+            let mut bound = BoundQuery {
                 body: BoundQueryBody::Values(values),
                 order_by: Vec::new(),
                 limit: query.limit,
                 offset: query.offset,
-            })
+            };
+            bound.order_by = bind_output_order_by(&query.order_by, &bound.output_columns())?;
+            Ok(bound)
         }
         QueryBody::SetOp {
             op,
@@ -77,7 +72,7 @@ pub(super) fn bind_query(
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
             // `ORDER BY` over a set operation resolves against the combined output
             // by position or name only (there is no single input scope).
-            let order_by = bind_set_op_order_by(&query.order_by, &output_columns)?;
+            let order_by = bind_output_order_by(&query.order_by, &output_columns)?;
             Ok(BoundQuery {
                 body: BoundQueryBody::SetOp(BoundSetOp {
                     op: *op,
@@ -234,11 +229,11 @@ fn reconcile_set_op(
     Ok((output_schema, output_columns))
 }
 
-/// Bind the query-level `ORDER BY` of a set operation. Each item must reference an
-/// output column by 1-based position or by name (no arbitrary expressions — a set
-/// operation has no single input scope); it becomes a `LocalRef` to that output
-/// slot, which the `Sort` above the set operation evaluates over the result rows.
-fn bind_set_op_order_by(
+/// Bind the query-level `ORDER BY` of a body that has no single input scope (a set
+/// operation or a `VALUES`). Each item must reference an output column by 1-based
+/// position or by name (no arbitrary expressions); it becomes a `LocalRef` to that
+/// output slot, which the `Sort` above the body evaluates over the result rows.
+fn bind_output_order_by(
     order_by: &[OrderByItem],
     output_columns: &[OutputColumn],
 ) -> Result<Vec<BoundOrderByItem>> {
@@ -258,13 +253,13 @@ fn bind_set_op_order_by(
                     .ok_or_else(|| {
                         plan_error(
                             SqlState::InvalidColumnReference,
-                            format!("column {column} does not exist in the set operation output"),
+                            format!("column {column} does not exist in the query output"),
                         )
                     })?,
                 _ => {
                     return Err(plan_error(
                         SqlState::FeatureNotSupported,
-                        "ORDER BY over a set operation must reference an output column by position or name",
+                        "ORDER BY over this query must reference an output column by position or name",
                     ));
                 }
             };
