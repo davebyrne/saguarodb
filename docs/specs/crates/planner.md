@@ -131,11 +131,28 @@ pub struct BoundQuery {
     pub offset: Option<u64>,
 }
 
-// The bound body of a query expression. Only a single SELECT is supported today;
-// set operations and standalone VALUES attach here as new variants.
+// The bound body of a query expression. Set operations attach here as a further
+// variant.
 pub enum BoundQueryBody {
     Select(BoundSelect),
+    Values(BoundValues),
 }
+
+// A bound VALUES body: a literal row set. Every row has the same width as
+// output_schema; each column's type is the common type of its entries (a bare NULL
+// takes the column type; an all-NULL column is rejected). Columns are named
+// column1, column2, ... Lowers directly to the existing Values plan node.
+pub struct BoundValues {
+    pub rows: Vec<Vec<BoundExpr>>,
+    pub output_schema: Vec<ColumnInfo>,
+}
+
+// A query's result column, described independently of the body that produced it.
+// output_schema() gives name + type (the wire RowDescription); output_columns()
+// adds nullability. Used by derived-table and INSERT-source binding (and, later,
+// set-operation reconciliation) without matching on the body variant.
+pub struct OutputColumn { pub name: String, pub data_type: DataType, pub nullable: bool }
+// impl BoundQuery { fn output_schema(&self) -> &[ColumnInfo]; fn output_columns(&self) -> Vec<OutputColumn>; }
 
 pub struct BoundSelect {
     pub distinct: Option<BoundDistinct>,  // All | On(keys)
@@ -184,6 +201,8 @@ A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and
 A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `BoundQuery` binds its body (a `BoundSelect`) and, for a `SELECT` body, binds the query-level `ORDER BY` against that block's output columns (the `ORDER BY`/`DISTINCT` validation is coupled and stays together). Logical planning lowers the body, then applies the wrapper's `ORDER BY`/`LIMIT`/`OFFSET`; the aggregate-context `ORDER BY` rewrite stays with the body because it depends on the body's `group_by`/aggregates. `BoundSelect` (without the query-level modifiers) is also used directly as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
 
 A FROM-less `SELECT` (`SELECT 1`, `SELECT count(*)`) binds with `from = None`: no bindings are registered, so any column reference fails with `SqlState::UndefinedColumn`. Logical planning lowers a `None` source to a single unit row — a one-row, zero-column `LogicalPlan::Values` node (already supported by the physical planner and executor) — with the `WHERE` clause, if any, applied as a `Filter` above it; the projection and any aggregation stack on top unchanged. `UPDATE`/`DELETE` always bind a real table, so their `from` is always `Some`.
+
+A `VALUES` body binds each row's expressions (a leaf, with no bindings — column references inside cannot resolve) and infers each column's type from its first non-`NULL` entry under the strict no-implicit-cast rule: every other entry must match exactly (a bare `NULL` adopts the type), rows must all be the same width, and an all-`NULL` column has no inferable type — all violations are `DatatypeMismatch`/`SyntaxError`. It lowers directly to the existing `LogicalPlan::Values` node, with `LIMIT`/`OFFSET` on top; `ORDER BY` over a bare `VALUES` is rejected (`FeatureNotSupported`) until set-operation output ordering lands. Because a derived table and an `INSERT ... <query>` source read the query's columns through `output_columns()`, `FROM (VALUES ...)`, `x IN (VALUES ...)`, and a scalar `(VALUES ...)` all work with no further code.
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 

@@ -10,8 +10,8 @@ use parser::{
 };
 
 use crate::{
-    BoundExpr, BoundInsertSource, BoundOnConflict, BoundQueryBody, BoundReturning, BoundSelect,
-    BoundSelectItem, BoundStatement,
+    BoundExpr, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect, BoundSelectItem,
+    BoundStatement,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
@@ -19,9 +19,7 @@ use super::query::{
     bind_excluded_binding, bind_query, bind_select_item, bind_table_from_schema,
     select_output_schema,
 };
-use super::{
-    BindContext, Binding, input_ref, plan_error, reject_aggregate, require_table, require_type,
-};
+use super::{BindContext, Binding, input_ref, plan_error, reject_aggregate, require_table};
 
 /// Bind `COPY <table> [(cols)] FROM STDIN | TO STDOUT`: resolve the table and the
 /// (possibly defaulted) column list to ids, reusing the INSERT column resolver.
@@ -280,17 +278,16 @@ fn bind_insert_query(
     declared: &[Option<DataType>],
 ) -> Result<BoundInsertSource> {
     let query = bind_query(catalog, subquery, declared)?;
-    let BoundQueryBody::Select(select) = &query.body;
-    let source_columns = &select.columns;
+    let source_columns = query.output_columns();
     if source_columns.len() != columns.len() {
         return Err(plan_error(
             SqlState::DatatypeMismatch,
             "INSERT ... SELECT query produces a different number of columns than the target",
         ));
     }
-    for (item, column_id) in source_columns.iter().zip(columns) {
+    for (source, column_id) in source_columns.iter().zip(columns) {
         let column = column_by_id(table, *column_id)?;
-        validate_assignable(&item.expr, column)?;
+        validate_assignable_from(&source.data_type, source.nullable, column)?;
     }
     Ok(BoundInsertSource::Query(Box::new(query)))
 }
@@ -451,17 +448,33 @@ fn column_by_id(table: &TableSchema, id: ColumnId) -> Result<&ColumnDef> {
 }
 
 fn validate_assignable(expr: &BoundExpr, column: &ColumnDef) -> Result<()> {
-    // A NUMERIC value is assignable to any NUMERIC column regardless of the
-    // declared (precision, scale): the value is rounded to the column's scale and
-    // checked for precision overflow at store time, not by type identity.
+    validate_assignable_from(&expr.data_type(), expr.nullable(), column)
+}
+
+/// Whether a source column of `(data_type, nullable)` may feed `column`: the types
+/// must match (a NUMERIC value is assignable to any NUMERIC column regardless of
+/// its declared precision/scale — rounded and range-checked at store time), and a
+/// nullable source cannot feed a `NOT NULL` column. Used both for a single bound
+/// expression and for the output columns of an `INSERT ... <query>` source.
+fn validate_assignable_from(
+    data_type: &DataType,
+    nullable: bool,
+    column: &ColumnDef,
+) -> Result<()> {
     let numeric_compatible = matches!(
-        (expr.data_type(), &column.data_type),
+        (data_type, &column.data_type),
         (DataType::Numeric { .. }, DataType::Numeric { .. })
     );
-    if !numeric_compatible {
-        require_type(expr, column.data_type.clone())?;
+    if !numeric_compatible && *data_type != column.data_type {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            format!(
+                "expected expression type {:?}, got {:?}",
+                column.data_type, data_type
+            ),
+        ));
     }
-    if !column.nullable && expr.nullable() {
+    if !column.nullable && nullable {
         return Err(plan_error(
             SqlState::NotNullViolation,
             format!("column {} cannot be NULL", column.name),

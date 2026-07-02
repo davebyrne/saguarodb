@@ -1,6 +1,6 @@
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, IndexId, ParsedColumnDef,
-    SequenceOptions, TableId,
+    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, IndexId,
+    ParsedColumnDef, SequenceOptions, TableId,
 };
 
 use crate::{BoundExpr, BoundOrderByItem, JoinType};
@@ -18,11 +18,33 @@ pub struct BoundQuery {
     pub offset: Option<u64>,
 }
 
-/// The bound body of a query expression. Only a single `SELECT` is supported
-/// today; set operations and standalone `VALUES` attach here as new variants.
+/// The bound body of a query expression. Set operations attach here as a further
+/// variant. `Select` is boxed to keep the variants a similar size (a `BoundSelect`
+/// is far larger than a `BoundValues` or a future set-operation node).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundQueryBody {
-    Select(BoundSelect),
+    Select(Box<BoundSelect>),
+    Values(BoundValues),
+}
+
+/// A bound `VALUES` body: a literal row set. Every row has the same width as
+/// `output_schema`; each column's type is the common type of its entries (a bare
+/// `NULL` takes the column's type). Output columns are named `column1`, `column2`,
+/// ... (no source table). Lowers directly to the existing `Values` plan node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundValues {
+    pub rows: Vec<Vec<BoundExpr>>,
+    pub output_schema: Vec<ColumnInfo>,
+}
+
+/// A query's result column, described independently of which body produced it —
+/// used to derive derived-table schemas, validate `INSERT` sources, and (later)
+/// reconcile set-operation arms, without matching on the body variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
 }
 
 impl BoundQuery {
@@ -31,6 +53,35 @@ impl BoundQuery {
     pub fn output_schema(&self) -> &[ColumnInfo] {
         match &self.body {
             BoundQueryBody::Select(select) => &select.output_schema,
+            BoundQueryBody::Values(values) => &values.output_schema,
+        }
+    }
+
+    /// The result columns with their nullability, in order. `output_schema` carries
+    /// name + type for the wire `RowDescription`; this adds the nullability that
+    /// derived-table and `INSERT`-source binding need, without exposing the body.
+    pub fn output_columns(&self) -> Vec<OutputColumn> {
+        match &self.body {
+            BoundQueryBody::Select(select) => select
+                .columns
+                .iter()
+                .map(|item| OutputColumn {
+                    name: item.alias.clone(),
+                    data_type: item.expr.data_type(),
+                    nullable: item.expr.nullable(),
+                })
+                .collect(),
+            BoundQueryBody::Values(values) => values
+                .output_schema
+                .iter()
+                .enumerate()
+                .map(|(index, column)| OutputColumn {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    // A VALUES column is nullable if any row's entry is.
+                    nullable: values.rows.iter().any(|row| row[index].nullable()),
+                })
+                .collect(),
         }
     }
 }

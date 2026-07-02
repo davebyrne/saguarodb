@@ -200,13 +200,43 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
 }
 
 /// Lower a bound query: lower its body, then apply the query-level
-/// `ORDER BY`/`LIMIT`/`OFFSET`. Only a `SELECT` body exists today; a set-operation
-/// body adds an arm here that combines its arms' plans before those modifiers.
+/// `ORDER BY`/`LIMIT`/`OFFSET`. A set-operation body adds an arm here that combines
+/// its arms' plans before those modifiers.
 fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
     match &query.body {
         BoundQueryBody::Select(select) => {
             plan_select_body(select, &query.order_by, query.limit, query.offset)
         }
+        // A VALUES body is a literal row set. It lowers directly to the existing
+        // `Values` node; `LIMIT`/`OFFSET` stack on top (`ORDER BY` over a bare
+        // VALUES is rejected in the binder for now).
+        BoundQueryBody::Values(values) => {
+            let plan = LogicalPlan::Values {
+                rows: values.rows.clone(),
+                output_schema: values.output_schema.clone(),
+            };
+            Ok(apply_limit(plan, query.limit, query.offset))
+        }
+    }
+}
+
+/// Stack a `Limit` node for the query-level `LIMIT`/`OFFSET`. A bare `OFFSET` with
+/// no `LIMIT` is `count = u64::MAX`; no `LIMIT`/`OFFSET` leaves the plan unchanged.
+fn apply_limit(plan: LogicalPlan, limit: Option<u64>, offset: Option<u64>) -> LogicalPlan {
+    if let Some(limit) = limit {
+        LogicalPlan::Limit {
+            source: Box::new(plan),
+            count: limit,
+            offset,
+        }
+    } else if let Some(offset) = offset {
+        LogicalPlan::Limit {
+            source: Box::new(plan),
+            count: u64::MAX,
+            offset: Some(offset),
+        }
+    } else {
+        plan
     }
 }
 
@@ -316,21 +346,7 @@ fn plan_select_body(
         plan = apply_distinct_and_projection(plan, select, distinct_keys, expressions);
     }
 
-    if let Some(limit) = limit {
-        plan = LogicalPlan::Limit {
-            source: Box::new(plan),
-            count: limit,
-            offset,
-        };
-    } else if let Some(offset) = offset {
-        plan = LogicalPlan::Limit {
-            source: Box::new(plan),
-            count: u64::MAX,
-            offset: Some(offset),
-        };
-    }
-
-    Ok(plan)
+    Ok(apply_limit(plan, limit, offset))
 }
 
 /// Stack the optional `Distinct` node below the `Projection`. `Distinct` sits

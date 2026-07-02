@@ -10,7 +10,7 @@ mod simplify;
 pub use binder::{bind, bind_parameterized};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
-    BoundReturning, BoundSelect, BoundSelectItem, BoundStatement,
+    BoundReturning, BoundSelect, BoundSelectItem, BoundStatement, BoundValues, OutputColumn,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -98,6 +98,7 @@ fn insert_source_mutates_sequences(source: &BoundInsertSource) -> bool {
 fn query_mutates_sequences(query: &BoundQuery) -> bool {
     let body_mutates = match &query.body {
         BoundQueryBody::Select(select) => select_mutates_sequences(select),
+        BoundQueryBody::Values(values) => values.rows.iter().flatten().any(expr_mutates_sequences),
     };
     body_mutates
         || query
@@ -450,6 +451,69 @@ mod tests {
         // it must not silently produce a zero-column result.
         let err = bind(&parse("select *").unwrap(), &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_binds_values_body_with_unified_column_types() {
+        let catalog = catalog_with_users();
+        // Column types are inferred per column; a bare NULL adopts the column type
+        // and makes the column nullable.
+        let bound = bind(&parse("values (1, 'a'), (null, 'b')").unwrap(), &catalog).unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::Values(values) = &query.body else {
+            panic!("expected a VALUES body");
+        };
+        assert_eq!(values.rows.len(), 2);
+        let schema = query.output_schema();
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0].name, "column1");
+        assert_eq!(schema[0].data_type, DataType::Integer);
+        assert_eq!(schema[1].data_type, DataType::Text);
+        // Nullability is exposed via output_columns: column1 has a NULL entry.
+        let output = query.output_columns();
+        assert!(output[0].nullable);
+        assert!(!output[1].nullable);
+    }
+
+    #[test]
+    fn binder_rejects_values_type_mismatch_across_rows() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("values (1), ('a')").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_rejects_values_rows_of_differing_width() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("values (1, 2), (3)").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_rejects_values_all_null_column() {
+        let catalog = catalog_with_users();
+        // An all-NULL column has no inferable type under the strict no-cast rule.
+        let err = bind(&parse("values (null), (null)").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_binds_values_derived_table_columns() {
+        let catalog = catalog_with_users();
+        let bound = bind(
+            &parse("select t.x from (values (10), (20)) as t(x)").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        // The derived table exposes its VALUES columns (renamed to `x`) to the
+        // outer scope, so the projection resolves and is typed Integer.
+        assert_eq!(query.output_schema()[0].name, "x");
+        assert_eq!(query.output_schema()[0].data_type, DataType::Integer);
     }
 
     #[test]

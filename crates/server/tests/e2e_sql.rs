@@ -3281,3 +3281,127 @@ async fn e2e_from_less_select() {
         err.message
     );
 }
+
+/// Standalone `VALUES` as a query body, and `VALUES` in FROM / IN subqueries.
+/// Exercises the `QueryBody::Values` variant end to end (parse -> bind -> plan ->
+/// execute), reusing the existing Values plan node.
+#[tokio::test]
+async fn e2e_values_query() {
+    let server = TestServer::start().await.unwrap();
+
+    // Top-level single-column VALUES -> one row per list.
+    let rows = server
+        .simple_query("values (1), (2), (3)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // Multi-column VALUES with mixed types.
+    let rows = server
+        .simple_query("values (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("a".to_string())],
+            vec![Some("2".to_string()), Some("b".to_string())],
+        ]
+    );
+
+    // A bare NULL in a column adopts that column's type; the column is nullable.
+    let rows = server
+        .simple_query("values (1), (null), (3)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![None],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // LIMIT / OFFSET apply to a VALUES body.
+    let rows = server
+        .simple_query("values (1), (2), (3), (4) limit 2 offset 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string())], vec![Some("3".to_string())]]
+    );
+
+    // VALUES in FROM as a derived table, with a column alias list.
+    let rows = server
+        .simple_query("select x + 1 from (values (10), (20)) as t(x)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("11".to_string())], vec![Some("21".to_string())]]
+    );
+
+    // VALUES as the right side of IN.
+    let rows = server
+        .simple_query("select 1 where 2 in (values (1), (2), (3))")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    let rows = server
+        .simple_query("select 1 where 9 in (values (1), (2), (3))")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    // Mismatched column types across rows are rejected (no implicit casts).
+    let err = server
+        .simple_query("values (1), ('a')")
+        .await
+        .err()
+        .expect("VALUES with mismatched column types should fail");
+    assert!(
+        err.message.contains("42804"),
+        "expected DatatypeMismatch: {}",
+        err.message
+    );
+
+    // Rows of differing width are rejected.
+    let err = server
+        .simple_query("values (1, 2), (3)")
+        .await
+        .err()
+        .expect("VALUES with unequal row widths should fail");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError: {}",
+        err.message
+    );
+
+    // ORDER BY over a bare VALUES is not supported yet.
+    let err = server
+        .simple_query("values (3), (1), (2) order by 1")
+        .await
+        .err()
+        .expect("ORDER BY over VALUES should be rejected for now");
+    assert!(
+        err.message.contains("0A000"),
+        "expected FeatureNotSupported: {}",
+        err.message
+    );
+}

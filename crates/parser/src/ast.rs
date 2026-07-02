@@ -181,12 +181,16 @@ pub struct Query {
     pub offset: Option<u64>,
 }
 
-/// The body of a query expression. Only a single `SELECT` is supported today;
-/// set operations and standalone `VALUES` attach here as new variants without
-/// disturbing the [`Query`] wrapper or the conversion/binding/planning pipeline.
+/// The body of a query expression. Set operations attach here as a further
+/// variant without disturbing the [`Query`] wrapper or the conversion/binding/
+/// planning pipeline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueryBody {
     Select(Select),
+    /// A `VALUES` list used as a query body (`VALUES (1,'a'), (2,'b')`): a literal
+    /// row set. Each inner `Vec` is one row; all rows must have the same width.
+    /// Output columns are unnamed (`column1`, `column2`, ...).
+    Values(Vec<Vec<Expr>>),
 }
 
 /// A single `SELECT` block, without the query-level `ORDER BY`/`LIMIT`/`OFFSET`

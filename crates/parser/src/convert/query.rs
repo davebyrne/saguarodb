@@ -41,31 +41,42 @@ pub(super) fn convert_query(query: sql::Query) -> Result<Query> {
     })
 }
 
-/// Convert a query body (`SetExpr`) into a [`QueryBody`]. Only a single `SELECT`
-/// is supported today; set operations, standalone `VALUES`, and other bodies fall
-/// through to `unsupported` — the seam where a `QueryBody::SetOp`/`Values` variant
-/// and its arm attach later. A parenthesized nested query is handled only in the
-/// subquery path (`convert_set_expr_to_query`), matching prior behavior.
+/// Convert a query body (`SetExpr`) into a [`QueryBody`]. `SELECT` and `VALUES`
+/// are supported; set operations attach here as a further arm later. Other bodies
+/// (a nested parenthesized query, `TABLE`, `INSERT`/`UPDATE` as a body) fall
+/// through to `unsupported`. A parenthesized nested query with its own ORDER BY/
+/// LIMIT is handled only in the subquery path (`convert_set_expr_to_query`).
 fn convert_query_body(set_expr: sql::SetExpr) -> Result<QueryBody> {
     match set_expr {
         sql::SetExpr::Select(select) => Ok(QueryBody::Select(convert_select(*select)?)),
+        sql::SetExpr::Values(values) => Ok(QueryBody::Values(convert_values(values)?)),
         _ => unsupported("unsupported SELECT body"),
     }
 }
 
+/// Convert a `VALUES` list's rows of expressions. The `explicit_row` (`VALUES
+/// ROW(...)`) spelling is semantically identical and accepted.
+fn convert_values(values: sql::Values) -> Result<Vec<Vec<Expr>>> {
+    values
+        .rows
+        .iter()
+        .map(|row| row.iter().map(convert_expr).collect::<Result<Vec<_>>>())
+        .collect()
+}
+
 /// Convert a subquery body (`Box<SetExpr>`, as carried by `IN (subquery)`) into a
-/// [`Query`]. A bare `SELECT` has no ORDER BY / LIMIT of its own; a parenthesized
-/// query may, so it is routed through the full query converter.
+/// [`Query`]. A parenthesized query may carry its own ORDER BY / LIMIT, so it is
+/// routed through the full query converter; any other body has no modifiers of its
+/// own and reuses [`convert_query_body`].
 pub(super) fn convert_set_expr_to_query(set_expr: sql::SetExpr) -> Result<Query> {
     match set_expr {
-        sql::SetExpr::Select(select) => Ok(Query {
-            body: QueryBody::Select(convert_select(*select)?),
+        sql::SetExpr::Query(query) => convert_query(*query),
+        other => Ok(Query {
+            body: convert_query_body(other)?,
             order_by: Vec::new(),
             limit: None,
             offset: None,
         }),
-        sql::SetExpr::Query(query) => convert_query(*query),
-        _ => unsupported("unsupported subquery body"),
     }
 }
 

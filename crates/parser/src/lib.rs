@@ -91,7 +91,9 @@ mod tests {
         else {
             panic!("expected scalar subquery, got {:?}", select.columns[0]);
         };
-        let QueryBody::Select(inner) = &subquery.body;
+        let QueryBody::Select(inner) = &subquery.body else {
+            panic!("expected a plain SELECT subquery body");
+        };
         assert!(
             matches!(inner.from.as_slice(), [FromItem::Table { name, .. }] if name == "accounts")
         );
@@ -195,6 +197,21 @@ mod tests {
     fn rejects_derived_table_without_alias() {
         let err = parse("select * from (select id from users)").unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn parses_top_level_values() {
+        let stmt = parse("values (1, 'a'), (2, 'b')").unwrap();
+        let Statement::Query(Query {
+            body: QueryBody::Values(rows),
+            ..
+        }) = stmt
+        else {
+            panic!("expected a VALUES query");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 2);
+        assert!(matches!(rows[0][0], Expr::Literal(Value::Integer(1))));
     }
 
     #[test]

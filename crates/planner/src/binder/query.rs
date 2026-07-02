@@ -7,19 +7,19 @@ use parser::{Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, Se
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
-    BoundSelectItem, JoinType,
+    BoundSelectItem, BoundValues, JoinType,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::{
     BindContext, Binding, contains_aggregate, input_ref, plan_error, reject_aggregate,
-    require_table,
+    require_table, require_type,
 };
 
 /// Bind a query expression: bind the body, then attach the query-level
-/// `ORDER BY`/`LIMIT`/`OFFSET`. Only a `SELECT` body exists today; set operations
-/// and standalone `VALUES` add arms here without disturbing the callers (top-level
-/// statement, derived table, `INSERT ... SELECT`, subquery expression).
+/// `ORDER BY`/`LIMIT`/`OFFSET`. Set operations add an arm here without disturbing
+/// the callers (top-level statement, derived table, `INSERT ... SELECT`, subquery
+/// expression).
 pub(super) fn bind_query(
     catalog: &dyn CatalogManager,
     query: &Query,
@@ -29,13 +29,108 @@ pub(super) fn bind_query(
         QueryBody::Select(select) => {
             let (bound_select, order_by) = bind_select(catalog, select, &query.order_by, declared)?;
             Ok(BoundQuery {
-                body: BoundQueryBody::Select(bound_select),
+                body: BoundQueryBody::Select(Box::new(bound_select)),
                 order_by,
                 limit: query.limit,
                 offset: query.offset,
             })
         }
+        QueryBody::Values(rows) => {
+            // `ORDER BY` over a bare VALUES needs output-position ordering, which
+            // arrives with set operations; until then it is rejected. `LIMIT`/
+            // `OFFSET` need no binding and pass through to the wrapper.
+            if !query.order_by.is_empty() {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "ORDER BY over VALUES is not supported yet",
+                ));
+            }
+            let values = bind_values(catalog, rows, declared)?;
+            Ok(BoundQuery {
+                body: BoundQueryBody::Values(values),
+                order_by: Vec::new(),
+                limit: query.limit,
+                offset: query.offset,
+            })
+        }
     }
+}
+
+/// Bind a `VALUES` body. Every row must have the same width. Each column's type is
+/// the common type of its entries under the strict no-implicit-cast rule: a bare
+/// `NULL` takes the inferred column type, and every non-`NULL` entry must match it
+/// exactly (else `DatatypeMismatch`); an all-`NULL` column has no inferable type
+/// and is rejected. VALUES is a leaf (no bindings), so column references inside it
+/// cannot resolve. Output columns are named `column1`, `column2`, ...
+fn bind_values(
+    catalog: &dyn CatalogManager,
+    rows: &[Vec<Expr>],
+    declared: &[Option<DataType>],
+) -> Result<BoundValues> {
+    let width = rows[0].len();
+    for row in rows {
+        if row.len() != width {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                "VALUES lists must all be the same length",
+            ));
+        }
+    }
+
+    // Pass 1: infer each column's type from its first non-NULL entry. An all-NULL
+    // column has no inferable type and is rejected (the strict no-implicit-cast
+    // rule gives no default type).
+    let mut output_schema = Vec::with_capacity(width);
+    for column in 0..width {
+        let mut data_type = None;
+        for row in rows {
+            if matches!(row[column], Expr::Literal(Value::Null)) {
+                continue;
+            }
+            let mut ctx = BindContext::new(catalog, declared);
+            data_type = Some(bind_expr(&mut ctx, &row[column], None)?.data_type());
+            break;
+        }
+        let Some(data_type) = data_type else {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "could not determine data type of VALUES column {}",
+                    column + 1
+                ),
+            ));
+        };
+        output_schema.push(ColumnInfo {
+            name: format!("column{}", column + 1),
+            data_type,
+            table_id: None,
+            column_id: None,
+            // A VALUES column is computed from its rows, with no single declared
+            // wire type, so it reports the collapsed default for `data_type`.
+            pg_type: None,
+        });
+    }
+
+    // Pass 2: bind every entry against its column type — bare NULLs adopt it, and
+    // every other entry must match it exactly.
+    let mut bound_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut bound_row = Vec::with_capacity(width);
+        for (column, expr) in row.iter().enumerate() {
+            let data_type = output_schema[column].data_type.clone();
+            let mut ctx = BindContext::new(catalog, declared);
+            let bound = bind_expr(&mut ctx, expr, Some(data_type.clone()))?;
+            reject_aggregate(&bound)?;
+            require_type(&bound, data_type)?;
+            bound_row.push(bound);
+        }
+        bound_rows.push(bound_row);
+    }
+
+    Ok(BoundValues {
+        rows: bound_rows,
+        output_schema,
+    })
 }
 
 /// Bind a single `SELECT` block together with the query-level `order_by` (bound
@@ -226,30 +321,29 @@ fn bind_derived_table(
     column_aliases: &[String],
 ) -> Result<BoundFrom> {
     let query = bind_query(catalog, subquery, &ctx.declared_params)?;
-    let BoundQueryBody::Select(select) = &query.body;
-    if column_aliases.len() > select.columns.len() {
+    let output = query.output_columns();
+    if column_aliases.len() > output.len() {
         return Err(plan_error(
             SqlState::SyntaxError,
             format!(
                 "table \"{alias}\" has {} columns available but {} column aliases specified",
-                select.columns.len(),
+                output.len(),
                 column_aliases.len()
             ),
         ));
     }
 
-    let columns: Vec<ColumnDef> = select
-        .columns
+    let columns: Vec<ColumnDef> = output
         .iter()
         .enumerate()
-        .map(|(index, item)| ColumnDef {
+        .map(|(index, column)| ColumnDef {
             id: index as ColumnId,
             name: column_aliases
                 .get(index)
                 .cloned()
-                .unwrap_or_else(|| item.alias.clone()),
-            data_type: item.expr.data_type(),
-            nullable: item.expr.nullable(),
+                .unwrap_or_else(|| column.name.clone()),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
             max_length: None,
             default: None,
             pg_type: None,
