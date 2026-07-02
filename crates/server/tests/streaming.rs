@@ -85,3 +85,49 @@ async fn streamed_select_inside_transaction_preserves_block_status() {
     );
     assert_eq!(conn.ok("commit").await.status, b'I');
 }
+
+/// A mid-stream error (division by zero on the second row) aborts the streamed
+/// read; in autocommit the connection returns to idle and stays usable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_select_error_autocommit_recovers() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, v integer)")
+        .await;
+    conn.ok("insert into t (id, v) values (1, 5), (2, 0)").await;
+
+    // Row 1 (10/5) streams; row 2 (10/0) fails mid-stream after a DataRow.
+    let outcome = conn.ok("select 10 / v from t order by id").await;
+    assert!(outcome.result.is_err(), "the streamed read fails");
+    assert_eq!(outcome.status, b'I', "autocommit returns to idle");
+
+    // The connection is intact for the next query.
+    let rows = conn.ok("select id from t order by id").await.rows();
+    assert_eq!(rows.len(), 2);
+}
+
+/// The same failing streamed read inside an explicit transaction poisons the
+/// block ('E'); only ROLLBACK/COMMIT are then accepted, and ROLLBACK recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streamed_select_error_inside_transaction_poisons_block() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, v integer)")
+        .await;
+    conn.ok("insert into t (id, v) values (1, 5), (2, 0)").await;
+
+    assert_eq!(conn.ok("begin").await.status, b'T');
+    let outcome = conn.ok("select 10 / v from t order by id").await;
+    assert!(outcome.result.is_err(), "the streamed read fails");
+    assert_eq!(outcome.status, b'E', "the block is poisoned");
+
+    // A further statement is rejected until the block ends.
+    let rejected = conn.ok("select id from t").await;
+    assert!(
+        rejected.result.is_err(),
+        "commands are ignored while failed"
+    );
+    assert_eq!(rejected.status, b'E');
+
+    assert_eq!(conn.ok("rollback").await.status, b'I');
+}

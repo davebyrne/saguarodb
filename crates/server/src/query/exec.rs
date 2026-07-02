@@ -300,7 +300,7 @@ impl QueryService {
                 // transaction's own aborted writes, not to committed deletes/updates).
                 // A streamed outcome is always a read, which leaves no dead versions.
                 let dead = match &outcome {
-                    StreamOutcome::Streamed => 0,
+                    StreamOutcome::Streamed { .. } => 0,
                     StreamOutcome::Direct(result) => dead_versions_in(result),
                 };
                 txn.dead_versions_pending = txn.dead_versions_pending.saturating_add(dead);

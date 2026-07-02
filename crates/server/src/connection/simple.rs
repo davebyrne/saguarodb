@@ -76,8 +76,8 @@ impl Session {
         // Stream rows to the socket as they arrive. `RowDescription` comes from the
         // first `Start` message; a socket-write or encode failure stops the drain
         // and is surfaced only after the task is joined (so the transaction slot is
-        // never lost).
-        let mut row_count: usize = 0;
+        // never lost). The `SELECT n` count is taken from the producer's outcome,
+        // not re-derived here.
         let mut write_err: Option<DbError> = None;
         while let Some(message) = row_rx.recv().await {
             let write_result = match message {
@@ -93,10 +93,7 @@ impl Session {
                     .await
                 }
                 StreamMessage::Rows(rows) => match encode_data_rows(&rows) {
-                    Ok(messages) => {
-                        row_count += rows.len();
-                        write_messages(stream, codec, &messages).await
-                    }
+                    Ok(messages) => write_messages(stream, codec, &messages).await,
                     Err(err) => Err(err),
                 },
             };
@@ -142,14 +139,15 @@ impl Session {
 
         match outcome {
             // A streamed SELECT: `RowDescription` and `DataRow`s were already
-            // written above; finish with the command tag and status.
-            Ok(StreamOutcome::Streamed) => {
+            // written above; finish with the command tag (the producer's
+            // authoritative row count) and status.
+            Ok(StreamOutcome::Streamed { count }) => {
                 drop(guard);
                 write_messages(
                     stream,
                     codec,
                     &[
-                        ServerMessage::CommandComplete(format!("SELECT {row_count}")),
+                        ServerMessage::CommandComplete(format!("SELECT {count}")),
                         ServerMessage::ReadyForQuery(status),
                     ],
                 )

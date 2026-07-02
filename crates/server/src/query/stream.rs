@@ -31,9 +31,10 @@ pub enum StreamMessage {
 
 /// The outcome of a (possibly streaming) statement execution.
 pub enum StreamOutcome {
-    /// A SELECT whose rows were streamed through the channel. The row count for
-    /// the command tag is tracked by the consumer draining the channel.
-    Streamed,
+    /// A SELECT whose rows were streamed through the channel. `count` is the
+    /// authoritative number of rows produced by the drive (used for the
+    /// `SELECT n` command tag).
+    Streamed { count: u64 },
     /// Any non-streamed result — DML, DDL, EXPLAIN, a COPY request, or a SELECT
     /// run on the materializing path — returned in full.
     Direct(ExecutionResult),
@@ -46,7 +47,7 @@ impl StreamOutcome {
     pub(crate) fn expect_direct(self) -> ExecutionResult {
         match self {
             StreamOutcome::Direct(result) => result,
-            StreamOutcome::Streamed => {
+            StreamOutcome::Streamed { .. } => {
                 unreachable!("a streamed outcome cannot arise without a row sink")
             }
         }

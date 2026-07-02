@@ -654,8 +654,8 @@ fn exec_or_stream(
 ) -> Result<StreamOutcome> {
     match sink {
         Some(sink) => {
-            engine.execute_query_streamed(ctx, physical, sink, STREAM_BATCH_ROWS)?;
-            Ok(StreamOutcome::Streamed)
+            let count = engine.execute_query_streamed(ctx, physical, sink, STREAM_BATCH_ROWS)?;
+            Ok(StreamOutcome::Streamed { count })
         }
         None => Ok(StreamOutcome::Direct(engine.execute(ctx, physical)?)),
     }
