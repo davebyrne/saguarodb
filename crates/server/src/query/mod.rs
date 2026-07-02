@@ -2902,4 +2902,50 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
     }
+
+    /// A gone consumer (client disconnected mid-stream) must stop the streamed
+    /// read cleanly rather than hanging or erroring: with the receiver dropped,
+    /// `ChannelRowSink::push` sees the closed channel and returns `Break`, so the
+    /// drive closes the executor and returns `Streamed`. Exercised without sockets
+    /// so it is fully deterministic; more than one batch of rows forces a
+    /// mid-drive `push` (and thus the early-stop `Break`).
+    #[test]
+    fn streamed_select_stops_cleanly_when_receiver_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+        let values = (1..=200)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        app.query_service
+            .execute_sql(&format!("insert into t (id) values {values}"))
+            .unwrap();
+
+        // Drop the receiver before any row is drained, as if the client vanished.
+        let (row_tx, row_rx) =
+            tokio::sync::mpsc::channel::<super::StreamMessage>(super::STREAM_CHANNEL_CAPACITY);
+        drop(row_rx);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (slot, _default, outcome) = app.query_service.execute_simple_streamed(
+            "select id from t order by id",
+            None,
+            IsolationLevel::default(),
+            &cancel,
+            Arc::new(SessionSequenceState::new()),
+            row_tx,
+        );
+
+        assert!(
+            matches!(outcome, Ok(super::StreamOutcome::Streamed { .. })),
+            "a dropped receiver stops the stream cleanly, not with an error or a hang"
+        );
+        assert!(
+            slot.is_none(),
+            "an autocommit read leaves no open transaction"
+        );
+    }
 }
