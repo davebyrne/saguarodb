@@ -11,7 +11,7 @@ pub mod test_support;
 
 pub use common::{ExecRow, RowIdentity};
 pub use expr::eval_expr;
-pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine};
+pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine, RowSink};
 pub use result::{CopyJob, ExecutionResult};
 
 #[cfg(test)]
@@ -2003,5 +2003,130 @@ mod tests {
                 .unwrap(),
             b"ann\t1\nbob\t2\n"
         );
+    }
+
+    /// A `RowSink` that records the schema, every batch's size, and all rows.
+    #[derive(Default)]
+    struct CollectingSink {
+        started: bool,
+        columns: Vec<ColumnInfo>,
+        batch_sizes: Vec<usize>,
+        rows: Vec<Row>,
+    }
+
+    impl crate::RowSink for CollectingSink {
+        fn start(&mut self, columns: &[ColumnInfo]) -> Result<()> {
+            self.started = true;
+            self.columns = columns.to_vec();
+            Ok(())
+        }
+
+        fn push(&mut self, rows: Vec<Row>) -> Result<std::ops::ControlFlow<()>> {
+            self.batch_sizes.push(rows.len());
+            self.rows.extend(rows);
+            Ok(std::ops::ControlFlow::Continue(()))
+        }
+    }
+
+    /// A `RowSink` that stops the scan once it has collected `limit` rows.
+    struct BreakAfterSink {
+        limit: usize,
+        rows: Vec<Row>,
+    }
+
+    impl crate::RowSink for BreakAfterSink {
+        fn start(&mut self, _columns: &[ColumnInfo]) -> Result<()> {
+            Ok(())
+        }
+
+        fn push(&mut self, rows: Vec<Row>) -> Result<std::ops::ControlFlow<()>> {
+            self.rows.extend(rows);
+            if self.rows.len() >= self.limit {
+                Ok(std::ops::ControlFlow::Break(()))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
+        }
+    }
+
+    fn seed_five_users(harness: &ExecutorHarness) {
+        harness
+            .execute(
+                "insert into users (id, name) \
+                 values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn streamed_select_matches_materialized_across_batch_sizes() {
+        let harness = ExecutorHarness::with_users();
+        seed_five_users(&harness);
+        let sql = "select id, name from users order by id";
+        let (columns, rows) = match harness.execute(sql).unwrap() {
+            ExecutionResult::Query { columns, rows } => (columns, rows),
+            other => panic!("expected a query result, got {other:?}"),
+        };
+
+        // Every batch size must reproduce the materialized result exactly: same
+        // columns, same rows, same order. Sizes span below, at, and above the row
+        // count so the final partial batch and the batch boundary are both covered.
+        for batch_size in [1usize, 2, 3, 5, 100] {
+            let mut sink = CollectingSink::default();
+            let count = harness
+                .stream_read_plan(sql, &mut sink, batch_size)
+                .unwrap();
+            assert!(sink.started, "start not called (batch_size={batch_size})");
+            assert_eq!(count, 5, "row count (batch_size={batch_size})");
+            assert_eq!(sink.columns, columns, "columns (batch_size={batch_size})");
+            assert_eq!(sink.rows, rows, "rows (batch_size={batch_size})");
+        }
+    }
+
+    #[test]
+    fn streamed_select_delivers_expected_batch_boundaries() {
+        let harness = ExecutorHarness::with_users();
+        seed_five_users(&harness);
+        let mut sink = CollectingSink::default();
+        harness
+            .stream_read_plan("select id from users order by id", &mut sink, 2)
+            .unwrap();
+        // Five rows in batches of two: [2, 2, 1].
+        assert_eq!(sink.batch_sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn streamed_select_break_stops_scan_early() {
+        let harness = ExecutorHarness::with_users();
+        seed_five_users(&harness);
+        // One row per batch; break once two rows have arrived. The engine must
+        // return immediately, having produced only the two rows it streamed — it
+        // must not drain the remaining three.
+        let mut sink = BreakAfterSink {
+            limit: 2,
+            rows: Vec::new(),
+        };
+        let count = harness
+            .stream_read_plan("select id from users order by id", &mut sink, 1)
+            .unwrap();
+        assert_eq!(count, 2, "streamed count reflects the early stop");
+        assert_eq!(sink.rows.len(), 2, "only the pre-break rows were delivered");
+    }
+
+    #[test]
+    fn streamed_empty_select_still_starts() {
+        let harness = ExecutorHarness::with_users();
+        let mut sink = CollectingSink::default();
+        let count = harness
+            .stream_read_plan("select id, name from users", &mut sink, 4)
+            .unwrap();
+        assert!(sink.started, "start must fire even with no rows");
+        assert_eq!(count, 0);
+        assert!(sink.rows.is_empty());
+        assert!(
+            sink.batch_sizes.is_empty(),
+            "no batches for an empty result"
+        );
+        assert_eq!(sink.columns.len(), 2, "schema is still reported");
     }
 }

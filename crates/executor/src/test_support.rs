@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use storage::{RowIterator, SchemaOperations, StorageEngine};
 
-use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine};
+use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 
 pub struct ExecutorHarness {
     catalog: MemoryCatalog,
@@ -97,6 +97,32 @@ impl ExecutorHarness {
             ExecutionResult::Query { rows, .. } => Ok(rows),
             _ => Err(common::DbError::internal("expected query result")),
         }
+    }
+
+    /// Stream a read query through `execute_query_streamed`, driving the provided
+    /// `sink` in batches of `batch_size`. Mirrors the read path of
+    /// `execute_with_cancel`; returns the number of rows streamed.
+    pub fn stream_read_plan(
+        &self,
+        sql: &str,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<u64> {
+        let statement = parser::parse(sql)?;
+        let bound = bind(&statement, &self.catalog)?;
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, &self.catalog)?;
+        let cancel = AtomicBool::new(false);
+        let ctx = ExecutionContext {
+            statement: StatementContext::new(0),
+            catalog: &self.catalog,
+            storage: &self.storage,
+            schema_ops: &self.storage,
+            gc_horizon: common::FIRST_NORMAL_XID,
+            cancel: &cancel,
+        };
+        self.engine
+            .execute_query_streamed(&ctx, &physical, sink, batch_size)
     }
 
     fn resolve_columns(&self, table: &str, columns: &[&str]) -> (TableId, Vec<ColumnId>) {

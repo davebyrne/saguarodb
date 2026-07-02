@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
@@ -63,6 +64,23 @@ pub trait PlanExecutor {
     fn close(&mut self) -> Result<()>;
 }
 
+/// A consumer of streamed query output. [`QueryEngine::execute_query_streamed`]
+/// calls [`RowSink::start`] once with the output schema, then [`RowSink::push`]
+/// with row batches until the plan is exhausted or the sink asks to stop.
+///
+/// This is the seam that lets the server stream `SELECT` results through a
+/// bounded channel without the `executor` crate depending on the channel type
+/// (`docs/specs/streaming.md` §3).
+pub trait RowSink {
+    /// Called once, before any rows, with the query's output columns.
+    fn start(&mut self, columns: &[ColumnInfo]) -> Result<()>;
+
+    /// Push a batch of rows. Returning [`ControlFlow::Break`] stops the scan
+    /// early (e.g. the downstream consumer is gone); the engine then closes the
+    /// executor and returns the count streamed so far.
+    fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>>;
+}
+
 pub struct QueryEngine;
 
 impl QueryEngine {
@@ -123,6 +141,29 @@ impl QueryEngine {
             } => execute_delete(ctx, *table, source, returning.as_ref()),
             _ => execute_query(ctx, plan),
         }
+    }
+
+    /// Drive a query `plan`, streaming its rows into `sink` in batches of at most
+    /// `batch_size` rows rather than materializing them into an
+    /// [`ExecutionResult::Query`]. Returns the number of rows streamed.
+    ///
+    /// This is the streaming counterpart of the `SELECT` arm of [`Self::execute`]
+    /// and shares its build/open/drive/close path (via [`drive_query`]), so the
+    /// streamed and materialized results cannot diverge
+    /// (`docs/specs/streaming.md` §3). The caller must hold the snapshot's
+    /// GC-horizon advertisement and any transaction guard for the full duration
+    /// of the call, exactly as the materializing path does.
+    pub fn execute_query_streamed(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        plan: &PhysicalPlan,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<u64> {
+        // Resolve uncorrelated subqueries up front, exactly as `execute` does
+        // before dispatching to `execute_query`.
+        let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
+        drive_query(ctx, &resolved, sink, batch_size)
     }
 }
 
@@ -275,19 +316,89 @@ pub(crate) fn build_executor<'a>(
     }
 }
 
+/// Batch size used to materialize a `SELECT` into an [`ExecutionResult::Query`].
+/// It only bounds temporary-batch churn on the non-streaming path (the rows are
+/// re-collected into one `Vec` regardless), so a large value minimizes overhead.
+const MATERIALIZE_BATCH_ROWS: usize = 1024;
+
 fn execute_query(ctx: &ExecutionContext<'_>, plan: &PhysicalPlan) -> Result<ExecutionResult> {
+    // The plan reaching here has already had its subqueries resolved by
+    // `QueryEngine::execute`; drive it into a collecting sink so the materialized
+    // path is the very same loop as the streaming path, and the two cannot
+    // diverge (`docs/specs/streaming.md` §3).
+    let mut sink = VecRowSink::default();
+    drive_query(ctx, plan, &mut sink, MATERIALIZE_BATCH_ROWS)?;
+    Ok(ExecutionResult::Query {
+        columns: sink.columns,
+        rows: sink.rows,
+    })
+}
+
+/// Build, open, and drive a *resolved* query `plan` into `sink`, closing the
+/// executor on every path. Shared by the materializing [`execute_query`] and the
+/// streaming [`QueryEngine::execute_query_streamed`].
+fn drive_query(
+    ctx: &ExecutionContext<'_>,
+    plan: &PhysicalPlan,
+    sink: &mut dyn RowSink,
+    batch_size: usize,
+) -> Result<u64> {
     let mut executor = build_executor(ctx, plan)?;
     open_executor(executor.as_mut())?;
-    let result = (|| {
-        let columns = executor.output_schema().to_vec();
-        let mut rows = Vec::new();
-        while let Some(row) = executor.next()? {
-            check_canceled(ctx)?;
-            rows.push(row.row);
-        }
-        Ok(ExecutionResult::Query { columns, rows })
-    })();
+    let result = drive_into_sink(ctx, executor.as_mut(), sink, batch_size);
     close_after(executor.as_mut(), result)
+}
+
+/// Emit the schema, then pull rows one at a time — polling cancellation between
+/// rows, exactly as the materializing loop did — accumulating them into batches
+/// of at most `batch_size` before handing each to `sink`. Stops early when the
+/// sink returns [`ControlFlow::Break`]. Returns the number of rows produced.
+fn drive_into_sink(
+    ctx: &ExecutionContext<'_>,
+    executor: &mut dyn PlanExecutor,
+    sink: &mut dyn RowSink,
+    batch_size: usize,
+) -> Result<u64> {
+    sink.start(executor.output_schema())?;
+    let mut count: u64 = 0;
+    let mut batch: Vec<Row> = Vec::with_capacity(batch_size);
+    while let Some(row) = executor.next()? {
+        check_canceled(ctx)?;
+        batch.push(row.row);
+        count += 1;
+        if batch.len() >= batch_size {
+            let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+            if sink.push(full)?.is_break() {
+                return Ok(count);
+            }
+        }
+    }
+    if !batch.is_empty() {
+        // This is the last batch; the scan is finished either way, so a `Break`
+        // request here has no remaining rows to skip.
+        let _ = sink.push(batch)?;
+    }
+    Ok(count)
+}
+
+/// A [`RowSink`] that materializes all rows into memory — the collecting sink
+/// behind the non-streaming [`execute_query`].
+#[derive(Default)]
+struct VecRowSink {
+    columns: Vec<ColumnInfo>,
+    rows: Vec<Row>,
+}
+
+impl RowSink for VecRowSink {
+    fn start(&mut self, columns: &[ColumnInfo]) -> Result<()> {
+        self.columns = columns.to_vec();
+        Ok(())
+    }
+
+    fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>> {
+        self.rows.extend(rows);
+        Ok(ControlFlow::Continue(()))
+    }
 }
 
 fn execute_insert(

@@ -30,6 +30,37 @@ pub trait PlanExecutor {
 
 Default `next_batch` calls `next` in a loop. Operators should release page pins and owned resources in `close` and `Drop`.
 
+### Streaming SELECT output
+
+`QueryEngine::execute_query_streamed` is the streaming counterpart of the SELECT
+arm of `execute`. Instead of materializing rows into `ExecutionResult::Query`, it
+drives the operator tree into a caller-supplied `RowSink` in batches, so the
+server can stream results through a bounded channel without the `executor` crate
+depending on any channel type (`docs/specs/streaming.md`).
+
+```rust
+pub trait RowSink {
+    fn start(&mut self, columns: &[ColumnInfo]) -> Result<()>;   // once, before rows
+    fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>>; // Break = stop early
+}
+
+impl QueryEngine {
+    pub fn execute_query_streamed(
+        &self, ctx: &ExecutionContext<'_>, plan: &PhysicalPlan,
+        sink: &mut dyn RowSink, batch_size: usize,
+    ) -> Result<u64>; // rows streamed
+}
+```
+
+`start` is called once with the output schema (even for an empty result), then
+`push` receives row batches of at most `batch_size` until the plan is exhausted
+or the sink returns `ControlFlow::Break` (e.g. the consumer is gone), after which
+the executor is closed. Cancellation is polled between rows exactly as the
+materializing path does. The materializing `execute_query` is itself expressed as
+this same drive with an in-memory collecting sink, so streamed and materialized
+results cannot diverge. The caller must hold the snapshot's GC-horizon
+advertisement and any transaction guard for the whole call, as with `execute`.
+
 ## Query Engine Boundary
 
 The concrete server `QueryService` wires:
@@ -38,7 +69,7 @@ The concrete server `QueryService` wires:
 parse -> bind -> logical_plan -> physical_plan -> execute
 ```
 
-For SELECT, it materializes plain `Row` values into `ExecutionResult::Query`. For DML/DDL, it executes immediately and returns command metadata. A future server streaming bridge may drive `PlanExecutor` directly without changing physical operator semantics.
+For SELECT, it either materializes plain `Row` values into `ExecutionResult::Query` or streams them through `execute_query_streamed` (see above); for DML/DDL, it executes immediately and returns command metadata. Streaming drives the same operators without changing their semantics.
 
 `ExecutionResult` has four variants: `Query` (SELECT rows and columns), `Modified { command, count }` (DML/DDL), `ModifiedReturning { command, count, columns, rows }` (a DML statement with a `RETURNING` clause — it both modifies rows and produces a result set; `count` drives the DML command tag while `columns`/`rows` are the `RETURNING` projection), and `Explanation { text }` (EXPLAIN). `QueryEngine::execute` produces `Query`, `Modified`, and `ModifiedReturning`; `Explanation` is produced by the server's `QueryService` (EXPLAIN never calls the executor), but the variant lives in the executor crate's `ExecutionResult`.
 
