@@ -435,6 +435,61 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
     server.await.unwrap();
 }
 
+/// A JDBC-style client that declares an `int4` parameter (OID 23) and binds it in
+/// binary (4 bytes): the `Parse` is accepted (previously rejected as an
+/// "unsupported parameter type OID"), `ParameterDescription` echoes int4, and the
+/// 4-byte binary bind decodes correctly.
+#[tokio::test]
+async fn extended_protocol_accepts_int4_parameter_oid_and_echoes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key, name text)",
+        "insert into users (id, name) values (1, 'Ada')",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    // Parse declaring $1 as int4 (OID 23), then Describe the statement.
+    let mut seq = parse_bytes("", "select name from users where id = $1", &[23]);
+    seq.extend(describe_statement_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b'1', 0, 0, 0, 4]),
+        "ParseComplete (int4 OID accepted)"
+    );
+    // ParameterDescription ('t') echoes the declared int4 OID: count 1, then OID 23.
+    assert!(
+        response.windows(6).any(|w| w == [0, 1, 0, 0, 0, 23]),
+        "ParameterDescription echoes int4 OID 23"
+    );
+
+    // Bind $1 as a 4-byte binary int4 value and execute.
+    let id = 1i32.to_be_bytes();
+    let mut seq = bind_bytes("", "", &[1], &[Some(&id[..])], &[0]);
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(response.windows(3).any(|w| w == b"Ada"), "row value");
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn extended_protocol_error_is_recoverable_via_sync() {
     let dir = tempfile::tempdir().unwrap();

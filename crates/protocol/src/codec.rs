@@ -663,12 +663,24 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .map_err(|_| protocol_error("invalid integer parameter"))?;
             Ok(Value::Integer(int))
         }
-        (DataType::Integer, ValueFormat::Binary) => {
-            let array: [u8; 8] = bytes
-                .try_into()
-                .map_err(|_| protocol_error("binary integer parameter must be 8 bytes"))?;
-            Ok(Value::Integer(i64::from_be_bytes(array)))
-        }
+        // All integer widths share one storage type, so a client may bind a
+        // parameter as int2 (2 bytes), int4 (4 bytes), or int8 (8 bytes); each is
+        // sign-extended to the internal 64-bit integer.
+        (DataType::Integer, ValueFormat::Binary) => match bytes.len() {
+            2 => Ok(Value::Integer(i64::from(i16::from_be_bytes([
+                bytes[0], bytes[1],
+            ])))),
+            4 => Ok(Value::Integer(i64::from(i32::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ])))),
+            8 => {
+                let array: [u8; 8] = bytes.try_into().expect("length checked");
+                Ok(Value::Integer(i64::from_be_bytes(array)))
+            }
+            _ => Err(protocol_error(
+                "binary integer parameter must be 2, 4, or 8 bytes",
+            )),
+        },
         (DataType::Double, ValueFormat::Text) => {
             let text = decode_utf8(bytes, "double precision parameter")?;
             common::float::parse_double(text)
@@ -811,13 +823,6 @@ fn parse_bool_text(text: &str) -> Result<Value> {
         .ok_or_else(|| protocol_error("invalid boolean parameter"))
 }
 
-/// PostgreSQL type OID for a `DataType` that carries no declared wire type (e.g.
-/// an extended-protocol parameter). Uses the collapsed default (`Integer` =>
-/// int8, `Text` => text); see [`PgType`] for the width/kind-aware mapping.
-pub fn type_oid(data_type: &DataType) -> i32 {
-    PgType::from(data_type).oid()
-}
-
 fn put_error_field(body: &mut Vec<u8>, field: u8, value: &str) {
     body.push(field);
     put_cstr(body, value);
@@ -853,6 +858,34 @@ fn checked_i32(value: usize, message: &'static str) -> i32 {
 
 fn protocol_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::SyntaxError, message)
+}
+
+#[cfg(test)]
+mod integer_param_tests {
+    use super::decode_value;
+    use common::{DataType, Value};
+
+    #[test]
+    fn binary_integer_parameter_accepts_2_4_8_byte_widths() {
+        // A client may bind an integer parameter as int2, int4, or int8; each
+        // binary width sign-extends to the internal 64-bit integer.
+        for (bytes, expected) in [
+            (1234i16.to_be_bytes().to_vec(), 1234_i64),
+            ((-1234i16).to_be_bytes().to_vec(), -1234),
+            (100_000i32.to_be_bytes().to_vec(), 100_000),
+            ((-100_000i32).to_be_bytes().to_vec(), -100_000),
+            (5_000_000_000i64.to_be_bytes().to_vec(), 5_000_000_000),
+        ] {
+            assert_eq!(
+                decode_value(&bytes, DataType::Integer, 1).unwrap(),
+                Value::Integer(expected),
+                "binary width {}",
+                bytes.len()
+            );
+        }
+        // Any other length is rejected.
+        assert!(decode_value(&[0, 0, 0], DataType::Integer, 1).is_err());
+    }
 }
 
 #[cfg(test)]

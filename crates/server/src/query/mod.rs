@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::{
-    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, Result,
+    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, PgType, Result,
     SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
@@ -303,7 +303,7 @@ impl QueryService {
     pub fn prepare_sql(
         &self,
         sql: &str,
-        declared_param_types: &[Option<DataType>],
+        declared_param_types: &[Option<PgType>],
     ) -> Result<PreparedStatement> {
         let statement = parser::parse(sql)?;
         let class = statement_class(&statement)?;
@@ -334,7 +334,7 @@ impl QueryService {
                 class,
                 bound: None,
                 maintenance: None,
-                param_types: Vec::new(),
+                param_pg_types: Vec::new(),
                 result_columns: None,
             });
         }
@@ -346,21 +346,40 @@ impl QueryService {
                 class,
                 bound: None,
                 maintenance: Some(statement),
-                param_types: Vec::new(),
+                param_pg_types: Vec::new(),
                 result_columns: None,
             });
         }
+        // The binder resolves parameter types as `DataType` (declared or inferred).
+        let declared_data_types: Vec<Option<DataType>> = declared_param_types
+            .iter()
+            .map(|pg_type| pg_type.as_ref().map(PgType::data_type))
+            .collect();
         let (bound, param_types) = bind_parameterized(
             &statement,
             self.components.catalog.as_ref(),
-            declared_param_types,
+            &declared_data_types,
         )?;
+        // Remember each parameter's wire type so `ParameterDescription` echoes the
+        // OID the client declared; an inferred parameter falls back to the collapsed
+        // default from its resolved `DataType`.
+        let param_pg_types = param_types
+            .iter()
+            .enumerate()
+            .map(|(index, data_type)| {
+                declared_param_types
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| PgType::from(data_type))
+            })
+            .collect();
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
             class,
             bound: Some(bound),
             maintenance: None,
-            param_types,
+            param_pg_types,
             result_columns,
         })
     }
@@ -634,12 +653,12 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<BoundStatement> {
-        if params.len() != prepared.param_types.len() {
+        if params.len() != prepared.param_pg_types.len() {
             return Err(DbError::protocol(
                 SqlState::SyntaxError,
                 format!(
                     "prepared statement requires {} parameter(s), but {} were supplied",
-                    prepared.param_types.len(),
+                    prepared.param_pg_types.len(),
                     params.len()
                 ),
             ));
@@ -855,14 +874,18 @@ pub struct PreparedStatement {
     /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can run
     /// it through `run_vacuum`. `None` for every other class.
     maintenance: Option<Statement>,
-    param_types: Vec<DataType>,
+    /// Resolved parameter wire types, by position: the client-declared `PgType`
+    /// where an OID was given, otherwise the collapsed default inferred by the
+    /// binder. Drives both `ParameterDescription` (OID echo) and parameter decode
+    /// (via `PgType::data_type`).
+    param_pg_types: Vec<PgType>,
     result_columns: Option<Vec<ColumnInfo>>,
 }
 
 impl PreparedStatement {
-    /// Resolved parameter types, by position.
-    pub fn param_types(&self) -> &[DataType] {
-        &self.param_types
+    /// Resolved parameter wire types, by position.
+    pub fn param_pg_types(&self) -> &[PgType] {
+        &self.param_pg_types
     }
 
     /// Whether this is a transaction-control statement (BEGIN/COMMIT/ROLLBACK).
@@ -990,10 +1013,10 @@ mod tests {
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use catalog::{CatalogManager, CatalogSnapshot, MemoryCatalog};
     use common::{
-        ConcurrencyController, DataType, DbError, FlushPolicy, IndexId, IndexSchema,
-        IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, Result, RwLockConcurrencyController,
-        SequenceId, SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId,
-        TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+        ConcurrencyController, DbError, FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn,
+        PageFlushInfo, ParsedColumnDef, PgType, Result, RwLockConcurrencyController, SequenceId,
+        SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId, TableSchema,
+        TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -2903,7 +2926,9 @@ mod tests {
             .query_service
             .prepare_sql("select name from users where id = $1", &[])
             .unwrap();
-        assert_eq!(prepared.param_types(), &[DataType::Integer]);
+        // No declared OID: the binder infers an integer parameter, which echoes
+        // the collapsed default wire type (int8).
+        assert_eq!(prepared.param_pg_types(), &[PgType::Int8]);
         assert_eq!(prepared.result_columns().unwrap().len(), 1);
 
         for (id, name) in [(2, "Bo"), (1, "Ada")] {
@@ -2930,7 +2955,7 @@ mod tests {
             .query_service
             .prepare_sql("insert into users (id, name) values ($1, $2)", &[])
             .unwrap();
-        assert_eq!(prepared.param_types(), &[DataType::Integer, DataType::Text]);
+        assert_eq!(prepared.param_pg_types(), &[PgType::Int8, PgType::Text]);
         assert!(prepared.result_columns().is_none());
 
         app.query_service

@@ -167,9 +167,16 @@ that `DataType` intentionally collapses:
 `type_modifier` (`atttypmod`) is `varchar(n)`/`char(n)` -> `n + 4`,
 `numeric(p, s)` -> `((p << 16) | s) + 4`, and `-1` otherwise.
 
-The public helper `type_oid(data_type: &DataType) -> i32` returns the collapsed
-default OID for a bare `DataType` with no declared wire type (used for an
-extended-protocol `ParameterDescription`); it is `PgType::from(data_type).oid()`.
+On input, an extended-protocol `Parse` may declare each parameter's type OID.
+The accepted OIDs are the wire types above plus `0` (unspecified — the server
+infers the type): the distinct integer widths `int2` (`21`), `int4` (`23`),
+`int8` (`20`) all resolve to the single integer type, and `varchar` (`1043`) /
+`bpchar` (`1042`) / `text` (`25`) all resolve to text; any other OID is rejected
+with an "unsupported parameter type OID" error. The server remembers each
+declared wire type so `ParameterDescription` echoes the exact OID the client
+declared (an inferred parameter falls back to the collapsed default). A binary
+integer parameter may be bound as 2, 4, or 8 bytes (`int2`/`int4`/`int8`); each
+is sign-extended to the internal 64-bit integer.
 
 The simple query path sends text format for all columns. The extended protocol
 lets a client request binary format (code `1`) per column via `Bind`;

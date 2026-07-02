@@ -3,7 +3,7 @@ mod messages;
 mod state;
 
 pub use codec::{
-    PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type, type_oid,
+    PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type,
 };
 pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
@@ -421,8 +421,8 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_malformed_input() {
-        // Binary int8 must be exactly 8 bytes.
-        assert!(decode_value(&[0, 0, 0, 1], DataType::Integer, 1).is_err());
+        // Binary integer must be 2, 4, or 8 bytes (3 is malformed).
+        assert!(decode_value(&[0, 0, 0], DataType::Integer, 1).is_err());
         // Binary bool must be a single 0/1 byte.
         assert!(decode_value(&[2], DataType::Boolean, 1).is_err());
         // Unparseable text integer.

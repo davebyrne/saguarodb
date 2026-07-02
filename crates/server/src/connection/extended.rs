@@ -1,4 +1,4 @@
-use common::{ColumnInfo, DataType, DbError, Result, Row, Value};
+use common::{ColumnInfo, DbError, PgType, Result, Row, Value};
 use executor::ExecutionResult;
 use protocol::{PostgresCodec, ServerMessage, StatementKind};
 use std::sync::Arc;
@@ -167,7 +167,7 @@ impl Session {
     ) -> Result<Vec<ServerMessage>> {
         let declared = param_type_oids
             .iter()
-            .map(|oid| oid_to_data_type(*oid))
+            .map(|oid| oid_to_pg_type(*oid))
             .collect::<Result<Vec<_>>>()?;
         let prepared = self.app.query_service.prepare_sql(&query, &declared)?;
         self.prepared.insert(name, Arc::new(prepared));
@@ -207,11 +207,7 @@ impl Session {
                 let prepared = self.prepared.get(name).ok_or_else(|| {
                     protocol_error(format!("prepared statement \"{name}\" does not exist"))
                 })?;
-                let oids = prepared
-                    .param_types()
-                    .iter()
-                    .map(protocol::type_oid)
-                    .collect();
+                let oids = prepared.param_pg_types().iter().map(PgType::oid).collect();
                 Ok(vec![
                     ServerMessage::ParameterDescription(oids),
                     row_description_or_no_data(prepared.result_columns(), &[]),
@@ -265,29 +261,41 @@ impl Session {
     }
 }
 
-fn oid_to_data_type(oid: i32) -> Result<Option<DataType>> {
-    match oid {
-        0 => Ok(None),
-        20 => Ok(Some(DataType::Integer)),
-        25 => Ok(Some(DataType::Text)),
-        16 => Ok(Some(DataType::Boolean)),
-        1082 => Ok(Some(DataType::Date)),
-        1114 => Ok(Some(DataType::Timestamp)),
-        17 => Ok(Some(DataType::Bytea)),
-        2950 => Ok(Some(DataType::Uuid)),
-        701 => Ok(Some(DataType::Double)),
-        700 => Ok(Some(DataType::Real)),
-        1083 => Ok(Some(DataType::Time)),
-        1184 => Ok(Some(DataType::TimestampTz)),
-        1186 => Ok(Some(DataType::Interval)),
-        1700 => Ok(Some(DataType::Numeric {
+/// Map a client-declared parameter type OID to its wire type. Accepts the
+/// distinct integer widths (int2/int4/int8) and character kinds
+/// (text/varchar/bpchar); `0` is the unspecified marker (the server infers the
+/// type). The wire type is remembered so `ParameterDescription` can echo the
+/// exact OID the client declared, and its `DataType` drives binding/decoding.
+fn oid_to_pg_type(oid: i32) -> Result<Option<PgType>> {
+    let pg_type = match oid {
+        0 => return Ok(None),
+        16 => PgType::Bool,
+        17 => PgType::Bytea,
+        20 => PgType::Int8,
+        21 => PgType::Int2,
+        23 => PgType::Int4,
+        25 => PgType::Text,
+        700 => PgType::Float4,
+        701 => PgType::Float8,
+        1042 => PgType::Bpchar(None),
+        1043 => PgType::Varchar(None),
+        1082 => PgType::Date,
+        1083 => PgType::Time,
+        1114 => PgType::Timestamp,
+        1184 => PgType::Timestamptz,
+        1186 => PgType::Interval,
+        1700 => PgType::Numeric {
             precision: None,
             scale: 0,
-        })),
-        other => Err(protocol_error(format!(
-            "unsupported parameter type OID {other}"
-        ))),
-    }
+        },
+        2950 => PgType::Uuid,
+        other => {
+            return Err(protocol_error(format!(
+                "unsupported parameter type OID {other}"
+            )));
+        }
+    };
+    Ok(Some(pg_type))
 }
 
 fn decode_bind_params(
@@ -295,7 +303,7 @@ fn decode_bind_params(
     param_formats: &[i16],
     params: &[Option<Vec<u8>>],
 ) -> Result<Vec<Value>> {
-    let types = prepared.param_types();
+    let types = prepared.param_pg_types();
     if params.len() != types.len() {
         return Err(protocol_error(format!(
             "bind message supplies {} parameter value(s), but the statement requires {}",
@@ -310,7 +318,7 @@ fn decode_bind_params(
             None => Ok(Value::Null),
             Some(bytes) => protocol::decode_value(
                 bytes,
-                types[index].clone(),
+                types[index].data_type(),
                 resolve_format(param_formats, index),
             ),
         })
