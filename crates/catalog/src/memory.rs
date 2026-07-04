@@ -220,6 +220,15 @@ impl CatalogManager for MemoryCatalog {
         active_dict_id: Option<u32>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
+        // Resolve the live table first so a failed call (table absent/dropped)
+        // has no side effects on the dictionary id allocator.
+        let schema = snapshot
+            .tables_by_id
+            .get_mut(&table)
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        schema.compression = compression;
+        schema.active_dict_id = active_dict_id;
+        let schema = schema.clone();
         // An externally-supplied dictionary id (a fresh allocation on the live
         // ALTER path, or a replayed id during recovery) must never be at or
         // past the allocator's high-water mark, so bump it the same way every
@@ -227,13 +236,7 @@ impl CatalogManager for MemoryCatalog {
         if let Some(id) = active_dict_id {
             reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")?;
         }
-        let schema = snapshot
-            .tables_by_id
-            .get_mut(&table)
-            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
-        schema.compression = compression;
-        schema.active_dict_id = active_dict_id;
-        Ok(schema.clone())
+        Ok(schema)
     }
 
     fn allocate_dictionary_id(&self) -> Result<u32> {
@@ -708,13 +711,19 @@ fn validate_dictionary_ids(snapshot: &CatalogSnapshot) -> Result<()> {
         )));
     }
     for schema in snapshot.tables_by_id.values() {
-        if let Some(active_dict_id) = schema.active_dict_id
-            && active_dict_id >= snapshot.next_dictionary_id
-        {
-            return Err(DbError::internal(format!(
-                "catalog snapshot table {} active_dict_id {} is not less than next_dictionary_id {}",
-                schema.name, active_dict_id, snapshot.next_dictionary_id
-            )));
+        if let Some(active_dict_id) = schema.active_dict_id {
+            if active_dict_id == 0 {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot table {} active_dict_id is reserved value 0 (0 means \"no dictionary\"; use None instead)",
+                    schema.name
+                )));
+            }
+            if active_dict_id >= snapshot.next_dictionary_id {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot table {} active_dict_id {} is not less than next_dictionary_id {}",
+                    schema.name, active_dict_id, snapshot.next_dictionary_id
+                )));
+            }
         }
     }
     Ok(())
