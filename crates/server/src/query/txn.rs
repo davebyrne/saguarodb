@@ -56,8 +56,9 @@ fn no_such_savepoint(name: &str) -> DbError {
 impl QueryService {
     /// Handle BEGIN/COMMIT/ROLLBACK/SET TRANSACTION/SET SESSION CHARACTERISTICS
     /// against the session's transaction `slot` and `default_isolation` (the session
-    /// default, in/out). Only `Begin` reads the default and only
-    /// `SetSessionCharacteristics` updates it; every other arm returns it unchanged.
+    /// default, in/out). `BEGIN` reads the default; `SET SESSION CHARACTERISTICS`
+    /// updates it immediately outside a transaction or stores a pending change inside
+    /// one; `COMMIT` promotes a pending change after a healthy transaction commits.
     pub(super) fn handle_transaction_control(
         &self,
         kind: TransactionControl,
@@ -91,7 +92,13 @@ impl QueryService {
             TransactionControl::Commit => match slot {
                 // COMMIT of a healthy transaction commits durably.
                 Some(txn) if !txn.failed => {
+                    let committed_default = txn.committed_default_isolation(default_isolation);
                     let result = self.commit_transaction(txn).map(|()| commit_complete());
+                    let default_isolation = if result.is_ok() {
+                        committed_default
+                    } else {
+                        default_isolation
+                    };
                     (None, default_isolation, result)
                 }
                 // COMMIT of a failed transaction issues ROLLBACK (Postgres
@@ -156,7 +163,11 @@ impl QueryService {
                 }
                 let subxid = self.register_active_subxid(txn.txn_id);
                 txn.live_subxids.push(subxid);
-                txn.savepoints.push(SavepointLevel { name, subxid });
+                txn.savepoints.push(SavepointLevel {
+                    name,
+                    subxid,
+                    default_isolation_override: txn.default_isolation_override,
+                });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
             }
             Statement::ReleaseSavepoint { name } => {
@@ -190,6 +201,8 @@ impl QueryService {
                         // a nested level (popped from the stack but still live). A
                         // by-position slice would miss it and wrongly commit its rows.
                         let level_subxid = txn.savepoints[idx].subxid;
+                        let default_isolation_override =
+                            txn.savepoints[idx].default_isolation_override;
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -199,6 +212,7 @@ impl QueryService {
                         self.abort_subxids(&rolled);
                         txn.live_subxids.retain(|&s| s < level_subxid);
                         txn.savepoints.truncate(idx);
+                        txn.default_isolation_override = default_isolation_override;
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -206,6 +220,7 @@ impl QueryService {
                         txn.savepoints.push(SavepointLevel {
                             name,
                             subxid: fresh,
+                            default_isolation_override,
                         });
                         // ROLLBACK TO recovers a failed ('E') block to this savepoint.
                         txn.failed = false;
@@ -232,12 +247,13 @@ impl QueryService {
     /// Handle `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
     /// (`docs/specs/mvcc.md` §10 Milestone G2). Postgres semantics: it sets the
     /// per-connection DEFAULT isolation for FUTURE transactions and does NOT change
-    /// an already-open transaction's level; it is allowed inside a transaction block
-    /// (unlike `SET TRANSACTION`, it has no before-first-query rule) and persists
-    /// across transactions on this connection.
+    /// an already-open transaction's level; inside a transaction block, the new
+    /// default is visible immediately but persists only if the block commits.
     ///
-    /// - With an isolation-level mode, update `default_isolation` to the mapped level
-    ///   and leave the open transaction (if any) untouched.
+    /// - With an isolation-level mode and no open transaction, update
+    ///   `default_isolation` to the mapped level.
+    /// - With an isolation-level mode inside a healthy transaction, store a pending
+    ///   session-default change and leave the open transaction's isolation untouched.
     /// - With no isolation-level mode (e.g. `READ WRITE` only) it is a no-op success
     ///   that leaves the default unchanged.
     /// - Inside an already-failed (`'E'`) block it is rejected with `25P02` like any
@@ -251,8 +267,6 @@ impl QueryService {
         if let Some(txn) = &slot
             && txn.failed
         {
-            // A failed block rejects everything but COMMIT/ROLLBACK with `25P02` and
-            // stays 'E'; the session default is unchanged.
             return (
                 slot,
                 default_isolation,
@@ -262,12 +276,18 @@ impl QueryService {
                 )),
             );
         }
-        // Update the session default only when a level was given; otherwise it is a
-        // no-op success. The open transaction (if any) is returned UNCHANGED — this
-        // statement never mutates the current transaction's isolation, matching
-        // Postgres (it affects only future transactions).
-        let updated = isolation.unwrap_or(default_isolation);
-        (slot, updated, Ok(set_complete()))
+
+        let Some(level) = isolation else {
+            return (slot, default_isolation, Ok(set_complete()));
+        };
+
+        match slot {
+            Some(mut txn) => {
+                txn.set_default_isolation(level);
+                (Some(txn), default_isolation, Ok(set_complete()))
+            }
+            None => (None, level, Ok(set_complete())),
+        }
     }
 
     /// Handle `SET TRANSACTION ISOLATION LEVEL <level>` against the session's
@@ -333,6 +353,7 @@ impl QueryService {
         Ok(Transaction {
             txn_id,
             isolation,
+            default_isolation_override: None,
             first_statement_ran: false,
             failed: false,
             write_guard: None,

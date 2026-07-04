@@ -267,6 +267,152 @@ async fn default_transaction_isolation_guc_controls_future_transactions() {
 }
 
 #[tokio::test]
+async fn default_transaction_isolation_guc_is_transaction_scoped_like_postgres() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]],
+        "SET is visible inside the transaction"
+    );
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("read committed".to_string())]],
+        "changing the default does not change the already-open transaction"
+    );
+    conn.ok("ROLLBACK").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("read committed".to_string())]],
+        "ROLLBACK discards the session-default change"
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .rows();
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "COMMIT persists the session-default change"
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET LOCAL default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]],
+        "SET LOCAL is visible only in the transaction"
+    );
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "SET LOCAL does not persist after COMMIT"
+    );
+
+    conn.ok("SET LOCAL default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "SET LOCAL outside a transaction has no effect"
+    );
+}
+
+#[tokio::test]
+async fn transaction_isolation_default_uses_transaction_visible_default() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET LOCAL default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    conn.ok("SET transaction_isolation TO DEFAULT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .rows();
+    conn.ok("SET transaction_isolation TO DEFAULT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn default_transaction_isolation_guc_rolls_back_to_savepoint() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SAVEPOINT before_set").await.rows();
+    conn.ok("SET default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    conn.ok("ROLLBACK TO SAVEPOINT before_set").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("read committed".to_string())]],
+        "ROLLBACK TO restores the pending session-default state"
+    );
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("read committed".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .rows();
+    conn.ok("SAVEPOINT before_local").await.rows();
+    conn.ok("SET LOCAL default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    conn.ok("ROLLBACK TO SAVEPOINT before_local").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "ROLLBACK TO restores the saved local/default overlay"
+    );
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn session_config_works_over_the_extended_protocol() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

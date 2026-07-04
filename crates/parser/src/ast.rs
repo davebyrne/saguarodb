@@ -3,6 +3,12 @@ use common::{
     PgType, SequenceOptions, TableOptionPatch, ToastOptionPatch, Value,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetScope {
+    Session,
+    Local,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Statement {
     CreateTable {
@@ -115,11 +121,15 @@ pub enum Statement {
         isolation: Option<IsolationLevel>,
     },
     /// `SET [SESSION|LOCAL] <name> {=|TO} <value>` — session configuration
-    /// assignment. `SET TIME ZONE <value>` normalizes to `timezone`, and
-    /// `SET NAMES <encoding>` normalizes to `client_encoding`. GUC names are the
-    /// narrow exception to the quoted-identifier rule: quoted GUC name parts are
-    /// accepted and lowercase-normalized like PostgreSQL.
+    /// assignment. `SET TIME ZONE <value>` normalizes to `timezone`, and `SET NAMES
+    /// <encoding>` normalizes to `client_encoding`. Ordinary stored GUCs still treat
+    /// `LOCAL` as session-scoped for driver compatibility; PostgreSQL-special
+    /// parameters such as `default_transaction_isolation` can inspect `scope` for
+    /// exact behavior. GUC names are the narrow exception to the quoted-identifier
+    /// rule: quoted GUC name parts are accepted and lowercase-normalized like
+    /// PostgreSQL.
     SetVariable {
+        scope: SetScope,
         name: String,
         value: String,
     },

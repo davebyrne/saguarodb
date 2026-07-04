@@ -57,8 +57,9 @@ impl Session {
         // Move the session's transaction slot AND default isolation into the blocking
         // task so the whole statement (including any owned write guard) runs on one
         // thread, then take them both back along with the outcome. The default is
-        // threaded in/out like the slot so `SET SESSION CHARACTERISTICS` persists it
-        // and a new `BEGIN` inherits it (`docs/specs/mvcc.md` §10 Milestone G2).
+        // threaded in/out like the slot so committed default-isolation changes
+        // persist and a new `BEGIN` inherits them (`docs/specs/mvcc.md` §10
+        // Milestone G2).
         let txn = self.txn.take();
         let default_isolation = self.default_isolation;
         // Do NOT await the task yet: it must run while we drain `row_rx`, or a

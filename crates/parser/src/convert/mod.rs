@@ -7,7 +7,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use crate::Statement;
+use crate::{SetScope, Statement};
 
 mod ddl;
 mod dml;
@@ -257,12 +257,17 @@ fn convert_set(set: sql::Set) -> Result<Statement> {
             if hivevar {
                 return unsupported("Hive SET variables are not supported");
             }
-            validate_guc_scope(scope)?;
+            let scope = guc_scope(scope)?;
             let name = guc_object_name(&variable)?;
             let value = set_value_text(&values)?;
-            Ok(Statement::SetVariable { name, value })
+            Ok(Statement::SetVariable { scope, name, value })
         }
-        sql::Set::SetTimeZone { local: _, value } => Ok(Statement::SetVariable {
+        sql::Set::SetTimeZone { local, value } => Ok(Statement::SetVariable {
+            scope: if local {
+                SetScope::Local
+            } else {
+                SetScope::Session
+            },
             name: "timezone".to_string(),
             value: set_expr_text(&value),
         }),
@@ -274,11 +279,13 @@ fn convert_set(set: sql::Set) -> Result<Statement> {
                 return unsupported("SET NAMES COLLATE is not supported");
             }
             Ok(Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "client_encoding".to_string(),
                 value: charset_name.value,
             })
         }
         sql::Set::SetNamesDefault {} => Ok(Statement::SetVariable {
+            scope: SetScope::Session,
             name: "client_encoding".to_string(),
             value: "default".to_string(),
         }),
@@ -286,9 +293,10 @@ fn convert_set(set: sql::Set) -> Result<Statement> {
     }
 }
 
-fn validate_guc_scope(scope: Option<sql::ContextModifier>) -> Result<()> {
+fn guc_scope(scope: Option<sql::ContextModifier>) -> Result<SetScope> {
     match scope {
-        None | Some(sql::ContextModifier::Session | sql::ContextModifier::Local) => Ok(()),
+        None | Some(sql::ContextModifier::Session) => Ok(SetScope::Session),
+        Some(sql::ContextModifier::Local) => Ok(SetScope::Local),
         Some(sql::ContextModifier::Global) => unsupported("SET GLOBAL is not supported"),
     }
 }

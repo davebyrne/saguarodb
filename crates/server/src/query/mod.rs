@@ -82,6 +82,10 @@ pub struct Transaction {
     /// per statement, Repeatable Read captures one at the first statement and
     /// reuses it.
     isolation: IsolationLevel,
+    /// Transactional changes to `default_transaction_isolation`. PostgreSQL makes a
+    /// plain `SET` visible immediately but only persists it if the surrounding
+    /// transaction commits; `SET LOCAL` is visible only until transaction end.
+    default_isolation_override: Option<DefaultIsolationOverride>,
     /// `true` once the transaction has run its first query/data statement (i.e.
     /// captured its snapshot). `SET TRANSACTION ISOLATION LEVEL` is only valid
     /// while this is `false` (Postgres: "SET TRANSACTION ... must be called before
@@ -128,13 +132,49 @@ pub struct Transaction {
     live_subxids: Vec<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct DefaultIsolationOverride {
+    current: IsolationLevel,
+    on_commit: Option<IsolationLevel>,
+}
+
 /// One open savepoint: its name and the subxid that owns writes made under it.
 struct SavepointLevel {
     name: String,
     subxid: u64,
+    default_isolation_override: Option<DefaultIsolationOverride>,
 }
 
 impl Transaction {
+    fn current_default_isolation(&self, session_default: IsolationLevel) -> IsolationLevel {
+        self.default_isolation_override
+            .map(|override_state| override_state.current)
+            .unwrap_or(session_default)
+    }
+
+    fn committed_default_isolation(&self, session_default: IsolationLevel) -> IsolationLevel {
+        self.default_isolation_override
+            .and_then(|override_state| override_state.on_commit)
+            .unwrap_or(session_default)
+    }
+
+    fn set_default_isolation(&mut self, level: IsolationLevel) {
+        self.default_isolation_override = Some(DefaultIsolationOverride {
+            current: level,
+            on_commit: Some(level),
+        });
+    }
+
+    fn set_local_default_isolation(&mut self, level: IsolationLevel) {
+        let on_commit = self
+            .default_isolation_override
+            .and_then(|override_state| override_state.on_commit);
+        self.default_isolation_override = Some(DefaultIsolationOverride {
+            current: level,
+            on_commit,
+        });
+    }
+
     /// The current writing xid: the innermost open savepoint's subxid, or the
     /// top-level `txn_id` when no savepoint is open. New tuples stamp this as `xmin`.
     fn writing_xid(&self) -> u64 {
@@ -908,7 +948,8 @@ enum TransactionControl {
     SetTransaction(Option<IsolationLevel>),
     /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`: set the
     /// per-connection DEFAULT isolation for future transactions, without changing an
-    /// already-open transaction (`docs/specs/mvcc.md` §10 G2). `None` is a
+    /// already-open transaction. Inside a transaction block the change is pending
+    /// until commit (`docs/specs/mvcc.md` §10 G2). `None` is a
     /// `SET SESSION CHARACTERISTICS` with no level mode (a no-op success).
     SetSessionCharacteristics(Option<IsolationLevel>),
 }
@@ -2594,7 +2635,8 @@ mod tests {
         assert_eq!(row_count(res), 0);
 
         // SET SESSION CHARACTERISTICS ... REPEATABLE READ inside the open block:
-        // updates the session default but leaves THIS transaction Read Committed.
+        // queues a session-default change for commit but leaves THIS transaction
+        // Read Committed.
         let (slot, sd, res) = app.query_service.execute_simple(
             "set session characteristics as transaction isolation level repeatable read",
             slot,
@@ -2602,7 +2644,11 @@ mod tests {
             &cancel,
         );
         res.unwrap();
-        assert_eq!(sd, IsolationLevel::RepeatableRead);
+        assert_eq!(
+            sd,
+            IsolationLevel::ReadCommitted,
+            "the session default is not committed until the transaction commits"
+        );
         assert_eq!(
             super::slot_status(&slot),
             SessionTxnStatus::InTransaction,
@@ -2626,6 +2672,11 @@ mod tests {
             .query_service
             .execute_simple("commit", slot, sd, &cancel);
         res.unwrap();
+        assert_eq!(
+            sd,
+            IsolationLevel::RepeatableRead,
+            "COMMIT persists the pending session-default change"
+        );
 
         // The NEXT transaction is Repeatable Read (it inherited the updated default).
         app.query_service.execute_sql("delete from t").unwrap();
@@ -2708,6 +2759,21 @@ mod tests {
             sd,
             IsolationLevel::ReadCommitted,
             "a rejected SET SESSION CHARACTERISTICS leaves the default unchanged"
+        );
+
+        let (slot, sd, res) = app.query_service.execute_simple(
+            "set session characteristics as transaction read write",
+            slot,
+            sd,
+            &cancel,
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.code, SqlState::InFailedSqlTransaction);
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+        assert_eq!(
+            sd,
+            IsolationLevel::ReadCommitted,
+            "a no-level SET SESSION CHARACTERISTICS is still rejected in a failed block"
         );
         let (_slot, _sd, _res) = app
             .query_service

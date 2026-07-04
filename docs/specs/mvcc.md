@@ -1184,10 +1184,15 @@ savepoints via sub-transaction xids (optional, deferred).
     `SET SESSION CHARACTERISTICS` has no before-first-query rule and is allowed
     inside a transaction block; it updates the session default for FUTURE
     transactions only and leaves an already-open transaction's `isolation`
-    unchanged (Postgres-compatible). With no isolation-level mode (e.g. `READ WRITE`
-    only) it is a no-op success. Inside an already-failed (`'E'`) block it is
-    rejected with `25P02` (`InFailedSqlTransaction`) like any non-COMMIT/ROLLBACK
-    statement, leaving the default unchanged.
+    unchanged (Postgres-compatible). Inside a healthy block the new default is
+    visible immediately to `SHOW default_transaction_isolation`, but it is only
+    installed on the session if the block commits; rollback or failed-block `COMMIT`
+    discards it. `ROLLBACK TO SAVEPOINT` restores the pending default state captured
+    when the savepoint was created, while `RELEASE SAVEPOINT` merges later changes
+    upward. With no isolation-level mode (e.g. `READ WRITE` only) it is a no-op
+    success. Inside an already-failed (`'E'`) block it is rejected with `25P02`
+    (`InFailedSqlTransaction`) like any non-COMMIT/ROLLBACK statement, leaving the
+    default unchanged.
   - **Persistence and reset.** The default persists across transactions on the
     connection (it is threaded in/out of the query path beside the transaction
     slot) and resets to Read Committed for each new connection (the field is

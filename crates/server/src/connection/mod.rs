@@ -233,8 +233,8 @@ struct Session {
     /// (`docs/specs/mvcc.md` §10 Milestone G2). Starts at `ReadCommitted` and is
     /// updated by `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL
     /// <level>`. Threaded in/out of the query path alongside `txn`: a `BEGIN` with no
-    /// explicit `ISOLATION LEVEL` inherits it, while `SET SESSION CHARACTERISTICS`
-    /// updates it. It persists across transactions on this connection and resets to
+    /// explicit `ISOLATION LEVEL` inherits it, while committed default changes update
+    /// it. It persists across transactions on this connection and resets to
     /// `ReadCommitted` for each new connection (this field is per-`Session`).
     default_isolation: IsolationLevel,
     /// Per-connection sequence state for `currval`. `nextval` and

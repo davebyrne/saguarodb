@@ -6,7 +6,7 @@ use common::{
     Value,
 };
 use executor::ExecutionResult;
-use parser::Statement;
+use parser::{SetScope, Statement};
 
 use super::{QueryService, Transaction, mark_failed_on_error, reset_complete, set_complete};
 
@@ -104,8 +104,8 @@ impl QueryService {
         }
 
         match statement {
-            Statement::SetVariable { name, value } => {
-                self.handle_set_variable(name, value, slot, default_isolation, gucs)
+            Statement::SetVariable { scope, name, value } => {
+                self.handle_set_variable(scope, name, value, slot, default_isolation, gucs)
             }
             Statement::ResetVariable { name } => {
                 self.handle_reset_variable(name, slot, default_isolation, gucs)
@@ -165,6 +165,7 @@ impl QueryService {
 
     fn handle_set_variable(
         &self,
+        scope: SetScope,
         name: String,
         value: String,
         slot: Option<Transaction>,
@@ -173,9 +174,9 @@ impl QueryService {
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         match name.as_str() {
             "transaction_isolation" => {
-                let Some(level) = parse_optional_isolation_setting(&value, default_isolation)
-                else {
-                    return invalid_isolation(slot, default_isolation, &value);
+                let default = effective_default_isolation(&slot, default_isolation);
+                let Some(level) = parse_optional_isolation_setting(&value, default) else {
+                    return invalid_isolation(&name, slot, default_isolation, &value);
                 };
                 let (slot, result) = self.handle_set_transaction(Some(level), slot);
                 (slot, default_isolation, result)
@@ -184,9 +185,9 @@ impl QueryService {
                 let Some(level) =
                     parse_optional_isolation_setting(&value, IsolationLevel::default())
                 else {
-                    return invalid_isolation(slot, default_isolation, &value);
+                    return invalid_isolation(&name, slot, default_isolation, &value);
                 };
-                (slot, level, Ok(set_complete()))
+                set_default_transaction_isolation(scope, level, slot, default_isolation)
             }
             _ if value.eq_ignore_ascii_case("default") => {
                 gucs.reset(&name);
@@ -208,11 +209,18 @@ impl QueryService {
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         match name.as_deref() {
             Some("transaction_isolation") => {
-                let (slot, result) = self.handle_set_transaction(Some(default_isolation), slot);
+                let default = effective_default_isolation(&slot, default_isolation);
+                let (slot, result) = self.handle_set_transaction(Some(default), slot);
                 (slot, default_isolation, result.map(|_| reset_complete()))
             }
             Some("default_transaction_isolation") => {
-                (slot, IsolationLevel::default(), Ok(reset_complete()))
+                let (slot, default_isolation, result) = set_default_transaction_isolation(
+                    SetScope::Session,
+                    IsolationLevel::default(),
+                    slot,
+                    default_isolation,
+                );
+                (slot, default_isolation, result.map(|_| reset_complete()))
             }
             Some(name) => {
                 gucs.reset(name);
@@ -220,10 +228,45 @@ impl QueryService {
             }
             None => {
                 gucs.reset_all();
-                (slot, IsolationLevel::default(), Ok(reset_complete()))
+                let (slot, default_isolation, result) = set_default_transaction_isolation(
+                    SetScope::Session,
+                    IsolationLevel::default(),
+                    slot,
+                    default_isolation,
+                );
+                (slot, default_isolation, result.map(|_| reset_complete()))
             }
         }
     }
+}
+
+fn set_default_transaction_isolation(
+    scope: SetScope,
+    level: IsolationLevel,
+    slot: Option<Transaction>,
+    default_isolation: IsolationLevel,
+) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+    match (scope, slot) {
+        (SetScope::Local, None) => (None, default_isolation, Ok(set_complete())),
+        (SetScope::Session, None) => (None, level, Ok(set_complete())),
+        (SetScope::Local, Some(mut txn)) => {
+            txn.set_local_default_isolation(level);
+            (Some(txn), default_isolation, Ok(set_complete()))
+        }
+        (SetScope::Session, Some(mut txn)) => {
+            txn.set_default_isolation(level);
+            (Some(txn), default_isolation, Ok(set_complete()))
+        }
+    }
+}
+
+fn effective_default_isolation(
+    slot: &Option<Transaction>,
+    session_default: IsolationLevel,
+) -> IsolationLevel {
+    slot.as_ref()
+        .map(|txn| txn.current_default_isolation(session_default))
+        .unwrap_or(session_default)
 }
 
 fn failed_transaction_error() -> DbError {
@@ -234,6 +277,7 @@ fn failed_transaction_error() -> DbError {
 }
 
 fn invalid_isolation(
+    name: &str,
     slot: Option<Transaction>,
     default_isolation: IsolationLevel,
     value: &str,
@@ -243,7 +287,7 @@ fn invalid_isolation(
         default_isolation,
         Err(DbError::execute(
             SqlState::InvalidParameterValue,
-            format!("invalid value for parameter \"transaction_isolation\": \"{value}\""),
+            format!("invalid value for parameter \"{name}\": \"{value}\""),
         )),
     )
 }
@@ -287,7 +331,9 @@ fn show_value(
                 .unwrap_or(default_isolation);
             Some(isolation_setting(level).to_string())
         }
-        "default_transaction_isolation" => Some(isolation_setting(default_isolation).to_string()),
+        "default_transaction_isolation" => Some(
+            isolation_setting(effective_default_isolation(slot, default_isolation)).to_string(),
+        ),
         _ => gucs.get(name),
     }
 }
@@ -329,7 +375,7 @@ fn show_all_result(
     let mut settings = gucs.all();
     settings.push((
         "default_transaction_isolation".to_string(),
-        isolation_setting(default_isolation).to_string(),
+        isolation_setting(effective_default_isolation(slot, default_isolation)).to_string(),
     ));
     settings.push((
         "transaction_isolation".to_string(),

@@ -4,7 +4,7 @@ mod convert;
 pub use ast::{
     Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FromItem, FunctionArg,
     InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
-    Statement, UnaryOp,
+    SetScope, Statement, UnaryOp,
 };
 
 use common::Result;
@@ -23,7 +23,7 @@ mod tests {
 
     use crate::{
         BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody, SelectItem,
-        SetOp, Statement, UnaryOp, parse,
+        SetOp, SetScope, Statement, UnaryOp, parse,
     };
 
     #[test]
@@ -39,6 +39,7 @@ mod tests {
         assert_eq!(
             parse("SET extra_float_digits = 3").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "extra_float_digits".to_string(),
                 value: "3".to_string(),
             }
@@ -46,6 +47,7 @@ mod tests {
         assert_eq!(
             parse("SET datestyle TO 'ISO'").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "datestyle".to_string(),
                 value: "ISO".to_string(),
             }
@@ -53,6 +55,7 @@ mod tests {
         assert_eq!(
             parse("SET TIME ZONE 'UTC'").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "timezone".to_string(),
                 value: "UTC".to_string(),
             }
@@ -60,6 +63,7 @@ mod tests {
         assert_eq!(
             parse("SET search_path = \"$user\", public").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "search_path".to_string(),
                 value: "$user, public".to_string(),
             }
@@ -67,17 +71,23 @@ mod tests {
         assert_eq!(
             parse("SET SESSION statement_timeout = 0").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "statement_timeout".to_string(),
                 value: "0".to_string(),
             }
         );
-        assert!(matches!(
+        assert_eq!(
             parse("SET LOCAL statement_timeout = 0").unwrap(),
-            Statement::SetVariable { .. }
-        ));
+            Statement::SetVariable {
+                scope: SetScope::Local,
+                name: "statement_timeout".to_string(),
+                value: "0".to_string(),
+            }
+        );
         assert_eq!(
             parse("SET my_app.batch_size = -2").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "my_app.batch_size".to_string(),
                 value: "-2".to_string(),
             }
@@ -85,6 +95,7 @@ mod tests {
         assert_eq!(
             parse("SET \"Default_Transaction_Isolation\" TO 'serializable'").unwrap(),
             Statement::SetVariable {
+                scope: SetScope::Session,
                 name: "default_transaction_isolation".to_string(),
                 value: "serializable".to_string(),
             }
