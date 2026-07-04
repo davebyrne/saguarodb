@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::app::ServerComponents;
 use crate::registry::AdvertisedSnapshot;
 
+mod alter;
 mod copy;
 mod exec;
 mod stream;
@@ -339,9 +340,9 @@ impl QueryService {
             });
         }
         if let StatementClass::Maintenance = class {
-            // VACUUM takes no parameters, produces no rows, and does not bind/plan.
-            // Carry the parsed statement (the target table) so an extended-protocol
-            // `Execute` routes it through `run_vacuum`, exactly like the simple path.
+            // Maintenance commands take no parameters, produce no rows, and do not
+            // bind/plan. Carry the parsed statement so an extended-protocol `Execute`
+            // routes it through `run_maintenance`, exactly like the simple path.
             return Ok(PreparedStatement {
                 class,
                 bound: None,
@@ -437,7 +438,7 @@ impl QueryService {
         // arm is reached only if a caller bypasses that routing — keep it total.
         if let StatementClass::Maintenance = prepared.class {
             return self
-                .run_prepared_vacuum(prepared)
+                .run_prepared_maintenance(prepared)
                 .map(StreamOutcome::Direct);
         }
         let bound = self.substitute_prepared_params(prepared, params)?;
@@ -534,7 +535,7 @@ impl QueryService {
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
-        // VACUUM does not bind/plan: dispatch it before parameter substitution.
+        // Maintenance does not bind/plan: dispatch it before parameter substitution.
         // Inside an open transaction block it is rejected (poisoning it to 'E', like
         // DDL); otherwise it runs as a standalone maintenance unit.
         if let StatementClass::Maintenance = prepared.class {
@@ -545,14 +546,14 @@ impl QueryService {
                     default_isolation,
                     Err(DbError::plan(
                         SqlState::FeatureNotSupported,
-                        "VACUUM cannot run inside a transaction block",
+                        "maintenance commands cannot run inside a transaction block",
                     )),
                 );
             }
             return (
                 None,
                 default_isolation,
-                self.run_prepared_vacuum(prepared)
+                self.run_prepared_maintenance(prepared)
                     .map(StreamOutcome::Direct),
             );
         }
@@ -870,9 +871,10 @@ enum StatementClass {
 pub struct PreparedStatement {
     class: StatementClass,
     bound: Option<BoundStatement>,
-    /// The parsed maintenance statement (`VACUUM`), carried unbound for the
-    /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can run
-    /// it through `run_vacuum`. `None` for every other class.
+    /// The parsed maintenance statement (`VACUUM`, `ALTER TABLE ... SET
+    /// (compression = ...)`), carried unbound for the `StatementClass::Maintenance`
+    /// case so an extended-protocol `Execute` can run it through `run_maintenance`.
+    /// `None` for every other class.
     maintenance: Option<Statement>,
     /// Resolved parameter wire types, by position: the client-declared `PgType`
     /// where an OID was given, otherwise the collapsed default inferred by the
@@ -896,9 +898,10 @@ impl PreparedStatement {
         matches!(self.class, StatementClass::TransactionControl(_))
     }
 
-    /// Whether this is a maintenance command (`VACUUM`). The connection routes such
-    /// an `Execute` through the session path so it is rejected inside an open
-    /// transaction block and otherwise runs as a standalone maintenance unit.
+    /// Whether this is a maintenance command (`VACUUM`, `ALTER TABLE ... SET
+    /// (compression = ...)`). The connection routes such an `Execute` through the
+    /// session path so it is rejected inside an open transaction block and
+    /// otherwise runs as a standalone maintenance unit.
     pub fn is_maintenance(&self) -> bool {
         matches!(self.class, StatementClass::Maintenance)
     }

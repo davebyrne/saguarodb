@@ -8,16 +8,32 @@ use super::{PreparedStatement, QueryService};
 use crate::app::ServerComponents;
 
 impl QueryService {
-    /// Run a prepared (extended-protocol) `VACUUM`. The statement carries no bound
-    /// payload — it is the raw `Statement::Vacuum` parsed at `prepare_sql` time.
-    pub(super) fn run_prepared_vacuum(
+    /// Run a prepared (extended-protocol) maintenance command (`VACUUM` or
+    /// `ALTER TABLE ... SET (compression = ...)`). The statement carries no bound
+    /// payload — it is the raw maintenance `Statement` parsed at `prepare_sql` time.
+    pub(super) fn run_prepared_maintenance(
         &self,
         prepared: &PreparedStatement,
     ) -> Result<ExecutionResult> {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
-            DbError::internal("maintenance prepared statement has no carried VACUUM payload")
+            DbError::internal("maintenance prepared statement has no carried payload")
         })?;
-        self.run_vacuum(statement.clone())
+        self.run_maintenance(statement.clone())
+    }
+
+    /// Shared entry point for every maintenance command: dispatches to the
+    /// statement-specific implementation. Both the simple-query and
+    /// extended-protocol paths route maintenance through this one router.
+    pub(super) fn run_maintenance(&self, statement: Statement) -> Result<ExecutionResult> {
+        match &statement {
+            Statement::Vacuum { .. } => self.run_vacuum(statement),
+            Statement::AlterTableSetCompression { .. } => {
+                self.run_alter_table_compression(statement)
+            }
+            _ => Err(DbError::internal(
+                "run_maintenance called with a non-maintenance statement",
+            )),
+        }
     }
 
     /// Run `VACUUM` (Milestone F4a, `docs/specs/mvcc.md` §9/§10 F): reclaim dead MVCC

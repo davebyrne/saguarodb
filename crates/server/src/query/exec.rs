@@ -56,10 +56,11 @@ impl QueryService {
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
-        // VACUUM is a maintenance command: it does not bind/plan, and like DDL it is
-        // forbidden inside an explicit transaction block (Postgres: "VACUUM cannot run
-        // inside a transaction block"). Reject it with the open transaction poisoned to
-        // the 'E' failed state, matching the DDL-in-block contract.
+        // Maintenance commands (VACUUM, ALTER TABLE ... SET (compression = ...)) do
+        // not bind/plan, and like DDL are forbidden inside an explicit transaction
+        // block (Postgres: "VACUUM cannot run inside a transaction block"). Reject
+        // with the open transaction poisoned to the 'E' failed state, matching the
+        // DDL-in-block contract.
         if let StatementClass::Maintenance = class {
             if let Some(mut txn) = slot {
                 txn.failed = true;
@@ -68,14 +69,14 @@ impl QueryService {
                     default_isolation,
                     Err(DbError::plan(
                         SqlState::FeatureNotSupported,
-                        "VACUUM cannot run inside a transaction block",
+                        "maintenance commands cannot run inside a transaction block",
                     )),
                 );
             }
             return (
                 None,
                 default_isolation,
-                self.run_vacuum(statement).map(StreamOutcome::Direct),
+                self.run_maintenance(statement).map(StreamOutcome::Direct),
             );
         }
 
@@ -347,8 +348,9 @@ impl QueryService {
             StatementClass::Write | StatementClass::Ddl => self
                 .autocommit_write(statement, cancel, session_sequences)
                 .map(StreamOutcome::Direct),
-            // Maintenance (VACUUM) never reaches here: `dispatch` runs it via
-            // `run_vacuum` before the autocommit data path.
+            // Maintenance (VACUUM, ALTER TABLE ... SET (compression = ...)) never
+            // reaches here: `dispatch` runs it via `run_maintenance` before the
+            // autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
                 "maintenance reached the autocommit data path",
             )),
