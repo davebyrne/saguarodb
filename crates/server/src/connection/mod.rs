@@ -244,6 +244,9 @@ struct Session {
     /// Per-connection session configuration parameters used by driver startup
     /// probes (`SET`/`SHOW`/`RESET`/`DISCARD ALL`).
     session_gucs: Arc<SessionGucs>,
+    /// The `application_name` value last reported to the client via
+    /// `ParameterStatus` (startup report or a later change report).
+    reported_application_name: String,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -338,6 +341,7 @@ impl Session {
             default_isolation: IsolationLevel::default(),
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_gucs: Arc::new(SessionGucs::default()),
+            reported_application_name: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
             copy_in: None,
@@ -356,6 +360,20 @@ impl Session {
     fn begin_cancelable(&self) -> Arc<AtomicBool> {
         self.cancel.store(false, Ordering::Relaxed);
         self.cancel.clone()
+    }
+
+    /// Report `application_name` changes after `SET`/`RESET`/`DISCARD ALL`.
+    /// Other startup-reported parameters are fixed in this server.
+    fn application_name_status_change(&mut self) -> Option<ServerMessage> {
+        let current = self.session_gucs.application_name();
+        if current == self.reported_application_name {
+            return None;
+        }
+        self.reported_application_name = current.clone();
+        Some(ServerMessage::ParameterStatus {
+            key: "application_name".to_string(),
+            value: current,
+        })
     }
 
     /// Handle one decoded client message. Returns `Break` when the connection
@@ -392,8 +410,12 @@ impl Session {
             ClientMessage::Query(sql) => return self.run_query(stream, codec, sql).await,
             ClientMessage::Sync => {
                 self.failed = false;
-                let status = self.status_byte();
-                write_messages(stream, codec, &[ServerMessage::ReadyForQuery(status)]).await?;
+                write_messages(
+                    stream,
+                    codec,
+                    &[ServerMessage::ReadyForQuery(self.status_byte())],
+                )
+                .await?;
             }
             ClientMessage::Flush => {
                 stream
@@ -449,6 +471,7 @@ impl Session {
                     application_name,
                 })?;
                 self.session_gucs = Arc::new(SessionGucs::new(startup_application_name));
+                self.reported_application_name = self.session_gucs.application_name();
                 // Register a cancellation key for this connection and announce it
                 // with BackendKeyData, placed after the ParameterStatus messages
                 // and before the trailing ReadyForQuery.

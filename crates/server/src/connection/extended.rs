@@ -146,17 +146,20 @@ impl Session {
             // A streamed SELECT: `DataRow`s were already written above; finish with
             // the DML-less `SELECT n` tag (no `RowDescription`, no `ReadyForQuery`).
             Ok(StreamOutcome::Streamed { count }) => {
-                write_messages(
-                    stream,
-                    codec,
-                    &[ServerMessage::CommandComplete(format!("SELECT {count}"))],
-                )
-                .await
+                let mut messages = Vec::new();
+                if let Some(message) = self.application_name_status_change() {
+                    messages.push(message);
+                }
+                messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
+                write_messages(stream, codec, &messages).await
             }
             Ok(StreamOutcome::Direct(result)) => {
                 if is_discard_all_result(&result) {
                     self.prepared.clear();
                     self.portals.clear();
+                }
+                if let Some(message) = self.application_name_status_change() {
+                    write_messages(stream, codec, &[message]).await?;
                 }
                 write_portal_result(stream, codec, result, &result_formats).await
             }

@@ -9,6 +9,43 @@ fn error_message(outcome: &QueryOutcome) -> String {
     }
 }
 
+fn has_frame_containing(bytes: &[u8], tag: u8, needle: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let frame_tag = bytes[offset];
+        let len = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        let end = offset + 1 + len;
+        if len < 4 || end > bytes.len() {
+            return false;
+        }
+        let body = &bytes[offset + 5..end];
+        if frame_tag == tag && body.windows(needle.len()).any(|window| window == needle) {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn frame_count_containing(bytes: &[u8], tag: u8, needle: &[u8]) -> usize {
+    let mut offset = 0;
+    let mut count = 0;
+    while offset + 5 <= bytes.len() {
+        let frame_tag = bytes[offset];
+        let len = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        let end = offset + 1 + len;
+        if len < 4 || end > bytes.len() {
+            return count;
+        }
+        let body = &bytes[offset + 5..end];
+        if frame_tag == tag && body.windows(needle.len()).any(|window| window == needle) {
+            count += 1;
+        }
+        offset = end;
+    }
+    count
+}
+
 #[tokio::test]
 async fn set_show_reset_and_accept_all_gucs_are_session_local() {
     let server = TestServer::start().await.unwrap();
@@ -49,6 +86,96 @@ async fn set_show_reset_and_accept_all_gucs_are_session_local() {
 
     let message = error_message(&conn_a.ok("SHOW no_such_parameter").await);
     assert!(message.contains("C=42704"), "got {message}");
+}
+
+#[tokio::test]
+async fn changing_application_name_sends_parameter_status() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let response = conn
+        .query_raw("SET application_name = 'jdbc-app'")
+        .await
+        .unwrap();
+    assert!(
+        has_frame_containing(&response, b'S', b"application_name\0jdbc-app\0"),
+        "expected a ParameterStatus frame for application_name"
+    );
+
+    let response = conn
+        .query_raw("SET application_name = 'jdbc-app'")
+        .await
+        .unwrap();
+    assert!(!has_frame_containing(
+        &response,
+        b'S',
+        b"application_name\0"
+    ));
+
+    let response = conn.query_raw("DISCARD ALL").await.unwrap();
+    assert!(has_frame_containing(
+        &response,
+        b'S',
+        b"application_name\0\0"
+    ));
+}
+
+#[tokio::test]
+async fn changing_application_name_over_extended_protocol_sends_parameter_status() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let response = conn
+        .extended_execute_raw("SET application_name = 'ext-app'")
+        .await
+        .unwrap();
+    assert!(
+        has_frame_containing(&response, b'S', b"application_name\0ext-app\0"),
+        "expected extended Sync to report application_name"
+    );
+
+    let response = conn
+        .extended_execute_raw("SET application_name = 'ext-app'")
+        .await
+        .unwrap();
+    assert!(!has_frame_containing(
+        &response,
+        b'S',
+        b"application_name\0"
+    ));
+}
+
+#[tokio::test]
+async fn extended_application_name_reports_each_execute_before_sync() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let mut bytes = Connection::extended_parse("SET application_name = 'first'");
+    bytes.extend(Connection::extended_bind());
+    bytes.extend(Connection::extended_execute_portal());
+    bytes.extend(Connection::extended_parse(
+        "SET application_name = 'second'",
+    ));
+    bytes.extend(Connection::extended_bind());
+    bytes.extend(Connection::extended_execute_portal());
+    bytes.extend(Connection::extended_sync());
+
+    let response = conn.extended_raw(bytes).await.unwrap();
+    assert_eq!(
+        frame_count_containing(&response, b'S', b"application_name\0"),
+        2,
+        "each successful Execute that changes application_name should report"
+    );
+    assert!(has_frame_containing(
+        &response,
+        b'S',
+        b"application_name\0first\0"
+    ));
+    assert!(has_frame_containing(
+        &response,
+        b'S',
+        b"application_name\0second\0"
+    ));
 }
 
 #[tokio::test]

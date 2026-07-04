@@ -132,6 +132,10 @@ impl Session {
             return Err(err);
         }
 
+        if let Some(message) = self.application_name_status_change() {
+            write_messages(stream, codec, &[message]).await?;
+        }
+
         match outcome {
             // A streamed SELECT: `RowDescription` and `DataRow`s were already
             // written above; finish with the command tag (the producer's

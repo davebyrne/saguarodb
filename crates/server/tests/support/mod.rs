@@ -268,6 +268,16 @@ impl Connection {
         Ok(QueryOutcome { result, status })
     }
 
+    /// Send one simple query and return the raw response bytes through the trailing
+    /// `ReadyForQuery`, for tests that assert protocol framing.
+    pub async fn query_raw(&mut self, sql: &str) -> Result<Vec<u8>> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send query message: {err}")))?;
+        read_until_ready(&mut self.stream).await
+    }
+
     /// Run a query expecting transport success; panics on protocol/transport
     /// error (a server SQL error is still returned in the `QueryOutcome`).
     pub async fn ok(&mut self, sql: &str) -> QueryOutcome {
@@ -280,17 +290,44 @@ impl Connection {
     /// Returns the decoded rows (or the server error) and the transaction-status
     /// byte from `ReadyForQuery`.
     pub async fn extended_execute(&mut self, sql: &str) -> Result<QueryOutcome> {
+        let response = self.extended_execute_raw(sql).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
+    /// Run one parameterless extended-protocol statement and return the raw response
+    /// bytes through `ReadyForQuery`.
+    pub async fn extended_execute_raw(&mut self, sql: &str) -> Result<Vec<u8>> {
         let mut seq = parse_bytes("", sql, &[]);
         seq.extend(bind_bytes("", ""));
         seq.extend(execute_bytes(""));
         seq.extend(sync_bytes());
-        self.stream.write_all(&seq).await.map_err(|err| {
+        self.extended_raw(seq).await
+    }
+
+    /// Send raw extended-protocol messages and return bytes through `ReadyForQuery`.
+    pub async fn extended_raw(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>> {
+        self.stream.write_all(&bytes).await.map_err(|err| {
             common::DbError::io(format!("failed to send extended-protocol sequence: {err}"))
         })?;
-        let response = read_until_ready(&mut self.stream).await?;
-        let status = ready_for_query_status(&response)?;
-        let result = decode_simple_query_response(&response);
-        Ok(QueryOutcome { result, status })
+        read_until_ready(&mut self.stream).await
+    }
+
+    pub fn extended_parse(sql: &str) -> Vec<u8> {
+        parse_bytes("", sql, &[])
+    }
+
+    pub fn extended_bind() -> Vec<u8> {
+        bind_bytes("", "")
+    }
+
+    pub fn extended_execute_portal() -> Vec<u8> {
+        execute_bytes("")
+    }
+
+    pub fn extended_sync() -> Vec<u8> {
+        sync_bytes()
     }
 
     pub async fn prepare(&mut self, name: &str, sql: &str) -> Result<QueryOutcome> {
@@ -737,7 +774,7 @@ fn decode_simple_query_response(bytes: &[u8]) -> Result<SimpleQueryResult> {
             // Simple-query framing tags plus the extended-protocol acknowledgements
             // (`1` ParseComplete, `2` BindComplete, `n` NoData, `t`
             // ParameterDescription) that carry no rows.
-            b'T' | b'C' | b'Z' | b'1' | b'2' | b'n' | b't' => {}
+            b'T' | b'C' | b'Z' | b'S' | b'1' | b'2' | b'n' | b't' => {}
             _ => {
                 return Err(common::DbError::protocol(
                     common::SqlState::InternalError,
