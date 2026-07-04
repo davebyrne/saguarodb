@@ -2,6 +2,51 @@ mod support;
 
 use support::{Connection, TestServer};
 
+/// Independently probes whether this filesystem's `fallocate`
+/// `FALLOC_FL_PUNCH_HOLE` actually reclaims disk blocks, using a throwaway
+/// scratch file under `dir` (never a table's heap file) — mirroring the
+/// storage-level `hole_punch_reclaims_blocks_when_supported` probe
+/// (`crates/storage/src/heap.rs`). Some filesystems accept the fallocate call
+/// but don't shrink the allocated block count, so only a measured shrink in
+/// `st_blocks` counts as "supports punch". Deciding the test's expectation
+/// this way (rather than from whether the docs heap happened to shrink) means
+/// a real compression/punch regression cannot masquerade as "unsupported
+/// filesystem".
+#[cfg(target_os = "linux")]
+fn filesystem_supports_hole_punch(dir: &std::path::Path) -> bool {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = dir.join("hole-punch-probe.tmp");
+    let mut file = std::fs::File::create(&path).unwrap();
+    let block: u64 = 4096;
+    file.write_all(&vec![0xABu8; (block * 2) as usize]).unwrap();
+    file.sync_all().unwrap();
+    let before = file.metadata().unwrap().blocks() * 512;
+
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            block as libc::off_t,
+        )
+    };
+    let reclaimed = rc == 0 && {
+        let after = file.metadata().unwrap().blocks() * 512;
+        after < before
+    };
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+    reclaimed
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_supports_hole_punch(_dir: &std::path::Path) -> bool {
+    false
+}
+
 /// A dictionary created AFTER the last checkpoint must be re-resolvable at
 /// recovery purely from the dict file + WAL (`compression.md` §7): create a
 /// zstd table, load data, checkpoint, ALTER to train the dict (post-
@@ -77,13 +122,21 @@ async fn dictionary_and_compressed_wal_survive_restart() {
 }
 
 /// §13: `CREATE TABLE ... WITH (compression = 'zstd')` → insert → checkpoint →
-/// restart → select roundtrip, and the heap file's on-disk allocation is
-/// actually smaller than its logical size (hole-punched compressed pages),
-/// mirroring the storage-level `hole_punch_reclaims_blocks_when_supported`
-/// test (skip, don't fail, on a filesystem that doesn't reclaim).
+/// restart → select roundtrip, and the `docs` table's OWN heap file's on-disk
+/// allocation is actually smaller than its logical size (hole-punched
+/// compressed pages), mirroring the storage-level
+/// `hole_punch_reclaims_blocks_when_supported` test. Whether the reclaim
+/// assertion applies is decided by an INDEPENDENT probe
+/// ([`filesystem_supports_hole_punch`]) against a scratch file on this same
+/// filesystem — not by whether the docs heap happened to shrink — so a real
+/// compression/punch regression (e.g. every page stored raw) FAILS the test
+/// on a hole-punching filesystem instead of silently passing as "skip".
 #[tokio::test]
 async fn zstd_table_round_trips_and_reclaims_disk() {
     let dir = tempfile::tempdir().unwrap();
+    let fs_reclaims_holes = filesystem_supports_hole_punch(dir.path());
+
+    let table_id;
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
         server
@@ -102,6 +155,14 @@ async fn zstd_table_round_trips_and_reclaims_disk() {
                 .unwrap();
         }
         server.force_checkpoint().await.unwrap();
+        table_id = server
+            .app()
+            .components
+            .catalog
+            .get_table_by_name("docs")
+            .unwrap()
+            .expect("docs table exists in the catalog")
+            .id;
     }
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
     let rows = server
@@ -111,36 +172,47 @@ async fn zstd_table_round_trips_and_reclaims_disk() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("200".to_string())]]);
 
-    // Allocated < logical on a hole-punching fs (skip otherwise, as in the
-    // storage-level test): find the heap file(s) under `<data_dir>/heap`.
+    // Target the docs table's OWN heap file (`<table_id>.heap`), not "any .heap
+    // file" under the data dir — a catalog heap could otherwise be mistaken for
+    // it. The 200-row docs table is the only thing that should live here.
     use std::os::unix::fs::MetadataExt;
-    let heap_dir = dir.path().join("heap");
-    let mut punched = false;
-    let mut any_heap = false;
-    for entry in std::fs::read_dir(&heap_dir).unwrap().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("heap") {
-            continue;
-        }
-        any_heap = true;
-        let meta = entry.metadata().unwrap();
-        if meta.blocks() * 512 < meta.len() {
-            punched = true;
-        }
+    let heap_path = dir.path().join("heap").join(format!("{table_id}.heap"));
+    let meta = std::fs::metadata(&heap_path)
+        .unwrap_or_else(|err| panic!("expected docs heap file at {heap_path:?}: {err}"));
+    let allocated = meta.blocks() * 512;
+    let logical = meta.len();
+    let punched = allocated < logical;
+
+    if fs_reclaims_holes {
+        assert!(
+            punched,
+            "zstd heap file did not reclaim disk: allocated {allocated} >= logical {logical}"
+        );
+    } else {
+        eprintln!(
+            "skipping punch assertion: independent probe found this filesystem does not \
+             reclaim hole-punched blocks"
+        );
     }
-    assert!(
-        any_heap,
-        "expected at least one .heap file under {heap_dir:?}"
-    );
-    if !punched {
-        eprintln!("skipping punch assertion: filesystem did not reclaim blocks");
-    }
+}
+
+/// The deterministic `body` text inserted for a given `id` in
+/// `alter_both_directions_survives_restart`, so the test can assert the exact
+/// payload — not just row counts and pk aggregates — survives each rewrite.
+fn expected_body(id: i32) -> String {
+    format!("row-{id}-{}", "abcdefghij".repeat(10))
 }
 
 /// §13: `ALTER TABLE` rewrite in both directions (`none → zstd`, `zstd →
 /// none`) with correctness preserved, and the final state survives a restart.
+/// Correctness is checked both structurally (row count, pk min/max) AND at the
+/// payload level: a probe row's `body` must decode back to the exact original
+/// text after compression, after decompression, and after a crash-restart — a
+/// rewrite that corrupted `body` while preserving ids/row-count would pass the
+/// weaker checks alone.
 #[tokio::test]
 async fn alter_both_directions_survives_restart() {
+    const PROBE_ID: i32 = 42;
     let dir = tempfile::tempdir().unwrap();
     {
         let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
@@ -151,8 +223,8 @@ async fn alter_both_directions_survives_restart() {
         for i in 0..100 {
             server
                 .simple_query(&format!(
-                    "insert into t (id, body) values ({i}, 'row-{i}-{}')",
-                    "abcdefghij".repeat(10)
+                    "insert into t (id, body) values ({i}, '{}')",
+                    expected_body(i)
                 ))
                 .await
                 .unwrap();
@@ -167,6 +239,16 @@ async fn alter_both_directions_survives_restart() {
             .unwrap()
             .unwrap_rows();
         assert_eq!(rows, vec![vec![Some("100".to_string())]]);
+        let body_rows = server
+            .simple_query(&format!("select body from t where id = {PROBE_ID}"))
+            .await
+            .unwrap()
+            .unwrap_rows();
+        assert_eq!(
+            body_rows,
+            vec![vec![Some(expected_body(PROBE_ID))]],
+            "body must round-trip through the none -> zstd rewrite intact"
+        );
 
         server
             .simple_query("alter table t set (compression = 'none')")
@@ -178,6 +260,16 @@ async fn alter_both_directions_survives_restart() {
             .unwrap()
             .unwrap_rows();
         assert_eq!(rows, vec![vec![Some("100".to_string())]]);
+        let body_rows = server
+            .simple_query(&format!("select body from t where id = {PROBE_ID}"))
+            .await
+            .unwrap()
+            .unwrap_rows();
+        assert_eq!(
+            body_rows,
+            vec![vec![Some(expected_body(PROBE_ID))]],
+            "body must round-trip through the zstd -> none rewrite intact"
+        );
     }
     let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
     let rows = server
@@ -193,10 +285,34 @@ async fn alter_both_directions_survives_restart() {
             Some("100".to_string())
         ]]
     );
+    let body_rows = server
+        .simple_query(&format!("select body from t where id = {PROBE_ID}"))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        body_rows,
+        vec![vec![Some(expected_body(PROBE_ID))]],
+        "body must still decode correctly after a crash-restart"
+    );
 }
 
 /// §13: VACUUM works on a compressed table — dead versions are reclaimed
 /// through envelope-encoded (compressed) pages just as on raw pages.
+///
+/// `count(*) == 40` alone is a *visibility* check: MVCC hides dead versions
+/// from a snapshot whether or not VACUUM ever physically reclaimed them, so on
+/// its own it can't tell "VACUUM worked" from "VACUUM never ran". Two things
+/// give this test real teeth for the compressed path specifically:
+/// - `force_checkpoint()` runs BEFORE `vacuum t`, flushing the table's pages
+///   compressed to disk first, so VACUUM's heap-prune phase must decode them
+///   back through the envelope path (not find them already resident,
+///   uncompressed, in the buffer pool).
+/// - `dead_rows_since_vacuum()` — the per-commit dead-version accumulator
+///   (`docs/specs/mvcc.md` §9) — is asserted to be exactly 35 (25 from the
+///   UPDATE + 10 from the DELETE) right before VACUUM runs: a real,
+///   deterministic physical signal that there is genuine dead-version debt
+///   here for VACUUM to reclaim, not just a `count(*)` coincidence.
 #[tokio::test]
 async fn vacuum_on_compressed_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -221,6 +337,19 @@ async fn vacuum_on_compressed_table() {
         .simple_query("delete from t where id >= 40")
         .await
         .unwrap();
+    assert_eq!(
+        server.dead_rows_since_vacuum(),
+        35,
+        "25 updated + 10 deleted rows should have produced 35 committed dead \
+         versions for VACUUM to reclaim"
+    );
+
+    // Flush the compressed pages to disk BEFORE vacuuming, so VACUUM's
+    // heap-prune phase reads them back through the envelope decode path
+    // instead of finding them still resident (uncompressed) in the buffer
+    // pool.
+    server.force_checkpoint().await.unwrap();
+
     server.simple_query("vacuum t").await.unwrap();
     let rows = server
         .simple_query("select count(*) from t")
