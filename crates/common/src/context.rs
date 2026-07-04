@@ -119,6 +119,28 @@ impl SessionSequenceState {
     }
 }
 
+/// Connection identity reported by system information functions
+/// (`current_user`, `current_database()`, `pg_backend_pid()`, ...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// The startup `user` parameter.
+    pub user: String,
+    /// The startup `database` parameter, defaulted to the user name when omitted.
+    pub database: String,
+    /// The connection's cancellation-key process id (`BackendKeyData`).
+    pub backend_pid: i32,
+}
+
+impl Default for SessionInfo {
+    fn default() -> Self {
+        Self {
+            user: "saguarodb".to_string(),
+            database: "saguarodb".to_string(),
+            backend_pid: 0,
+        }
+    }
+}
+
 /// Records what a `SERIALIZABLE` transaction reads (SIREAD locks) and forms
 /// rw-antidependency edges when a write overwrites a concurrent read, so the server's
 /// serializable-conflict manager can detect dangerous structures and abort to preserve
@@ -218,6 +240,8 @@ pub struct StatementContext {
     /// Per-connection `currval` memory. The server installs a connection-owned
     /// handle; tests and non-session helpers get a fresh empty state by default.
     pub session_sequences: Arc<SessionSequenceState>,
+    /// Connection identity for system information functions.
+    pub session_info: Arc<SessionInfo>,
 }
 
 impl StatementContext {
@@ -238,6 +262,7 @@ impl StatementContext {
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
+            session_info: Arc::new(SessionInfo::default()),
         }
     }
 
@@ -257,6 +282,7 @@ impl StatementContext {
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
+            session_info: Arc::new(SessionInfo::default()),
         }
     }
 
@@ -278,6 +304,7 @@ impl StatementContext {
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
+            session_info: Arc::new(SessionInfo::default()),
         }
     }
 
@@ -333,6 +360,13 @@ impl StatementContext {
         self
     }
 
+    /// Install the connection identity used by system information functions.
+    #[must_use]
+    pub fn with_session_info(mut self, session_info: Arc<SessionInfo>) -> Self {
+        self.session_info = session_info;
+        self
+    }
+
     /// Advance `sequence` via [`SequenceManager::nextval`] and record the returned
     /// value as this session's `currval`, returning the new value. Shared by the
     /// `nextval(...)` expression and the INSERT/COPY `DEFAULT nextval` path so both
@@ -353,6 +387,7 @@ impl PartialEq for StatementContext {
             && self.isolation == other.isolation
             && self.live_txns == other.live_txns
             && self.gc_horizon == other.gc_horizon
+            && self.session_info == other.session_info
     }
 }
 
@@ -391,6 +426,22 @@ mod tests {
     fn contexts_with_same_txn_id_are_equal() {
         assert_eq!(StatementContext::new(7), StatementContext::new(7));
         assert_ne!(StatementContext::new(7), StatementContext::new(8));
+    }
+
+    #[test]
+    fn default_session_info_names_the_single_database() {
+        let ctx = StatementContext::new(1);
+        assert_eq!(ctx.session_info.user, "saguarodb");
+        assert_eq!(ctx.session_info.database, "saguarodb");
+        assert_eq!(ctx.session_info.backend_pid, 0);
+
+        let custom = std::sync::Arc::new(super::SessionInfo {
+            user: "ada".to_string(),
+            database: "mainframe".to_string(),
+            backend_pid: 7,
+        });
+        let ctx = StatementContext::new(1).with_session_info(custom.clone());
+        assert_eq!(ctx.session_info, custom);
     }
 
     #[test]

@@ -309,7 +309,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Passed to every storage operation. Carries the transaction id, the MVCC
 /// snapshot used for visibility, the isolation level, the GC horizon, and the
 /// server-installed runtime handles (row-lock conflict waiter, cancel flag,
-/// live subxid set, SSI tracker, sequence runtime).
+/// live subxid set, SSI tracker, sequence runtime, session identity).
 /// docs/specs/crates/common.md "Statement Context" is the authoritative
 /// field-by-field contract.
 pub struct StatementContext {
@@ -323,6 +323,7 @@ pub struct StatementContext {
     pub ssi_tracker: Arc<dyn SsiTracker>,
     pub sequence_manager: Arc<dyn SequenceManager>,
     pub session_sequences: Arc<SessionSequenceState>,
+    pub session_info: Arc<SessionInfo>,
 }
 ```
 

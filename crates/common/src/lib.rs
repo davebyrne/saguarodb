@@ -20,7 +20,8 @@ pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };
 pub use context::{
-    ConflictWaiter, SequenceManager, SessionSequenceState, SsiTracker, StatementContext,
+    ConflictWaiter, SequenceManager, SessionInfo, SessionSequenceState, SsiTracker,
+    StatementContext,
 };
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};

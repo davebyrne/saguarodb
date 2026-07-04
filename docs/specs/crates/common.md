@@ -446,6 +446,7 @@ pub struct StatementContext {
     pub ssi_tracker: Arc<dyn SsiTracker>,
     pub sequence_manager: Arc<dyn SequenceManager>,
     pub session_sequences: Arc<SessionSequenceState>,
+    pub session_info: Arc<SessionInfo>,
 }
 ```
 
@@ -476,7 +477,11 @@ prunes less, never unsafely. `conflict_waiter`, `cancel`, `live_txns`, and
 `sequence_manager` is the runtime sequence implementation used by
 `nextval`/`setval` and by `currval`'s execution-time existence check;
 `session_sequences` is the per-connection map storing `currval`'s last returned
-values. Default contexts install loud/no-op test implementations where
+values. `session_info` carries connection identity (`user`, `database`,
+`backend_pid`) for system information functions; it defaults to the single built-in
+`saguarodb` database/user with pid `0`. Server connection plumbing installs the
+real per-connection value when system information functions are wired into query
+execution. Default contexts install loud/no-op test implementations where
 appropriate. `StatementContext` is `Clone` but not `Copy`.
 
 ## MVCC Types
