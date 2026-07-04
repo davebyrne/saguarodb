@@ -38,6 +38,14 @@ pub struct CompressionRegistry {
     dicts: RwLock<HashMap<u32, Arc<LoadedDictionary>>>,
 }
 
+// `CompressionRegistry` is shared across the server's storage/WAL threads, so
+// it must be `Send + Sync`. Lock this in at the declaration so a future
+// non-Send/Sync field fails to compile here, not in a downstream crate.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CompressionRegistry>();
+};
+
 fn corrupt(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
