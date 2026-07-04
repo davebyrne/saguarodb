@@ -40,6 +40,11 @@ pub enum WalRecordKind {
     HeapDelete { file_id: FileId, page_num: PageNum, slot: u16 },
     HeapUpdateHeader { file_id: FileId, page_num: PageNum, slot: u16, xmax: u64, t_ctid: (PageNum, u16), infomask: u16 },
     FullPageImage { file_id: FileId, page_num: PageNum, image: Vec<u8> },
+    // Compression (`docs/specs/compression.md`), compact binary payloads.
+    FullPageImageCompressed { file_id: FileId, page_num: PageNum, codec: u8, dict_id: u32, payload: Vec<u8> },
+    CreateDictionary { dict_id: u32, table_id: TableId, bytes: Vec<u8> },
+    // Compression, JSON payload (the logical-DDL fallback encoding).
+    AlterTableCompression { table_id: TableId, compression: CompressionSetting, active_dict_id: Option<u32> },
 }
 ```
 
@@ -55,6 +60,14 @@ The physiological redo records (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpd
 
 `HeapUpdateHeader` is an in-place mutation of a v2 tuple header — it sets the `xmax`, forward `t_ctid` pointer, and `infomask` of the live tuple at `slot` without relocating it (the three are fixed-width header fields, so the tuple keeps its exact offset and length and the page is not compacted). It is the MVCC substrate for `UPDATE`/`DELETE` version stamping (Milestone B commits 8–9, `docs/specs/mvcc.md` §5.3); the record and its redo handler land first, ahead of engine emission. Recovery replays it PageLSN-gated like the other heap records: it is skipped when `page_lsn >= record.lsn`, otherwise it rewrites the header (via `page::set_tuple_header`) and the primitive stamps `record.lsn`, so replay is idempotent.
 
+### Compression records (`docs/specs/compression.md`)
+
+Three record kinds support per-table page and WAL full-page-image compression. `wal` has no dependency on `saguarodb-compress` — these records carry plain codec ids, dictionary ids, and already-compressed/plain bytes; `storage` and `server` own compressing/decompressing at their call sites (`docs/specs/crates/storage.md`, `docs/specs/crates/server.md`).
+
+- **`FullPageImageCompressed { file_id, page_num, codec, dict_id, payload }`** (type byte `18`, compact binary, mirroring `FullPageImage`'s framing: `file_id`(4) + `page_num`(4) + `codec`(1) + `dict_id`(4) + `payload`). `payload` decompresses to exactly `PAGE_SIZE` bytes via the named `codec`/`dict_id`. Emitted by `storage::fpi_record_kind` in place of a plain `FullPageImage` only when it is smaller (unconditional compression attempt, per-record self-describing raw fallback — the WAL never expands, `compression.md` §6). The existing `FullPageImage` record and its redo handling are unchanged; a `FullPageImageCompressed` record is normalized to a decompressed `FullPageImage` by the caller (`server::apply_redo`) before physical redo runs, so `storage::apply_physical_redo` itself never sees the compressed variant (see "Replay" below).
+- **`CreateDictionary { dict_id, table_id, bytes }`** (type byte `19`, compact binary: `dict_id`(4) + `table_id`(4) + raw trained-dictionary `bytes`). Installs an immutable per-table zstd dictionary. Appended (and flushed with the creating statement's commit) whenever `ALTER TABLE ... SET (compression = 'zstd')` trains one; the durability order is dictionary file written to `<data>/dicts/` **before** this record is appended, so a page envelope or a WAL FPI can only ever reference a dictionary id that is either already on disk or resolvable from an earlier-LSN `CreateDictionary` record (`compression.md` §7). Replay installs the dictionary file if it is not already present — **idempotent**, since `DictStore::save` is a no-op when the file already exists — and registers it with the in-memory dictionary resolver, so later records can resolve the same `dict_id`. It is classified alongside the other object-creating DDL records: `server` reserves the dictionary id even for a skipped aborted/in-flight record, so a later dictionary never reuses the same id.
+- **`AlterTableCompression { table_id, compression, active_dict_id }`** (type byte `20`; no dedicated binary arm in `encode_payload`/`decode_payload`, so it falls through to the generic `serde_json` encoding like the other logical/DDL records — the type byte still round-trips and is checked against the decoded kind on decode). The DDL record for `ALTER TABLE ... SET (compression = ...)`: updates a table's `compression` setting and `active_dict_id` in the catalog. Gated on replay exactly like `CreateTable`/`CreateIndex`/etc — only a committed transaction's record is applied (`server::is_logical_catalog_record`); an aborted/in-flight one is skipped and reserves no id of its own (the table id and any `active_dict_id` were already reserved by the table's `CreateTable` and this record's own `CreateDictionary`, if one preceded it).
+
 On disk:
 
 ```text
@@ -66,7 +79,7 @@ Payload: variable
 CRC32: 4 bytes
 ```
 
-CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). The `Type` byte is authoritative for binary records.
+CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields (not JSON) despite one being physiological-adjacent and the other logical/DDL-adjacent — see above; `AlterTableCompression` is the one compression record that uses the JSON fallback. The `Type` byte is authoritative for binary records.
 
 ## Public API
 
@@ -162,7 +175,8 @@ After heap pages are flushed + fsynced and the control record is stored:
 Recovery (redo-all, Milestone D2):
 
 - Reads the control record checkpoint LSN.
-- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index/sequence IDs.
+- Calls `replay_from(checkpoint_lsn)` and applies every page-mutation record (`is_redo_operation`) under PageLSN gating, regardless of the transaction's outcome; the `Commit`/`CommitWithSubxids`/`Abort`/`Checkpoint` markers are skipped. DDL records install objects only for committed transactions (server-gated by the CLOG), and skipped aborted/in-flight create records reserve their table/index/sequence IDs. `CreateDictionary` and `AlterTableCompression` are classified alongside those DDL records (`server::is_logical_catalog_record`): a skipped aborted/in-flight `CreateDictionary` still reserves its dictionary id.
+- Before physical redo runs, the server normalizes a `FullPageImageCompressed` record to a decompressed raw `FullPageImage` (resolving `dict_id` against the dictionary resolver seeded from `<data>/dicts/` before redo begins) — an unresolvable `dict_id` at this point is a fatal structured recovery error, since it indicates a deleted/corrupted dictionary file rather than a normal crash state. `storage::apply_physical_redo` itself only ever sees the raw `FullPageImage` variant.
 - Reconstructs the CLOG at `open`: seeded from the durable CLOG snapshot (`clog.dat`) plus a fold of the post-`clog_lsn` `Commit`/`Abort` records, or fully rebuilt from those records when no snapshot exists (see "Durable CLOG snapshot"). The CLOG — not a replay filter — decides visibility: an aborted or in-flight (no `Commit`/`Abort`) transaction's replayed versions are present in the heap but invisible, and reclaimed by VACUUM (Milestone F).
 - Seeds `next_txn_id` by scanning `replay_from(0)` over all retained records (including `CommitWithSubxids.subxids` and the `Checkpoint` marker's high-water), not just the post-checkpoint redo range.
 
@@ -249,3 +263,4 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
 - Truncated WAL still replays from manifest checkpoint LSN.
 - CRC detects corrupted record.
 - Incomplete trailing record after crash is ignored.
+- `FullPageImageCompressed` and `CreateDictionary` round-trip through the compact binary encoding (and `CreateDictionary`'s payload length is exercised at a realistic dictionary size); `AlterTableCompression` round-trips through the JSON fallback for both `Zstd`/`Some(dict_id)` and `None`/`None`. A malformed physical payload (wrong length for its type byte) is rejected.

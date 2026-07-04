@@ -58,6 +58,10 @@ pub trait RecoveryOperations: Send + Sync {
         value: i64,
         is_called: bool,
     ) -> Result<()>;
+    /// Recovery apply for `ALTER TABLE ... SET (compression)`: installs the
+    /// updated schema and re-registers the file compression configs. Must not
+    /// append WAL (see At-Rest Page Compression).
+    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
 }
 ```
 
@@ -884,6 +888,13 @@ at byte offset `n * PAGE_SIZE` with positioned reads/writes. `load_page` returns
 (missing file or beyond-EOF / short tail); `write_page` writes in place without
 fsync; `sync_all` fsyncs all open files and the directory; `page_count` returns a
 file's on-disk extent in pages, used to seed page allocation after recovery.
+`HeapPageStore::open(dir)` opens with a fresh, default (all-raw)
+`compress::CompressionRegistry`; `HeapPageStore::open_with_compression(dir,
+registry)` opens sharing a registry instance with the caller — the server
+constructs one `CompressionRegistry` and passes it to both the `HeapPageStore`
+(at-rest envelopes) and `PageBackedStorageEngine::open_with_compression` (WAL
+FPIs), so a file's config is consulted consistently by both paths (see
+At-Rest Page Compression).
 
 `apply_physical_redo(page, lsn, kind)` replays one physiological redo record
 (`HeapInit`/`HeapInsert`/`HeapDelete`/`HeapUpdateHeader`/`FullPageImage`) onto a page buffer, gated by
@@ -891,7 +902,125 @@ the page-LSN: a record whose effect is already present (`page_lsn(page) >= lsn`)
 skipped, making replay idempotent. `FullPageImage` is validated to be exactly
 `PAGE_SIZE` bytes before install. Recovery uses it to redo every physical page
 mutation after the checkpoint LSN, regardless of the dirtying transaction's
-outcome; the CLOG decides whether replayed versions are visible.
+outcome; the CLOG decides whether replayed versions are visible. A WAL
+`FullPageImageCompressed` record is normalized to a decompressed raw
+`FullPageImage` by the caller (`server`) before it reaches
+`apply_physical_redo`, so this function itself only ever sees raw `PAGE_SIZE`
+images (see At-Rest Page Compression, and `docs/specs/crates/wal.md`).
+
+## At-Rest Page Compression
+
+`HeapPageStore` transparently compresses page slots per-file using
+`saguarodb-compress`'s codec, envelope, and dictionary machinery
+(`docs/specs/compression.md`). None of `PageStore`/`PageLoader`, the buffer
+pool, or any code above the store is aware of this — every method still reads
+and writes exactly `PAGE_SIZE` logical bytes; compression is folded entirely
+into `write_page`'s encode step and `load_page`'s decode step.
+
+- **Envelope detection on load.** `decode_slot` reads the raw on-disk slot,
+  then hands it to `CompressionRegistry::decompress_page`: `Ok(None)` (not an
+  envelope — a raw page or an all-zero sparse hole) returns the raw bytes as
+  today; `Ok(Some(image))` returns the decompressed `PAGE_SIZE` image; `Err`
+  (a structurally invalid envelope, an unresolvable dictionary, or a
+  decompressed length other than `PAGE_SIZE`) is the corruption case (below).
+- **Write path.** `write_page` asks `CompressionRegistry::compress_page_at_rest`
+  for the file's envelope. When it returns `None` (no config, or the envelope
+  would not be smaller than a raw page), the full raw image is written exactly
+  as before. Otherwise the smallest whole number of filesystem blocks
+  (`FS_BLOCK_SIZE = 4096`, a conservative assumed allocation quantum — see
+  `docs/specs/compression.md` §5 and §12 for the page-size-agnostic framing)
+  needed to hold the envelope is computed; if that is fewer blocks than the
+  page's full slot, the envelope is written **zero-padded out to a full
+  `PAGE_SIZE` slot** at the page's normal offset, and only then are the
+  trailing blocks punched with `fallocate(FALLOC_FL_PUNCH_HOLE |
+  FALLOC_FL_KEEP_SIZE)`. Writing the full slot before punching — rather than a
+  short write of just the envelope — is what keeps `st_size` (and so
+  `page_count = st_size / PAGE_SIZE`, allocator seeding, and VACUUM's
+  full-extent scan) exactly right even when the page being written is the
+  file's current tail; a short write there would under-report the extent.
+  `KEEP_SIZE` means the punch never changes `st_size`. If the envelope would
+  not fit in fewer blocks than the raw slot, the raw image is written instead
+  (which naturally un-punches any earlier hole at that offset).
+- **Hole punching is best-effort and latches off.** `punch_hole` never fails
+  the write: an `EOPNOTSUPP`/`EINVAL` `fallocate` result is recorded once (an
+  `AtomicBool` on the store) and punching is skipped thereafter for that
+  store — correct either way, since a skipped punch merely reclaims nothing
+  and the length-delimited envelope decode never reads the stale trailing
+  bytes. Punching is a no-op on non-Linux targets.
+- **`open_with_compression` and config registration.** A `HeapPageStore`
+  constructed via `open_with_compression` shares one `CompressionRegistry`
+  with the storage engine. The engine registers each file's config
+  (`register_table_compression`) whenever schemas are installed at
+  startup/recovery (`install_schemas`, `install_index_schemas`), on `CREATE
+  TABLE`, on `CREATE INDEX`, and on `ALTER TABLE ... SET (compression)`: the
+  heap file gets `(codec, active_dict_id)` from the table's `compression`
+  setting, and every index file for that table (the primary-key index and
+  every secondary index) gets the SAME codec but **never** the heap's trained
+  dictionary — a heap-trained dictionary does not fit B-tree node content, so
+  index files always compress dict-less (or not at all). A file with no
+  registered config always writes/reads raw.
+- **Strict vs. lenient loads.** `PageLoader::load_page` is strict: an invalid
+  envelope is a loud, structured corruption error, exactly like any other page
+  corruption on a normal read/write path. `PageLoader::load_page_lenient` (see
+  `docs/specs/crates/buffer.md`) reports the same failure as an absent page
+  instead. Only recovery redo (`BufferPool::fetch_for_redo`) uses the lenient
+  form: a torn compressed envelope is exactly like a torn raw page mid-write —
+  it was dirty, so its first post-checkpoint modification logged an FPI that
+  redo will replay — so treating it as a zeroed missing frame is sound and
+  strictly better than trusting a torn raw page's garbage bytes and garbage
+  PageLSN.
+- **`fpi_record_kind` policy at the five FPI sites.** Every call site that logs
+  a WAL full-page image builds its record through
+  `engine::fpi_record_kind(compression, file_id, page_num, image)`, which asks
+  `CompressionRegistry::compress_fpi` (unconditional — independent of the
+  file's at-rest config) and emits `WalRecordKind::FullPageImageCompressed`
+  when it shrinks the image, `WalRecordKind::FullPageImage` (raw) otherwise —
+  self-describing per record, so the WAL never expands. The five sites are:
+  `BTree::log_full_page` (every B-tree node mutation — the primary-key index,
+  every secondary index, and index vacuum's leaf rewrite all share this one
+  function), `log_insert` (a heap row's first-touch-since-checkpoint FPI),
+  `stamp_xmax_logged` (the `UPDATE`/`DELETE` in-place `xmax`/`t_ctid` stamp's
+  first-touch FPI), `apply_prune_plan` (the heap-prune VACUUM pass, F2b/H3),
+  and `reclaim_line_pointers` (the line-pointer-reclaim VACUUM pass, F3b).
+- **`set_table_compression(schema)`.** Installs an ALTERed schema into the
+  live `TableState` and re-registers the heap file's config plus every live
+  secondary-index file's config (still dict-less) under the new setting. Pure
+  in-memory bookkeeping — it appends no WAL and takes no page latch; the
+  caller (the server's `ALTER TABLE` handler, or its recovery replay via
+  `apply_set_table_compression`) owns WAL record emission and ordering
+  (`docs/specs/compression.md` §8, and `docs/specs/crates/server.md`).
+- **`sample_heap_pages(schema, cap)`.** Returns up to `cap` **heap-only**
+  initialized page images, evenly sampled across the heap file's current
+  extent (`page::is_initialized`, the `PAGE_TYPE_DATA` check). Used by `ALTER
+  TABLE ... SET (compression = 'zstd')` to build a dictionary-training corpus.
+  The caller holds the exclusive checkpoint guard, so the sampled images are a
+  stable snapshot; an abandoned fresh-page hole is skipped without being
+  faulted in.
+- **`rewrite_table_pages(schema)`.** Dirties every **initialized** page —
+  heap AND index (`page::is_any_page_initialized`, which accepts both
+  `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
+  `sample_heap_pages` uses) — of the table's heap file, primary-key index
+  file, and every live secondary-index file, across each file's full current
+  extent, skipping abandoned fresh-page holes. It does this purely by
+  acquiring each page's buffer-pool write guard under that file's structural
+  latch: acquiring the guard marks the frame dirty without touching a single
+  logical byte. Because logical bytes and PageLSNs are completely unchanged,
+  **no WAL record is appended** — the envelope lives below the WAL contract,
+  so re-encoding a page at rest needs no redo record, only a later flush.
+  Returns the number of pages touched. The caller (`ALTER TABLE`) subsequently
+  flushes the buffer pool and fsyncs the store so every dirtied page is
+  actually re-encoded under the new config (see
+  `docs/specs/crates/server.md` and `docs/specs/compression.md` §8) — the
+  caller holds the exclusive checkpoint guard for the whole ALTER, so no
+  concurrent writer observes an inconsistent mix of dirtied-but-unflushed and
+  not-yet-dirtied pages.
+- **Corruption semantics.** An envelope validation failure is a distinct
+  structured corruption-class error (`SqlState::InternalError`), never
+  confused with "this is a raw page." A normal `load_page`/`write_page` fault
+  propagates it loudly, like any other page corruption. `fetch_for_redo` maps
+  it to a zeroed frame via `load_page_lenient` instead, relying on the
+  post-checkpoint `FullPageImage` to re-establish the page (see "Strict vs.
+  lenient loads" above).
 
 ## WAL Interaction
 
@@ -908,6 +1037,11 @@ Normal data operations append physiological redo records as they mutate pages, s
   `SetSequenceValue` and flush that WAL before the live value changes. Recovery
   replays these value records unconditionally against storage's installed
   sequence state.
+- Every full-page image storage logs — heap or index, DML or VACUUM — goes
+  through `fpi_record_kind`, which compresses it unconditionally and logs
+  `FullPageImageCompressed` in place of `FullPageImage` whenever that shrinks
+  the record (see At-Rest Page Compression). This is independent of whether
+  the page's own file is configured to compress at rest.
 
 Server query orchestration appends `Commit` and flushes WAL after the statement succeeds. Storage should not append commit records.
 
@@ -937,11 +1071,34 @@ impl PageBackedStorageEngine {
         mode: StorageMode,
     ) -> Result<Self>;
 
+    /// Open sharing `compression` with the caller's `HeapPageStore` (the
+    /// server injects the SAME instance into both, `docs/specs/compression.md`
+    /// §5a). `open` is equivalent to this with a fresh, default (all-raw)
+    /// registry.
+    pub fn open_with_compression(
+        buffer_pool: Arc<dyn BufferPool>,
+        wal: Arc<dyn WalManager>,
+        mode: StorageMode,
+        compression: Arc<compress::CompressionRegistry>,
+    ) -> Result<Self>;
+
     pub fn install_schemas(&self, schemas: Vec<TableSchema>) -> Result<()>;
     pub fn install_index_schemas(&self, schemas: Vec<IndexSchema>) -> Result<()>;
     pub fn install_sequences(&self, schemas: Vec<SequenceSchema>) -> Result<()>;
     pub fn sequence_schemas_for_checkpoint(&self) -> Result<Vec<SequenceSchema>>;
     pub fn set_mode(&self, mode: StorageMode) -> Result<()>;
+
+    /// Install an ALTERed table schema's compression setting into the live
+    /// state and re-register file configs. No WAL (see At-Rest Page
+    /// Compression).
+    pub fn set_table_compression(&self, schema: &TableSchema) -> Result<()>;
+    /// Up to `cap` evenly-sampled initialized heap page images, for
+    /// dictionary training.
+    pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
+    /// Dirty every initialized page (heap + all index files) of `schema`'s
+    /// table so a following flush re-encodes them under the current config.
+    /// Appends no WAL. Returns the number of pages touched.
+    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize>;
 }
 ```
 

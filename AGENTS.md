@@ -62,7 +62,9 @@ precedence.
 ## SQL And Durability Rules
 
 - Preserve the supported SQL subset unless the specs are intentionally updated:
-  `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
+  `CREATE TABLE` (optionally `WITH (compression = 'none' | 'zstd')`, selecting
+  per-table at-rest page compression; `docs/specs/compression.md`),
+  `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
   `INSERT ... VALUES`, `SELECT` with the supported clauses and joins (including
   uncorrelated subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and
   `[NOT] EXISTS (SELECT ...)` — in expressions, and derived tables
@@ -78,9 +80,13 @@ precedence.
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
   (per-connection default) — Read Committed / Repeatable Read / Serializable,
   with SERIALIZABLE implemented as Serializable Snapshot Isolation
-  (`docs/specs/ssi.md`)), and the maintenance
+  (`docs/specs/ssi.md`)), the maintenance
   command `VACUUM [table]` (non-relational: it does not bind/plan, takes the
-  exclusive guard, and is rejected inside a transaction block).
+  exclusive guard, and is rejected inside a transaction block), and
+  `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (also a
+  maintenance command: does not bind/plan relationally, takes the exclusive
+  guard, is rejected inside a transaction block, and performs a full rewrite of
+  the table's heap and index files under the new setting; `docs/specs/compression.md`).
 - Unsupported parsed forms should be rejected by the binder or server with
   structured `common::DbError` values and accurate SQLSTATE codes.
 - Do not introduce implicit casts. Type mismatches return

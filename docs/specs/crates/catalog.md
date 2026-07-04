@@ -24,6 +24,8 @@ pub struct Catalog {
     sequences_by_name: HashMap<String, SequenceId>,
     sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     next_sequence_id: SequenceId,
+    // Dictionary-id allocator for trained compression dictionaries (`docs/specs/compression.md` §7).
+    next_dictionary_id: u32,
 }
 
 pub struct CatalogSnapshot {
@@ -36,19 +38,24 @@ pub struct CatalogSnapshot {
     pub sequences_by_name: HashMap<String, SequenceId>,
     pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     pub next_sequence_id: SequenceId,
+    pub next_dictionary_id: u32,
 }
 ```
 
 `TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`, and
-`SequenceSchema` live in `common`.
+`SequenceSchema` live in `common`. `TableSchema` additionally carries
+`compression: CompressionSetting` and `active_dict_id: Option<u32>` (see
+"Compression" below).
 
 Table IDs, index IDs, and sequence IDs are independent namespaces; all are
 monotonically increasing and never reused. `next_index_id` starts at
 `PRIMARY_KEY_INDEX_ID + 1`, because index id `0` is reserved for a table's
 primary-key index and is never assigned to a secondary index. `next_sequence_id`
-starts at `1`. The index and sequence fields deserialize with defaults (empty
+starts at `1`. `next_dictionary_id` starts at `1` (dictionary id `0` is
+reserved to mean "no dictionary", never assigned to a real dictionary). The
+index, sequence, and dictionary-id fields deserialize with defaults (empty
 maps and initial allocator values), so catalogs persisted before secondary
-indexes or sequences existed still load.
+indexes, sequences, or compression existed still load.
 
 ## Public API
 
@@ -67,8 +74,25 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        compression: CompressionSetting,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+    /// Applies an ALTER (or replays one during recovery): locates the live
+    /// table by id and mutates its `compression`/`active_dict_id` in place,
+    /// returning the updated clone. Also high-water-reserves `active_dict_id`
+    /// when `Some` (see "Compression" below).
+    fn set_table_compression(
+        &self,
+        table: TableId,
+        compression: CompressionSetting,
+        active_dict_id: Option<u32>,
+    ) -> Result<TableSchema>;
+    /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
+    /// "no dictionary").
+    fn allocate_dictionary_id(&self) -> Result<u32>;
+    /// Advances the dictionary-id allocator's high-water mark past `id`
+    /// (WAL replay and orphan-dictionary-file recovery); never rewinds it.
+    fn reserve_dictionary_id(&self, id: u32) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
@@ -118,6 +142,21 @@ historical sequence schemas, and
 `reserve_sequence_id(id)` advances `next_sequence_id` to at least `id + 1`
 without installing a schema.
 
+`set_table_compression(table, compression, active_dict_id)` resolves the live
+table by id first (a missing/dropped table has no side effect on the
+dictionary-id allocator), then updates the schema's `compression` and
+`active_dict_id` in place and returns the updated clone. When `active_dict_id`
+is `Some(id)`, it **also** reserves that id (`reserve_id` against
+`next_dictionary_id`) exactly like every other `apply_*` path advances its own
+id allocator past an installed id — this covers both a fresh allocation on the
+live `ALTER` path and a replayed id during recovery, so the allocator
+high-water mark never lags an id a schema now references.
+`allocate_dictionary_id` returns `next_dictionary_id` and advances it by one
+(overflow-guarded, `SqlState`-free `DbError::internal` on exhaustion, like the
+other id allocators); `reserve_dictionary_id(id)` advances the same high-water
+mark to at least `id + 1` without allocating, for WAL replay and orphaned
+dictionary files discovered at startup.
+
 ## Create Table Rules
 
 - Table name must be unique; a duplicate name returns `SqlState::DuplicateTable`.
@@ -131,6 +170,7 @@ without installing a schema.
 - A column's `default` is converted from `ParsedDefault` on `ParsedColumnDef` to `ColumnDefault` on the stored `ColumnDef`. `ParsedDefault::Const(Value)` becomes `ColumnDefault::Const(Value)`. User-written `ParsedDefault::Nextval(name)` resolves `name` through the current sequence registry and becomes `ColumnDefault::Nextval(SequenceId)`, but cannot reference a sequence marked `owned`. Internal `ParsedDefault::OwnedNextval(name)` is accepted only for an owned sequence created by `SERIAL` desugaring. A remaining `ParsedDefault::Serial` marker is an internal error because execution must replace it before calling the catalog. The binder type-checks defaults before the catalog sees them; the executor applies them to omitted columns at write time.
 - Empty catalogs start with `next_table_id = 1`; `TableId` is assigned from `next_table_id`.
 - `UNIQUE` column / table constraints are not stored on the table schema; the executor creates a unique index per constraint immediately after the table (PostgreSQL-style auto name `<table>_<col...>_key`), reusing the normal `create_index` path (catalog + storage + `CreateIndex` WAL record). Recovery replays the `CreateTable` then `CreateIndex` records in order.
+- `create_table`'s `compression: CompressionSetting` parameter (binder-resolved from an optional `CREATE TABLE ... WITH (compression = ...)` clause, defaulting to `CompressionSetting::None` when the clause is absent) is stored on the schema verbatim as `TableSchema.compression`; `active_dict_id` starts `None` — a freshly created `zstd` table is dict-less until an `ALTER` trains a dictionary (`docs/specs/compression.md` §4, §7).
 
 ## Create Sequence Rules
 
@@ -165,28 +205,29 @@ without installing a schema.
 
 ## Catalog Persistence
 
-The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index and sequence fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes or sequences existed still deserializes (empty maps and initial allocator values). `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`; the brief legacy bare-`Value` default form deserializes as `ColumnDefault::Const(value)`.
+The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index and sequence fields carry `#[serde(default)]`, so a catalog persisted before secondary indexes or sequences existed still deserializes (empty maps and initial allocator values). `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`; the brief legacy bare-`Value` default form deserializes as `ColumnDefault::Const(value)`. `TableSchema.compression` and `TableSchema.active_dict_id` carry `#[serde(default)]` too (`compression` defaults to `CompressionSetting::None`, `active_dict_id` to `None`), and `CatalogSnapshot.next_dictionary_id` carries `#[serde(default = "default_next_dictionary_id")]` (`= 1`), so a catalog persisted before compression existed deserializes with every table dict-less and the dictionary-id allocator starting fresh.
 
 On startup:
 
 1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
 3. Recovery replays committed post-checkpoint `CreateTable`, `DropTable`,
-   `CreateIndex`, `DropIndex`, `CreateSequence`, and `DropSequence` records.
-   Table/index/sequence records update both catalog and storage. Aborted or
-   in-flight create records are not installed, but recovery still calls the
-   matching `reserve_*_id` method so IDs are never reused.
+   `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`,
+   `CreateDictionary`, and `AlterTableCompression` records. Table/index/sequence
+   records update both catalog and storage. Aborted or in-flight create
+   records are not installed, but recovery still calls the matching
+   `reserve_*_id` method so IDs are never reused.
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, at least one primary key column, every primary key column ID to exist, every primary key column to be non-null, no duplicate primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values; startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every name index entry to point at an existing schema with the same name and ID, every schema to have a reverse name index entry, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, at least one primary key column, every primary key column ID to exist, every primary key column to be non-null, no duplicate primary key column, and `next_table_id >= max(table_id) + 1`. Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, and `next_index_id >= max(index_id) + 1`. Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
 
 ## WAL Interaction
 
 `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`,
-and `DROP SEQUENCE` are logged. The executor/storage orchestration must ensure
-catalog mutation and storage file mutation are part of the same statement-level
-commit.
+`DROP SEQUENCE`, `CreateDictionary`, and `AlterTableCompression` are logged.
+The executor/storage orchestration must ensure catalog mutation and storage
+file mutation are part of the same statement-level commit.
 
 If a normal DDL statement fails after catalog mutation but before statement success, the caller must restore the previous catalog snapshot before returning the error.
 
@@ -196,8 +237,9 @@ Recovery apply methods must update catalog state consistently with storage state
 
 - Name map and ID map are consistent, for tables, indexes, and sequences.
 - IDs are never reused after drop.
-- Table, index, sequence, and column ID assignment is overflow-guarded: rather than wrap or reuse, an exhausted ID space returns `SqlState::InternalError`.
+- Table, index, sequence, column, and dictionary ID assignment is overflow-guarded: rather than wrap or reuse, an exhausted ID space returns `SqlState::InternalError`/`DbError::internal`.
 - Index id `PRIMARY_KEY_INDEX_ID` is reserved and never assigned to a secondary index.
+- Dictionary id `0` is reserved to mean "no dictionary" and is never assigned to a real dictionary or accepted as a table's `active_dict_id`.
 - Every secondary index references an existing table and existing columns on it; dropping a table removes its indexes.
 - Binder is the only consumer that resolves table, column, and index names for
   query planning. `DROP SEQUENCE` intentionally carries the sequence name
@@ -225,3 +267,13 @@ Recovery apply methods must update catalog state consistently with storage state
   or the sequence is owned by `SERIAL`, rejects explicit defaults that borrow an
   owned sequence, persists through snapshot round-trip, and a snapshot without
   sequence fields loads as an empty sequence set.
+- `create_table` stores the requested `compression` setting and starts
+  `active_dict_id` at `None`.
+- `set_table_compression` updates and persists a table's `compression` and
+  `active_dict_id`, and reserving a fresh `active_dict_id` advances
+  `next_dictionary_id` past it.
+- Dictionary ids allocate monotonically (`allocate_dictionary_id`) and survive
+  `reserve_dictionary_id` (a reserve above the current high-water mark advances
+  it; a reserve below a value already allocated is a no-op).
+- A snapshot without the dictionary-id field defaults `next_dictionary_id` to
+  `1`, and the first allocation from that defaulted state still returns `1`.

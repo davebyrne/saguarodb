@@ -33,6 +33,15 @@ pub struct PageInfo {
 
 pub trait PageLoader: Send + Sync {
     fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>>;
+
+    /// Like `load_page`, but a page whose stored form fails validation (e.g. a
+    /// torn compressed envelope, `docs/specs/compression.md` §5) is reported
+    /// as absent instead of an error. Default impl delegates to `load_page`
+    /// unchanged, so an implementation with no lenient distinction (nothing to
+    /// validate beyond the raw bytes) needs no override.
+    fn load_page_lenient(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+        self.load_page(file_id, page_num)
+    }
 }
 
 pub trait PageStore: PageLoader {
@@ -61,7 +70,7 @@ pub trait BufferPool: Send + Sync {
 pub struct MemoryBufferPool { /* the concrete BufferPool implementation */ }
 ```
 
-`flush_dirty_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`, regardless of whether its dirtying transaction committed (the CLOG hides the non-committed tuples). It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, inserting a zeroed frame when the page is absent from the store (a new page being re-established); it marks the frame dirty under the recovery txn id (`0`). `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
+`flush_dirty_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`, regardless of whether its dirtying transaction committed (the CLOG hides the non-committed tuples). It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, loading a miss via `store.load_page_lenient` (not `load_page`) and inserting a zeroed frame both when the page is absent from the store (a new page being re-established) and when the stored page fails validation (e.g. a torn compressed envelope) — recovery redo is the ONE caller that uses the lenient form, since a torn stored page there is exactly like a torn raw page: it was dirty, so its first post-checkpoint modification logged a `FullPageImage` that redo will replay, making a zeroed-then-repaired frame sound (`docs/specs/compression.md` §5, `docs/specs/crates/storage.md`). It marks the frame dirty under the recovery txn id (`0`). Every other caller (`read_page`/`write_page`/normal `get_or_insert_clean` misses) uses the strict `load_page`, which surfaces the same failure loudly as page corruption. `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
 
 `MemoryBufferPool::new(frame_count, flush_policy, store)` stores `Box<dyn FlushPolicy>` and `Arc<dyn PageStore>`. `read_page` first checks resident frames; on a miss it calls `store.load_page(file_id, page_num)`. `Some(data)` is inserted as a clean page and returned. `None` means the page does not exist and returns `ErrorKind::Storage` / `SqlState::InternalError` with a message of the form `page not found: file_id=…, page_num=…`. A loader error from `store.load_page` is propagated unchanged, so its `ErrorKind` is whatever the injected `PageStore` returns (a file-backed store yields `ErrorKind::Io`).
 
@@ -180,3 +189,4 @@ Checkpoint holds the **exclusive** checkpoint guard (E2b lock inversion, `common
 - A working set larger than the pool spills to the heap and reads back correctly.
 - `mark_all_clean` makes previously dirty pages evictable.
 - `iter_pages` returns in-memory page data for checkpoint flushing and the storage page scan.
+- `fetch_for_redo` loads a miss through `load_page_lenient`, not `load_page`; a `PageLoader` with no override falls back to `load_page` unchanged (the default impl).

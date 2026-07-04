@@ -14,6 +14,7 @@ This directory decomposes the overview spec into crate-level contracts for the i
 | Crate | Spec | Responsibility |
 |---|---|---|
 | `common` | [common.md](common.md) | Shared IDs, values, rows, errors, execution envelopes, and cross-crate traits |
+| `compress` | [compress.md](compress.md) | Compression codecs, at-rest page envelope, dictionary training/store, shared `CompressionRegistry` |
 | `parser` | [parser.md](parser.md) | SQL text to SaguaroDB AST |
 | `catalog` | [catalog.md](catalog.md) | Table metadata, stable IDs, schema snapshots |
 | `planner` | [planner.md](planner.md) | Bind, logical plan, physical plan |
@@ -28,7 +29,8 @@ This directory decomposes the overview spec into crate-level contracts for the i
 ## Cross-Crate Rules
 
 - Parser output may contain user-facing names. All phases after binding use IDs and slot indices.
-- `common` is the only leaf crate. No crate may depend on `server`.
+- `common` and `compress` are leaf crates (`compress` depends on `common` only). No crate may depend on `server`.
+- `compress` is consumed by `storage` (at-rest page envelopes, WAL full-page-image compression) and `server` (constructs and shares the `CompressionRegistry`/`DictStore`); `wal` does not depend on `compress` — its compression-related record types carry plain codec/dict-id fields and bytes (see `docs/specs/compression.md`, `wal.md`).
 - Cargo package names use the `saguarodb-*` prefix, but internal `Cargo.toml` dependencies use short aliases such as `common`, `storage`, and `wal`.
 - `storage` must not depend on `planner`; shared access types such as `KeyRange` live in `common`.
 - Normal storage operations append WAL records. Recovery operations must not append WAL records.

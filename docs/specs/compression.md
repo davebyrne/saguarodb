@@ -145,12 +145,20 @@ smaller than `PAGE_SIZE`, and the format supports page sizes up to 32 KiB
    `compression = none` ⇒ write the raw 8 KiB image exactly as today.
 2. Compress the image. Compute the smallest whole number of filesystem
    blocks (assumed 4096 bytes; see note) that holds envelope + payload.
-   If that is fewer blocks than `PAGE_SIZE / 4096`, write envelope +
-   payload at the page's normal `page_num * PAGE_SIZE` offset and punch the
-   trailing blocks with `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
-   Otherwise write the raw image (which naturally un-punches any prior
-   hole). At 8 KiB pages this degenerates to: compressed slot iff
-   envelope + payload ≤ 4096.
+   If that is fewer blocks than `PAGE_SIZE / 4096`, write the envelope +
+   payload **zero-padded out to a full `PAGE_SIZE` slot** at the page's
+   normal `page_num * PAGE_SIZE` offset — not a short write of just the
+   envelope bytes — and only then punch the trailing blocks with
+   `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. Writing the full
+   slot before punching is what keeps `st_size` exact even when this page is
+   the file's current tail: a short write there would leave the file shorter
+   than `(page_num + 1) * PAGE_SIZE`, under-reporting `page_count` (and so
+   under-seeding the allocator and truncating VACUUM's full-extent scan);
+   `PUNCH_HOLE | KEEP_SIZE` never changes `st_size`, so writing the full slot
+   first and punching after is exact regardless of whether the page is an
+   interior page or the tail. Otherwise write the raw image (which naturally
+   un-punches any prior hole). At 8 KiB pages this degenerates to: compressed
+   slot iff envelope + payload ≤ 4096.
 3. `EOPNOTSUPP`/`EINVAL` from `fallocate` ⇒ record the fact once per store
    and skip punching thereafter (correct, merely reclaims nothing).
 
@@ -287,12 +295,22 @@ like `VACUUM` / `CREATE INDEX` backfill). Ordered steps:
    write-ahead covered.
 7. **Rewrite pass (no WAL records):** for each page `0..page_count` of the
    heap file, the PK index file, and every secondary index file (skipping
-   buffer-reported abandoned holes): fault the logical image in via the
-   buffer pool and `write_page` it through the store under the new config.
-   Logical bytes and PageLSN are unchanged, so no WAL is needed; the
-   envelope is below the WAL contract. Resident dirty pages are also
-   rewritten — their later checkpoint flush simply writes the same logical
-   image again under the same config.
+   buffer-reported abandoned holes and pages that are not yet initialized):
+   fault the logical image into the buffer pool and mark it dirty by taking
+   its write guard, without touching a single logical byte — `rewrite_table_pages`
+   is a pure "dirty every initialized page" pass. The actual re-encoding
+   happens afterward, when the caller flushes those now-dirty pages through
+   the buffer pool (`flush_dirty_pages`) and syncs the store (`sync_all`):
+   `flush_dirty_pages` calls `PageStore::write_page` for each flushable dirty
+   page, and `write_page` is exactly where the envelope encode step (§5) runs
+   under the just-installed config. Logical bytes and PageLSN are unchanged
+   throughout, so no WAL is needed; the envelope is below the WAL contract.
+   Same effect as re-encoding page-by-page during the pass itself — every
+   page ends up written through `write_page` under the new config — but the
+   plumbing is dirty-then-flush rather than an inline write per page. A
+   resident page that was ALREADY dirty (from other in-flight work) is
+   likewise re-dirtied by this pass and is naturally re-encoded by the same
+   follow-on flush.
 8. `store.sync_all()`, release the guard, return command tag `ALTER TABLE`.
 
 **Crash behavior:**
