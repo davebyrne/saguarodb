@@ -164,11 +164,35 @@ fn rewrite_table_pages_dirties_every_initialized_page() {
     fixture.buffer.flush_dirty_pages().unwrap();
     fixture.buffer.mark_all_clean().unwrap();
 
+    // Task 12's ALTER rewrite path depends on `rewrite_table_pages` being a
+    // pure "mark dirty" no-op: it must not append WAL records, and it must
+    // not change any page's logical bytes (only the caller's own follow-up
+    // flush/WAL emission does that). Capture both witnesses before the call.
+    let heap_before: [u8; buffer::PAGE_SIZE] = {
+        let guard = fixture.buffer.read_page(TABLE_ID, 0).unwrap();
+        *guard.data()
+    };
+    let wal_len_before = fixture.wal.replay_from(0).unwrap().count();
+
     let touched = fixture
         .engine
         .rewrite_table_pages(&users_schema_zstd())
         .unwrap();
     assert!(touched >= 2, "heap page + at least the index metapage/root");
+
+    assert_eq!(
+        fixture.wal.replay_from(0).unwrap().count(),
+        wal_len_before,
+        "rewrite_table_pages must append no WAL records of its own"
+    );
+    let heap_after: [u8; buffer::PAGE_SIZE] = {
+        let guard = fixture.buffer.read_page(TABLE_ID, 0).unwrap();
+        *guard.data()
+    };
+    assert_eq!(
+        heap_before, heap_after,
+        "rewrite_table_pages must dirty pages without mutating their bytes"
+    );
 
     // Pages are dirty again: flush succeeds and the store re-encodes.
     fixture.buffer.flush_dirty_pages().unwrap();

@@ -289,6 +289,7 @@ impl PageBackedStorageEngine {
     pub fn install_index_schemas(&self, schemas: Vec<IndexSchema>) -> Result<()> {
         let mut state = self.lock_state()?;
         state.indexes.clear();
+        let mut configs = Vec::with_capacity(schemas.len());
         for schema in schemas {
             // A secondary index's file never uses the heap's trained dictionary,
             // so its config is derived from the OWNING table's compression
@@ -305,10 +306,10 @@ impl PageBackedStorageEngine {
                         schema.id, schema.table
                     ))
                 })?;
-            self.compression.set_file_config(
+            configs.push((
                 secondary_index_file_id(schema.id),
                 index_compression_for(table_compression),
-            );
+            ));
             state.indexes.insert(
                 schema.id,
                 IndexState {
@@ -316,6 +317,10 @@ impl PageBackedStorageEngine {
                     dropped: false,
                 },
             );
+        }
+        drop(state);
+        for (file_id, config) in configs {
+            self.compression.set_file_config(file_id, config);
         }
         Ok(())
     }
@@ -475,10 +480,7 @@ impl PageBackedStorageEngine {
             .collect();
         drop(state);
         self.register_table_compression(schema);
-        let index_config = match schema.compression {
-            CompressionSetting::None => compress::FileCompression::None,
-            CompressionSetting::Zstd => compress::FileCompression::Zstd { dict_id: None },
-        };
+        let index_config = index_compression_for(schema.compression);
         for index_id in secondary_ids {
             self.compression
                 .set_file_config(secondary_index_file_id(index_id), index_config);
