@@ -40,4 +40,8 @@ impl RecoveryOperations for PageBackedStorageEngine {
     ) -> Result<()> {
         self.apply_set_sequence_value_without_wal(sequence, value, is_called)
     }
+
+    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()> {
+        self.set_table_compression(&schema)
+    }
 }

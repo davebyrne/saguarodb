@@ -33,10 +33,10 @@ use std::ops::Bound;
 
 use buffer::{BufferPool, PageWriteGuard};
 use common::{DbError, FileId, Key, KeyRange, PageNum, Result, SqlState};
-use wal::{WalManager, WalRecord, WalRecordKind};
+use wal::{WalManager, WalRecord};
 
 use crate::codec::{decode_key, decode_key_prefix, encode_key};
-use crate::engine::RowLocation;
+use crate::engine::{RowLocation, fpi_record_kind};
 use crate::index_page;
 
 const META_PAGE: PageNum = 0;
@@ -83,6 +83,7 @@ pub(crate) struct BTree<'a, V> {
     buffer: &'a dyn BufferPool,
     wal: &'a dyn WalManager,
     file_id: FileId,
+    compression: &'a compress::CompressionRegistry,
     _value: PhantomData<fn() -> V>,
 }
 
@@ -116,11 +117,13 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         buffer: &'a dyn BufferPool,
         wal: &'a dyn WalManager,
         file_id: FileId,
+        compression: &'a compress::CompressionRegistry,
     ) -> Self {
         Self {
             buffer,
             wal,
             file_id,
+            compression,
             _value: PhantomData,
         }
     }
@@ -686,11 +689,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         let lsn = self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
-            kind: WalRecordKind::FullPageImage {
-                file_id: self.file_id,
-                page_num: guard.page_num(),
-                image: image.to_vec(),
-            },
+            kind: fpi_record_kind(self.compression, self.file_id, guard.page_num(), &image),
         })?;
         crate::page::set_page_lsn(&mut image, lsn);
         *guard.data_mut() = image;
@@ -997,7 +996,7 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
     use common::{DbError, Key, KeyRange, Lsn, TxnId, TxnStatus, TxnStatusView, Value};
-    use wal::{FileWalManager, WalManager, WalRecord};
+    use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     use super::*;
     use crate::HeapPageStore;
@@ -1010,6 +1009,7 @@ mod tests {
     struct Fixture {
         buffer: Arc<MemoryBufferPool>,
         wal: Arc<FileWalManager>,
+        compression: compress::CompressionRegistry,
         _dir: tempfile::TempDir,
     }
 
@@ -1024,16 +1024,27 @@ mod tests {
             Self {
                 buffer,
                 wal,
+                compression: compress::CompressionRegistry::new(),
                 _dir: dir,
             }
         }
 
         fn tree(&self) -> BTree<'_, RowLocation> {
-            BTree::new(self.buffer.as_ref(), self.wal.as_ref(), INDEX_FILE)
+            BTree::new(
+                self.buffer.as_ref(),
+                self.wal.as_ref(),
+                INDEX_FILE,
+                &self.compression,
+            )
         }
 
         fn secondary_tree(&self) -> BTree<'_, RowLocation> {
-            BTree::new(self.buffer.as_ref(), self.wal.as_ref(), SECONDARY_FILE)
+            BTree::new(
+                self.buffer.as_ref(),
+                self.wal.as_ref(),
+                SECONDARY_FILE,
+                &self.compression,
+            )
         }
     }
 
@@ -1078,7 +1089,16 @@ mod tests {
                 self.fail_at.store(0, Ordering::SeqCst);
                 return Err(DbError::io("injected WAL append failure"));
             }
-            if let WalRecordKind::FullPageImage { page_num, .. } = record.kind
+            // Both the raw and (now unconditionally attempted) compressed FPI
+            // variants carry a `page_num`; match either so failure injection
+            // still targets the intended page regardless of which one the
+            // registry produced for it.
+            let fpi_page_num = match record.kind {
+                WalRecordKind::FullPageImage { page_num, .. }
+                | WalRecordKind::FullPageImageCompressed { page_num, .. } => Some(page_num),
+                _ => None,
+            };
+            if let Some(page_num) = fpi_page_num
                 && self.fail_page.load(Ordering::SeqCst) == page_num
             {
                 self.fail_page.store(NO_FAIL_PAGE, Ordering::SeqCst);
@@ -1242,7 +1262,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
         tree.create(1).unwrap();
 
         wal.fail_next_append();
@@ -1265,7 +1286,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
 
         wal.fail_next_append();
         let err = tree.create(1).unwrap_err();
@@ -1300,7 +1322,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
         tree.create(1).unwrap();
 
         let mut value = 0i64;
@@ -1347,7 +1370,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(64, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
         tree.create(1).unwrap();
 
         let mut value = 0i64;
@@ -1400,7 +1424,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(128, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
         tree.create(1).unwrap();
 
         let mut inserted = Vec::new();
@@ -1452,7 +1477,8 @@ mod tests {
             Arc::new(HeapPageStore::open(dir.path().join("idx")).unwrap());
         let buffer = Arc::new(MemoryBufferPool::new(128, Box::new(AlwaysFlush), store));
         let wal = FailingWal::default();
-        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE);
+        let registry = compress::CompressionRegistry::new();
+        let tree = BTree::<RowLocation>::new(buffer.as_ref(), &wal, INDEX_FILE, &registry);
         tree.create(1).unwrap();
 
         let mut inserted = Vec::new();

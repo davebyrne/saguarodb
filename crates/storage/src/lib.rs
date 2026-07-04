@@ -488,10 +488,12 @@ mod tests {
             slot_num: slot,
         };
         drop(page);
+        let registry = compress::CompressionRegistry::new();
         crate::btree::BTree::new(
             harness.buffer.as_ref(),
             harness.wal.as_ref(),
             crate::heap::index_file_id(1),
+            &registry,
         )
         .insert(setup_ctx.txn_id, &Key(vec![Value::Integer(1)]), &location)
         .unwrap();
@@ -1453,9 +1455,16 @@ mod tests {
                 self.fail_at.store(0, Ordering::SeqCst);
                 return Err(DbError::io("injected WAL append failure"));
             }
-            if matches!(record.kind, WalRecordKind::FullPageImage { .. })
-                && self.fail_next_fpi.swap(false, Ordering::SeqCst)
-            {
+            // Compression (Task 7) attempts zstd on EVERY full-page image, even
+            // under a registry with no file configured, so a compressible test
+            // page now logs `FullPageImageCompressed` instead of the raw
+            // variant. Treat either as "an FPI" for failure injection and
+            // counting.
+            let is_fpi = matches!(
+                record.kind,
+                WalRecordKind::FullPageImage { .. } | WalRecordKind::FullPageImageCompressed { .. }
+            );
+            if is_fpi && self.fail_next_fpi.swap(false, Ordering::SeqCst) {
                 return Err(DbError::io("injected WAL append failure"));
             }
             if matches!(record.kind, WalRecordKind::HeapUpdateHeader { .. })
@@ -1465,12 +1474,17 @@ mod tests {
             {
                 return Err(DbError::io("injected WAL append failure"));
             }
-            if let WalRecordKind::FullPageImage { file_id, .. } = &record.kind {
+            let fpi_file_id = match &record.kind {
+                WalRecordKind::FullPageImage { file_id, .. }
+                | WalRecordKind::FullPageImageCompressed { file_id, .. } => Some(*file_id),
+                _ => None,
+            };
+            if let Some(file_id) = fpi_file_id {
                 *self
                     .fpi_count_by_file
                     .lock()
                     .unwrap()
-                    .entry(*file_id)
+                    .entry(file_id)
                     .or_insert(0) += 1;
             }
             Ok(self.count.fetch_add(1, Ordering::SeqCst) as Lsn + 1)

@@ -124,6 +124,16 @@ pub fn is_initialized(data: &[u8; PAGE_SIZE]) -> bool {
     data[PAGE_TYPE_OFFSET] == PAGE_TYPE_DATA
 }
 
+/// Whether `data` holds ANY initialized page — heap (`PAGE_TYPE_DATA`) *or*
+/// index (`PAGE_TYPE_INDEX`). Unlike [`is_initialized`] (heap-only; used by
+/// heap-specific full-extent scans like VACUUM and dictionary sampling), this
+/// is for maintenance passes that walk a table's heap AND its index files
+/// uniformly (e.g. `rewrite_table_pages`, which must re-dirty index metapages
+/// and nodes too, not just heap pages).
+pub(crate) fn is_any_page_initialized(data: &[u8; PAGE_SIZE]) -> bool {
+    matches!(data[PAGE_TYPE_OFFSET], PAGE_TYPE_DATA | PAGE_TYPE_INDEX)
+}
+
 /// Stamp the page-LSN (the LSN of the WAL record that last modified this page)
 /// into the header and refresh the checksum.
 pub fn set_page_lsn(data: &mut [u8; PAGE_SIZE], lsn: Lsn) {

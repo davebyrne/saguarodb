@@ -197,11 +197,7 @@ impl PageBackedStorageEngine {
         let fpi_lsn = self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
-            kind: WalRecordKind::FullPageImage {
-                file_id,
-                page_num,
-                image: scratch.to_vec(),
-            },
+            kind: fpi_record_kind(&self.compression, file_id, page_num, &scratch),
         })?;
         page::set_page_lsn(&mut scratch, fpi_lsn);
         // All steps succeeded: publish the finished image into the live frame in one
@@ -669,14 +665,11 @@ impl PageBackedStorageEngine {
             // LSN so redo gating is exact.
             let provisional_lsn = page::page_lsn(guard.data());
             page::reclaim_line_pointers(guard.data_mut(), &slots, provisional_lsn)?;
+            let image = *guard.data();
             let fpi_lsn = self.wal.append(WalRecord {
                 lsn: 0,
                 txn_id: VACUUM_TXN,
-                kind: WalRecordKind::FullPageImage {
-                    file_id,
-                    page_num,
-                    image: guard.data().to_vec(),
-                },
+                kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
             })?;
             page::set_page_lsn(guard.data_mut(), fpi_lsn);
         }

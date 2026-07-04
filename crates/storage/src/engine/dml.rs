@@ -106,11 +106,7 @@ impl PageBackedStorageEngine {
             let record = WalRecord {
                 lsn: 0,
                 txn_id,
-                kind: WalRecordKind::FullPageImage {
-                    file_id,
-                    page_num,
-                    image: image.to_vec(),
-                },
+                kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
             };
             let lsn = match self.wal.append(record) {
                 Ok(lsn) => lsn,
@@ -302,11 +298,12 @@ impl PageBackedStorageEngine {
             let record = WalRecord {
                 lsn: 0,
                 txn_id,
-                kind: WalRecordKind::FullPageImage {
-                    file_id: location.file_id,
-                    page_num: location.page_num,
-                    image: image.to_vec(),
-                },
+                kind: fpi_record_kind(
+                    &self.compression,
+                    location.file_id,
+                    location.page_num,
+                    &image,
+                ),
             };
             let lsn = match self.wal.append(record) {
                 Ok(lsn) => lsn,

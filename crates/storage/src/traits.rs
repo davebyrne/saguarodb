@@ -76,4 +76,7 @@ pub trait RecoveryOperations: Send + Sync {
         value: i64,
         is_called: bool,
     ) -> Result<()>;
+    /// Recovery apply for `ALTER TABLE ... SET (compression)`: installs the
+    /// updated schema and re-registers file configs. Must not append WAL.
+    fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
 }

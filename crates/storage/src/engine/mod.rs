@@ -42,10 +42,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
-    ColumnId, ColumnInfo, DbError, FileId, IndexId, IndexSchema, Key, KeyRange, Lsn, PageNum,
-    Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema, Snapshot, SqlState,
-    StatementContext, StoredRow, TableId, TableSchema, TxnStatusView, UniqueConflict, Value,
-    WriteConflict, classify_unique_conflict, is_visible, write_conflict,
+    ColumnId, ColumnInfo, CompressionSetting, DbError, FileId, IndexId, IndexSchema, Key, KeyRange,
+    Lsn, PageNum, Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema, Snapshot,
+    SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView, UniqueConflict,
+    Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
 };
 use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -184,6 +184,11 @@ struct StorageState {
 pub struct PageBackedStorageEngine {
     pub(crate) buffer_pool: Arc<dyn BufferPool>,
     pub(crate) wal: Arc<dyn WalManager>,
+    /// Shared file-compression config + dictionary resolver
+    /// (`docs/specs/compression.md`): heap/index at-rest envelopes consult it via
+    /// `HeapPageStore`, and every WAL full-page image compresses through it
+    /// (`fpi_record_kind`) unconditionally, independent of any file's config.
+    pub(crate) compression: Arc<compress::CompressionRegistry>,
     state: Mutex<StorageState>,
     /// Per-[`FileId`] structural write latches (Milestone E2a; see the module-level
     /// lock-ordering doc). Lazily populated: the registry `Mutex` is held only
@@ -202,14 +207,35 @@ impl std::fmt::Debug for PageBackedStorageEngine {
 }
 
 impl PageBackedStorageEngine {
+    /// Open with a fresh, default (all-raw) [`compress::CompressionRegistry`] —
+    /// no file compresses at rest and every WAL FPI still compresses
+    /// unconditionally through the default dict-less codec (`compress_fpi`).
     pub fn open(
         buffer_pool: Arc<dyn BufferPool>,
         wal: Arc<dyn WalManager>,
         mode: StorageMode,
     ) -> Result<Self> {
+        Self::open_with_compression(
+            buffer_pool,
+            wal,
+            mode,
+            Arc::new(compress::CompressionRegistry::new()),
+        )
+    }
+
+    /// Open sharing `compression` with the caller (the server injects the SAME
+    /// registry instance into the `HeapPageStore` for at-rest envelopes, so file
+    /// configs set here are consulted by both, `docs/specs/compression.md` §5a).
+    pub fn open_with_compression(
+        buffer_pool: Arc<dyn BufferPool>,
+        wal: Arc<dyn WalManager>,
+        mode: StorageMode,
+        compression: Arc<compress::CompressionRegistry>,
+    ) -> Result<Self> {
         Ok(Self {
             buffer_pool,
             wal,
+            compression,
             state: Mutex::new(StorageState {
                 mode,
                 tables: BTreeMap::new(),
@@ -244,6 +270,9 @@ impl PageBackedStorageEngine {
         let mut state = self.lock_state()?;
         state.tables.clear();
         for schema in schemas {
+            // `register_table_compression` touches only `self.compression` (a
+            // separate lock), so it is safe to call while `state` is held.
+            self.register_table_compression(&schema);
             state.tables.insert(
                 schema.id,
                 TableState {
@@ -261,6 +290,25 @@ impl PageBackedStorageEngine {
         let mut state = self.lock_state()?;
         state.indexes.clear();
         for schema in schemas {
+            // A secondary index's file never uses the heap's trained dictionary,
+            // so its config is derived from the OWNING table's compression
+            // setting alone (`compression.md` §4). The table is looked up in the
+            // ALREADY-HELD `state` (installed before its indexes at startup); a
+            // miss is an internal inconsistency in the installed catalog.
+            let table_compression = state
+                .tables
+                .get(&schema.table)
+                .map(|table| table.schema.compression)
+                .ok_or_else(|| {
+                    storage_internal(format!(
+                        "index {} references an unknown table {}",
+                        schema.id, schema.table
+                    ))
+                })?;
+            self.compression.set_file_config(
+                secondary_index_file_id(schema.id),
+                index_compression_for(table_compression),
+            );
             state.indexes.insert(
                 schema.id,
                 IndexState {
@@ -362,7 +410,12 @@ impl PageBackedStorageEngine {
     }
 
     fn btree(&self, index_file_id: FileId) -> BTree<'_, RowLocation> {
-        BTree::new(self.buffer_pool.as_ref(), self.wal.as_ref(), index_file_id)
+        BTree::new(
+            self.buffer_pool.as_ref(),
+            self.wal.as_ref(),
+            index_file_id,
+            self.compression.as_ref(),
+        )
     }
 
     /// The B-tree for a secondary index. Uniform with the primary-key index: keyed
@@ -373,7 +426,130 @@ impl PageBackedStorageEngine {
             self.buffer_pool.as_ref(),
             self.wal.as_ref(),
             secondary_index_file_id(index),
+            self.compression.as_ref(),
         )
+    }
+
+    /// Install `schema`'s at-rest file configs into the shared registry: the
+    /// heap file gets the table's codec + trained dictionary; the primary-key
+    /// index file gets the SAME codec but never the heap's dictionary
+    /// (`docs/specs/compression.md` §4). Called whenever a table's schema is
+    /// installed or its compression setting changes.
+    fn register_table_compression(&self, schema: &TableSchema) {
+        use compress::FileCompression;
+        let heap_config = match schema.compression {
+            CompressionSetting::None => FileCompression::None,
+            CompressionSetting::Zstd => FileCompression::Zstd {
+                dict_id: schema.active_dict_id,
+            },
+        };
+        // Index pages never use the heap-trained dictionary (`compression.md` §4).
+        let index_config = match schema.compression {
+            CompressionSetting::None => FileCompression::None,
+            CompressionSetting::Zstd => FileCompression::Zstd { dict_id: None },
+        };
+        self.compression.set_file_config(schema.id, heap_config);
+        self.compression
+            .set_file_config(index_file_id(schema.id), index_config);
+    }
+
+    /// Install an ALTERed schema: swap the TableState schema and re-register
+    /// file configs. No WAL — the caller (server ALTER / recovery replay) owns
+    /// record emission and ordering (`compression.md` §8).
+    pub fn set_table_compression(&self, schema: &TableSchema) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("state lock poisoned"))?;
+        let table = state
+            .tables
+            .get_mut(&schema.id)
+            .filter(|t| !t.dropped)
+            .ok_or_else(|| DbError::internal(format!("table {} is not installed", schema.id)))?;
+        table.schema = schema.clone();
+        let secondary_ids: Vec<IndexId> = state
+            .indexes
+            .values()
+            .filter(|i| !i.dropped && i.schema.table == schema.id)
+            .map(|i| i.schema.id)
+            .collect();
+        drop(state);
+        self.register_table_compression(schema);
+        let index_config = match schema.compression {
+            CompressionSetting::None => compress::FileCompression::None,
+            CompressionSetting::Zstd => compress::FileCompression::Zstd { dict_id: None },
+        };
+        for index_id in secondary_ids {
+            self.compression
+                .set_file_config(secondary_index_file_id(index_id), index_config);
+        }
+        Ok(())
+    }
+
+    /// Evenly-sampled initialized heap page images for dictionary training.
+    /// Caller holds the exclusive guard, so the images are stable.
+    pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>> {
+        let file_id = schema.id;
+        let page_count = self.buffer_pool.page_count(file_id)?;
+        if page_count == 0 || cap == 0 {
+            return Ok(Vec::new());
+        }
+        let step = (page_count as usize).div_ceil(cap).max(1) as PageNum;
+        let mut samples = Vec::new();
+        let mut page_num = 0;
+        while page_num < page_count {
+            if !self.buffer_pool.is_page_abandoned(file_id, page_num) {
+                let guard = self.buffer_pool.read_page(file_id, page_num)?;
+                if page::is_initialized(guard.data()) {
+                    samples.push(guard.data().to_vec());
+                }
+            }
+            page_num += step;
+        }
+        Ok(samples)
+    }
+
+    /// Dirty every initialized page of the table's heap, PK-index, and live
+    /// secondary-index files so the following flush re-encodes them at rest
+    /// under the updated registry config. Logical bytes and PageLSNs are
+    /// untouched, so NO WAL records are appended (`compression.md` §8 step 7).
+    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize> {
+        let mut files = vec![schema.id, index_file_id(schema.id)];
+        {
+            let state = self.lock_state()?;
+            files.extend(
+                state
+                    .indexes
+                    .values()
+                    .filter(|i| !i.dropped && i.schema.table == schema.id)
+                    .map(|i| secondary_index_file_id(i.schema.id)),
+            );
+        }
+        let mut touched = 0usize;
+        for file_id in files {
+            let page_count = self.buffer_pool.page_count(file_id)?;
+            let latch = self.structural_latch(file_id);
+            for page_num in 0..page_count {
+                if self.buffer_pool.is_page_abandoned(file_id, page_num) {
+                    continue;
+                }
+                {
+                    let guard = self.buffer_pool.read_page(file_id, page_num)?;
+                    // Heap AND index files are walked here (unlike the
+                    // heap-only `page::is_initialized`), so accept either
+                    // page type.
+                    if !page::is_any_page_initialized(guard.data()) {
+                        continue;
+                    }
+                }
+                let _structural = latch.lock();
+                // Acquiring the write guard marks the frame dirty under the
+                // maintenance txn id; the page bytes are not modified.
+                let _guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
+                touched += 1;
+            }
+        }
+        Ok(touched)
     }
 
     /// Append a WAL record (in `Normal` mode only) and return its assigned LSN.
@@ -836,6 +1012,10 @@ impl SchemaOperations for PageBackedStorageEngine {
                 },
             );
         }
+        // Register the heap/PK-index file configs before the tree's own pages
+        // are created, so even its first metapage/root are encoded at rest per
+        // the declared setting.
+        self.register_table_compression(schema);
         // Create the empty on-disk index (metapage + root leaf). Its redo is
         // logged as full-page images, so recovery re-establishes it.
         self.btree(index_file_id(schema.id)).create(ctx.txn_id)
@@ -890,6 +1070,12 @@ impl SchemaOperations for PageBackedStorageEngine {
                 },
             );
         }
+        // The new secondary index's file config mirrors the OWNING table's
+        // codec but never its dictionary (`compression.md` §4).
+        self.compression.set_file_config(
+            secondary_index_file_id(schema.id),
+            index_compression_for(table_schema.compression),
+        );
         // Build the empty secondary tree (its pages are full-page-image redo), then
         // backfill it from the live rows via the primary-key index. Each PK entry's
         // TID is a HOT-chain ROOT; the new secondary entry points at that ROOT
@@ -1095,6 +1281,42 @@ impl RowIterator for PageRowIterator {
 
     fn schema(&self) -> &[ColumnInfo] {
         &self.schema
+    }
+}
+
+/// Build the WAL record kind for a full-page image: the compressed variant
+/// when the registry shrinks it (unconditional policy, `compression.md` §6),
+/// the raw image otherwise. Compression failure can never fail a write.
+pub(crate) fn fpi_record_kind(
+    compression: &compress::CompressionRegistry,
+    file_id: FileId,
+    page_num: PageNum,
+    image: &[u8; buffer::PAGE_SIZE],
+) -> WalRecordKind {
+    match compression.compress_fpi(file_id, image) {
+        Some((codec, dict_id, payload)) => WalRecordKind::FullPageImageCompressed {
+            file_id,
+            page_num,
+            codec,
+            dict_id,
+            payload,
+        },
+        None => WalRecordKind::FullPageImage {
+            file_id,
+            page_num,
+            image: image.to_vec(),
+        },
+    }
+}
+
+/// The at-rest file config for a secondary-index file, mirroring the owning
+/// table's `compression` setting but never its trained dictionary
+/// (`docs/specs/compression.md` §4): index pages are always dict-less zstd (or
+/// none).
+fn index_compression_for(compression: CompressionSetting) -> compress::FileCompression {
+    match compression {
+        CompressionSetting::None => compress::FileCompression::None,
+        CompressionSetting::Zstd => compress::FileCompression::Zstd { dict_id: None },
     }
 }
 
@@ -1354,3 +1576,10 @@ mod concurrent_writers_tests;
 /// `xmin`/`xmax` are committed/aborted/in-flight at a chosen `horizon`.
 #[cfg(test)]
 mod vacuum_tests;
+
+/// Registry-wiring tests (compression Task 7): the engine constructed via
+/// `open_with_compression` compresses WAL full-page images unconditionally and
+/// exposes the ALTER-support methods (`set_table_compression`,
+/// `sample_heap_pages`, `rewrite_table_pages`).
+#[cfg(test)]
+mod compression_tests;

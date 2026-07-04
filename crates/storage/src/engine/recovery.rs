@@ -4,6 +4,7 @@ impl PageBackedStorageEngine {
     pub(crate) fn apply_create_table_without_wal(&self, schema: TableSchema) -> Result<()> {
         // Recovery replays the index pages from their full-page-image redo
         // records, so this installs metadata only; it must not create the tree.
+        self.register_table_compression(&schema);
         let mut state = self.lock_state()?;
         state.tables.insert(
             schema.id,
@@ -30,12 +31,30 @@ impl PageBackedStorageEngine {
         // replayed from their full-page-image redo records, so this installs index
         // metadata only and must not build or backfill the tree.
         let mut state = self.lock_state()?;
+        // The owning table's compression setting determines the (dict-less)
+        // index file config (`compression.md` §4); it must already be installed
+        // (CreateTable replays before CreateIndex).
+        let table_compression = state
+            .tables
+            .get(&schema.table)
+            .map(|table| table.schema.compression)
+            .ok_or_else(|| {
+                storage_internal(format!(
+                    "index {} references an unknown table {}",
+                    schema.id, schema.table
+                ))
+            })?;
         state.indexes.insert(
             schema.id,
             IndexState {
-                schema,
+                schema: schema.clone(),
                 dropped: false,
             },
+        );
+        drop(state);
+        self.compression.set_file_config(
+            secondary_index_file_id(schema.id),
+            index_compression_for(table_compression),
         );
         Ok(())
     }

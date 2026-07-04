@@ -7,6 +7,7 @@ use common::{
     ColumnDef, CompressionSetting, DataType, IndexSchema, KeyRange, PageFlushInfo, Row, Snapshot,
     StatementContext, TableSchema, Value,
 };
+use compress::CompressionRegistry;
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::{PageBackedStorageEngine, RowLocation, VACUUM_TXN};
@@ -143,8 +144,14 @@ impl Fixture {
         buffer::PAGE_SIZE - slot_array - free_start
     }
 
-    /// Every `FullPageImage` record in the WAL, as `(page_num, image)` pairs.
+    /// Every full-page-image record (raw or compressed) in the WAL for this
+    /// table's heap file, decompressed back to `(page_num, image)` pairs.
+    /// Compression (Task 7) attempts zstd on every FPI unconditionally, even
+    /// under the fixture's plain (no file config, no dictionary) registry, so
+    /// a compressible page now logs `FullPageImageCompressed`; a fresh
+    /// dict-less registry decompresses it identically.
     fn full_page_images(&self) -> Vec<(u32, Vec<u8>)> {
+        let registry = CompressionRegistry::new();
         self.wal
             .replay_from(0)
             .unwrap()
@@ -154,6 +161,18 @@ impl Fixture {
                     page_num,
                     image,
                 } if file_id == TABLE_ID => Some((page_num, image)),
+                WalRecordKind::FullPageImageCompressed {
+                    file_id,
+                    page_num,
+                    codec,
+                    dict_id,
+                    payload,
+                } if file_id == TABLE_ID => {
+                    let image = registry
+                        .decompress_fpi(codec, dict_id, &payload, buffer::PAGE_SIZE)
+                        .unwrap();
+                    Some((page_num, image))
+                }
                 _ => None,
             })
             .collect()
@@ -244,6 +263,35 @@ fn name_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
         .into_iter()
         .map(|(_, tid)| tid)
         .collect()
+}
+
+/// Normalize a `FullPageImageCompressed` record to the raw `FullPageImage`
+/// shape `apply_physical_redo` accepts (decompressing via a fresh dict-less
+/// registry — every FPI in this file's fixtures is dict-less, since no test
+/// here registers a dictionary). Every other record kind passes through
+/// unchanged. Mirrors the resolve-to-raw step real recovery replay performs
+/// (Task 11) before physiological redo.
+fn resolve_to_raw_fpi(kind: WalRecordKind) -> WalRecordKind {
+    match kind {
+        WalRecordKind::FullPageImageCompressed {
+            file_id,
+            page_num,
+            codec,
+            dict_id,
+            payload,
+        } => {
+            let registry = CompressionRegistry::new();
+            let image = registry
+                .decompress_fpi(codec, dict_id, &payload, buffer::PAGE_SIZE)
+                .unwrap();
+            WalRecordKind::FullPageImage {
+                file_id,
+                page_num,
+                image,
+            }
+        }
+        other => other,
+    }
 }
 
 #[test]
@@ -410,17 +458,19 @@ fn vacuumed_index_page_survives_recovery_replay() {
 
     // Replaying the index file's FullPageImages onto a fresh page under PageLSN
     // gating reinstalls the vacuumed leaf byte-for-byte (the crash-safety
-    // guarantee — FPI redo regardless of txn id).
+    // guarantee — FPI redo regardless of txn id). `apply_physical_redo` only
+    // accepts the raw variant, so resolve a compressed FPI first.
     let mut recovered = [0u8; buffer::PAGE_SIZE];
     for record in fixture.wal.replay_from(0).unwrap() {
         let record = record.unwrap();
+        let kind = resolve_to_raw_fpi(record.kind);
         if let WalRecordKind::FullPageImage {
             file_id, page_num, ..
-        } = &record.kind
+        } = &kind
             && *file_id == pk_file_id
             && *page_num == leaf_page
         {
-            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &kind).unwrap();
         }
     }
     assert_eq!(
@@ -706,13 +756,14 @@ fn pruned_page_survives_recovery_replay() {
     let mut recovered = [0u8; buffer::PAGE_SIZE];
     for record in fixture.wal.replay_from(0).unwrap() {
         let record = record.unwrap();
+        let kind = resolve_to_raw_fpi(record.kind);
         if let WalRecordKind::FullPageImage {
             file_id, page_num, ..
-        } = &record.kind
+        } = &kind
             && *file_id == TABLE_ID
             && *page_num == gone.page_num
         {
-            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &kind).unwrap();
         }
     }
     assert_eq!(
@@ -1075,7 +1126,11 @@ fn reclaim_then_reuse_survives_recovery_replay() {
     let mut recovered = [0u8; buffer::PAGE_SIZE];
     for record in fixture.wal.replay_from(0).unwrap() {
         let record = record.unwrap();
-        let target = match &record.kind {
+        // `apply_physical_redo` only accepts the raw FPI variant; resolve a
+        // compressed one first (a compressible reclaimed/reused page now logs
+        // `FullPageImageCompressed`).
+        let kind = resolve_to_raw_fpi(record.kind);
+        let target = match &kind {
             WalRecordKind::HeapInit {
                 file_id, page_num, ..
             }
@@ -1091,7 +1146,7 @@ fn reclaim_then_reuse_survives_recovery_replay() {
             _ => None,
         };
         if target == Some((TABLE_ID, gone.page_num)) {
-            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &record.kind).unwrap();
+            crate::redo::apply_physical_redo(&mut recovered, record.lsn, &kind).unwrap();
         }
     }
     assert_eq!(
