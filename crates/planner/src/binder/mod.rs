@@ -237,11 +237,15 @@ fn bind_inner(
         | Statement::Rollback
         | Statement::SetTransaction { .. }
         | Statement::SetSessionCharacteristics { .. }
+        | Statement::SetVariable { .. }
+        | Statement::ResetVariable { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::DiscardAll
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
         | Statement::RollbackToSavepoint { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
-            "transaction control statements do not bind",
+            "session control statements do not bind",
         )),
         // VACUUM is a maintenance command dispatched to `run_vacuum` before binding
         // (it is not relational and never binds/plans). This defensive arm keeps the

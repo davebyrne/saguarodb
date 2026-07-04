@@ -1,0 +1,392 @@
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+use common::{
+    ColumnInfo, DataType, DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState,
+    Value,
+};
+use executor::ExecutionResult;
+use parser::Statement;
+
+use super::{QueryService, Transaction, mark_failed_on_error, reset_complete, set_complete};
+
+/// Per-connection accept-all GUC store for driver compatibility.
+///
+/// PostgreSQL rejects unknown parameters. SaguaroDB deliberately stores arbitrary
+/// names so client handshake/introspection statements can run. A few parameters
+/// with real server behavior (`transaction_isolation`,
+/// `default_transaction_isolation`) are derived from transaction state instead of
+/// living in this map.
+#[derive(Debug)]
+pub struct SessionGucs {
+    defaults: BTreeMap<String, String>,
+    settings: Mutex<BTreeMap<String, String>>,
+}
+
+impl SessionGucs {
+    pub fn new(application_name: String) -> Self {
+        let mut defaults = BTreeMap::new();
+        for (name, value) in [
+            ("application_name", application_name.as_str()),
+            ("client_encoding", "UTF8"),
+            ("datestyle", "ISO"),
+            ("extra_float_digits", "1"),
+            ("integer_datetimes", "on"),
+            ("search_path", "\"$user\", public"),
+            ("server_encoding", "UTF8"),
+            ("server_version", "16.0"),
+            ("standard_conforming_strings", "on"),
+            ("timezone", "UTC"),
+        ] {
+            defaults.insert(name.to_string(), value.to_string());
+        }
+        let settings = Mutex::new(defaults.clone());
+        Self { defaults, settings }
+    }
+
+    pub fn set(&self, name: &str, value: String) {
+        self.lock().insert(name.to_string(), value);
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.lock().get(name).cloned()
+    }
+
+    pub fn reset(&self, name: &str) {
+        let mut settings = self.lock();
+        match self.defaults.get(name) {
+            Some(default) => settings.insert(name.to_string(), default.clone()),
+            None => settings.remove(name),
+        };
+    }
+
+    pub fn reset_all(&self) {
+        *self.lock() = self.defaults.clone();
+    }
+
+    pub fn all(&self) -> Vec<(String, String)> {
+        self.lock()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    pub fn application_name(&self) -> String {
+        self.get("application_name").unwrap_or_default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
+        self.settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for SessionGucs {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
+}
+
+impl QueryService {
+    pub(super) fn handle_session_config(
+        &self,
+        statement: Statement,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        gucs: &SessionGucs,
+        session_sequences: &SessionSequenceState,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        if let Some(txn) = &slot
+            && txn.failed
+        {
+            return (slot, default_isolation, Err(failed_transaction_error()));
+        }
+
+        match statement {
+            Statement::SetVariable { name, value } => {
+                self.handle_set_variable(name, value, slot, default_isolation, gucs)
+            }
+            Statement::ResetVariable { name } => {
+                self.handle_reset_variable(name, slot, default_isolation, gucs)
+            }
+            Statement::ShowVariable { name: Some(name) } => {
+                let value = show_value(&name, &slot, default_isolation, gucs);
+                match value {
+                    Some(value) => (slot, default_isolation, Ok(show_result(&name, value))),
+                    None => (
+                        mark_failed_on_error(slot),
+                        default_isolation,
+                        Err(DbError::execute(
+                            SqlState::UndefinedObject,
+                            format!("unrecognized configuration parameter \"{name}\""),
+                        )),
+                    ),
+                }
+            }
+            Statement::ShowVariable { name: None } => {
+                let result = show_all_result(gucs, &slot, default_isolation);
+                (slot, default_isolation, Ok(result))
+            }
+            Statement::DiscardAll => {
+                if let Some(mut txn) = slot {
+                    txn.failed = true;
+                    return (
+                        Some(txn),
+                        default_isolation,
+                        Err(DbError::plan(
+                            SqlState::FeatureNotSupported,
+                            "DISCARD ALL cannot run inside a transaction block",
+                        )),
+                    );
+                }
+                gucs.reset_all();
+                if let Err(err) = session_sequences.reset_all() {
+                    return (None, default_isolation, Err(err));
+                }
+                (
+                    None,
+                    IsolationLevel::default(),
+                    Ok(ExecutionResult::Modified {
+                        command: "DISCARD ALL".to_string(),
+                        count: 0,
+                    }),
+                )
+            }
+            other => (
+                slot,
+                default_isolation,
+                Err(DbError::internal(format!(
+                    "handle_session_config received a non-session-config statement: {other:?}"
+                ))),
+            ),
+        }
+    }
+
+    fn handle_set_variable(
+        &self,
+        name: String,
+        value: String,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        gucs: &SessionGucs,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        match name.as_str() {
+            "transaction_isolation" => {
+                let Some(level) = parse_optional_isolation_setting(&value, default_isolation)
+                else {
+                    return invalid_isolation(slot, default_isolation, &value);
+                };
+                let (slot, result) = self.handle_set_transaction(Some(level), slot);
+                (slot, default_isolation, result)
+            }
+            "default_transaction_isolation" => {
+                let Some(level) =
+                    parse_optional_isolation_setting(&value, IsolationLevel::default())
+                else {
+                    return invalid_isolation(slot, default_isolation, &value);
+                };
+                (slot, level, Ok(set_complete()))
+            }
+            _ if value.eq_ignore_ascii_case("default") => {
+                gucs.reset(&name);
+                (slot, default_isolation, Ok(set_complete()))
+            }
+            _ => {
+                gucs.set(&name, value);
+                (slot, default_isolation, Ok(set_complete()))
+            }
+        }
+    }
+
+    fn handle_reset_variable(
+        &self,
+        name: Option<String>,
+        slot: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        gucs: &SessionGucs,
+    ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+        match name.as_deref() {
+            Some("transaction_isolation") => {
+                let (slot, result) = self.handle_set_transaction(Some(default_isolation), slot);
+                (slot, default_isolation, result.map(|_| reset_complete()))
+            }
+            Some("default_transaction_isolation") => {
+                (slot, IsolationLevel::default(), Ok(reset_complete()))
+            }
+            Some(name) => {
+                gucs.reset(name);
+                (slot, default_isolation, Ok(reset_complete()))
+            }
+            None => {
+                gucs.reset_all();
+                (slot, IsolationLevel::default(), Ok(reset_complete()))
+            }
+        }
+    }
+}
+
+fn failed_transaction_error() -> DbError {
+    DbError::execute(
+        SqlState::InFailedSqlTransaction,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+}
+
+fn invalid_isolation(
+    slot: Option<Transaction>,
+    default_isolation: IsolationLevel,
+    value: &str,
+) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
+    (
+        mark_failed_on_error(slot),
+        default_isolation,
+        Err(DbError::execute(
+            SqlState::InvalidParameterValue,
+            format!("invalid value for parameter \"transaction_isolation\": \"{value}\""),
+        )),
+    )
+}
+
+fn parse_optional_isolation_setting(
+    value: &str,
+    default: IsolationLevel,
+) -> Option<IsolationLevel> {
+    if value.eq_ignore_ascii_case("default") {
+        return Some(default);
+    }
+    parse_isolation_setting(value)
+}
+
+fn parse_isolation_setting(value: &str) -> Option<IsolationLevel> {
+    let normalized = value
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .replace(['_', '-'], " ")
+        .to_ascii_lowercase();
+    match normalized.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["read", "uncommitted"] | ["read", "committed"] => Some(IsolationLevel::ReadCommitted),
+        ["repeatable", "read"] | ["snapshot"] => Some(IsolationLevel::RepeatableRead),
+        ["serializable"] => Some(IsolationLevel::Serializable),
+        _ => None,
+    }
+}
+
+fn show_value(
+    name: &str,
+    slot: &Option<Transaction>,
+    default_isolation: IsolationLevel,
+    gucs: &SessionGucs,
+) -> Option<String> {
+    match name {
+        "transaction_isolation" => {
+            let level = slot
+                .as_ref()
+                .map(|txn| txn.isolation)
+                .unwrap_or(default_isolation);
+            Some(isolation_setting(level).to_string())
+        }
+        "default_transaction_isolation" => Some(isolation_setting(default_isolation).to_string()),
+        _ => gucs.get(name),
+    }
+}
+
+fn isolation_setting(level: IsolationLevel) -> &'static str {
+    match level {
+        IsolationLevel::ReadCommitted => "read committed",
+        IsolationLevel::RepeatableRead => "repeatable read",
+        IsolationLevel::Serializable => "serializable",
+    }
+}
+
+fn text_column(name: &str) -> ColumnInfo {
+    ColumnInfo {
+        name: name.to_string(),
+        data_type: DataType::Text,
+        table_id: None,
+        column_id: None,
+        pg_type: None,
+    }
+}
+
+fn show_result(name: &str, value: String) -> ExecutionResult {
+    ExecutionResult::ModifiedReturning {
+        command: "SHOW".to_string(),
+        count: 0,
+        columns: vec![text_column(name)],
+        rows: vec![Row {
+            values: vec![Value::Text(value)],
+        }],
+    }
+}
+
+fn show_all_result(
+    gucs: &SessionGucs,
+    slot: &Option<Transaction>,
+    default_isolation: IsolationLevel,
+) -> ExecutionResult {
+    let mut settings = gucs.all();
+    settings.push((
+        "default_transaction_isolation".to_string(),
+        isolation_setting(default_isolation).to_string(),
+    ));
+    settings.push((
+        "transaction_isolation".to_string(),
+        show_value("transaction_isolation", slot, default_isolation, gucs)
+            .expect("transaction_isolation is always derived"),
+    ));
+    settings.sort();
+    let rows = settings
+        .into_iter()
+        .map(|(name, setting)| Row {
+            values: vec![
+                Value::Text(name),
+                Value::Text(setting),
+                Value::Text(String::new()),
+            ],
+        })
+        .collect();
+    ExecutionResult::ModifiedReturning {
+        command: "SHOW".to_string(),
+        count: 0,
+        columns: vec![
+            text_column("name"),
+            text_column("setting"),
+            text_column("description"),
+        ],
+        rows,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guc_store_resets_unknown_values_by_removing_them() {
+        let gucs = SessionGucs::default();
+        gucs.set("my_app.batch_size", "250".to_string());
+        assert_eq!(gucs.get("my_app.batch_size").as_deref(), Some("250"));
+
+        gucs.reset("my_app.batch_size");
+        assert_eq!(gucs.get("my_app.batch_size"), None);
+    }
+
+    #[test]
+    fn isolation_settings_match_postgres_spellings() {
+        assert_eq!(
+            parse_isolation_setting("read uncommitted"),
+            Some(IsolationLevel::ReadCommitted)
+        );
+        assert_eq!(
+            parse_isolation_setting("repeatable_read"),
+            Some(IsolationLevel::RepeatableRead)
+        );
+        assert_eq!(
+            parse_isolation_setting("SERIALIZABLE"),
+            Some(IsolationLevel::Serializable)
+        );
+        assert_eq!(parse_isolation_setting("bogus"), None);
+    }
+}

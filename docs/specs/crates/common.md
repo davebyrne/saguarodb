@@ -347,6 +347,7 @@ pub enum SqlState {
     SyntaxError,
     UndefinedTable,
     UndefinedColumn,
+    UndefinedObject,
     InvalidColumnReference,
     DuplicateTable,
     DatatypeMismatch,
@@ -376,6 +377,10 @@ pub type Result<T> = std::result::Result<T, DbError>;
 ```
 
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
+
+`SqlState::UndefinedObject` maps to SQLSTATE `42704`: an object-like name is not
+recognized when no more specific relation/column SQLSTATE applies. The server
+uses it for `SHOW` of an unknown configuration parameter.
 
 `SqlState::InFailedSqlTransaction` maps to SQLSTATE `25P02`: a statement other
 than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction block.

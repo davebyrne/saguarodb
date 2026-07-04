@@ -8,9 +8,9 @@ use parser::Statement;
 use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
 
 use super::{
-    BindSource, QueryService, StatementClass, StatementRuntime, StreamOutcome, Transaction,
-    WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream, mark_failed_on_error,
-    run_plan, statement_class,
+    BindSource, QueryService, SessionGucs, StatementClass, StatementRuntime, StreamOutcome,
+    Transaction, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
+    mark_failed_on_error, run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -19,6 +19,7 @@ impl QueryService {
     /// `default_isolation` is the session default (in/out, like `slot`); only
     /// transaction-control statements read or update it, so the data and maintenance
     /// arms pass it back unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch(
         &self,
         statement: Statement,
@@ -26,6 +27,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        gucs: &SessionGucs,
         // `Some` streams a `SELECT`'s rows into the sink; `None` materializes.
         // Only the data (read/write) arms consult it; every other arm ignores it
         // and returns `StreamOutcome::Direct`.
@@ -44,6 +46,17 @@ impl QueryService {
         if let StatementClass::TransactionControl(kind) = class {
             let (slot, default_isolation, result) =
                 self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+        }
+
+        if let StatementClass::SessionConfig = class {
+            let (slot, default_isolation, result) = self.handle_session_config(
+                statement,
+                slot,
+                default_isolation,
+                gucs,
+                session_sequences.as_ref(),
+            );
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
@@ -358,6 +371,10 @@ impl QueryService {
             // them through `handle_transaction_control`).
             StatementClass::TransactionControl(_) => Err(DbError::internal(
                 "transaction control reached the autocommit data path",
+            )),
+            // Session configuration is dispatched before the autocommit data path.
+            StatementClass::SessionConfig => Err(DbError::internal(
+                "session configuration reached the autocommit data path",
             )),
             // COPY is intercepted by `dispatch` (→ `dispatch_copy`) and driven by the
             // connection loop, never the autocommit data path.

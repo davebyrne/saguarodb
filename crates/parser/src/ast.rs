@@ -114,6 +114,28 @@ pub enum Statement {
     SetSessionCharacteristics {
         isolation: Option<IsolationLevel>,
     },
+    /// `SET [SESSION|LOCAL] <name> {=|TO} <value>` — session configuration
+    /// assignment. `SET TIME ZONE <value>` normalizes to `timezone`, and
+    /// `SET NAMES <encoding>` normalizes to `client_encoding`. GUC names are the
+    /// narrow exception to the quoted-identifier rule: quoted GUC name parts are
+    /// accepted and lowercase-normalized like PostgreSQL.
+    SetVariable {
+        name: String,
+        value: String,
+    },
+    /// `RESET <name>` / `RESET ALL`. `None` means `ALL`. sqlparser 0.56 does not
+    /// parse RESET, so the converter intercepts it before the general parser.
+    ResetVariable {
+        name: Option<String>,
+    },
+    /// `SHOW <name>` / `SHOW ALL`. `None` means `ALL`. Multi-word PostgreSQL
+    /// aliases such as `SHOW TIME ZONE` and `SHOW TRANSACTION ISOLATION LEVEL`
+    /// normalize to their GUC names.
+    ShowVariable {
+        name: Option<String>,
+    },
+    /// `DISCARD ALL` — reset session configuration and other per-session state.
+    DiscardAll,
     /// `VACUUM` (all user tables) or `VACUUM <table>` (one table). A maintenance
     /// command that reclaims dead MVCC versions; `table` is the lowercase-normalized
     /// identifier, `None` for the whole database. sqlparser 0.56 does not parse

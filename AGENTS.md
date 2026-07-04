@@ -78,7 +78,10 @@ precedence.
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
-  (per-connection default) — Read Committed / Repeatable Read / Serializable,
+  (per-connection default), plus `SET`/`SHOW`/`RESET` of session configuration
+  parameters (including PostgreSQL-compatible `transaction_isolation` and
+  `default_transaction_isolation`) and `DISCARD ALL` — Read Committed /
+  Repeatable Read / Serializable,
   with SERIALIZABLE implemented as Serializable Snapshot Isolation
   (`docs/specs/ssi.md`)), the maintenance
   command `VACUUM [table]` (non-relational: it does not bind/plan, takes the
@@ -93,7 +96,8 @@ precedence.
   `SqlState::DatatypeMismatch`, except `NULL` is valid where the target
   expression or column is nullable.
 - Normalize unquoted SQL identifiers to lowercase. Quoted identifiers remain
-  unsupported unless the specs change.
+  unsupported except quoted session-configuration parameter names, which are
+  accepted case-insensitively like PostgreSQL GUC names.
 - Preserve autocommit semantics. The server owns statement guards, transaction
   ID allocation, WAL commit records, WAL flush, rollback before durable commit,
   cleanup after durable commit, and checkpoint triggering.

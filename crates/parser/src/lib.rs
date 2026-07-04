@@ -35,6 +35,133 @@ mod tests {
     }
 
     #[test]
+    fn parses_set_variable_forms() {
+        assert_eq!(
+            parse("SET extra_float_digits = 3").unwrap(),
+            Statement::SetVariable {
+                name: "extra_float_digits".to_string(),
+                value: "3".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("SET datestyle TO 'ISO'").unwrap(),
+            Statement::SetVariable {
+                name: "datestyle".to_string(),
+                value: "ISO".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("SET TIME ZONE 'UTC'").unwrap(),
+            Statement::SetVariable {
+                name: "timezone".to_string(),
+                value: "UTC".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("SET search_path = \"$user\", public").unwrap(),
+            Statement::SetVariable {
+                name: "search_path".to_string(),
+                value: "$user, public".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("SET SESSION statement_timeout = 0").unwrap(),
+            Statement::SetVariable {
+                name: "statement_timeout".to_string(),
+                value: "0".to_string(),
+            }
+        );
+        assert!(matches!(
+            parse("SET LOCAL statement_timeout = 0").unwrap(),
+            Statement::SetVariable { .. }
+        ));
+        assert_eq!(
+            parse("SET my_app.batch_size = -2").unwrap(),
+            Statement::SetVariable {
+                name: "my_app.batch_size".to_string(),
+                value: "-2".to_string(),
+            }
+        );
+        assert_eq!(
+            parse("SET \"Default_Transaction_Isolation\" TO 'serializable'").unwrap(),
+            Statement::SetVariable {
+                name: "default_transaction_isolation".to_string(),
+                value: "serializable".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn set_transaction_forms_are_untouched_by_the_guc_path() {
+        assert!(matches!(
+            parse("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Statement::SetTransaction { isolation: Some(_) }
+        ));
+        assert!(matches!(
+            parse("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .unwrap(),
+            Statement::SetSessionCharacteristics { isolation: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn parses_show_reset_and_discard() {
+        assert_eq!(
+            parse("SHOW extra_float_digits").unwrap(),
+            Statement::ShowVariable {
+                name: Some("extra_float_digits".to_string())
+            }
+        );
+        assert_eq!(
+            parse("SHOW ALL").unwrap(),
+            Statement::ShowVariable { name: None }
+        );
+        assert_eq!(
+            parse("SHOW TIME ZONE").unwrap(),
+            Statement::ShowVariable {
+                name: Some("timezone".to_string())
+            }
+        );
+        assert_eq!(
+            parse("SHOW TRANSACTION ISOLATION LEVEL").unwrap(),
+            Statement::ShowVariable {
+                name: Some("transaction_isolation".to_string())
+            }
+        );
+        assert_eq!(
+            parse("RESET extra_float_digits").unwrap(),
+            Statement::ResetVariable {
+                name: Some("extra_float_digits".to_string())
+            }
+        );
+        assert_eq!(
+            parse("RESET \"Transaction_Isolation\";").unwrap(),
+            Statement::ResetVariable {
+                name: Some("transaction_isolation".to_string())
+            }
+        );
+        assert_eq!(
+            parse("RESET ALL;").unwrap(),
+            Statement::ResetVariable { name: None }
+        );
+        assert_eq!(parse("DISCARD ALL").unwrap(), Statement::DiscardAll);
+
+        let err = parse("DISCARD PLANS").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        for sql in [
+            "SET GLOBAL statement_timeout = 0",
+            "SET GLOBAL TIME ZONE 'UTC'",
+            "SET GLOBAL NAMES utf8",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
     fn numeric_typed_literal_validates_precision_and_scale() {
         // A valid NUMERIC literal parses.
         assert!(parse("select numeric '1.23' from t").is_ok());

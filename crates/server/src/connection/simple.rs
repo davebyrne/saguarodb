@@ -48,6 +48,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session_sequences = self.session_sequences.clone();
+        let session_gucs = self.session_gucs.clone();
         // A SELECT streams its rows through this bounded channel: the blocking
         // producer sends `Start` (columns) then `Rows` batches; this async task
         // drains them to the socket while the producer runs, giving TCP
@@ -70,6 +71,7 @@ impl Session {
                 default_isolation,
                 &cancel,
                 session_sequences,
+                session_gucs,
                 row_tx,
             )
         });
@@ -159,6 +161,10 @@ impl Session {
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
             Ok(StreamOutcome::Direct(result)) => {
+                if is_discard_all_result(&result) {
+                    self.prepared.clear();
+                    self.portals.clear();
+                }
                 drop(guard);
                 write_execution_result(stream, codec, result, status).await?
             }
@@ -174,6 +180,13 @@ impl Session {
         }
         Ok(ControlFlow::Continue(()))
     }
+}
+
+fn is_discard_all_result(result: &ExecutionResult) -> bool {
+    matches!(
+        result,
+        ExecutionResult::Modified { command, .. } if command == "DISCARD ALL"
+    )
 }
 
 /// Encode a batch of result rows as `DataRow` messages in the simple-query

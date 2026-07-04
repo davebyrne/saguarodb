@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::app::AppState;
 use crate::cancel::BackendKey;
 use crate::query::{
-    CopyInChunk, PreparedStatement, SessionTxnStatus, StreamOutcome, Transaction,
+    CopyInChunk, PreparedStatement, SessionGucs, SessionTxnStatus, StreamOutcome, Transaction,
     abort_session_transaction,
 };
 use crate::shutdown::InFlightQueryGuard;
@@ -240,6 +240,9 @@ struct Session {
     /// `setval(..., true)` record into this map; `currval` reads it and errors
     /// before any value is recorded on this connection.
     session_sequences: Arc<SessionSequenceState>,
+    /// Per-connection session configuration parameters used by driver startup
+    /// probes (`SET`/`SHOW`/`RESET`/`DISCARD ALL`).
+    session_gucs: Arc<SessionGucs>,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
     cancel: Arc<AtomicBool>,
@@ -333,6 +336,7 @@ impl Session {
             // §10 Milestone G2).
             default_isolation: IsolationLevel::default(),
             session_sequences: Arc::new(SessionSequenceState::new()),
+            session_gucs: Arc::new(SessionGucs::default()),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
             copy_in: None,
@@ -432,8 +436,18 @@ impl Session {
             | ClientMessage::Describe { .. }
             | ClientMessage::Close { .. }
             | ClientMessage::Execute { .. } => {}
-            msg @ ClientMessage::Startup { .. } => {
-                let mut replies = self.state.handle_message(msg)?;
+            ClientMessage::Startup {
+                user,
+                database,
+                application_name,
+            } => {
+                let startup_application_name = application_name.clone().unwrap_or_default();
+                let mut replies = self.state.handle_message(ClientMessage::Startup {
+                    user,
+                    database,
+                    application_name,
+                })?;
+                self.session_gucs = Arc::new(SessionGucs::new(startup_application_name));
                 // Register a cancellation key for this connection and announce it
                 // with BackendKeyData, placed after the ParameterStatus messages
                 // and before the trailing ReadyForQuery.
@@ -564,6 +578,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::SyntaxError => "42601",
         SqlState::UndefinedTable => "42P01",
         SqlState::UndefinedColumn => "42703",
+        SqlState::UndefinedObject => "42704",
         SqlState::InvalidColumnReference => "42P10",
         SqlState::DuplicateTable => "42P07",
         SqlState::DatatypeMismatch => "42804",

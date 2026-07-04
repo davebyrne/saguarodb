@@ -28,6 +28,9 @@ pub enum SqlState {
     SyntaxError,
     UndefinedTable,
     UndefinedColumn,
+    /// `42704`: an object-like name is not recognized, e.g. a `SHOW` of an
+    /// unknown configuration parameter.
+    UndefinedObject,
     /// `42P10`: a column reference is invalid in its context, e.g. a
     /// `SELECT DISTINCT` query whose `ORDER BY` references an expression that is
     /// not in the select list, or a `DISTINCT ON` whose expressions do not match

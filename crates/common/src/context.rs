@@ -109,6 +109,14 @@ impl SessionSequenceState {
             .get(&sequence)
             .copied())
     }
+
+    pub fn reset_all(&self) -> Result<()> {
+        self.currvals
+            .lock()
+            .map_err(|_| DbError::internal("session sequence state lock poisoned"))?
+            .clear();
+        Ok(())
+    }
 }
 
 /// Records what a `SERIALIZABLE` transaction reads (SIREAD locks) and forms

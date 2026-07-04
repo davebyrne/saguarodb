@@ -35,6 +35,10 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     if let Some(statement) = try_parse_alter_table(sql)? {
         return Ok(statement);
     }
+    if let Some(statement) = try_parse_reset(sql)? {
+        return Ok(statement);
+    }
+    reject_set_global(sql)?;
     if let Some(statement) = try_parse_create_sequence(sql)? {
         return Ok(statement);
     }
@@ -171,6 +175,11 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             Ok(Statement::Begin { isolation })
         }
         sql::Statement::Set(set) => convert_set(set),
+        sql::Statement::ShowVariable { variable } => convert_show(&variable),
+        sql::Statement::Discard { object_type } => match object_type {
+            sql::DiscardObject::ALL => Ok(Statement::DiscardAll),
+            _ => feature_not_supported("only DISCARD ALL is supported"),
+        },
         sql::Statement::Commit {
             chain,
             end: _,
@@ -214,35 +223,136 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     }
 }
 
-/// Convert a `SET ...` statement. v1 supports the transaction-scoped
-/// `SET TRANSACTION ISOLATION LEVEL <level>` (`session == false`) and the
-/// session-scoped `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL
-/// <level>` (`session == true`, the per-connection default). Both share the same
-/// mode parsing (so the four SQL levels map onto our two identically, and access
-/// modes follow the same accept-`READ WRITE`/reject-`READ ONLY` convention);
-/// `SET TRANSACTION SNAPSHOT` and every other `SET` form are unsupported.
+/// Convert a `SET ...` statement. Transaction-control forms retain their
+/// dedicated variants. Driver-style session configuration forms become
+/// `Statement::SetVariable` so the server can handle them against a connection
+/// GUC store without binding or planning.
 fn convert_set(set: sql::Set) -> Result<Statement> {
-    let sql::Set::SetTransaction {
-        modes,
-        snapshot,
-        session,
-    } = set
-    else {
-        return unsupported("unsupported SET statement");
+    match set {
+        sql::Set::SetTransaction {
+            modes,
+            snapshot,
+            session,
+        } => {
+            if snapshot.is_some() {
+                return unsupported("SET TRANSACTION SNAPSHOT is not supported in v1");
+            }
+            let isolation = transaction_isolation_mode(&modes)?;
+            if session {
+                // `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
+                // sets the per-connection default isolation for FUTURE transactions
+                // (G2). It reuses the same level mapping and access-mode handling as
+                // the transaction-scoped form above.
+                Ok(Statement::SetSessionCharacteristics { isolation })
+            } else {
+                Ok(Statement::SetTransaction { isolation })
+            }
+        }
+        sql::Set::SingleAssignment {
+            scope,
+            hivevar,
+            variable,
+            values,
+        } => {
+            if hivevar {
+                return unsupported("Hive SET variables are not supported");
+            }
+            validate_guc_scope(scope)?;
+            let name = guc_object_name(&variable)?;
+            let value = set_value_text(&values)?;
+            Ok(Statement::SetVariable { name, value })
+        }
+        sql::Set::SetTimeZone { local: _, value } => Ok(Statement::SetVariable {
+            name: "timezone".to_string(),
+            value: set_expr_text(&value),
+        }),
+        sql::Set::SetNames {
+            charset_name,
+            collation_name,
+        } => {
+            if collation_name.is_some() {
+                return unsupported("SET NAMES COLLATE is not supported");
+            }
+            Ok(Statement::SetVariable {
+                name: "client_encoding".to_string(),
+                value: charset_name.value,
+            })
+        }
+        sql::Set::SetNamesDefault {} => Ok(Statement::SetVariable {
+            name: "client_encoding".to_string(),
+            value: "default".to_string(),
+        }),
+        _ => unsupported("unsupported SET statement"),
+    }
+}
+
+fn validate_guc_scope(scope: Option<sql::ContextModifier>) -> Result<()> {
+    match scope {
+        None | Some(sql::ContextModifier::Session | sql::ContextModifier::Local) => Ok(()),
+        Some(sql::ContextModifier::Global) => unsupported("SET GLOBAL is not supported"),
+    }
+}
+
+fn guc_object_name(name: &sql::ObjectName) -> Result<String> {
+    guc_name_parts(name.0.iter().filter_map(sql::ObjectNamePart::as_ident))
+}
+
+fn guc_ident_name(ident: &sql::Ident) -> String {
+    ident.value.to_ascii_lowercase()
+}
+
+fn guc_name_parts<'a>(parts: impl IntoIterator<Item = &'a sql::Ident>) -> Result<String> {
+    let parts = parts.into_iter().map(guc_ident_name).collect::<Vec<_>>();
+    match parts.as_slice() {
+        [] => Err(parse_error("empty configuration parameter name")),
+        [single] => Ok(single.clone()),
+        [prefix, name] => Ok(format!("{prefix}.{name}")),
+        _ => unsupported("configuration parameter names support at most one dot"),
+    }
+}
+
+fn set_value_text(values: &[sql::Expr]) -> Result<String> {
+    if values.is_empty() {
+        return Err(parse_error("SET requires a value"));
+    }
+    Ok(values
+        .iter()
+        .map(set_expr_text)
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+fn set_expr_text(expr: &sql::Expr) -> String {
+    match expr {
+        sql::Expr::Value(value) => match value.clone().value.into_string() {
+            Some(value) => value,
+            None => value.to_string(),
+        },
+        sql::Expr::Identifier(ident) => ident.value.clone(),
+        sql::Expr::CompoundIdentifier(idents) => idents
+            .iter()
+            .map(|ident| ident.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        _ => expr.to_string(),
+    }
+}
+
+fn convert_show(variable: &[sql::Ident]) -> Result<Statement> {
+    if variable.is_empty() {
+        return Err(parse_error("SHOW requires a parameter name or ALL"));
+    }
+    let parts = variable.iter().map(guc_ident_name).collect::<Vec<_>>();
+    let part_refs = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let name = match part_refs.as_slice() {
+        ["all"] => return Ok(Statement::ShowVariable { name: None }),
+        ["time", "zone"] => "timezone".to_string(),
+        ["transaction", "isolation", "level"] => "transaction_isolation".to_string(),
+        [single] => (*single).to_string(),
+        [prefix, name] => format!("{prefix}.{name}"),
+        _ => return unsupported("unsupported SHOW variable name"),
     };
-    if snapshot.is_some() {
-        return unsupported("SET TRANSACTION SNAPSHOT is not supported in v1");
-    }
-    let isolation = transaction_isolation_mode(&modes)?;
-    if session {
-        // `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` sets
-        // the per-connection default isolation for FUTURE transactions (G2). It
-        // reuses the same level mapping and access-mode handling as the
-        // transaction-scoped form above.
-        Ok(Statement::SetSessionCharacteristics { isolation })
-    } else {
-        Ok(Statement::SetTransaction { isolation })
-    }
+    Ok(Statement::ShowVariable { name: Some(name) })
 }
 
 /// Extract an optional `ISOLATION LEVEL <level>` from a list of transaction modes,
@@ -447,6 +557,92 @@ fn ident_name(ident: &sql::Ident) -> Result<String> {
         return Err(parse_error("quoted identifiers are not supported"));
     }
     Ok(ident.value.to_ascii_lowercase())
+}
+
+/// Intercept `RESET <name>` / `RESET ALL` before sqlparser, which cannot parse
+/// RESET in 0.56. GUC names are the one identifier path where quoted names are
+/// allowed; PostgreSQL treats them case-insensitively, so normalize to lowercase.
+fn try_parse_reset(sql: &str) -> Result<Option<Statement>> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens: Vec<_> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    let Some(Token::Word(keyword)) = tokens.first() else {
+        return Ok(None);
+    };
+    if !keyword.value.eq_ignore_ascii_case("reset") {
+        return Ok(None);
+    }
+
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    if tokens
+        .iter()
+        .skip(1)
+        .any(|token| *token == Token::SemiColon)
+    {
+        return Err(parse_error("expected exactly one SQL statement"));
+    }
+
+    let mut parts = Vec::new();
+    let mut index = 1;
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::Word(word) => {
+                let ident = match word.quote_style {
+                    Some(quote) => sql::Ident::with_quote(quote, word.value.clone()),
+                    None => sql::Ident::new(word.value.clone()),
+                };
+                parts.push(ident);
+                index += 1;
+            }
+            Token::DoubleQuotedString(value) => {
+                parts.push(sql::Ident::with_quote('"', value.clone()));
+                index += 1;
+            }
+            Token::Period if index > 1 && index + 1 < tokens.len() => {
+                index += 1;
+            }
+            _ => return unsupported("RESET supports a configuration parameter name or ALL"),
+        }
+    }
+
+    match parts.as_slice() {
+        [] => Err(parse_error("RESET requires a parameter name or ALL")),
+        [single] if single.value.eq_ignore_ascii_case("all") => {
+            Ok(Some(Statement::ResetVariable { name: None }))
+        }
+        _ => Ok(Some(Statement::ResetVariable {
+            name: Some(guc_name_parts(parts.iter())?),
+        })),
+    }
+}
+
+fn reject_set_global(sql: &str) -> Result<()> {
+    let dialect = PostgreSqlDialect {};
+    let tokens: Vec<_> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    let [Token::Word(set), Token::Word(global), ..] = tokens.as_slice() else {
+        return Ok(());
+    };
+    if set.quote_style.is_none()
+        && global.quote_style.is_none()
+        && set.value.eq_ignore_ascii_case("set")
+        && global.value.eq_ignore_ascii_case("global")
+    {
+        return unsupported("SET GLOBAL is not supported");
+    }
+    Ok(())
 }
 
 /// Intercept `VACUUM` (and `VACUUM <table>`) before sqlparser, which cannot parse

@@ -286,7 +286,7 @@ impl QueryService {
     ///   `SET TRANSACTION` runs as its own implicit single-statement transaction
     ///   that does no query, so there is nothing for the level to affect; Postgres
     ///   treats it as a no-op (and warns), which we mirror as a plain success.
-    fn handle_set_transaction(
+    pub(super) fn handle_set_transaction(
         &self,
         isolation: Option<IsolationLevel>,
         slot: Option<Transaction>,

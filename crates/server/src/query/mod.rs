@@ -21,11 +21,13 @@ use crate::registry::AdvertisedSnapshot;
 mod alter;
 mod copy;
 mod exec;
+mod gucs;
 mod stream;
 mod txn;
 mod vacuum;
 
 pub use copy::CopyInChunk;
+pub use gucs::SessionGucs;
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
 pub use stream::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 use txn::StatementRuntime;
@@ -205,6 +207,7 @@ impl QueryService {
             default_isolation,
             cancel,
             Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionGucs::default()),
         )
     }
 
@@ -215,6 +218,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        gucs: Arc<SessionGucs>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         let parsed = match parser::parse(sql) {
             Ok(parsed) => parsed,
@@ -232,6 +236,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            &gucs,
             None,
         );
         (
@@ -250,6 +255,7 @@ impl QueryService {
     /// the snapshot's GC-horizon advertisement and any transaction guard are held
     /// across the stream, exactly as on the materializing path
     /// (`docs/specs/streaming.md` §4, §5).
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_simple_streamed(
         &self,
         sql: &str,
@@ -257,6 +263,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        gucs: Arc<SessionGucs>,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let parsed = match parser::parse(sql) {
@@ -272,6 +279,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            &gucs,
             Some(&mut sink),
         )
     }
@@ -323,6 +331,12 @@ impl QueryService {
             return Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "savepoints require the simple query protocol",
+            ));
+        }
+        if let StatementClass::SessionConfig = class {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "session configuration statements require the simple query protocol",
             ));
         }
         if let StatementClass::TransactionControl(_) = class {
@@ -461,6 +475,10 @@ impl QueryService {
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
             }
+            StatementClass::SessionConfig => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "session configuration statements require the simple query protocol",
+            )),
             StatementClass::TransactionControl(_) => Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "transaction control statements require the simple query protocol",
@@ -600,6 +618,11 @@ impl QueryService {
                         .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
+                    }
+                    StatementClass::SessionConfig => {
+                        unreachable!(
+                            "session configuration is rejected at prepare time for the extended protocol"
+                        )
                     }
                     StatementClass::TransactionControl(_) => {
                         unreachable!("transaction control is dispatched above before substitution")
@@ -802,6 +825,13 @@ fn set_complete() -> ExecutionResult {
     }
 }
 
+fn reset_complete() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "RESET".to_string(),
+        count: 0,
+    }
+}
+
 fn savepoint_complete() -> ExecutionResult {
     ExecutionResult::Modified {
         command: "SAVEPOINT".to_string(),
@@ -862,6 +892,10 @@ enum StatementClass {
     /// (`docs/specs/savepoints.md`); simple-query only. The op + name are read from
     /// the parsed `Statement` in `handle_savepoint` (so this stays a `Copy` marker).
     Savepoint,
+    /// `SET`/`RESET`/`SHOW`/`DISCARD ALL` session configuration. These statements
+    /// are non-relational and are handled against the connection's GUC/session
+    /// state before binding or planning.
+    SessionConfig,
 }
 
 /// A parsed and bound extended-protocol statement that can be executed
@@ -969,6 +1003,10 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
                 TransactionControl::SetSessionCharacteristics(*isolation),
             ))
         }
+        Statement::SetVariable { .. }
+        | Statement::ResetVariable { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::DiscardAll => Ok(StatementClass::SessionConfig),
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
         Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
             Ok(StatementClass::Maintenance)
@@ -2079,12 +2117,14 @@ mod tests {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let session_sequences = Arc::new(SessionSequenceState::new());
+        let gucs = Arc::new(super::SessionGucs::default());
         let (_slot, iso, err) = app.query_service.execute_simple_with_session_sequences(
             "select currval('users_id_seq') from seq_probe",
             None,
             IsolationLevel::default(),
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(
             err.unwrap_err().code,
@@ -2097,6 +2137,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 1);
         assert_eq!(
@@ -2111,6 +2152,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 1);
         assert_eq!(
@@ -2125,6 +2167,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 10);
         assert_eq!(begin_writer_calls.load(Ordering::SeqCst), 2);
@@ -2135,6 +2178,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 1);
 
@@ -2144,6 +2188,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 10);
 
@@ -2154,6 +2199,7 @@ mod tests {
             iso,
             &cancel,
             fresh_session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 20);
 
@@ -2163,6 +2209,7 @@ mod tests {
             iso,
             &cancel,
             fresh_session_sequences,
+            gucs.clone(),
         );
         assert_eq!(
             err.unwrap_err().code,
@@ -2187,12 +2234,14 @@ mod tests {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let session_sequences = Arc::new(SessionSequenceState::new());
+        let gucs = Arc::new(super::SessionGucs::default());
         let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
             "insert into users (name) values ('Ada') returning id",
             None,
             IsolationLevel::default(),
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 1);
 
@@ -2202,6 +2251,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         result.unwrap();
         let (slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
@@ -2210,6 +2260,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 2);
         let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
@@ -2218,6 +2269,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         result.unwrap();
 
@@ -2227,6 +2279,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences.clone(),
+            gucs.clone(),
         );
         assert_eq!(single_integer(result), 3);
 
@@ -2236,6 +2289,7 @@ mod tests {
             iso,
             &cancel,
             session_sequences,
+            gucs.clone(),
         );
         assert_eq!(
             result_values(result),
@@ -3142,6 +3196,7 @@ mod tests {
             IsolationLevel::default(),
             &cancel,
             Arc::new(SessionSequenceState::new()),
+            Arc::new(super::SessionGucs::default()),
             row_tx,
         );
 
