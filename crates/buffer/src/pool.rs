@@ -662,7 +662,10 @@ impl BufferPool for MemoryBufferPool {
                     std::thread::yield_now();
                 }
                 ResidentLookup::Absent => {
-                    let data = self.store.load_page(file_id, page_num)?.unwrap_or_default();
+                    let data = self
+                        .store
+                        .load_page_lenient(file_id, page_num)?
+                        .unwrap_or_default();
                     let frame =
                         self.insert_loaded_write_page(file_id, page_num, RECOVERY_TXN, data)?;
                     return Ok(write_guard(file_id, page_num, frame));

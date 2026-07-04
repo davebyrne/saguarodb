@@ -1017,9 +1017,11 @@ name = "saguarodb-storage"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "parking_lot",
  "saguarodb-buffer",
  "saguarodb-common",
+ "saguarodb-compress",
  "saguarodb-wal",
  "serde",
  "serde_json",

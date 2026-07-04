@@ -36,6 +36,11 @@ pub(crate) fn secondary_index_file_id(index: IndexId) -> FileId {
     index | SECONDARY_INDEX_BITS
 }
 
+/// Filesystem allocation quantum assumed for hole punching. Punching is a
+/// space optimization only — on a filesystem with larger blocks the punch
+/// reclaims nothing and correctness is unaffected.
+const FS_BLOCK_SIZE: usize = 4096;
+
 /// Mutable page home backed by one file per table: the heap at `<dir>/<id>.heap`
 /// and the primary-key index at `<dir>/<table>.idx`, with page `n` stored at byte
 /// offset `n * PAGE_SIZE`. Pages are loaded on a buffer miss and written back in
@@ -43,10 +48,20 @@ pub(crate) fn secondary_index_file_id(index: IndexId) -> FileId {
 pub struct HeapPageStore {
     dir: PathBuf,
     files: Mutex<HashMap<FileId, Arc<File>>>,
+    compression: Arc<compress::CompressionRegistry>,
+    /// Set when fallocate reports the fs cannot punch holes; skip thereafter.
+    punch_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl HeapPageStore {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_compression(dir, Arc::new(compress::CompressionRegistry::new()))
+    }
+
+    pub fn open_with_compression(
+        dir: impl AsRef<Path>,
+        compression: Arc<compress::CompressionRegistry>,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|err| {
             DbError::io(format!(
@@ -57,6 +72,8 @@ impl HeapPageStore {
         Ok(Self {
             dir,
             files: Mutex::new(HashMap::new()),
+            compression,
+            punch_unsupported: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -101,20 +118,17 @@ impl HeapPageStore {
             ))),
         }
     }
-}
 
-fn page_offset(page_num: PageNum) -> u64 {
-    page_num as u64 * PAGE_SIZE as u64
-}
-
-impl PageLoader for HeapPageStore {
-    fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+    /// Read the raw on-disk slot for a page, if it exists. `Ok(None)` means the
+    /// page is not present (beyond EOF or a short tail); a hole between two
+    /// written pages reads back as a zeroed slot, matching sparse-file semantics.
+    fn read_slot(&self, file_id: FileId, page_num: PageNum) -> Result<Option<[u8; PAGE_SIZE]>> {
         let Some(file) = self.handle(file_id, false)? else {
             return Ok(None);
         };
         let mut buf = [0u8; PAGE_SIZE];
         match file.read_exact_at(&mut buf, page_offset(page_num)) {
-            Ok(()) => Ok(Some(PageData(buf))),
+            Ok(()) => Ok(Some(buf)),
             // A full page does not exist at this offset (beyond EOF or a short
             // tail). Treated as not-present; redo/checkpoint will rewrite it.
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
@@ -123,6 +137,81 @@ impl PageLoader for HeapPageStore {
             ))),
         }
     }
+
+    /// Read and decode a page slot, applying the file's compression config.
+    /// `lenient` controls how a corrupt envelope is reported: `false` (normal
+    /// reads) surfaces it loudly; `true` (recovery redo) reports the page as
+    /// absent so a zeroed frame is repaired by the following FullPageImage.
+    fn decode_slot(
+        &self,
+        file_id: FileId,
+        page_num: PageNum,
+        lenient: bool,
+    ) -> Result<Option<PageData>> {
+        let Some(buf) = self.read_slot(file_id, page_num)? else {
+            return Ok(None);
+        };
+        match self.compression.decompress_page(&buf, PAGE_SIZE) {
+            Ok(Some(image)) => {
+                let bytes: [u8; PAGE_SIZE] = image.try_into().expect("length checked by registry");
+                Ok(Some(PageData(bytes)))
+            }
+            Ok(None) => Ok(Some(PageData(buf))),
+            // Corrupt envelope: absent for redo (zeroed frame + FPI repair, which
+            // is strictly better detection than a torn raw page's garbage
+            // PageLSN); loud corruption error for normal reads.
+            Err(_) if lenient => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Best-effort hole punch over `[offset, offset + len)`; never fails the
+    /// write. Stale trailing bytes left by a failed or skipped punch are never
+    /// read back — the envelope is length-delimited.
+    #[cfg(target_os = "linux")]
+    fn punch_hole(&self, file: &File, offset: u64, len: u64) {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+        if self.punch_unsupported.load(Ordering::Relaxed) {
+            return;
+        }
+        let rc = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
+            ) {
+                self.punch_unsupported.store(true, Ordering::Relaxed);
+            }
+            // Any punch failure is tolerated: the slot keeps stale trailing
+            // bytes, which the length-delimited envelope decode never reads.
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn punch_hole(&self, _file: &File, _offset: u64, _len: u64) {}
+}
+
+fn page_offset(page_num: PageNum) -> u64 {
+    page_num as u64 * PAGE_SIZE as u64
+}
+
+impl PageLoader for HeapPageStore {
+    fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+        self.decode_slot(file_id, page_num, false)
+    }
+
+    fn load_page_lenient(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+        self.decode_slot(file_id, page_num, true)
+    }
 }
 
 impl PageStore for HeapPageStore {
@@ -130,12 +219,39 @@ impl PageStore for HeapPageStore {
         let file = self
             .handle(file_id, true)?
             .expect("handle with create=true is always Some");
-        file.write_all_at(&data.0, page_offset(page_num))
-            .map_err(|err| {
-                DbError::io(format!(
-                    "failed to write heap page {file_id}/{page_num}: {err}"
-                ))
-            })
+        let offset = page_offset(page_num);
+        if let Some(envelope) = self.compression.compress_page_at_rest(file_id, &data.0)? {
+            // Smallest whole number of fs blocks holding the envelope; only
+            // worthwhile when it frees at least one block of the page's slot.
+            let used = envelope.len().div_ceil(FS_BLOCK_SIZE) * FS_BLOCK_SIZE;
+            if used < PAGE_SIZE {
+                // Write the envelope zero-padded to a FULL slot, then punch the
+                // trailing blocks. Writing the whole slot keeps st_size — and so
+                // page_count = st_size / PAGE_SIZE, which seeds the allocator and
+                // bounds VACUUM's full-extent scan — identical to the raw path
+                // even when this page is the file's current tail (a short write
+                // there would under-report the extent; PUNCH_HOLE|KEEP_SIZE
+                // preserves st_size but never grows it). No set_len: a stale
+                // metadata read racing a concurrent later-page write could
+                // truncate it. The punch then returns the padding blocks.
+                let mut slot = [0u8; PAGE_SIZE];
+                slot[..envelope.len()].copy_from_slice(&envelope);
+                file.write_all_at(&slot, offset).map_err(|err| {
+                    DbError::io(format!(
+                        "failed to write heap page {file_id}/{page_num}: {err}"
+                    ))
+                })?;
+                self.punch_hole(&file, offset + used as u64, (PAGE_SIZE - used) as u64);
+                return Ok(());
+            }
+        }
+        // Note: this raw write also handles a partially-punched prior slot;
+        // writing the full 8 KiB re-allocates (un-punches) the hole.
+        file.write_all_at(&data.0, offset).map_err(|err| {
+            DbError::io(format!(
+                "failed to write heap page {file_id}/{page_num}: {err}"
+            ))
+        })
     }
 
     fn page_count(&self, file_id: FileId) -> Result<PageNum> {
@@ -271,5 +387,108 @@ mod tests {
         assert!(dir.path().join("5.heap").exists());
         assert!(dir.path().join("5.idx").exists());
         assert!(dir.path().join("5.sidx").exists());
+    }
+
+    use compress::{CompressionRegistry, FileCompression};
+    use std::sync::Arc;
+
+    fn compressible_page() -> PageData {
+        let mut data = [0u8; PAGE_SIZE];
+        let row = b"repetitive-row-content-abcdefghijklmnopqrstuvwxyz;";
+        for (i, byte) in row.iter().cycle().take(PAGE_SIZE).enumerate() {
+            data[i] = *byte;
+        }
+        PageData(data)
+    }
+
+    fn zstd_store(dir: &std::path::Path) -> (HeapPageStore, Arc<CompressionRegistry>) {
+        let registry = Arc::new(CompressionRegistry::new());
+        registry.set_file_config(1, FileCompression::Zstd { dict_id: None });
+        let store = HeapPageStore::open_with_compression(dir, registry.clone()).unwrap();
+        (store, registry)
+    }
+
+    #[test]
+    fn compressed_write_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _registry) = zstd_store(dir.path());
+        let page = compressible_page();
+        store.write_page(1, 0, &page).unwrap();
+        store.sync_all().unwrap();
+        assert_eq!(store.load_page(1, 0).unwrap().unwrap().0, page.0);
+        // page_count is st_size-based and unaffected by punching.
+        assert_eq!(store.page_count(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn mixed_raw_and_compressed_slots_coexist_in_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(CompressionRegistry::new());
+        let store = HeapPageStore::open_with_compression(dir.path(), registry.clone()).unwrap();
+
+        store.write_page(1, 0, &compressible_page()).unwrap(); // raw (no config yet)
+        registry.set_file_config(1, FileCompression::Zstd { dict_id: None });
+        store.write_page(1, 1, &compressible_page()).unwrap(); // compressed
+
+        assert_eq!(
+            store.load_page(1, 0).unwrap().unwrap().0,
+            compressible_page().0
+        );
+        assert_eq!(
+            store.load_page(1, 1).unwrap().unwrap().0,
+            compressible_page().0
+        );
+
+        // Rewriting page 1 raw (config back to None) un-punches it.
+        registry.set_file_config(1, FileCompression::None);
+        store.write_page(1, 1, &compressible_page()).unwrap();
+        assert_eq!(
+            store.load_page(1, 1).unwrap().unwrap().0,
+            compressible_page().0
+        );
+    }
+
+    #[test]
+    fn corrupt_envelope_errors_strictly_but_reads_none_leniently() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _registry) = zstd_store(dir.path());
+        store.write_page(1, 0, &compressible_page()).unwrap();
+
+        // Flip one payload byte on disk (past the 18-byte envelope header).
+        let path = dir.path().join("1.heap");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[compress::ENVELOPE_HEADER_LEN + 4] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = store.load_page(1, 0).unwrap_err();
+        assert_eq!(err.code, common::SqlState::InternalError);
+        // Lenient (redo) load treats the torn slot as absent → zeroed → FPI repair.
+        assert!(store.load_page_lenient(1, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn hole_punch_reclaims_blocks_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _registry) = zstd_store(dir.path());
+        for page_num in 0..8 {
+            store.write_page(1, page_num, &compressible_page()).unwrap();
+        }
+        store.sync_all().unwrap();
+
+        let meta = std::fs::metadata(dir.path().join("1.heap")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let allocated = meta.blocks() * 512;
+        let logical = meta.len();
+        assert_eq!(logical, 8 * PAGE_SIZE as u64);
+        // On a hole-punch filesystem each 8K slot keeps only its first 4K block.
+        // Skip (don't fail) where the fs doesn't support punching.
+        if allocated >= logical {
+            eprintln!("skipping: filesystem did not reclaim punched blocks");
+            return;
+        }
+        assert!(
+            allocated <= logical / 2 + 4096,
+            "allocated={allocated} logical={logical}"
+        );
     }
 }

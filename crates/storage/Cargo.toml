@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 buffer = { package = "saguarodb-buffer", path = "../buffer" }
 common = { package = "saguarodb-common", path = "../common" }
+compress = { package = "saguarodb-compress", path = "../compress" }
 wal = { package = "saguarodb-wal", path = "../wal" }
 crc32fast.workspace = true
+libc.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

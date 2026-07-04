@@ -4,6 +4,14 @@ use crate::PageData;
 
 pub trait PageLoader: Send + Sync {
     fn load_page(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>>;
+
+    /// Like `load_page`, but a page whose stored form fails validation (a torn
+    /// compressed envelope) is reported as absent instead of an error. ONLY for
+    /// recovery redo, where a zeroed frame is re-established by a FullPageImage;
+    /// normal reads must use `load_page`, which surfaces corruption loudly.
+    fn load_page_lenient(&self, file_id: FileId, page_num: PageNum) -> Result<Option<PageData>> {
+        self.load_page(file_id, page_num)
+    }
 }
 
 /// A read/write page home: loads pages on a buffer miss and flushes dirty pages
