@@ -1,6 +1,6 @@
 # SaguaroDB MVCC — Design & Implementation Plan
 
-**Date:** 2026-06-21
+**Date:** 2026-07-04
 **Status:** Draft
 **Branch:** `feat/mvcc`
 **Foundation:** `develop` @ `7035c89` (redo-WAL / on-disk-B-tree architecture)
@@ -413,10 +413,20 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
 ### 5.5 `StatementContext` and the snapshot type (`crates/common`)
 
 ```rust
+// docs/specs/crates/common.md "Statement Context" is the authoritative
+// field-by-field contract; the MVCC-relevant fields are txn_id, snapshot,
+// isolation, live_txns, and gc_horizon.
 pub struct StatementContext {
     pub txn_id: u64,
-    pub snapshot: Snapshot,          // new
-    pub isolation: IsolationLevel,   // new
+    pub snapshot: Arc<Snapshot>,
+    pub isolation: IsolationLevel,
+    pub conflict_waiter: Arc<dyn ConflictWaiter>,   // docs/specs/deadlock.md
+    pub cancel: Arc<AtomicBool>,
+    pub live_txns: Arc<[u64]>,                      // docs/specs/savepoints.md §4
+    pub gc_horizon: u64,                            // §10 Milestone H3 (HOT prune)
+    pub ssi_tracker: Arc<dyn SsiTracker>,           // docs/specs/ssi.md
+    pub sequence_manager: Arc<dyn SequenceManager>,
+    pub session_sequences: Arc<SessionSequenceState>,
 }
 
 pub struct Snapshot {
@@ -425,7 +435,11 @@ pub struct Snapshot {
     pub xip: Vec<u64>,     // in-progress xids in [xmin, xmax) at snapshot capture
 }
 
-pub enum IsolationLevel { ReadCommitted, RepeatableRead /* = snapshot */ }
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead, // = snapshot isolation
+    Serializable,   // = SSI on the Repeatable Read snapshot (docs/specs/ssi.md)
+}
 ```
 
 An **active-transaction registry** on `ServerComponents` (the set of in-progress

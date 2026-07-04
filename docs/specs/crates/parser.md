@@ -1,6 +1,6 @@
 # `parser` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-04
 **Status:** Draft
 
 ## Purpose
@@ -45,10 +45,16 @@ pub enum Statement {
     Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Explain(Box<Statement>),
     // `BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`. `isolation` is the
-    // requested level mapped onto the two we support (`None` = transaction default).
+    // requested level mapped onto Read Committed / Repeatable Read / Serializable
+    // (`None` = transaction default).
     Begin { isolation: Option<IsolationLevel> },
     Commit,
     Rollback,
+    // Savepoints (docs/specs/savepoints.md): names lowercase-normalized; executed
+    // by the server's transaction lifecycle (they do not bind/plan).
+    Savepoint { name: String },              // SAVEPOINT <name>
+    ReleaseSavepoint { name: String },       // RELEASE [SAVEPOINT] <name>
+    RollbackToSavepoint { name: String },    // ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>
     // `SET TRANSACTION ISOLATION LEVEL <level>` (transaction-scoped). `isolation` is
     // the mapped level, `None` for a `SET TRANSACTION` with no isolation-level mode.
     SetTransaction { isolation: Option<IsolationLevel> },
@@ -203,7 +209,11 @@ pub enum Expr {
         when_clauses: Vec<(Expr, Expr)>,
         else_clause: Option<Box<Expr>>,
     },
-    Cast { expr: Box<Expr>, data_type: DataType },
+    Cast {
+        expr: Box<Expr>,
+        data_type: DataType,
+        pg_type: PgType,  // declared wire type of the cast target (OID/typmod reporting)
+    },
 }
 
 pub enum FunctionArg {

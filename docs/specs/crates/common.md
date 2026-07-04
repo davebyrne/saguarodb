@@ -1,6 +1,6 @@
 # `common` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-04
 **Status:** Draft
 
 ## Purpose
@@ -134,7 +134,7 @@ pub struct RowIdentity {
 }
 ```
 
-`Value` ordering is used for B-tree keys. The ordering is total and deterministic: `Null < Boolean < Integer < Text`, with natural ordering inside each variant. SQL comparison semantics still apply in expression evaluation; B-tree ordering is a storage ordering.
+`Value` ordering is used for B-tree keys. The ordering is total and deterministic, following the enum's declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid`, with natural ordering inside each variant. Because the derived `Ord` **is** the durable B-tree key ordering, variant order is a durable contract: new variants must be appended at the end of the enum — never inserted or reordered mid-enum — unless the key ordering/encoding is deliberately revisited and migrated (see `docs/specs/rust-style.md`, Serialization and Durable Formats). SQL comparison semantics still apply in expression evaluation; B-tree ordering is a storage ordering.
 
 ## Column Lifecycle Types
 
@@ -488,7 +488,12 @@ pub struct Snapshot {
 
 pub enum TxnStatus { InProgress, Committed, Aborted }
 
-pub enum IsolationLevel { ReadCommitted, RepeatableRead /* = snapshot isolation */ }
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead, // = snapshot isolation
+    Serializable,   // = SSI: the Repeatable Read snapshot plus rw-conflict
+                    //   tracking and dangerous-structure detection (docs/specs/ssi.md)
+}
 ```
 
 `Snapshot::empty()` (also `Default`) is the degenerate `{ xmin: 0, xmax: 0, xip:

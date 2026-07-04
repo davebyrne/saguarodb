@@ -1,6 +1,6 @@
 # SaguaroDB Rust Style Guidelines
 
-**Date:** 2026-05-03
+**Date:** 2026-07-04
 **Status:** Draft
 
 This document defines Rust style and engineering conventions for SaguaroDB. It complements the crate specs in `docs/specs/crates/` and applies to all Rust workspace crates unless a crate spec explicitly says otherwise.
@@ -94,6 +94,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - WAL and manifest data must be checksummed according to their specs.
 - Do not serialize arbitrary public structs directly as a durable format unless the codec wraps them in a versioned record.
 - Be conservative when changing serialized structs. Add fields in a way that existing control or WAL records can be rejected clearly or migrated deliberately.
+- `common::Value` and `common::DataType` variant order is a durable contract: `Value`'s derived `Ord` is the on-disk B-tree key ordering (the index compares decoded `Key(Vec<Value>)` values directly). Append new variants at the end of these enums; never insert or reorder mid-enum without deliberately revisiting and migrating the key ordering/encoding.
 - Keep WAL payload encoding behind the WAL codec and storage row encoding behind the storage codec.
 
 ## SQL Semantics in Rust Code
@@ -101,7 +102,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - Do not implement implicit casts. Type mismatches return `SqlState::DatatypeMismatch`.
 - `NULL` may be accepted where the target column or expression is nullable.
 - SQL three-valued logic belongs in executor expression evaluation, not in `Value` ordering.
-- `Value::Ord` is storage key ordering only: `Null < Boolean < Integer < Text`.
+- `Value::Ord` is storage key ordering only, derived from `common::Value`'s declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid`, with natural ordering inside each variant.
 - Composite (multi-column) primary keys are supported end to end: the catalog records the ordered key column list, the storage key encoding (`Key(Vec<Value>)`) covers all key columns, and a leading-column equality uses the prefix-matching primary-key range scan.
 
 ## Modules and File Size

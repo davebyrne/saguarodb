@@ -1,6 +1,6 @@
 # SaguaroDB Overview Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-04
 **Status:** Draft
 
 ## 1. Overview
@@ -109,11 +109,15 @@ pub struct RowId {
 
 ```rust
 /// A single SQL value. This is the fundamental unit of data throughout the system.
-/// Implements Ord for use as B-tree keys (NULL sorts first, then Bool, Integer, Text).
+/// Implements Ord for use as B-tree keys; the cross-variant order is the
+/// declaration order below (Null sorts first).
 pub enum Value {
     Null,
     Boolean(bool),
     Integer(i64),
+    Float(OrderedF64),// DOUBLE PRECISION; total-order f64 wrapper
+    Real(OrderedF32), // REAL; total-order f32 wrapper
+    Numeric(Decimal), // NUMERIC/DECIMAL; exact decimal (compares by value)
     Text(String),  // Future: consider Arc<str> for zero-copy from buffer pool
     Date(i64),     // days from the Unix epoch (1970-01-01)
     Timestamp(i64),// microseconds from the Unix epoch (no time zone)
@@ -122,9 +126,6 @@ pub enum Value {
     Interval(Interval),// months/days/micros; compares by canonical estimate
     Bytes(Vec<u8>),// BYTEA, raw bytes
     Uuid([u8; 16]),// UUID, 16 bytes
-    Float(OrderedF64),// DOUBLE PRECISION; total-order f64 wrapper
-    Real(OrderedF32), // REAL; total-order f32 wrapper
-    Numeric(Decimal), // NUMERIC/DECIMAL; exact decimal (compares by value)
 }
 
 /// An ordered sequence of values representing one tuple.
@@ -154,6 +155,8 @@ pub enum KeyRange {
     All,                                   // Full index scan
 }
 ```
+
+`Value` derives `Ord`/`Eq`/`Hash` from its declaration order, and that derived order **is** the durable B-tree key ordering (the on-disk index compares decoded `Key(Vec<Value>)` values directly). Variant order in `Value` (and, by the same conservatism, `DataType`) is therefore a durable on-disk contract: new variants must be **appended** at the end of the enum — never inserted or reordered mid-enum — unless the key ordering/encoding is deliberately revisited and migrated. `crates/common/src/value.rs` is the authoritative definition; see `docs/specs/crates/common.md`.
 
 #### Data Types
 
@@ -303,12 +306,22 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 ```rust
 /// Passed to every storage operation. Carries the transaction id, the MVCC
-/// snapshot used for visibility, the isolation level, and the GC horizon.
+/// snapshot used for visibility, the isolation level, the GC horizon, and the
+/// server-installed runtime handles (row-lock conflict waiter, cancel flag,
+/// live subxid set, SSI tracker, sequence runtime).
+/// docs/specs/crates/common.md "Statement Context" is the authoritative
+/// field-by-field contract.
 pub struct StatementContext {
     pub txn_id: u64,
-    pub snapshot: Snapshot,
+    pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    pub conflict_waiter: Arc<dyn ConflictWaiter>,
+    pub cancel: Arc<AtomicBool>,
+    pub live_txns: Arc<[u64]>,
     pub gc_horizon: u64,
+    pub ssi_tracker: Arc<dyn SsiTracker>,
+    pub sequence_manager: Arc<dyn SequenceManager>,
+    pub session_sequences: Arc<SessionSequenceState>,
 }
 ```
 
@@ -601,18 +614,52 @@ pub enum Statement {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
-        unique: Vec<Vec<String>>,
+        unique: Vec<Vec<String>>,  // UNIQUE constraints; each becomes a unique index
         compression: Option<CompressionSetting>,
         toast: ToastOptionPatch,
     },
     DropTable { name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
-    Insert { table: String, columns: Vec<String>, source: InsertSource },
+    CreateSequence { name: String, options: SequenceOptions },
+    DropSequence { name: String, if_exists: bool },
+    Insert {
+        table: String,
+        columns: Vec<String>,
+        source: InsertSource,
+        on_conflict: Option<OnConflict>,     // INSERT ... ON CONFLICT ... (upsert)
+        returning: Option<Vec<SelectItem>>,  // INSERT ... RETURNING <items>
+    },
     Query(Query),
-    Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr> },
-    Delete { table: String, filter: Option<Expr> },
+    Update {
+        table: String,
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+        returning: Option<Vec<SelectItem>>,  // UPDATE ... RETURNING <items>
+    },
+    Delete {
+        table: String,
+        filter: Option<Expr>,
+        returning: Option<Vec<SelectItem>>,  // DELETE ... RETURNING <items>
+    },
     Explain(Box<Statement>),
+    // Transaction control (docs/specs/mvcc.md §10 G) and savepoints
+    // (docs/specs/savepoints.md); executed by the server, not bound/planned.
+    Begin { isolation: Option<IsolationLevel> },  // BEGIN / START TRANSACTION [ISOLATION LEVEL ...]
+    Commit,                                       // COMMIT / END
+    Rollback,                                     // ROLLBACK (without a savepoint)
+    Savepoint { name: String },                   // SAVEPOINT <name>
+    ReleaseSavepoint { name: String },            // RELEASE [SAVEPOINT] <name>
+    RollbackToSavepoint { name: String },         // ROLLBACK ... TO [SAVEPOINT] <name>
+    SetTransaction { isolation: Option<IsolationLevel> },            // SET TRANSACTION ... (txn-scoped)
+    SetSessionCharacteristics { isolation: Option<IsolationLevel> }, // session default isolation
+    Vacuum { table: Option<String> },             // VACUUM [table] — maintenance, not bound/planned
+    Copy {                                        // COPY <table> [(cols)] FROM STDIN | TO STDOUT
+        table: String,                            // (docs/specs/copy.md)
+        columns: Vec<String>,
+        direction: CopyDirection,
+        options: CopyOptions,
+    },
 }
 
 pub enum InsertSource {
@@ -620,15 +667,33 @@ pub enum InsertSource {
     Query(Box<Query>),       // INSERT INTO t SELECT ...
 }
 
+/// ON CONFLICT [target] DO NOTHING | DO UPDATE SET ... [WHERE ...]. The arbiter
+/// is the primary key (validated by the binder).
+pub struct OnConflict {
+    pub target: Option<ConflictTarget>,
+    pub action: ConflictAction,
+}
+
+pub enum ConflictTarget {
+    Columns(Vec<String>),  // the binder requires exactly the primary-key columns
+}
+
+pub enum ConflictAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<Assignment>,  // may reference the `excluded` pseudo-table
+        filter: Option<Expr>,
+    },
+}
+
 pub struct Assignment {
     pub column: String,
     pub value: Expr,
 }
 
-// A query expression: a body plus the query-level ORDER BY/LIMIT/OFFSET (which sit
-// outside the body, so a future set operation orders/limits the combined result).
-// `QueryBody::Select` is the only variant today; UNION/INTERSECT/EXCEPT, CTEs, and
-// standalone VALUES attach as new QueryBody variants.
+// A query expression: an optional WITH clause, a body, and the query-level
+// ORDER BY/LIMIT/OFFSET (which sit outside the body, so a set operation orders
+// and limits the combined result and the CTEs are visible to the whole body).
 pub struct Query {
     pub with: Vec<Cte>,  // WITH CTEs (non-recursive), inlined as named derived tables
     pub body: QueryBody,
@@ -637,10 +702,24 @@ pub struct Query {
     pub offset: Option<u64>,
 }
 
+/// A common table expression: `name [(col, ...)] AS (query)`. `column_aliases`
+/// optionally renames the CTE's output columns left to right.
+pub struct Cte {
+    pub name: String,
+    pub column_aliases: Vec<String>,
+    pub query: Box<Query>,
+}
+
 pub enum QueryBody {
     Select(Select),
     Values(Vec<Vec<Expr>>),  // VALUES (1,'a'), (2,'b')
     SetOp { op: SetOp, all: bool, left: Box<Query>, right: Box<Query> },  // a UNION b
+}
+
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
 }
 
 pub struct Select {
@@ -665,6 +744,9 @@ pub enum SelectItem {
 
 pub enum FromItem {
     Table { name: String, alias: Option<String> },
+    // A derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required;
+    // column_aliases optionally renames the subquery's output columns.
+    Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
@@ -689,7 +771,11 @@ pub struct OrderByItem {
 
 pub enum Expr {
     Literal(Value),
+    Placeholder(u32),  // extended-protocol parameter `$n` (1-based)
     ColumnRef { table: Option<String>, column: String },
+    Subquery(Box<Query>),  // scalar subquery (SELECT ...) as a value
+    InSubquery { expr: Box<Expr>, subquery: Box<Query>, negated: bool },  // x [NOT] IN (SELECT ...)
+    Exists { subquery: Box<Query>, negated: bool },  // [NOT] EXISTS (SELECT ...)
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     Function { name: String, args: Vec<FunctionArg>, distinct: bool },
@@ -697,13 +783,23 @@ pub enum Expr {
     IsNotNull(Box<Expr>),
     InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
     Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
-    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+        case_insensitive: bool,  // ILIKE when true; plain LIKE when false
+        escape: Option<char>,    // default Some('\\'); ESCAPE '' disables (None)
+    },
     Case {
         operand: Option<Box<Expr>>,
         when_clauses: Vec<(Expr, Expr)>,
         else_clause: Option<Box<Expr>>,
     },
-    Cast { expr: Box<Expr>, data_type: DataType },
+    Cast {
+        expr: Box<Expr>,
+        data_type: DataType,
+        pg_type: PgType,  // declared wire type of the cast target (OID/typmod reporting)
+    },
 }
 
 pub enum FunctionArg {
@@ -720,6 +816,8 @@ pub enum BinOp {
     And, Or,
     // String
     Concat,
+    // NULL-safe comparison (never returns NULL)
+    IsDistinctFrom, IsNotDistinctFrom,
 }
 
 pub enum UnaryOp {
@@ -785,11 +883,54 @@ pub enum BoundStatement {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource },
+    Insert {
+        table: TableId,
+        columns: Vec<ColumnId>,
+        source: BoundInsertSource,
+        on_conflict: Option<BoundOnConflict>,
+        returning: Option<BoundReturning>,
+    },
     Query(BoundQuery),
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect },
-    Delete { table: TableId, source: BoundSelect },
+    Update {
+        table: TableId,
+        assignments: Vec<(ColumnId, BoundExpr)>,
+        source: BoundSelect,
+        returning: Option<BoundReturning>,
+    },
+    Delete {
+        table: TableId,
+        source: BoundSelect,
+        returning: Option<BoundReturning>,
+    },
     Explain(Box<BoundStatement>),
+    // COPY <table> [(cols)] FROM STDIN | TO STDOUT. Resolved table + column ids
+    // (COPY order; defaulted to all columns in catalog order). Not lowered to a
+    // LogicalPlan — the server drives COPY directly (docs/specs/copy.md).
+    Copy {
+        table: TableId,
+        columns: Vec<ColumnId>,
+        direction: CopyDirection,
+        options: CopyOptions,
+    },
+}
+
+/// A bound RETURNING clause: the projection expressions evaluated over each
+/// affected full row (the inserted/updated NEW row, or the deleted OLD row) and
+/// the result-set column metadata that becomes the statement's RowDescription.
+pub struct BoundReturning {
+    pub exprs: Vec<BoundExpr>,
+    pub output_schema: Vec<ColumnInfo>,
+}
+
+/// A bound INSERT ... ON CONFLICT action (arbiter = the primary key). DoUpdate's
+/// assignment values and filter are bound over `existing ++ excluded` — the
+/// existing target row in slots 0..n and the proposed row in slots n..2n.
+pub enum BoundOnConflict {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<(ColumnId, BoundExpr)>,
+        filter: Option<BoundExpr>,
+    },
 }
 
 pub enum BoundInsertSource {
@@ -838,6 +979,14 @@ pub enum BoundFrom {
         table: TableId,
         binding: BindingId,
         alias: Option<String>,
+        schema: Vec<ColumnDef>,
+    },
+    // A derived table (SELECT ...) AS alias [(cols)], bound in its own scope; its
+    // columns are projected into the outer scope at `binding`'s slots.
+    Derived {
+        query: Box<BoundQuery>,
+        binding: BindingId,
+        alias: String,
         schema: Vec<ColumnDef>,
     },
     Join {
@@ -984,9 +1133,24 @@ pub enum LogicalPlan {
     DropSequence { name: String, if_exists: bool },
 
     // DML
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan> },
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan> },
-    Delete { table: TableId, source: Box<LogicalPlan> },
+    Insert {
+        table: TableId,
+        columns: Vec<ColumnId>,
+        source: Box<LogicalPlan>,
+        on_conflict: Option<BoundOnConflict>,
+        returning: Option<BoundReturning>,
+    },
+    Update {
+        table: TableId,
+        assignments: Vec<(ColumnId, BoundExpr)>,
+        source: Box<LogicalPlan>,
+        returning: Option<BoundReturning>,
+    },
+    Delete {
+        table: TableId,
+        source: Box<LogicalPlan>,
+        returning: Option<BoundReturning>,
+    },
 
     // Query operators
     Scan { table: TableId, filter: Option<BoundExpr> },
@@ -1003,6 +1167,7 @@ pub enum LogicalPlan {
         output_schema: Vec<ColumnInfo>,
     },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
+    SetOp { op: SetOp, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> },
 }
 
 pub struct AggregateExpr {
@@ -1019,6 +1184,12 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    StddevSamp, // STDDEV / STDDEV_SAMP (divisor n - 1)
+    StddevPop,  // STDDEV_POP (divisor n)
+    VarSamp,    // VARIANCE / VAR_SAMP (divisor n - 1)
+    VarPop,     // VAR_POP (divisor n)
+    BoolAnd,    // BOOL_AND — true when every non-NULL input is true
+    BoolOr,     // BOOL_OR — true when any non-NULL input is true
 }
 
 pub struct BoundOrderByItem {
@@ -1056,9 +1227,24 @@ pub enum PhysicalPlan {
     DropSequence { name: String, if_exists: bool },
 
     // DML
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan> },
-    Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan> },
-    Delete { table: TableId, source: Box<PhysicalPlan> },
+    Insert {
+        table: TableId,
+        columns: Vec<ColumnId>,
+        source: Box<PhysicalPlan>,
+        on_conflict: Option<BoundOnConflict>,
+        returning: Option<BoundReturning>,
+    },
+    Update {
+        table: TableId,
+        assignments: Vec<(ColumnId, BoundExpr)>,
+        source: Box<PhysicalPlan>,
+        returning: Option<BoundReturning>,
+    },
+    Delete {
+        table: TableId,
+        source: Box<PhysicalPlan>,
+        returning: Option<BoundReturning>,
+    },
 
     // Access methods
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
@@ -1092,6 +1278,7 @@ pub enum PhysicalPlan {
         output_schema: Vec<ColumnInfo>,
     },
     Values { rows: Vec<Vec<BoundExpr>>, output_schema: Vec<ColumnInfo> },
+    SetOp { op: SetOp, all: bool, left: Box<PhysicalPlan>, right: Box<PhysicalPlan> },
 }
 
 ```
@@ -1780,7 +1967,7 @@ impl PageBackedStorageEngine {
 
 `data/wal.dat` — single file, append-only. Old segments before the last completed checkpoint can be truncated.
 
-## 10. Catalog
+## 11. Catalog
 
 The `catalog` crate manages metadata about all database objects.
 
@@ -1928,7 +2115,7 @@ The catalog is stored in the control record (`data/manifest.dat`) at each checkp
 
 Wrapped in `RwLock`. Reads take a read lock. DDL takes a write lock. DDL is infrequent so this is not a bottleneck.
 
-## 11. Server & Connection Management
+## 12. Server & Connection Management
 
 The `server` crate is the binary entry point.
 
@@ -2017,7 +2204,7 @@ pub struct Config {
 
 Loaded from command-line args only. There is no environment-variable or config-file loading.
 
-## 12. Future Work (Designed For, Not Implemented)
+## 13. Future Work (Designed For, Not Implemented)
 
 - **Serializable Isolation (SSI):** `SERIALIZABLE` is its own level — Serializable Snapshot Isolation, the Repeatable Read snapshot plus rw-antidependency tracking and dangerous-structure detection (Cahill/Ports), with relation/tuple-granularity SIREAD locks; see `docs/specs/ssi.md`.
 - **Savepoints / Sub-transactions:** Implemented via sub-transaction xids without undo (`SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`, nested, crash-recoverable); see `docs/specs/savepoints.md`.

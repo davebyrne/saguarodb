@@ -1,6 +1,6 @@
 # `planner` Crate Specification
 
-**Date:** 2026-05-03
+**Date:** 2026-07-04
 **Status:** Draft
 
 ## Purpose
@@ -48,7 +48,7 @@ crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
 
 ## Binder Contract
 
-Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP SEQUENCE` is a deliberate exception: it carries the normalized sequence name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE` with `SERIAL` is another exception: the binder records the SERIAL columns, and the executor chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
+Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP SEQUENCE` is a deliberate exception: it carries the normalized sequence name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
 
 Binder responsibilities:
 
@@ -66,7 +66,7 @@ Binder responsibilities:
   expressions bind as ordinary value expressions.
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column. A `NOT NULL` column may be omitted from an `INSERT` only when it has a non-`NULL` `ColumnDefault::Const` or a `ColumnDefault::Nextval`; otherwise the omission is rejected with `SqlState::NotNullViolation`.
-- Validate each `CREATE TABLE` column `DEFAULT` against the column type (no implicit casts): `ParsedDefault::Const(value)` must match the column's `DataType` (any `Numeric` value matches any `NUMERIC(p, s)` column), else `SqlState::DatatypeMismatch`; a `NULL` default is accepted only on a nullable column (else `SqlState::NotNullViolation`). `ParsedDefault::Nextval(name)` must resolve to an existing non-owned sequence (`SqlState::UndefinedTable` if missing, `SqlState::DependentObjectsStillExist` if it names an owned SERIAL sequence) and requires an `INTEGER` target column. `ParsedDefault::Serial` requires an `INTEGER` target column and records the SERIAL column name and ordinal on the bound `CREATE TABLE`; generated owned sequence names are chosen by the executor.
+- Validate each `CREATE TABLE` column `DEFAULT` against the column type (no implicit casts): `ParsedDefault::Const(value)` must match the column's `DataType` (any `Numeric` value matches any `NUMERIC(p, s)` column), else `SqlState::DatatypeMismatch`; a `NULL` default is accepted only on a nullable column (else `SqlState::NotNullViolation`). `ParsedDefault::Nextval(name)` must resolve to an existing non-owned sequence (`SqlState::UndefinedTable` if missing, `SqlState::DependentObjectsStillExist` if it names an owned SERIAL sequence) and requires an `INTEGER` target column. `ParsedDefault::Serial` requires an `INTEGER` target column; the marker stays on the parsed column list (nothing extra is recorded on the bound `CREATE TABLE`), and the executor derives the SERIAL columns and chooses generated owned sequence names at execution time.
 - Bind `ON CONFLICT` (`bind_on_conflict`): the arbiter is **always the primary key**. An explicit conflict target must name exactly the primary-key column(s) — any other column list (a secondary unique index) is rejected with `FeatureNotSupported`; a missing target is allowed for `DO NOTHING` but rejected for `DO UPDATE`. `DO NOTHING` binds to `BoundOnConflict::DoNothing`. `DO UPDATE SET ... [WHERE ...]` binds over **two** bindings — the target table (slots `0..n`, bare columns resolve here) and a `qualified_only` `excluded` pseudo-table (slots `n..2n`, only `excluded.<col>` resolves) — so a bare column means the existing row and `excluded.<col>` the proposed row (matching PostgreSQL, no ambiguity). The primary key cannot be assigned and duplicate assignments are rejected, as in `UPDATE`.
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
@@ -420,6 +420,12 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    StddevSamp, // STDDEV / STDDEV_SAMP (divisor n - 1)
+    StddevPop,  // STDDEV_POP (divisor n)
+    VarSamp,    // VARIANCE / VAR_SAMP (divisor n - 1)
+    VarPop,     // VAR_POP (divisor n)
+    BoolAnd,    // BOOL_AND — true when every non-NULL input is true
+    BoolOr,     // BOOL_OR — true when any non-NULL input is true
 }
 
 pub struct BoundOrderByItem {
@@ -447,7 +453,7 @@ pub enum LogicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Scan { table: TableId, filter: Option<BoundExpr> },
@@ -530,7 +536,7 @@ pub enum PhysicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
+    Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
