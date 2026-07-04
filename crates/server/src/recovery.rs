@@ -333,6 +333,14 @@ fn apply_redo(
         | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
             "recovery replay received an unexpected WAL record",
         )),
+        // TEMPORARY (compression Task 5): real replay arms land with the registry
+        // wiring (Task 11). Nothing emits these records until Task 7+, and no
+        // server test replays them before Task 11 replaces this arm.
+        WalRecordKind::FullPageImageCompressed { .. }
+        | WalRecordKind::CreateDictionary { .. }
+        | WalRecordKind::AlterTableCompression { .. } => Err(DbError::internal(
+            "compression WAL records are not yet replayable",
+        )),
     }
 }
 

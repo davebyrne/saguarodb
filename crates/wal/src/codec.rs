@@ -28,6 +28,9 @@ const TYPE_CREATE_SEQUENCE: u8 = 14;
 const TYPE_DROP_SEQUENCE: u8 = 15;
 const TYPE_SEQUENCE_ADVANCE: u8 = 16;
 const TYPE_SET_SEQUENCE_VALUE: u8 = 17;
+pub(crate) const TYPE_FULL_PAGE_IMAGE_COMPRESSED: u8 = 18;
+pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
+pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -163,6 +166,9 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::HeapDelete { .. } => TYPE_HEAP_DELETE,
         WalRecordKind::HeapUpdateHeader { .. } => TYPE_HEAP_UPDATE_HEADER,
         WalRecordKind::FullPageImage { .. } => TYPE_FULL_PAGE_IMAGE,
+        WalRecordKind::FullPageImageCompressed { .. } => TYPE_FULL_PAGE_IMAGE_COMPRESSED,
+        WalRecordKind::CreateDictionary { .. } => TYPE_CREATE_DICTIONARY,
+        WalRecordKind::AlterTableCompression { .. } => TYPE_ALTER_TABLE_COMPRESSION,
     }
 }
 
@@ -230,6 +236,33 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             payload.extend_from_slice(image);
             Ok(payload)
         }
+        WalRecordKind::FullPageImageCompressed {
+            file_id,
+            page_num,
+            codec,
+            dict_id,
+            payload,
+        } => {
+            let mut buf = Vec::with_capacity(13 + payload.len());
+            buf.extend_from_slice(&file_id.to_le_bytes());
+            buf.extend_from_slice(&page_num.to_le_bytes());
+            buf.push(*codec);
+            buf.extend_from_slice(&dict_id.to_le_bytes());
+            buf.extend_from_slice(payload);
+            Ok(buf)
+        }
+        WalRecordKind::CreateDictionary {
+            dict_id,
+            table_id,
+            bytes,
+        } => {
+            let mut buf = Vec::with_capacity(8 + bytes.len());
+            buf.extend_from_slice(&dict_id.to_le_bytes());
+            buf.extend_from_slice(&table_id.to_le_bytes());
+            buf.extend_from_slice(bytes);
+            Ok(buf)
+        }
+        // AlterTableCompression: no arm — the `_ =>` serde_json fallback handles it.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -290,6 +323,28 @@ fn decode_payload(type_id: u8, payload: &[u8]) -> Result<WalRecordKind> {
                 file_id: read_u32(payload, 0)?,
                 page_num: read_u32(payload, 4)?,
                 image: payload[8..].to_vec(),
+            })
+        }
+        TYPE_FULL_PAGE_IMAGE_COMPRESSED => {
+            if payload.len() < 13 {
+                return Err(wal_error("compressed full-page-image payload too short"));
+            }
+            Ok(WalRecordKind::FullPageImageCompressed {
+                file_id: read_u32(payload, 0)?,
+                page_num: read_u32(payload, 4)?,
+                codec: payload[8],
+                dict_id: read_u32(payload, 9)?,
+                payload: payload[13..].to_vec(),
+            })
+        }
+        TYPE_CREATE_DICTIONARY => {
+            if payload.len() < 8 {
+                return Err(wal_error("create-dictionary payload too short"));
+            }
+            Ok(WalRecordKind::CreateDictionary {
+                dict_id: read_u32(payload, 0)?,
+                table_id: read_u32(payload, 4)?,
+                bytes: payload[8..].to_vec(),
             })
         }
         _ => {
@@ -475,6 +530,81 @@ mod tests {
         let bytes = encode_record(&record).unwrap();
         // payload is 4 (file_id) + 4 (page_num) + 8192 (image), not a JSON array.
         assert_eq!(bytes.len(), HEADER_LEN + 8 + 8192 + CRC_LEN);
+    }
+
+    #[test]
+    fn round_trips_compression_records() {
+        let kinds = [
+            WalRecordKind::FullPageImageCompressed {
+                file_id: 3,
+                page_num: 9,
+                codec: 2,
+                dict_id: 7,
+                payload: vec![1, 2, 3, 4, 5],
+            },
+            WalRecordKind::CreateDictionary {
+                dict_id: 7,
+                table_id: 3,
+                bytes: vec![9; 64],
+            },
+            WalRecordKind::AlterTableCompression {
+                table_id: 3,
+                compression: common::CompressionSetting::Zstd,
+                active_dict_id: Some(7),
+            },
+            WalRecordKind::AlterTableCompression {
+                table_id: 4,
+                compression: common::CompressionSetting::None,
+                active_dict_id: None,
+            },
+        ];
+        for kind in kinds {
+            let record = WalRecord {
+                lsn: 5,
+                txn_id: 11,
+                kind,
+            };
+            let bytes = encode_record(&record).unwrap();
+            assert_eq!(
+                decode_record(&bytes).unwrap(),
+                record,
+                "kind failed round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_fpi_uses_compact_binary_payload() {
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::FullPageImageCompressed {
+                file_id: 1,
+                page_num: 0,
+                codec: 1,
+                dict_id: 0,
+                payload: vec![0u8; 100],
+            },
+        };
+        let bytes = encode_record(&record).unwrap();
+        // 4 (file_id) + 4 (page_num) + 1 (codec) + 4 (dict_id) + 100 (payload)
+        assert_eq!(bytes.len(), HEADER_LEN + 13 + 100 + CRC_LEN);
+    }
+
+    #[test]
+    fn create_dictionary_uses_compact_binary_payload() {
+        let record = WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            kind: WalRecordKind::CreateDictionary {
+                dict_id: 2,
+                table_id: 5,
+                bytes: vec![7u8; 50],
+            },
+        };
+        let bytes = encode_record(&record).unwrap();
+        // 4 (dict_id) + 4 (table_id) + 50 (bytes)
+        assert_eq!(bytes.len(), HEADER_LEN + 8 + 50 + CRC_LEN);
     }
 
     #[test]

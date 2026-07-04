@@ -1,5 +1,6 @@
 use common::{
-    FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId, SequenceSchema, TableId, TableSchema,
+    CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId, SequenceSchema,
+    TableId, TableSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +104,29 @@ pub enum WalRecordKind {
         file_id: FileId,
         page_num: PageNum,
         image: Vec<u8>,
+    },
+    /// Compressed full-page image. `payload` decompresses to exactly PAGE_SIZE
+    /// bytes via the codec/dict named here; emitted only when smaller than raw.
+    FullPageImageCompressed {
+        file_id: FileId,
+        page_num: PageNum,
+        codec: u8,
+        dict_id: u32,
+        payload: Vec<u8>,
+    },
+    /// Installs an immutable per-table compression dictionary. Replay writes the
+    /// dict file if absent and registers it, so later records can resolve it.
+    CreateDictionary {
+        dict_id: u32,
+        table_id: TableId,
+        bytes: Vec<u8>,
+    },
+    /// DDL: updates a table's compression setting + active dictionary
+    /// (CLOG-gated on replay like other DDL).
+    AlterTableCompression {
+        table_id: TableId,
+        compression: CompressionSetting,
+        active_dict_id: Option<u32>,
     },
 }
 
