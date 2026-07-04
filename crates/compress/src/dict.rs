@@ -1,0 +1,161 @@
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+
+use common::{DbError, Result, SqlState};
+
+/// Dictionary file: [magic "SGDC"][version u8][dict_id u32 LE][table_id u32 LE]
+/// [payload_len u32 LE][crc32(payload) u32 LE][payload] (`compression.md` §7).
+const DICT_MAGIC: [u8; 4] = *b"SGDC";
+const DICT_FORMAT_VERSION: u8 = 1;
+const DICT_HEADER_LEN: usize = 4 + 1 + 4 + 4 + 4 + 4;
+
+/// Cap trained dictionaries at ~110 KiB (zstd's customary maximum).
+const MAX_DICT_BYTES: usize = 112_640;
+
+fn corrupt(message: impl Into<String>) -> DbError {
+    DbError::storage(SqlState::InternalError, message)
+}
+
+/// Train a zstd dictionary from page-image samples. `None` when the corpus is
+/// too small for ZDICT (a freshly created or tiny table) — callers proceed
+/// dict-less; training failure is never a statement error.
+pub fn train_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if samples.len() < 8 {
+        return None;
+    }
+    zstd::dict::from_samples(samples, MAX_DICT_BYTES).ok()
+}
+
+/// Immutable dictionary files under `<data>/dicts/<dict_id>.dict`.
+pub struct DictStore {
+    dir: PathBuf,
+}
+
+impl DictStore {
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(|err| {
+            DbError::io(format!(
+                "failed to create dict directory {}: {err}",
+                dir.display()
+            ))
+        })?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self, dict_id: u32) -> PathBuf {
+        self.dir.join(format!("{dict_id}.dict"))
+    }
+
+    /// Persist a dictionary durably (temp + fsync + rename + dir fsync, the
+    /// control-file pattern). Idempotent: an existing file is left untouched
+    /// so recovery replay of `CreateDictionary` is safe.
+    pub fn save(&self, dict_id: u32, table_id: u32, bytes: &[u8]) -> Result<()> {
+        let path = self.path(dict_id);
+        if path.exists() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(DICT_HEADER_LEN + bytes.len());
+        out.extend_from_slice(&DICT_MAGIC);
+        out.push(DICT_FORMAT_VERSION);
+        out.extend_from_slice(&dict_id.to_le_bytes());
+        out.extend_from_slice(&table_id.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(bytes).to_le_bytes());
+        out.extend_from_slice(bytes);
+
+        let tmp = self.dir.join(format!("{dict_id}.dict.tmp"));
+        fs::write(&tmp, &out)
+            .map_err(|err| DbError::io(format!("failed to write {}: {err}", tmp.display())))?;
+        File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|err| DbError::io(format!("failed to fsync {}: {err}", tmp.display())))?;
+        fs::rename(&tmp, &path)
+            .map_err(|err| DbError::io(format!("failed to rename dict file: {err}")))?;
+        File::open(&self.dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|err| DbError::io(format!("failed to fsync dict directory: {err}")))?;
+        Ok(())
+    }
+
+    /// Load every `*.dict` file, CRC-validated: `(dict_id, table_id, bytes)`.
+    pub fn load_all(&self) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        let entries = fs::read_dir(&self.dir)
+            .map_err(|err| DbError::io(format!("failed to read dict directory: {err}")))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| DbError::io(format!("dict dir entry: {err}")))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("dict") {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .map_err(|err| DbError::io(format!("failed to read {}: {err}", path.display())))?;
+            out.push(decode_dict_file(&bytes, &path)?);
+        }
+        Ok(out)
+    }
+}
+
+fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    if bytes.len() < DICT_HEADER_LEN || bytes[..4] != DICT_MAGIC {
+        return Err(corrupt(format!("bad dictionary file {}", path.display())));
+    }
+    if bytes[4] != DICT_FORMAT_VERSION {
+        return Err(corrupt(format!(
+            "unknown dict file version in {}",
+            path.display()
+        )));
+    }
+    let dict_id = u32::from_le_bytes(bytes[5..9].try_into().expect("4 bytes"));
+    let table_id = u32::from_le_bytes(bytes[9..13].try_into().expect("4 bytes"));
+    let len = u32::from_le_bytes(bytes[13..17].try_into().expect("4 bytes")) as usize;
+    let stored_crc = u32::from_le_bytes(bytes[17..21].try_into().expect("4 bytes"));
+    let payload = bytes
+        .get(DICT_HEADER_LEN..DICT_HEADER_LEN + len)
+        .ok_or_else(|| corrupt(format!("dict file {} truncated", path.display())))?;
+    if crc32fast::hash(payload) != stored_crc {
+        return Err(corrupt(format!(
+            "dict file {} CRC mismatch",
+            path.display()
+        )));
+    }
+    Ok((dict_id, table_id, payload.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dict_store_saves_and_loads_with_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DictStore::open(dir.path().join("dicts")).unwrap();
+        store.save(1, 42, b"dict-one-bytes").unwrap();
+        store.save(2, 43, b"dict-two-bytes").unwrap();
+        // Idempotent re-save (recovery replays CreateDictionary).
+        store.save(1, 42, b"dict-one-bytes").unwrap();
+
+        let mut all = store.load_all().unwrap();
+        all.sort_by_key(|(id, _, _)| *id);
+        assert_eq!(
+            all,
+            vec![
+                (1, 42, b"dict-one-bytes".to_vec()),
+                (2, 43, b"dict-two-bytes".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dict_store_rejects_tampered_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DictStore::open(dir.path().join("dicts")).unwrap();
+        store.save(1, 42, b"dict-one-bytes").unwrap();
+        let path = dir.path().join("dicts").join("1.dict");
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(store.load_all().is_err());
+    }
+}

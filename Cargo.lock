@@ -938,6 +938,7 @@ dependencies = [
  "crc32fast",
  "parking_lot",
  "saguarodb-common",
+ "tempfile",
  "zstd",
 ]
 

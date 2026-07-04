@@ -9,3 +9,6 @@ common = { package = "saguarodb-common", path = "../common" }
 crc32fast.workspace = true
 parking_lot.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
