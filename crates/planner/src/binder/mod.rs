@@ -127,6 +127,10 @@ fn bind_inner(
             columns,
             primary_key,
             unique,
+            // Semantic threading of the WITH-clause compression setting is a
+            // later task; the parser field exists now so `parser` and
+            // `planner` stay in lockstep.
+            compression: _,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -245,6 +249,12 @@ fn bind_inner(
         Statement::Vacuum { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
             "VACUUM is a maintenance command and does not bind",
+        )),
+        // ALTER TABLE ... SET (compression) is a maintenance command dispatched
+        // before binding (the VACUUM pattern); this arm keeps `bind` total.
+        Statement::AlterTableSetCompression { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "ALTER TABLE is a maintenance command and does not bind",
         )),
         Statement::Copy {
             table,

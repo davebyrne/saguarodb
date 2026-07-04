@@ -1,4 +1,6 @@
-use common::{DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState};
+use common::{
+    CompressionSetting, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState,
+};
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -23,6 +25,13 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     // to the parser (`docs/specs/crates/parser.md`). `VACUUM` is a maintenance
     // command, not a relational statement, and never reaches bind/plan.
     if let Some(statement) = try_parse_vacuum(sql)? {
+        return Ok(statement);
+    }
+    // sqlparser 0.56's ALTER TABLE coverage does not match our supported subset
+    // (only `SET (compression = ...)`), so ALTER is intercepted the same way as
+    // VACUUM: this owns the whole ALTER namespace and every other ALTER form is
+    // rejected here rather than falling through to sqlparser.
+    if let Some(statement) = try_parse_alter_table(sql)? {
         return Ok(statement);
     }
     if let Some(statement) = try_parse_create_sequence(sql)? {
@@ -520,6 +529,110 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
         return unsupported("VACUUM target must be a simple table name in v1");
     }
     Ok(target.to_ascii_lowercase())
+}
+
+/// Intercept `ALTER ...` before sqlparser (the VACUUM pattern above). Owns the
+/// whole ALTER namespace: the one supported form (`ALTER TABLE <name> SET
+/// (compression = 'none' | 'zstd')`) parses; every other `ALTER ...` input,
+/// however well-formed, is `FeatureNotSupported` here rather than falling
+/// through to sqlparser (whose ALTER TABLE coverage does not match our
+/// supported subset). A malformed option list (missing `(...)`, missing `=`,
+/// …) is a plain syntax error.
+fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
+    let trimmed = sql.trim();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return Ok(None);
+    };
+    if !first.eq_ignore_ascii_case("alter") {
+        return Ok(None);
+    }
+
+    // Tokenize with sqlparser's tokenizer, dropping whitespace (the CREATE
+    // SEQUENCE pattern below).
+    let dialect = PostgreSqlDialect {};
+    let tokens: Vec<Token> = Tokenizer::new(&dialect, trimmed)
+        .tokenize()
+        .map_err(|err| parse_error(format!("tokenize error: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    let unsupported_form = || {
+        Err(DbError::parse(
+            SqlState::FeatureNotSupported,
+            "only ALTER TABLE <name> SET (compression = ...) is supported",
+        ))
+    };
+
+    let mut i = 0;
+    if !expect_word(&tokens, &mut i, "alter") {
+        return Ok(None);
+    }
+    if !expect_word(&tokens, &mut i, "table") {
+        return unsupported_form();
+    }
+    // Table identifier: unquoted word, lowercased (the `ident_name` rule).
+    let table = match tokens.get(i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
+        _ => return Err(parse_error("expected table name after ALTER TABLE")),
+    };
+    i += 1;
+    if !expect_word(&tokens, &mut i, "set") {
+        return unsupported_form();
+    }
+    if !matches!(tokens.get(i), Some(Token::LParen)) {
+        return Err(parse_error("expected ( after ALTER TABLE ... SET"));
+    }
+    i += 1;
+    if !expect_word(&tokens, &mut i, "compression") {
+        return unsupported_form();
+    }
+    if !matches!(tokens.get(i), Some(Token::Eq)) {
+        return Err(parse_error("expected = after compression"));
+    }
+    i += 1;
+    let value = match tokens.get(i) {
+        Some(Token::SingleQuotedString(s)) => s.to_ascii_lowercase(),
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
+        _ => return Err(parse_error("expected compression codec value")),
+    };
+    i += 1;
+    if !matches!(tokens.get(i), Some(Token::RParen)) {
+        return Err(parse_error("expected ) to close the option list"));
+    }
+    i += 1;
+    if matches!(tokens.get(i), Some(Token::SemiColon)) {
+        i += 1;
+    }
+    if i != tokens.len() {
+        return Err(parse_error("unexpected trailing input after ALTER TABLE"));
+    }
+    let compression = match value.as_str() {
+        "none" => CompressionSetting::None,
+        "zstd" => CompressionSetting::Zstd,
+        other => {
+            return Err(DbError::parse(
+                SqlState::FeatureNotSupported,
+                format!("unsupported compression codec {other}"),
+            ));
+        }
+    };
+    Ok(Some(Statement::AlterTableSetCompression {
+        table,
+        compression,
+    }))
+}
+
+/// Consume `expected` at `tokens[*i]` (case-insensitive, unquoted word only),
+/// advancing `*i` on a match. The free-function form (rather than a closure)
+/// avoids overlapping borrows of `tokens`/`i` at call sites.
+fn expect_word(tokens: &[Token], i: &mut usize, expected: &str) -> bool {
+    if matches_word(tokens.get(*i), expected) {
+        *i += 1;
+        true
+    } else {
+        false
+    }
 }
 
 fn try_parse_create_sequence(sql: &str) -> Result<Option<Statement>> {

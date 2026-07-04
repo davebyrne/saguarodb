@@ -16,8 +16,8 @@ pub fn parse(sql: &str) -> Result<Statement> {
 #[cfg(test)]
 mod tests {
     use common::{
-        CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, SequenceOptions, SqlState,
-        Value,
+        CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
+        SequenceOptions, SqlState, Value,
     };
 
     use crate::{
@@ -1529,6 +1529,94 @@ mod tests {
 
         let err = parse("create table users (id integer primary key deferrable)").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn parses_create_table_with_compression() {
+        for (sql, expected) in [
+            (
+                "create table t (id integer primary key) with (compression = 'zstd')",
+                Some(CompressionSetting::Zstd),
+            ),
+            (
+                "create table t (id integer primary key) with (compression = 'none')",
+                Some(CompressionSetting::None),
+            ),
+            (
+                "create table t (id integer primary key) with (compression = zstd)",
+                Some(CompressionSetting::Zstd),
+            ),
+            ("create table t (id integer primary key)", None),
+        ] {
+            let Statement::CreateTable { compression, .. } = parse(sql).unwrap() else {
+                panic!("expected CreateTable for `{sql}`");
+            };
+            assert_eq!(compression, expected, "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_create_table_options() {
+        // Unknown key stays a syntax error (the old fillfactor rejection).
+        let err =
+            parse("create table t (id integer primary key) with (fillfactor = 70)").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+        // Known key, unknown codec: deliberately-unsupported => 0A000.
+        let err = parse("create table t (id integer primary key) with (compression = 'lz4')")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        // Duplicate key.
+        let err = parse(
+            "create table t (id integer primary key) with (compression = 'zstd', compression = 'none')",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn parses_alter_table_set_compression() {
+        for (sql, compression) in [
+            (
+                "alter table users set (compression = 'zstd')",
+                CompressionSetting::Zstd,
+            ),
+            (
+                "ALTER TABLE Users SET (compression = 'none');",
+                CompressionSetting::None,
+            ),
+            (
+                "alter table users set (compression = zstd)",
+                CompressionSetting::Zstd,
+            ),
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::AlterTableSetCompression {
+                    table: "users".to_string(),
+                    compression,
+                },
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_alter_forms() {
+        for sql in [
+            "alter table users add column x integer",
+            "alter table users set (fillfactor = 70)",
+            "alter table users rename to people",
+            "alter index foo set (compression = 'zstd')",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
+        }
+        let err = parse("alter table users set (compression = 'lz4')").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        // Malformed (no option list) is a plain syntax error.
+        let err = parse("alter table users set compression").unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
     }
 

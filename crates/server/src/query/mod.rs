@@ -967,6 +967,7 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
             ))
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
+        Statement::AlterTableSetCompression { .. } => Ok(StatementClass::Maintenance),
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }

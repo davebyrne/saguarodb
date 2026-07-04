@@ -1,11 +1,11 @@
-use common::{ParsedColumnDef, ParsedDefault, PgType, Result, Value};
+use common::{CompressionSetting, ParsedColumnDef, ParsedDefault, PgType, Result, Value};
 use sqlparser::ast as sql;
 
 use crate::{Expr, Statement, UnaryOp};
 
 use super::{
-    column_char_length, convert_expr, convert_pg_type, ident_name, object_name, serial_pg_type,
-    unsupported,
+    column_char_length, convert_expr, convert_pg_type, feature_not_supported, ident_name,
+    object_name, parse_error, serial_pg_type, unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -139,7 +139,6 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         || !matches!(hive_distribution, sql::HiveDistributionStyle::NONE)
         || hive_formats.as_ref().is_some_and(hive_format_has_options)
         || !table_properties.is_empty()
-        || !with_options.is_empty()
         || file_format.is_some()
         || location.is_some()
         || query.is_some()
@@ -239,12 +238,64 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         }
     }
 
+    let compression = convert_table_options(with_options)?;
+
     Ok(Statement::CreateTable {
         name: object_name(&name)?,
         columns,
         primary_key,
         unique,
+        compression,
     })
+}
+
+/// Parse `WITH (compression = 'none' | 'zstd')`. Unknown keys are syntax
+/// errors; a known key with an unsupported codec is 0A000; duplicates are
+/// syntax errors (the CREATE SEQUENCE duplicate-option convention).
+fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<Option<CompressionSetting>> {
+    let mut compression = None;
+    for option in options {
+        let sql::SqlOption::KeyValue { key, value } = option else {
+            return Err(parse_error("unsupported storage option form"));
+        };
+        let name = ident_name(&key)?;
+        if name != "compression" {
+            return Err(parse_error(format!("unsupported storage option {name}")));
+        }
+        if compression.is_some() {
+            return Err(parse_error("duplicate compression option"));
+        }
+        compression = Some(parse_compression_value(&value)?);
+    }
+    Ok(compression)
+}
+
+/// Parse a `compression` option value: a single-quoted string or a bare
+/// identifier, case-insensitively. `ident_name` is not reused here because it
+/// also rejects quoted identifiers, which is not the concern for a WITH-clause
+/// value.
+fn parse_compression_value(value: &sql::Expr) -> Result<CompressionSetting> {
+    let text = match value {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::SingleQuotedString(s) => s.to_ascii_lowercase(),
+            _ => {
+                return Err(parse_error(
+                    "compression value must be a string or identifier",
+                ));
+            }
+        },
+        sql::Expr::Identifier(ident) => ident_name(ident)?,
+        _ => {
+            return Err(parse_error(
+                "compression value must be a string or identifier",
+            ));
+        }
+    };
+    match text.as_str() {
+        "none" => Ok(CompressionSetting::None),
+        "zstd" => Ok(CompressionSetting::Zstd),
+        other => feature_not_supported(format!("unsupported compression codec {other}")),
+    }
 }
 
 fn convert_column_def(

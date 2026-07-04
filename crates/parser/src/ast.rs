@@ -1,6 +1,6 @@
 use common::{
-    CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef, PgType, SequenceOptions,
-    Value,
+    CompressionSetting, CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef,
+    PgType, SequenceOptions, Value,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +13,9 @@ pub enum Statement {
         /// table-level `UNIQUE (a, b)`). Each becomes a unique index at create
         /// time. Empty when the table has no unique constraints.
         unique: Vec<Vec<String>>,
+        /// `WITH (compression = ...)`. `None` when the clause is absent (the
+        /// binder defaults an absent clause to [`CompressionSetting::None`]).
+        compression: Option<CompressionSetting>,
     },
     DropTable {
         name: String,
@@ -114,6 +117,14 @@ pub enum Statement {
     /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
     Vacuum {
         table: Option<String>,
+    },
+    /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')` — the only
+    /// supported ALTER form. Intercepted before sqlparser (like VACUUM) so the
+    /// grammar does not depend on sqlparser's ALTER coverage; every other
+    /// `ALTER ...` input is rejected at parse time.
+    AlterTableSetCompression {
+        table: String,
+        compression: CompressionSetting,
     },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
     /// non-relational bulk-transfer command (text/CSV, simple-query only). The
