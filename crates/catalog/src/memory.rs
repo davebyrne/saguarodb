@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, DataType, DbError, IndexId, IndexSchema,
-    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, Result, SequenceId, SequenceOptions,
-    SequenceSchema, SqlState, TableId, TableSchema,
+    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, IndexId,
+    IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, Result, SequenceId,
+    SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema,
 };
 
 use crate::CatalogManager;
@@ -482,6 +482,8 @@ fn build_schema(
         name,
         columns: assigned_columns,
         primary_key: primary_key_ids,
+        compression: CompressionSetting::None,
+        active_dict_id: None,
     })
 }
 

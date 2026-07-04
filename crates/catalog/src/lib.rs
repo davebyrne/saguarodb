@@ -60,8 +60,8 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, DataType, ErrorKind, IndexSchema, ParsedColumnDef, PgType,
-        SequenceOptions, SequenceSchema, SqlState, TableSchema,
+        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexSchema,
+        ParsedColumnDef, PgType, SequenceOptions, SequenceSchema, SqlState, TableSchema,
     };
 
     use crate::{
@@ -467,6 +467,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -510,6 +512,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -546,6 +550,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
 
         let err = catalog.apply_create_table(schema).unwrap_err();
@@ -699,6 +705,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0, 1],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -736,6 +744,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -766,6 +776,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![1],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -926,6 +938,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
 
         catalog.apply_create_table(schema.clone()).unwrap();
@@ -1250,6 +1264,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1289,6 +1305,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),

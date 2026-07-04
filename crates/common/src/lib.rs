@@ -40,7 +40,7 @@ pub use numeric::{Decimal, RoundingStrategy};
 pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
-    ColumnDef, ColumnDefault, ColumnInfo, DataType, IndexSchema, ParsedColumnDef, ParsedDefault,
-    SequenceOptions, SequenceSchema, TableSchema,
+    ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType, IndexSchema,
+    ParsedColumnDef, ParsedDefault, SequenceOptions, SequenceSchema, TableSchema,
 };
 pub use value::{Value, parse_bool_text};

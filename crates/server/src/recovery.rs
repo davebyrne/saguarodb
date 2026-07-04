@@ -390,6 +390,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: common::CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 

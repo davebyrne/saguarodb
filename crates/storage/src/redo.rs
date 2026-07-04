@@ -75,7 +75,7 @@ fn redo_error(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use buffer::PageData;
-    use common::{ColumnDef, DataType, TableSchema, Value, XMAX_COMMITTED};
+    use common::{ColumnDef, CompressionSetting, DataType, TableSchema, Value, XMAX_COMMITTED};
     use wal::WalRecordKind;
 
     use super::apply_physical_redo;
@@ -114,6 +114,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 

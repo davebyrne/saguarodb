@@ -9,3 +9,6 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 rust_decimal = { workspace = true }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

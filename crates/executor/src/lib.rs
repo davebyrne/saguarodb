@@ -20,9 +20,9 @@ mod tests {
 
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
-        ColumnDef, ColumnDefault, ColumnInfo, CopyFormat, CopyOptions, DataType, ExecRow, Key,
-        ParsedColumnDef, Result, Row, RowId, RowIdentity, SequenceManager, SessionSequenceState,
-        SqlState, StatementContext, TableSchema, Value,
+        ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
+        DataType, ExecRow, Key, ParsedColumnDef, Result, Row, RowId, RowIdentity, SequenceManager,
+        SessionSequenceState, SqlState, StatementContext, TableSchema, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -470,6 +470,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
 
         let row = crate::query::build_insert_row(
@@ -508,6 +510,8 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         };
 
         let row = crate::query::build_insert_row(&statement, &schema, &[], vec![]).unwrap();

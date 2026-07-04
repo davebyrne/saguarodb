@@ -24,9 +24,9 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key, KeyRange, Lsn, Result,
-        Row, SequenceManager, SequenceSchema, SqlState, StatementContext, TableSchema, TxnId,
-        TxnStatus, TxnStatusView, Value,
+        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
+        KeyRange, Lsn, Result, Row, SequenceManager, SequenceSchema, SqlState, StatementContext,
+        TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -1582,6 +1582,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 
@@ -1673,6 +1675,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 

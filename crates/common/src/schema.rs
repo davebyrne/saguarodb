@@ -38,6 +38,16 @@ pub enum DataType {
     },
 }
 
+/// Per-table at-rest page compression setting (`docs/specs/compression.md`
+/// §4). Governs only the table's file envelopes; WAL full-page-image
+/// compression is unconditional and independent of this setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CompressionSetting {
+    #[default]
+    None,
+    Zstd,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParsedDefault {
     Const(Value),
@@ -150,6 +160,13 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
+    /// At-rest page compression for this table's heap and index files.
+    #[serde(default)]
+    pub compression: CompressionSetting,
+    /// The trained dictionary new heap-page writes compress against
+    /// (`None` until an ALTER trains one). Index files never use it.
+    #[serde(default)]
+    pub active_dict_id: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +218,7 @@ pub struct IndexSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnDef, ColumnInfo, DataType, PgType};
+    use super::{ColumnDef, ColumnInfo, CompressionSetting, DataType, PgType, TableSchema};
 
     #[test]
     fn column_info_can_describe_expression_output() {
@@ -239,5 +256,24 @@ mod tests {
             ..unlabeled
         };
         assert_eq!(labeled.wire_type(), PgType::Int4);
+    }
+
+    #[test]
+    fn table_schema_without_compression_fields_deserializes_to_defaults() {
+        // A pre-compression snapshot/WAL payload must keep loading.
+        let json = r#"{
+            "id": 1,
+            "name": "users",
+            "columns": [],
+            "primary_key": []
+        }"#;
+        let schema: TableSchema = serde_json::from_str(json).unwrap();
+        assert_eq!(schema.compression, CompressionSetting::None);
+        assert_eq!(schema.active_dict_id, None);
+    }
+
+    #[test]
+    fn compression_setting_defaults_to_none() {
+        assert_eq!(CompressionSetting::default(), CompressionSetting::None);
     }
 }

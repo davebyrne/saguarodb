@@ -733,7 +733,9 @@ mod tests {
     };
     use crate::codec::{decode_row, encode_row};
     use buffer::PageData;
-    use common::{ColumnDef, DataType, INVALID_XID, TableSchema, Value, XMAX_COMMITTED};
+    use common::{
+        ColumnDef, CompressionSetting, DataType, INVALID_XID, TableSchema, Value, XMAX_COMMITTED,
+    };
 
     fn schema() -> TableSchema {
         TableSchema {
@@ -760,6 +762,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 

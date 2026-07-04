@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, DataType, IndexSchema, KeyRange, PageFlushInfo, Row, Snapshot, StatementContext,
-    TableSchema, Value,
+    ColumnDef, CompressionSetting, DataType, IndexSchema, KeyRange, PageFlushInfo, Row, Snapshot,
+    StatementContext, TableSchema, Value,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -198,6 +198,8 @@ fn users_schema() -> TableSchema {
             },
         ],
         primary_key: vec![0],
+        compression: CompressionSetting::None,
+        active_dict_id: None,
     }
 }
 

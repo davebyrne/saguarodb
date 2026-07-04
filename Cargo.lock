@@ -928,6 +928,7 @@ dependencies = [
  "parking_lot",
  "rust_decimal",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

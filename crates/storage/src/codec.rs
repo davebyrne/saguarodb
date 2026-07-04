@@ -645,8 +645,8 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use common::{
-        ColumnDef, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema, Value, XMAX_COMMITTED,
-        XMIN_COMMITTED,
+        ColumnDef, CompressionSetting, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema,
+        Value, XMAX_COMMITTED, XMIN_COMMITTED,
     };
 
     use super::{
@@ -680,6 +680,8 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
         }
     }
 
