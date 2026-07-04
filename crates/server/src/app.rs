@@ -24,6 +24,13 @@ pub struct ServerComponents {
     pub wal: Arc<dyn WalManager>,
     pub control: Arc<dyn ControlStore>,
     pub store: Arc<dyn PageStore>,
+    /// Shared compression state (`docs/specs/compression.md` §5a): the SAME
+    /// instance is injected into both `store` (at-rest envelopes) and `storage`
+    /// (WAL FPIs), so a file's config is consulted consistently by both.
+    pub compression: Arc<compress::CompressionRegistry>,
+    /// Durable home for trained per-table dictionaries (`compression.md` §7),
+    /// seeded into `compression` at startup and appended to on `CreateDictionary`.
+    pub dict_store: Arc<compress::DictStore>,
     pub concurrency: Arc<dyn ConcurrencyController>,
     pub checkpoint: CheckpointState,
     pub shutdown: Arc<ShutdownState>,

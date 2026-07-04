@@ -1048,8 +1048,12 @@ mod tests {
         concurrency: Arc<dyn ConcurrencyController>,
     ) -> AppState {
         config.data_dir = data_dir.to_path_buf();
-        let store: Arc<dyn PageStore> =
-            Arc::new(HeapPageStore::open(data_dir.join("heap")).unwrap());
+        let compression = Arc::new(compress::CompressionRegistry::new());
+        let dict_store = Arc::new(compress::DictStore::open(data_dir.join("dicts")).unwrap());
+        let store: Arc<dyn PageStore> = Arc::new(
+            HeapPageStore::open_with_compression(data_dir.join("heap"), compression.clone())
+                .unwrap(),
+        );
         let buffer_pool: Arc<dyn BufferPool> = Arc::new(MemoryBufferPool::new(
             config.buffer_pool_frames,
             Box::new(TestFlushPolicy),
@@ -1057,8 +1061,13 @@ mod tests {
         ));
         buffer_pool.enable_stealing();
         let storage = Arc::new(
-            PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Normal)
-                .unwrap(),
+            PageBackedStorageEngine::open_with_compression(
+                buffer_pool.clone(),
+                wal.clone(),
+                StorageMode::Normal,
+                compression.clone(),
+            )
+            .unwrap(),
         );
         let active_txns = ActiveTxnRegistry::new();
         let lock_manager = Arc::new(crate::lock_manager::LockManager::new(
@@ -1076,6 +1085,8 @@ mod tests {
             wal,
             control,
             store,
+            compression,
+            dict_store,
             concurrency,
             checkpoint: CheckpointState {
                 last_checkpoint_lsn: AtomicU64::new(0),

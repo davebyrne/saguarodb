@@ -16,9 +16,18 @@ use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
 
 pub fn open_app(config: Config) -> Result<AppState> {
+    // Shared compression state (`docs/specs/compression.md` §5a/§7): one registry
+    // instance is injected into both the at-rest heap store and the WAL FPI path
+    // so a file's config is consulted consistently by both; the dict store is the
+    // durable home for trained per-table dictionaries.
+    let compression = Arc::new(compress::CompressionRegistry::new());
+    let dict_store = Arc::new(compress::DictStore::open(config.data_dir.join("dicts"))?);
     let control: Arc<dyn ControlStore> =
         Arc::new(FileControlStore::open(&config.data_dir, PAGE_SIZE as u32)?);
-    let store: Arc<dyn PageStore> = Arc::new(HeapPageStore::open(config.data_dir.join("heap"))?);
+    let store: Arc<dyn PageStore> = Arc::new(HeapPageStore::open_with_compression(
+        config.data_dir.join("heap"),
+        compression.clone(),
+    )?);
     let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(config.data_dir.join("wal.dat"))?);
     let buffer_pool: Arc<dyn BufferPool> = Arc::new(MemoryBufferPool::new(
         config.buffer_pool_frames,
@@ -44,10 +53,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
         None => Arc::new(MemoryCatalog::empty()),
     };
 
-    let storage = Arc::new(PageBackedStorageEngine::open(
+    let storage = Arc::new(PageBackedStorageEngine::open_with_compression(
         buffer_pool.clone(),
         wal.clone(),
         StorageMode::Recovery,
+        compression.clone(),
     )?);
     // Install both table and secondary-index schemas from the loaded catalog so
     // recovery replay and later DML maintain the indexes.
@@ -59,6 +69,20 @@ pub fn open_app(config: Config) -> Result<AppState> {
     storage.install_schemas(tables)?;
     storage.install_index_schemas(indexes)?;
     storage.install_sequences(catalog.list_sequences()?)?;
+
+    // Seed the dictionary resolver from the durable dict files so replay can
+    // decompress dict-compressed FPIs and at-rest loads resolve dict ids
+    // (`compression.md` §7). Orphan files (crash between file-durable and WAL
+    // commit) are registered too — harmless — and their ids are burned so a
+    // future allocation never collides with an orphan.
+    let mut max_dict_id = 0u32;
+    for (dict_id, _table_id, bytes) in dict_store.load_all()? {
+        compression.register_dictionary(dict_id, &bytes)?;
+        max_dict_id = max_dict_id.max(dict_id);
+    }
+    if max_dict_id > 0 {
+        catalog.reserve_dictionary_id(max_dict_id)?;
+    }
 
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
     // record after the checkpoint LSN onto the heap and index pages, regardless of
@@ -112,6 +136,8 @@ pub fn open_app(config: Config) -> Result<AppState> {
             catalog.as_ref(),
             storage.as_ref(),
             buffer_pool.as_ref(),
+            compression.as_ref(),
+            dict_store.as_ref(),
             record.lsn,
             record.kind,
         )?;
@@ -160,6 +186,8 @@ pub fn open_app(config: Config) -> Result<AppState> {
         wal,
         control,
         store,
+        compression,
+        dict_store,
         concurrency: Arc::new(RwLockConcurrencyController::new()),
         checkpoint: CheckpointState {
             last_checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
@@ -241,6 +269,8 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::DropIndex { .. }
             | WalRecordKind::CreateSequence { .. }
             | WalRecordKind::DropSequence { .. }
+            | WalRecordKind::CreateDictionary { .. }
+            | WalRecordKind::AlterTableCompression { .. }
     )
 }
 
@@ -258,9 +288,14 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
             catalog.reserve_sequence_id(schema.id)?;
             Ok(true)
         }
+        WalRecordKind::CreateDictionary { dict_id, .. } => {
+            catalog.reserve_dictionary_id(*dict_id)?;
+            Ok(true)
+        }
         WalRecordKind::DropTable { .. }
         | WalRecordKind::DropIndex { .. }
-        | WalRecordKind::DropSequence { .. } => Ok(false),
+        | WalRecordKind::DropSequence { .. }
+        | WalRecordKind::AlterTableCompression { .. } => Ok(false),
         _ => Ok(false),
     }
 }
@@ -269,9 +304,33 @@ fn apply_redo(
     catalog: &dyn CatalogManager,
     storage: &dyn RecoveryOperations,
     buffer_pool: &dyn BufferPool,
+    compression: &compress::CompressionRegistry,
+    dict_store: &compress::DictStore,
     lsn: u64,
     kind: WalRecordKind,
 ) -> Result<()> {
+    // Normalize a dict/codec-compressed FPI to a plain raw `FullPageImage` before
+    // the match below: the physical arm's OR-pattern binds `file_id`/`page_num`
+    // identically across its member kinds, but `FullPageImageCompressed` carries
+    // different fields (`codec`/`dict_id`/`payload`) and cannot join it directly.
+    // Decompressing here lets the existing physical-redo path run unchanged.
+    let kind = match kind {
+        WalRecordKind::FullPageImageCompressed {
+            file_id,
+            page_num,
+            codec,
+            dict_id,
+            payload,
+        } => {
+            let image = compression.decompress_fpi(codec, dict_id, &payload, PAGE_SIZE)?;
+            WalRecordKind::FullPageImage {
+                file_id,
+                page_num,
+                image,
+            }
+        }
+        other => other,
+    };
     match &kind {
         WalRecordKind::CreateTable { schema } => {
             catalog.apply_create_table(schema.clone())?;
@@ -333,13 +392,29 @@ fn apply_redo(
         | WalRecordKind::Checkpoint { .. } => Err(DbError::internal(
             "recovery replay received an unexpected WAL record",
         )),
-        // TEMPORARY (compression Task 5): real replay arms land with the registry
-        // wiring (Task 11). Nothing emits these records until Task 7+, and no
-        // server test replays them before Task 11 replaces this arm.
-        WalRecordKind::FullPageImageCompressed { .. }
-        | WalRecordKind::CreateDictionary { .. }
-        | WalRecordKind::AlterTableCompression { .. } => Err(DbError::internal(
-            "compression WAL records are not yet replayable",
+        WalRecordKind::CreateDictionary {
+            dict_id,
+            table_id,
+            bytes,
+        } => {
+            // Recovery apply: durable-file install is idempotent; no WAL appended.
+            dict_store.save(*dict_id, *table_id, bytes)?;
+            compression.register_dictionary(*dict_id, bytes)?;
+            catalog.reserve_dictionary_id(*dict_id)?;
+            Ok(())
+        }
+        WalRecordKind::AlterTableCompression {
+            table_id,
+            compression: setting,
+            active_dict_id,
+        } => {
+            let schema = catalog.set_table_compression(*table_id, *setting, *active_dict_id)?;
+            storage.apply_set_table_compression(schema)
+        }
+        // Normalized away above: `FullPageImageCompressed` never reaches this match
+        // (it is rewritten to `FullPageImage` before the match runs).
+        WalRecordKind::FullPageImageCompressed { .. } => Err(DbError::internal(
+            "unreachable: FullPageImageCompressed is normalized before dispatch",
         )),
     }
 }

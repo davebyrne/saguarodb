@@ -12,6 +12,7 @@ path = "src/main.rs"
 buffer = { package = "saguarodb-buffer", path = "../buffer" }
 catalog = { package = "saguarodb-catalog", path = "../catalog" }
 common = { package = "saguarodb-common", path = "../common" }
+compress = { package = "saguarodb-compress", path = "../compress" }
 control = { package = "saguarodb-control", path = "../control" }
 executor = { package = "saguarodb-executor", path = "../executor" }
 parser = { package = "saguarodb-parser", path = "../parser" }

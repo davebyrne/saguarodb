@@ -1000,6 +1000,7 @@ dependencies = [
  "saguarodb-buffer",
  "saguarodb-catalog",
  "saguarodb-common",
+ "saguarodb-compress",
  "saguarodb-control",
  "saguarodb-executor",
  "saguarodb-parser",
