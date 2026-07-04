@@ -36,6 +36,7 @@ pub struct ControlData {
     pub checkpoint_lsn: Lsn,   // redo boundary: heap reflects flushed page effects <= this LSN
     pub tables: Vec<TableId>,  // sorted, no duplicates
     pub catalog: Vec<u8>,      // serialized catalog snapshot
+    pub page_size: u32,        // page size (bytes) the data directory was created with
 }
 ```
 
@@ -47,21 +48,30 @@ versions are visible.
 The control record uses a versioned binary envelope:
 
 - magic: `SGMF` (4 bytes)
-- version: little-endian `u32`, current = `2`
+- version: little-endian `u32`, current = `3`
 - payload length: little-endian `u32`
 - payload checksum: little-endian CRC32 over the exact payload bytes
-- payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, and `catalog`
+- payload: UTF-8 JSON containing `checkpoint_lsn`, sorted `tables`, `catalog`,
+  and `page_size`
 
 The four header fields form a fixed 16-byte header (`MANIFEST_HEADER_LEN = 16`)
 that precedes the payload.
 
 Decode must reject a file shorter than the 16-byte header, magic mismatch,
-unsupported versions (including the legacy full-snapshot manifest, version `1`),
-length mismatch, checksum mismatch, malformed payload JSON, unsorted table IDs,
-and duplicate table IDs. Development builds do not migrate older formats; an
-incompatible or corrupt control file surfaces as `SqlState::InternalError`
-(there is no dedicated corruption SQLSTATE) and the data directory must be
-rebuilt.
+unsupported versions (including the legacy full-snapshot manifest, version `1`,
+and the pre-`page_size` manifest, version `2`), length mismatch, checksum
+mismatch, malformed payload JSON, unsorted table IDs, and duplicate table IDs.
+Development builds do not migrate older formats; an incompatible or corrupt
+control file surfaces as `SqlState::InternalError` (there is no dedicated
+corruption SQLSTATE) and the data directory must be rebuilt.
+
+`page_size` is forward-compatibility insurance for a future data-dir-creation-
+time page size; today every data directory is created with the compile-time
+`buffer::PAGE_SIZE` (8192). It is validated separately, *after* a successful
+decode (`FileControlStore::open`'s caller supplies the binary's page size, and
+`load` compares it against the stored value): a mismatch is a plain, clean
+startup error naming both values, not corruption — the envelope itself decoded
+fine.
 
 `checkpoint_lsn` is the WAL high-water mark whose effects are reflected in the
 heap. Recovery replays committed WAL records with `LSN > checkpoint_lsn`.
@@ -74,10 +84,10 @@ pub trait ControlStore: Send + Sync {
     fn store(&self, checkpoint_lsn: Lsn, tables: &[TableId], catalog: &[u8]) -> Result<()>;
 }
 
-pub struct FileControlStore { /* data directory */ }
+pub struct FileControlStore { /* data directory, expected page size */ }
 
 impl FileControlStore {
-    pub fn open(data_dir: impl AsRef<std::path::Path>) -> Result<Self>;
+    pub fn open(data_dir: impl AsRef<std::path::Path>, page_size: u32) -> Result<Self>;
 }
 ```
 
@@ -99,7 +109,8 @@ truncate the WAL only **after** `store` succeeds.
 `load` returns `Ok(None)` when no control file exists, otherwise the validated
 `ControlData`. Recovery uses `checkpoint_lsn` as the redo boundary and `catalog`
 to initialize the catalog; heap pages are read separately by the buffer pool's
-`PageStore`.
+`PageStore`. `load` also rejects a `page_size` mismatch between the decoded
+control record and the `page_size` passed to `open` (see above).
 
 ## Crash Safety
 
@@ -112,7 +123,10 @@ to initialize the catalog; heap pages are read separately by the buffer pool's
 
 ## Acceptance Tests
 
-- `store` then `load` round-trips `checkpoint_lsn`, tables, and catalog.
+- `store` then `load` round-trips `checkpoint_lsn`, tables, catalog, and
+  `page_size`.
 - `load` returns `None` with no control file.
 - `store` overwrites the previous control record.
 - Decode rejects checksum/version/length tampering and unsorted/duplicate tables.
+- `load` rejects a `page_size` mismatch with a clean startup error naming both
+  values (not reported as corruption).

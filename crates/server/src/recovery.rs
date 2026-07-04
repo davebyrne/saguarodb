@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use buffer::{BufferPool, MemoryBufferPool, PageStore};
+use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
 use common::{DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController};
 use control::{ControlStore, FileControlStore};
@@ -16,7 +16,8 @@ use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
 
 pub fn open_app(config: Config) -> Result<AppState> {
-    let control: Arc<dyn ControlStore> = Arc::new(FileControlStore::open(&config.data_dir)?);
+    let control: Arc<dyn ControlStore> =
+        Arc::new(FileControlStore::open(&config.data_dir, PAGE_SIZE as u32)?);
     let store: Arc<dyn PageStore> = Arc::new(HeapPageStore::open(config.data_dir.join("heap"))?);
     let wal: Arc<dyn WalManager> = Arc::new(FileWalManager::open(config.data_dir.join("wal.dat"))?);
     let buffer_pool: Arc<dyn BufferPool> = Arc::new(MemoryBufferPool::new(

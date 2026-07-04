@@ -11,7 +11,7 @@ mod tests {
     #[test]
     fn store_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileControlStore::open(dir.path()).unwrap();
+        let store = FileControlStore::open(dir.path(), 8192).unwrap();
         store.store(55, &[1, 2], b"catalog").unwrap();
 
         let loaded = store.load().unwrap().unwrap();
@@ -24,14 +24,14 @@ mod tests {
     #[test]
     fn load_returns_none_without_control_file() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileControlStore::open(dir.path()).unwrap();
+        let store = FileControlStore::open(dir.path(), 8192).unwrap();
         assert!(store.load().unwrap().is_none());
     }
 
     #[test]
     fn store_overwrites_previous_control_record() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileControlStore::open(dir.path()).unwrap();
+        let store = FileControlStore::open(dir.path(), 8192).unwrap();
         store.store(10, &[1], b"old").unwrap();
         store.store(20, &[1, 3], b"new").unwrap();
 

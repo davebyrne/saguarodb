@@ -1123,6 +1123,7 @@ mod tests {
                 checkpoint_lsn,
                 tables: tables.to_vec(),
                 catalog: catalog.to_vec(),
+                page_size: buffer::PAGE_SIZE as u32,
             });
             Ok(())
         }
@@ -1418,7 +1419,9 @@ mod tests {
             Config::default(),
             Arc::new(MemoryCatalog::empty()),
             wal.clone(),
-            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
             Arc::new(RwLockConcurrencyController::new()),
         );
         let service = super::QueryService::new(app.components.clone());
@@ -1513,7 +1516,9 @@ mod tests {
             config,
             catalog,
             wal,
-            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
             concurrency,
         );
         app.query_service
@@ -1560,7 +1565,9 @@ mod tests {
             config,
             catalog,
             wal,
-            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
             concurrency,
         );
 
@@ -1623,7 +1630,9 @@ mod tests {
             config,
             catalog,
             wal,
-            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
             concurrency,
         );
 
@@ -1940,7 +1949,9 @@ mod tests {
             config,
             Arc::new(MemoryCatalog::empty()),
             wal,
-            Arc::new(control::FileControlStore::open(dir.path()).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
             concurrency,
         );
         app.query_service

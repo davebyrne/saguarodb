@@ -2,7 +2,7 @@ use common::{DbError, Lsn, Result, SqlState, TableId};
 use serde::{Deserialize, Serialize};
 
 const MANIFEST_MAGIC: &[u8; 4] = b"SGMF";
-const MANIFEST_VERSION: u32 = 2;
+const MANIFEST_VERSION: u32 = 3;
 const MANIFEST_HEADER_LEN: usize = 16;
 
 /// The durable control record. It is the checkpoint commit point: the redo
@@ -13,6 +13,7 @@ pub struct ControlData {
     pub checkpoint_lsn: Lsn,
     pub tables: Vec<TableId>,
     pub catalog: Vec<u8>,
+    pub page_size: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -20,6 +21,7 @@ struct ControlPayload {
     checkpoint_lsn: Lsn,
     tables: Vec<TableId>,
     catalog: Vec<u8>,
+    page_size: u32,
 }
 
 pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
@@ -27,6 +29,7 @@ pub(crate) fn encode_control(control: &ControlData) -> Result<Vec<u8>> {
         checkpoint_lsn: control.checkpoint_lsn,
         tables: control.tables.clone(),
         catalog: control.catalog.clone(),
+        page_size: control.page_size,
     };
     let payload_bytes = serde_json::to_vec(&payload)
         .map_err(|err| corrupt_control(format!("failed to encode control payload: {err}")))?;
@@ -79,6 +82,7 @@ pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlData> {
         checkpoint_lsn: payload.checkpoint_lsn,
         tables: payload.tables,
         catalog: payload.catalog,
+        page_size: payload.page_size,
     })
 }
 
@@ -111,6 +115,7 @@ mod tests {
             checkpoint_lsn: 42,
             tables: vec![1, 2],
             catalog: b"catalog-bytes".to_vec(),
+            page_size: 8192,
         }
     }
 
@@ -118,6 +123,18 @@ mod tests {
     fn round_trips_control_data() {
         let bytes = encode_control(&control()).unwrap();
         assert_eq!(decode_control(&bytes).unwrap(), control());
+    }
+
+    #[test]
+    fn control_round_trips_page_size() {
+        let data = ControlData {
+            checkpoint_lsn: 7,
+            tables: vec![1, 2],
+            catalog: vec![9, 9],
+            page_size: 8192,
+        };
+        let bytes = encode_control(&data).unwrap();
+        assert_eq!(decode_control(&bytes).unwrap(), data);
     }
 
     #[test]
@@ -156,6 +173,7 @@ mod tests {
                 checkpoint_lsn: 42,
                 tables,
                 catalog: Vec::new(),
+                page_size: 8192,
             })
             .unwrap();
 
