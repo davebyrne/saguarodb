@@ -1,0 +1,433 @@
+# Design: Per-Table Page Compression and WAL Full-Page-Image Compression
+
+**Date:** 2026-07-04
+**Status:** Approved design (pre-implementation)
+**Branch:** `feat/compression`
+
+## 1. Summary
+
+Add transparent compression at two points:
+
+1. **Pages at rest** — each 8 KiB page is individually compressed by
+   `HeapPageStore` when flushed and decompressed when loaded, with the freed
+   tail of the page's fixed 8 KiB file slot returned to the filesystem via
+   hole punching. Controlled by a **per-table setting** declared at
+   `CREATE TABLE` and changed by a new `ALTER TABLE ... SET (compression)`
+   statement that rewrites the table in full.
+2. **WAL full-page images** — every FPI payload is compressed
+   **unconditionally** (independent of any table setting) before it is
+   appended, and decompressed during replay.
+
+Both use zstd. Cross-page redundancy is captured with **per-table trained
+zstd dictionaries** shared by the at-rest path and the WAL path.
+
+Everything happens below the buffer pool and below the logical WAL contract:
+the buffer pool, executor, planner, and MVCC code see only uncompressed
+8 KiB page images. No logical page byte, PageLSN, TID, or index entry
+changes meaning.
+
+## 2. Goals and non-goals
+
+**Goals**
+
+- Reduce heap, index, and WAL disk footprint with zero hot-path (buffer-hit)
+  cost. Compression CPU is paid on flush/append; decompression on buffer
+  miss and replay.
+- Preserve every existing durability invariant: WAL-before-data, first-touch
+  FPI torn-page repair, PageLSN-gated redo, checkpoint ordering, `page_count`
+  semantics, stable `(page, slot)` TIDs.
+- Build the shared codec/dictionary infrastructure that future TOAST work
+  will reuse (codec-id registry, versioned envelopes, dictionary store).
+
+**Non-goals (explicit)**
+
+- TOAST / out-of-line values (future; reuses the codec registry).
+- Multi-page compression groups on the live store (breaks the torn-page
+  repair invariant for undirtied group members, or requires COW machinery;
+  grouping belongs to future sealed/archival segments).
+- A page-map / copy-on-write store (byte-granular savings). The `PageStore`
+  trait boundary is unchanged, so this remains a possible later evolution of
+  `HeapPageStore` internals; the envelope defined here would be reused as
+  the stored extent format.
+- Per-table or runtime page size (see §12 for the forward-compatibility
+  provisions we do make).
+- Compression of non-FPI WAL records. Size-thresholded `HeapInsert` payload
+  compression is documented follow-up work; tiny records (`HeapUpdateHeader`,
+  `Commit`, `Abort`) lose to per-record framing overhead by construction.
+- Dictionary garbage collection. Dictionary files are small (~100 KiB) and
+  immutable; v1 never deletes them.
+- A global server flag for table compression. The per-table setting is the
+  only control surface for at-rest compression. WAL FPI compression has no
+  knob at all (always on, with a per-record raw fallback).
+
+## 3. New crate: `compress` (`saguarodb-compress`)
+
+Leaf library crate wrapping zstd. Depends on `common` only (plus the
+external `zstd` crate). Consumed by `storage` and `server`. `wal` does
+**not** depend on it (WAL record types carry plain bytes plus codec/dict-id
+fields; compression happens at the storage/recovery call sites).
+
+Owns:
+
+- **Codec registry** (`u8` codec ids): `0 = none`, `1 = zstd`,
+  `2 = zstd + dictionary`. Unknown ids are structured corruption-class
+  errors. Future codecs (e.g. lz4) allocate new ids.
+- **Compression levels** (fixed constants in v1): zstd level 1 on the WAL
+  append path (inside statement execution), zstd level 3 for pages at rest
+  (background flush / eviction / rewrite).
+- **Dictionary training** (`zstd`'s ZDICT) and dictionary handles for
+  compress/decompress.
+- **The at-rest page envelope** (§5).
+- **The dictionary file format** (§7).
+
+The `CompressionSetting` enum (`None | Zstd`) lives in `common` so `catalog`
+and `parser`/binder can reference it without depending on `compress`.
+
+## 4. Per-table setting and SQL surface
+
+- `TableSchema` gains `compression: CompressionSetting` and
+  `active_dict_id: Option<u32>`.
+- **`CREATE TABLE <name> (...) WITH (compression = 'none' | 'zstd')`** —
+  new optional trailing clause. Unknown option keys or values are binder
+  errors with accurate SQLSTATEs. Omitted ⇒ `none` (current behavior).
+  String literal values; unquoted identifiers are also accepted and
+  lowercased per the identifier rules.
+- **`ALTER TABLE <name> SET (compression = 'none' | 'zstd')`** — the first
+  `ALTER` form in the grammar; every other `ALTER` remains rejected.
+  Semantics in §8. Dispatched like `VACUUM`: autocommit only, rejected
+  inside a transaction block, runs under the exclusive statement guard.
+  Unlike `VACUUM` it parses/binds normally (it names a table and carries
+  options) but does not plan/execute relationally.
+- A table's secondary indexes and primary-key index inherit the table's
+  setting for their files, but compress **dict-less** (a heap-trained
+  dictionary does not fit B-tree node content; per-index dictionaries are
+  future work).
+- The setting governs **only the at-rest envelope** in the table's files.
+  WAL FPI compression is unconditional and independent (§6).
+
+## 5. At-rest page envelope (`HeapPageStore`)
+
+### Format
+
+A compressed page slot begins with an 18-byte envelope header:
+
+```text
+[0..4)   magic          = "SGCP" (0x53 0x47 0x43 0x50)
+[4]      0xFF           (position of a raw page's PageType; 0xFF is invalid)
+[5]      0xFF           (position of a raw page's PageVersion; 0xFF is invalid)
+[6]      envelope format version = 1
+[7]      codec id       (1 = zstd, 2 = zstd + dictionary; 0 never appears at rest)
+[8..12)  dict_id  u32 LE (0 when codec = 1)
+[12..14) payload length u16 LE
+[14..18) CRC32 over payload, LE
+[18..)   compressed payload
+```
+
+Detection on load: `bytes[0..6] == [SGCP, 0xFF, 0xFF]` ⇒ envelope; anything
+else ⇒ raw page bytes. A valid raw v2 page always carries `PageVersion = 2`
+at offset 5 and `PageType ∈ {1, 2}` at offset 4, so no raw page can collide
+with the envelope marker. An all-zero slot (sparse hole / never-written) is
+not an envelope and falls through to the existing raw-page handling.
+Decompressed length must equal `PAGE_SIZE` exactly; anything else is a
+corruption-class error. The decompressed image still carries the standard
+page checksum, which is verified by the existing page validation — two
+independent integrity layers.
+
+`u16` payload length is sufficient: payloads are only stored compressed when
+smaller than `PAGE_SIZE`, and the format supports page sizes up to 32 KiB
+(§12), so payloads are always < 32768.
+
+### Write path
+
+`write_page(file_id, page_num, data)`:
+
+1. Look up the file's `(codec, dict)` config (§5a). No config or
+   `compression = none` ⇒ write the raw 8 KiB image exactly as today.
+2. Compress the image. Compute the smallest whole number of filesystem
+   blocks (assumed 4096 bytes; see note) that holds envelope + payload.
+   If that is fewer blocks than `PAGE_SIZE / 4096`, write envelope +
+   payload at the page's normal `page_num * PAGE_SIZE` offset and punch the
+   trailing blocks with `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+   Otherwise write the raw image (which naturally un-punches any prior
+   hole). At 8 KiB pages this degenerates to: compressed slot iff
+   envelope + payload ≤ 4096.
+3. `EOPNOTSUPP`/`EINVAL` from `fallocate` ⇒ record the fact once per store
+   and skip punching thereafter (correct, merely reclaims nothing).
+
+`KEEP_SIZE` preserves `st_size`, so `page_count` (= `st_size / PAGE_SIZE`)
+is untouched — allocator seeding and VACUUM's full-extent scan are
+unaffected. Note: the 4096-byte block assumption is conservative; on a
+filesystem with larger blocks the punch is a harmless no-op region-wise.
+
+### Read path
+
+`load_page`: read the full 8 KiB slot; if the envelope marker matches,
+validate version/codec/CRC, resolve the dictionary (§7), decompress to
+exactly `PAGE_SIZE`, return the image. Otherwise return the raw bytes as
+today. Mixed encodings within one file are always legal and self-describing
+— this is what makes the `ALTER` rewrite crash-tolerant and lets config
+changes apply lazily to future writes.
+
+### Corruption semantics
+
+Envelope validation failure (bad version, unknown codec, CRC mismatch,
+wrong decompressed length, unresolvable dict) is a **distinct structured
+error kind** (corruption-class):
+
+- Normal reads (`read_page`/`write_page` faulting) propagate it — loud,
+  like any page corruption.
+- `fetch_for_redo` (recovery) maps it to a **zeroed frame**, exactly like a
+  missing page, so the post-checkpoint `FullPageImage` re-establishes it.
+  This is sound: a torn page was mid-write ⇒ it was dirty ⇒ its first
+  post-checkpoint modification logged an FPI that redo will replay. (This
+  is strictly better than today's raw-page behavior, where a torn write
+  yields garbage bytes whose garbage PageLSN the redo gate trusts.)
+
+### 5a. Store configuration
+
+`HeapPageStore` gains an engine-facing config API (the `PageStore` trait
+and the buffer pool are unchanged):
+
+- `set_file_compression(file_id, CodecConfig)` — called by the storage
+  engine when schemas are installed at startup/recovery, on `CREATE TABLE`,
+  on `CREATE INDEX`, and on `ALTER TABLE ... SET (compression)`. Heap files
+  get `(codec, active_dict_id)`; index files get the dict-less variant of
+  the table's codec.
+- `register_dictionary(dict_id, bytes)` — populates the in-memory
+  dictionary resolver. Seeded at store open by scanning `<data>/dicts/`
+  (§7) and updated when a dictionary is created.
+
+A file with no registered config writes raw — always correct, since
+envelopes are self-describing and mixed encodings are legal.
+
+## 6. WAL full-page-image compression
+
+- New binary record type
+  `FullPageImageCompressed { file_id, page_num, codec: u8, dict_id: u32, payload }`.
+  The existing `FullPageImage` type remains and remains decodable. The
+  record CRC already covers the payload; no envelope or second CRC inside
+  the record.
+- **Policy: unconditional.** Every FPI append site (first-touch-per-
+  checkpoint images, every B-tree node image, VACUUM/prune/reclaim images)
+  compresses the 8 KiB image with zstd level 1, using the owning table's
+  active dictionary for **heap** pages when one exists and dict-less zstd
+  otherwise (index pages: always dict-less). If the compressed payload is
+  not smaller than `PAGE_SIZE`, the site emits a plain `FullPageImage`
+  instead — per-record, self-describing, the WAL never expands.
+- Compression happens in `storage` at record-construction time (storage
+  owns the FPI sites and the file→dict mapping); `wal` just stores bytes.
+- **Replay:** recovery decompresses the payload back to an exact-`PAGE_SIZE`
+  image — resolving `dict_id` against the dictionary resolver — before
+  handing it to `apply_physical_redo`, whose `len == PAGE_SIZE` contract
+  and PageLSN-gating are unchanged. Resolution order is guaranteed by §7's
+  durability rules. A `dict_id` that cannot be resolved during replay is a
+  fatal structured recovery error (it indicates deletion/corruption of a
+  dictionary file, not a normal crash state).
+- `--checkpoint-wal-bytes` continues to measure appended (now smaller)
+  bytes; checkpoints trigger correspondingly less often. No semantic
+  change.
+
+## 7. Dictionaries
+
+- **Identity:** global monotonic `u32` dict ids allocated by the catalog
+  (`next_dict_id` persisted with the catalog; replay advances it past any
+  `CreateDictionary` record it sees, mirroring table/index id recovery).
+  `0` is reserved for "no dictionary".
+- **Artifact:** an immutable file `<data>/dicts/<dict_id>.dict`:
+
+```text
+[magic "SGDC"][format version u8][dict_id u32][table_id u32]
+[payload length u32][CRC32 over payload][trained dictionary bytes]
+```
+
+  Written with the control-file pattern: temp file → fsync → rename →
+  fsync directory. Never modified after creation; never deleted in v1.
+- **WAL:** a binary logical record
+  `CreateDictionary { dict_id, table_id, bytes }` is appended (and flushed
+  with the creating statement's commit) so replay can resolve dict ids
+  created after the last checkpoint. Replay installs the file if absent
+  (recovery operations do not append WAL) and registers it with the
+  resolver. Like other DDL effects it is gated on the creating
+  transaction's committed status via the rebuilt CLOG.
+- **Durability order (load-bearing):** dictionary file durable → WAL record
+  appended → anything (page envelope or WAL FPI record) may reference the
+  dict id. Consequently a referenced dictionary is always resolvable: at
+  recovery, dictionaries referenced by post-checkpoint records are either
+  in `<data>/dicts/` already or installed by an earlier-LSN
+  `CreateDictionary` record.
+- **Training (v1):** only during `ALTER TABLE ... SET (compression = 'zstd')`
+  on a table with data (§8). Training samples are the table's decompressed
+  heap page images, sampled evenly across the file, capped at 4096 pages
+  (a 32 MiB corpus).
+  If the corpus is too small for ZDICT to train, the `ALTER` proceeds
+  dict-less — not an error. A freshly created zstd table therefore starts
+  dict-less (plain zstd) until an `ALTER` retrains it; re-running the same
+  `ALTER` retrains from current data and rewrites. Auto-training (e.g. at
+  VACUUM once a table crosses a size threshold) is documented follow-up
+  work.
+
+## 8. `ALTER TABLE ... SET (compression = ...)` semantics
+
+Runs autocommit-only under the exclusive statement guard (writers drained,
+like `VACUUM` / `CREATE INDEX` backfill). Ordered steps:
+
+1. Bind: table must exist; value must be `'none'` or `'zstd'`.
+2. Take the exclusive guard.
+3. If the new setting is `zstd` and the table has data: train a dictionary
+   from current heap page images; persist the dict file (§7). If training
+   is skipped/fails, `active_dict_id` becomes `None`.
+4. Append + flush WAL: `CreateDictionary` (if trained) and a logical
+   `AlterTableCompression { table_id, compression, active_dict_id }` DDL
+   record, then the commit record (immediate-commit DDL, like other DDL).
+   Recovery applies `AlterTableCompression` to the catalog CLOG-gated,
+   exactly like other DDL records.
+5. Update the in-memory catalog and the store's file configs (heap + all
+   index files of the table).
+6. `wal.flush()` — everything below is plain page I/O and must be
+   write-ahead covered.
+7. **Rewrite pass (no WAL records):** for each page `0..page_count` of the
+   heap file, the PK index file, and every secondary index file (skipping
+   buffer-reported abandoned holes): fault the logical image in via the
+   buffer pool and `write_page` it through the store under the new config.
+   Logical bytes and PageLSN are unchanged, so no WAL is needed; the
+   envelope is below the WAL contract. Resident dirty pages are also
+   rewritten — their later checkpoint flush simply writes the same logical
+   image again under the same config.
+8. `store.sync_all()`, release the guard, return command tag `ALTER TABLE`.
+
+**Crash behavior:**
+
+- Crash before step 4's flush completes: the DDL did not commit; the CLOG
+  marks it aborted/in-flight; replay skips the catalog change. A persisted
+  dict file may be orphaned — harmless (unreferenced, small, GC is future
+  work). The old setting stands.
+- Crash during/after the rewrite: the catalog change is durable; files hold
+  a mix of old- and new-encoding slots, every one self-describing and
+  readable; subsequent writes follow the new setting. The rewrite is **not**
+  resumed automatically — re-running the same `ALTER` completes it. This is
+  documented behavior, not corruption.
+
+`compression = 'none'`: steps 3 is skipped, `active_dict_id` becomes `None`,
+and the rewrite writes raw images (un-punching holes as a side effect of
+full-slot writes).
+
+## 9. Control file
+
+Gains a `page_size` field (with a format version bump per the durability
+rules). Validated at open: a mismatch between the binary's compile-time
+`PAGE_SIZE` and the data directory's recorded size is a clean startup
+error naming both values — never reported as page corruption. Existing
+data directories without the field are handled per the crate's existing
+versioning policy (development builds do not migrate old formats).
+
+## 10. What explicitly does not change
+
+- `PAGE_SIZE` stays 8192, compile-time.
+- The `PageStore` / `PageLoader` / `BufferPool` traits, guards, latching,
+  eviction-steal, and checkpoint flow. (Steal and checkpoint call
+  `write_page`, which now compresses — the WAL-durability-before-page-write
+  ordering they already enforce is exactly what makes that safe.)
+- Page format, row/tuple format, line pointers, TIDs, index formats, and
+  the stable `(page, slot)` contract.
+- `apply_physical_redo`'s contract (exact-`PAGE_SIZE` images, PageLSN
+  gating).
+- Recovery structure: schemas (and now dictionaries) install before redo;
+  redo-all with CLOG-decided visibility.
+- VACUUM, HOT, MVCC visibility — all operate on logical images above the
+  seam.
+
+## 11. Performance expectations (design targets, not promises)
+
+- At-rest ceiling with 8 KiB pages over 4 KiB blocks: 50% per page,
+  achieved for every page whose envelope + zstd payload ≤ 4096 bytes.
+  Dictionary compression exists precisely to push more pages under that
+  bar; B-tree pages (prefix-redundant) generally compress well dict-less.
+- WAL: FPI-dominated workloads should see roughly 2–4× fewer WAL bytes,
+  with knock-on reduction in checkpoint frequency via
+  `--checkpoint-wal-bytes`.
+- CPU: zstd-1 ≈ 10–20 µs per 8 KiB image on the WAL/DML path; zstd-3 on
+  flush paths only; decompress ≈ 2–5 µs on buffer miss. Buffer-hit reads
+  and all in-memory mutation are untouched.
+
+## 12. Forward compatibility: page size
+
+Decisions here deliberately keep a future data-dir-creation-time page size
+(8/16/32 KiB) cheap without building it now:
+
+- The control file records `page_size` (§9) — the load-bearing item.
+- All new code references `PAGE_SIZE` (never literal 8192/4096-derived
+  constants) and expresses hole-punch math generically in whole filesystem
+  blocks, which is already correct at 16/32 KiB.
+- The envelope is page-size-agnostic (explicit payload length; decompressed
+  size must equal the data dir's page size). Dictionaries and WAL records
+  are content/length-delimited and equally agnostic.
+- Documented ceiling: heap line pointers store `[offset: u16][len: u16]`,
+  so the page format supports at most 32 KiB pages; 64 KiB requires page-
+  format surgery and is out of consideration.
+- No `initdb` concept is needed later: first boot with an absent control
+  file already *is* initialization; a future `--page-size` flag consumed
+  only at that bootstrap (and validated against the control file thereafter)
+  suffices.
+- The upgrade ladder: (1) this feature's format insurance; (2) if demanded,
+  compile-time 16/32 KiB binary variants (Postgres model) — no format
+  changes needed; (3) only if one binary must serve mixed sizes, the
+  mechanical `[u8; PAGE_SIZE]` → runtime-length refactor, which costs the
+  same then as now and is therefore deferred.
+
+## 13. Testing
+
+- **`compress`:** compress/decompress roundtrips with and without
+  dictionaries; envelope encode/decode/detect (incl. raw-page and all-zero
+  non-collision); CRC tamper detection; unknown codec/version rejection;
+  dict file encode/decode/CRC; training on small corpora (graceful
+  dict-less fallback).
+- **`storage`:** mixed raw/compressed files roundtrip through
+  `load_page`/`write_page`; incompressible pages stored raw; `page_count`
+  invariance under punching; torn/corrupt envelope → structured error on
+  normal read, zeroed frame + FPI repair through the redo path; hole
+  punching actually reclaims blocks (verified via `SEEK_HOLE`/`SEEK_DATA`,
+  skipped when the fs does not support it); store config updates take
+  effect on subsequent writes.
+- **`wal`:** `FullPageImageCompressed` encode/decode; raw fallback when
+  incompressible; replay decompresses (dict and dict-less) before redo;
+  `CreateDictionary` replay installs and registers; dict-id high-water
+  recovery.
+- **`server` integration:** `CREATE TABLE ... WITH (compression = 'zstd')`
+  → insert → restart → select roundtrip; `ALTER TABLE` rewrite in both
+  directions (`none → zstd`, `zstd → none`) with correctness across
+  restart; crash simulated mid-rewrite recovers with mixed encodings
+  readable and re-running `ALTER` completes; recovery resolving a
+  dictionary created after the last checkpoint; VACUUM on a compressed
+  table; `ALTER` rejected inside a transaction block; unknown `WITH`
+  options rejected; control-file `page_size` mismatch rejected cleanly.
+
+## 14. Documentation updates (same change)
+
+- New `docs/specs/crates/compress.md`.
+- `docs/specs/crates/storage.md` — envelope, store config API, corruption
+  semantics, ALTER rewrite pass.
+- `docs/specs/crates/wal.md` — `FullPageImageCompressed`,
+  `CreateDictionary`, replay behavior.
+- `docs/specs/crates/catalog.md` — compression setting, `active_dict_id`,
+  dict-id allocation.
+- `docs/specs/crates/parser.md` — `WITH (...)` clause, `ALTER TABLE` form.
+- `docs/specs/crates/server.md` — ALTER dispatch, recovery dictionary
+  seeding.
+- `docs/specs/crates/control.md` — `page_size` field.
+- `docs/specs/overview.md` — crate graph (`compress`), SQL subset.
+- Project `CLAUDE.md` — SQL subset list gains
+  `ALTER TABLE ... SET (compression = ...)`; crate list mention.
+
+## 15. Future work (recorded, not scoped)
+
+- Dictionary GC (safe once no file slot, catalog reference, or retained WAL
+  record references a dict id — natural after `ALTER` rewrite + checkpoint
+  + truncation).
+- Auto-training at VACUUM past a size threshold.
+- Size-thresholded `HeapInsert` payload compression.
+- Per-index dictionaries.
+- lz4 codec id for CPU-constrained deployments.
+- Page-map/COW store (byte-granular savings) behind the same trait, reusing
+  the envelope as the extent format.
+- Sealed multi-page segments for cold data (where multi-page compression
+  groups are safe); TOAST value compression via the same codec registry.
