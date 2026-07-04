@@ -199,8 +199,8 @@ fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
 mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
-        CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind, PRIMARY_KEY_INDEX_ID,
-        ParsedColumnDef, PgType, SequenceOptions, SqlState, Value,
+        CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
+        PRIMARY_KEY_INDEX_ID, ParsedColumnDef, PgType, SequenceOptions, SqlState, Value,
     };
     use parser::parse;
 
@@ -822,6 +822,31 @@ mod tests {
         assert_eq!(columns[0].name, "id");
         assert_eq!(columns[0].default, Some(common::ParsedDefault::Serial));
         assert_eq!(columns[1].default, None);
+    }
+
+    #[test]
+    fn bind_create_table_resolves_compression_default() {
+        let catalog = MemoryCatalog::empty();
+        let stmt =
+            parse("create table t (id integer primary key) with (compression = 'zstd')").unwrap();
+        let BoundStatement::CreateTable { compression, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(compression, CompressionSetting::Zstd);
+
+        let stmt = parse("create table t (id integer primary key)").unwrap();
+        let BoundStatement::CreateTable { compression, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(compression, CompressionSetting::None);
+    }
+
+    #[test]
+    fn alter_table_does_not_bind() {
+        let catalog = MemoryCatalog::empty();
+        let stmt = parse("alter table t set (compression = 'zstd')").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     #[test]

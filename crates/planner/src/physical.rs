@@ -1,8 +1,8 @@
 use std::ops::Bound;
 
 use common::{
-    ColumnId, ColumnInfo, DataType, IndexId, Key, KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
-    Result, SequenceOptions, TableId, Value,
+    ColumnId, ColumnInfo, CompressionSetting, DataType, IndexId, Key, KeyRange,
+    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId, Value,
 };
 
 use crate::{
@@ -17,6 +17,7 @@ pub enum PhysicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
+        compression: CompressionSetting,
     },
     DropTable {
         table: TableId,
@@ -135,11 +136,13 @@ pub fn physical_plan(
             columns,
             primary_key,
             unique,
+            compression,
         } => Ok(PhysicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
+            compression: *compression,
         }),
         LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
         LogicalPlan::CreateIndex {

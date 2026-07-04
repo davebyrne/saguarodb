@@ -1,6 +1,6 @@
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, IndexId,
-    ParsedColumnDef, SequenceOptions, TableId,
+    ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
+    IndexId, ParsedColumnDef, SequenceOptions, TableId,
 };
 use parser::SetOp;
 
@@ -125,6 +125,9 @@ pub enum BoundStatement {
         /// Column name lists for `UNIQUE` constraints; each becomes a unique
         /// index created together with the table.
         unique: Vec<Vec<String>>,
+        /// The table's storage compression setting, resolved from the
+        /// `WITH (compression = ...)` clause at bind time (`None` if omitted).
+        compression: CompressionSetting,
     },
     DropTable {
         table: TableId,

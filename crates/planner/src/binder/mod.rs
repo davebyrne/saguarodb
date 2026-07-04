@@ -127,10 +127,7 @@ fn bind_inner(
             columns,
             primary_key,
             unique,
-            // Semantic threading of the WITH-clause compression setting is a
-            // later task; the parser field exists now so `parser` and
-            // `planner` stay in lockstep.
-            compression: _,
+            compression,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -155,6 +152,7 @@ fn bind_inner(
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
+                compression: compression.unwrap_or_default(),
             })
         }
         Statement::DropTable { name } => {

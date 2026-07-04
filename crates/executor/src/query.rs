@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    ColumnDefault, ColumnId, ColumnInfo, CopyOptions, DataType, DbError, ExecRow, IndexId, Key,
-    KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions, SequenceSchema,
-    SqlState, StatementContext, TableId, TableSchema, Value,
+    ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
+    ExecRow, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions,
+    SequenceSchema, SqlState, StatementContext, TableId, TableSchema, Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
@@ -105,7 +105,8 @@ impl QueryEngine {
                 columns,
                 primary_key,
                 unique,
-            } => execute_create_table(ctx, name, columns, primary_key, unique),
+                compression,
+            } => execute_create_table(ctx, name, columns, primary_key, unique, *compression),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
                 name,
@@ -891,6 +892,7 @@ fn execute_create_table(
     columns: &[ParsedColumnDef],
     primary_key: &[String],
     unique: &[Vec<String>],
+    compression: CompressionSetting,
 ) -> Result<ExecutionResult> {
     let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
     let mut created_sequences = Vec::new();
@@ -905,20 +907,17 @@ fn execute_create_table(
     }
 
     let columns = columns_with_serial_defaults(columns, &serial)?;
-    // TODO(Task 10): thread the bound statement's compression setting instead
-    // of this placeholder once CREATE TABLE ... COMPRESSION is parsed/bound.
-    let schema = match ctx.catalog.create_table(
-        name.to_string(),
-        columns,
-        primary_key.to_vec(),
-        common::CompressionSetting::None,
-    ) {
-        Ok(schema) => schema,
-        Err(err) => {
-            cleanup_serial_sequences(ctx, &created_sequences);
-            return Err(err);
-        }
-    };
+    let schema =
+        match ctx
+            .catalog
+            .create_table(name.to_string(), columns, primary_key.to_vec(), compression)
+        {
+            Ok(schema) => schema,
+            Err(err) => {
+                cleanup_serial_sequences(ctx, &created_sequences);
+                return Err(err);
+            }
+        };
     if let Err(err) = ctx.schema_ops.create_table(&ctx.statement, &schema) {
         cleanup_created_table(ctx, schema.id, &created_sequences);
         return Err(err);

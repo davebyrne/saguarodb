@@ -1,5 +1,6 @@
 use common::{
-    ColumnId, ColumnInfo, DbError, IndexId, ParsedColumnDef, Result, SequenceOptions, TableId,
+    ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result,
+    SequenceOptions, TableId,
 };
 
 use crate::{
@@ -15,6 +16,7 @@ pub enum LogicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
+        compression: CompressionSetting,
     },
     DropTable {
         table: TableId,
@@ -122,11 +124,13 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns,
             primary_key,
             unique,
+            compression,
         } => Ok(LogicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
+            compression: *compression,
         }),
         BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
         BoundStatement::CreateIndex {
