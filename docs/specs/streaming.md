@@ -161,9 +161,10 @@ enum StreamOutcome {
 New server entry points (mirroring the existing `execute_simple_*` /
 `execute_prepared_*` shapes, plus a channel sender):
 
-- `execute_simple_streamed(sql, txn, default_isolation, cancel, seqs, row_tx)
+- `execute_simple_streamed(sql, txn, default_isolation, cancel, seqs, session_info, row_tx)
   -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>)`
-- an analogous `execute_prepared_*_streamed` for the extended `Execute` path.
+- analogous `execute_prepared_*_streamed` entry points for the extended `Execute`
+  path, also carrying the connection's `SessionInfo`.
 
 For a `Read` statement that is a plain SELECT, the read helpers build a
 channel-backed `RowSink` and call `execute_query_streamed`, returning

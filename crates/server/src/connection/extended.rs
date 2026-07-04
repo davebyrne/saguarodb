@@ -41,6 +41,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session_sequences = self.session_sequences.clone();
+        let session_info = self.session_info.clone();
         let session_gucs = self.session_gucs.clone();
 
         // When an explicit transaction is open on this session, the extended-
@@ -79,6 +80,7 @@ impl Session {
                     default_isolation,
                     &cancel,
                     session_sequences,
+                    session_info,
                     session_gucs,
                     row_tx,
                 )
@@ -91,6 +93,7 @@ impl Session {
                     &params,
                     &cancel,
                     session_sequences,
+                    session_info,
                     row_tx,
                 );
                 (None, default_isolation, result)

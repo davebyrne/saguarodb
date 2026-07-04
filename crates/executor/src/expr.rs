@@ -496,6 +496,16 @@ fn eval_function(
     }
 
     match name {
+        "version" => Ok(Value::Text(format!(
+            "PostgreSQL 16.0 (SaguaroDB {})",
+            env!("CARGO_PKG_VERSION")
+        ))),
+        "current_database" | "current_catalog" => {
+            Ok(Value::Text(ctx.session_info.database.clone()))
+        }
+        "current_schema" => Ok(Value::Text("public".to_string())),
+        "current_user" | "session_user" | "user" => Ok(Value::Text(ctx.session_info.user.clone())),
+        "pg_backend_pid" => Ok(Value::Integer(i64::from(ctx.session_info.backend_pid))),
         "upper" => Ok(Value::Text(function_text(&values[0])?.to_uppercase())),
         "lower" => Ok(Value::Text(function_text(&values[0])?.to_lowercase())),
         "trim" => Ok(Value::Text(function_text(&values[0])?.trim().to_string())),

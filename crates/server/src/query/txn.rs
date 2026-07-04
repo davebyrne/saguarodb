@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    DbError, IsolationLevel, Result, SequenceManager, SessionSequenceState, Snapshot, SqlState,
-    StatementContext,
+    DbError, IsolationLevel, Result, SequenceManager, SessionInfo, SessionSequenceState, Snapshot,
+    SqlState, StatementContext,
 };
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
@@ -20,16 +20,19 @@ use crate::registry::AdvertisedSnapshot;
 pub(super) struct StatementRuntime<'a> {
     cancel: &'a Arc<AtomicBool>,
     session_sequences: Arc<SessionSequenceState>,
+    session_info: Arc<SessionInfo>,
 }
 
 impl<'a> StatementRuntime<'a> {
     pub(super) fn new(
         cancel: &'a Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> Self {
         Self {
             cancel,
             session_sequences,
+            session_info,
         }
     }
 }
@@ -646,6 +649,7 @@ impl QueryService {
                 .with_live_txns(live_txns)
                 .with_sequence_manager(sequence_manager)
                 .with_session_sequences(runtime.session_sequences)
+                .with_session_info(runtime.session_info)
                 // Install the lock manager (so an in-progress row-lock conflict blocks
                 // instead of failing fast) and the connection's cancel flag (so a
                 // blocked writer is interruptible) — `docs/specs/deadlock.md`.

@@ -2,7 +2,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use common::{DbError, IsolationLevel, Result, SessionSequenceState, SqlState};
+use common::{DbError, IsolationLevel, Result, SessionInfo, SessionSequenceState, SqlState};
 use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext};
 use tokio::sync::mpsc;
 
@@ -33,13 +33,16 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> (Option<Transaction>, Result<u64>) {
         match slot {
             None => (
                 None,
-                self.copy_in_autocommit(job, cancel, rx, session_sequences),
+                self.copy_in_autocommit(job, cancel, rx, session_sequences, session_info),
             ),
-            Some(txn) => self.copy_in_transaction(txn, job, cancel, rx, session_sequences),
+            Some(txn) => {
+                self.copy_in_transaction(txn, job, cancel, rx, session_sequences, session_info)
+            }
         }
     }
 
@@ -52,6 +55,7 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> Result<u64> {
         let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
         let txn_id = self.register_active_txn();
@@ -65,7 +69,7 @@ impl QueryService {
             IsolationLevel::default(),
             gc_horizon,
             Arc::from([txn_id]),
-            StatementRuntime::new(cancel, session_sequences),
+            StatementRuntime::new(cancel, session_sequences, session_info),
         );
 
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
@@ -108,6 +112,7 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         rx: mpsc::Receiver<CopyInChunk>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> (Option<Transaction>, Result<u64>) {
         if txn.write_guard.is_none()
             && let Err(err) = self.acquire_write_guard(&mut txn)
@@ -127,7 +132,7 @@ impl QueryService {
                 txn.isolation,
                 gc_horizon,
                 txn.live_txns(),
-                StatementRuntime::new(cancel, session_sequences),
+                StatementRuntime::new(cancel, session_sequences, session_info),
             );
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
@@ -153,13 +158,21 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> (Option<Transaction>, Result<u64>) {
         match slot {
             None => (
                 None,
-                self.copy_out_autocommit(job, cancel, frame_tx, session_sequences),
+                self.copy_out_autocommit(job, cancel, frame_tx, session_sequences, session_info),
             ),
-            Some(txn) => self.copy_out_transaction(txn, job, cancel, frame_tx, session_sequences),
+            Some(txn) => self.copy_out_transaction(
+                txn,
+                job,
+                cancel,
+                frame_tx,
+                session_sequences,
+                session_info,
+            ),
         }
     }
 
@@ -171,6 +184,7 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> Result<u64> {
         let (snapshot, _advertised) = self.capture_snapshot(0);
         let ctx = self.execution_context(
@@ -179,7 +193,7 @@ impl QueryService {
             IsolationLevel::default(),
             0,
             Arc::from([0]),
-            StatementRuntime::new(cancel, session_sequences),
+            StatementRuntime::new(cancel, session_sequences, session_info),
         );
         drive_copy_out(&ctx, job, frame_tx)
     }
@@ -193,6 +207,7 @@ impl QueryService {
         cancel: &Arc<AtomicBool>,
         frame_tx: mpsc::Sender<Vec<u8>>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
     ) -> (Option<Transaction>, Result<u64>) {
         let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
         txn.first_statement_ran = true;
@@ -205,7 +220,7 @@ impl QueryService {
                 txn.isolation,
                 0,
                 txn.live_txns(),
-                StatementRuntime::new(cancel, session_sequences),
+                StatementRuntime::new(cancel, session_sequences, session_info),
             );
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);

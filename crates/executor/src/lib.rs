@@ -22,8 +22,8 @@ mod tests {
     use common::{
         ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
         DataType, ExecRow, Key, ParsedColumnDef, RelationKind, Result, Row, RowId, RowIdentity,
-        SequenceManager, SessionSequenceState, SqlState, StatementContext, TableSchema,
-        ToastOptions, Value,
+        SequenceManager, SessionInfo, SessionSequenceState, SqlState, StatementContext,
+        TableSchema, ToastOptions, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -1484,6 +1484,68 @@ mod tests {
             vec![Row {
                 values: vec![Value::Integer(4), Value::Text("é".to_string())]
             }]
+        );
+    }
+
+    #[test]
+    fn system_information_functions_read_session_info() {
+        let ctx = StatementContext::new(0).with_session_info(Arc::new(SessionInfo {
+            user: "alice".to_string(),
+            database: "appdb".to_string(),
+            backend_pid: 4242,
+        }));
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let eval = |name: &str, data_type: DataType| {
+            eval_expr(
+                &ctx,
+                &BoundExpr::Function {
+                    name: name.to_string(),
+                    args: Vec::new(),
+                    data_type,
+                    nullable: false,
+                },
+                &row,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            eval("version", DataType::Text),
+            Value::Text(format!(
+                "PostgreSQL 16.0 (SaguaroDB {})",
+                env!("CARGO_PKG_VERSION")
+            ))
+        );
+        assert_eq!(
+            eval("current_database", DataType::Text),
+            Value::Text("appdb".to_string())
+        );
+        assert_eq!(
+            eval("current_catalog", DataType::Text),
+            Value::Text("appdb".to_string())
+        );
+        assert_eq!(
+            eval("current_schema", DataType::Text),
+            Value::Text("public".to_string())
+        );
+        assert_eq!(
+            eval("current_user", DataType::Text),
+            Value::Text("alice".to_string())
+        );
+        assert_eq!(
+            eval("session_user", DataType::Text),
+            Value::Text("alice".to_string())
+        );
+        assert_eq!(
+            eval("user", DataType::Text),
+            Value::Text("alice".to_string())
+        );
+        assert_eq!(
+            eval("pg_backend_pid", DataType::Integer),
+            Value::Integer(4242)
         );
     }
 

@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use common::{
     CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, PgType, Result,
-    SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
+    SessionInfo, SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -276,6 +276,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            Arc::new(SessionInfo::default()),
             &gucs,
             None,
         );
@@ -303,6 +304,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
         gucs: Arc<SessionGucs>,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
@@ -319,6 +321,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            session_info,
             &gucs,
             Some(&mut sink),
         )
@@ -481,6 +484,7 @@ impl QueryService {
             params,
             cancel,
             Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
             None,
         )
         .map(StreamOutcome::expect_direct)
@@ -492,6 +496,7 @@ impl QueryService {
         params: &[Value],
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
@@ -514,17 +519,17 @@ impl QueryService {
         match prepared.class {
             StatementClass::Read => match class {
                 StatementClass::Read => {
-                    self.autocommit_read(bound, cancel, session_sequences, sink)
+                    self.autocommit_read(bound, cancel, session_sequences, session_info, sink)
                 }
                 // A read promoted to a write (e.g. `SELECT nextval(...)`) is
                 // materialized, not streamed.
                 StatementClass::Write => self
-                    .autocommit_bound_write(bound, cancel, session_sequences)
+                    .autocommit_bound_write(bound, cancel, session_sequences, session_info)
                     .map(StreamOutcome::Direct),
                 _ => unreachable!("classify_bound only promotes reads to writes"),
             },
             StatementClass::Write | StatementClass::Ddl => self
-                .autocommit_bound_write(bound, cancel, session_sequences)
+                .autocommit_bound_write(bound, cancel, session_sequences, session_info)
                 .map(StreamOutcome::Direct),
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
@@ -562,6 +567,7 @@ impl QueryService {
         params: &[Value],
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> Result<StreamOutcome> {
         let mut sink = ChannelRowSink::new(row_tx);
@@ -570,6 +576,7 @@ impl QueryService {
             params,
             cancel,
             session_sequences,
+            session_info,
             Some(&mut sink),
         )
     }
@@ -597,6 +604,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
         gucs: Arc<SessionGucs>,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
@@ -667,8 +675,7 @@ impl QueryService {
                     txn,
                     class,
                     BindSource::Bound(bound),
-                    cancel,
-                    session_sequences,
+                    StatementRuntime::new(cancel, session_sequences, session_info),
                     sink,
                 );
                 (slot, default_isolation, result)
@@ -681,17 +688,26 @@ impl QueryService {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
                         match class {
-                            StatementClass::Read => {
-                                self.autocommit_read(bound, cancel, session_sequences, sink)
-                            }
+                            StatementClass::Read => self.autocommit_read(
+                                bound,
+                                cancel,
+                                session_sequences,
+                                session_info,
+                                sink,
+                            ),
                             StatementClass::Write => self
-                                .autocommit_bound_write(bound, cancel, session_sequences)
+                                .autocommit_bound_write(
+                                    bound,
+                                    cancel,
+                                    session_sequences,
+                                    session_info,
+                                )
                                 .map(StreamOutcome::Direct),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
                     StatementClass::Write | StatementClass::Ddl => self
-                        .autocommit_bound_write(bound, cancel, session_sequences)
+                        .autocommit_bound_write(bound, cancel, session_sequences, session_info)
                         .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
@@ -732,6 +748,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
         gucs: Arc<SessionGucs>,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
@@ -743,6 +760,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            session_info,
             gucs,
             Some(&mut sink),
         )
@@ -1151,8 +1169,8 @@ mod tests {
     use common::{
         ConcurrencyController, DbError, FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn,
         PageFlushInfo, ParsedColumnDef, PgType, RelationKind, Result, RwLockConcurrencyController,
-        SequenceId, SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId,
-        TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
+        SequenceId, SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState,
+        TableId, TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -3329,6 +3347,7 @@ mod tests {
             IsolationLevel::default(),
             &cancel,
             Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
             Arc::new(super::SessionGucs::default()),
             row_tx,
         );

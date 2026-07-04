@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value,
+    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionInfo, SessionSequenceState, SqlState,
+    Value,
 };
 use executor::ExecutionResult;
 use protocol::{
@@ -241,6 +242,9 @@ struct Session {
     /// `setval(..., true)` record into this map; `currval` reads it and errors
     /// before any value is recorded on this connection.
     session_sequences: Arc<SessionSequenceState>,
+    /// Connection identity from startup plus BackendKeyData, used by PostgreSQL
+    /// system information functions.
+    session_info: Arc<SessionInfo>,
     /// Per-connection session configuration parameters used by driver startup
     /// probes (`SET`/`SHOW`/`RESET`/`DISCARD ALL`).
     session_gucs: Arc<SessionGucs>,
@@ -340,6 +344,7 @@ impl Session {
             // §10 Milestone G2).
             default_isolation: IsolationLevel::default(),
             session_sequences: Arc::new(SessionSequenceState::new()),
+            session_info: Arc::new(SessionInfo::default()),
             session_gucs: Arc::new(SessionGucs::default()),
             reported_application_name: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -464,6 +469,8 @@ impl Session {
                 database,
                 application_name,
             } => {
+                let session_user = user.clone();
+                let session_database = database.clone().unwrap_or_else(|| session_user.clone());
                 let startup_application_name = application_name.clone().unwrap_or_default();
                 let mut replies = self.state.handle_message(ClientMessage::Startup {
                     user,
@@ -481,6 +488,11 @@ impl Session {
                     .cancel_registry
                     .register(self.cancel.clone());
                 self.backend_key = Some(key);
+                self.session_info = Arc::new(SessionInfo {
+                    user: session_user,
+                    database: session_database,
+                    backend_pid: key.process_id,
+                });
                 let insert_at = replies.len().saturating_sub(1);
                 replies.insert(
                     insert_at,

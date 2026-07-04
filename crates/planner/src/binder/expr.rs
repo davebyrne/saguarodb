@@ -20,7 +20,7 @@ pub(super) fn bind_expr(
     match expr {
         Expr::Literal(value) => bind_literal(value, expected),
         Expr::Placeholder(index) => bind_placeholder(ctx, *index, expected),
-        Expr::ColumnRef { table, column } => resolve_column(ctx, table.as_deref(), column),
+        Expr::ColumnRef { table, column } => bind_column_ref(ctx, table.as_deref(), column),
         Expr::Subquery(select) => bind_scalar_subquery(ctx, select),
         Expr::BinaryOp { left, op, right } => bind_binary_op(ctx, left, op.clone(), right),
         Expr::UnaryOp { op, expr } => bind_unary_op(ctx, op.clone(), expr),
@@ -536,7 +536,44 @@ fn bind_function(
         "nullif" => return bind_nullif(ctx, args),
         _ => {}
     }
+    if is_system_info_function(&name) {
+        return bind_system_info_function(&name, args);
+    }
     bind_scalar_function(ctx, &name, args)
+}
+
+fn bind_system_info_function(name: &str, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let args = expr_args(name, args)?;
+    if !args.is_empty() {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("function {name} expects no arguments"),
+        ));
+    }
+    let data_type = match name {
+        "pg_backend_pid" => DataType::Integer,
+        _ => DataType::Text,
+    };
+    Ok(BoundExpr::Function {
+        name: name.to_string(),
+        args: Vec::new(),
+        data_type,
+        nullable: false,
+    })
+}
+
+fn is_system_info_function(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "current_database"
+            | "current_catalog"
+            | "current_schema"
+            | "current_user"
+            | "session_user"
+            | "user"
+            | "pg_backend_pid"
+    )
 }
 
 fn bind_nextval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
@@ -1285,7 +1322,7 @@ fn update_case_type(
     }
 }
 
-fn resolve_column(ctx: &BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
+fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
     let mut matches = Vec::new();
     for binding in &ctx.bindings {
         // A `qualified_only` binding (the `excluded` pseudo-table) participates
@@ -1308,6 +1345,9 @@ fn resolve_column(ctx: &BindContext, table: Option<&str>, column: &str) -> Resul
 
     match matches.as_slice() {
         [(binding, column)] => Ok(input_ref(binding, column)),
+        [] if table.is_none() && column.eq_ignore_ascii_case("current_schema") => {
+            bind_system_info_function("current_schema", &[])
+        }
         [] => Err(plan_error(
             SqlState::UndefinedColumn,
             format!("column {column} does not exist"),

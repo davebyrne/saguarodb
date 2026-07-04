@@ -88,6 +88,53 @@ async fn loopback_startup_and_simple_query_return_protocol_rows() {
 }
 
 #[tokio::test]
+async fn system_information_functions_use_startup_session_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            handle_connection(socket, app).await.unwrap();
+        })
+    };
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(&startup_bytes_with_database("driver_user", "driver_db"))
+        .await
+        .unwrap();
+    let startup = read_until_ready(&mut client).await;
+    let backend_pid = backend_pid_from_startup(&startup);
+
+    client
+        .write_all(&query_bytes(
+            "select current_user, current_database(), current_catalog, current_schema, \
+             pg_backend_pid()",
+        ))
+        .await
+        .unwrap();
+    let response = read_until_ready(&mut client).await;
+    let rows = data_row_text_fields(&response);
+
+    assert_eq!(
+        rows,
+        vec![vec![
+            "driver_user".to_string(),
+            "driver_db".to_string(),
+            "driver_db".to_string(),
+            "public".to_string(),
+            backend_pid.to_string(),
+        ]]
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn session_characteristics_default_is_per_connection_over_the_wire() {
     // End-to-end (Milestone G2): `SET SESSION CHARACTERISTICS ... REPEATABLE READ`
     // on one connection makes a later plain `BEGIN` on THAT connection default to
@@ -201,11 +248,24 @@ async fn session_characteristics_default_is_per_connection_over_the_wire() {
 }
 
 fn startup_bytes(user: &str) -> Vec<u8> {
+    startup_bytes_with_database_opt(user, None)
+}
+
+fn startup_bytes_with_database(user: &str, database: &str) -> Vec<u8> {
+    startup_bytes_with_database_opt(user, Some(database))
+}
+
+fn startup_bytes_with_database_opt(user: &str, database: Option<&str>) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&196608i32.to_be_bytes());
     body.extend_from_slice(b"user\0");
     body.extend_from_slice(user.as_bytes());
     body.push(0);
+    if let Some(database) = database {
+        body.extend_from_slice(b"database\0");
+        body.extend_from_slice(database.as_bytes());
+        body.push(0);
+    }
     body.push(0);
 
     let mut packet = Vec::new();
@@ -225,6 +285,52 @@ fn query_bytes(sql: &str) -> Vec<u8> {
 
 fn terminate_bytes() -> Vec<u8> {
     vec![b'X', 0, 0, 0, 4]
+}
+
+fn backend_pid_from_startup(response: &[u8]) -> i32 {
+    let mut offset = 0;
+    while offset + 5 <= response.len() {
+        let tag = response[offset];
+        let len = i32::from_be_bytes(response[offset + 1..offset + 5].try_into().unwrap());
+        let len = usize::try_from(len).unwrap();
+        let body_start = offset + 5;
+        let body_end = offset + 1 + len;
+        if tag == b'K' {
+            return i32::from_be_bytes(response[body_start..body_start + 4].try_into().unwrap());
+        }
+        offset = body_end;
+    }
+    panic!("startup response did not include BackendKeyData");
+}
+
+fn data_row_text_fields(response: &[u8]) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    while offset + 5 <= response.len() {
+        let tag = response[offset];
+        let len = i32::from_be_bytes(response[offset + 1..offset + 5].try_into().unwrap());
+        let len = usize::try_from(len).unwrap();
+        let body_start = offset + 5;
+        let body_end = offset + 1 + len;
+        if tag == b'D' {
+            let mut body = body_start;
+            let fields = u16::from_be_bytes(response[body..body + 2].try_into().unwrap());
+            body += 2;
+            let mut row = Vec::new();
+            for _ in 0..fields {
+                let field_len = i32::from_be_bytes(response[body..body + 4].try_into().unwrap());
+                body += 4;
+                assert!(field_len >= 0, "test query should not return NULL fields");
+                let field_len = usize::try_from(field_len).unwrap();
+                let text = std::str::from_utf8(&response[body..body + field_len]).unwrap();
+                row.push(text.to_string());
+                body += field_len;
+            }
+            rows.push(row);
+        }
+        offset = body_end;
+    }
+    rows
 }
 
 fn tagged(tag: u8, body: &[u8]) -> Vec<u8> {

@@ -48,6 +48,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session_sequences = self.session_sequences.clone();
+        let session_info = self.session_info.clone();
         let session_gucs = self.session_gucs.clone();
         // A SELECT streams its rows through this bounded channel: the blocking
         // producer sends `Start` (columns) then `Rows` batches; this async task
@@ -72,6 +73,7 @@ impl Session {
                 default_isolation,
                 &cancel,
                 session_sequences,
+                session_info,
                 session_gucs,
                 row_tx,
             )

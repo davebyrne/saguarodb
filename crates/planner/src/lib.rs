@@ -1080,6 +1080,163 @@ mod tests {
     }
 
     #[test]
+    fn binder_types_system_information_functions() {
+        let catalog = catalog_with_users();
+        let stmt = parse(
+            "select version(), current_database(), current_catalog, current_user, \
+             session_user, user, pg_backend_pid()",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        let names = select
+            .columns
+            .iter()
+            .map(|item| match &item.expr {
+                BoundExpr::Function { name, nullable, .. } => {
+                    assert!(!nullable);
+                    name.as_str()
+                }
+                expr => panic!("expected function expression, got {expr:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "version",
+                "current_database",
+                "current_catalog",
+                "current_user",
+                "session_user",
+                "user",
+                "pg_backend_pid",
+            ]
+        );
+        for column in &select.output_schema[..6] {
+            assert_eq!(column.data_type, DataType::Text);
+        }
+        assert_eq!(select.output_schema[6].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn binder_binds_current_schema_fallback_but_prefers_real_column() {
+        let empty = MemoryCatalog::empty();
+        let bound = bind(&parse("select current_schema").unwrap(), &empty).unwrap();
+
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            &select.columns[0].expr,
+            BoundExpr::Function {
+                name,
+                data_type,
+                nullable,
+                ..
+            } if name == "current_schema" && *data_type == DataType::Text && !*nullable
+        ));
+
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "schemas".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                    ParsedColumnDef {
+                        name: "current_schema".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let bound = bind(
+            &parse("select current_schema from schemas").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert!(matches!(
+            &select.columns[0].expr,
+            BoundExpr::InputRef {
+                data_type,
+                nullable,
+                ..
+            } if *data_type == DataType::Text && *nullable
+        ));
+
+        catalog
+            .create_table(
+                "other_schemas".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                    ParsedColumnDef {
+                        name: "current_schema".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+            )
+            .unwrap();
+        let err = bind(
+            &parse("select current_schema from schemas, other_schemas").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+        assert!(err.message.contains("ambiguous"));
+    }
+
+    #[test]
+    fn binder_rejects_system_information_function_arguments() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select version(1)").unwrap(), &catalog).unwrap_err();
+
+        assert_eq!(err.kind, ErrorKind::Plan);
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
     fn binder_binds_sequence_functions_and_mutation_classifier() {
         let catalog = catalog_with_users_and_sequence();
         let sequence = catalog
