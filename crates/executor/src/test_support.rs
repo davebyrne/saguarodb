@@ -44,6 +44,7 @@ impl ExecutorHarness {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         let storage = MemoryStorage::empty();

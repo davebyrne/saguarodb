@@ -1330,12 +1330,32 @@ mod tests {
             name: String,
             columns: Vec<ParsedColumnDef>,
             primary_key: Vec<String>,
+            compression: common::CompressionSetting,
         ) -> Result<TableSchema> {
-            self.inner.create_table(name, columns, primary_key)
+            self.inner
+                .create_table(name, columns, primary_key, compression)
         }
 
         fn drop_table(&self, id: TableId) -> Result<()> {
             self.inner.drop_table(id)
+        }
+
+        fn set_table_compression(
+            &self,
+            table: TableId,
+            compression: common::CompressionSetting,
+            active_dict_id: Option<u32>,
+        ) -> Result<TableSchema> {
+            self.inner
+                .set_table_compression(table, compression, active_dict_id)
+        }
+
+        fn allocate_dictionary_id(&self) -> Result<u32> {
+            self.inner.allocate_dictionary_id()
+        }
+
+        fn reserve_dictionary_id(&self, id: u32) -> Result<()> {
+            self.inner.reserve_dictionary_id(id)
         }
 
         fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {

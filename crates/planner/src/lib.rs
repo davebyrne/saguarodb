@@ -230,6 +230,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog
@@ -286,6 +287,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog
@@ -315,6 +317,7 @@ mod tests {
                     },
                 ],
                 vec!["code".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog
@@ -374,6 +377,7 @@ mod tests {
                     },
                 ],
                 vec!["small".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog

@@ -5,8 +5,8 @@ pub use memory::{CatalogSnapshot, MemoryCatalog};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 
 use common::{
-    IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema,
-    TableId, TableSchema,
+    CompressionSetting, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions,
+    SequenceSchema, TableId, TableSchema,
 };
 
 pub trait CatalogManager: Send + Sync {
@@ -23,8 +23,24 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        compression: CompressionSetting,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+    /// Applies an ALTER (or replays one during recovery): locates the live
+    /// table by id and mutates its compression setting and active dictionary
+    /// id in place, returning the updated clone.
+    fn set_table_compression(
+        &self,
+        table: TableId,
+        compression: CompressionSetting,
+        active_dict_id: Option<u32>,
+    ) -> Result<TableSchema>;
+    /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
+    /// "no dictionary").
+    fn allocate_dictionary_id(&self) -> Result<u32>;
+    /// Advances the dictionary id allocator's high-water mark past `id`
+    /// (replay and orphan-dictionary-file recovery); never rewinds it.
+    fn reserve_dictionary_id(&self, id: u32) -> Result<()>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
@@ -97,6 +113,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog
@@ -127,6 +144,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -144,6 +162,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -152,6 +171,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap_err();
 
@@ -176,6 +196,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -215,6 +236,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap_err();
 
@@ -232,6 +254,7 @@ mod tests {
                 "orders".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         let failed_index = catalog
@@ -252,6 +275,7 @@ mod tests {
                 "orders".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         let recreated_index = catalog
@@ -284,6 +308,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         assert_eq!(table.id, 10);
@@ -525,6 +550,7 @@ mod tests {
             sequences_by_name: HashMap::from([("users_id_seq".to_string(), 1)]),
             sequences_by_id: HashMap::from([(1, sequence)]),
             next_sequence_id: 2,
+            next_dictionary_id: 1,
         };
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
@@ -583,6 +609,7 @@ mod tests {
                     pg_type: None,
                 }],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -614,6 +641,7 @@ mod tests {
                     pg_type: None,
                 }],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -645,6 +673,7 @@ mod tests {
                     pg_type: None,
                 }],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap_err();
         assert_eq!(err.code, SqlState::DependentObjectsStillExist);
@@ -670,6 +699,7 @@ mod tests {
                     pg_type: None,
                 }],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -802,6 +832,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string(), "id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap_err();
 
@@ -814,7 +845,12 @@ mod tests {
         let catalog = MemoryCatalog::empty();
 
         let err = catalog
-            .create_table("users".to_string(), vec![id_column(false)], vec![])
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec![],
+                CompressionSetting::None,
+            )
             .unwrap_err();
 
         assert_eq!(err.kind, ErrorKind::Plan);
@@ -840,6 +876,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string(), "tenant".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -859,6 +896,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["missing".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap_err();
 
@@ -874,6 +912,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -887,6 +926,7 @@ mod tests {
                 "accounts".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         assert_eq!(accounts.id, users.id + 1);
@@ -900,6 +940,7 @@ mod tests {
                 "users".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -913,6 +954,7 @@ mod tests {
                 "accounts".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
 
@@ -954,6 +996,7 @@ mod tests {
                 "accounts".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         assert_eq!(next.id, 8);
@@ -1079,6 +1122,7 @@ mod tests {
                 "accounts".to_string(),
                 vec![id_column(false)],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         catalog
@@ -1361,5 +1405,84 @@ mod tests {
 
         // The validated load path accepts it.
         MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    fn create_table_stores_compression_setting() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::Zstd,
+            )
+            .unwrap();
+        assert_eq!(schema.compression, CompressionSetting::Zstd);
+        assert_eq!(schema.active_dict_id, None);
+    }
+
+    #[test]
+    fn set_table_compression_updates_and_persists() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let updated = catalog
+            .set_table_compression(schema.id, CompressionSetting::Zstd, Some(3))
+            .unwrap();
+        assert_eq!(updated.compression, CompressionSetting::Zstd);
+        assert_eq!(updated.active_dict_id, Some(3));
+        // Round-trips through the snapshot.
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .get_table(schema.id)
+                .unwrap()
+                .unwrap()
+                .active_dict_id,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn dictionary_ids_allocate_monotonically_and_survive_reserve() {
+        let catalog = MemoryCatalog::empty();
+        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 1);
+        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 2);
+        catalog.reserve_dictionary_id(10).unwrap();
+        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 11);
+        // Reserving below the mark never rewinds it.
+        catalog.reserve_dictionary_id(3).unwrap();
+        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 12);
+    }
+
+    #[test]
+    fn snapshot_without_dictionary_field_defaults_next_id_to_one() {
+        // Mirror snapshot_without_index_fields_deserializes_to_empty_indexes:
+        // a catalog persisted before compression/dictionary ids existed.
+        let json = r#"{
+            "tables_by_name": {"users": 1},
+            "tables_by_id": {"1": {
+                "id": 1,
+                "name": "users",
+                "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
+                "primary_key": [0]
+            }},
+            "next_table_id": 2
+        }"#;
+
+        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
+        assert_eq!(snapshot.next_dictionary_id, 1);
+
+        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        assert_eq!(catalog.allocate_dictionary_id().unwrap(), 1);
     }
 }

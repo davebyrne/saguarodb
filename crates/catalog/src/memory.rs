@@ -29,6 +29,12 @@ pub struct CatalogSnapshot {
     pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     #[serde(default = "default_next_sequence_id")]
     pub next_sequence_id: SequenceId,
+    // Dictionary-id allocator for trained compression dictionaries. Defaults
+    // so catalogs written before compression existed still deserialize (no
+    // dictionaries yet, first allocation is 1; 0 is reserved to mean "no
+    // dictionary").
+    #[serde(default = "default_next_dictionary_id")]
+    pub next_dictionary_id: u32,
 }
 
 impl Default for CatalogSnapshot {
@@ -43,6 +49,7 @@ impl Default for CatalogSnapshot {
             sequences_by_name: HashMap::new(),
             sequences_by_id: HashMap::new(),
             next_sequence_id: default_next_sequence_id(),
+            next_dictionary_id: default_next_dictionary_id(),
         }
     }
 }
@@ -52,6 +59,10 @@ fn default_next_index_id() -> IndexId {
 }
 
 fn default_next_sequence_id() -> SequenceId {
+    1
+}
+
+fn default_next_dictionary_id() -> u32 {
     1
 }
 
@@ -135,6 +146,7 @@ impl CatalogManager for MemoryCatalog {
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
         snapshot.next_index_id = snapshot.next_index_id.max(current.next_index_id);
         snapshot.next_sequence_id = snapshot.next_sequence_id.max(current.next_sequence_id);
+        snapshot.next_dictionary_id = snapshot.next_dictionary_id.max(current.next_dictionary_id);
         *current = snapshot;
         Ok(())
     }
@@ -178,6 +190,7 @@ impl CatalogManager for MemoryCatalog {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        compression: CompressionSetting,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
         reject_duplicate_table_name(&snapshot, &name)?;
@@ -186,7 +199,7 @@ impl CatalogManager for MemoryCatalog {
         let next_table_id = table_id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
-        let schema = build_schema(&snapshot, table_id, name, columns, primary_key)?;
+        let schema = build_schema(&snapshot, table_id, name, columns, primary_key, compression)?;
 
         snapshot
             .tables_by_name
@@ -198,6 +211,43 @@ impl CatalogManager for MemoryCatalog {
 
     fn drop_table(&self, id: TableId) -> Result<()> {
         self.apply_drop_table(id)
+    }
+
+    fn set_table_compression(
+        &self,
+        table: TableId,
+        compression: CompressionSetting,
+        active_dict_id: Option<u32>,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        // An externally-supplied dictionary id (a fresh allocation on the live
+        // ALTER path, or a replayed id during recovery) must never be at or
+        // past the allocator's high-water mark, so bump it the same way every
+        // other apply_* path advances its id allocator past an installed id.
+        if let Some(id) = active_dict_id {
+            reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")?;
+        }
+        let schema = snapshot
+            .tables_by_id
+            .get_mut(&table)
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        schema.compression = compression;
+        schema.active_dict_id = active_dict_id;
+        Ok(schema.clone())
+    }
+
+    fn allocate_dictionary_id(&self) -> Result<u32> {
+        let mut snapshot = self.write_snapshot()?;
+        let id = snapshot.next_dictionary_id;
+        snapshot.next_dictionary_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog dictionary id overflow"))?;
+        Ok(id)
+    }
+
+    fn reserve_dictionary_id(&self, id: u32) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")
     }
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
@@ -405,6 +455,7 @@ fn build_schema(
     name: String,
     columns: Vec<ParsedColumnDef>,
     primary_key: Vec<String>,
+    compression: CompressionSetting,
 ) -> Result<TableSchema> {
     let mut seen_names = HashSet::new();
     let mut column_ids_by_name = HashMap::new();
@@ -482,7 +533,7 @@ fn build_schema(
         name,
         columns: assigned_columns,
         primary_key: primary_key_ids,
-        compression: CompressionSetting::None,
+        compression,
         active_dict_id: None,
     })
 }
@@ -645,6 +696,27 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     }
 
     validate_indexes(snapshot)?;
+    validate_dictionary_ids(snapshot)?;
+    Ok(())
+}
+
+fn validate_dictionary_ids(snapshot: &CatalogSnapshot) -> Result<()> {
+    if snapshot.next_dictionary_id < 1 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_dictionary_id {} must be at least 1 (0 is reserved for \"no dictionary\")",
+            snapshot.next_dictionary_id
+        )));
+    }
+    for schema in snapshot.tables_by_id.values() {
+        if let Some(active_dict_id) = schema.active_dict_id
+            && active_dict_id >= snapshot.next_dictionary_id
+        {
+            return Err(DbError::internal(format!(
+                "catalog snapshot table {} active_dict_id {} is not less than next_dictionary_id {}",
+                schema.name, active_dict_id, snapshot.next_dictionary_id
+            )));
+        }
+    }
     Ok(())
 }
 

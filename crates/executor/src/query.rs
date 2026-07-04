@@ -905,10 +905,14 @@ fn execute_create_table(
     }
 
     let columns = columns_with_serial_defaults(columns, &serial)?;
-    let schema = match ctx
-        .catalog
-        .create_table(name.to_string(), columns, primary_key.to_vec())
-    {
+    // TODO(Task 10): thread the bound statement's compression setting instead
+    // of this placeholder once CREATE TABLE ... COMPRESSION is parsed/bound.
+    let schema = match ctx.catalog.create_table(
+        name.to_string(),
+        columns,
+        primary_key.to_vec(),
+        common::CompressionSetting::None,
+    ) {
         Ok(schema) => schema,
         Err(err) => {
             cleanup_serial_sequences(ctx, &created_sequences);
