@@ -333,12 +333,6 @@ impl QueryService {
                 "savepoints require the simple query protocol",
             ));
         }
-        if let StatementClass::SessionConfig = class {
-            return Err(DbError::plan(
-                SqlState::FeatureNotSupported,
-                "session configuration statements require the simple query protocol",
-            ));
-        }
         if let StatementClass::TransactionControl(_) = class {
             // BEGIN/COMMIT/ROLLBACK take no parameters and produce no rows; they do
             // not bind. Carry the prepared statement with a no-op bound payload so
@@ -349,6 +343,7 @@ impl QueryService {
                 class,
                 bound: None,
                 maintenance: None,
+                session_config: None,
                 param_pg_types: Vec::new(),
                 result_columns: None,
             });
@@ -361,8 +356,20 @@ impl QueryService {
                 class,
                 bound: None,
                 maintenance: Some(statement),
+                session_config: None,
                 param_pg_types: Vec::new(),
                 result_columns: None,
+            });
+        }
+        if let StatementClass::SessionConfig = class {
+            let result_columns = gucs::session_config_result_columns(&statement);
+            return Ok(PreparedStatement {
+                class,
+                bound: None,
+                maintenance: None,
+                session_config: Some(statement),
+                param_pg_types: Vec::new(),
+                result_columns,
             });
         }
         // The binder resolves parameter types as `DataType` (declared or inferred).
@@ -394,6 +401,7 @@ impl QueryService {
             class,
             bound: Some(bound),
             maintenance: None,
+            session_config: None,
             param_pg_types,
             result_columns,
         })
@@ -455,6 +463,12 @@ impl QueryService {
                 .run_prepared_maintenance(prepared)
                 .map(StreamOutcome::Direct);
         }
+        if let StatementClass::SessionConfig = prepared.class {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "session configuration statements require session execution context",
+            ));
+        }
         let bound = self.substitute_prepared_params(prepared, params)?;
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
@@ -475,10 +489,9 @@ impl QueryService {
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
             }
-            StatementClass::SessionConfig => Err(DbError::plan(
-                SqlState::FeatureNotSupported,
-                "session configuration statements require the simple query protocol",
-            )),
+            StatementClass::SessionConfig => {
+                unreachable!("session configuration is dispatched above before substitution")
+            }
             StatementClass::TransactionControl(_) => Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "transaction control statements require the simple query protocol",
@@ -544,12 +557,36 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        gucs: Arc<SessionGucs>,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
             let (slot, default_isolation, result) =
                 self.handle_transaction_control(kind, slot, default_isolation, cancel);
+            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+        }
+
+        if let StatementClass::SessionConfig = prepared.class {
+            let statement = match prepared.session_config.clone() {
+                Some(statement) => statement,
+                None => {
+                    return (
+                        slot,
+                        default_isolation,
+                        Err(DbError::internal(
+                            "prepared session-configuration statement has no payload",
+                        )),
+                    );
+                }
+            };
+            let (slot, default_isolation, result) = self.handle_session_config(
+                statement,
+                slot,
+                default_isolation,
+                &gucs,
+                session_sequences.as_ref(),
+            );
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
@@ -621,7 +658,7 @@ impl QueryService {
                     }
                     StatementClass::SessionConfig => {
                         unreachable!(
-                            "session configuration is rejected at prepare time for the extended protocol"
+                            "session configuration is dispatched above before substitution"
                         )
                     }
                     StatementClass::TransactionControl(_) => {
@@ -655,6 +692,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         cancel: &Arc<AtomicBool>,
         session_sequences: Arc<SessionSequenceState>,
+        gucs: Arc<SessionGucs>,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let mut sink = ChannelRowSink::new(row_tx);
@@ -665,6 +703,7 @@ impl QueryService {
             default_isolation,
             cancel,
             session_sequences,
+            gucs,
             Some(&mut sink),
         )
     }
@@ -898,10 +937,11 @@ enum StatementClass {
     SessionConfig,
 }
 
-/// A parsed and bound extended-protocol statement that can be executed
-/// repeatedly with different parameter values. `bound` is `None` only for
-/// transaction-control statements (BEGIN/COMMIT/ROLLBACK), which carry no bound
-/// payload and are dispatched through the session's transaction lifecycle.
+/// A prepared extended-protocol statement that can be executed repeatedly with
+/// different parameter values. Most statements carry a bound relational payload;
+/// non-relational statements (transaction control, VACUUM, and session
+/// configuration) carry their parsed statement/class instead and are dispatched
+/// through the session path without binding.
 pub struct PreparedStatement {
     class: StatementClass,
     bound: Option<BoundStatement>,
@@ -910,6 +950,10 @@ pub struct PreparedStatement {
     /// case so an extended-protocol `Execute` can run it through `run_maintenance`.
     /// `None` for every other class.
     maintenance: Option<Statement>,
+    /// The parsed session-configuration statement (`SET`/`RESET`/`SHOW`/
+    /// `DISCARD ALL`), carried unbound so an extended-protocol `Execute` routes it
+    /// to the connection's GUC/session state. `None` for every other class.
+    session_config: Option<Statement>,
     /// Resolved parameter wire types, by position: the client-declared `PgType`
     /// where an OID was given, otherwise the collapsed default inferred by the
     /// binder. Drives both `ParameterDescription` (OID echo) and parameter decode
@@ -938,6 +982,13 @@ impl PreparedStatement {
     /// otherwise runs as a standalone maintenance unit.
     pub fn is_maintenance(&self) -> bool {
         matches!(self.class, StatementClass::Maintenance)
+    }
+
+    /// Whether this is a session-configuration statement (`SET`/`RESET`/`SHOW`/
+    /// `DISCARD ALL`). The connection routes such an `Execute` through the session
+    /// path so the connection's GUC store and transaction state apply.
+    pub fn is_session_config(&self) -> bool {
+        matches!(self.class, StatementClass::SessionConfig)
     }
 
     /// Result column metadata, or `None` for a statement that returns no rows.
@@ -3161,6 +3212,22 @@ mod tests {
             .execute_prepared(&prepared, &[])
             .unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[tokio::test]
+    async fn stateless_prepared_execution_rejects_session_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql("set default_transaction_isolation to serializable", &[])
+            .unwrap();
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     /// A gone consumer (client disconnected mid-stream) must stop the streamed

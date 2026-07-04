@@ -140,6 +140,92 @@ async fn default_transaction_isolation_guc_controls_future_transactions() {
 }
 
 #[tokio::test]
+async fn session_config_works_over_the_extended_protocol() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    let out = conn
+        .extended_execute("SET application_name = 'ext-test'")
+        .await
+        .unwrap();
+    assert!(out.result.is_ok());
+    assert_eq!(out.status, b'I');
+    assert_eq!(
+        conn.extended_execute("SHOW application_name")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("ext-test".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("SHOW application_name").await.rows(),
+        vec![vec![Some("ext-test".to_string())]],
+        "extended SET uses the same per-session GUC store as simple SHOW"
+    );
+
+    conn.extended_execute("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conn.extended_execute("SHOW default_transaction_isolation")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "outside a transaction, transaction_isolation reflects the session default"
+    );
+
+    let outside = conn
+        .extended_execute("SET transaction_isolation TO SERIALIZABLE")
+        .await
+        .unwrap();
+    assert!(outside.result.is_ok());
+    assert_eq!(outside.status, b'I');
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("repeatable read".to_string())]],
+        "outside a transaction, SET transaction_isolation is a SET TRANSACTION no-op"
+    );
+
+    conn.ok("BEGIN").await.rows();
+    let in_txn = conn
+        .extended_execute("SET transaction_isolation TO SERIALIZABLE")
+        .await
+        .unwrap();
+    assert!(in_txn.result.is_ok());
+    assert_eq!(in_txn.status, b'T');
+    assert_eq!(
+        conn.ok("SHOW transaction_isolation").await.rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+}
+
+#[tokio::test]
+async fn extended_discard_all_deallocates_prepared_statements() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.prepare("stale", "select 1").await.unwrap().unwrap();
+    assert_eq!(
+        conn.execute_prepared("stale").await.unwrap().rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    let out = conn.extended_execute("DISCARD ALL").await.unwrap();
+    assert!(out.result.is_ok());
+    assert_eq!(out.status, b'I');
+
+    let stale = conn.execute_prepared("stale").await.unwrap();
+    assert!(error_message(&stale).contains("prepared statement \"stale\" does not exist"));
+}
+
+#[tokio::test]
 async fn discard_all_resets_gucs_default_isolation_and_sequence_currval() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

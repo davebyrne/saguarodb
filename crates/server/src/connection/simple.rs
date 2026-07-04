@@ -9,7 +9,7 @@ use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
     Session, TransactionState, command_complete_tag, encode_row, error_response,
-    streamed_task_result, write_messages,
+    is_discard_all_result, streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -180,13 +180,6 @@ impl Session {
         }
         Ok(ControlFlow::Continue(()))
     }
-}
-
-fn is_discard_all_result(result: &ExecutionResult) -> bool {
-    matches!(
-        result,
-        ExecutionResult::Modified { command, .. } if command == "DISCARD ALL"
-    )
 }
 
 /// Encode a batch of result rows as `DataRow` messages in the simple-query

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use common::{
     ColumnInfo, DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState, Value,
 };
+use executor::ExecutionResult;
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
     ServerMessage,
@@ -562,6 +563,13 @@ fn command_complete_tag(command: &str, count: u64) -> String {
         "UPDATE" | "DELETE" => format!("{command} {count}"),
         _ => command.to_string(),
     }
+}
+
+fn is_discard_all_result(result: &ExecutionResult) -> bool {
+    matches!(
+        result,
+        ExecutionResult::Modified { command, .. } if command == "DISCARD ALL"
+    )
 }
 
 fn error_response(err: &DbError) -> ServerMessage {

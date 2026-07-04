@@ -9,7 +9,7 @@ use crate::query::{PreparedStatement, STREAM_CHANNEL_CAPACITY, StreamMessage, St
 
 use super::{
     Portal, Session, TransactionState, command_complete_tag, encode_row, error_response,
-    protocol_error, resolve_format, streamed_task_result, write_messages,
+    is_discard_all_result, protocol_error, resolve_format, streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -41,6 +41,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session_sequences = self.session_sequences.clone();
+        let session_gucs = self.session_gucs.clone();
 
         // When an explicit transaction is open on this session, the extended-
         // protocol `Execute` participates in THAT transaction rather than starting
@@ -54,8 +55,10 @@ impl Session {
         // `self.txn` like a simple-query control statement. Otherwise (a data
         // statement with no open transaction), `Execute` stays a self-contained
         // autocommit unit.
-        let route_through_session =
-            self.txn.is_some() || statement.is_transaction_control() || statement.is_maintenance();
+        let route_through_session = self.txn.is_some()
+            || statement.is_transaction_control()
+            || statement.is_maintenance()
+            || statement.is_session_config();
 
         // A SELECT streams its rows through this bounded channel while the producer
         // runs (`docs/specs/streaming.md` §4). Both routing branches return a
@@ -76,6 +79,7 @@ impl Session {
                     default_isolation,
                     &cancel,
                     session_sequences,
+                    session_gucs,
                     row_tx,
                 )
             })
@@ -150,6 +154,10 @@ impl Session {
                 .await
             }
             Ok(StreamOutcome::Direct(result)) => {
+                if is_discard_all_result(&result) {
+                    self.prepared.clear();
+                    self.portals.clear();
+                }
                 write_portal_result(stream, codec, result, &result_formats).await
             }
             Err(err) => {

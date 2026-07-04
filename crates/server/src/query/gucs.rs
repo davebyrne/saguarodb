@@ -359,6 +359,18 @@ fn show_all_result(
     }
 }
 
+pub(super) fn session_config_result_columns(statement: &Statement) -> Option<Vec<ColumnInfo>> {
+    match statement {
+        Statement::ShowVariable { name: Some(name) } => Some(vec![text_column(name)]),
+        Statement::ShowVariable { name: None } => Some(vec![
+            text_column("name"),
+            text_column("setting"),
+            text_column("description"),
+        ]),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
