@@ -928,10 +928,6 @@ fn split_point(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
     mid.clamp(1, entries.len() - 1)
 }
 
-#[allow(
-    dead_code,
-    reason = "used by staged TOAST row preparation before INSERT/UPDATE integration"
-)]
 pub(crate) fn validate_index_key_fits(key: &Key) -> Result<()> {
     let key_bytes = encode_key(key)?;
     validate_index_entry_fits(key_bytes.len(), LOCATION_LEN)

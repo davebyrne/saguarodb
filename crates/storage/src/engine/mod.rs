@@ -52,9 +52,7 @@ use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 use crate::btree::BTree;
-use crate::codec::{
-    DecodedPhysicalValue, ToastPointer, decode_physical_row, decode_row, encode_row,
-};
+use crate::codec::{DecodedPhysicalValue, ToastPointer, decode_physical_row, decode_row};
 use crate::heap::{index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{RowIterator, SchemaOperations, StorageEngine};
@@ -855,7 +853,13 @@ impl StorageEngine for PageBackedStorageEngine {
         // (rule 1: never two at once). A transiently orphaned heap tuple (if the PK
         // check below fails) is invisible via CLOG once the txn aborts and reclaimed
         // by VACUUM — the same orphan-on-conflict handling `update` relies on.
-        let location = self.write_new_row(&schema, &row, ctx.txn_id)?;
+        let row_bytes = self.prepare_row_for_storage(
+            ctx,
+            &schema,
+            &crate::codec::MvccHeader::fresh(ctx.txn_id, 0),
+            &row,
+        )?;
+        let location = self.write_new_row_bytes(&schema, &row_bytes, ctx.txn_id)?;
 
         // Visibility-aware primary-key uniqueness AND the index insert under ONE hold
         // of the PK index structural latch (Milestone E2a, the critical atomic
@@ -987,8 +991,9 @@ impl StorageEngine for PageBackedStorageEngine {
         // H3 update-path prune (under the heap latch, `ctx.gc_horizon` threaded in)
         // tries to reclaim same-page room first; only if it still cannot fit does it
         // fall back.
-        if let Some(result) =
-            self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
+        if schema.toast_table_id.is_none()
+            && let Some(result) =
+                self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
         {
             // SSI: a successful HOT update overwrote the row a concurrent serializable
             // reader may have read (`docs/specs/ssi.md` §6).
@@ -1008,7 +1013,13 @@ impl StorageEngine for PageBackedStorageEngine {
         // or a scan on an unchanged secondary value would never find it (the
         // changed-index-only skip is a HOT optimization, Milestone H; applying it
         // here would be a correctness bug — `docs/specs/mvcc.md` Appendix A commit 9).
-        let new_location = self.write_new_row(&schema, &row, ctx.txn_id)?;
+        let row_bytes = self.prepare_row_for_storage(
+            ctx,
+            &schema,
+            &crate::codec::MvccHeader::fresh(ctx.txn_id, 0),
+            &row,
+        )?;
+        let new_location = self.write_new_row_bytes(&schema, &row_bytes, ctx.txn_id)?;
 
         // Stamp the old version *before* the new version's uniqueness checks, so its
         // `xmax = ctx.txn_id` makes `unique_conflict_kind` treat it as own-deleted
@@ -1335,17 +1346,28 @@ impl SchemaOperations for PageBackedStorageEngine {
             let versions = self.collect_chain_versions(&table_schema, root)?;
 
             // A non-HOT root is its own one-element chain (no HOT successors). Index its
-            // PHYSICAL row unconditionally, pointing at the root — exactly the pre-HOT
-            // backfill behavior: every physically-present row (committed, in-flight, or
-            // aborted) gets an entry, and the scan filters by visibility at read time.
-            // The broken-chain hazard cannot arise for a single-version chain. Use the
+            // physical row only if it is not dead-to-all at the build horizon. Dead
+            // rows cannot be visible to any snapshot and must be skipped before
+            // detoasting, because aborted toasted parents may reference chunks that
+            // are invisible through the hidden relation's snapshot-visible scan. The
+            // broken-chain hazard cannot arise for a single-version chain. Use the
             // version `collect_chain_versions` resolved (which already followed a
             // REDIRECT root to its NORMAL target) rather than re-reading `root` — a
             // REDIRECT slot reads no bytes directly. A reclaimed (DEAD/UNUSED) root
             // resolves to no versions; nothing to index.
             if versions.len() <= 1 {
                 if let Some((_loc, decoded)) = versions.first() {
-                    let (key, has_null) = secondary_index_key(&table_schema, schema, &decoded.row)?;
+                    if common::is_dead_to_all(
+                        decoded.header.xmin,
+                        decoded.header.xmax,
+                        decoded.header.infomask,
+                        gc_horizon,
+                        self.txn_status_view(),
+                    ) {
+                        continue;
+                    }
+                    let row = self.materialize_physical_row(ctx, &table_schema, decoded.clone())?;
+                    let (key, has_null) = secondary_index_key(&table_schema, schema, &row)?;
                     self.insert_secondary_entry(ctx, &table_schema, schema, &key, has_null, &root)?;
                 }
                 continue;
@@ -1360,15 +1382,16 @@ impl SchemaOperations for PageBackedStorageEngine {
             let mut live_entries: Vec<(Key, bool)> = Vec::new();
             for (_loc, decoded) in &versions {
                 if common::is_dead_to_all(
-                    decoded.xmin,
-                    decoded.xmax,
-                    decoded.infomask,
+                    decoded.header.xmin,
+                    decoded.header.xmax,
+                    decoded.header.infomask,
                     gc_horizon,
                     self.txn_status_view(),
                 ) {
                     continue;
                 }
-                let (new_key, has_null) = secondary_index_key(&table_schema, schema, &decoded.row)?;
+                let row = self.materialize_physical_row(ctx, &table_schema, decoded.clone())?;
+                let (new_key, has_null) = secondary_index_key(&table_schema, schema, &row)?;
                 if !live_entries.iter().any(|(k, _)| *k == new_key) {
                     live_entries.push((new_key, has_null));
                 }

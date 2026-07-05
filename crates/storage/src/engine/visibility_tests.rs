@@ -430,9 +430,10 @@ fn point_lookup_hides_invisible_and_shows_committed() {
 fn index_scan_skips_invisible_versions_without_erroring() {
     let fixture = fixture_with_mixed_visibility();
     // Build the secondary index after the rows exist, under a committed txn.
-    // Backfill reads the live physical rows (not snapshot-filtered), so every
-    // row — including the aborted/in-progress ones — gets an index entry. The
-    // scan must then *skip* the invisible ones at the heap, not error.
+    // Backfill reads not-dead-to-all physical rows (not snapshot-filtered), so
+    // the in-progress row gets an index entry even though it is invisible to
+    // this reader. The scan must then skip invisible entries at the heap, not
+    // error.
     let builder = ctx(101, snapshot(102, vec![]));
     fixture
         .engine
@@ -454,9 +455,8 @@ fn index_scan_skips_invisible_versions_without_erroring() {
     while let Some(stored) = iter.next().unwrap() {
         names.push(stored.row.values[1].clone());
     }
-    // The index has entries for all three rows, but only the committed one is
-    // visible; the entries pointing at the aborted/in-progress tuples are
-    // skipped rather than returned or erroring.
+    // Only the committed row is visible; any invisible index entries are skipped
+    // rather than returned or erroring.
     assert_eq!(names, vec![Value::Text("committed".to_string())]);
 }
 

@@ -3,8 +3,9 @@ use common::{
     SqlState, TableSchema, TxnId, Value, XMIN_COMMITTED,
 };
 
-/// On-page row encoding version currently emitted by the regular DML path. The
-/// MVCC layout (v2) is
+/// On-page row encoding version emitted by the legacy `encode_row` helper. The
+/// storage engine's TOAST-aware DML path emits prepared row format v3. The MVCC
+/// layout (v2) is
 /// `[version=2][infomask:2][xmin:8][xmax:8][t_ctid:6][null_bitmap][columns]`.
 /// Row format v3 keeps the same MVCC header and null bitmap, but uses tagged
 /// varlena length words for `TEXT`/`BYTEA`. The legacy pre-MVCC layout (v1) is
@@ -126,10 +127,6 @@ impl ToastPointer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "constructed by the TOAST write path added after the v3 codec phase"
-)]
 pub(crate) enum VarlenaPhysical {
     Plain(Vec<u8>),
     Compressed {
@@ -143,10 +140,6 @@ pub(crate) enum VarlenaPhysical {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "constructed by the TOAST write path added after the v3 codec phase"
-)]
 pub(crate) enum PreparedColumnValue {
     Null,
     Value(Value),
@@ -744,10 +737,6 @@ pub(crate) fn decode_physical_row(
     Ok(DecodedPhysicalRow { header, values })
 }
 
-#[allow(
-    dead_code,
-    reason = "called by encode_row_v3_prepared once the TOAST write path is wired in"
-)]
 fn encode_column_value_v3(bytes: &mut Vec<u8>, column: &ColumnDef, value: &Value) -> Result<()> {
     match value {
         Value::Null => Err(DbError::storage(

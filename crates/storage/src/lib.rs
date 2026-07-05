@@ -2239,6 +2239,285 @@ mod tests {
         assert!(err.message.contains("CRC32"));
     }
 
+    #[test]
+    fn insert_large_text_writes_toast_and_reads_logical_value() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false), 0)
+            .unwrap();
+        let name = "insert-large-text-name-".repeat(140);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(name.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        harness.storage.insert(&ctx, 1, row.clone()).unwrap();
+
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &pk(1)).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            collect(harness.storage.scan_range(&ctx, 1, &KeyRange::All).unwrap()),
+            vec![row.clone()]
+        );
+        assert_eq!(
+            collect(
+                harness
+                    .storage
+                    .index_scan(&ctx, 1, name_index(false).id, &name_eq(&name))
+                    .unwrap()
+            ),
+            vec![row]
+        );
+        assert_eq!(
+            external_value_ids_for_key(&harness, &base, &pk(1), 1),
+            vec![1]
+        );
+        assert!(!visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn insert_large_bytea_round_trips() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+
+        harness.storage.insert(&ctx, 1, row.clone()).unwrap();
+
+        assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+        assert_eq!(
+            external_value_ids_for_key(&harness, &base, &pk(1), 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn primary_key_conflict_ignores_toast_physical_pointer() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(
+                &ctx,
+                1,
+                Row {
+                    values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+                },
+            )
+            .unwrap();
+
+        let err = harness
+            .storage
+            .insert(
+                &ctx,
+                1,
+                Row {
+                    values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(16))],
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
+    fn create_index_backfills_toasted_logical_values() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let name = "create-index-toasted-name-".repeat(120);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(name.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+        harness.storage.insert(&ctx, 1, row.clone()).unwrap();
+
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false), 0)
+            .unwrap();
+
+        assert_eq!(
+            collect(
+                harness
+                    .storage
+                    .index_scan(&ctx, 1, name_index(false).id, &name_eq(&name))
+                    .unwrap()
+            ),
+            vec![row]
+        );
+    }
+
+    #[test]
+    fn create_index_skips_aborted_toasted_rows_before_detoast() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let index_ctx = StatementContext::new(2);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let name = "aborted-toasted-name-".repeat(120);
+        harness
+            .storage
+            .insert(
+                &insert_ctx,
+                1,
+                Row {
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text(name.clone()),
+                        Value::Boolean(true),
+                        Value::Null,
+                    ],
+                },
+            )
+            .unwrap();
+        harness.wal.mark_aborted(insert_ctx.txn_id);
+
+        harness
+            .storage
+            .create_index(&index_ctx, &name_index(false), 0)
+            .unwrap();
+
+        assert!(
+            collect(
+                harness
+                    .storage
+                    .index_scan(&index_ctx, 1, name_index(false).id, &name_eq(&name))
+                    .unwrap()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn update_toasted_value_creates_new_value_id() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let first = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+        let second = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9500))],
+        };
+        harness.storage.insert(&insert_ctx, 1, first).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), second.clone())
+                .unwrap()
+        );
+
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            external_value_ids_for_key(&harness, &base, &pk(1), 1),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn update_non_toast_column_retoasts_owned_value_and_old_snapshot_reads_old_value() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let old_snapshot_ctx = StatementContext::with_snapshot(
+            10,
+            Arc::new(common::Snapshot {
+                xmin: 1,
+                xmax: 2,
+                xip: Vec::new(),
+            }),
+        );
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let old_note = "old toasted note ".repeat(600);
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(false),
+                Value::Text(old_note.clone()),
+            ],
+        };
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text(old_note),
+            ],
+        };
+        harness
+            .storage
+            .insert(&insert_ctx, 1, old_row.clone())
+            .unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+        assert_eq!(
+            harness.storage.get(&old_snapshot_ctx, 1, &pk(1)).unwrap(),
+            Some(old_row)
+        );
+        assert_eq!(
+            external_value_ids_for_key(&harness, &base, &pk(1), 3),
+            vec![1, 2]
+        );
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -2286,6 +2565,40 @@ mod tests {
                 ref other => panic!("expected integer id, got {other:?}"),
             })
             .collect()
+    }
+
+    fn external_value_ids_for_key(
+        harness: &StorageHarness,
+        schema: &TableSchema,
+        key: &Key,
+        column: usize,
+    ) -> Vec<u64> {
+        let btree: BTree<'_, RowLocation> = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            index_file_id(schema.id),
+            harness.storage.compression.as_ref(),
+        );
+        let mut value_ids = Vec::new();
+        for location in btree.scan_key(key).unwrap() {
+            let readable = harness
+                .storage
+                .buffer_pool
+                .read_page(location.file_id, location.page_num)
+                .unwrap();
+            let bytes = crate::page::read_row(readable.data(), location.slot_num)
+                .unwrap()
+                .unwrap();
+            let physical = decode_physical_row(schema, &bytes).unwrap();
+            match &physical.values[column] {
+                DecodedPhysicalValue::External { pointer, .. } => {
+                    value_ids.push(pointer.value_id);
+                }
+                other => panic!("expected external value at column {column}, got {other:?}"),
+            }
+        }
+        value_ids.sort_unstable();
+        value_ids
     }
 
     struct StorageHarness {

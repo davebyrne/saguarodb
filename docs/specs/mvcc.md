@@ -1272,7 +1272,7 @@ savepoints via sub-transaction xids (optional, deferred).
     reader find the row via the new index (a too-narrow build-visibility gate would lose
     that read). When every version is dead-to-all (no snapshot can see the chain) there
     is nothing to index. A non-HOT (single-version) root indexes its physical row
-    exactly as before — unchanged backfill behavior for pre-HOT data.
+    only when it is not dead-to-all at the build horizon.
 
   - **Guard 2 — VACUUM skips committed-dead HOT-chain tuples (superseded by H3).**
     The H2 heap-prune reclaims a dead-to-all HOT member only when its creator aborted

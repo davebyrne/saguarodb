@@ -17,13 +17,14 @@ fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> 
 
 impl PageBackedStorageEngine {
     /// Read the *current physical* row at `location`, ignoring snapshot
-    /// visibility. Used by index-maintenance paths (delete/update/index backfill)
-    /// that must see the live tuple to recompute its index keys, not the version a
+    /// visibility, and materialize any TOAST values. Used by index-maintenance paths
+    /// that must see the live tuple to recompute index keys, not the version a
     /// reader's snapshot would observe. User-facing reads use
     /// [`Self::read_visible_row`] instead. Returns `None` if the line pointer is
     /// absent (DEAD/UNUSED).
-    pub(super) fn read_location(
+    pub(super) fn read_location_materialized(
         &self,
+        ctx: &StatementContext,
         schema: &TableSchema,
         location: RowLocation,
     ) -> Result<Option<Row>> {
@@ -33,7 +34,10 @@ impl PageBackedStorageEngine {
         let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
             return Ok(None);
         };
-        Ok(Some(decode_row(schema, &bytes)?.row))
+        let physical = decode_physical_row(schema, &bytes)?;
+        drop(readable);
+        self.materialize_physical_row(ctx, schema, physical)
+            .map(Some)
     }
 
     pub(super) fn materialize_physical_row(
@@ -235,7 +239,7 @@ impl PageBackedStorageEngine {
     /// the bounded `t_ctid` walk (the same `HOT_UPDATED → HEAP_ONLY`, same-page,
     /// stop-at-independently-indexed rule as [`Self::resolve_visible_in_chain`], but
     /// gathering ALL members instead of returning the first visible one). Each element
-    /// is `(RowLocation, DecodedRow)` for a `NORMAL` member.
+    /// is `(RowLocation, DecodedPhysicalRow)` for a `NORMAL` member.
     ///
     /// Used by `create_index`'s HOT broken-chain check (`docs/specs/mvcc.md` §10
     /// Milestone H2) — a non-HOT root resolves to a one-element vec (so a plain
@@ -251,7 +255,7 @@ impl PageBackedStorageEngine {
         &self,
         schema: &TableSchema,
         root: RowLocation,
-    ) -> Result<Vec<(RowLocation, crate::codec::DecodedRow)>> {
+    ) -> Result<Vec<(RowLocation, crate::codec::DecodedPhysicalRow)>> {
         let readable = self.buffer_pool.read_page(root.file_id, root.page_num)?;
         let data = readable.data();
         let page_num = root.page_num;
@@ -282,9 +286,9 @@ impl PageBackedStorageEngine {
             let Some(bytes) = page::read_row(data, current_slot)? else {
                 return Err(storage_internal("HOT chain member is not a live tuple"));
             };
-            let decoded = decode_row(schema, &bytes)?;
-            let infomask = decoded.infomask;
-            let t_ctid = decoded.t_ctid;
+            let decoded = decode_physical_row(schema, &bytes)?;
+            let infomask = decoded.header.infomask;
+            let t_ctid = decoded.header.t_ctid;
             versions.push((
                 RowLocation {
                     file_id,

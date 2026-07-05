@@ -118,9 +118,9 @@ impl PageBackedStorageEngine {
             // or committed-but-not-yet-visible version.
             for (_member_loc, decoded) in self.collect_chain_versions(schema, location)? {
                 match classify_unique_conflict(
-                    decoded.xmin,
-                    decoded.xmax,
-                    decoded.infomask,
+                    decoded.header.xmin,
+                    decoded.header.xmax,
+                    decoded.header.infomask,
                     current_txns,
                     status,
                 ) {

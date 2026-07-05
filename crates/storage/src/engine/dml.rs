@@ -11,19 +11,11 @@ pub(super) enum StampOutcome {
     WouldBlock(u64),
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 enum ToastStreamPayload {
     RawColumn,
     Owned(std::sync::Arc<[u8]>),
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 struct ToastCandidate {
     column: usize,
     raw_len: u32,
@@ -34,30 +26,18 @@ struct ToastCandidate {
     current_stored_len: usize,
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 struct CompressedToastValue {
     codec: u8,
     dict_id: Option<u32>,
     payload: std::sync::Arc<[u8]>,
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 enum ToastColumnPlan {
     Null,
     Value,
     Varlena(ToastVarlenaPlan),
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 enum ToastVarlenaPlan {
     Plain,
     Compressed {
@@ -70,10 +50,6 @@ enum ToastVarlenaPlan {
     External(ToastPointer),
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
     row.values
         .iter()
@@ -85,10 +61,6 @@ fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
         .collect()
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn validate_logical_index_keys_fit(
     storage: &PageBackedStorageEngine,
     schema: &TableSchema,
@@ -102,10 +74,6 @@ fn validate_logical_index_keys_fit(
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn toastable_raw_bytes<'a>(data_type: &DataType, value: &'a Value) -> Option<&'a [u8]> {
     match (data_type, value) {
         (DataType::Text, Value::Text(text)) => Some(text.as_bytes()),
@@ -114,10 +82,6 @@ fn toastable_raw_bytes<'a>(data_type: &DataType, value: &'a Value) -> Option<&'a
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn supported_varlena_len(len: usize) -> Result<u32> {
     let len = u32::try_from(len).map_err(|_| {
         DbError::storage(
@@ -134,18 +98,10 @@ fn supported_varlena_len(len: usize) -> Result<u32> {
     Ok(len)
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn inline_compressed_stored_len(payload_len: usize) -> usize {
     1 + 4 + 4 + 4 + payload_len
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn planned_row_meets_toast_goal(
     schema: &TableSchema,
     row: &Row,
@@ -155,10 +111,6 @@ fn planned_row_meets_toast_goal(
     Ok(len <= schema.toast.tuple_target as usize && row_len_fits_page(len))
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn ensure_planned_row_fits_page(
     schema: &TableSchema,
     row: &Row,
@@ -167,10 +119,6 @@ fn ensure_planned_row_fits_page(
     ensure_row_len_fits_page(planned_row_len(schema, row, plans)?)
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn ensure_row_len_fits_page(row_len: usize) -> Result<()> {
     if !row_len_fits_page(row_len) {
         return Err(DbError::storage(
@@ -181,20 +129,12 @@ fn ensure_row_len_fits_page(row_len: usize) -> Result<()> {
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn row_len_fits_page(row_len: usize) -> bool {
     row_len
         .checked_add(page_overhead())
         .is_some_and(|len| len <= buffer::PAGE_SIZE)
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn planned_row_len(schema: &TableSchema, row: &Row, plans: &[ToastColumnPlan]) -> Result<usize> {
     if row.values.len() != schema.columns.len() || plans.len() != schema.columns.len() {
         return Err(DbError::storage(
@@ -218,10 +158,6 @@ fn planned_row_len(schema: &TableSchema, row: &Row, plans: &[ToastColumnPlan]) -
     Ok(len)
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn planned_column_len(
     column: &ColumnDef,
     value: &Value,
@@ -276,10 +212,6 @@ fn planned_column_len(
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn logical_value_v3_len(column: &ColumnDef, value: &Value) -> Result<usize> {
     match value {
         Value::Null => Err(DbError::storage(
@@ -312,10 +244,6 @@ fn logical_value_v3_len(column: &ColumnDef, value: &Value) -> Result<usize> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn checked_varlena_len_add(prefix_len: usize, payload_len: usize) -> Result<usize> {
     prefix_len.checked_add(payload_len).ok_or_else(|| {
         DbError::storage(
@@ -325,20 +253,12 @@ fn checked_varlena_len_add(prefix_len: usize, payload_len: usize) -> Result<usiz
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn checked_row_len_add(row_len: usize, column_len: usize) -> Result<usize> {
     row_len.checked_add(column_len).ok_or_else(|| {
         DbError::storage(SqlState::ProgramLimitExceeded, "row length overflows usize")
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn external_stream_stored_len(codec: u8, dict_id: Option<u32>, payload_len: usize) -> Result<u32> {
     let header_len: usize = match codec {
         compress::CODEC_NONE | compress::CODEC_ZSTD => {
@@ -372,10 +292,6 @@ fn external_stream_stored_len(codec: u8, dict_id: Option<u32>, payload_len: usiz
     supported_varlena_len(len)
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn candidate_stream_payload<'a>(
     schema: &TableSchema,
     row: &'a Row,
@@ -403,10 +319,6 @@ fn candidate_stream_payload<'a>(
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "staged TOAST row preparation is wired into DML in the next phase"
-)]
 fn materialize_prepared_values(
     schema: &TableSchema,
     row: &Row,
@@ -470,10 +382,6 @@ fn materialize_prepared_values(
 }
 
 impl PageBackedStorageEngine {
-    #[allow(
-        dead_code,
-        reason = "staged TOAST row preparation is wired into DML in the next phase"
-    )]
     pub(crate) fn prepare_row_for_storage(
         &self,
         ctx: &StatementContext,
@@ -559,10 +467,6 @@ impl PageBackedStorageEngine {
         Ok(bytes)
     }
 
-    #[allow(
-        dead_code,
-        reason = "staged TOAST row preparation is wired into DML in the next phase"
-    )]
     fn prepare_inline_toast_candidates(
         &self,
         schema: &TableSchema,
@@ -627,10 +531,6 @@ impl PageBackedStorageEngine {
         Ok((plans, candidates))
     }
 
-    #[allow(
-        dead_code,
-        reason = "staged TOAST row preparation is wired into DML in the next phase"
-    )]
     fn try_toast_value_compression(
         &self,
         schema: &TableSchema,
@@ -664,13 +564,12 @@ impl PageBackedStorageEngine {
         }
     }
 
-    pub(super) fn write_new_row(
+    pub(super) fn write_new_row_bytes(
         &self,
         schema: &TableSchema,
-        row: &Row,
+        row_bytes: &[u8],
         txn_id: u64,
     ) -> Result<RowLocation> {
-        let row_bytes = encode_row(schema, row, txn_id)?;
         if row_bytes.len() + page_overhead() > buffer::PAGE_SIZE {
             return Err(DbError::storage(
                 SqlState::ProgramLimitExceeded,
@@ -699,7 +598,7 @@ impl PageBackedStorageEngine {
             if has_space {
                 let mut writable = self.buffer_pool.write_page(file_id, page_num, txn_id)?;
                 let slot_num =
-                    self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;
+                    self.log_insert(&mut writable, txn_id, file_id, page_num, row_bytes)?;
                 return Ok(RowLocation {
                     file_id,
                     page_num,
@@ -728,7 +627,7 @@ impl PageBackedStorageEngine {
         writable.publish();
         page::init_page(writable.data_mut(), page_num);
         page::set_page_lsn(writable.data_mut(), init_lsn);
-        let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, &row_bytes)?;
+        let slot_num = self.log_insert(&mut writable, txn_id, file_id, page_num, row_bytes)?;
         Ok(RowLocation {
             file_id,
             page_num,
@@ -1054,7 +953,8 @@ impl PageBackedStorageEngine {
         // compare every secondary index's key against the new row's. The primary key
         // is already known unchanged (the caller rejects a PK change). A missing
         // predecessor here means it was reclaimed under us — not eligible.
-        let Some(previous_row) = self.read_location(schema, previous_location)? else {
+        let Some(previous_row) = self.read_location_materialized(ctx, schema, previous_location)?
+        else {
             return Ok(None);
         };
         for index in self.table_indexes(table)? {

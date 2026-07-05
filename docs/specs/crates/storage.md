@@ -153,13 +153,14 @@ results are unchanged from the pre-MVCC engine.
 - **Index backfill; DML locates the visible version; HOT broken-chain guard.**
   `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
   the chain view is stable) with the GC horizon threaded in. A non-HOT single-version
-  root is indexed from its *current physical* tuple exactly as before. A HOT chain
-  (root + heap-only members, via `collect_chain_versions`) is checked for a **broken
-  chain**: if two or more not-`is_dead_to_all` versions disagree on the new index's
-  key(s), the build aborts with retryable `SerializationFailure` (`40001`); otherwise
-  the single distinct live key is indexed (unconditionally — not gated on the builder's
-  snapshot, so an older concurrent reader's version is still indexable), the entry
-  pointing at the chain ROOT.
+  root is indexed from its *current physical* tuple only when it is not
+  `is_dead_to_all` at that horizon. A HOT chain (root + heap-only members, via
+  `collect_chain_versions`) is checked for a **broken chain**: if two or more
+  not-`is_dead_to_all` versions disagree on the new index's key(s), the build aborts
+  with retryable `SerializationFailure` (`40001`); otherwise the single distinct live
+  key is indexed (unconditionally — not gated on the builder's snapshot, so an older
+  concurrent reader's version is still indexable), the entry pointing at the chain
+  ROOT.
   `delete` and `update` locate the *visible* version via `locate_visible_version`;
   `delete` stamps its `xmax` in place, `update` stamps it and chains it to the new
   version (HOT or non-HOT). Neither removes an index entry.
@@ -647,13 +648,14 @@ value.
 [row_format_version: 1 byte][infomask: 2][xmin: 8][xmax: 8][t_ctid: 6][null_bitmap][col1_data][col2_data]...
 ```
 
-- `row_format_version`: ordinary DML currently emits `2`. The codec also defines
-  prepared row format `3` for the TOAST write path. `decode_row` accepts legacy
+- `row_format_version`: ordinary INSERT and non-HOT UPDATE emit prepared row
+  format `3`; the legacy `encode_row` helper still emits v2 for tests and
+  compatibility helpers. `decode_row` accepts legacy
   `1` tuples (which omit the MVCC header —
   `[version=1][null_bitmap][columns]`), v2 tuples, and v3 tuples whose varlena
   columns are physically plain. All other versions are rejected as corrupt. V3
   compressed/external varlena payloads are exposed by the storage-private
-  physical decoder until the detoast read path materializes them.
+  physical decoder until storage read paths materialize them.
 - MVCC tuple header (v2 and v3 only), all little-endian:
   - `infomask`: 2-byte hint bits. Bit 0 `XMIN_COMMITTED`, bit 1 `XMIN_ABORTED`,
     bit 2 `XMAX_COMMITTED`, bit 3 `XMAX_ABORTED` cache settled transaction status
@@ -1212,9 +1214,10 @@ rows.
 ## TOAST Row Preparation
 
 Storage owns a storage-private row preparation helper that converts a logical
-`Row` into row-format v3 bytes before heap insertion/update paths use it. Until
-the DML integration is wired, ordinary DML still emits v2 rows; the helper is the
-single planned path for TOAST-aware writes.
+`Row` into row-format v3 bytes for INSERT and the normal non-HOT UPDATE path.
+Index keys are computed from the caller's logical row before physical TOAST
+encoding, so primary and secondary indexes store logical keys rather than TOAST
+pointers.
 
 Preparation first validates the logical primary-key and live secondary-index
 keys using the same B-tree entry-size rules as index insertion. This preflight
@@ -1249,6 +1252,14 @@ helper returns `ProgramLimitExceeded` without writing chunks. For the planned
 external values, storage writes the complete external stream to the hidden
 relation under the caller's transaction, stores real `ToastPointer`s in the
 parent row, and returns the v3 parent bytes.
+
+HOT updates remain enabled for tables without a hidden TOAST relation. Tables
+with `toast_table_id = Some(_)` currently route UPDATE through the normal
+fully-indexed path even when the indexed columns are unchanged. This avoids
+committing unreferenced chunks when same-page HOT placement fails after external
+chunk writes. Re-enabling HOT for TOAST-enabled tables requires a placement path
+that can decide same-page fit before chunk writes without violating structural
+latch ordering.
 
 ## TOAST Read Materialization
 
