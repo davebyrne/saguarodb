@@ -1,8 +1,10 @@
 mod support;
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
-use common::{RelationKind, ToastCompression, ToastMode};
+use common::{KeyRange, RelationKind, StatementContext, ToastCompression, ToastMode};
+use storage::StorageEngine;
 use support::{Connection, TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
@@ -91,6 +93,191 @@ fn assert_users_toast_metadata(server: &TestServer) {
         }
     );
     assert_eq!(catalog.get_table_by_name(&toast.name).unwrap(), None);
+}
+
+fn visible_toast_chunk_count(server: &TestServer, table: &str) -> usize {
+    let app = server.app();
+    let base = app
+        .components
+        .catalog
+        .get_table_by_name(table)
+        .expect("catalog lookup")
+        .expect("base table exists");
+    let toast_table_id = base.toast_table_id.expect("base table has TOAST relation");
+    let toast = app
+        .components
+        .catalog
+        .get_table(toast_table_id)
+        .expect("toast catalog lookup")
+        .expect("toast table exists");
+    assert!(matches!(toast.relation_kind, RelationKind::Toast { .. }));
+    let reader_txn = app
+        .components
+        .next_txn_id
+        .load(Ordering::Acquire)
+        .saturating_add(1_000);
+    let mut iter = app
+        .components
+        .storage
+        .scan_range(
+            &StatementContext::new(reader_txn),
+            toast_table_id,
+            &KeyRange::All,
+        )
+        .expect("scan hidden TOAST relation");
+    let mut count = 0;
+    while iter.next().expect("scan hidden TOAST chunk").is_some() {
+        count += 1;
+    }
+    count
+}
+
+#[tokio::test]
+async fn committed_toasted_insert_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "committed-toast-recovery-body-".repeat(260);
+    let payload = format!("\\x{}", "7a".repeat(1400));
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (id integer primary key, body text, payload bytea) \
+                 with (toast = aggressive, toast_tuple_target = 512, \
+                       toast_min_value_size = 128, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query(&format!(
+                "insert into docs (id, body, payload) \
+                 values (1, '{body}', BYTEA '{payload}')"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            visible_toast_chunk_count(&server, "docs") > 0,
+            "large committed values should be externalized before restart"
+        );
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select body, payload from docs where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some(body), Some(payload)]]);
+}
+
+#[tokio::test]
+async fn in_flight_toasted_insert_is_hidden_after_restart_and_vacuum_allows_future_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uncommitted = "uncommitted-toast-recovery-body-".repeat(260);
+    let committed = "post-vacuum-toast-recovery-body-".repeat(260);
+
+    {
+        let app = saguarodb_server::recovery::open_app(saguarodb_server::config::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..saguarodb_server::config::Config::default()
+        })
+        .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table docs (id integer primary key, body text) \
+                 with (toast = aggressive, toast_tuple_target = 512, \
+                       toast_min_value_size = 128, toast_compression = none)",
+            )
+            .unwrap();
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let iso = common::IsolationLevel::default();
+        let (mut slot, _iso, result) = app
+            .query_service
+            .execute_simple("begin", None, iso, &cancel);
+        result.unwrap();
+        let (next, _iso, result) = app.query_service.execute_simple(
+            &format!("insert into docs (id, body) values (1, '{uncommitted}')"),
+            slot,
+            iso,
+            &cancel,
+        );
+        result.unwrap();
+        slot = next;
+        assert!(slot.is_some(), "the transaction should remain open");
+        app.components
+            .wal
+            .flush()
+            .expect("uncommitted TOAST WAL records are durable before crash");
+        // Simulate process loss: do not run transaction cleanup, and do not write a
+        // Commit or Abort record after the uncommitted WAL became durable.
+        std::mem::forget(slot);
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert!(
+        server
+            .simple_query("select id from docs")
+            .await
+            .unwrap()
+            .unwrap_rows()
+            .is_empty(),
+        "the in-flight toasted parent row must be invisible after recovery"
+    );
+    assert_eq!(
+        visible_toast_chunk_count(&server, "docs"),
+        0,
+        "aborted recovered chunk rows must not be visible"
+    );
+
+    server.simple_query("vacuum docs").await.unwrap();
+    server
+        .simple_query(&format!(
+            "insert into docs (id, body) values (2, '{committed}')"
+        ))
+        .await
+        .unwrap();
+    assert!(
+        visible_toast_chunk_count(&server, "docs") > 0,
+        "future toasted writes should still work after vacuuming recovered aborts"
+    );
+    let rows = server
+        .simple_query("select body from docs where id = 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some(committed)]]);
+}
+
+#[tokio::test]
+async fn drop_table_removes_hidden_toast_relation_after_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let toast_table_id;
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (id integer primary key, body text) \
+                 with (toast = aggressive)",
+            )
+            .await
+            .unwrap();
+        let docs = server
+            .app()
+            .components
+            .catalog
+            .get_table_by_name("docs")
+            .unwrap()
+            .expect("docs table exists before drop");
+        toast_table_id = docs.toast_table_id.expect("hidden TOAST relation id");
+        server.simple_query("drop table docs").await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let catalog = &server.app().components.catalog;
+    assert_eq!(catalog.get_table_by_name("docs").unwrap(), None);
+    assert_eq!(catalog.get_table(toast_table_id).unwrap(), None);
 }
 
 #[tokio::test]
