@@ -96,11 +96,13 @@ impl QueryService {
 
         // 6-8. Rewrite: re-encode every page, logging a FullPageImage per
         // page and stamping the FPI's LSN as the page's new PageLSN (§8).
-        // The rewrite FPIs must be durable BEFORE the page flush
-        // (write-ahead) — `flush_dirty_pages` errors on a dirty page whose
-        // PageLSN exceeds the flushed WAL. A crash mid-rewrite leaves
-        // self-describing mixed encodings, and a torn page write is
-        // repaired by redo replaying its FPI (§8).
+        // This flush is load-bearing. `flush_dirty_pages` does NOT gate on
+        // PageLSN — it assumes the WAL is already durable — so the
+        // rewrite's FPIs must be flushed here first. Removing this flush
+        // would let a torn page write precede its FPI being durable
+        // (silent corruption on recovery), NOT produce a loud error. A
+        // crash mid-rewrite leaves self-describing mixed encodings, and a
+        // torn page write is repaired by redo replaying its FPI (§8).
         components.storage.rewrite_table_pages(&schema)?;
         components.wal.flush()?;
         components.buffer_pool.flush_dirty_pages()?;

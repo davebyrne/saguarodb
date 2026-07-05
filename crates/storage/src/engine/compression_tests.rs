@@ -3,18 +3,19 @@ use std::sync::Arc;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, CompressionSetting, DataType, PageFlushInfo, Row, Snapshot, StatementContext,
-    TableSchema, Value,
+    ColumnDef, CompressionSetting, DataType, IndexSchema, PageFlushInfo, Row, Snapshot,
+    StatementContext, TableSchema, Value,
 };
 use compress::CompressionRegistry;
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use crate::engine::{PageBackedStorageEngine, StorageMode};
-use crate::heap::{HeapPageStore, index_file_id};
+use crate::heap::{HeapPageStore, index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{SchemaOperations, StorageEngine};
 
 const TABLE_ID: u32 = 1;
+const NOTE_INDEX_ID: u32 = 7;
 
 struct AlwaysFlush;
 impl common::FlushPolicy for AlwaysFlush {
@@ -52,6 +53,20 @@ fn users_schema_zstd() -> TableSchema {
         primary_key: vec![0],
         compression: CompressionSetting::Zstd,
         active_dict_id: None,
+    }
+}
+
+/// A non-unique secondary index on the `note` column, mirroring
+/// `vacuum_tests::name_index` — gives `rewrite_table_pages` a live
+/// secondary-index file to exercise (it otherwise only ever sees the heap
+/// and primary-key files).
+fn note_index() -> IndexSchema {
+    IndexSchema {
+        id: NOTE_INDEX_ID,
+        table: TABLE_ID,
+        name: "users_note".to_string(),
+        columns: vec![1],
+        unique: false,
     }
 }
 
@@ -122,6 +137,11 @@ impl Fixture {
             .unwrap();
         commit(&fixture.wal, 100);
         fixture
+            .engine
+            .create_index(&ctx(101), &note_index(), 0)
+            .unwrap();
+        commit(&fixture.wal, 101);
+        fixture
     }
 
     /// Insert `count` committed rows starting at txn id `start_txn`.
@@ -139,7 +159,7 @@ impl Fixture {
 #[test]
 fn dml_on_zstd_table_logs_compressed_fpis() {
     let fixture = Fixture::new();
-    fixture.insert_rows(101, 20);
+    fixture.insert_rows(102, 20);
 
     // Every FPI for this table's files must be the compressed variant (the
     // repetitive rows compress far below 8 KiB): B-tree node images AND the
@@ -188,14 +208,15 @@ fn resolve_to_raw_fpi(kind: WalRecordKind) -> WalRecordKind {
 #[test]
 fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
     let fixture = Fixture::new();
-    fixture.insert_rows(101, 20);
+    fixture.insert_rows(102, 20);
     // Checkpoint-style flush, then mark everything clean so the following
     // assertions are about exactly what `rewrite_table_pages` itself does.
     fixture.buffer.flush_dirty_pages().unwrap();
     fixture.buffer.mark_all_clean().unwrap();
 
     let pk_file_id = index_file_id(TABLE_ID);
-    let files = [TABLE_ID, pk_file_id];
+    let secondary_file_id = secondary_index_file_id(NOTE_INDEX_ID);
+    let files = [TABLE_ID, pk_file_id, secondary_file_id];
 
     // Snapshot every initialized page's image before the rewrite.
     let mut before: HashMap<(u32, u32), [u8; buffer::PAGE_SIZE]> = HashMap::new();
@@ -212,8 +233,15 @@ fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
         }
     }
     assert!(
-        before.len() >= 2,
-        "heap page + at least the index metapage/root"
+        before.len() >= 3,
+        "heap page + PK index root + secondary index root"
+    );
+    assert!(
+        before
+            .keys()
+            .any(|&(file_id, _)| file_id == secondary_file_id),
+        "the secondary-index file must have at least one initialized page \
+         for this test to exercise rewrite_table_pages' secondary-index branch"
     );
 
     let wal_len_before = fixture.wal.replay_from(0).unwrap().count();
@@ -302,9 +330,12 @@ fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
         );
     }
 
-    // The rewrite FPIs are durable ahead of the following page flush
-    // (write-ahead), so the flush succeeds without erroring on an
-    // unflushable PageLSN.
+    // Confirms only that the rewritten pages flush cleanly under this
+    // fixture's `AlwaysFlush` policy, which ignores PageLSN — it does NOT
+    // exercise write-ahead ordering. The real guarantee (the rewrite's FPIs
+    // must be durable before `flush_dirty_pages` runs, since that call does
+    // not gate on PageLSN itself) is enforced by the caller's `wal.flush()`
+    // in `run_alter_table_compression`, not by this call.
     fixture.buffer.flush_dirty_pages().unwrap();
 }
 
@@ -312,7 +343,7 @@ fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
 fn sample_heap_pages_returns_page_images_capped() {
     let fixture = Fixture::new();
     // Enough rows to span several heap pages.
-    fixture.insert_rows(101, 200);
+    fixture.insert_rows(102, 200);
 
     let samples = fixture
         .engine

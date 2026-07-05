@@ -317,9 +317,12 @@ and dispatched before binding, exactly like `VACUUM` — the binder never sees
    page-header PageLSN (and its checksum) advances. `wal.flush()` runs
    immediately after this pass and before the page flush (step 8): the
    rewrite FPIs must be durable write-ahead of the pages that now carry a
-   higher PageLSN, or `flush_dirty_pages` would error on an unflushable
-   dirty page. A resident page that was ALREADY dirty (from other
-   in-flight work) is likewise FPI-logged and re-stamped by this pass.
+   higher PageLSN. `flush_dirty_pages` does not gate on PageLSN at all — it
+   assumes the caller already flushed the WAL — so skipping this flush
+   would not error loudly; it would let a torn page write precede its FPI
+   being durable, i.e. silent corruption on recovery. A resident page that
+   was ALREADY dirty (from other in-flight work) is likewise FPI-logged and
+   re-stamped by this pass.
 8. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
    pool: `PageStore::write_page` re-encodes each flushable dirty page under
    the just-installed config — the envelope encode step (§5) runs here.

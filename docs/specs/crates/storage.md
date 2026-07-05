@@ -1013,13 +1013,16 @@ into `write_page`'s encode step and `load_page`'s decode step.
   replaying the page's own FPI, instead of the WAL-free "just dirty it"
   version this once was. Returns the number of pages touched (and so the
   number of FPIs logged). The caller (`ALTER TABLE`) must flush the WAL
-  (write-ahead of the page writes — `flush_dirty_pages` errors on a dirty
-  page whose PageLSN exceeds the flushed WAL) before flushing the buffer pool
-  and fsyncing the store so every dirtied page is actually re-encoded under
-  the new config (see `docs/specs/crates/server.md` and
-  `docs/specs/compression.md` §8) — the caller holds the exclusive
-  checkpoint guard for the whole ALTER, so no concurrent writer observes an
-  inconsistent mix of dirtied-but-unflushed and not-yet-dirtied pages.
+  (write-ahead of the page writes) before flushing the buffer pool and
+  fsyncing the store so every dirtied page is actually re-encoded under the
+  new config (see `docs/specs/crates/server.md` and
+  `docs/specs/compression.md` §8) — `flush_dirty_pages` itself does not gate
+  on PageLSN (it passes `page_lsn: None` and assumes the caller already made
+  the WAL durable), so skipping this flush would not error; it would let a
+  torn page write precede its FPI being durable, i.e. silent corruption on
+  recovery. The caller holds the exclusive checkpoint guard for the whole
+  ALTER, so no concurrent writer observes an inconsistent mix of
+  dirtied-but-unflushed and not-yet-dirtied pages.
 - **Corruption semantics.** An envelope validation failure is a distinct
   structured corruption-class error (`SqlState::InternalError`), never
   confused with "this is a raw page." A normal `load_page`/`write_page` fault
