@@ -897,14 +897,14 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
                             schema.name
                         )));
                     }
-                    let toast_schema =
+                    let hidden_schema =
                         snapshot.tables_by_id.get(&toast_table_id).ok_or_else(|| {
                             DbError::internal(format!(
                                 "catalog snapshot table {} references missing TOAST relation {}",
                                 schema.name, toast_table_id
                             ))
                         })?;
-                    if toast_schema.relation_kind
+                    if hidden_schema.relation_kind
                         != (RelationKind::Toast {
                             base_table: schema.id,
                         })
@@ -914,6 +914,7 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
                             schema.name, toast_table_id
                         )));
                     }
+                    validate_hidden_toast_schema(schema, hidden_schema)?;
                 }
             }
             RelationKind::Toast { base_table } => {
@@ -953,8 +954,20 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
                         schema.name, base_table
                     )));
                 }
+                validate_hidden_toast_schema(base_schema, schema)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_hidden_toast_schema(base: &TableSchema, hidden: &TableSchema) -> Result<()> {
+    let expected = toast_schema(base, hidden.id);
+    if hidden != &expected {
+        return Err(DbError::internal(format!(
+            "catalog snapshot TOAST relation {} does not match the required internal schema",
+            hidden.name
+        )));
     }
     Ok(())
 }

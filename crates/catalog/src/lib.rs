@@ -100,7 +100,7 @@ mod tests {
     use common::{
         ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexSchema,
         ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema, SqlState,
-        TableSchema, ToastCompression, ToastMode, ToastOptions,
+        TableSchema, ToastCompression, ToastMode, ToastOptions, toast_schema,
     };
 
     use crate::{
@@ -1684,8 +1684,7 @@ mod tests {
     fn validate_accepts_hidden_toast_relation_without_name_index() {
         let mut base = stored_id_table(1, "users");
         base.toast_table_id = Some(2);
-        let mut toast = stored_id_table(2, "\0toast_1");
-        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        let toast = toast_schema(&base, 2);
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
             tables_by_id: HashMap::from([(1, base), (2, toast)]),
@@ -1697,12 +1696,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_malformed_hidden_toast_schema() {
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = toast_schema(&base, 2);
+        toast.columns[2].data_type = DataType::Text;
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, base), (2, toast)]),
+            next_table_id: 3,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("required internal schema"));
+    }
+
+    #[test]
     fn apply_create_table_installs_hidden_toast_relation_by_id_only() {
         let catalog = MemoryCatalog::empty();
         let mut base = stored_id_table(1, "users");
         base.toast_table_id = Some(2);
-        let mut toast = stored_id_table(2, "\0toast_1");
-        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        let toast = toast_schema(&base, 2);
 
         catalog.apply_create_table(base).unwrap();
         catalog.apply_create_table(toast).unwrap();
@@ -1720,8 +1736,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let mut base = stored_id_table(1, "users");
         base.toast_table_id = Some(2);
-        let mut toast = stored_id_table(2, "\0toast_1");
-        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        let toast = toast_schema(&base, 2);
 
         catalog.apply_create_table(base).unwrap();
         catalog.apply_create_table(toast).unwrap();
@@ -1738,8 +1753,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let mut base = stored_id_table(1, "users");
         base.toast_table_id = Some(2);
-        let mut toast = stored_id_table(2, "\0toast_1");
-        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        let toast = toast_schema(&base, 2);
 
         catalog.apply_create_table(base).unwrap();
         catalog.apply_create_table(toast).unwrap();
