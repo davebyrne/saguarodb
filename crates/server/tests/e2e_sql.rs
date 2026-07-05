@@ -262,6 +262,179 @@ async fn e2e_returning_over_extended_protocol() {
 }
 
 #[tokio::test]
+async fn e2e_toasted_text_and_bytea_round_trip_through_dml_returning() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table docs (id integer primary key, body text, payload bytea) \
+             with (toast = aggressive, toast_tuple_target = 512, \
+                   toast_min_value_size = 128, toast_compression = none)",
+        )
+        .await
+        .unwrap();
+
+    let body_a = "toast-body-a-".repeat(180);
+    let body_b = "toast-body-b-".repeat(190);
+    let payload_a = format!("\\x{}", "ab".repeat(1400));
+    let payload_b = format!("\\x{}", "cd".repeat(1500));
+
+    let rows = server
+        .simple_query(&format!(
+            "insert into docs (id, body, payload) \
+             values (1, '{body_a}', BYTEA '{payload_a}') returning id, body, payload"
+        ))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some(body_a.clone()),
+            Some(payload_a.clone())
+        ]]
+    );
+
+    let rows = server
+        .simple_query("select body, payload from docs where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some(body_a.clone()), Some(payload_a.clone())]]
+    );
+
+    let rows = server
+        .simple_query(&format!(
+            "update docs set body = '{body_b}', payload = BYTEA '{payload_b}' \
+             where id = 1 returning body, payload"
+        ))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some(body_b.clone()), Some(payload_b.clone())]]
+    );
+
+    let rows = server
+        .simple_query("delete from docs where id = 1 returning body, payload")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some(body_b), Some(payload_b)]]);
+
+    let rows = server
+        .simple_query("select id from docs")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_toasted_values_work_with_secondary_and_unique_indexes() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table docs (id integer primary key, body text, slug text) \
+             with (toast = aggressive, toast_tuple_target = 512, \
+                   toast_min_value_size = 128, toast_compression = none)",
+        )
+        .await
+        .unwrap();
+
+    let body_a = "indexed-toast-body-a-".repeat(70);
+    let body_b = "indexed-toast-body-b-".repeat(70);
+    let slug_a = "unique-toast-slug-a-".repeat(70);
+    let slug_b = "unique-toast-slug-b-".repeat(70);
+
+    server
+        .simple_query(&format!(
+            "insert into docs (id, body, slug) values (1, '{body_a}', '{slug_a}')"
+        ))
+        .await
+        .unwrap();
+    server
+        .simple_query("create index docs_body on docs (body)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create unique index docs_slug on docs (slug)")
+        .await
+        .unwrap();
+
+    let explain = server
+        .simple_query(&format!(
+            "explain select id from docs where body = '{body_a}'"
+        ))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "TOASTed secondary-index lookup should plan an IndexScan, got: {:?}",
+        explain[0][0]
+    );
+    let rows = server
+        .simple_query(&format!("select id from docs where body = '{body_a}'"))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    server
+        .simple_query(&format!(
+            "insert into docs (id, body, slug) values (2, '{body_b}', '{slug_b}')"
+        ))
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query(&format!("select id from docs where body = '{body_b}'"))
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+
+    let err = server
+        .simple_query(&format!(
+            "insert into docs (id, body, slug) values (3, '{body_b}', '{slug_a}')"
+        ))
+        .await
+        .err()
+        .expect("duplicate TOASTable slug should violate the unique index");
+    assert!(err.message.to_lowercase().contains("unique"));
+}
+
+#[tokio::test]
+async fn e2e_toasted_returning_over_extended_protocol() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table docs (id integer primary key, body text) \
+         with (toast = aggressive, toast_tuple_target = 512, \
+               toast_min_value_size = 128, toast_compression = none)")
+        .await;
+
+    let body = "extended-toast-body-".repeat(160);
+    let rows = conn
+        .extended_execute(&format!(
+            "insert into docs (id, body) values (1, '{body}') returning id, body"
+        ))
+        .await
+        .unwrap()
+        .rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string()), Some(body.clone())]]);
+
+    let rows = conn
+        .extended_execute(&format!("select id from docs where body = '{body}'"))
+        .await
+        .unwrap()
+        .rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
 async fn e2e_create_insert_select_update_delete_explain() {
     let server = TestServer::start().await.unwrap();
 

@@ -87,6 +87,35 @@ async fn copy_from_round_trips_through_copy_to() {
 }
 
 #[tokio::test]
+async fn copy_from_toasted_text_and_bytea_round_trips_through_copy_to() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok(
+        "create table docs (id integer primary key, body text, payload bytea) \
+         with (toast = aggressive, toast_tuple_target = 512, \
+               toast_min_value_size = 128, toast_compression = none)",
+    )
+    .await;
+
+    let body = "copy-toast-body-".repeat(170);
+    let payload = format!("\\\\x{}", "ef".repeat(1300));
+    let copy_data = format!("1\t{body}\t{payload}\n");
+
+    let copy = conn
+        .copy_from("copy docs from stdin", &[copy_data.as_bytes()])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 1"));
+
+    let (data, copy) = conn
+        .copy_to("copy docs to stdout")
+        .await
+        .expect("COPY TO should materialize toasted values");
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 1"));
+    assert_eq!(data, copy_data.as_bytes());
+}
+
+#[tokio::test]
 async fn copy_from_bad_value_aborts_whole_copy() {
     let (_server, mut conn) = server_with_table().await;
 
