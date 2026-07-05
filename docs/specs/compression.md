@@ -88,8 +88,9 @@ and `parser`/binder can reference it without depending on `compress`.
 - `TableSchema` gains `compression: CompressionSetting` and
   `active_dict_id: Option<u32>`.
 - **`CREATE TABLE <name> (...) WITH (compression = 'none' | 'zstd')`** —
-  new optional trailing clause. Unknown option keys or values are binder
-  errors with accurate SQLSTATEs. Omitted ⇒ `none` (current behavior).
+  new optional trailing clause. Unknown option keys are rejected at parse
+  time (`SqlState::SyntaxError`) and an unsupported codec value is
+  `SqlState::FeatureNotSupported` — there is no bind step. Omitted ⇒ `none`.
   String literal values; unquoted identifiers are also accepted and
   lowercased per the identifier rules.
 - **`ALTER TABLE <name> SET (compression = 'none' | 'zstd')`** — the first
@@ -307,11 +308,11 @@ Steps 5-8 are post-durable-commit cleanup: any error there is fatal
 rather than a returned statement error, exactly like every other autocommit
 write path (`docs/specs/crates/server.md`), because the DDL already committed
 and misreporting it as failed would be worse than crashing. The exclusive
-guard covers steps 1-8 and is released before the post-commit checkpoint
+guard covers steps 1-7 and is released before the post-commit checkpoint
 trigger runs (`record_commit_and_maybe_checkpoint_after_durable_commit`,
 `docs/specs/crates/server.md`) — that call takes its own exclusive guard, so
 calling it earlier would deadlock — which is also what makes the rewrite's
-WAL activity in step 7 count toward `--checkpoint-wal-bytes` right away
+WAL activity in step 6 count toward `--checkpoint-wal-bytes` right away
 instead of waiting on an unrelated later commit to notice it.
 
 1. Parse: the compression value must be `'none'` or `'zstd'` (checked by the
@@ -330,9 +331,7 @@ instead of waiting on an unrelated later commit to notice it.
    exactly like other DDL records.
 5. Update the in-memory catalog and the store's file configs (heap + all
    index files of the table).
-6. `wal.flush()` — everything below is plain page I/O and must be
-   write-ahead covered.
-7. **Rewrite pass (an FPI per page — torn-page repair, exactly like
+6. **Rewrite pass (an FPI per page — torn-page repair, exactly like
    VACUUM):** for each page `0..page_count` of the heap file, the PK index
    file, and every secondary index file (skipping buffer-reported abandoned
    holes and pages that are not yet initialized): take its write guard,
@@ -342,7 +341,7 @@ instead of waiting on an unrelated later commit to notice it.
    PageLSN (`rewrite_table_pages`, mirroring `vacuum_heap` /
    `reclaim_line_pointers`). Logical bytes are unchanged — only the
    page-header PageLSN (and its checksum) advances. `wal.flush()` runs
-   immediately after this pass and before the page flush (step 8): the
+   immediately after this pass and before the page flush (step 7): the
    rewrite FPIs must be durable write-ahead of the pages that now carry a
    higher PageLSN. `flush_dirty_pages` does not gate on PageLSN at all — it
    assumes the caller already flushed the WAL — so skipping this flush
@@ -350,7 +349,7 @@ instead of waiting on an unrelated later commit to notice it.
    being durable, i.e. silent corruption on recovery. A resident page that
    was ALREADY dirty (from other in-flight work) is likewise FPI-logged and
    re-stamped by this pass.
-8. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
+7. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
    pool: `PageStore::write_page` re-encodes each flushable dirty page under
    the just-installed config — the envelope encode step (§5) runs here.
    Then `store.sync_all()`, then `buffer_pool.mark_all_clean()` —
@@ -370,8 +369,8 @@ instead of waiting on an unrelated later commit to notice it.
 - Crash during/after the rewrite: the catalog change is durable; files hold
   a mix of old- and new-encoding slots, every one self-describing and
   readable; subsequent writes follow the new setting. A page torn mid-write
-  during the rewrite's own page flush (step 8) is **repaired by redo**
-  replaying that page's `FullPageImage` from step 7, exactly like any other
+  during the rewrite's own page flush (step 7) is **repaired by redo**
+  replaying that page's `FullPageImage` from step 6, exactly like any other
   page-write path (§5) — it is not left corrupt, and recovery does not
   depend on the `ALTER` being re-run. The rewrite as a whole is still **not**
   resumed automatically past whatever page range it reached: re-running the

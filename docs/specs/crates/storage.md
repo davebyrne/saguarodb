@@ -969,19 +969,22 @@ into `write_page`'s encode step and `load_page`'s decode step.
   redo will replay — so treating it as a zeroed missing frame is sound and
   strictly better than trusting a torn raw page's garbage bytes and garbage
   PageLSN.
-- **`fpi_record_kind` policy at the five FPI sites.** Every call site that logs
+- **`fpi_record_kind` policy at the FPI sites.** Every call site that logs
   a WAL full-page image builds its record through
   `engine::fpi_record_kind(compression, file_id, page_num, image)`, which asks
   `CompressionRegistry::compress_fpi` (unconditional — independent of the
   file's at-rest config) and emits `WalRecordKind::FullPageImageCompressed`
   when it shrinks the image, `WalRecordKind::FullPageImage` (raw) otherwise —
-  self-describing per record, so the WAL never expands. The five sites are:
+  self-describing per record, so the WAL never expands. The five steady-state
+  DML/VACUUM sites are:
   `BTree::log_full_page` (every B-tree node mutation — the primary-key index,
   every secondary index, and index vacuum's leaf rewrite all share this one
   function), `log_insert` (a heap row's first-touch-since-checkpoint FPI),
   `stamp_xmax_logged` (the `UPDATE`/`DELETE` in-place `xmax`/`t_ctid` stamp's
   first-touch FPI), `apply_prune_plan` (the heap-prune VACUUM pass, F2b/H3),
-  and `reclaim_line_pointers` (the line-pointer-reclaim VACUUM pass, F3b).
+  and `reclaim_line_pointers` (the line-pointer-reclaim VACUUM pass, F3b). The
+  `ALTER TABLE` rewrite (`rewrite_table_pages`, below) is a sixth caller of the
+  same helper, logging one FPI per re-encoded page.
 - **`set_table_compression(schema)`.** Installs an ALTERed schema into the
   live `TableState` and re-registers the heap file's config plus every live
   secondary-index file's config (still dict-less) under the new setting. Pure
