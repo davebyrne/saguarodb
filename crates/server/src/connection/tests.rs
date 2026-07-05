@@ -442,6 +442,86 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn extended_protocol_parameterized_toasted_text_and_bytea_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    client
+        .write_all(&query_bytes(
+            "create table docs (id integer primary key, body text, payload bytea) \
+             with (toast = aggressive, toast_tuple_target = 512, \
+                   toast_min_value_size = 128, toast_compression = none)",
+        ))
+        .await
+        .unwrap();
+    read_until_ready(&mut client).await;
+
+    let body = "extended-param-toast-body-".repeat(150);
+    let payload = vec![0xcd; 1400];
+    let expected_payload = format!("\\x{}", "cd".repeat(payload.len()));
+
+    let mut seq = parse_bytes(
+        "",
+        "insert into docs (id, body, payload) values ($1, $2, $3) returning body, payload",
+        &[20, 25, 17],
+    );
+    seq.extend(bind_bytes(
+        "",
+        "",
+        &[0, 0, 1],
+        &[Some(b"1"), Some(body.as_bytes()), Some(&payload)],
+        &[0, 0],
+    ));
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response
+            .windows(body.len())
+            .any(|window| window == body.as_bytes()),
+        "text parameter round-tripped through a returned toasted row"
+    );
+    assert!(
+        response
+            .windows(expected_payload.len())
+            .any(|window| window == expected_payload.as_bytes()),
+        "binary bytea parameter round-tripped through a returned toasted row"
+    );
+
+    let mut seq = parse_bytes("", "select body, payload from docs where id = $1", &[20]);
+    seq.extend(bind_bytes("", "", &[0], &[Some(b"1")], &[0, 0]));
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response
+            .windows(body.len())
+            .any(|window| window == body.as_bytes()),
+        "text parameter stayed readable after storage"
+    );
+    assert!(
+        response
+            .windows(expected_payload.len())
+            .any(|window| window == expected_payload.as_bytes()),
+        "bytea parameter stayed readable after storage"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
 /// A JDBC-style client that declares an `int4` parameter (OID 23) and binds it in
 /// binary (4 bytes): the `Parse` is accepted (previously rejected as an
 /// "unsupported parameter type OID"), `ParameterDescription` echoes int4, and the
