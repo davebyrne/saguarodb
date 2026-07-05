@@ -222,10 +222,9 @@ impl Fixture {
         snapshot: Snapshot,
         current_txn: u64,
     ) -> Option<(super::RowLocation, u16)> {
-        let schema = users_schema();
         let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
         self.engine
-            .locate_visible_version(&schema, &btree, key, &snapshot, &[current_txn])
+            .locate_visible_version(&btree, key, &snapshot, &[current_txn])
             .unwrap()
     }
 
@@ -236,10 +235,9 @@ impl Fixture {
         snapshot: Snapshot,
         current_txn: u64,
     ) -> Option<(super::RowLocation, u16)> {
-        let schema = hot_schema();
         let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
         self.engine
-            .locate_visible_version(&schema, &btree, key, &snapshot, &[current_txn])
+            .locate_visible_version(&btree, key, &snapshot, &[current_txn])
             .unwrap()
     }
 

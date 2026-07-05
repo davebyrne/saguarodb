@@ -25,10 +25,10 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
-        KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
-        StatementContext, TableSchema, ToastCompression, ToastMode, ToastOptions, TxnId, TxnStatus,
-        TxnStatusView, Value, toast_schema,
+        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexId,
+        IndexSchema, Key, KeyRange, Lsn, RelationKind, Result, Row, SequenceManager,
+        SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression, ToastMode,
+        ToastOptions, TxnId, TxnStatus, TxnStatusView, Value, toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -36,10 +36,13 @@ mod tests {
         PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
         StorageMode, apply_physical_redo,
         btree::BTree,
-        codec::{DecodedPhysicalValue, MvccHeader, decode_physical_row},
+        codec::{
+            DecodedPhysicalValue, MvccHeader, PreparedColumnValue, ToastPointer, VarlenaPhysical,
+            decode_physical_row, encode_row_v3_prepared,
+        },
         decode_row, encode_row,
         engine::RowLocation,
-        heap::index_file_id,
+        heap::{index_file_id, secondary_index_file_id},
         toast::{TOAST_CHUNK_PAYLOAD, build_external_stream},
     };
 
@@ -2072,6 +2075,170 @@ mod tests {
         assert!(visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
     }
 
+    #[test]
+    fn read_materializes_inline_compressed_text_for_get_scan_and_index_scan() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false), 0)
+            .unwrap();
+        let name = "read-materialized-name-".repeat(80);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(name.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+        let row_bytes = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap();
+        assert!(matches!(
+            decode_physical_row(&base, &row_bytes).unwrap().values[1],
+            DecodedPhysicalValue::Compressed { .. }
+        ));
+        let location = seed_parent_tuple(&harness, &ctx, &base, &row_bytes, &pk(1));
+        seed_secondary_entry(
+            &harness,
+            &ctx,
+            name_index(false).id,
+            &Key(vec![Value::Text(name.clone())]),
+            &location,
+        );
+
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &pk(1)).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            collect(harness.storage.scan_range(&ctx, 1, &KeyRange::All).unwrap()),
+            vec![row.clone()]
+        );
+        assert_eq!(
+            collect(
+                harness
+                    .storage
+                    .index_scan(&ctx, 1, name_index(false).id, &name_eq(&name))
+                    .unwrap()
+            ),
+            vec![row]
+        );
+    }
+
+    #[test]
+    fn read_materializes_external_bytea_for_get_and_scan() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = entropy_bytes(9000);
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(raw)],
+        };
+        let row_bytes = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap();
+        assert!(matches!(
+            decode_physical_row(&base, &row_bytes).unwrap().values[1],
+            DecodedPhysicalValue::External { .. }
+        ));
+        seed_parent_tuple(&harness, &ctx, &base, &row_bytes, &pk(1));
+
+        assert_eq!(
+            harness.storage.get(&ctx, 1, &pk(1)).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(
+            collect(harness.storage.scan_range(&ctx, 1, &KeyRange::All).unwrap()),
+            vec![row]
+        );
+    }
+
+    #[test]
+    fn read_visible_external_value_with_missing_chunks_errors() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row_bytes = external_name_parent_bytes(&base, ctx.txn_id, 1, 99);
+        seed_parent_tuple(&harness, &ctx, &base, &row_bytes, &pk(1));
+
+        let err = harness.storage.get(&ctx, 1, &pk(1)).unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("expected"));
+    }
+
+    #[test]
+    fn read_skips_invisible_external_value_without_touching_missing_chunks() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(10);
+        let read_ctx = StatementContext::new(20);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let row_bytes = external_name_parent_bytes(&base, insert_ctx.txn_id, 1, 99);
+        seed_parent_tuple(&harness, &insert_ctx, &base, &row_bytes, &pk(1));
+        harness.wal.mark_aborted(insert_ctx.txn_id);
+
+        assert_eq!(harness.storage.get(&read_ctx, 1, &pk(1)).unwrap(), None);
+        assert!(
+            collect(
+                harness
+                    .storage
+                    .scan_range(&read_ctx, 1, &KeyRange::All)
+                    .unwrap()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_rejects_inline_crc_mismatch() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = b"crc-checked inline text".repeat(80);
+        let payload = compress::compress_value_zstd(&raw).unwrap();
+        let row_bytes = encode_row_v3_prepared(
+            &base,
+            &MvccHeader::fresh(ctx.txn_id, 0),
+            &[
+                PreparedColumnValue::Value(Value::Integer(1)),
+                PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                    codec: compress::CODEC_ZSTD,
+                    dict_id: None,
+                    raw_len: raw.len() as u32,
+                    raw_crc32: crc32fast::hash(&raw) ^ 1,
+                    payload,
+                }),
+                PreparedColumnValue::Value(Value::Boolean(true)),
+                PreparedColumnValue::Null,
+            ],
+        )
+        .unwrap();
+        seed_parent_tuple(&harness, &ctx, &base, &row_bytes, &pk(1));
+
+        let err = harness.storage.get(&ctx, 1, &pk(1)).unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("CRC32"));
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -2691,6 +2858,102 @@ mod tests {
             .prepare_row_for_storage(ctx, schema, &MvccHeader::fresh(ctx.txn_id, 0), row)
             .unwrap();
         decode_physical_row(schema, &bytes).unwrap().values
+    }
+
+    fn seed_parent_tuple(
+        harness: &StorageHarness,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        row_bytes: &[u8],
+        key: &Key,
+    ) -> RowLocation {
+        let location = RowLocation {
+            file_id: schema.id,
+            page_num: 0,
+            slot_num: 0,
+        };
+        {
+            let mut guard = harness
+                .storage
+                .buffer_pool
+                .fetch_for_redo(schema.id, 0)
+                .unwrap();
+            apply_physical_redo(
+                guard.data_mut(),
+                10,
+                &WalRecordKind::HeapInit {
+                    file_id: schema.id,
+                    page_num: 0,
+                },
+            )
+            .unwrap();
+        }
+        {
+            let mut guard = harness
+                .storage
+                .buffer_pool
+                .fetch_for_redo(schema.id, 0)
+                .unwrap();
+            apply_physical_redo(
+                guard.data_mut(),
+                11,
+                &WalRecordKind::HeapInsert {
+                    file_id: schema.id,
+                    page_num: 0,
+                    slot: 0,
+                    row_bytes: row_bytes.to_vec(),
+                },
+            )
+            .unwrap();
+        }
+        let btree = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            index_file_id(schema.id),
+            harness.storage.compression.as_ref(),
+        );
+        btree.insert(ctx.txn_id, key, &location).unwrap();
+        location
+    }
+
+    fn seed_secondary_entry(
+        harness: &StorageHarness,
+        ctx: &StatementContext,
+        index: IndexId,
+        key: &Key,
+        location: &RowLocation,
+    ) {
+        let btree = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            secondary_index_file_id(index),
+            harness.storage.compression.as_ref(),
+        );
+        btree.insert(ctx.txn_id, key, location).unwrap();
+    }
+
+    fn external_name_parent_bytes(
+        schema: &TableSchema,
+        txn_id: TxnId,
+        row_id: i64,
+        value_id: u64,
+    ) -> Vec<u8> {
+        encode_row_v3_prepared(
+            schema,
+            &MvccHeader::fresh(txn_id, 0),
+            &[
+                PreparedColumnValue::Value(Value::Integer(row_id)),
+                PreparedColumnValue::Varlena(VarlenaPhysical::External(ToastPointer {
+                    value_id,
+                    raw_len: 4,
+                    stored_len: 8,
+                    codec: compress::CODEC_NONE,
+                })),
+                PreparedColumnValue::Value(Value::Boolean(true)),
+                PreparedColumnValue::Null,
+            ],
+        )
+        .unwrap()
     }
 
     fn entropy_bytes(len: usize) -> Vec<u8> {

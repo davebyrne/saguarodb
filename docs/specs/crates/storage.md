@@ -1250,6 +1250,30 @@ external values, storage writes the complete external stream to the hidden
 relation under the caller's transaction, stores real `ToastPointer`s in the
 parent row, and returns the v3 parent bytes.
 
+## TOAST Read Materialization
+
+User-facing storage reads return logical `Row` values. Visibility resolution is
+header-only: `get`, primary-key scans, and secondary-index scans first resolve the
+visible heap tuple using only MVCC header fields and HOT-chain metadata. They do
+not decompress inline values or read external TOAST chunks for invisible tuples.
+
+After a tuple is known visible, storage decodes the physical v3 row and
+materializes each value:
+
+- Plain values become their ordinary logical `Value`.
+- Inline compressed `TEXT`/`BYTEA` values are decompressed with the stored codec
+  and dictionary id, checked against the stored raw length, checked against the
+  stored `raw_crc32`, and then rebuilt as `Value::Text` or `Value::Bytes`.
+- External `TEXT`/`BYTEA` values read the hidden TOAST relation using the same
+  statement snapshot, reconstruct the complete stream in `(value_id, seq)` order,
+  parse the stream header for dictionary id and `raw_crc32`, decompress/validate
+  the payload, and rebuild the logical value.
+
+Visible rows with missing, duplicate, out-of-order, length-mismatched, CRC-bad,
+UTF-8-invalid, or dictionary-unresolvable TOAST data return a structured storage
+error. Invisible rows with broken external chunks are skipped without touching
+those chunks.
+
 ## Structural Write Latches (Milestone E2a)
 
 Stage-2 concurrency (`docs/specs/mvcc.md` §7.1, §10 E2a) serializes structural

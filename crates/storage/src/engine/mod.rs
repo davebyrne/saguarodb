@@ -52,7 +52,9 @@ use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 use crate::btree::BTree;
-use crate::codec::{ToastPointer, decode_row, encode_row};
+use crate::codec::{
+    DecodedPhysicalValue, ToastPointer, decode_physical_row, decode_row, encode_row,
+};
 use crate::heap::{index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{RowIterator, SchemaOperations, StorageEngine};
@@ -910,9 +912,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // once versioning lands (B4); collect every candidate TID and return the
         // single one visible to this snapshot. Today there is one entry per key.
         for location in self.btree(index_fid).scan_key(key)? {
-            if let Some((_resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
-            {
+            if let Some((_resolved, row)) = self.read_visible_row(ctx, &schema, location)? {
                 return Ok(Some(row));
             }
         }
@@ -920,7 +920,7 @@ impl StorageEngine for PageBackedStorageEngine {
     }
 
     fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool> {
-        let Some((schema, index_fid)) = self.table_handle_opt(table)? else {
+        let Some((_, index_fid)) = self.table_handle_opt(table)? else {
             return Ok(false);
         };
         let btree = self.btree(index_fid);
@@ -928,7 +928,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // executor matched). If none is visible the key was already deleted or is
         // absent, so the delete affects no row — preserve the no-op semantics.
         let Some((location, infomask)) =
-            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, &ctx.live_txns)?
+            self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
         else {
             return Ok(false);
         };
@@ -965,7 +965,7 @@ impl StorageEngine for PageBackedStorageEngine {
         // is visible the key was already deleted or is absent, so the update affects
         // no row — preserve the no-op semantics.
         let Some((previous_location, infomask)) =
-            self.locate_visible_version(&schema, &btree, key, &ctx.snapshot, &ctx.live_txns)?
+            self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
         else {
             return Ok(false);
         };
@@ -1112,9 +1112,7 @@ impl StorageEngine for PageBackedStorageEngine {
             // why the bounded walk's stop-at-indexed-successor rule prevents a row
             // from being returned twice (`mvcc.md` §10 Milestone H1). The yielded
             // `RowId` is the resolved live version, not the index TID.
-            let Some((resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
-            else {
+            let Some((resolved, row)) = self.read_visible_row(ctx, &schema, location)? else {
                 continue;
             };
             rows.push(StoredRow {
@@ -1157,9 +1155,7 @@ impl StorageEngine for PageBackedStorageEngine {
         for (_entry_key, location) in entries {
             // Resolve to the visible version; an invisible chain (or a DEAD/absent
             // root line pointer) is skipped, not an error.
-            let Some((resolved, row)) =
-                self.read_visible_row(&schema, location, &ctx.snapshot, &ctx.live_txns)?
-            else {
+            let Some((resolved, row)) = self.read_visible_row(ctx, &schema, location)? else {
                 continue;
             };
             // The row's primary key is recovered from the heap row, preserving the

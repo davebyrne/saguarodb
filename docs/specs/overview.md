@@ -1351,6 +1351,8 @@ Development builds do not migrate older page formats. Existing page files withou
 
 Storage has a staged TOAST-aware row preparation helper for the upcoming ordinary DML write path; ordinary DML currently still emits v2 tuples. The helper converts logical rows to v3 parent tuple bytes, preflights primary-key and secondary-index key sizes before any chunk writes, bypasses recursive TOAST for hidden TOAST relations, preserves inline-only behavior for legacy user tables without a companion TOAST relation, attempts configured value compression for eligible medium `TEXT`/`BYTEA` values, length-simulates largest-first externalization before writing chunks, then writes TOAST chunks under the caller's transaction only after the final parent tuple is known to fit a page.
 
+User-facing storage reads resolve tuple visibility from MVCC headers before materializing v3 TOAST values. Only visible parent tuples decompress inline compressed values or read external chunks from the hidden TOAST relation; invisible tuples with missing or corrupt chunks are skipped without touching those chunks.
+
 ### File Layout
 
 Files are named by stable numeric ID, not by user-visible names. This avoids rename issues (future `ALTER TABLE RENAME`), filesystem-unsafe characters in table names, and name collisions.

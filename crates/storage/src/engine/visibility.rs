@@ -1,5 +1,20 @@
 use super::*;
 
+fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> Result<Value> {
+    let column = schema.columns.get(column).ok_or_else(|| {
+        crate::toast::toast_corruption("TOAST physical value references a missing column")
+    })?;
+    match column.data_type {
+        DataType::Text => String::from_utf8(raw)
+            .map(Value::Text)
+            .map_err(|_| crate::toast::toast_corruption("TOAST text value is not valid UTF-8")),
+        DataType::Bytea => Ok(Value::Bytes(raw)),
+        _ => Err(crate::toast::toast_corruption(
+            "TOAST physical value references a non-varlena column",
+        )),
+    }
+}
+
 impl PageBackedStorageEngine {
     /// Read the *current physical* row at `location`, ignoring snapshot
     /// visibility. Used by index-maintenance paths (delete/update/index backfill)
@@ -20,6 +35,67 @@ impl PageBackedStorageEngine {
         };
         Ok(Some(decode_row(schema, &bytes)?.row))
     }
+
+    pub(super) fn materialize_physical_row(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        physical: crate::codec::DecodedPhysicalRow,
+    ) -> Result<Row> {
+        let mut values = Vec::with_capacity(physical.values.len());
+        for physical_value in physical.values {
+            match physical_value {
+                DecodedPhysicalValue::Null => values.push(Value::Null),
+                DecodedPhysicalValue::Value(value) => values.push(value),
+                DecodedPhysicalValue::Compressed {
+                    column,
+                    codec,
+                    dict_id,
+                    raw_len,
+                    raw_crc32,
+                    payload,
+                } => {
+                    let raw = self
+                        .materialize_toast_payload(codec, dict_id, raw_len, raw_crc32, &payload)?;
+                    values.push(toast_value_for_column(schema, column, raw)?);
+                }
+                DecodedPhysicalValue::External { column, pointer } => {
+                    let stream = self.read_toast_stream(ctx, schema, &pointer)?;
+                    let (dict_id, raw_crc32, payload) =
+                        crate::toast::parse_external_stream(pointer.codec, &stream)?;
+                    let raw = self.materialize_toast_payload(
+                        pointer.codec,
+                        dict_id,
+                        pointer.raw_len,
+                        raw_crc32,
+                        payload,
+                    )?;
+                    values.push(toast_value_for_column(schema, column, raw)?);
+                }
+            }
+        }
+        Ok(Row { values })
+    }
+
+    fn materialize_toast_payload(
+        &self,
+        codec: u8,
+        dict_id: Option<u32>,
+        raw_len: u32,
+        raw_crc32: u32,
+        payload: &[u8],
+    ) -> Result<Vec<u8>> {
+        let raw = self
+            .compression
+            .decompress_value(codec, dict_id, payload, raw_len as usize)?;
+        if crc32fast::hash(&raw) != raw_crc32 {
+            return Err(crate::toast::toast_corruption(
+                "TOAST value raw CRC32 does not match stored metadata",
+            ));
+        }
+        Ok(raw)
+    }
+
     /// Resolve an index entry's TID — possibly a HOT root — to the heap slot of the
     /// single version **visible** to `snapshot` from `current_txns`, reading the
     /// `location` page once under a read latch (pure: no page mutation; pruning is
@@ -50,7 +126,6 @@ impl PageBackedStorageEngine {
     /// single-tuple visibility check.
     fn resolve_visible_in_chain(
         &self,
-        schema: &TableSchema,
         location: RowLocation,
         snapshot: &Snapshot,
         current_txns: &[u64],
@@ -96,11 +171,11 @@ impl PageBackedStorageEngine {
             let Some(bytes) = page::read_row(data, current_slot)? else {
                 return Err(storage_internal("HOT chain member is not a live tuple"));
             };
-            let decoded = decode_row(schema, &bytes)?;
+            let (xmin, xmax, t_ctid, infomask) = crate::codec::decode_mvcc_header(&bytes)?;
             if is_visible(
-                decoded.xmin,
-                decoded.xmax,
-                decoded.infomask,
+                xmin,
+                xmax,
+                infomask,
                 snapshot,
                 current_txns,
                 self.txn_status_view(),
@@ -111,7 +186,7 @@ impl PageBackedStorageEngine {
                         page_num,
                         slot_num: current_slot,
                     },
-                    decoded.infomask,
+                    infomask,
                 )));
             }
 
@@ -121,10 +196,10 @@ impl PageBackedStorageEngine {
             // reachable only here). Any other case — latest version, a non-HOT
             // successor, or an off-page successor — is independently indexed/absent,
             // so we must not cross into it (double-count guard).
-            if decoded.infomask & crate::codec::HOT_UPDATED == 0 {
+            if infomask & crate::codec::HOT_UPDATED == 0 {
                 return Ok(None);
             }
-            let (succ_page, succ_slot) = decoded.t_ctid;
+            let (succ_page, succ_slot) = t_ctid;
             if succ_page != page_num {
                 return Ok(None);
             }
@@ -262,20 +337,25 @@ impl PageBackedStorageEngine {
     /// index TID itself.
     pub(super) fn read_visible_row(
         &self,
+        ctx: &StatementContext,
         schema: &TableSchema,
         location: RowLocation,
-        snapshot: &Snapshot,
-        current_txns: &[u64],
     ) -> Result<Option<(RowLocation, Row)>> {
         let Some((resolved, _infomask)) =
-            self.resolve_visible_in_chain(schema, location, snapshot, current_txns)?
+            self.resolve_visible_in_chain(location, &ctx.snapshot, &ctx.live_txns)?
         else {
             return Ok(None);
         };
         // The resolved slot is the NORMAL, visible chain member; read its bytes.
-        let Some(row) = self.read_location(schema, resolved)? else {
+        let readable = self
+            .buffer_pool
+            .read_page(resolved.file_id, resolved.page_num)?;
+        let Some(bytes) = page::read_row(readable.data(), resolved.slot_num)? else {
             return Ok(None);
         };
+        let physical = decode_physical_row(schema, &bytes)?;
+        drop(readable);
+        let row = self.materialize_physical_row(ctx, schema, physical)?;
         Ok(Some((resolved, row)))
     }
     /// Locate the single version of `key` visible to `snapshot` from `current_txns`
@@ -290,7 +370,6 @@ impl PageBackedStorageEngine {
     /// (`read_row` ⇒ `None`) is a reclaimed slot and is skipped.
     pub(super) fn locate_visible_version(
         &self,
-        schema: &TableSchema,
         index_btree: &BTree<'_, RowLocation>,
         key: &Key,
         snapshot: &Snapshot,
@@ -303,7 +382,7 @@ impl PageBackedStorageEngine {
             // stamp), not the index TID — so a HOT-updated row is stamped at the live
             // heap-only version, not its pruned root.
             if let Some(resolved) =
-                self.resolve_visible_in_chain(schema, location, snapshot, current_txns)?
+                self.resolve_visible_in_chain(location, snapshot, current_txns)?
             {
                 return Ok(Some(resolved));
             }
