@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use common::{
-    ColumnInfo, DataType, DbError, IsolationLevel, Result, Row, SessionSequenceState, SqlState,
-    Value,
+    ColumnInfo, DataType, DbError, IsolationLevel, POSTGRES_COMPAT_VERSION, Result, Row,
+    SessionSequenceState, SqlState, Value,
 };
 use executor::ExecutionResult;
 use parser::{SetScope, Statement};
@@ -34,7 +34,7 @@ impl SessionGucs {
             ("integer_datetimes", "on"),
             ("search_path", "\"$user\", public"),
             ("server_encoding", "UTF8"),
-            ("server_version", "16.0"),
+            ("server_version", POSTGRES_COMPAT_VERSION),
             ("standard_conforming_strings", "on"),
             ("timezone", "UTC"),
         ] {
@@ -311,7 +311,7 @@ fn parse_isolation_setting(value: &str) -> Option<IsolationLevel> {
         .to_ascii_lowercase();
     match normalized.split_whitespace().collect::<Vec<_>>().as_slice() {
         ["read", "uncommitted"] | ["read", "committed"] => Some(IsolationLevel::ReadCommitted),
-        ["repeatable", "read"] | ["snapshot"] => Some(IsolationLevel::RepeatableRead),
+        ["repeatable", "read"] => Some(IsolationLevel::RepeatableRead),
         ["serializable"] => Some(IsolationLevel::Serializable),
         _ => None,
     }
@@ -379,8 +379,12 @@ fn show_all_result(
     ));
     settings.push((
         "transaction_isolation".to_string(),
-        show_value("transaction_isolation", slot, default_isolation, gucs)
-            .expect("transaction_isolation is always derived"),
+        isolation_setting(
+            slot.as_ref()
+                .map(|txn| txn.isolation)
+                .unwrap_or(default_isolation),
+        )
+        .to_string(),
     ));
     settings.sort();
     let rows = settings
@@ -445,6 +449,7 @@ mod tests {
             parse_isolation_setting("SERIALIZABLE"),
             Some(IsolationLevel::Serializable)
         );
+        assert_eq!(parse_isolation_setting("snapshot"), None);
         assert_eq!(parse_isolation_setting("bogus"), None);
     }
 }

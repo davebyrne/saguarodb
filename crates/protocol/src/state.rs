@@ -1,4 +1,4 @@
-use common::{DbError, Result, SqlState};
+use common::{DbError, POSTGRES_COMPAT_VERSION, Result, SqlState};
 
 use crate::{ClientMessage, ServerMessage};
 
@@ -39,7 +39,7 @@ impl ConnectionState for PostgresConnectionState {
                 ServerMessage::AuthenticationOk,
                 ServerMessage::ParameterStatus {
                     key: "server_version".to_string(),
-                    value: "16.0".to_string(),
+                    value: POSTGRES_COMPAT_VERSION.to_string(),
                 },
                 ServerMessage::ParameterStatus {
                     key: "server_encoding".to_string(),

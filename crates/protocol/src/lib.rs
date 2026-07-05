@@ -8,7 +8,7 @@ pub use state::{ConnectionState, PostgresConnectionState};
 
 #[cfg(test)]
 mod tests {
-    use common::{ColumnInfo, DataType, PgType, Value};
+    use common::{ColumnInfo, DataType, POSTGRES_COMPAT_VERSION, PgType, Value};
 
     use super::{
         ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -460,7 +460,7 @@ mod tests {
             Some(ServerMessage::ReadyForQuery(b'I'))
         ));
         for (key, value) in [
-            ("server_version", "16.0"),
+            ("server_version", POSTGRES_COMPAT_VERSION),
             ("server_encoding", "UTF8"),
             ("client_encoding", "UTF8"),
             ("DateStyle", "ISO"),

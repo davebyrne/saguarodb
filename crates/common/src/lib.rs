@@ -16,6 +16,10 @@ pub mod schema;
 pub mod uuid;
 pub mod value;
 
+/// PostgreSQL compatibility version reported to clients through
+/// `server_version`, startup `ParameterStatus`, and `version()`.
+pub const POSTGRES_COMPAT_VERSION: &str = "16.0";
+
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };

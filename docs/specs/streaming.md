@@ -155,22 +155,26 @@ enum StreamOutcome {
     Streamed { count: u64 },
     /// Everything else — handled by the async side exactly as today.
     Direct(ExecutionResult),
+    /// `DISCARD ALL`: write the result and clear connection-owned objects.
+    SessionReset(ExecutionResult),
 }
 ```
 
 New server entry points (mirroring the existing `execute_simple_*` /
 `execute_prepared_*` shapes, plus a channel sender):
 
-- `execute_simple_streamed(sql, txn, default_isolation, cancel, seqs, session_info, row_tx)
+- `execute_simple_streamed(sql, txn, default_isolation, session_ctx, row_tx)
   -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>)`
 - analogous `execute_prepared_*_streamed` entry points for the extended `Execute`
-  path, also carrying the connection's `SessionInfo`.
+  path. `session_ctx` carries the connection's cancellation flag,
+  `SessionSequenceState`, `SessionInfo`, and `SessionGucs`.
 
 For a `Read` statement that is a plain SELECT, the read helpers build a
 channel-backed `RowSink` and call `execute_query_streamed`, returning
 `Streamed { count }`. EXPLAIN (also a `Read`) returns `Direct(Explanation)`; the
 sink is used only for the plain-SELECT sub-case. All non-read arms return
-`Direct(result)` and never touch the channel.
+`Direct(result)` (or `SessionReset(result)` for `DISCARD ALL`) and never touch the
+channel.
 
 ### 4.2 Sink threading
 

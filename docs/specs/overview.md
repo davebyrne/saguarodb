@@ -477,7 +477,7 @@ A `SELECT` **streams** its rows: the `spawn_blocking` producer owns the `PlanExe
 Async connection task (Tokio)           Blocking thread (spawn_blocking)
 ─────────────────────────────          ────────────────────────────────
 1. Decode Query msg
-2. execute_simple_streamed(sql, session_info, tx) ─►
+2. execute_simple_streamed(sql, session_ctx, tx) ─►
                                         3. Parse → Bind → Plan
                                         4. Build + open PlanExecutor
                                ◄─────   5. send Start { columns }
@@ -2152,7 +2152,7 @@ Tokio listener (async)
             └─ Protocol codec decodes client messages
             └─ For Query messages:
                  └─ create bounded row channel; spawn_blocking:
-                      query_service.execute_simple_streamed(sql, session_info, row_tx)
+                      query_service.execute_simple_streamed(sql, session_ctx, row_tx)
                       → Bind → Plan → build PlanExecutor
                       → SELECT: push row batches into the channel (backpressure);
                         other statements return an ExecutionResult

@@ -1170,6 +1170,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         let bound = bind(
@@ -1216,6 +1217,7 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
             )
             .unwrap();
         let err = bind(

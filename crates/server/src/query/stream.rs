@@ -39,6 +39,9 @@ pub enum StreamOutcome {
     /// Any non-streamed result — DML, DDL, EXPLAIN, a COPY request, or a SELECT
     /// run on the materializing path — returned in full.
     Direct(ExecutionResult),
+    /// A non-streamed result that also requires connection-scoped session objects
+    /// outside the query service (prepared statements and portals) to be reset.
+    SessionReset(ExecutionResult),
 }
 
 impl StreamOutcome {
@@ -47,7 +50,7 @@ impl StreamOutcome {
     /// so this cannot panic on those paths.
     pub(crate) fn expect_direct(self) -> ExecutionResult {
         match self {
-            StreamOutcome::Direct(result) => result,
+            StreamOutcome::Direct(result) | StreamOutcome::SessionReset(result) => result,
             StreamOutcome::Streamed { .. } => {
                 unreachable!("a streamed outcome cannot arise without a row sink")
             }

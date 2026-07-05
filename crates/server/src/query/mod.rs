@@ -38,6 +38,53 @@ pub struct QueryService {
     engine: QueryEngine,
 }
 
+/// Per-connection state borrowed by query execution for one statement. The
+/// transaction slot and default isolation are still threaded separately because
+/// statement execution consumes and returns them.
+#[derive(Clone)]
+pub struct QuerySessionContext {
+    cancel: Arc<AtomicBool>,
+    session_sequences: Arc<SessionSequenceState>,
+    session_info: Arc<SessionInfo>,
+    gucs: Arc<SessionGucs>,
+}
+
+impl QuerySessionContext {
+    pub fn new(
+        cancel: Arc<AtomicBool>,
+        session_sequences: Arc<SessionSequenceState>,
+        session_info: Arc<SessionInfo>,
+        gucs: Arc<SessionGucs>,
+    ) -> Self {
+        Self {
+            cancel,
+            session_sequences,
+            session_info,
+            gucs,
+        }
+    }
+
+    fn cancel(&self) -> &Arc<AtomicBool> {
+        &self.cancel
+    }
+
+    fn session_sequences(&self) -> &SessionSequenceState {
+        self.session_sequences.as_ref()
+    }
+
+    fn gucs(&self) -> &SessionGucs {
+        self.gucs.as_ref()
+    }
+
+    fn statement_runtime(&self) -> StatementRuntime<'_> {
+        StatementRuntime::new(
+            &self.cancel,
+            self.session_sequences.clone(),
+            self.session_info.clone(),
+        )
+    }
+}
+
 /// The concurrency guard an autocommit write/DDL unit holds for its lifetime. DML
 /// takes the SHARED writer guard (concurrent with other writers); DDL takes the
 /// EXCLUSIVE guard because catalog rollback restores whole object maps and CREATE
@@ -270,16 +317,14 @@ impl QueryService {
         };
         // No row sink: every SELECT materializes into `ExecutionResult::Query`, so
         // the outcome is always `Direct`.
-        let (slot, default_isolation, result) = self.dispatch(
-            parsed,
-            slot,
-            default_isolation,
-            cancel,
+        let session = QuerySessionContext::new(
+            cancel.clone(),
             session_sequences,
             Arc::new(SessionInfo::default()),
-            &gucs,
-            None,
+            gucs,
         );
+        let (slot, default_isolation, result) =
+            self.dispatch(parsed, slot, default_isolation, &session, None);
         (
             slot,
             default_isolation,
@@ -290,22 +335,18 @@ impl QueryService {
     /// The streaming counterpart of [`Self::execute_simple_with_session_sequences`]:
     /// a `SELECT` streams its rows through `row_tx` (as `StreamMessage::Start`
     /// followed by `StreamMessage::Rows` batches) and returns
-    /// [`StreamOutcome::Streamed`]; every other statement returns
-    /// [`StreamOutcome::Direct`] with its full result, untouched. The blocking
+    /// [`StreamOutcome::Streamed`]; every other statement returns a non-streamed
+    /// outcome with its full result. The blocking
     /// producer owns the executor and the channel sender for the whole call, so
     /// the snapshot's GC-horizon advertisement and any transaction guard are held
     /// across the stream, exactly as on the materializing path
     /// (`docs/specs/streaming.md` §4, §5).
-    #[allow(clippy::too_many_arguments)]
     pub fn execute_simple_streamed(
         &self,
         sql: &str,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
-        session_sequences: Arc<SessionSequenceState>,
-        session_info: Arc<SessionInfo>,
-        gucs: Arc<SessionGucs>,
+        session: QuerySessionContext,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let parsed = match parser::parse(sql) {
@@ -315,16 +356,7 @@ impl QueryService {
         // The sink owns `row_tx` for the whole dispatch; when it drops (as this
         // function returns) the channel closes, ending the consumer's drain loop.
         let mut sink = ChannelRowSink::new(row_tx);
-        self.dispatch(
-            parsed,
-            slot,
-            default_isolation,
-            cancel,
-            session_sequences,
-            session_info,
-            &gucs,
-            Some(&mut sink),
-        )
+        self.dispatch(parsed, slot, default_isolation, &session, Some(&mut sink))
     }
 
     /// Backwards-compatible autocommit entry point: run one SQL string with no
@@ -465,13 +497,13 @@ impl QueryService {
     /// autocommit unit: the caller has no open explicit transaction (the session's
     /// transaction slot is `None`), so each `Execute` is its own implicit
     /// `BEGIN…COMMIT`. When a transaction IS open, the connection routes through
-    /// [`Self::execute_prepared_in_session_with_session_sequences`] instead, so the
+    /// [`Self::execute_prepared_in_session_with_context`] instead, so the
     /// autocommit write path here is never reached while the session already holds
     /// the write guard.
     ///
     /// Like [`Self::execute_simple`], this uses a fresh throwaway
     /// [`SessionSequenceState`] (autocommit/tests). A real connection calls
-    /// [`Self::execute_prepared_cancelable_with_session_sequences`] with its own
+    /// [`Self::execute_prepared_cancelable_with_session_context`] with its own
     /// session state (see `connection/extended.rs`).
     pub fn execute_prepared_cancelable(
         &self,
@@ -479,24 +511,21 @@ impl QueryService {
         params: &[Value],
         cancel: &Arc<AtomicBool>,
     ) -> Result<ExecutionResult> {
-        self.execute_prepared_cancelable_with_session_sequences(
-            prepared,
-            params,
-            cancel,
+        let session = QuerySessionContext::new(
+            cancel.clone(),
             Arc::new(SessionSequenceState::new()),
             Arc::new(SessionInfo::default()),
-            None,
-        )
-        .map(StreamOutcome::expect_direct)
+            Arc::new(SessionGucs::default()),
+        );
+        self.execute_prepared_cancelable_with_session_context(prepared, params, &session, None)
+            .map(StreamOutcome::expect_direct)
     }
 
-    pub fn execute_prepared_cancelable_with_session_sequences(
+    pub fn execute_prepared_cancelable_with_session_context(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
-        cancel: &Arc<AtomicBool>,
-        session_sequences: Arc<SessionSequenceState>,
-        session_info: Arc<SessionInfo>,
+        session: &QuerySessionContext,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
@@ -519,17 +548,17 @@ impl QueryService {
         match prepared.class {
             StatementClass::Read => match class {
                 StatementClass::Read => {
-                    self.autocommit_read(bound, cancel, session_sequences, session_info, sink)
+                    self.autocommit_read(bound, session.statement_runtime(), sink)
                 }
                 // A read promoted to a write (e.g. `SELECT nextval(...)`) is
                 // materialized, not streamed.
                 StatementClass::Write => self
-                    .autocommit_bound_write(bound, cancel, session_sequences, session_info)
+                    .autocommit_bound_write(bound, session.statement_runtime())
                     .map(StreamOutcome::Direct),
                 _ => unreachable!("classify_bound only promotes reads to writes"),
             },
             StatementClass::Write | StatementClass::Ddl => self
-                .autocommit_bound_write(bound, cancel, session_sequences, session_info)
+                .autocommit_bound_write(bound, session.statement_runtime())
                 .map(StreamOutcome::Direct),
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
@@ -557,26 +586,22 @@ impl QueryService {
     }
 
     /// Streaming counterpart of
-    /// [`Self::execute_prepared_cancelable_with_session_sequences`]: a SELECT
+    /// [`Self::execute_prepared_cancelable_with_session_context`]: a SELECT
     /// streams its rows through `row_tx` and returns [`StreamOutcome::Streamed`];
-    /// everything else returns [`StreamOutcome::Direct`]. For the autocommit
+    /// everything else returns a non-streamed outcome. For the autocommit
     /// extended-protocol `Execute` path (`connection/extended.rs`).
     pub fn execute_prepared_cancelable_streamed(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
-        cancel: &Arc<AtomicBool>,
-        session_sequences: Arc<SessionSequenceState>,
-        session_info: Arc<SessionInfo>,
+        session: QuerySessionContext,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> Result<StreamOutcome> {
         let mut sink = ChannelRowSink::new(row_tx);
-        self.execute_prepared_cancelable_with_session_sequences(
+        self.execute_prepared_cancelable_with_session_context(
             prepared,
             params,
-            cancel,
-            session_sequences,
-            session_info,
+            &session,
             Some(&mut sink),
         )
     }
@@ -589,29 +614,25 @@ impl QueryService {
     /// write guard is reused — never re-acquired — and the transaction's
     /// snapshot/isolation and 'E' failed-state gating apply. Transaction-control
     /// statements are dispatched through `handle_transaction_control`, exactly like
-    /// a simple `BEGIN`/`COMMIT`/`ROLLBACK`. `session_sequences` is the connection's
-    /// persistent `currval` memory (see `connection/extended.rs`).
+    /// a simple `BEGIN`/`COMMIT`/`ROLLBACK`. `session` carries the connection's
+    /// persistent `currval`, startup identity, cancellation, and GUC state.
     ///
     /// Precondition: `slot` is `Some` (the connection only calls this with an open
     /// transaction; with no open transaction it uses the autocommit
-    /// `execute_prepared_cancelable_with_session_sequences`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_prepared_in_session_with_session_sequences(
+    /// `execute_prepared_cancelable_with_session_context`).
+    pub fn execute_prepared_in_session_with_context(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
-        session_sequences: Arc<SessionSequenceState>,
-        session_info: Arc<SessionInfo>,
-        gucs: Arc<SessionGucs>,
+        session: &QuerySessionContext,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         if let StatementClass::TransactionControl(kind) = prepared.class {
             let (slot, default_isolation, result) =
-                self.handle_transaction_control(kind, slot, default_isolation, cancel);
+                self.handle_transaction_control(kind, slot, default_isolation, session.cancel());
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
@@ -628,14 +649,22 @@ impl QueryService {
                     );
                 }
             };
+            let resets_session_objects = matches!(statement, Statement::DiscardAll);
             let (slot, default_isolation, result) = self.handle_session_config(
                 statement,
                 slot,
                 default_isolation,
-                &gucs,
-                session_sequences.as_ref(),
+                session.gucs(),
+                session.session_sequences(),
             );
-            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+            let result = result.map(|result| {
+                if resets_session_objects {
+                    StreamOutcome::SessionReset(result)
+                } else {
+                    StreamOutcome::Direct(result)
+                }
+            });
+            return (slot, default_isolation, result);
         }
 
         // Maintenance does not bind/plan: dispatch it before parameter substitution.
@@ -675,7 +704,7 @@ impl QueryService {
                     txn,
                     class,
                     BindSource::Bound(bound),
-                    StatementRuntime::new(cancel, session_sequences, session_info),
+                    session.statement_runtime(),
                     sink,
                 );
                 (slot, default_isolation, result)
@@ -688,26 +717,17 @@ impl QueryService {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
                         match class {
-                            StatementClass::Read => self.autocommit_read(
-                                bound,
-                                cancel,
-                                session_sequences,
-                                session_info,
-                                sink,
-                            ),
+                            StatementClass::Read => {
+                                self.autocommit_read(bound, session.statement_runtime(), sink)
+                            }
                             StatementClass::Write => self
-                                .autocommit_bound_write(
-                                    bound,
-                                    cancel,
-                                    session_sequences,
-                                    session_info,
-                                )
+                                .autocommit_bound_write(bound, session.statement_runtime())
                                 .map(StreamOutcome::Direct),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
                     StatementClass::Write | StatementClass::Ddl => self
-                        .autocommit_bound_write(bound, cancel, session_sequences, session_info)
+                        .autocommit_bound_write(bound, session.statement_runtime())
                         .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
@@ -735,33 +755,26 @@ impl QueryService {
     }
 
     /// Streaming counterpart of
-    /// [`Self::execute_prepared_in_session_with_session_sequences`]: a SELECT
+    /// [`Self::execute_prepared_in_session_with_context`]: a SELECT
     /// streams its rows through `row_tx`; every other statement returns
-    /// [`StreamOutcome::Direct`]. For the in-transaction extended-protocol
+    /// a non-streamed outcome. For the in-transaction extended-protocol
     /// `Execute` path (`connection/extended.rs`).
-    #[allow(clippy::too_many_arguments)]
     pub fn execute_prepared_in_session_streamed(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
-        session_sequences: Arc<SessionSequenceState>,
-        session_info: Arc<SessionInfo>,
-        gucs: Arc<SessionGucs>,
+        session: QuerySessionContext,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let mut sink = ChannelRowSink::new(row_tx);
-        self.execute_prepared_in_session_with_session_sequences(
+        self.execute_prepared_in_session_with_context(
             prepared,
             params,
             slot,
             default_isolation,
-            cancel,
-            session_sequences,
-            session_info,
-            gucs,
+            &session,
             Some(&mut sink),
         )
     }
@@ -3341,14 +3354,17 @@ mod tests {
         drop(row_rx);
 
         let cancel = Arc::new(AtomicBool::new(false));
+        let session = super::QuerySessionContext::new(
+            cancel,
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+            Arc::new(super::SessionGucs::default()),
+        );
         let (slot, _default, outcome) = app.query_service.execute_simple_streamed(
             "select id from t order by id",
             None,
             IsolationLevel::default(),
-            &cancel,
-            Arc::new(SessionSequenceState::new()),
-            Arc::new(SessionInfo::default()),
-            Arc::new(super::SessionGucs::default()),
+            session,
             row_tx,
         );
 

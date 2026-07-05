@@ -204,6 +204,15 @@ async fn transaction_isolation_guc_matches_set_transaction_rules() {
         "outside a transaction, SET transaction_isolation is a SET TRANSACTION no-op"
     );
 
+    let invalid = conn
+        .ok("SET default_transaction_isolation TO snapshot")
+        .await;
+    assert!(error_message(&invalid).contains("22023"));
+    assert_eq!(
+        conn.ok("SHOW default_transaction_isolation").await.rows(),
+        vec![vec![Some("read committed".to_string())]]
+    );
+
     conn.ok("BEGIN").await.rows();
     let set = conn.ok("SET transaction_isolation TO SERIALIZABLE").await;
     assert!(set.result.is_ok());

@@ -21,9 +21,9 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
-        DataType, ExecRow, Key, ParsedColumnDef, RelationKind, Result, Row, RowId, RowIdentity,
-        SequenceManager, SessionInfo, SessionSequenceState, SqlState, StatementContext,
-        TableSchema, ToastOptions, Value,
+        DataType, ExecRow, Key, POSTGRES_COMPAT_VERSION, ParsedColumnDef, RelationKind, Result,
+        Row, RowId, RowIdentity, SequenceManager, SessionInfo, SessionSequenceState, SqlState,
+        StatementContext, TableSchema, ToastOptions, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -1515,7 +1515,8 @@ mod tests {
         assert_eq!(
             eval("version", DataType::Text),
             Value::Text(format!(
-                "PostgreSQL 16.0 (SaguaroDB {})",
+                "PostgreSQL {} (SaguaroDB {})",
+                POSTGRES_COMPAT_VERSION,
                 env!("CARGO_PKG_VERSION")
             ))
         );

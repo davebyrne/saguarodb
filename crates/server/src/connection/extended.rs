@@ -5,11 +5,13 @@ use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::{PreparedStatement, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+use crate::query::{
+    PreparedStatement, QuerySessionContext, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome,
+};
 
 use super::{
     Portal, Session, TransactionState, command_complete_tag, encode_row, error_response,
-    is_discard_all_result, protocol_error, resolve_format, streamed_task_result, write_messages,
+    protocol_error, resolve_format, streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -43,6 +45,8 @@ impl Session {
         let session_sequences = self.session_sequences.clone();
         let session_info = self.session_info.clone();
         let session_gucs = self.session_gucs.clone();
+        let session =
+            QuerySessionContext::new(cancel, session_sequences, session_info, session_gucs);
 
         // When an explicit transaction is open on this session, the extended-
         // protocol `Execute` participates in THAT transaction rather than starting
@@ -78,24 +82,15 @@ impl Session {
                     &params,
                     txn,
                     default_isolation,
-                    &cancel,
-                    session_sequences,
-                    session_info,
-                    session_gucs,
+                    session,
                     row_tx,
                 )
             })
         } else {
             let default_isolation = self.default_isolation;
             tokio::task::spawn_blocking(move || {
-                let result = service.execute_prepared_cancelable_streamed(
-                    &statement,
-                    &params,
-                    &cancel,
-                    session_sequences,
-                    session_info,
-                    row_tx,
-                );
+                let result = service
+                    .execute_prepared_cancelable_streamed(&statement, &params, session, row_tx);
                 (None, default_isolation, result)
             })
         };
@@ -156,11 +151,15 @@ impl Session {
                 messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
                 write_messages(stream, codec, &messages).await
             }
-            Ok(StreamOutcome::Direct(result)) => {
-                if is_discard_all_result(&result) {
-                    self.prepared.clear();
-                    self.portals.clear();
+            Ok(StreamOutcome::SessionReset(result)) => {
+                self.prepared.clear();
+                self.portals.clear();
+                if let Some(message) = self.application_name_status_change() {
+                    write_messages(stream, codec, &[message]).await?;
                 }
+                write_portal_result(stream, codec, result, &result_formats).await
+            }
+            Ok(StreamOutcome::Direct(result)) => {
                 if let Some(message) = self.application_name_status_change() {
                     write_messages(stream, codec, &[message]).await?;
                 }

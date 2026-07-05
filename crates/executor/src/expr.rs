@@ -1,4 +1,7 @@
-use common::{DataType, DbError, ExecRow, PgType, Result, SqlState, StatementContext, Value};
+use common::{
+    DataType, DbError, ExecRow, POSTGRES_COMPAT_VERSION, PgType, Result, SqlState,
+    StatementContext, Value,
+};
 use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 
 pub fn eval_expr(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
@@ -497,7 +500,8 @@ fn eval_function(
 
     match name {
         "version" => Ok(Value::Text(format!(
-            "PostgreSQL 16.0 (SaguaroDB {})",
+            "PostgreSQL {} (SaguaroDB {})",
+            POSTGRES_COMPAT_VERSION,
             env!("CARGO_PKG_VERSION")
         ))),
         "current_database" | "current_catalog" => {

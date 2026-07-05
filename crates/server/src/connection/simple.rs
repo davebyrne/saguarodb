@@ -5,11 +5,11 @@ use std::ops::ControlFlow;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+use crate::query::{QuerySessionContext, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
     Session, TransactionState, command_complete_tag, encode_row, error_response,
-    is_discard_all_result, streamed_task_result, write_messages,
+    streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -50,6 +50,8 @@ impl Session {
         let session_sequences = self.session_sequences.clone();
         let session_info = self.session_info.clone();
         let session_gucs = self.session_gucs.clone();
+        let session =
+            QuerySessionContext::new(cancel, session_sequences, session_info, session_gucs);
         // A SELECT streams its rows through this bounded channel: the blocking
         // producer sends `Start` (columns) then `Rows` batches; this async task
         // drains them to the socket while the producer runs, giving TCP
@@ -67,16 +69,7 @@ impl Session {
         // result larger than the channel would deadlock (producer blocked on a full
         // channel, consumer not yet reading).
         let task = tokio::task::spawn_blocking(move || {
-            service.execute_simple_streamed(
-                &sql,
-                txn,
-                default_isolation,
-                &cancel,
-                session_sequences,
-                session_info,
-                session_gucs,
-                row_tx,
-            )
+            service.execute_simple_streamed(&sql, txn, default_isolation, session, row_tx)
         });
 
         // Stream rows to the socket as they arrive. `RowDescription` comes from the
@@ -165,13 +158,15 @@ impl Session {
             Ok(StreamOutcome::Direct(ExecutionResult::BeginCopyOut(job))) => {
                 self.run_copy_out(stream, codec, job, guard).await?
             }
+            Ok(StreamOutcome::SessionReset(result)) => {
+                self.prepared.clear();
+                self.portals.clear();
+                drop(guard);
+                write_execution_result(stream, codec, result, status).await?
+            }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
             Ok(StreamOutcome::Direct(result)) => {
-                if is_discard_all_result(&result) {
-                    self.prepared.clear();
-                    self.portals.clear();
-                }
                 drop(guard);
                 write_execution_result(stream, codec, result, status).await?
             }
