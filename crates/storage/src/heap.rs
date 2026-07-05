@@ -223,6 +223,11 @@ impl PageStore for HeapPageStore {
         if let Some(envelope) = self.compression.compress_page_at_rest(file_id, &data.0)? {
             // Smallest whole number of fs blocks holding the envelope; only
             // worthwhile when it frees at least one block of the page's slot.
+            // This 4 KiB (FS_BLOCK_SIZE) quantum is why a trained dictionary
+            // buys little at rest on 8 KiB pages: a compressible page already
+            // fits one block, and nothing (dict or not) goes below one block.
+            // Larger pages leave room between block boundaries for a dictionary
+            // to lower the block count (docs/specs/compression.md §11).
             let used = envelope.len().div_ceil(FS_BLOCK_SIZE) * FS_BLOCK_SIZE;
             if used < PAGE_SIZE {
                 // Write the envelope zero-padded to a FULL slot, then punch the

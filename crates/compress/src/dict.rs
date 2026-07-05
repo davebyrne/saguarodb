@@ -19,6 +19,13 @@ fn corrupt(message: impl Into<String>) -> DbError {
 /// Train a zstd dictionary from page-image samples. `None` when the corpus is
 /// too small for ZDICT (a freshly created or tiny table) — callers proceed
 /// dict-less; training failure is never a statement error.
+///
+/// At-rest value is page-size-dependent: on 8 KiB pages over 4 KiB blocks a
+/// trained dictionary rarely changes the reclaimed block count (a compressible
+/// page already fits one block, and hole punching cannot go below one block).
+/// It begins to help only at 16/32 KiB builds, where a page can span several
+/// 4 KiB blocks and the dictionary can drop the count (measured numbers and
+/// mechanism in `docs/specs/compression.md` §11).
 pub fn train_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>> {
     if samples.len() < 8 {
         return None;

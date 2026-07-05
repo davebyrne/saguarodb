@@ -412,6 +412,25 @@ versioning policy (development builds do not migrate old formats).
   achieved for every page whose envelope + zstd payload ≤ 4096 bytes.
   Dictionary compression exists precisely to push more pages under that
   bar; B-tree pages (prefix-redundant) generally compress well dict-less.
+- **The dictionary's at-rest payoff is page-size-dependent (measured).**
+  Hole punching reclaims whole 4 KiB filesystem blocks, so a page occupies
+  `ceil((envelope + payload) / 4096)` blocks and can never fall below one
+  4 KiB block. A dictionary can only help by *lowering that block count*, so
+  it is inert whenever the dict-less compressed page already fits in one
+  block — which compressible data does at 8 KiB pages, and usually still does
+  at 16 KiB. Larger pages hold more content, so the dict-less compressed form
+  is likelier to spill past one block; the dictionary can then collapse it
+  back toward a single block and cross a boundary. Throwaway 16/32 KiB builds
+  over one page-filling row per page (~0.85 × page of shared,
+  not-repeated-within-a-page boilerplate) measured a dictionary gain of
+  **+0.0 pp at 8 KiB and 16 KiB, and +12.4 pp at 32 KiB** (75% → 87.5%);
+  plain dict-less reduction also rose with page size (50% → 75% → 75%) as the
+  fixed 4 KiB minimum became a smaller fraction of the page. Consequence: **at
+  the shipped 8 KiB page the per-table dictionary buys essentially nothing at
+  rest** — it begins to pay only at a 16/32 KiB build (§12), or for data
+  compressible only just past one block. (In the WAL the dictionary is
+  likewise marginal for insert-heavy workloads, whose FPI stream is dominated
+  by dict-less B-tree node images.)
 - WAL: FPI-dominated workloads should see roughly 2–4× fewer WAL bytes,
   with knock-on reduction in checkpoint frequency via
   `--checkpoint-wal-bytes`.
@@ -428,6 +447,12 @@ Decisions here deliberately keep a future data-dir-creation-time page size
 - All new code references `PAGE_SIZE` (never literal 8192/4096-derived
   constants) and expresses hole-punch math generically in whole filesystem
   blocks, which is already correct at 16/32 KiB.
+- Larger pages are also what make the per-table **dictionary** earn its
+  complexity: at 8 KiB the 4 KiB block quantum pins compressible pages to a
+  single block regardless of the dictionary (§11 has the measured numbers), so
+  a 16/32 KiB build variant is the first point at which a dictionary reduces
+  the at-rest block count. If dictionaries are ever to pay off at rest, they
+  are effectively coupled to shipping a larger-page build.
 - The envelope is page-size-agnostic (explicit payload length; decompressed
   size must equal the data dir's page size). Dictionaries and WAL records
   are content/length-delimited and equally agnostic.
