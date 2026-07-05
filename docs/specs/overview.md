@@ -1749,7 +1749,7 @@ impl PageBackedStorageEngine {
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table/index/sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas`, `install_index_schemas`, and `install_sequences` after loading the catalog snapshot.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table/index/sequence metadata plus empty TOAST value-id allocator state. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas`, `install_index_schemas`, and `install_sequences` after loading the catalog snapshot. In normal mode, `install_schemas` seeds each hidden TOAST relation's in-memory `value_id` allocator by physically scanning chunk rows and setting the next id to `1 + max(value_id)` across committed, aborted, and in-flight tuples. In recovery mode, TOAST allocator seeding is deferred until the recovery-to-normal transition so physical redo after schema install cannot leave a stale cached next id, and maintenance cannot prune redone rows before the allocator has recorded their high-water mark.
 
 **Recovery procedure** (driven by the server startup sequence):
 

@@ -178,6 +178,7 @@ struct StorageState {
     tables: BTreeMap<TableId, TableState>,
     indexes: BTreeMap<IndexId, IndexState>,
     sequences: BTreeMap<SequenceId, SequenceState>,
+    toast_next_value_ids: BTreeMap<TableId, u64>,
     rollback: BTreeMap<u64, TxnRollback>,
 }
 
@@ -241,6 +242,7 @@ impl PageBackedStorageEngine {
                 tables: BTreeMap::new(),
                 indexes: BTreeMap::new(),
                 sequences: BTreeMap::new(),
+                toast_next_value_ids: BTreeMap::new(),
                 rollback: BTreeMap::new(),
             }),
             structural_latches: Mutex::new(HashMap::new()),
@@ -267,13 +269,16 @@ impl PageBackedStorageEngine {
     }
 
     pub fn install_schemas(&self, schemas: Vec<TableSchema>) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.tables.clear();
+        let seed_toast_allocators = self.lock_state()?.mode == StorageMode::Normal;
+        let mut tables = BTreeMap::new();
+        let mut toast_next_value_ids = BTreeMap::new();
         for schema in schemas {
-            // `register_table_compression` touches only `self.compression` (a
-            // separate lock), so it is safe to call while `state` is held.
             self.register_table_compression(&schema);
-            state.tables.insert(
+            if seed_toast_allocators && matches!(schema.relation_kind, RelationKind::Toast { .. }) {
+                let next_value_id = self.seed_toast_next_value_id(&schema)?;
+                toast_next_value_ids.insert(schema.id, next_value_id);
+            }
+            tables.insert(
                 schema.id,
                 TableState {
                     schema,
@@ -281,6 +286,9 @@ impl PageBackedStorageEngine {
                 },
             );
         }
+        let mut state = self.lock_state()?;
+        state.tables = tables;
+        state.toast_next_value_ids = toast_next_value_ids;
         Ok(())
     }
 
@@ -348,6 +356,13 @@ impl PageBackedStorageEngine {
     }
 
     pub fn set_mode(&self, mode: StorageMode) -> Result<()> {
+        let should_reseed_toast = {
+            let state = self.lock_state()?;
+            state.mode == StorageMode::Recovery && mode == StorageMode::Normal
+        };
+        if should_reseed_toast {
+            self.reseed_toast_value_ids_for_recovery_completion()?;
+        }
         self.lock_state()?.mode = mode;
         Ok(())
     }
@@ -388,6 +403,90 @@ impl PageBackedStorageEngine {
             }
             _ => Ok(None),
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "called by the storage-private TOAST write path added in a later phase"
+    )]
+    pub(crate) fn alloc_toast_value_id(&self, toast_table: TableId) -> Result<u64> {
+        let schema = {
+            let mut state = self.lock_state()?;
+            let schema = {
+                let table_state = live_table(&state, toast_table)?;
+                crate::toast::ensure_toast_relation(&table_state.schema)?;
+                table_state.schema.clone()
+            };
+            if let Some(next_value_id) = state.toast_next_value_ids.get_mut(&toast_table) {
+                return crate::toast::allocate_next_value_id(next_value_id);
+            }
+            schema
+        };
+
+        let seeded_next_value_id = self.seed_toast_next_value_id(&schema)?;
+        let mut state = self.lock_state()?;
+        {
+            let table_state = live_table(&state, toast_table)?;
+            crate::toast::ensure_toast_relation(&table_state.schema)?;
+        }
+        let next_value_id = state
+            .toast_next_value_ids
+            .entry(toast_table)
+            .or_insert(seeded_next_value_id);
+        crate::toast::allocate_next_value_id(next_value_id)
+    }
+
+    fn seed_toast_next_value_id(&self, schema: &TableSchema) -> Result<u64> {
+        crate::toast::ensure_toast_relation(schema)?;
+        let file_id = schema.id;
+        let page_count = self.buffer_pool.page_count(file_id)?;
+        let mut max_value_id: Option<u64> = None;
+        for page_num in 0..page_count {
+            if self.buffer_pool.is_page_abandoned(file_id, page_num) {
+                continue;
+            }
+            let guard = self.buffer_pool.read_page(file_id, page_num)?;
+            if !page::is_initialized(guard.data()) {
+                continue;
+            }
+            let slot_count = page::next_slot(guard.data())?;
+            for slot in 0..slot_count {
+                let Some(row_bytes) = page::read_row(guard.data(), slot)? else {
+                    continue;
+                };
+                let row = decode_row(schema, &row_bytes)?.row;
+                let value_id = crate::toast::value_id_from_chunk_row(schema, &row)?;
+                max_value_id = Some(max_value_id.map_or(value_id, |max| max.max(value_id)));
+            }
+        }
+        max_value_id
+            .map(crate::toast::next_after_value_id)
+            .unwrap_or(Ok(crate::toast::FIRST_TOAST_VALUE_ID))
+    }
+
+    fn reseed_toast_value_ids_for_recovery_completion(&self) -> Result<()> {
+        let toast_schemas = {
+            let state = self.lock_state()?;
+            state
+                .tables
+                .values()
+                .filter(|table_state| {
+                    !table_state.dropped
+                        && matches!(table_state.schema.relation_kind, RelationKind::Toast { .. })
+                })
+                .map(|table_state| table_state.schema.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut toast_next_value_ids = BTreeMap::new();
+        for schema in toast_schemas {
+            toast_next_value_ids.insert(schema.id, self.seed_toast_next_value_id(&schema)?);
+        }
+
+        let mut state = self.lock_state()?;
+        if state.mode == StorageMode::Recovery {
+            state.toast_next_value_ids = toast_next_value_ids;
+        }
+        Ok(())
     }
 
     /// The live secondary indexes on a table, ordered by index id. DML consults
@@ -1039,6 +1138,11 @@ impl SchemaOperations for PageBackedStorageEngine {
                     dropped: false,
                 },
             );
+            if matches!(schema.relation_kind, RelationKind::Toast { .. }) {
+                state
+                    .toast_next_value_ids
+                    .insert(schema.id, crate::toast::FIRST_TOAST_VALUE_ID);
+            }
         }
         // Register the heap/PK-index file configs before the tree's own pages
         // are created, so even its first metapage/root are encoded at rest per
@@ -1466,6 +1570,12 @@ fn live_toast_table_id(state: &StorageState, table: TableId) -> Option<TableId> 
 
 fn mark_table_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {
     record_table_before(state, txn_id, table);
+    let is_toast_relation = state.tables.get(&table).is_some_and(|table_state| {
+        matches!(table_state.schema.relation_kind, RelationKind::Toast { .. })
+    });
+    if is_toast_relation {
+        state.toast_next_value_ids.remove(&table);
+    }
     if let Some(table_state) = state.tables.get_mut(&table) {
         // V1 leaves heap and index pages in place (no physical reclaim).
         table_state.dropped = true;

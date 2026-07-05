@@ -6,6 +6,7 @@ mod index_page;
 mod page;
 mod recovery;
 mod redo;
+mod toast;
 mod traits;
 
 pub use codec::{DecodedRow, decode_row, encode_row};
@@ -27,13 +28,13 @@ mod tests {
         ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
         KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
         StatementContext, TableSchema, ToastCompression, ToastMode, ToastOptions, TxnId, TxnStatus,
-        TxnStatusView, Value,
+        TxnStatusView, Value, toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
     use crate::{
         PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
-        StorageMode, decode_row, encode_row,
+        StorageMode, apply_physical_redo, decode_row, encode_row,
     };
 
     #[test]
@@ -1369,6 +1370,146 @@ mod tests {
         assert_eq!(err.code, SqlState::UndefinedTable);
     }
 
+    #[test]
+    fn toast_value_id_allocator_starts_at_one_for_empty_relation() {
+        let harness = StorageHarness::new();
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.install_schemas(vec![base, toast]).unwrap();
+
+        assert_eq!(harness.storage.alloc_toast_value_id(2).unwrap(), 1);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_is_monotonic_in_memory() {
+        let harness = StorageHarness::new();
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.install_schemas(vec![base, toast]).unwrap();
+
+        assert_eq!(harness.storage.alloc_toast_value_id(2).unwrap(), 1);
+        assert_eq!(harness.storage.alloc_toast_value_id(2).unwrap(), 2);
+        assert_eq!(harness.storage.alloc_toast_value_id(2).unwrap(), 3);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_seeds_from_physical_chunk_rows() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(4, 0, b"chunk-a"))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(9, 0, b"chunk-b"))
+            .unwrap();
+
+        let reopened = PageBackedStorageEngine::open(
+            harness.buffer.clone(),
+            harness.wal.clone(),
+            StorageMode::Normal,
+        )
+        .unwrap();
+        let (base, toast) = base_and_toast_schema();
+        reopened.install_schemas(vec![base, toast]).unwrap();
+
+        assert_eq!(reopened.alloc_toast_value_id(2).unwrap(), 10);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_reseeds_when_recovery_enters_normal_mode() {
+        let buffer = Arc::new(MemoryBufferPool::empty(64));
+        let wal = Arc::new(CountingWal::default());
+        let recovery =
+            PageBackedStorageEngine::open(buffer.clone(), wal, StorageMode::Recovery).unwrap();
+        let (base, toast) = base_and_toast_schema();
+        recovery.install_schemas(vec![base, toast]).unwrap();
+
+        redo_toast_chunk(&recovery, 19, 88, 1, b"redone").unwrap();
+        recovery.set_mode(StorageMode::Normal).unwrap();
+
+        assert_eq!(recovery.alloc_toast_value_id(2).unwrap(), 20);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_keeps_recovery_seed_if_row_removed_before_allocation() {
+        let buffer = Arc::new(MemoryBufferPool::empty(64));
+        let wal = Arc::new(CountingWal::default());
+        let recovery = PageBackedStorageEngine::open(buffer, wal, StorageMode::Recovery).unwrap();
+        let (base, toast) = base_and_toast_schema();
+        recovery.install_schemas(vec![base, toast]).unwrap();
+
+        redo_toast_chunk(&recovery, 19, 88, 1, b"redone-then-removed").unwrap();
+        recovery.set_mode(StorageMode::Normal).unwrap();
+        {
+            let mut guard = recovery.buffer_pool.fetch_for_redo(2, 0).unwrap();
+            apply_physical_redo(
+                guard.data_mut(),
+                3,
+                &WalRecordKind::HeapDelete {
+                    file_id: 2,
+                    page_num: 0,
+                    slot: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(recovery.alloc_toast_value_id(2).unwrap(), 20);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_seeds_from_aborted_physical_chunk_rows() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(77);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(12, 0, b"aborted"))
+            .unwrap();
+        harness.wal.mark_aborted(ctx.txn_id);
+
+        let reopened = PageBackedStorageEngine::open(
+            harness.buffer.clone(),
+            harness.wal.clone(),
+            StorageMode::Normal,
+        )
+        .unwrap();
+        let (base, toast) = base_and_toast_schema();
+        reopened.install_schemas(vec![base, toast]).unwrap();
+
+        assert_eq!(reopened.alloc_toast_value_id(2).unwrap(), 13);
+    }
+
+    #[test]
+    fn toast_value_id_allocator_rejects_ids_past_i64_max() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(i64::MAX, 0, b"last"))
+            .unwrap();
+
+        let reopened = PageBackedStorageEngine::open(
+            harness.buffer.clone(),
+            harness.wal.clone(),
+            StorageMode::Normal,
+        )
+        .unwrap();
+        let (base, toast) = base_and_toast_schema();
+        reopened.install_schemas(vec![base, toast]).unwrap();
+
+        let err = reopened.alloc_toast_value_id(2).unwrap_err();
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -1773,6 +1914,59 @@ mod tests {
                 Value::Null,
             ],
         }
+    }
+
+    fn base_and_toast_schema() -> (TableSchema, TableSchema) {
+        let mut base = users_schema();
+        base.toast_table_id = Some(2);
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
+    fn toast_chunk_row(value_id: i64, seq: i64, data: &[u8]) -> Row {
+        Row {
+            values: vec![
+                Value::Integer(value_id),
+                Value::Integer(seq),
+                Value::Bytes(data.to_vec()),
+            ],
+        }
+    }
+
+    fn redo_toast_chunk(
+        storage: &PageBackedStorageEngine,
+        value_id: i64,
+        txn_id: TxnId,
+        first_lsn: Lsn,
+        data: &[u8],
+    ) -> Result<()> {
+        let (_, toast) = base_and_toast_schema();
+        let row_bytes = encode_row(&toast, &toast_chunk_row(value_id, 0, data), txn_id)?;
+        {
+            let mut guard = storage.buffer_pool.fetch_for_redo(2, 0)?;
+            apply_physical_redo(
+                guard.data_mut(),
+                first_lsn,
+                &WalRecordKind::HeapInit {
+                    file_id: 2,
+                    page_num: 0,
+                },
+            )?;
+        }
+        {
+            let mut guard = storage.buffer_pool.fetch_for_redo(2, 0)?;
+            apply_physical_redo(
+                guard.data_mut(),
+                first_lsn + 1,
+                &WalRecordKind::HeapInsert {
+                    file_id: 2,
+                    page_num: 0,
+                    slot: 0,
+                    row_bytes,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Longest `big_text` payload whose encoded row exactly fills one data page,

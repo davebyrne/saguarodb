@@ -1129,11 +1129,38 @@ impl PageBackedStorageEngine {
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables), `install_index_schemas` (secondary indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table, TOAST value-id allocator, and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables and hidden TOAST relations), `install_index_schemas` (secondary indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. In normal mode, `install_schemas` seeds every hidden TOAST relation's in-memory value-id allocator by physically scanning its heap rows (including aborted and in-flight tuples) and setting `next_value_id = 1 + max(value_id)`, or `1` when the relation has no chunks. In recovery mode, `install_schemas` intentionally leaves TOAST allocator entries absent: post-checkpoint physical redo may install additional chunk rows after schema metadata is loaded, so the recovery-to-normal transition reseeds every live hidden TOAST relation after redo has finished and before maintenance or DML can prune rows. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
 `RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
+
+## TOAST Value ID Allocation
+
+Hidden TOAST relations store chunk keys as `(value_id INTEGER, seq INTEGER)`.
+Storage owns an in-memory per-TOAST-relation allocator for `value_id`; it is
+intentionally not part of the public `StorageEngine` trait and is consumed by
+the storage-private TOAST write path. Allocation starts at `1`, is monotonic for
+the life of the process, and is not rolled back on transaction abort. The
+allocator refuses to hand out any value above `i64::MAX` because the hidden
+relation key stores `value_id` as `Value::Integer`; exceeding that bound returns
+`SqlState::ProgramLimitExceeded` with a clear TOAST allocator message.
+
+Allocator seeding scans physical heap pages of the hidden TOAST relation rather
+than snapshot-visible rows: every `NORMAL` line pointer is decoded and its first
+column is read as `value_id`, regardless of the tuple's `xmin`/`xmax` status.
+This includes committed, aborted, and in-flight chunk rows, preventing value-id
+reuse after aborts or crash replay. The scan ignores uninitialized/sparse pages
+and non-live line pointers, propagates page/row corruption as structured storage
+errors, and treats `value_id <= 0` or non-integer/missing `value_id` as
+corruption. Normal `CREATE TABLE` seeds a newly created hidden TOAST relation at
+`1`. Recovery metadata apply (`apply_create_table_without_wal`) does not seed
+hidden TOAST relations because later physical redo can add chunk rows for the
+same relation; `set_mode(StorageMode::Normal)` seeds live hidden TOAST
+relations from the final post-redo physical state. `alloc_toast_value_id` also
+lazily seeds on a missing cache entry as a defensive fallback, so replay/order
+changes cannot make allocation reuse an ID already present in physical chunk
+rows.
 
 ## Structural Write Latches (Milestone E2a)
 
