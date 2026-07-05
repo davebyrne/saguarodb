@@ -1,5 +1,6 @@
 mod support;
 
+use saguarodb_server::config::Config;
 use support::{Connection, TestServer};
 
 /// Independently probes whether this filesystem's `fallocate`
@@ -417,4 +418,137 @@ async fn bad_options_are_rejected() {
             .err()
             .unwrap_or_else(|| panic!("expected rejection for `{sql}`"));
     }
+}
+
+/// Review fix (points 1+2): `run_alter_table_compression` previously never
+/// called `record_commit_and_maybe_checkpoint_after_durable_commit`, so its
+/// rewrite's (potentially large) FullPageImage bytes were not counted toward
+/// the WAL-bytes checkpoint threshold until an unrelated later commit
+/// happened to notice them. This proves the ALTER's own WAL activity is now
+/// counted: with `checkpoint_every_n_commits` disabled (so only WAL bytes can
+/// trip a checkpoint) and a `checkpoint_wal_bytes` threshold sized well below
+/// what a many-page rewrite produces (but comfortably above a single small
+/// commit record), running the ALTER on a table with real data must itself
+/// trigger a checkpoint.
+#[tokio::test]
+async fn alter_table_rewrite_trips_checkpoint_wal_bytes_threshold() {
+    let config = Config {
+        checkpoint_every_n_commits: u64::MAX,
+        checkpoint_wal_bytes: 8 * 1024,
+        ..Config::default()
+    };
+    let server = TestServer::start_with_config(config).await.unwrap();
+    server
+        .simple_query("create table logs (id integer primary key, body text)")
+        .await
+        .unwrap();
+
+    // 512 rows of varied, only moderately compressible text spread across
+    // 20+ heap pages, so the rewrite's FullPageImage records comfortably
+    // exceed the 8 KiB threshold regardless of the exact zstd ratio achieved.
+    let body_fill = "abcdefghijklmnopqrstuvwxyz-".repeat(12);
+    for chunk in 0..32 {
+        let values: Vec<String> = (0..16)
+            .map(|i| {
+                let id = chunk * 16 + i;
+                format!("({id}, 'log-line-{id}-{body_fill}')")
+            })
+            .collect();
+        server
+            .simple_query(&format!(
+                "insert into logs (id, body) values {}",
+                values.join(",")
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Reset the WAL-bytes accounting baseline so only the ALTER's own WAL
+    // activity below (dict training record + AlterTableCompression + Commit +
+    // one FullPageImage per rewritten page) is measured against the threshold.
+    server.force_checkpoint().await.unwrap();
+    let before = server.checkpoint_count();
+
+    server
+        .simple_query("alter table logs set (compression = 'zstd')")
+        .await
+        .unwrap();
+
+    assert!(
+        server.checkpoint_count() > before,
+        "ALTER TABLE's rewrite must count toward the checkpoint WAL-bytes \
+         threshold and trigger a checkpoint here (checkpoint-accounting fix)"
+    );
+}
+
+/// Review fix (point 3): a table whose catalog `active_dict_id` names a
+/// dictionary must fail recovery loudly and immediately if that dictionary's
+/// durable file is missing, rather than silently falling back to dict-less
+/// decoding at write time and surfacing a confusing decode error much later,
+/// on first read of a dict-compressed page.
+#[tokio::test]
+async fn recovery_fails_fast_on_missing_referenced_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table logs (id integer primary key, body text)")
+            .await
+            .unwrap();
+        let body_fill = "abcdefghijklmnopqrstuvwxyz-".repeat(12);
+        for chunk in 0..32 {
+            let values: Vec<String> = (0..16)
+                .map(|i| {
+                    let id = chunk * 16 + i;
+                    format!("({id}, 'log-line-{id}-{body_fill}')")
+                })
+                .collect();
+            server
+                .simple_query(&format!(
+                    "insert into logs (id, body) values {}",
+                    values.join(",")
+                ))
+                .await
+                .unwrap();
+        }
+        // Trains + persists a dictionary and makes `logs` reference it as its
+        // active dict.
+        server
+            .simple_query("alter table logs set (compression = 'zstd')")
+            .await
+            .unwrap();
+        // Checkpoint so the WAL's `CreateDictionary`/`AlterTableCompression`
+        // records are truncated away: otherwise recovery's redo replay would
+        // just re-save the deleted dict file below from the WAL record's
+        // embedded bytes, masking the missing-file case this test targets.
+        server.force_checkpoint().await.unwrap();
+    }
+
+    // Delete the trained dictionary file: the catalog still references it as
+    // `logs`'s active dict, but the durable dict file is now gone.
+    let dicts_dir = dir.path().join("dicts");
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&dicts_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|x| x.to_str()) == Some("dict") {
+            std::fs::remove_file(entry.path()).unwrap();
+            deleted += 1;
+        }
+    }
+    assert_eq!(deleted, 1, "expected exactly one trained dictionary file");
+
+    let err = TestServer::start_with_data_dir(dir.path())
+        .await
+        .err()
+        .expect("recovery must fail when a catalog-referenced dictionary file is missing");
+    assert!(
+        err.message.contains("logs"),
+        "error should name the affected table: {}",
+        err.message
+    );
+    assert!(
+        err.message.to_lowercase().contains("dictionary"),
+        "error should mention the missing dictionary: {}",
+        err.message
+    );
 }

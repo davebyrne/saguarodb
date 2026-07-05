@@ -4,7 +4,7 @@ use sqlparser::ast as sql;
 use crate::{Expr, Statement, UnaryOp};
 
 use super::{
-    column_char_length, convert_expr, convert_pg_type, feature_not_supported, ident_name,
+    column_char_length, compression_from_str, convert_expr, convert_pg_type, ident_name,
     object_name, parse_error, serial_pg_type, unsupported,
 };
 
@@ -291,11 +291,7 @@ fn parse_compression_value(value: &sql::Expr) -> Result<CompressionSetting> {
             ));
         }
     };
-    match text.as_str() {
-        "none" => Ok(CompressionSetting::None),
-        "zstd" => Ok(CompressionSetting::Zstd),
-        other => feature_not_supported(format!("unsupported compression codec {other}")),
-    }
+    compression_from_str(&text)
 }
 
 fn convert_column_def(

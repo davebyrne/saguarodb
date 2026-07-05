@@ -269,6 +269,19 @@ envelopes are self-describing and mixed encodings are legal.
   recovery, dictionaries referenced by post-checkpoint records are either
   in `<data>/dicts/` already or installed by an earlier-LSN
   `CreateDictionary` record.
+- **Boot-time validation:** after seeding the dictionary resolver from
+  `<data>/dicts/` (and before replay), recovery (`open_app`) checks every
+  catalog table whose CURRENT `active_dict_id` is `Some(id)` against the
+  resolver; if `id` was not registered, recovery fails immediately with a
+  structured internal error naming the table and dict id, instead of
+  silently proceeding dict-less and surfacing a confusing decode error much
+  later on first read of a dict-compressed page. Under normal operation this
+  can only fire if a `.dict` file was deleted or the `dicts/` directory was
+  otherwise tampered with — the durability order above guarantees a
+  reachable dictionary is never legitimately missing. The check covers only
+  each table's CURRENT active dict; a HISTORICAL dict id referenced by an
+  older `FullPageImageCompressed` WAL record is unchecked but always present
+  too, since dict files are never deleted in v1.
 - **Training (v1):** only during `ALTER TABLE ... SET (compression = 'zstd')`
   on a table with data (§8). Training samples are the table's decompressed
   heap page images, sampled evenly across the file, capped at 4096 pages
@@ -286,6 +299,20 @@ Runs autocommit-only under the exclusive statement guard (writers drained,
 like `VACUUM` / `CREATE INDEX` backfill). Classified `StatementClass::Maintenance`
 and dispatched before binding, exactly like `VACUUM` — the binder never sees
 `AlterTableSetCompression`. Ordered steps:
+
+Step 4's commit-record flush is the **durable commit point**. Steps 1-4
+propagate an error normally as a statement error (nothing has committed yet).
+Steps 5-8 are post-durable-commit cleanup: any error there is fatal
+(`fatal_after_durable_commit` — logs, best-effort WAL flush, `process::exit`)
+rather than a returned statement error, exactly like every other autocommit
+write path (`docs/specs/crates/server.md`), because the DDL already committed
+and misreporting it as failed would be worse than crashing. The exclusive
+guard covers steps 1-8 and is released before the post-commit checkpoint
+trigger runs (`record_commit_and_maybe_checkpoint_after_durable_commit`,
+`docs/specs/crates/server.md`) — that call takes its own exclusive guard, so
+calling it earlier would deadlock — which is also what makes the rewrite's
+WAL activity in step 7 count toward `--checkpoint-wal-bytes` right away
+instead of waiting on an unrelated later commit to notice it.
 
 1. Parse: the compression value must be `'none'` or `'zstd'` (checked by the
    parser, `SqlState::FeatureNotSupported` otherwise). Table existence is
@@ -326,7 +353,12 @@ and dispatched before binding, exactly like `VACUUM` — the binder never sees
 8. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
    pool: `PageStore::write_page` re-encodes each flushable dirty page under
    the just-installed config — the envelope encode step (§5) runs here.
-   Then `store.sync_all()`, release the guard, return command tag
+   Then `store.sync_all()`, then `buffer_pool.mark_all_clean()` —
+   `flush_dirty_pages` does not itself mark frames clean (the caller fsyncs
+   via the store and only then calls `mark_all_clean`); skipping it would
+   not lose data, but would leave the rewrite's pages dirty and get them
+   redundantly re-written at the next checkpoint. Release the guard, then
+   trigger the post-commit checkpoint accounting, then return command tag
    `ALTER TABLE`.
 
 **Crash behavior:**
@@ -438,7 +470,11 @@ Decisions here deliberately keep a future data-dir-creation-time page size
   readable and re-running `ALTER` completes; recovery resolving a
   dictionary created after the last checkpoint; VACUUM on a compressed
   table; `ALTER` rejected inside a transaction block; unknown `WITH`
-  options rejected; control-file `page_size` mismatch rejected cleanly.
+  options rejected; control-file `page_size` mismatch rejected cleanly;
+  `ALTER`'s rewrite counts toward `--checkpoint-wal-bytes` and triggers a
+  checkpoint on its own (checkpoint-accounting regression test); recovery
+  fails fast, naming the table and dict id, when the catalog's active
+  dictionary file is missing (boot-time validation regression test, §7).
 
 ## 14. Documentation updates (same change)
 

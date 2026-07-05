@@ -84,6 +84,30 @@ pub fn open_app(config: Config) -> Result<AppState> {
         catalog.reserve_dictionary_id(max_dict_id)?;
     }
 
+    // Fail fast on a catalog-referenced-but-missing dictionary, rather than a
+    // silent write-time dict-less fallback followed by a much later, confusing
+    // read-time decode error. Every table whose CURRENT `active_dict_id` names a
+    // dictionary must have had that dictionary registered by the seeding loop
+    // just above; if not, its durable `.dict` file is missing (deleted,
+    // corrupted `dicts/` directory, manual tampering) and recovery cannot
+    // safely proceed for that table. This validates only each table's CURRENT
+    // active dict — a HISTORICAL dict id referenced by an older
+    // `FullPageImageCompressed` WAL record is also always present, since v1
+    // never deletes dict files (`compression.md` §7).
+    for schema in catalog.list_tables()? {
+        if let Some(dict_id) = schema.active_dict_id
+            && !compression.has_dictionary(dict_id)
+        {
+            return Err(DbError::internal(format!(
+                "table '{}' (id {}) references active dictionary {dict_id}, but no dictionary \
+                 file for it was found under {}",
+                schema.name,
+                schema.id,
+                config.data_dir.join("dicts").display()
+            )));
+        }
+    }
+
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
     // record after the checkpoint LSN onto the heap and index pages, regardless of
     // the dirtying transaction's outcome. PageLSN gating makes this idempotent;

@@ -607,16 +607,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     if i != tokens.len() {
         return Err(parse_error("unexpected trailing input after ALTER TABLE"));
     }
-    let compression = match value.as_str() {
-        "none" => CompressionSetting::None,
-        "zstd" => CompressionSetting::Zstd,
-        other => {
-            return Err(DbError::parse(
-                SqlState::FeatureNotSupported,
-                format!("unsupported compression codec {other}"),
-            ));
-        }
-    };
+    let compression = compression_from_str(&value)?;
     Ok(Some(Statement::AlterTableSetCompression {
         table,
         compression,
@@ -831,4 +822,18 @@ fn unsupported<T>(message: impl Into<String>) -> Result<T> {
 /// file COPY, binary format) → SQLSTATE `0A000` rather than a syntax error.
 fn feature_not_supported<T>(message: impl Into<String>) -> Result<T> {
     Err(DbError::parse(SqlState::FeatureNotSupported, message))
+}
+
+/// Parse an already-lowercased compression codec string into a
+/// `CompressionSetting`. The single accepted-codec list, shared by `CREATE
+/// TABLE ... WITH (compression = ...)` (`ddl::parse_compression_value`) and
+/// `ALTER TABLE ... SET (compression = ...)` (`try_parse_alter_table`), so
+/// both sites reject an unsupported codec with the identical
+/// `FeatureNotSupported` SQLSTATE and message.
+pub(crate) fn compression_from_str(text: &str) -> Result<CompressionSetting> {
+    match text {
+        "none" => Ok(CompressionSetting::None),
+        "zstd" => Ok(CompressionSetting::Zstd),
+        other => feature_not_supported(format!("unsupported compression codec {other}")),
+    }
 }
