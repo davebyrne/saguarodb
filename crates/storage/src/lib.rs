@@ -1322,8 +1322,7 @@ mod tests {
         let err = harness
             .storage
             .get(&ctx, 2, &Key(vec![Value::Integer(1)]))
-            .err()
-            .expect("a dropped table's hidden TOAST relation should not be readable");
+            .expect_err("a dropped table's hidden TOAST relation should not be readable");
         assert_eq!(err.code, SqlState::UndefinedTable);
     }
 

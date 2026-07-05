@@ -5,7 +5,7 @@ use common::{
     ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, IndexId,
     IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, RelationKind, Result,
     SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, ToastMode,
-    ToastOptions,
+    ToastOptions, needs_toast_relation, toast_schema,
 };
 
 use crate::CatalogManager;
@@ -187,41 +187,40 @@ impl CatalogManager for MemoryCatalog {
             .cloned()
             .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
 
-        if let RelationKind::Toast { base_table } = schema.relation_kind {
-            if snapshot
+        if let RelationKind::Toast { base_table } = schema.relation_kind
+            && snapshot
                 .tables_by_id
                 .get(&base_table)
                 .is_some_and(|base| base.toast_table_id == Some(id))
-            {
-                return Err(DbError::internal(format!(
-                    "cannot drop hidden TOAST relation {} while base table {} still references it",
-                    schema.name, base_table
-                )));
-            }
+        {
+            return Err(DbError::internal(format!(
+                "cannot drop hidden TOAST relation {} while base table {} still references it",
+                schema.name, base_table
+            )));
         }
 
         let mut table_ids = vec![id];
-        if let RelationKind::User = schema.relation_kind {
-            if let Some(toast_table_id) = schema.toast_table_id {
-                if toast_table_id == id {
+        if let RelationKind::User = schema.relation_kind
+            && let Some(toast_table_id) = schema.toast_table_id
+        {
+            if toast_table_id == id {
+                return Err(DbError::internal(format!(
+                    "catalog table {} references itself as a TOAST relation",
+                    schema.name
+                )));
+            }
+            if let Some(toast_schema) = snapshot.tables_by_id.get(&toast_table_id) {
+                if toast_schema.relation_kind
+                    != (RelationKind::Toast {
+                        base_table: schema.id,
+                    })
+                {
                     return Err(DbError::internal(format!(
-                        "catalog table {} references itself as a TOAST relation",
-                        schema.name
+                        "catalog table {} references non-matching TOAST relation {}",
+                        schema.name, toast_table_id
                     )));
                 }
-                if let Some(toast_schema) = snapshot.tables_by_id.get(&toast_table_id) {
-                    if toast_schema.relation_kind
-                        != (RelationKind::Toast {
-                            base_table: schema.id,
-                        })
-                    {
-                        return Err(DbError::internal(format!(
-                            "catalog table {} references non-matching TOAST relation {}",
-                            schema.name, toast_table_id
-                        )));
-                    }
-                    table_ids.push(toast_table_id);
-                }
+                table_ids.push(toast_table_id);
             }
         }
 
@@ -238,25 +237,48 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_table(
+    fn create_table_with_options(
         &self,
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         compression: CompressionSetting,
+        toast: ToastOptions,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
         reject_duplicate_table_name(&snapshot, &name)?;
 
         let table_id = snapshot.next_table_id;
-        let next_table_id = table_id
+        let mut next_table_id = table_id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
-        let schema = build_schema(&snapshot, table_id, name, columns, primary_key, compression)?;
+        let mut schema = build_schema(
+            &snapshot,
+            table_id,
+            name,
+            columns,
+            primary_key,
+            compression,
+            toast,
+        )?;
+        validate_toast_options(&schema)?;
+        let hidden_toast = if needs_toast_relation(&schema) {
+            let toast_id = next_table_id;
+            next_table_id = toast_id
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
+            schema.toast_table_id = Some(toast_id);
+            Some(toast_schema(&schema, toast_id))
+        } else {
+            None
+        };
 
         snapshot
             .tables_by_name
             .insert(schema.name.clone(), schema.id);
+        if let Some(hidden_toast) = hidden_toast {
+            snapshot.tables_by_id.insert(hidden_toast.id, hidden_toast);
+        }
         snapshot.tables_by_id.insert(schema.id, schema.clone());
         snapshot.next_table_id = next_table_id;
         Ok(schema)
@@ -289,6 +311,46 @@ impl CatalogManager for MemoryCatalog {
         if let Some(id) = active_dict_id {
             reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")?;
         }
+        Ok(schema)
+    }
+
+    fn set_table_toast_metadata(
+        &self,
+        table: TableId,
+        toast: ToastOptions,
+        toast_table_id: Option<TableId>,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "cannot set TOAST metadata on hidden relation {}",
+                schema.name
+            )));
+        }
+        schema.toast = toast;
+        schema.toast_table_id = toast_table_id;
+        validate_toast_options(&schema)?;
+        if let Some(toast_table_id) = toast_table_id {
+            let toast_schema = snapshot.tables_by_id.get(&toast_table_id).ok_or_else(|| {
+                DbError::internal(format!(
+                    "table id {table} references missing TOAST relation {toast_table_id}"
+                ))
+            })?;
+            if toast_schema.relation_kind != (RelationKind::Toast { base_table: table }) {
+                return Err(DbError::internal(format!(
+                    "table id {table} references non-matching TOAST relation {toast_table_id}"
+                )));
+            }
+        }
+        if let Some(id) = schema.toast.active_dict_id {
+            reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")?;
+        }
+        snapshot.tables_by_id.insert(table, schema.clone());
         Ok(schema)
     }
 
@@ -512,6 +574,7 @@ fn build_schema(
     columns: Vec<ParsedColumnDef>,
     primary_key: Vec<String>,
     compression: CompressionSetting,
+    toast: ToastOptions,
 ) -> Result<TableSchema> {
     let mut seen_names = HashSet::new();
     let mut column_ids_by_name = HashMap::new();
@@ -591,7 +654,7 @@ fn build_schema(
         primary_key: primary_key_ids,
         compression,
         active_dict_id: None,
-        toast: ToastOptions::legacy_catalog_default(),
+        toast,
         toast_table_id: None,
         relation_kind: RelationKind::User,
     })
@@ -827,12 +890,6 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
     for schema in snapshot.tables_by_id.values() {
         match schema.relation_kind {
             RelationKind::User => {
-                if schema.toast.mode != ToastMode::Off && schema.toast_table_id.is_none() {
-                    return Err(DbError::internal(format!(
-                        "catalog snapshot table {} enables TOAST without a toast_table_id",
-                        schema.name
-                    )));
-                }
                 if let Some(toast_table_id) = schema.toast_table_id {
                     if toast_table_id == schema.id {
                         return Err(DbError::internal(format!(

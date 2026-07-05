@@ -1,5 +1,6 @@
 use common::{
     CompressionSetting, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState,
+    TableOptionPatch, ToastCompression, ToastMode, ToastOptions,
 };
 use sqlparser::ast as sql;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -532,12 +533,11 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
 }
 
 /// Intercept `ALTER ...` before sqlparser (the VACUUM pattern above). Owns the
-/// whole ALTER namespace: the one supported form (`ALTER TABLE <name> SET
-/// (compression = 'none' | 'zstd')`) parses; every other `ALTER ...` input,
-/// however well-formed, is `FeatureNotSupported` here rather than falling
-/// through to sqlparser (whose ALTER TABLE coverage does not match our
-/// supported subset). A malformed option list (missing `(...)`, missing `=`,
-/// …) is a plain syntax error.
+/// whole ALTER namespace: supported storage-option forms parse here; every
+/// other `ALTER ...` input, however well-formed, is `FeatureNotSupported`
+/// rather than falling through to sqlparser (whose ALTER TABLE coverage does
+/// not match our supported subset). A malformed option list (missing `(...)`,
+/// missing `=`, …) is a plain syntax error.
 fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     let trimmed = sql.trim();
     let Some(first) = trimmed.split_whitespace().next() else {
@@ -560,7 +560,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     let unsupported_form = || {
         Err(DbError::parse(
             SqlState::FeatureNotSupported,
-            "only ALTER TABLE <name> SET (compression = ...) is supported",
+            "only ALTER TABLE <name> SET (...) storage options are supported",
         ))
     };
 
@@ -584,19 +584,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
         return Err(parse_error("expected ( after ALTER TABLE ... SET"));
     }
     i += 1;
-    if !expect_word(&tokens, &mut i, "compression") {
-        return unsupported_form();
-    }
-    if !matches!(tokens.get(i), Some(Token::Eq)) {
-        return Err(parse_error("expected = after compression"));
-    }
-    i += 1;
-    let value = match tokens.get(i) {
-        Some(Token::SingleQuotedString(s)) => s.to_ascii_lowercase(),
-        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
-        _ => return Err(parse_error("expected compression codec value")),
-    };
-    i += 1;
+    let options = parse_alter_table_options(&tokens, &mut i)?;
     if !matches!(tokens.get(i), Some(Token::RParen)) {
         return Err(parse_error("expected ) to close the option list"));
     }
@@ -607,11 +595,147 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     if i != tokens.len() {
         return Err(parse_error("unexpected trailing input after ALTER TABLE"));
     }
-    let compression = compression_from_str(&value)?;
-    Ok(Some(Statement::AlterTableSetCompression {
-        table,
-        compression,
-    }))
+    if !options.toast.is_empty() {
+        return Ok(Some(Statement::AlterTableSetOptions { table, options }));
+    }
+    if let Some(compression) = options.compression {
+        return Ok(Some(Statement::AlterTableSetCompression {
+            table,
+            compression,
+        }));
+    }
+    Err(parse_error("ALTER TABLE SET requires at least one option"))
+}
+
+fn parse_alter_table_options(tokens: &[Token], i: &mut usize) -> Result<TableOptionPatch> {
+    let mut parsed = TableOptionPatch::default();
+    loop {
+        let name = parse_option_name(tokens, i)?;
+        if !matches!(tokens.get(*i), Some(Token::Eq)) {
+            return Err(parse_error(format!("expected = after {name}")));
+        }
+        *i += 1;
+        match name.as_str() {
+            "compression" => {
+                if parsed.compression.is_some() {
+                    return Err(parse_error("duplicate compression option"));
+                }
+                parsed.compression = Some(compression_from_str(&parse_enum_option_token(
+                    tokens,
+                    i,
+                    "compression",
+                )?)?);
+            }
+            "toast" => {
+                if parsed.toast.mode.is_some() {
+                    return Err(parse_error("duplicate toast option"));
+                }
+                parsed.toast.mode = Some(parse_toast_mode_token(tokens, i)?);
+            }
+            "toast_tuple_target" => {
+                if parsed.toast.tuple_target.is_some() {
+                    return Err(parse_error("duplicate toast_tuple_target option"));
+                }
+                let value = parse_u32_option_token(tokens, i, "toast_tuple_target")?;
+                if !(ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET)
+                    .contains(&value)
+                {
+                    return Err(invalid_parameter_value(format!(
+                        "toast_tuple_target must be between {} and {}",
+                        ToastOptions::MIN_TOAST_TUPLE_TARGET,
+                        ToastOptions::MAX_TOAST_TUPLE_TARGET
+                    )));
+                }
+                parsed.toast.tuple_target = Some(value);
+            }
+            "toast_min_value_size" => {
+                if parsed.toast.min_value_size.is_some() {
+                    return Err(parse_error("duplicate toast_min_value_size option"));
+                }
+                let value = parse_u32_option_token(tokens, i, "toast_min_value_size")?;
+                if value < ToastOptions::MIN_TOAST_MIN_VALUE_SIZE {
+                    return Err(invalid_parameter_value(format!(
+                        "toast_min_value_size must be at least {}",
+                        ToastOptions::MIN_TOAST_MIN_VALUE_SIZE
+                    )));
+                }
+                parsed.toast.min_value_size = Some(value);
+            }
+            "toast_compression" => {
+                if parsed.toast.compression.is_some() {
+                    return Err(parse_error("duplicate toast_compression option"));
+                }
+                parsed.toast.compression = Some(parse_toast_compression_token(tokens, i)?);
+            }
+            _ => return Err(parse_error(format!("unsupported storage option {name}"))),
+        }
+        if matches!(tokens.get(*i), Some(Token::Comma)) {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(parsed)
+}
+
+fn parse_option_name(tokens: &[Token], i: &mut usize) -> Result<String> {
+    let name = match tokens.get(*i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
+        Some(Token::Word(_)) => return Err(parse_error("quoted identifiers are not supported")),
+        _ => return Err(parse_error("expected storage option name")),
+    };
+    *i += 1;
+    Ok(name)
+}
+
+fn parse_enum_option_token(tokens: &[Token], i: &mut usize, name: &str) -> Result<String> {
+    let value = match tokens.get(*i) {
+        Some(Token::SingleQuotedString(s)) => s.to_ascii_lowercase(),
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
+        _ => {
+            return Err(parse_error(format!(
+                "{name} value must be a string or identifier"
+            )));
+        }
+    };
+    *i += 1;
+    Ok(value)
+}
+
+fn parse_toast_mode_token(tokens: &[Token], i: &mut usize) -> Result<ToastMode> {
+    match parse_enum_option_token(tokens, i, "toast")?.as_str() {
+        "off" => Ok(ToastMode::Off),
+        "auto" => Ok(ToastMode::Auto),
+        "aggressive" => Ok(ToastMode::Aggressive),
+        other => feature_not_supported(format!("unsupported toast mode {other}")),
+    }
+}
+
+fn parse_toast_compression_token(tokens: &[Token], i: &mut usize) -> Result<ToastCompression> {
+    match parse_enum_option_token(tokens, i, "toast_compression")?.as_str() {
+        "none" => Ok(ToastCompression::None),
+        "zstd" => Ok(ToastCompression::Zstd),
+        "zstd_dict" => Ok(ToastCompression::ZstdDict),
+        other => feature_not_supported(format!("unsupported toast compression codec {other}")),
+    }
+}
+
+fn parse_u32_option_token(tokens: &[Token], i: &mut usize, name: &str) -> Result<u32> {
+    let negative = matches!(tokens.get(*i), Some(Token::Minus));
+    if negative {
+        *i += 1;
+    }
+    let Some(Token::Number(text, false)) = tokens.get(*i) else {
+        return Err(parse_error(format!("{name} must be an integer literal")));
+    };
+    *i += 1;
+    if negative {
+        return Err(invalid_parameter_value(format!(
+            "{name} must be a non-negative integer"
+        )));
+    }
+    text.parse::<u32>()
+        .map_err(|_| invalid_parameter_value(format!("{name} must be a non-negative integer")))
 }
 
 /// Consume `expected` at `tokens[*i]` (case-insensitive, unquoted word only),
@@ -812,6 +936,10 @@ fn matches_word(token: Option<&Token>, expected: &str) -> bool {
 
 fn parse_error(message: impl Into<String>) -> DbError {
     DbError::parse(SqlState::SyntaxError, message)
+}
+
+fn invalid_parameter_value(message: impl Into<String>) -> DbError {
+    DbError::parse(SqlState::InvalidParameterValue, message)
 }
 
 fn unsupported<T>(message: impl Into<String>) -> Result<T> {

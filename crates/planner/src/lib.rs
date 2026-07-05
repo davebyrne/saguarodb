@@ -200,7 +200,8 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        PRIMARY_KEY_INDEX_ID, ParsedColumnDef, PgType, SequenceOptions, SqlState, Value,
+        PRIMARY_KEY_INDEX_ID, ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression,
+        ToastMode, ToastOptions, Value,
     };
     use parser::parse;
 
@@ -839,6 +840,41 @@ mod tests {
             panic!("expected CreateTable");
         };
         assert_eq!(compression, CompressionSetting::None);
+    }
+
+    #[test]
+    fn bind_create_table_resolves_toast_options() {
+        let catalog = MemoryCatalog::empty();
+
+        let stmt = parse("create table t (id integer primary key)").unwrap();
+        let BoundStatement::CreateTable { toast, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(toast, ToastOptions::default_new_table());
+
+        let stmt =
+            parse("create table t (id integer primary key) with (toast = aggressive)").unwrap();
+        let BoundStatement::CreateTable { toast, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(toast.mode, ToastMode::Aggressive);
+        assert_eq!(
+            toast.min_value_size,
+            ToastOptions::AGGRESSIVE_TOAST_MIN_VALUE_SIZE
+        );
+
+        let stmt = parse(
+            "create table t (id integer primary key) with \
+             (toast = aggressive, toast_min_value_size = 777, toast_compression = none)",
+        )
+        .unwrap();
+        let BoundStatement::CreateTable { toast, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(toast.mode, ToastMode::Aggressive);
+        assert_eq!(toast.min_value_size, 777);
+        assert_eq!(toast.compression, ToastCompression::None);
+        assert_eq!(toast.active_dict_id, None);
     }
 
     #[test]

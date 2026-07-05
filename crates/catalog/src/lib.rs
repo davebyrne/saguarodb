@@ -6,7 +6,7 @@ pub use serialize::{deserialize_catalog, serialize_catalog};
 
 use common::{
     CompressionSetting, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions,
-    SequenceSchema, TableId, TableSchema,
+    SequenceSchema, TableId, TableSchema, ToastOptions,
 };
 
 pub trait CatalogManager: Send + Sync {
@@ -24,6 +24,22 @@ pub trait CatalogManager: Send + Sync {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         compression: CompressionSetting,
+    ) -> Result<TableSchema> {
+        self.create_table_with_options(
+            name,
+            columns,
+            primary_key,
+            compression,
+            ToastOptions::legacy_catalog_default(),
+        )
+    }
+    fn create_table_with_options(
+        &self,
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
     /// Applies an ALTER (or replays one during recovery): locates the live
@@ -34,6 +50,12 @@ pub trait CatalogManager: Send + Sync {
         table: TableId,
         compression: CompressionSetting,
         active_dict_id: Option<u32>,
+    ) -> Result<TableSchema>;
+    fn set_table_toast_metadata(
+        &self,
+        table: TableId,
+        toast: ToastOptions,
+        toast_table_id: Option<TableId>,
     ) -> Result<TableSchema>;
     /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
     /// "no dictionary").
@@ -1473,6 +1495,85 @@ mod tests {
     }
 
     #[test]
+    fn create_table_with_options_stores_toast_options_and_hidden_relation() {
+        let catalog = MemoryCatalog::empty();
+        let mut toast = ToastOptions::default_new_table();
+        toast.tuple_target = 4096;
+        let schema = catalog
+            .create_table_with_options(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "bio".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                toast.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(schema.toast, toast);
+        assert_eq!(schema.toast_table_id, Some(2));
+        let hidden = catalog.get_table(2).unwrap().unwrap();
+        assert_eq!(hidden.name, "\0toast_1");
+        assert_eq!(hidden.relation_kind, RelationKind::Toast { base_table: 1 });
+        assert_eq!(hidden.compression, CompressionSetting::None);
+        assert_eq!(hidden.toast, ToastOptions::legacy_catalog_default());
+        assert_eq!(hidden.primary_key, vec![0, 1]);
+        assert_eq!(
+            hidden
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["value_id", "seq", "data"]
+        );
+        assert_eq!(catalog.get_table_by_name("\0toast_1").unwrap(), None);
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap()
+                .toast
+                .tuple_target,
+            4096
+        );
+        assert_eq!(
+            restored.get_table(2).unwrap().unwrap().relation_kind,
+            RelationKind::Toast { base_table: 1 }
+        );
+    }
+
+    #[test]
+    fn create_table_with_options_skips_hidden_relation_without_toastable_columns() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table_with_options(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                ToastOptions::default_new_table(),
+            )
+            .unwrap();
+
+        assert_eq!(schema.toast, ToastOptions::default_new_table());
+        assert_eq!(schema.toast_table_id, None);
+        assert_eq!(catalog.get_table(2).unwrap(), None);
+    }
+
+    #[test]
     fn set_table_compression_updates_and_persists() {
         let catalog = MemoryCatalog::empty();
         let schema = catalog
@@ -1500,6 +1601,30 @@ mod tests {
                 .active_dict_id,
             Some(3)
         );
+    }
+
+    #[test]
+    fn set_table_toast_metadata_updates_options_and_reserves_dictionary_id() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let mut toast = ToastOptions::default_new_table();
+        toast.compression = ToastCompression::ZstdDict;
+        toast.active_dict_id = Some(7);
+
+        let updated = catalog
+            .set_table_toast_metadata(schema.id, toast.clone(), None)
+            .unwrap();
+        assert_eq!(updated.toast, toast);
+
+        let next = catalog.allocate_dictionary_id().unwrap();
+        assert_eq!(next, 8);
     }
 
     #[test]

@@ -84,7 +84,8 @@ pub enum BoundStatement {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
-        serial: Vec<SerialColumn>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
@@ -208,6 +209,15 @@ pub enum BoundFrom {
     },
 }
 ```
+
+For `CREATE TABLE`, binder defaults an absent `compression` option to
+`CompressionSetting::None`. It merges `Statement::CreateTable.toast` into
+`ToastOptions::default_new_table()`: omitted TOAST options keep the default,
+`toast = aggressive` with no explicit `toast_min_value_size` stores
+`ToastOptions::AGGRESSIVE_TOAST_MIN_VALUE_SIZE`, and any explicit
+`toast_compression` clears `active_dict_id` in the resolved `ToastOptions`
+(new tables have no active dictionary yet). `ALTER TABLE` maintenance statements
+do not bind.
 
 A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
@@ -429,7 +439,7 @@ Scalar functions remain `BoundExpr::Function`. Binder validates each call's arit
 
 ```rust
 pub enum LogicalPlan {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
@@ -512,7 +522,7 @@ usable (e.g. `id = 3 + 4` folds to `id = 7`).
 
 ```rust
 pub enum PhysicalPlan {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },

@@ -970,7 +970,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
             ))
         }
         Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
-        Statement::AlterTableSetCompression { .. } => Ok(StatementClass::Maintenance),
+        Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
+            Ok(StatementClass::Maintenance)
+        }
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
@@ -1018,9 +1020,9 @@ mod tests {
     use catalog::{CatalogManager, CatalogSnapshot, MemoryCatalog};
     use common::{
         ConcurrencyController, DbError, FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn,
-        PageFlushInfo, ParsedColumnDef, PgType, Result, RwLockConcurrencyController, SequenceId,
-        SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId, TableSchema,
-        TxnId, TxnStatus, TxnStatusView, Value,
+        PageFlushInfo, ParsedColumnDef, PgType, RelationKind, Result, RwLockConcurrencyController,
+        SequenceId, SequenceOptions, SequenceSchema, SessionSequenceState, SqlState, TableId,
+        TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -1351,6 +1353,18 @@ mod tests {
                 .create_table(name, columns, primary_key, compression)
         }
 
+        fn create_table_with_options(
+            &self,
+            name: String,
+            columns: Vec<ParsedColumnDef>,
+            primary_key: Vec<String>,
+            compression: common::CompressionSetting,
+            toast: common::ToastOptions,
+        ) -> Result<TableSchema> {
+            self.inner
+                .create_table_with_options(name, columns, primary_key, compression, toast)
+        }
+
         fn drop_table(&self, id: TableId) -> Result<()> {
             self.inner.drop_table(id)
         }
@@ -1363,6 +1377,16 @@ mod tests {
         ) -> Result<TableSchema> {
             self.inner
                 .set_table_compression(table, compression, active_dict_id)
+        }
+
+        fn set_table_toast_metadata(
+            &self,
+            table: TableId,
+            toast: common::ToastOptions,
+            toast_table_id: Option<TableId>,
+        ) -> Result<TableSchema> {
+            self.inner
+                .set_table_toast_metadata(table, toast, toast_table_id)
         }
 
         fn allocate_dictionary_id(&self) -> Result<u32> {
@@ -1634,6 +1658,52 @@ mod tests {
             begin_checkpoint_calls.load(Ordering::SeqCst),
             0,
             "DML should not serialize through the exclusive guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_table_with_toast_options_installs_hidden_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql(
+                "create table users (id integer primary key, bio text) with \
+                 (toast = aggressive, toast_tuple_target = 4096, \
+                  toast_min_value_size = 512, toast_compression = zstd)",
+            )
+            .unwrap();
+
+        let users = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .expect("users table exists");
+        assert_eq!(users.toast.mode, ToastMode::Aggressive);
+        assert_eq!(users.toast.tuple_target, 4096);
+        assert_eq!(users.toast.min_value_size, 512);
+        assert_eq!(users.toast.compression, ToastCompression::Zstd);
+
+        let toast_id = users.toast_table_id.expect("hidden TOAST relation id");
+        let toast = app
+            .components
+            .catalog
+            .get_table(toast_id)
+            .unwrap()
+            .expect("hidden TOAST relation exists");
+        assert_eq!(
+            toast.relation_kind,
+            RelationKind::Toast {
+                base_table: users.id
+            }
+        );
+        assert_eq!(
+            app.components
+                .catalog
+                .get_table_by_name(&toast.name)
+                .unwrap(),
+            None
         );
     }
 

@@ -17,7 +17,8 @@ pub fn parse(sql: &str) -> Result<Statement> {
 mod tests {
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        SequenceOptions, SqlState, Value,
+        SequenceOptions, SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptionPatch,
+        Value,
     };
 
     use crate::{
@@ -1557,6 +1558,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_create_table_with_toast_options() {
+        let Statement::CreateTable { toast, .. } = parse(
+            "create table t (id integer primary key, body text) with \
+             (toast = aggressive, toast_tuple_target = 4096, \
+              toast_min_value_size = 512, toast_compression = 'zstd_dict')",
+        )
+        .unwrap() else {
+            panic!("expected CreateTable");
+        };
+
+        assert_eq!(toast.mode, Some(ToastMode::Aggressive));
+        assert_eq!(toast.tuple_target, Some(4096));
+        assert_eq!(toast.min_value_size, Some(512));
+        assert_eq!(toast.compression, Some(ToastCompression::ZstdDict));
+    }
+
+    #[test]
     fn rejects_bad_create_table_options() {
         // Unknown key stays a syntax error (the old fillfactor rejection).
         let err =
@@ -1572,6 +1590,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
+        let err = parse("create table t (id integer primary key) with (toast_tuple_target = 100)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidParameterValue);
+        let err = parse("create table t (id integer primary key) with (toast_tuple_target = 9000)")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidParameterValue);
+        let err =
+            parse("create table t (id integer primary key) with (toast = 'always')").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     #[test]
@@ -1602,10 +1629,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_alter_table_set_toast_options() {
+        let expected = TableOptionPatch {
+            compression: Some(CompressionSetting::Zstd),
+            toast: ToastOptionPatch {
+                mode: Some(ToastMode::Aggressive),
+                tuple_target: Some(4096),
+                min_value_size: None,
+                compression: Some(ToastCompression::Zstd),
+            },
+        };
+        assert_eq!(
+            parse(
+                "alter table users set (compression = zstd, toast = aggressive, \
+                 toast_tuple_target = 4096, toast_compression = zstd)"
+            )
+            .unwrap(),
+            Statement::AlterTableSetOptions {
+                table: "users".to_string(),
+                options: expected,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_alter_forms() {
         for sql in [
             "alter table users add column x integer",
-            "alter table users set (fillfactor = 70)",
             "alter table users rename to people",
             "alter index foo set (compression = 'zstd')",
         ] {
@@ -1613,8 +1663,12 @@ mod tests {
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
             assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
         }
+        let err = parse("alter table users set (fillfactor = 70)").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
         let err = parse("alter table users set (compression = 'lz4')").unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
+        let err = parse("alter table users set (toast_tuple_target = 100)").unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidParameterValue);
         // Malformed (no option list) is a plain syntax error.
         let err = parse("alter table users set compression").unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);

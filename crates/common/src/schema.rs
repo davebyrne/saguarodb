@@ -71,6 +71,20 @@ pub struct ToastOptions {
     pub active_dict_id: Option<u32>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToastOptionPatch {
+    pub mode: Option<ToastMode>,
+    pub tuple_target: Option<u32>,
+    pub min_value_size: Option<u32>,
+    pub compression: Option<ToastCompression>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableOptionPatch {
+    pub compression: Option<CompressionSetting>,
+    pub toast: ToastOptionPatch,
+}
+
 impl ToastOptions {
     pub const DEFAULT_TOAST_TUPLE_TARGET: u32 = 2048;
     pub const MIN_TOAST_TUPLE_TARGET: u32 = 256;
@@ -98,6 +112,42 @@ impl ToastOptions {
             compression: ToastCompression::None,
             active_dict_id: None,
         }
+    }
+
+    pub fn apply_patch(&self, patch: &ToastOptionPatch) -> Self {
+        let mut options = self.clone();
+        if let Some(mode) = patch.mode {
+            options.mode = mode;
+            if mode == ToastMode::Aggressive && patch.min_value_size.is_none() {
+                options.min_value_size = Self::AGGRESSIVE_TOAST_MIN_VALUE_SIZE;
+            }
+        }
+        if let Some(tuple_target) = patch.tuple_target {
+            options.tuple_target = tuple_target;
+        }
+        if let Some(min_value_size) = patch.min_value_size {
+            options.min_value_size = min_value_size;
+        }
+        if let Some(compression) = patch.compression {
+            options.compression = compression;
+            options.active_dict_id = None;
+        }
+        options
+    }
+}
+
+impl ToastOptionPatch {
+    pub fn is_empty(&self) -> bool {
+        self.mode.is_none()
+            && self.tuple_target.is_none()
+            && self.min_value_size.is_none()
+            && self.compression.is_none()
+    }
+}
+
+impl TableOptionPatch {
+    pub fn is_empty(&self) -> bool {
+        self.compression.is_none() && self.toast.is_empty()
     }
 }
 
@@ -238,6 +288,62 @@ pub struct TableSchema {
     /// User table vs. hidden toast relation metadata.
     #[serde(default)]
     pub relation_kind: RelationKind,
+}
+
+pub fn needs_toast_relation(schema: &TableSchema) -> bool {
+    schema.relation_kind == RelationKind::User
+        && schema
+            .columns
+            .iter()
+            .any(|column| matches!(column.data_type, DataType::Text | DataType::Bytea))
+}
+
+pub fn toast_relation_name(base_table: TableId) -> String {
+    format!("\0toast_{base_table}")
+}
+
+pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
+    TableSchema {
+        id: toast_id,
+        name: toast_relation_name(base.id),
+        columns: vec![
+            ColumnDef {
+                id: 0,
+                name: "value_id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: Some(PgType::Int8),
+            },
+            ColumnDef {
+                id: 1,
+                name: "seq".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: Some(PgType::Int4),
+            },
+            ColumnDef {
+                id: 2,
+                name: "data".to_string(),
+                data_type: DataType::Bytea,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: Some(PgType::Bytea),
+            },
+        ],
+        primary_key: vec![0, 1],
+        compression: CompressionSetting::None,
+        active_dict_id: None,
+        toast: ToastOptions::legacy_catalog_default(),
+        toast_table_id: None,
+        relation_kind: RelationKind::Toast {
+            base_table: base.id,
+        },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

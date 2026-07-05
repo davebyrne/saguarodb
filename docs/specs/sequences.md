@@ -361,10 +361,11 @@ one-way — the table's column default needs the sequence id, but the sequence
 stores no table reference (`owned: bool` only, §4.1) — so the order is simply
 "sequences first, then table," with no placeholder to patch:
 
-- **Binder:** for each `serial` column, validate it is a top-level `CREATE TABLE`
-  column, set the column to `INTEGER` + `NOT NULL`, and record the SERIAL column
-  name and ordinal in `BoundStatement::CreateTable`. The column's default is
-  left to be finalized at execution.
+- **Parser/binder:** a SERIAL column is represented by
+  `ParsedDefault::Serial`; binder preserves that marker on
+  `BoundStatement::CreateTable`. The owned sequence name is chosen at execution
+  time from the current catalog, so prepared statements cannot reserve stale
+  names.
 - **Executor (`execute_create_table`), in order, one autocommit transaction:**
   1. Choose each owned sequence name from the current catalog under the DDL guard:
      `<table>_<column>_seq`, appending the smallest free numeric suffix if taken.
@@ -373,7 +374,7 @@ stores no table reference (`owned: bool` only, §4.1) — so the order is simply
      `CreateSequence` WAL record. The record is final — it carries no table id.
   2. Set each SERIAL column's default to internal
      `ParsedDefault::OwnedNextval(<generated name>)`.
-  3. `catalog.create_table(...)`, which resolves explicit `Nextval(name)`
+  3. `catalog.create_table_with_options(...)`, which resolves explicit `Nextval(name)`
      defaults only against non-owned sequences and resolves
      `OwnedNextval(name)` only against owned sequences created for SERIAL →
      `ColumnDefault::Nextval(id)` on the stored `ColumnDef`.

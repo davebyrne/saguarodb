@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`/`INT2`, `INTEGER`/`INT`/`INT4`, and `BIGINT`/`INT8` all share one 64-bit integer storage but report their distinct PostgreSQL width OIDs (`int2`/`int4`/`int8`; bare `INTEGER` is `int4`), and `int2`/`int4` values are range-checked at write and cast time (`SqlState::NumericValueOutOfRange` when out of range); `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')` and report their serial kind's width), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time, and reported on the wire as `varchar`/`bpchar`/`text` with the declared length; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, and an optional trailing `WITH (compression = 'none' | 'zstd')` clause selecting per-table at-rest page compression, defaulting to `none`; see `docs/specs/compression.md`), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]` and `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (rewrites the table's heap and index files in full under the exclusive statement guard; autocommit only, rejected inside a transaction block; see `docs/specs/compression.md`), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
+- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, and optional trailing `WITH (...)` storage options: `compression = 'none' | 'zstd'`, `toast = 'off' | 'auto' | 'aggressive'`, `toast_tuple_target = <integer>`, `toast_min_value_size = <integer>`, and `toast_compression = 'none' | 'zstd' | 'zstd_dict'`; see `docs/specs/compression.md` and TOAST metadata below), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and sequence functions `nextval`/`currval`/`setval`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]` and `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (rewrites the table's heap and index files in full under the exclusive statement guard; autocommit only, rejected inside a transaction block; see `docs/specs/compression.md`), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms. `ALTER TABLE <table> SET (...)` with TOAST options parses as maintenance but is currently rejected at execution until TOAST ALTER is implemented.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -597,7 +597,14 @@ The AST uses strings for identifiers — name resolution to IDs happens in the p
 
 ```rust
 pub enum Statement {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String> },
+    CreateTable {
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        unique: Vec<Vec<String>>,
+        compression: Option<CompressionSetting>,
+        toast: ToastOptionPatch,
+    },
     DropTable { name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
@@ -770,7 +777,8 @@ pub enum BoundStatement {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
-        serial: Vec<SerialColumn>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
@@ -966,7 +974,8 @@ pub enum LogicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
-        serial: Vec<SerialColumn>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
@@ -1037,7 +1046,8 @@ pub enum PhysicalPlan {
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
-        serial: Vec<SerialColumn>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     },
     DropTable { table: TableId },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
@@ -1786,7 +1796,7 @@ pub struct TableSchema {
 }
 ```
 
-`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, and validates hidden TOAST relation cross-links when `toast_table_id` is present. Hidden TOAST relations are stored by ID and must not be present in the user table name index.
+`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's SQL DDL API `create_table_with_options` accepts `ParsedColumnDef`, assigns `ColumnId`s, stores the binder-resolved `ToastOptions`, and creates a hidden TOAST relation for user tables with at least one `TEXT` or `BYTEA` column. The hidden relation is stored by ID only, named `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`, and uses `compression = none`. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, and validates hidden TOAST relation cross-links when `toast_table_id` is present. Hidden TOAST relations must not be present in the user table name index.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` resolves by name at execution time to preserve extended-protocol prepared-statement semantics, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
@@ -1816,10 +1826,32 @@ pub trait CatalogManager: Send + Sync {
         name: String,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
+        compression: CompressionSetting,
+    ) -> Result<TableSchema>;
+    fn create_table_with_options(
+        &self,
+        name: String,
+        columns: Vec<ParsedColumnDef>,
+        primary_key: Vec<String>,
+        compression: CompressionSetting,
+        toast: ToastOptions,
     ) -> Result<TableSchema>;
 
     /// Remove a table
     fn drop_table(&self, id: TableId) -> Result<()>;
+
+    fn set_table_compression(
+        &self,
+        table: TableId,
+        compression: CompressionSetting,
+        active_dict_id: Option<u32>,
+    ) -> Result<TableSchema>;
+    fn set_table_toast_metadata(
+        &self,
+        table: TableId,
+        toast: ToastOptions,
+        toast_table_id: Option<TableId>,
+    ) -> Result<TableSchema>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
@@ -1862,6 +1894,7 @@ pub struct CatalogSnapshot {
     pub sequences_by_name: HashMap<String, SequenceId>,
     pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     pub next_sequence_id: SequenceId,
+    pub next_dictionary_id: u32,
 }
 ```
 

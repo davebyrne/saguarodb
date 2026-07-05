@@ -2,6 +2,7 @@ mod support;
 
 use std::path::Path;
 
+use common::{RelationKind, ToastCompression, ToastMode};
 use support::{Connection, TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
@@ -39,6 +40,57 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
             vec![Some("2".to_string()), Some("Grace".to_string())],
         ]
     );
+}
+
+#[tokio::test]
+async fn create_table_toast_metadata_survives_replay_and_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table users (id integer primary key, bio text) with \
+                 (toast = aggressive, toast_tuple_target = 4096, \
+                  toast_min_value_size = 512, toast_compression = zstd)",
+            )
+            .await
+            .unwrap();
+    }
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        assert_users_toast_metadata(&server);
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_users_toast_metadata(&server);
+}
+
+fn assert_users_toast_metadata(server: &TestServer) {
+    let catalog = &server.app().components.catalog;
+    let users = catalog
+        .get_table_by_name("users")
+        .unwrap()
+        .expect("users table exists");
+    assert_eq!(users.toast.mode, ToastMode::Aggressive);
+    assert_eq!(users.toast.tuple_target, 4096);
+    assert_eq!(users.toast.min_value_size, 512);
+    assert_eq!(users.toast.compression, ToastCompression::Zstd);
+
+    let toast_id = users.toast_table_id.expect("hidden TOAST relation id");
+    let toast = catalog
+        .get_table(toast_id)
+        .unwrap()
+        .expect("hidden TOAST relation exists");
+    assert_eq!(
+        toast.relation_kind,
+        RelationKind::Toast {
+            base_table: users.id
+        }
+    );
+    assert_eq!(catalog.get_table_by_name(&toast.name).unwrap(), None);
 }
 
 #[tokio::test]

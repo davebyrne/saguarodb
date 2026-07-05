@@ -175,6 +175,18 @@ pub struct ToastOptions {
     pub active_dict_id: Option<u32>,
 }
 
+pub struct ToastOptionPatch {
+    pub mode: Option<ToastMode>,
+    pub tuple_target: Option<u32>,
+    pub min_value_size: Option<u32>,
+    pub compression: Option<ToastCompression>,
+}
+
+pub struct TableOptionPatch {
+    pub compression: Option<CompressionSetting>,
+    pub toast: ToastOptionPatch,
+}
+
 pub enum RelationKind {
     User,
     Toast { base_table: TableId },
@@ -278,6 +290,20 @@ Catalog validation rejects TOAST policy values outside the durable bounds:
 `tuple_target` must be in `256..=8000`, `min_value_size` must be at least `128`,
 and `active_dict_id = Some(0)` is invalid because dictionary id `0` is the
 reserved "no dictionary" sentinel.
+
+`ToastOptionPatch` / `TableOptionPatch` are parser-to-binder option carriers, not
+durable catalog state. `ToastOptions::apply_patch` implements the SQL merge rule:
+omitted options preserve the base options; `toast = aggressive` plus omitted
+`toast_min_value_size` stores `AGGRESSIVE_TOAST_MIN_VALUE_SIZE`; explicit
+`toast_compression` clears `active_dict_id`.
+
+`needs_toast_relation(schema)`, `toast_relation_name(base_table)`, and
+`toast_schema(base, toast_id)` define the hidden TOAST relation metadata shared
+by catalog/executor/storage phases. A user table needs a hidden relation when it
+has a `TEXT` or `BYTEA` column. The generated relation is named
+`"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)`
+with primary key `(value_id, seq)`, uses at-rest page `compression = none`, and
+has `RelationKind::Toast { base_table }`.
 
 `IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate non-NULL indexed values (NULLs are distinct); a non-unique index admits duplicates. On disk every index entry is disambiguated by the heap TID it points at (see `storage` Secondary Indexes), so no metadata distinguishes the two beyond the `unique` flag.
 

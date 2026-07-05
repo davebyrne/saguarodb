@@ -30,6 +30,10 @@ impl QueryService {
             Statement::AlterTableSetCompression { .. } => {
                 self.run_alter_table_compression(statement)
             }
+            Statement::AlterTableSetOptions { .. } => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "ALTER TABLE SET TOAST options is not implemented yet",
+            )),
             _ => Err(DbError::internal(
                 "run_maintenance called with a non-maintenance statement",
             )),

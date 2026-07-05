@@ -1,11 +1,14 @@
-use common::{CompressionSetting, ParsedColumnDef, ParsedDefault, PgType, Result, Value};
+use common::{
+    CompressionSetting, DbError, ParsedColumnDef, ParsedDefault, PgType, Result, SqlState,
+    TableOptionPatch, ToastCompression, ToastMode, ToastOptions, Value,
+};
 use sqlparser::ast as sql;
 
 use crate::{Expr, Statement, UnaryOp};
 
 use super::{
-    column_char_length, compression_from_str, convert_expr, convert_pg_type, ident_name,
-    object_name, parse_error, serial_pg_type, unsupported,
+    column_char_length, compression_from_str, convert_expr, convert_pg_type, feature_not_supported,
+    ident_name, object_name, parse_error, serial_pg_type, unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -238,36 +241,80 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         }
     }
 
-    let compression = convert_table_options(with_options)?;
+    let options = convert_table_options(with_options)?;
 
     Ok(Statement::CreateTable {
         name: object_name(&name)?,
         columns,
         primary_key,
         unique,
-        compression,
+        compression: options.compression,
+        toast: options.toast,
     })
 }
 
-/// Parse `WITH (compression = 'none' | 'zstd')`. Unknown keys are syntax
-/// errors; a known key with an unsupported codec is 0A000; duplicates are
-/// syntax errors (the CREATE SEQUENCE duplicate-option convention).
-fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<Option<CompressionSetting>> {
-    let mut compression = None;
+/// Parse `WITH (...)` storage options. Unknown keys are syntax errors; known
+/// keys with unsupported enum values are 0A000; duplicates are syntax errors
+/// (the CREATE SEQUENCE duplicate-option convention).
+fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<TableOptionPatch> {
+    let mut parsed = TableOptionPatch::default();
     for option in options {
         let sql::SqlOption::KeyValue { key, value } = option else {
             return Err(parse_error("unsupported storage option form"));
         };
         let name = ident_name(&key)?;
-        if name != "compression" {
-            return Err(parse_error(format!("unsupported storage option {name}")));
+        match name.as_str() {
+            "compression" => {
+                if parsed.compression.is_some() {
+                    return Err(parse_error("duplicate compression option"));
+                }
+                parsed.compression = Some(parse_compression_value(&value)?);
+            }
+            "toast" => {
+                if parsed.toast.mode.is_some() {
+                    return Err(parse_error("duplicate toast option"));
+                }
+                parsed.toast.mode = Some(parse_toast_mode_value(&value)?);
+            }
+            "toast_tuple_target" => {
+                if parsed.toast.tuple_target.is_some() {
+                    return Err(parse_error("duplicate toast_tuple_target option"));
+                }
+                let value = parse_u32_storage_option("toast_tuple_target", &value)?;
+                if !(ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET)
+                    .contains(&value)
+                {
+                    return Err(invalid_parameter_value(format!(
+                        "toast_tuple_target must be between {} and {}",
+                        ToastOptions::MIN_TOAST_TUPLE_TARGET,
+                        ToastOptions::MAX_TOAST_TUPLE_TARGET
+                    )));
+                }
+                parsed.toast.tuple_target = Some(value);
+            }
+            "toast_min_value_size" => {
+                if parsed.toast.min_value_size.is_some() {
+                    return Err(parse_error("duplicate toast_min_value_size option"));
+                }
+                let value = parse_u32_storage_option("toast_min_value_size", &value)?;
+                if value < ToastOptions::MIN_TOAST_MIN_VALUE_SIZE {
+                    return Err(invalid_parameter_value(format!(
+                        "toast_min_value_size must be at least {}",
+                        ToastOptions::MIN_TOAST_MIN_VALUE_SIZE
+                    )));
+                }
+                parsed.toast.min_value_size = Some(value);
+            }
+            "toast_compression" => {
+                if parsed.toast.compression.is_some() {
+                    return Err(parse_error("duplicate toast_compression option"));
+                }
+                parsed.toast.compression = Some(parse_toast_compression_value(&value)?);
+            }
+            _ => return Err(parse_error(format!("unsupported storage option {name}"))),
         }
-        if compression.is_some() {
-            return Err(parse_error("duplicate compression option"));
-        }
-        compression = Some(parse_compression_value(&value)?);
     }
-    Ok(compression)
+    Ok(parsed)
 }
 
 /// Parse a `compression` option value: a single-quoted string or a bare
@@ -275,23 +322,72 @@ fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<Option<Compress
 /// also rejects quoted identifiers, which is not the concern for a WITH-clause
 /// value.
 fn parse_compression_value(value: &sql::Expr) -> Result<CompressionSetting> {
-    let text = match value {
-        sql::Expr::Value(v) => match &v.value {
-            sql::Value::SingleQuotedString(s) => s.to_ascii_lowercase(),
-            _ => {
-                return Err(parse_error(
-                    "compression value must be a string or identifier",
-                ));
-            }
-        },
-        sql::Expr::Identifier(ident) => ident_name(ident)?,
-        _ => {
-            return Err(parse_error(
-                "compression value must be a string or identifier",
-            ));
-        }
-    };
+    let text = parse_enum_storage_option("compression", value)?;
     compression_from_str(&text)
+}
+
+fn parse_toast_mode_value(value: &sql::Expr) -> Result<ToastMode> {
+    match parse_enum_storage_option("toast", value)?.as_str() {
+        "off" => Ok(ToastMode::Off),
+        "auto" => Ok(ToastMode::Auto),
+        "aggressive" => Ok(ToastMode::Aggressive),
+        other => feature_not_supported(format!("unsupported toast mode {other}")),
+    }
+}
+
+fn parse_toast_compression_value(value: &sql::Expr) -> Result<ToastCompression> {
+    match parse_enum_storage_option("toast_compression", value)?.as_str() {
+        "none" => Ok(ToastCompression::None),
+        "zstd" => Ok(ToastCompression::Zstd),
+        "zstd_dict" => Ok(ToastCompression::ZstdDict),
+        other => feature_not_supported(format!("unsupported toast compression codec {other}")),
+    }
+}
+
+fn parse_enum_storage_option(name: &str, value: &sql::Expr) -> Result<String> {
+    match value {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::SingleQuotedString(s) => Ok(s.to_ascii_lowercase()),
+            _ => Err(parse_error(format!(
+                "{name} value must be a string or identifier"
+            ))),
+        },
+        sql::Expr::Identifier(ident) => ident_name(ident),
+        _ => Err(parse_error(format!(
+            "{name} value must be a string or identifier"
+        ))),
+    }
+}
+
+fn parse_u32_storage_option(name: &str, value: &sql::Expr) -> Result<u32> {
+    match value {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::Number(text, false) => text.parse::<u32>().map_err(|_| {
+                invalid_parameter_value(format!("{name} must be a non-negative integer"))
+            }),
+            _ => Err(parse_error(format!("{name} must be an integer literal"))),
+        },
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus,
+            expr,
+        } if matches!(
+            expr.as_ref(),
+            sql::Expr::Value(sql::ValueWithSpan {
+                value: sql::Value::Number(_, false),
+                ..
+            })
+        ) =>
+        {
+            Err(invalid_parameter_value(format!(
+                "{name} must be a non-negative integer"
+            )))
+        }
+        _ => Err(parse_error(format!("{name} must be an integer literal"))),
+    }
+}
+
+fn invalid_parameter_value(message: impl Into<String>) -> DbError {
+    DbError::parse(SqlState::InvalidParameterValue, message)
 }
 
 fn convert_column_def(

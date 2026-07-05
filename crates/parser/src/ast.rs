@@ -1,6 +1,6 @@
 use common::{
     CompressionSetting, CopyDirection, CopyOptions, DataType, IsolationLevel, ParsedColumnDef,
-    PgType, SequenceOptions, Value,
+    PgType, SequenceOptions, TableOptionPatch, ToastOptionPatch, Value,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +16,9 @@ pub enum Statement {
         /// `WITH (compression = ...)`. `None` when the clause is absent (the
         /// binder defaults an absent clause to [`CompressionSetting::None`]).
         compression: Option<CompressionSetting>,
+        /// `WITH (toast..., toast_compression...)` storage options. Empty when
+        /// omitted; the binder merges this patch with new-table defaults.
+        toast: ToastOptionPatch,
     },
     DropTable {
         name: String,
@@ -125,6 +128,12 @@ pub enum Statement {
     AlterTableSetCompression {
         table: String,
         compression: CompressionSetting,
+    },
+    /// `ALTER TABLE <name> SET (...)` with at least one TOAST option. Parsed now
+    /// so option semantics are stable; execution is a later storage phase.
+    AlterTableSetOptions {
+        table: String,
+        options: TableOptionPatch,
     },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
     /// non-relational bulk-transfer command (text/CSV, simple-query only). The

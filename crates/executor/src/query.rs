@@ -6,7 +6,7 @@ use catalog::CatalogManager;
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions,
-    SequenceSchema, SqlState, StatementContext, TableId, TableSchema, Value,
+    SequenceSchema, SqlState, StatementContext, TableId, TableSchema, ToastOptions, Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RowIterator, SchemaOperations, StorageEngine};
@@ -106,7 +106,16 @@ impl QueryEngine {
                 primary_key,
                 unique,
                 compression,
-            } => execute_create_table(ctx, name, columns, primary_key, unique, *compression),
+                toast,
+            } => execute_create_table(
+                ctx,
+                name,
+                columns,
+                primary_key,
+                unique,
+                *compression,
+                toast.clone(),
+            ),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
                 name,
@@ -893,6 +902,7 @@ fn execute_create_table(
     primary_key: &[String],
     unique: &[Vec<String>],
     compression: CompressionSetting,
+    toast: ToastOptions,
 ) -> Result<ExecutionResult> {
     let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
     let mut created_sequences = Vec::new();
@@ -907,18 +917,34 @@ fn execute_create_table(
     }
 
     let columns = columns_with_serial_defaults(columns, &serial)?;
-    let schema =
-        match ctx
-            .catalog
-            .create_table(name.to_string(), columns, primary_key.to_vec(), compression)
-        {
-            Ok(schema) => schema,
-            Err(err) => {
-                cleanup_serial_sequences(ctx, &created_sequences);
-                return Err(err);
-            }
-        };
+    let schema = match ctx.catalog.create_table_with_options(
+        name.to_string(),
+        columns,
+        primary_key.to_vec(),
+        compression,
+        toast,
+    ) {
+        Ok(schema) => schema,
+        Err(err) => {
+            cleanup_serial_sequences(ctx, &created_sequences);
+            return Err(err);
+        }
+    };
+    let toast_schema = match schema.toast_table_id {
+        Some(toast_table_id) => Some(
+            ctx.catalog
+                .get_table(toast_table_id)?
+                .ok_or_else(|| DbError::internal("created table is missing its TOAST relation"))?,
+        ),
+        None => None,
+    };
     if let Err(err) = ctx.schema_ops.create_table(&ctx.statement, &schema) {
+        cleanup_created_table(ctx, schema.id, &created_sequences);
+        return Err(err);
+    }
+    if let Some(toast_schema) = &toast_schema
+        && let Err(err) = ctx.schema_ops.create_table(&ctx.statement, toast_schema)
+    {
         cleanup_created_table(ctx, schema.id, &created_sequences);
         return Err(err);
     }

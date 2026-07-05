@@ -1,6 +1,6 @@
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    IndexId, ParsedColumnDef, SequenceOptions, TableId,
+    IndexId, ParsedColumnDef, SequenceOptions, TableId, ToastOptions,
 };
 use parser::SetOp;
 
@@ -128,6 +128,9 @@ pub enum BoundStatement {
         /// The table's storage compression setting, resolved from the
         /// `WITH (compression = ...)` clause at bind time (`None` if omitted).
         compression: CompressionSetting,
+        /// The table's TOAST policy, resolved from `WITH (toast...)` options at
+        /// bind time.
+        toast: ToastOptions,
     },
     DropTable {
         table: TableId,

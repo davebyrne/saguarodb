@@ -128,6 +128,7 @@ fn bind_inner(
             primary_key,
             unique,
             compression,
+            toast,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -153,6 +154,7 @@ fn bind_inner(
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
                 compression: compression.unwrap_or_default(),
+                toast: common::ToastOptions::default_new_table().apply_patch(toast),
             })
         }
         Statement::DropTable { name } => {
@@ -250,10 +252,12 @@ fn bind_inner(
         )),
         // ALTER TABLE ... SET (compression) is a maintenance command dispatched
         // before binding (the VACUUM pattern); this arm keeps `bind` total.
-        Statement::AlterTableSetCompression { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "ALTER TABLE is a maintenance command and does not bind",
-        )),
+        Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
+            Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "ALTER TABLE is a maintenance command and does not bind",
+            ))
+        }
         Statement::Copy {
             table,
             columns,
