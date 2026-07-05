@@ -25,8 +25,8 @@ mod tests {
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
         ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
-        KeyRange, Lsn, Result, Row, SequenceManager, SequenceSchema, SqlState, StatementContext,
-        TableSchema, TxnId, TxnStatus, TxnStatusView, Value,
+        KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
+        StatementContext, TableSchema, ToastOptions, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -857,6 +857,7 @@ mod tests {
 
         let err = harness.storage.insert(&ctx, 2, row).unwrap_err();
 
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
         assert!(err.message.contains("row is too large for a data page"));
         assert!(
             harness
@@ -1304,6 +1305,28 @@ mod tests {
         assert_eq!(err.code, SqlState::UndefinedTable);
     }
 
+    #[test]
+    fn drop_table_cascades_to_hidden_toast_relation_metadata() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut base = users_schema();
+        base.toast_table_id = Some(2);
+        let mut toast = users_schema();
+        toast.id = 2;
+        toast.name = "\0toast_1".to_string();
+        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        harness.storage.install_schemas(vec![base, toast]).unwrap();
+
+        harness.storage.drop_table(&ctx, 1).unwrap();
+
+        let err = harness
+            .storage
+            .get(&ctx, 2, &Key(vec![Value::Integer(1)]))
+            .err()
+            .expect("a dropped table's hidden TOAST relation should not be readable");
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -1598,6 +1621,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         }
     }
 
@@ -1691,6 +1717,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         }
     }
 

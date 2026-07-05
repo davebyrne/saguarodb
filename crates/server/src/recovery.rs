@@ -84,29 +84,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
         catalog.reserve_dictionary_id(max_dict_id)?;
     }
 
-    // Fail fast on a catalog-referenced-but-missing dictionary, rather than a
-    // silent write-time dict-less fallback followed by a much later, confusing
-    // read-time decode error. Every table whose CURRENT `active_dict_id` names a
-    // dictionary must have had that dictionary registered by the seeding loop
-    // just above; if not, its durable `.dict` file is missing (deleted,
-    // corrupted `dicts/` directory, manual tampering) and recovery cannot
-    // safely proceed for that table. This validates only each table's CURRENT
-    // active dict — a HISTORICAL dict id referenced by an older
-    // `FullPageImageCompressed` WAL record is also always present, since v1
-    // never deletes dict files (`compression.md` §7).
-    for schema in catalog.list_tables()? {
-        if let Some(dict_id) = schema.active_dict_id
-            && !compression.has_dictionary(dict_id)
-        {
-            return Err(DbError::internal(format!(
-                "table '{}' (id {}) references active dictionary {dict_id}, but no dictionary \
-                 file for it was found under {}",
-                schema.name,
-                schema.id,
-                config.data_dir.join("dicts").display()
-            )));
-        }
-    }
+    validate_referenced_dictionaries(
+        catalog.as_ref(),
+        compression.as_ref(),
+        &config.data_dir.join("dicts"),
+    )?;
 
     // Redo-all (`docs/specs/mvcc.md` §8, Milestone D2): replay every PHYSICAL redo
     // record after the checkpoint LSN onto the heap and index pages, regardless of
@@ -478,10 +460,63 @@ fn next_txn_id(wal: &dyn WalManager) -> Result<u64> {
     Ok(next.max(common::FIRST_NORMAL_XID))
 }
 
+fn validate_referenced_dictionaries(
+    catalog: &dyn CatalogManager,
+    compression: &compress::CompressionRegistry,
+    dict_dir: &Path,
+) -> Result<()> {
+    // Fail fast on a catalog-referenced-but-missing dictionary, rather than a
+    // silent write-time dict-less fallback followed by a much later, confusing
+    // read-time decode error. Every table whose CURRENT table/TOAST dict field
+    // names a dictionary must have had that dictionary registered by the seeding
+    // loop; if not, its durable `.dict` file is missing (deleted, corrupted
+    // `dicts/` directory, manual tampering) and recovery cannot safely proceed.
+    for schema in catalog.list_tables()? {
+        validate_dictionary_ref(
+            &schema.name,
+            schema.id,
+            "active dictionary",
+            schema.active_dict_id,
+            compression,
+            dict_dir,
+        )?;
+        validate_dictionary_ref(
+            &schema.name,
+            schema.id,
+            "TOAST active dictionary",
+            schema.toast.active_dict_id,
+            compression,
+            dict_dir,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_dictionary_ref(
+    table_name: &str,
+    table_id: common::TableId,
+    field_name: &str,
+    dict_id: Option<u32>,
+    compression: &compress::CompressionRegistry,
+    dict_dir: &Path,
+) -> Result<()> {
+    if let Some(dict_id) = dict_id
+        && !compression.has_dictionary(dict_id)
+    {
+        return Err(DbError::internal(format!(
+            "table '{table_name}' (id {table_id}) references {field_name} {dict_id}, but no \
+             dictionary file for it was found under {}",
+            dict_dir.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
+    use catalog::CatalogManager;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     fn table_schema(id: common::TableId, name: &str) -> common::TableSchema {
@@ -500,7 +535,30 @@ mod tests {
             primary_key: vec![0],
             compression: common::CompressionSetting::None,
             active_dict_id: None,
+            toast: common::ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: common::RelationKind::User,
         }
+    }
+
+    #[test]
+    fn validate_referenced_dictionaries_checks_toast_active_dict() {
+        let catalog = catalog::MemoryCatalog::empty();
+        let mut schema = table_schema(1, "logs");
+        schema.toast.active_dict_id = Some(7);
+        catalog.apply_create_table(schema).unwrap();
+        let compression = compress::CompressionRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = super::validate_referenced_dictionaries(&catalog, &compression, dir.path())
+            .unwrap_err();
+
+        assert!(
+            err.message.contains("TOAST active dictionary 7"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("logs"), "{}", err.message);
     }
 
     #[tokio::test]

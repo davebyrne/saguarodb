@@ -77,7 +77,8 @@ mod tests {
 
     use common::{
         ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexSchema,
-        ParsedColumnDef, PgType, SequenceOptions, SequenceSchema, SqlState, TableSchema,
+        ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema, SqlState,
+        TableSchema, ToastCompression, ToastMode, ToastOptions,
     };
 
     use crate::{
@@ -92,6 +93,28 @@ mod tests {
             max_length: None,
             default: None,
             pg_type: None,
+        }
+    }
+
+    fn stored_id_table(id: u32, name: &str) -> TableSchema {
+        TableSchema {
+            id,
+            name: name.to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            }],
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         }
     }
 
@@ -494,6 +517,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -539,6 +565,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -578,6 +607,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
 
         let err = catalog.apply_create_table(schema).unwrap_err();
@@ -737,6 +769,9 @@ mod tests {
             primary_key: vec![0, 1],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -776,6 +811,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -808,6 +846,9 @@ mod tests {
             primary_key: vec![1],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -982,6 +1023,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
 
         catalog.apply_create_table(schema.clone()).unwrap();
@@ -1310,6 +1354,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1351,6 +1398,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1450,6 +1500,129 @@ mod tests {
                 .active_dict_id,
             Some(3)
         );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_toast_option_bounds() {
+        let mut table = stored_id_table(1, "users");
+        table.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET - 1;
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, table)]),
+            next_table_id: 2,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("toast tuple_target"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_toast_dictionary_id() {
+        let mut table = stored_id_table(1, "users");
+        table.toast.compression = ToastCompression::ZstdDict;
+        table.toast.active_dict_id = Some(2);
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, table)]),
+            next_table_id: 2,
+            next_dictionary_id: 2,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("toast active_dict_id"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_toast_relation_link() {
+        let mut base = stored_id_table(1, "users");
+        base.toast = ToastOptions::default_new_table();
+        base.toast.mode = ToastMode::Auto;
+        base.toast_table_id = Some(2);
+        let unrelated = stored_id_table(2, "other");
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1), ("other".to_string(), 2)]),
+            tables_by_id: HashMap::from([(1, base), (2, unrelated)]),
+            next_table_id: 3,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("non-matching TOAST relation"));
+    }
+
+    #[test]
+    fn validate_accepts_hidden_toast_relation_without_name_index() {
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = stored_id_table(2, "\0toast_1");
+        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, base), (2, toast)]),
+            next_table_id: 3,
+            ..CatalogSnapshot::default()
+        };
+
+        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    fn apply_create_table_installs_hidden_toast_relation_by_id_only() {
+        let catalog = MemoryCatalog::empty();
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = stored_id_table(2, "\0toast_1");
+        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+
+        catalog.apply_create_table(base).unwrap();
+        catalog.apply_create_table(toast).unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(
+            snapshot.tables_by_name,
+            HashMap::from([("users".to_string(), 1)])
+        );
+        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    fn apply_drop_table_cascades_to_hidden_toast_relation() {
+        let catalog = MemoryCatalog::empty();
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = stored_id_table(2, "\0toast_1");
+        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+
+        catalog.apply_create_table(base).unwrap();
+        catalog.apply_create_table(toast).unwrap();
+        catalog.apply_drop_table(1).unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.tables_by_name.is_empty());
+        assert!(snapshot.tables_by_id.is_empty());
+        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    fn apply_drop_table_rejects_direct_hidden_toast_drop_while_base_links_it() {
+        let catalog = MemoryCatalog::empty();
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = stored_id_table(2, "\0toast_1");
+        toast.relation_kind = RelationKind::Toast { base_table: 1 };
+
+        catalog.apply_create_table(base).unwrap();
+        catalog.apply_create_table(toast).unwrap();
+        let err = catalog.apply_drop_table(2).unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("cannot drop hidden TOAST relation"));
+        MemoryCatalog::try_from_snapshot(catalog.snapshot().unwrap()).unwrap();
     }
 
     #[test]

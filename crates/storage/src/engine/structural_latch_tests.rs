@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, CompressionSetting, DataType, FileId, IndexSchema, PageFlushInfo, Row, Snapshot,
-    StatementContext, TableSchema, Value,
+    ColumnDef, CompressionSetting, DataType, FileId, IndexSchema, PageFlushInfo, RelationKind, Row,
+    Snapshot, StatementContext, TableSchema, ToastOptions, Value,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -85,6 +85,9 @@ fn users_schema() -> TableSchema {
         primary_key: vec![0],
         compression: CompressionSetting::None,
         active_dict_id: None,
+        toast: ToastOptions::legacy_catalog_default(),
+        toast_table_id: None,
+        relation_kind: RelationKind::User,
     }
 }
 

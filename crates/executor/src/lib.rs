@@ -21,8 +21,9 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
-        DataType, ExecRow, Key, ParsedColumnDef, Result, Row, RowId, RowIdentity, SequenceManager,
-        SessionSequenceState, SqlState, StatementContext, TableSchema, Value,
+        DataType, ExecRow, Key, ParsedColumnDef, RelationKind, Result, Row, RowId, RowIdentity,
+        SequenceManager, SessionSequenceState, SqlState, StatementContext, TableSchema,
+        ToastOptions, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -472,6 +473,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
 
         let row = crate::query::build_insert_row(
@@ -512,6 +516,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         };
 
         let row = crate::query::build_insert_row(&statement, &schema, &[], vec![]).unwrap();

@@ -174,6 +174,31 @@ pub enum DataType {
     Real,
     Numeric { precision: Option<u32>, scale: u32 },
 }
+
+pub enum ToastMode {
+    Off,
+    Auto,
+    Aggressive,
+}
+
+pub enum ToastCompression {
+    None,
+    Zstd,
+    ZstdDict,
+}
+
+pub struct ToastOptions {
+    pub mode: ToastMode,
+    pub tuple_target: u32,
+    pub min_value_size: u32,
+    pub compression: ToastCompression,
+    pub active_dict_id: Option<u32>,
+}
+
+pub enum RelationKind {
+    User,
+    Toast { base_table: TableId },
+}
 ```
 
 #### Column Types
@@ -263,6 +288,7 @@ pub enum SqlState {
     QueryCanceled,              // 57014
     FeatureNotSupported,        // 0A000
     InFailedSqlTransaction,     // 25P02
+    ProgramLimitExceeded,       // 54000
     SerializationFailure,       // 40001
     IoError,                    // 58030
     InternalError,              // XX000
@@ -1752,10 +1778,15 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,       // ColumnDef with assigned IDs
     pub primary_key: Vec<ColumnId>,
+    pub compression: CompressionSetting,
+    pub active_dict_id: Option<u32>,
+    pub toast: ToastOptions,
+    pub toast_table_id: Option<TableId>,
+    pub relation_kind: RelationKind,
 }
 ```
 
-`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only.
+`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's `create_table` accepts `ParsedColumnDef` and assigns `ColumnId`s, producing a `TableSchema` with `ColumnDef`. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, and validates hidden TOAST relation cross-links when `toast_table_id` is present. Hidden TOAST relations are stored by ID and must not be present in the user table name index.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` resolves by name at execution time to preserve extended-protocol prepared-statement semantics, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
@@ -1834,7 +1865,7 @@ pub struct CatalogSnapshot {
 }
 ```
 
-Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, and `next_sequence_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing IDs and advances `next_table_id` past that schema ID; `reserve_table_id` advances the table allocator past an ID without installing a schema; `apply_drop_table` removes by ID without assigning IDs. `apply_create_index`/`apply_drop_index` do the same for secondary indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` WAL records so their IDs are not reused while physical page records or logical sequence IDs may have been observed in WAL.
+Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, and `next_sequence_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing IDs and advances `next_table_id` past that schema ID; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` advances the table allocator past an ID without installing a schema; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_drop_index` do the same for secondary indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` WAL records so their IDs are not reused while physical page records or logical sequence IDs may have been observed in WAL.
 
 ### Persistence
 

@@ -155,6 +155,31 @@ pub enum DataType {
     Numeric { precision: Option<u32>, scale: u32 },
 }
 
+pub enum ToastMode {
+    Off,
+    Auto,
+    Aggressive,
+}
+
+pub enum ToastCompression {
+    None,
+    Zstd,
+    ZstdDict,
+}
+
+pub struct ToastOptions {
+    pub mode: ToastMode,
+    pub tuple_target: u32,
+    pub min_value_size: u32,
+    pub compression: ToastCompression,
+    pub active_dict_id: Option<u32>,
+}
+
+pub enum RelationKind {
+    User,
+    Toast { base_table: TableId },
+}
+
 pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
@@ -196,6 +221,11 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
+    pub compression: CompressionSetting,
+    pub active_dict_id: Option<u32>,
+    pub toast: ToastOptions,
+    pub toast_table_id: Option<TableId>,
+    pub relation_kind: RelationKind,
 }
 
 pub struct IndexSchema {
@@ -229,6 +259,25 @@ pub struct SequenceSchema {
 ```
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
+
+`ToastOptions` is durable per-table policy for storage-private TOAST handling.
+It does not change public SQL values: `Value::Text(String)` and
+`Value::Bytes(Vec<u8>)` remain fully materialized across parser, binder,
+planner, executor, protocol, COPY, indexes, and public storage traits.
+`ToastOptions::default_new_table()` is the intended default for newly created
+user tables after TOAST storage support is fully wired:
+`mode = Auto`, `tuple_target = 2048`, `min_value_size = 1024`,
+`compression = ZstdDict`, `active_dict_id = None`.
+`ToastOptions::legacy_catalog_default()` is used by serde defaults for catalog
+snapshots written before TOAST existed:
+`mode = Off`, `tuple_target = 2048`, `min_value_size = 1024`,
+`compression = None`, `active_dict_id = None`. `RelationKind::default()` is
+`User`. `TableSchema.toast_table_id = None` means no hidden TOAST relation is
+known for that table.
+Catalog validation rejects TOAST policy values outside the durable bounds:
+`tuple_target` must be in `256..=8000`, `min_value_size` must be at least `128`,
+and `active_dict_id = Some(0)` is invalid because dictionary id `0` is the
+reserved "no dictionary" sentinel.
 
 `IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate non-NULL indexed values (NULLs are distinct); a non-unique index admits duplicates. On disk every index entry is disambiguated by the heap TID it points at (see `storage` Secondary Indexes), so no metadata distinguishes the two beyond the `unique` flag.
 
@@ -290,6 +339,7 @@ pub enum SqlState {
     InFailedSqlTransaction,
     NoActiveSqlTransaction,
     InvalidSavepointSpecification,
+    ProgramLimitExceeded,
     SerializationFailure,
     DeadlockDetected,
     IoError,
@@ -334,6 +384,10 @@ or an unterminated CSV quote). Both are raised on the `COPY` import path; see
 `SqlState::InvalidParameterValue` maps to SQLSTATE `22023`; sequence DDL uses it
 for semantically invalid options such as `INCREMENT BY 0`, `MINVALUE > MAXVALUE`,
 or `START` outside the min/max bounds.
+
+`SqlState::ProgramLimitExceeded` maps to SQLSTATE `54000`; storage uses it when
+user data exceeds a supported implementation limit, such as a row or varlena
+value that cannot fit the supported durable format.
 
 `SqlState::ObjectNotInPrerequisiteState` maps to SQLSTATE `55000`; sequence
 `currval` uses it when a connection has not yet called `nextval` or

@@ -272,17 +272,18 @@ envelopes are self-describing and mixed encodings are legal.
   `CreateDictionary` record.
 - **Boot-time validation:** after seeding the dictionary resolver from
   `<data>/dicts/` (and before replay), recovery (`open_app`) checks every
-  catalog table whose CURRENT `active_dict_id` is `Some(id)` against the
-  resolver; if `id` was not registered, recovery fails immediately with a
-  structured internal error naming the table and dict id, instead of
-  silently proceeding dict-less and surfacing a confusing decode error much
-  later on first read of a dict-compressed page. Under normal operation this
-  can only fire if a `.dict` file was deleted or the `dicts/` directory was
-  otherwise tampered with — the durability order above guarantees a
-  reachable dictionary is never legitimately missing. The check covers only
-  each table's CURRENT active dict; a HISTORICAL dict id referenced by an
-  older `FullPageImageCompressed` WAL record is unchecked but always present
-  too, since dict files are never deleted in v1.
+  catalog table whose CURRENT `active_dict_id` or `toast.active_dict_id` is
+  `Some(id)` against the resolver; if `id` was not registered, recovery fails
+  immediately with a structured internal error naming the table, dict field,
+  and dict id, instead of silently proceeding dict-less and surfacing a
+  confusing decode error much later on first read of a dict-compressed page or
+  TOAST value. Under normal operation this can only fire if a `.dict` file was
+  deleted or the `dicts/` directory was otherwise tampered with — the
+  durability order above guarantees a reachable dictionary is never
+  legitimately missing. The check covers only each table's CURRENT active dict
+  fields; a HISTORICAL dict id referenced by an older
+  `FullPageImageCompressed` WAL record is unchecked but always present too,
+  since dict files are never deleted in v1.
 - **Training (v1):** only during `ALTER TABLE ... SET (compression = 'zstd')`
   on a table with data (§8). Training samples are the table's decompressed
   heap page images, sampled evenly across the file, capped at 4096 pages

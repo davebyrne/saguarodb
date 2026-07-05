@@ -41,6 +41,7 @@ pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
     ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType, IndexSchema,
-    ParsedColumnDef, ParsedDefault, SequenceOptions, SequenceSchema, TableSchema,
+    ParsedColumnDef, ParsedDefault, RelationKind, SequenceOptions, SequenceSchema, TableSchema,
+    ToastCompression, ToastMode, ToastOptions,
 };
 pub use value::{Value, parse_bool_text};

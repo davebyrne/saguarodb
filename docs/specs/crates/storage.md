@@ -839,6 +839,11 @@ used for a secondary index.
   bound includes all of its rows. Results are returned in index order, each read
   directly from the heap at its TID. The `StoredRow.key` is recovered from the heap
   row's primary key.
+- **Entry size.** Before descending or mutating pages, B-tree insertion rejects
+  an encoded `(key, value)` that cannot fit in a fresh leaf node or whose future
+  internal separator could not fit in a fresh internal node. The error is
+  `SqlState::ProgramLimitExceeded` (`54000`) because the limit is user-data
+  dependent, not page corruption.
 - **Maintenance.** `insert` adds an entry to every index. `delete` removes **no**
   entry — it stamps the deleted version's `xmax` in place and retains its entries
   (VACUUM reclaims them; see MVCC Delete). `update` likewise removes no old index
@@ -852,9 +857,11 @@ used for a secondary index.
   (a duplicate value for a unique index fails the build with `UniqueViolation`).
   `drop_index` marks the index dropped and leaves its pages in place (accepted
   bloat, like `drop_table`). `drop_table` (and its recovery replay) cascades to
-  mark the table's secondary indexes dropped too, keeping storage's index set
-  consistent with the catalog's drop-table cascade. The engine learns a table's
-  live indexes from the installed index schemas (`install_index_schemas`) plus
+  mark the table's secondary indexes dropped too; when the table has a hidden
+  TOAST relation, the hidden relation and its secondary indexes are marked
+  dropped as metadata as well. This keeps storage's table/index set consistent
+  with the catalog's drop-table cascade. The engine learns a table's live
+  indexes from the installed index schemas (`install_index_schemas`) plus
   in-session creates.
 - **Crash safety.** Like the primary-key index, every secondary node mutation
   logs a `FullPageImage` and stamps the page-LSN, so index pages recover through

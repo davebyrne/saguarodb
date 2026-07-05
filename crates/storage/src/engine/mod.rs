@@ -43,9 +43,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, FileId, IndexId, IndexSchema, Key, KeyRange,
-    Lsn, PageNum, Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema, Snapshot,
-    SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView, UniqueConflict,
-    Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
+    Lsn, PageNum, RelationKind, Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema,
+    Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView,
+    UniqueConflict, Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
 };
 use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -1043,17 +1043,12 @@ impl SchemaOperations for PageBackedStorageEngine {
         {
             return Ok(());
         }
+        let toast_table_id = live_toast_table_id(&state, table);
         self.append_wal(&state, ctx, WalRecordKind::DropTable { table })?;
-        record_table_before(&mut state, ctx.txn_id, table);
-        let table_state = state
-            .tables
-            .get_mut(&table)
-            .ok_or_else(|| undefined_table(table))?;
-        // V1 leaves the heap and index pages in place (no physical reclaim).
-        table_state.dropped = true;
-        // Cascade to the table's secondary indexes, mirroring the catalog's
-        // drop-table cascade so the two stay consistent.
-        mark_table_indexes_dropped(&mut state, ctx.txn_id, table);
+        mark_table_dropped(&mut state, ctx.txn_id, table);
+        if let Some(toast_table_id) = toast_table_id {
+            mark_table_dropped(&mut state, ctx.txn_id, toast_table_id);
+        }
         Ok(())
     }
 
@@ -1443,6 +1438,25 @@ fn record_table_before(state: &mut StorageState, txn_id: u64, table: TableId) {
         .tables
         .entry(table)
         .or_insert(previous);
+}
+
+fn live_toast_table_id(state: &StorageState, table: TableId) -> Option<TableId> {
+    let table_state = state.tables.get(&table)?;
+    if table_state.dropped || table_state.schema.relation_kind != RelationKind::User {
+        return None;
+    }
+    table_state.schema.toast_table_id
+}
+
+fn mark_table_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {
+    record_table_before(state, txn_id, table);
+    if let Some(table_state) = state.tables.get_mut(&table) {
+        // V1 leaves heap and index pages in place (no physical reclaim).
+        table_state.dropped = true;
+    }
+    // Cascade to secondary indexes, mirroring the catalog's drop-table cascade so
+    // the two metadata layers stay consistent.
+    mark_table_indexes_dropped(state, txn_id, table);
 }
 
 fn record_index_before(state: &mut StorageState, txn_id: u64, index: IndexId) {

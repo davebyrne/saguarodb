@@ -122,6 +122,10 @@ pub(crate) fn entry_stored_len(key_len: usize, value_len: usize) -> usize {
     entry_size(key_len, value_len) + SLOT_LEN
 }
 
+pub(crate) fn entry_fits_empty_node(key_len: usize, value_len: usize) -> bool {
+    entry_stored_len(key_len, value_len) <= PAGE_SIZE - BODY_START
+}
+
 /// Insert an entry at logical position `pos` (0..=count), shifting later slots.
 /// The caller is responsible for keeping entries sorted by key. Fails if the
 /// node is full; the btree splits before reaching that.

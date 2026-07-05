@@ -3,8 +3,9 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
     ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, IndexId,
-    IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, Result, SequenceId,
-    SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema,
+    IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, RelationKind, Result,
+    SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, ToastMode,
+    ToastOptions,
 };
 
 use crate::CatalogManager;
@@ -159,16 +160,20 @@ impl CatalogManager for MemoryCatalog {
     fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
-        reject_duplicate_table_name(&snapshot, &schema.name)?;
+        if schema.relation_kind == RelationKind::User {
+            reject_duplicate_table_name(&snapshot, &schema.name)?;
+        }
         reject_duplicate_table_id(&snapshot, schema.id)?;
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog table id overflow while applying create table")
         })?;
 
-        snapshot
-            .tables_by_name
-            .insert(schema.name.clone(), schema.id);
+        if schema.relation_kind == RelationKind::User {
+            snapshot
+                .tables_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
         snapshot.next_table_id = snapshot.next_table_id.max(next_after_schema);
         snapshot.tables_by_id.insert(schema.id, schema);
         Ok(())
@@ -178,10 +183,58 @@ impl CatalogManager for MemoryCatalog {
         let mut snapshot = self.write_snapshot()?;
         let schema = snapshot
             .tables_by_id
-            .remove(&id)
+            .get(&id)
+            .cloned()
             .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
-        snapshot.tables_by_name.remove(&schema.name);
-        drop_indexes_for_table(&mut snapshot, id);
+
+        if let RelationKind::Toast { base_table } = schema.relation_kind {
+            if snapshot
+                .tables_by_id
+                .get(&base_table)
+                .is_some_and(|base| base.toast_table_id == Some(id))
+            {
+                return Err(DbError::internal(format!(
+                    "cannot drop hidden TOAST relation {} while base table {} still references it",
+                    schema.name, base_table
+                )));
+            }
+        }
+
+        let mut table_ids = vec![id];
+        if let RelationKind::User = schema.relation_kind {
+            if let Some(toast_table_id) = schema.toast_table_id {
+                if toast_table_id == id {
+                    return Err(DbError::internal(format!(
+                        "catalog table {} references itself as a TOAST relation",
+                        schema.name
+                    )));
+                }
+                if let Some(toast_schema) = snapshot.tables_by_id.get(&toast_table_id) {
+                    if toast_schema.relation_kind
+                        != (RelationKind::Toast {
+                            base_table: schema.id,
+                        })
+                    {
+                        return Err(DbError::internal(format!(
+                            "catalog table {} references non-matching TOAST relation {}",
+                            schema.name, toast_table_id
+                        )));
+                    }
+                    table_ids.push(toast_table_id);
+                }
+            }
+        }
+
+        for table_id in table_ids {
+            let schema = snapshot
+                .tables_by_id
+                .remove(&table_id)
+                .ok_or_else(|| undefined_table(format!("table id {table_id} does not exist")))?;
+            if snapshot.tables_by_name.get(&schema.name) == Some(&table_id) {
+                snapshot.tables_by_name.remove(&schema.name);
+            }
+            drop_indexes_for_table(&mut snapshot, table_id);
+        }
         Ok(())
     }
 
@@ -538,6 +591,9 @@ fn build_schema(
         primary_key: primary_key_ids,
         compression,
         active_dict_id: None,
+        toast: ToastOptions::legacy_catalog_default(),
+        toast_table_id: None,
+        relation_kind: RelationKind::User,
     })
 }
 
@@ -664,6 +720,11 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
                 "catalog snapshot name index {name} points to missing table id {id}",
             ))
         })?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "catalog snapshot name index {name} points to hidden TOAST relation id {id}",
+            )));
+        }
         if &schema.name != name || schema.id != *id {
             return Err(DbError::internal(format!(
                 "catalog snapshot name/id mismatch for table {name}",
@@ -678,11 +739,23 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
                 schema.id
             )));
         }
-        if snapshot.tables_by_name.get(&schema.name) != Some(id) {
-            return Err(DbError::internal(format!(
-                "catalog snapshot table {} is missing from name index",
-                schema.name
-            )));
+        match schema.relation_kind {
+            RelationKind::User => {
+                if snapshot.tables_by_name.get(&schema.name) != Some(id) {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot table {} is missing from name index",
+                        schema.name
+                    )));
+                }
+            }
+            RelationKind::Toast { .. } => {
+                if snapshot.tables_by_name.contains_key(&schema.name) {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot hidden TOAST relation {} must not be in the name index",
+                        schema.name
+                    )));
+                }
+            }
         }
         validate_schema(schema, &snapshot.sequences_by_id)?;
         max_table_id = max_table_id.max(*id);
@@ -700,6 +773,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
 
     validate_indexes(snapshot)?;
     validate_dictionary_ids(snapshot)?;
+    validate_toast_relations(snapshot)?;
     Ok(())
 }
 
@@ -711,18 +785,117 @@ fn validate_dictionary_ids(snapshot: &CatalogSnapshot) -> Result<()> {
         )));
     }
     for schema in snapshot.tables_by_id.values() {
-        if let Some(active_dict_id) = schema.active_dict_id {
-            if active_dict_id == 0 {
-                return Err(DbError::internal(format!(
-                    "catalog snapshot table {} active_dict_id is reserved value 0 (0 means \"no dictionary\"; use None instead)",
-                    schema.name
-                )));
+        validate_dictionary_ref(
+            &schema.name,
+            "active_dict_id",
+            schema.active_dict_id,
+            snapshot.next_dictionary_id,
+        )?;
+        validate_dictionary_ref(
+            &schema.name,
+            "toast active_dict_id",
+            schema.toast.active_dict_id,
+            snapshot.next_dictionary_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_dictionary_ref(
+    table_name: &str,
+    field_name: &str,
+    active_dict_id: Option<u32>,
+    next_dictionary_id: u32,
+) -> Result<()> {
+    let Some(active_dict_id) = active_dict_id else {
+        return Ok(());
+    };
+    if active_dict_id == 0 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {table_name} {field_name} is reserved value 0 (0 means \"no dictionary\"; use None instead)"
+        )));
+    }
+    if active_dict_id >= next_dictionary_id {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {table_name} {field_name} {active_dict_id} is not less than next_dictionary_id {next_dictionary_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
+    for schema in snapshot.tables_by_id.values() {
+        match schema.relation_kind {
+            RelationKind::User => {
+                if schema.toast.mode != ToastMode::Off && schema.toast_table_id.is_none() {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot table {} enables TOAST without a toast_table_id",
+                        schema.name
+                    )));
+                }
+                if let Some(toast_table_id) = schema.toast_table_id {
+                    if toast_table_id == schema.id {
+                        return Err(DbError::internal(format!(
+                            "catalog snapshot table {} references itself as a TOAST relation",
+                            schema.name
+                        )));
+                    }
+                    let toast_schema =
+                        snapshot.tables_by_id.get(&toast_table_id).ok_or_else(|| {
+                            DbError::internal(format!(
+                                "catalog snapshot table {} references missing TOAST relation {}",
+                                schema.name, toast_table_id
+                            ))
+                        })?;
+                    if toast_schema.relation_kind
+                        != (RelationKind::Toast {
+                            base_table: schema.id,
+                        })
+                    {
+                        return Err(DbError::internal(format!(
+                            "catalog snapshot table {} references non-matching TOAST relation {}",
+                            schema.name, toast_table_id
+                        )));
+                    }
+                }
             }
-            if active_dict_id >= snapshot.next_dictionary_id {
-                return Err(DbError::internal(format!(
-                    "catalog snapshot table {} active_dict_id {} is not less than next_dictionary_id {}",
-                    schema.name, active_dict_id, snapshot.next_dictionary_id
-                )));
+            RelationKind::Toast { base_table } => {
+                if base_table == schema.id {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} references itself as base table",
+                        schema.name
+                    )));
+                }
+                if schema.toast_table_id.is_some() {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} must not have its own toast_table_id",
+                        schema.name
+                    )));
+                }
+                if schema.toast.mode != ToastMode::Off {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} must have toast mode Off",
+                        schema.name
+                    )));
+                }
+                let base_schema = snapshot.tables_by_id.get(&base_table).ok_or_else(|| {
+                    DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} references missing base table {}",
+                        schema.name, base_table
+                    ))
+                })?;
+                if base_schema.relation_kind != RelationKind::User {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} references non-user base table {}",
+                        schema.name, base_table
+                    )));
+                }
+                if base_schema.toast_table_id != Some(schema.id) {
+                    return Err(DbError::internal(format!(
+                        "catalog snapshot TOAST relation {} is not linked from base table {}",
+                        schema.name, base_table
+                    )));
+                }
             }
         }
     }
@@ -895,6 +1068,8 @@ fn validate_schema(
     schema: &TableSchema,
     sequences_by_id: &HashMap<SequenceId, SequenceSchema>,
 ) -> Result<()> {
+    validate_toast_options(schema)?;
+
     let mut column_ids = HashSet::new();
     let mut column_names = HashSet::new();
     for (expected_id, column) in schema.columns.iter().enumerate() {
@@ -953,6 +1128,29 @@ fn validate_schema(
         }
     }
 
+    Ok(())
+}
+
+fn validate_toast_options(schema: &TableSchema) -> Result<()> {
+    if !(ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET)
+        .contains(&schema.toast.tuple_target)
+    {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} toast tuple_target {} is outside {}..={}",
+            schema.name,
+            schema.toast.tuple_target,
+            ToastOptions::MIN_TOAST_TUPLE_TARGET,
+            ToastOptions::MAX_TOAST_TUPLE_TARGET
+        )));
+    }
+    if schema.toast.min_value_size < ToastOptions::MIN_TOAST_MIN_VALUE_SIZE {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} toast min_value_size {} is below {}",
+            schema.name,
+            schema.toast.min_value_size,
+            ToastOptions::MIN_TOAST_MIN_VALUE_SIZE
+        )));
+    }
     Ok(())
 }
 

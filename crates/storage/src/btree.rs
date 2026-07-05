@@ -218,6 +218,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     pub(crate) fn insert(&self, txn_id: u64, key: &Key, value: &V) -> Result<()> {
         let key_bytes = encode_key(key)?;
         let value = value.encode()?;
+        reject_oversized_entry(key_bytes.len(), value.len())?;
         let probe = Probe {
             key,
             value: Some(&value),
@@ -855,6 +856,24 @@ fn append_entries(
     Ok(())
 }
 
+fn reject_oversized_entry(key_len: usize, value_len: usize) -> Result<()> {
+    let separator_len = key_len.checked_add(value_len).ok_or_else(|| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "index entry is too large for a b-tree page",
+        )
+    })?;
+    if !index_page::entry_fits_empty_node(key_len, value_len)
+        || !index_page::entry_fits_empty_node(separator_len, CHILD_LEN)
+    {
+        return Err(DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "index entry is too large for a b-tree page",
+        ));
+    }
+    Ok(())
+}
+
 fn entries_fit_as_internal_node(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
     let mut data = [0; buffer::PAGE_SIZE];
     index_page::init(&mut data, 1, false);
@@ -995,7 +1014,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
-    use common::{DbError, Key, KeyRange, Lsn, TxnId, TxnStatus, TxnStatusView, Value};
+    use common::{DbError, Key, KeyRange, Lsn, SqlState, TxnId, TxnStatus, TxnStatusView, Value};
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     use super::*;
@@ -1208,6 +1227,21 @@ mod tests {
         tree.insert(1, &key(5), &location(0, 2)).unwrap();
         assert_eq!(tree.search(&key(5)).unwrap(), Some(location(0, 2)));
         assert_eq!(tree.search(&key(6)).unwrap(), None);
+    }
+
+    #[test]
+    fn insert_rejects_entry_too_large_for_btree_page() {
+        let fixture = Fixture::new(64);
+        let tree = fixture.tree();
+        tree.create(1).unwrap();
+        let oversized = Key(vec![Value::Text("x".repeat(buffer::PAGE_SIZE))]);
+
+        let err = tree.insert(1, &oversized, &location(0, 2)).unwrap_err();
+
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+        assert!(err.message.contains("index entry"));
+        let (_root, _is_leaf, count) = root_shape(fixture.buffer.as_ref(), INDEX_FILE);
+        assert_eq!(count, 0);
     }
 
     #[test]

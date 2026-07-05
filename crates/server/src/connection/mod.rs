@@ -583,6 +583,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::InFailedSqlTransaction => "25P02",
         SqlState::NoActiveSqlTransaction => "25P01",
         SqlState::InvalidSavepointSpecification => "3B001",
+        SqlState::ProgramLimitExceeded => "54000",
         SqlState::SerializationFailure => "40001",
         SqlState::DeadlockDetected => "40P01",
         SqlState::IoError => "58030",

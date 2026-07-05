@@ -21,7 +21,7 @@ impl PageBackedStorageEngine {
         let row_bytes = encode_row(schema, row, txn_id)?;
         if row_bytes.len() + page_overhead() > buffer::PAGE_SIZE {
             return Err(DbError::storage(
-                SqlState::InternalError,
+                SqlState::ProgramLimitExceeded,
                 "row is too large for a data page",
             ));
         }

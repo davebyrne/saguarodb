@@ -48,6 +48,68 @@ pub enum CompressionSetting {
     Zstd,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToastMode {
+    Off,
+    Auto,
+    Aggressive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToastCompression {
+    None,
+    Zstd,
+    ZstdDict,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToastOptions {
+    pub mode: ToastMode,
+    pub tuple_target: u32,
+    pub min_value_size: u32,
+    pub compression: ToastCompression,
+    pub active_dict_id: Option<u32>,
+}
+
+impl ToastOptions {
+    pub const DEFAULT_TOAST_TUPLE_TARGET: u32 = 2048;
+    pub const MIN_TOAST_TUPLE_TARGET: u32 = 256;
+    pub const MAX_TOAST_TUPLE_TARGET: u32 = 8000;
+    pub const DEFAULT_TOAST_MIN_VALUE_SIZE: u32 = 1024;
+    pub const AGGRESSIVE_TOAST_MIN_VALUE_SIZE: u32 = 256;
+    pub const MIN_TOAST_MIN_VALUE_SIZE: u32 = 128;
+    pub const MIN_TOAST_COMPRESSION_SAVINGS: usize = 16;
+
+    pub fn default_new_table() -> Self {
+        Self {
+            mode: ToastMode::Auto,
+            tuple_target: Self::DEFAULT_TOAST_TUPLE_TARGET,
+            min_value_size: Self::DEFAULT_TOAST_MIN_VALUE_SIZE,
+            compression: ToastCompression::ZstdDict,
+            active_dict_id: None,
+        }
+    }
+
+    pub fn legacy_catalog_default() -> Self {
+        Self {
+            mode: ToastMode::Off,
+            tuple_target: Self::DEFAULT_TOAST_TUPLE_TARGET,
+            min_value_size: Self::DEFAULT_TOAST_MIN_VALUE_SIZE,
+            compression: ToastCompression::None,
+            active_dict_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RelationKind {
+    #[default]
+    User,
+    Toast {
+        base_table: TableId,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParsedDefault {
     Const(Value),
@@ -167,6 +229,15 @@ pub struct TableSchema {
     /// (`None` until an ALTER trains one). Index files never use it.
     #[serde(default)]
     pub active_dict_id: Option<u32>,
+    /// Storage-private TOAST policy for future writes.
+    #[serde(default = "ToastOptions::legacy_catalog_default")]
+    pub toast: ToastOptions,
+    /// Hidden companion relation for out-of-line toast chunks, when present.
+    #[serde(default)]
+    pub toast_table_id: Option<TableId>,
+    /// User table vs. hidden toast relation metadata.
+    #[serde(default)]
+    pub relation_kind: RelationKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +289,10 @@ pub struct IndexSchema {
 
 #[cfg(test)]
 mod tests {
-    use super::{ColumnDef, ColumnInfo, CompressionSetting, DataType, PgType, TableSchema};
+    use super::{
+        ColumnDef, ColumnInfo, CompressionSetting, DataType, PgType, RelationKind, TableSchema,
+        ToastCompression, ToastMode, ToastOptions,
+    };
 
     #[test]
     fn column_info_can_describe_expression_output() {
@@ -270,10 +344,38 @@ mod tests {
         let schema: TableSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.compression, CompressionSetting::None);
         assert_eq!(schema.active_dict_id, None);
+        assert_eq!(schema.toast, ToastOptions::legacy_catalog_default());
+        assert_eq!(schema.toast_table_id, None);
+        assert_eq!(schema.relation_kind, RelationKind::User);
     }
 
     #[test]
     fn compression_setting_defaults_to_none() {
         assert_eq!(CompressionSetting::default(), CompressionSetting::None);
+    }
+
+    #[test]
+    fn toast_options_defaults_are_split_for_new_and_legacy_tables() {
+        assert_eq!(
+            ToastOptions::default_new_table(),
+            ToastOptions {
+                mode: ToastMode::Auto,
+                tuple_target: 2048,
+                min_value_size: 1024,
+                compression: ToastCompression::ZstdDict,
+                active_dict_id: None,
+            }
+        );
+        assert_eq!(
+            ToastOptions::legacy_catalog_default(),
+            ToastOptions {
+                mode: ToastMode::Off,
+                tuple_target: 2048,
+                min_value_size: 1024,
+                compression: ToastCompression::None,
+                active_dict_id: None,
+            }
+        );
+        assert_eq!(RelationKind::default(), RelationKind::User);
     }
 }

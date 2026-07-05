@@ -73,6 +73,9 @@ pub enum SqlState {
     /// `3B001`: `RELEASE`/`ROLLBACK TO` named a savepoint that does not exist in
     /// the current transaction. See `docs/specs/savepoints.md` §2.
     InvalidSavepointSpecification,
+    /// `54000`: a statement exceeded an implementation limit, e.g. a row or
+    /// logical varlena value cannot fit within the supported storage format.
+    ProgramLimitExceeded,
     /// `40001`: a write-write conflict against a **committed**-superseded version —
     /// another transaction updated/deleted the target row since this writer's
     /// snapshot. A conflict against an *in-progress* writer no longer maps here:

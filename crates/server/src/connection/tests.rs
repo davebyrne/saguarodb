@@ -5,9 +5,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use common::{ErrorKind, IsolationLevel, Result};
+use common::{ErrorKind, IsolationLevel, Result, SqlState};
 
-use super::{StreamOutcome, TransactionState, handle_connection, streamed_task_result};
+use super::{
+    StreamOutcome, TransactionState, handle_connection, sqlstate_code, streamed_task_result,
+};
 use crate::app::AppState;
 
 #[test]
@@ -15,6 +17,11 @@ fn transaction_state_maps_to_postgres_status_byte() {
     assert_eq!(TransactionState::Idle.status_byte(), b'I');
     assert_eq!(TransactionState::InTransaction.status_byte(), b'T');
     assert_eq!(TransactionState::Failed.status_byte(), b'E');
+}
+
+#[test]
+fn program_limit_exceeded_maps_to_sqlstate_54000() {
+    assert_eq!(sqlstate_code(SqlState::ProgramLimitExceeded), "54000");
 }
 
 #[tokio::test]

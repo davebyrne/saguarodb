@@ -17,13 +17,14 @@ impl PageBackedStorageEngine {
     }
     pub(crate) fn apply_drop_table_without_wal(&self, table: TableId) -> Result<()> {
         let mut state = self.lock_state()?;
-        if let Some(table_state) = state.tables.get_mut(&table) {
-            table_state.dropped = true;
-        }
+        let toast_table_id = live_toast_table_id(&state, table);
         // Recovery replays a single DropTable record; cascade to the table's
-        // indexes here, matching the catalog's apply_drop_table cascade. txn 0
-        // means no rollback tracking.
-        mark_table_indexes_dropped(&mut state, 0, table);
+        // indexes and hidden TOAST relation here, matching the catalog's
+        // apply_drop_table cascade. txn 0 means no rollback tracking.
+        mark_table_dropped(&mut state, 0, table);
+        if let Some(toast_table_id) = toast_table_id {
+            mark_table_dropped(&mut state, 0, toast_table_id);
+        }
         Ok(())
     }
     pub(crate) fn apply_create_index_without_wal(&self, schema: IndexSchema) -> Result<()> {

@@ -127,7 +127,7 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Text(value) => {
                 bytes.push(KEY_TAG_TEXT);
                 let len = u32::try_from(value.len()).map_err(|_| {
-                    DbError::storage(SqlState::InternalError, "key text is too large")
+                    DbError::storage(SqlState::ProgramLimitExceeded, "key text is too large")
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(value.as_bytes());
@@ -159,7 +159,7 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
             Value::Bytes(value) => {
                 bytes.push(KEY_TAG_BYTEA);
                 let len = u32::try_from(value.len()).map_err(|_| {
-                    DbError::storage(SqlState::InternalError, "key bytea is too large")
+                    DbError::storage(SqlState::ProgramLimitExceeded, "key bytea is too large")
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(value);
@@ -342,8 +342,9 @@ pub(crate) fn encode_row_with_infomask(
                 put_numeric(&mut bytes, value);
             }
             Value::Text(value) if column.data_type == DataType::Text => {
-                let len = u32::try_from(value.len())
-                    .map_err(|_| DbError::storage(SqlState::InternalError, "text is too large"))?;
+                let len = u32::try_from(value.len()).map_err(|_| {
+                    DbError::storage(SqlState::ProgramLimitExceeded, "text is too large")
+                })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(value.as_bytes());
             }
@@ -366,8 +367,9 @@ pub(crate) fn encode_row_with_infomask(
                 put_interval(&mut bytes, value);
             }
             Value::Bytes(value) if column.data_type == DataType::Bytea => {
-                let len = u32::try_from(value.len())
-                    .map_err(|_| DbError::storage(SqlState::InternalError, "bytea is too large"))?;
+                let len = u32::try_from(value.len()).map_err(|_| {
+                    DbError::storage(SqlState::ProgramLimitExceeded, "bytea is too large")
+                })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(value);
             }
@@ -645,8 +647,8 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use common::{
-        ColumnDef, CompressionSetting, DataType, FROZEN_XID, INVALID_XID, Key, Row, TableSchema,
-        Value, XMAX_COMMITTED, XMIN_COMMITTED,
+        ColumnDef, CompressionSetting, DataType, FROZEN_XID, INVALID_XID, Key, RelationKind, Row,
+        TableSchema, ToastOptions, Value, XMAX_COMMITTED, XMIN_COMMITTED,
     };
 
     use super::{
@@ -682,6 +684,9 @@ mod tests {
             primary_key: vec![0],
             compression: CompressionSetting::None,
             active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
         }
     }
 
