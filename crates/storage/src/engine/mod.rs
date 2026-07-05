@@ -740,6 +740,93 @@ impl PageBackedStorageEngine {
         Ok(samples)
     }
 
+    /// Bounded logical TEXT/BYTEA samples for TOAST dictionary training.
+    ///
+    /// Unlike `scan_range`, this walks heap pages directly so the caller's
+    /// `max_samples`/`max_bytes` budget limits memory use on large tables. Rows
+    /// are filtered with the normal MVCC visibility predicate and then routed
+    /// through the same detoast materialization path used by user reads, so the
+    /// samples represent logical column bytes regardless of their current inline,
+    /// compressed, or external physical form.
+    pub fn sample_toast_values(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        max_samples: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let toastable_columns: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| {
+                matches!(column.data_type, DataType::Text | DataType::Bytea).then_some(index)
+            })
+            .collect();
+        if max_samples == 0 || max_bytes == 0 || toastable_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut samples = Vec::new();
+        let mut sampled_bytes = 0usize;
+        let page_count = self.buffer_pool.page_count(schema.id)?;
+        'pages: for page_num in 0..page_count {
+            if self.buffer_pool.is_page_abandoned(schema.id, page_num) {
+                continue;
+            }
+
+            let page_rows = {
+                let guard = self.buffer_pool.read_page(schema.id, page_num)?;
+                if !page::is_initialized(guard.data()) {
+                    continue;
+                }
+                let slot_count = page::next_slot(guard.data())?;
+                let mut rows = Vec::new();
+                for slot in 0..slot_count {
+                    if let Some(bytes) = page::read_row(guard.data(), slot)? {
+                        rows.push(bytes);
+                    }
+                }
+                rows
+            };
+
+            for bytes in page_rows {
+                let physical = decode_physical_row(schema, &bytes)?;
+                if !is_visible(
+                    physical.header.xmin,
+                    physical.header.xmax,
+                    physical.header.infomask,
+                    &ctx.snapshot,
+                    ctx.live_txns.as_ref(),
+                    self.txn_status_view(),
+                ) {
+                    continue;
+                }
+                let row = self.materialize_physical_row(ctx, schema, physical)?;
+                for &column_index in &toastable_columns {
+                    if samples.len() >= max_samples || sampled_bytes >= max_bytes {
+                        break 'pages;
+                    }
+                    let Some(raw) = row.values.get(column_index).and_then(|value| match value {
+                        Value::Text(text) => Some(text.as_bytes()),
+                        Value::Bytes(bytes) => Some(bytes.as_slice()),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let remaining = max_bytes - sampled_bytes;
+                    let sample_len = raw.len().min(remaining);
+                    samples.push(raw[..sample_len].to_vec());
+                    sampled_bytes += sample_len;
+                }
+            }
+        }
+        Ok(samples)
+    }
+
     /// Re-encode every initialized page of the table's heap, PK-index, and
     /// live secondary-index files at rest under the updated registry config.
     /// Each page is logged as a single unconditional `FullPageImage` (under

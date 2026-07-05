@@ -1089,6 +1089,16 @@ into `write_page`'s encode step and `load_page`'s decode step.
   The caller holds the exclusive checkpoint guard, so the sampled images are a
   stable snapshot; an abandoned fresh-page hole is skipped without being
   faulted in.
+- **`sample_toast_values(ctx, schema, max_samples, max_bytes)`.** Returns
+  bounded logical `TEXT`/`BYTEA` samples for TOAST value-dictionary training.
+  It walks heap pages directly instead of calling the public scan iterator so
+  `max_samples`/`max_bytes` bound memory on large tables. Each physical tuple is
+  filtered through the normal MVCC visibility predicate using `ctx`; visible
+  rows are then routed through the same materialization path as user reads, so
+  inline raw, inline compressed, and external TOAST values all contribute their
+  logical bytes. Empty values and non-toastable columns are skipped. The server
+  calls this under the exclusive maintenance guard for `ALTER TABLE ... SET
+  (toast_compression = zstd_dict)`.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
@@ -1200,6 +1210,14 @@ impl PageBackedStorageEngine {
     /// Up to `cap` evenly-sampled initialized heap page images, for
     /// dictionary training.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
+    /// Bounded logical TEXT/BYTEA value bytes for TOAST dictionary training.
+    pub fn sample_toast_values(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        max_samples: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>>;
     /// Re-encode every initialized page (heap + all index files) of
     /// `schema`'s table so a following flush writes them under the current
     /// config. Logs a FullPageImage per page and stamps its LSN as the new

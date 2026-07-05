@@ -1,6 +1,11 @@
 mod support;
 
+use common::{
+    ColumnDef, CompressionSetting, DataType, KeyRange, PgType, RelationKind, StatementContext,
+    TableSchema, ToastCompression, ToastMode, ToastOptions,
+};
 use saguarodb_server::config::Config;
+use storage::{RecoveryOperations, StorageEngine};
 use support::{Connection, TestServer};
 
 /// Independently probes whether this filesystem's `fallocate`
@@ -549,6 +554,305 @@ async fn recovery_fails_fast_on_missing_referenced_dictionary() {
     assert!(
         err.message.to_lowercase().contains("dictionary"),
         "error should mention the missing dictionary: {}",
+        err.message
+    );
+}
+
+fn hidden_toast_chunk_count(server: &TestServer, table: &str) -> usize {
+    let catalog = &server.app().components.catalog;
+    let base = catalog
+        .get_table_by_name(table)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{table} table exists"));
+    let toast_table_id = base.toast_table_id.expect("hidden TOAST relation id");
+    let ctx = StatementContext::new(0);
+    let mut iter = server
+        .app()
+        .components
+        .storage
+        .scan_range(&ctx, toast_table_id, &KeyRange::All)
+        .unwrap();
+    let mut chunks = 0;
+    while iter.next().unwrap().is_some() {
+        chunks += 1;
+    }
+    chunks
+}
+
+fn legacy_schema_without_toast() -> TableSchema {
+    TableSchema {
+        id: 50,
+        name: "legacy_docs".to_string(),
+        columns: vec![
+            ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: Some(PgType::Int8),
+            },
+            ColumnDef {
+                id: 1,
+                name: "body".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                max_length: None,
+                default: None,
+                pg_type: Some(PgType::Text),
+            },
+        ],
+        primary_key: vec![0],
+        compression: CompressionSetting::None,
+        active_dict_id: None,
+        toast: ToastOptions::legacy_catalog_default(),
+        toast_table_id: None,
+        relation_kind: RelationKind::User,
+    }
+}
+
+#[tokio::test]
+async fn alter_toast_options_apply_to_future_writes_and_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let large_body = "large-toast-value-".repeat(350);
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (id integer primary key, body text) \
+                 with (toast = off, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into docs (id, body) values (1, 'inline-before-alter')")
+            .await
+            .unwrap();
+        assert_eq!(hidden_toast_chunk_count(&server, "docs"), 0);
+
+        server
+            .simple_query(
+                "alter table docs set \
+                 (toast = aggressive, toast_tuple_target = 512, \
+                  toast_min_value_size = 128, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+
+        let docs = server
+            .app()
+            .components
+            .catalog
+            .get_table_by_name("docs")
+            .unwrap()
+            .expect("docs table exists");
+        assert_eq!(docs.toast.mode, ToastMode::Aggressive);
+        assert_eq!(docs.toast.tuple_target, 512);
+        assert_eq!(docs.toast.min_value_size, 128);
+        assert_eq!(docs.toast.compression, ToastCompression::None);
+        assert_eq!(docs.toast.active_dict_id, None);
+
+        server
+            .simple_query(&format!(
+                "insert into docs (id, body) values (2, '{large_body}')"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            hidden_toast_chunk_count(&server, "docs") > 0,
+            "future writes after TOAST ALTER should use the hidden TOAST relation"
+        );
+        assert_eq!(
+            server
+                .simple_query("select body from docs where id = 2")
+                .await
+                .unwrap()
+                .unwrap_rows(),
+            vec![vec![Some(large_body.clone())]]
+        );
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let docs = server
+        .app()
+        .components
+        .catalog
+        .get_table_by_name("docs")
+        .unwrap()
+        .expect("docs table exists after restart");
+    assert_eq!(docs.toast.mode, ToastMode::Aggressive);
+    assert_eq!(docs.toast.tuple_target, 512);
+    assert_eq!(docs.toast.min_value_size, 128);
+    assert_eq!(docs.toast.compression, ToastCompression::None);
+    assert!(
+        docs.toast_table_id.is_some(),
+        "hidden TOAST relation should survive WAL replay"
+    );
+    assert_eq!(
+        server
+            .simple_query("select id, body from docs order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("inline-before-alter".to_string())
+            ],
+            vec![Some("2".to_string()), Some(large_body)],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn alter_toast_zstd_dict_trains_value_dictionary_when_corpus_suffices() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table logs (id integer primary key, body text) \
+             with (toast = off, toast_compression = none)",
+        )
+        .await
+        .unwrap();
+    let body_fill = "alpha-beta-gamma-delta-epsilon-".repeat(35);
+    for chunk in 0..8 {
+        let values: Vec<String> = (0..8)
+            .map(|i| {
+                let id = chunk * 8 + i;
+                format!("({id}, 'sample-{id}-{body_fill}')")
+            })
+            .collect();
+        server
+            .simple_query(&format!(
+                "insert into logs (id, body) values {}",
+                values.join(",")
+            ))
+            .await
+            .unwrap();
+    }
+
+    server
+        .simple_query(
+            "alter table logs set \
+             (toast = aggressive, toast_min_value_size = 128, \
+              toast_compression = zstd_dict)",
+        )
+        .await
+        .unwrap();
+
+    let logs = server
+        .app()
+        .components
+        .catalog
+        .get_table_by_name("logs")
+        .unwrap()
+        .expect("logs table exists");
+    assert_eq!(logs.toast.compression, ToastCompression::ZstdDict);
+    let dict_id = logs
+        .toast
+        .active_dict_id
+        .expect("large repetitive corpus should train a TOAST dictionary");
+    assert!(
+        server.app().components.compression.has_dictionary(dict_id),
+        "trained TOAST dictionary should be registered for future writes"
+    );
+}
+
+#[tokio::test]
+async fn alter_toast_zstd_dict_allows_tiny_corpus_without_dictionary() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table notes (id integer primary key, body text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into notes (id, body) values (1, 'short'), (2, 'small')")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("alter table notes set (toast_compression = zstd_dict)")
+        .await
+        .unwrap();
+
+    let notes = server
+        .app()
+        .components
+        .catalog
+        .get_table_by_name("notes")
+        .unwrap()
+        .expect("notes table exists");
+    assert_eq!(notes.toast.compression, ToastCompression::ZstdDict);
+    assert_eq!(notes.toast.active_dict_id, None);
+}
+
+#[tokio::test]
+async fn alter_toast_options_create_hidden_relation_for_legacy_catalog_table() {
+    let server = TestServer::start().await.unwrap();
+    let legacy = legacy_schema_without_toast();
+    server
+        .app()
+        .components
+        .catalog
+        .apply_create_table(legacy.clone())
+        .unwrap();
+    server
+        .app()
+        .components
+        .storage
+        .apply_create_table(legacy)
+        .unwrap();
+
+    server
+        .simple_query("alter table legacy_docs set (toast = off)")
+        .await
+        .unwrap();
+
+    let legacy_docs = server
+        .app()
+        .components
+        .catalog
+        .get_table_by_name("legacy_docs")
+        .unwrap()
+        .expect("legacy_docs table exists");
+    let toast_id = legacy_docs
+        .toast_table_id
+        .expect("ALTER should allocate hidden TOAST relation for legacy text table");
+    let hidden = server
+        .app()
+        .components
+        .catalog
+        .get_table(toast_id)
+        .unwrap()
+        .expect("hidden TOAST relation exists");
+    assert_eq!(
+        hidden.relation_kind,
+        RelationKind::Toast {
+            base_table: legacy_docs.id
+        }
+    );
+    assert_eq!(hidden.compression, CompressionSetting::None);
+}
+
+#[tokio::test]
+async fn alter_rejects_mixed_page_compression_and_toast_options() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table docs (id integer primary key, body text)")
+        .await
+        .unwrap();
+
+    let result = server
+        .simple_query("alter table docs set (compression = zstd, toast = auto)")
+        .await;
+    let Err(err) = result else {
+        panic!("mixed page compression and TOAST ALTER should be rejected");
+    };
+    assert!(
+        err.message
+            .contains("cannot combine page compression and TOAST options"),
+        "unexpected error: {}",
         err.message
     );
 }

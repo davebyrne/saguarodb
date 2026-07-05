@@ -267,8 +267,10 @@ envelopes are self-describing and mixed encodings are legal.
   with the creating statement's commit) so replay can resolve dict ids
   created after the last checkpoint. Replay installs the file if absent
   (recovery operations do not append WAL) and registers it with the
-  resolver. Like other DDL effects it is gated on the creating
-  transaction's committed status via the rebuilt CLOG.
+  resolver. The creating statement may be page-compression `ALTER TABLE ...
+  SET (compression = 'zstd')` or TOAST value-compression `ALTER TABLE ...
+  SET (toast_compression = zstd_dict)`. Like other DDL effects it is gated on
+  the creating transaction's committed status via the rebuilt CLOG.
 - **Durability order (load-bearing):** dictionary file durable → WAL record
   appended → anything (page envelope, WAL FPI record, or TOAST value payload)
   may reference the dict id. Consequently a referenced dictionary is always

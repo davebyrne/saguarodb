@@ -1,8 +1,16 @@
-use std::sync::atomic::Ordering;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use common::{CompressionSetting, DbError, Result, SqlState, TableId};
+use common::{
+    CompressionSetting, DbError, RelationKind, Result, SqlState, StatementContext, TableId,
+    TableOptionPatch, TableSchema, ToastCompression, ToastOptions, needs_toast_relation,
+    toast_schema,
+};
 use executor::ExecutionResult;
 use parser::Statement;
+use storage::SchemaOperations;
 use wal::{WalRecord, WalRecordKind};
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
@@ -12,6 +20,18 @@ use super::QueryService;
 /// How many heap pages to sample for dictionary training (`compression.md`
 /// §7: evenly sampled, capped — a 32 MiB corpus at 8 KiB pages).
 const DICT_TRAINING_PAGE_CAP: usize = 4096;
+/// Logical TOAST value samples used when `ALTER TABLE ... SET
+/// (toast_compression = zstd_dict)` trains a value dictionary. The byte cap keeps
+/// memory bounded independently of table size.
+const TOAST_DICT_MAX_SAMPLES: usize = 4096;
+const TOAST_DICT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+struct ToastAlterPostCommit {
+    table_id: TableId,
+    toast: ToastOptions,
+    toast_table_id: Option<TableId>,
+    hidden_schema: Option<TableSchema>,
+}
 
 impl QueryService {
     /// `ALTER TABLE <t> SET (compression = ...)`: immediate-commit DDL under
@@ -181,5 +201,177 @@ impl QueryService {
         // marked dirty and get redundantly re-written at the next checkpoint.
         components.buffer_pool.mark_all_clean()?;
         Ok(())
+    }
+
+    /// `ALTER TABLE <t> SET (toast...)`: future-write-only TOAST policy change
+    /// under the exclusive maintenance guard. Existing parent rows and existing
+    /// TOAST chunks are left byte-for-byte as they are; normal reads keep using the
+    /// per-value physical metadata to decode old rows.
+    ///
+    /// If the ALTER has to create a hidden TOAST relation for a legacy catalog
+    /// table, the storage relation is created before the DDL commit so its empty
+    /// primary-key B-tree pages are WAL-before-Commit and crash-recoverable. The
+    /// catalog does not expose that hidden relation, nor does the base table point
+    /// at it, until after the commit record is flushed.
+    pub(super) fn run_alter_table_toast_options(
+        &self,
+        statement: Statement,
+    ) -> Result<ExecutionResult> {
+        let Statement::AlterTableSetOptions { table, options } = statement else {
+            return Err(DbError::internal(
+                "expected ALTER TABLE SET options statement",
+            ));
+        };
+        if options.compression.is_some() {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "ALTER TABLE cannot combine page compression and TOAST options yet",
+            ));
+        }
+        if options.toast.is_empty() {
+            return Err(DbError::internal(
+                "ALTER TABLE SET options carried no TOAST options",
+            ));
+        }
+
+        let components = &self.components;
+        {
+            let _guard = components.concurrency.begin_checkpoint()?;
+            let schema = components
+                .catalog
+                .get_table_by_name(&table)?
+                .ok_or_else(|| {
+                    DbError::plan(
+                        SqlState::UndefinedTable,
+                        format!("table {table} does not exist"),
+                    )
+                })?;
+            if schema.relation_kind != RelationKind::User {
+                return Err(DbError::plan(
+                    SqlState::FeatureNotSupported,
+                    "cannot ALTER TOAST options on a hidden relation",
+                ));
+            }
+
+            let txn_id = components
+                .active_txns
+                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+            let pre_commit = self.prepare_alter_table_toast_commit(txn_id, &schema, &options);
+            let post_commit = match pre_commit {
+                Ok(post_commit) => post_commit,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = components.wal.append(WalRecord {
+                lsn: 0,
+                txn_id,
+                kind: WalRecordKind::AlterTableToast {
+                    table_id: post_commit.table_id,
+                    toast: post_commit.toast.clone(),
+                    toast_table_id: post_commit.toast_table_id,
+                },
+            }) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+
+            if let Err(err) = self.finish_alter_table_toast_after_commit(post_commit) {
+                self.fatal_after_durable_commit(err);
+            }
+            if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+                self.fatal_after_durable_commit(err);
+            }
+            components.active_txns.deregister(txn_id);
+            components.lock_manager.on_txn_finished();
+        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
+
+        Ok(ExecutionResult::Modified {
+            command: "ALTER TABLE".to_string(),
+            count: 0,
+        })
+    }
+
+    fn prepare_alter_table_toast_commit(
+        &self,
+        txn_id: u64,
+        schema: &TableSchema,
+        options: &TableOptionPatch,
+    ) -> Result<ToastAlterPostCommit> {
+        let components = &self.components;
+        let ctx = StatementContext::new(txn_id).with_conflict_waiter(
+            components.lock_manager.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let mut toast = schema.toast.apply_patch(&options.toast);
+        if options.toast.compression == Some(ToastCompression::ZstdDict) {
+            let samples = components.storage.sample_toast_values(
+                &ctx,
+                schema,
+                TOAST_DICT_MAX_SAMPLES,
+                TOAST_DICT_MAX_BYTES,
+            )?;
+            if let Some(bytes) = compress::train_dictionary(&samples) {
+                let dict_id = components.catalog.allocate_dictionary_id()?;
+                components.dict_store.save(dict_id, schema.id, &bytes)?;
+                components
+                    .compression
+                    .register_dictionary(dict_id, &bytes)?;
+                components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::CreateDictionary {
+                        dict_id,
+                        table_id: schema.id,
+                        bytes,
+                    },
+                })?;
+                toast.active_dict_id = Some(dict_id);
+            }
+        }
+
+        let hidden_schema = if schema.toast_table_id.is_none() && needs_toast_relation(schema) {
+            let toast_table_id = components.catalog.snapshot()?.next_table_id;
+            components.catalog.reserve_table_id(toast_table_id)?;
+            let mut base = schema.clone();
+            base.toast_table_id = Some(toast_table_id);
+            let hidden = toast_schema(&base, toast_table_id);
+            components.storage.create_table(&ctx, &hidden)?;
+            Some(hidden)
+        } else {
+            None
+        };
+        let toast_table_id = hidden_schema
+            .as_ref()
+            .map(|schema| schema.id)
+            .or(schema.toast_table_id);
+
+        Ok(ToastAlterPostCommit {
+            table_id: schema.id,
+            toast,
+            toast_table_id,
+            hidden_schema,
+        })
+    }
+
+    fn finish_alter_table_toast_after_commit(&self, post: ToastAlterPostCommit) -> Result<()> {
+        let components = &self.components;
+        if let Some(hidden_schema) = post.hidden_schema {
+            components.catalog.apply_create_table(hidden_schema)?;
+        }
+        let schema = components.catalog.set_table_toast_metadata(
+            post.table_id,
+            post.toast,
+            post.toast_table_id,
+        )?;
+        components.storage.set_table_toast_metadata(&schema)
     }
 }
