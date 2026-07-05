@@ -36,6 +36,7 @@ mod tests {
         PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
         StorageMode, apply_physical_redo,
         btree::BTree,
+        codec::{DecodedPhysicalValue, MvccHeader, decode_physical_row},
         decode_row, encode_row,
         engine::RowLocation,
         heap::index_file_id,
@@ -1686,6 +1687,391 @@ mod tests {
         assert!(err.message.contains("hidden TOAST relation"));
     }
 
+    #[test]
+    fn prepare_row_under_target_with_no_eligible_values_stays_plain() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(b"small".to_vec())],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        assert_eq!(
+            values[1],
+            DecodedPhysicalValue::Value(Value::Bytes(b"small".to_vec()))
+        );
+        assert!(visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn prepare_hidden_toast_relation_does_not_recurse() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let data = vec![42; 3000];
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Integer(0),
+                Value::Bytes(data.clone()),
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &toast, &row);
+
+        assert_eq!(values[2], DecodedPhysicalValue::Value(Value::Bytes(data)));
+    }
+
+    #[test]
+    fn prepare_legacy_table_without_toast_relation_stays_plain() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, _) = base_and_toast_schema();
+        base.toast_table_id = None;
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        let raw = "a".repeat(1500);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(raw.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        assert_eq!(values[1], DecodedPhysicalValue::Value(Value::Text(raw)));
+    }
+
+    #[test]
+    fn prepare_medium_compressible_text_under_target_becomes_inline_compressed() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = "a".repeat(1500);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(raw.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        match &values[1] {
+            DecodedPhysicalValue::Compressed {
+                codec,
+                dict_id,
+                raw_len,
+                raw_crc32,
+                ..
+            } => {
+                assert_eq!(*codec, compress::CODEC_ZSTD);
+                assert_eq!(*dict_id, None);
+                assert_eq!(*raw_len, raw.len() as u32);
+                assert_eq!(*raw_crc32, crc32fast::hash(raw.as_bytes()));
+            }
+            other => panic!("expected inline compressed text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_default_auto_uses_1024_min_value_size() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = "a".repeat(512);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(raw.clone()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        assert_eq!(values[1], DecodedPhysicalValue::Value(Value::Text(raw)));
+    }
+
+    #[test]
+    fn prepare_aggressive_uses_256_min_value_size() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.mode = ToastMode::Aggressive;
+        base.toast.min_value_size = ToastOptions::AGGRESSIVE_TOAST_MIN_VALUE_SIZE;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = "a".repeat(512);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(raw),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        assert!(matches!(
+            values[1],
+            DecodedPhysicalValue::Compressed {
+                codec: compress::CODEC_ZSTD,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prepare_incompressible_large_bytea_externalizes_raw_stream() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = entropy_bytes(9000);
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(raw.clone())],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        let pointer = match &values[1] {
+            DecodedPhysicalValue::External { pointer, .. } => pointer,
+            other => panic!("expected external bytea, got {other:?}"),
+        };
+        assert_eq!(pointer.codec, compress::CODEC_NONE);
+        assert_eq!(pointer.raw_len, raw.len() as u32);
+        let stream = harness
+            .storage
+            .read_toast_stream(&ctx, &base, pointer)
+            .unwrap();
+        let (dict_id, raw_crc32, payload) =
+            crate::toast::parse_external_stream(pointer.codec, &stream).unwrap();
+        assert_eq!(dict_id, None);
+        assert_eq!(raw_crc32, crc32fast::hash(&raw));
+        assert_eq!(payload, raw.as_slice());
+    }
+
+    #[test]
+    fn prepare_zstd_dict_inline_records_dictionary_id() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::ZstdDict;
+        base.toast.active_dict_id = Some(7);
+        register_test_dictionary(&harness, 7);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = dict_value(99, 1800);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text(String::from_utf8(raw.clone()).unwrap()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        match &values[1] {
+            DecodedPhysicalValue::Compressed {
+                codec,
+                dict_id,
+                raw_len,
+                raw_crc32,
+                ..
+            } => {
+                assert_eq!(*codec, compress::CODEC_ZSTD_DICT);
+                assert_eq!(*dict_id, Some(7));
+                assert_eq!(*raw_len, raw.len() as u32);
+                assert_eq!(*raw_crc32, crc32fast::hash(&raw));
+            }
+            other => panic!("expected zstd-dict inline value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_zstd_dict_external_stream_records_dictionary_id_and_crc() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = dict_external_base_and_toast_schema();
+        base.toast.compression = ToastCompression::ZstdDict;
+        base.toast.active_dict_id = Some(7);
+        register_test_dictionary(&harness, 7);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = dict_value(77, 12_000);
+        let mut values = vec![Value::Integer(1)];
+        values.extend((0..40).map(Value::Integer));
+        values.push(Value::Text(String::from_utf8(raw.clone()).unwrap()));
+        let row = Row { values };
+
+        let physical = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        let pointer = match physical.last().unwrap() {
+            DecodedPhysicalValue::External { pointer, .. } => pointer,
+            other => panic!("expected external zstd-dict text, got {other:?}"),
+        };
+        assert_eq!(pointer.codec, compress::CODEC_ZSTD_DICT);
+        let stream = harness
+            .storage
+            .read_toast_stream(&ctx, &base, pointer)
+            .unwrap();
+        let (dict_id, raw_crc32, payload) =
+            crate::toast::parse_external_stream(pointer.codec, &stream).unwrap();
+        assert_eq!(dict_id, Some(7));
+        assert_eq!(raw_crc32, crc32fast::hash(&raw));
+        assert!(!payload.is_empty());
+    }
+
+    #[test]
+    fn prepare_externalizes_largest_value_first() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = two_bytea_base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let smaller = entropy_bytes(3000);
+        let larger = entropy_bytes(6000);
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Bytes(smaller),
+                Value::Bytes(larger),
+            ],
+        };
+
+        let values = prepare_physical_row(&harness, &ctx, &base, &row);
+
+        let smaller_pointer = match &values[1] {
+            DecodedPhysicalValue::External { pointer, .. } => pointer,
+            other => panic!("expected smaller value externalized, got {other:?}"),
+        };
+        let larger_pointer = match &values[2] {
+            DecodedPhysicalValue::External { pointer, .. } => pointer,
+            other => panic!("expected larger value externalized, got {other:?}"),
+        };
+        assert_eq!(larger_pointer.value_id, 1);
+        assert_eq!(smaller_pointer.value_id, 2);
+    }
+
+    #[test]
+    fn prepare_non_toastable_row_over_page_limit_is_rejected() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let schema = integer_heavy_schema(1100);
+        let row = Row {
+            values: (0..1100).map(Value::Integer).collect(),
+        };
+
+        let err = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &schema, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+    }
+
+    #[test]
+    fn prepare_toast_off_rejects_row_that_requires_externalization() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = bytea_base_and_toast_schema();
+        base.toast.mode = ToastMode::Off;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+
+        let err = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+        assert!(visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn prepare_rejects_after_all_candidates_externalized_without_chunks() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = wide_bytea_base_and_toast_schema(1100);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let mut values: Vec<Value> = (0..1100).map(Value::Integer).collect();
+        values.push(Value::Bytes(entropy_bytes(9000)));
+        let row = Row { values };
+
+        let err = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+        assert!(visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn prepare_oversized_indexed_text_rejects_before_writing_chunks() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&ctx, &name_index(false), 0)
+            .unwrap();
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("x".repeat(PAGE_SIZE)),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+
+        let err = harness
+            .storage
+            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::ProgramLimitExceeded);
+        assert!(visible_toast_chunk_sizes(&harness, &ctx, 1).is_empty());
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -2099,6 +2485,168 @@ mod tests {
         (base, toast)
     }
 
+    fn bytea_base_and_toast_schema() -> (TableSchema, TableSchema) {
+        let mut base = TableSchema {
+            id: 1,
+            name: "bytea_base".to_string(),
+            columns: vec![
+                ColumnDef {
+                    id: 0,
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+                ColumnDef {
+                    id: 1,
+                    name: "payload".to_string(),
+                    data_type: DataType::Bytea,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+            ],
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::default_new_table(),
+            toast_table_id: Some(2),
+            relation_kind: RelationKind::User,
+        };
+        base.toast.min_value_size = 128;
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
+    fn two_bytea_base_and_toast_schema() -> (TableSchema, TableSchema) {
+        let (mut base, _) = bytea_base_and_toast_schema();
+        base.columns.push(ColumnDef {
+            id: 2,
+            name: "payload2".to_string(),
+            data_type: DataType::Bytea,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        });
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
+    fn integer_heavy_schema(column_count: usize) -> TableSchema {
+        let mut columns = Vec::with_capacity(column_count);
+        for index in 0..column_count {
+            columns.push(ColumnDef {
+                id: index as u16,
+                name: format!("c{index}"),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            });
+        }
+        TableSchema {
+            id: 1,
+            name: "wide_fixed".to_string(),
+            columns,
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::default_new_table(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
+        }
+    }
+
+    fn wide_bytea_base_and_toast_schema(integer_column_count: usize) -> (TableSchema, TableSchema) {
+        let mut columns = Vec::with_capacity(integer_column_count + 1);
+        for index in 0..integer_column_count {
+            columns.push(ColumnDef {
+                id: index as u16,
+                name: format!("c{index}"),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            });
+        }
+        columns.push(ColumnDef {
+            id: integer_column_count as u16,
+            name: "payload".to_string(),
+            data_type: DataType::Bytea,
+            nullable: false,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        });
+        let mut base = TableSchema {
+            id: 1,
+            name: "wide_bytea".to_string(),
+            columns,
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::default_new_table(),
+            toast_table_id: Some(2),
+            relation_kind: RelationKind::User,
+        };
+        base.toast.min_value_size = 128;
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
+    fn dict_external_base_and_toast_schema() -> (TableSchema, TableSchema) {
+        let mut columns = vec![ColumnDef {
+            id: 0,
+            name: "id".to_string(),
+            data_type: DataType::Integer,
+            nullable: false,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        }];
+        for index in 0..40 {
+            columns.push(ColumnDef {
+                id: index + 1,
+                name: format!("fixed{index}"),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            });
+        }
+        columns.push(ColumnDef {
+            id: 41,
+            name: "body".to_string(),
+            data_type: DataType::Text,
+            nullable: false,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        });
+        let mut base = TableSchema {
+            id: 1,
+            name: "dict_external".to_string(),
+            columns,
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::default_new_table(),
+            toast_table_id: Some(2),
+            relation_kind: RelationKind::User,
+        };
+        base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
+        base.toast.min_value_size = 128;
+        let toast = toast_schema(&base, 2);
+        (base, toast)
+    }
+
     fn toast_chunk_row(value_id: i64, seq: i64, data: &[u8]) -> Row {
         Row {
             values: vec![
@@ -2130,6 +2678,46 @@ mod tests {
             }
         }
         sizes
+    }
+
+    fn prepare_physical_row(
+        harness: &StorageHarness,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Vec<DecodedPhysicalValue> {
+        let bytes = harness
+            .storage
+            .prepare_row_for_storage(ctx, schema, &MvccHeader::fresh(ctx.txn_id, 0), row)
+            .unwrap();
+        decode_physical_row(schema, &bytes).unwrap().values
+    }
+
+    fn entropy_bytes(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0xFF) as u8
+            })
+            .collect()
+    }
+
+    fn dict_value(seed: u8, len: usize) -> Vec<u8> {
+        let chunk = format!("customer-{seed:03}-email-bio-location-plan-status-lifecycle-event;");
+        chunk.as_bytes().iter().copied().cycle().take(len).collect()
+    }
+
+    fn register_test_dictionary(harness: &StorageHarness, dict_id: u32) {
+        let samples: Vec<Vec<u8>> = (0..64).map(|seed| dict_value(seed, 2048)).collect();
+        let dict = compress::train_dictionary(&samples).expect("dictionary corpus is large enough");
+        harness
+            .storage
+            .compression
+            .register_dictionary(dict_id, &dict)
+            .unwrap();
     }
 
     fn redo_toast_chunk(

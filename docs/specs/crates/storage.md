@@ -1209,6 +1209,47 @@ lazily seeds on a missing cache entry as a defensive fallback, so replay/order
 changes cannot make allocation reuse an ID already present in physical chunk
 rows.
 
+## TOAST Row Preparation
+
+Storage owns a storage-private row preparation helper that converts a logical
+`Row` into row-format v3 bytes before heap insertion/update paths use it. Until
+the DML integration is wired, ordinary DML still emits v2 rows; the helper is the
+single planned path for TOAST-aware writes.
+
+Preparation first validates the logical primary-key and live secondary-index
+keys using the same B-tree entry-size rules as index insertion. This preflight
+runs before any external TOAST chunks are written, so oversized indexed values
+return `SqlState::ProgramLimitExceeded` without leaving orphan chunk rows.
+
+Hidden TOAST relations bypass TOAST recursively and are encoded as plain v3 rows.
+Legacy user tables with `toast_table_id = None` also encode inline-only: no
+inline compression, no externalization, and a row that cannot fit on one heap page
+returns `ProgramLimitExceeded`.
+
+For user tables with a hidden TOAST relation, non-null `TEXT` and `BYTEA` values
+whose logical byte length is at least `toast.min_value_size` are candidates.
+Storage computes `raw_crc32` over the logical bytes, tries the table's configured
+value compression (`none`, `zstd`, or `zstd_dict` with the active dictionary; when
+`zstd_dict` has no active dictionary it falls back to plain zstd), and keeps an
+inline compressed envelope only when the complete inline compressed representation
+saves at least `ToastOptions::MIN_TOAST_COMPRESSION_SAVINGS` bytes versus plain.
+Inline compression is attempted even when the row already fits; this is what lets
+medium values benefit from dictionaries.
+
+The helper computes the exact v3 length of the inline candidate row before
+materializing the final parent bytes. If the candidate is at or below
+`toast.tuple_target` and fits a heap page, it returns that row. With
+`toast.mode = Off`, externalization is disabled; the inline candidate is returned
+only if it fits a page. Otherwise storage length-simulates replacing candidates
+with fixed-width external pointers, largest current inline representation first,
+until the parent row meets the target and page limit, or until every candidate is
+external. Simulation happens before chunk writes and avoids constructing a full
+oversized all-inline row. If the final simulated parent cannot fit a page, the
+helper returns `ProgramLimitExceeded` without writing chunks. For the planned
+external values, storage writes the complete external stream to the hidden
+relation under the caller's transaction, stores real `ToastPointer`s in the
+parent row, and returns the v3 parent bytes.
+
 ## Structural Write Latches (Milestone E2a)
 
 Stage-2 concurrency (`docs/specs/mvcc.md` §7.1, §10 E2a) serializes structural

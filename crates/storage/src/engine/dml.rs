@@ -11,7 +11,659 @@ pub(super) enum StampOutcome {
     WouldBlock(u64),
 }
 
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+enum ToastStreamPayload {
+    RawColumn,
+    Owned(std::sync::Arc<[u8]>),
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+struct ToastCandidate {
+    column: usize,
+    raw_len: u32,
+    raw_crc32: u32,
+    stream_codec: u8,
+    stream_dict_id: Option<u32>,
+    stream_payload: ToastStreamPayload,
+    current_stored_len: usize,
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+struct CompressedToastValue {
+    codec: u8,
+    dict_id: Option<u32>,
+    payload: std::sync::Arc<[u8]>,
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+enum ToastColumnPlan {
+    Null,
+    Value,
+    Varlena(ToastVarlenaPlan),
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+enum ToastVarlenaPlan {
+    Plain,
+    Compressed {
+        codec: u8,
+        dict_id: Option<u32>,
+        raw_len: u32,
+        raw_crc32: u32,
+        payload: std::sync::Arc<[u8]>,
+    },
+    External(ToastPointer),
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
+    row.values
+        .iter()
+        .cloned()
+        .map(|value| match value {
+            Value::Null => crate::codec::PreparedColumnValue::Null,
+            other => crate::codec::PreparedColumnValue::Value(other),
+        })
+        .collect()
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn validate_logical_index_keys_fit(
+    storage: &PageBackedStorageEngine,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<()> {
+    crate::btree::validate_index_key_fits(&key_for_row(schema, row)?)?;
+    for index in storage.table_indexes(schema.id)? {
+        let (key, _has_null) = secondary_index_key(schema, &index, row)?;
+        crate::btree::validate_index_key_fits(&key)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn toastable_raw_bytes<'a>(data_type: &DataType, value: &'a Value) -> Option<&'a [u8]> {
+    match (data_type, value) {
+        (DataType::Text, Value::Text(text)) => Some(text.as_bytes()),
+        (DataType::Bytea, Value::Bytes(bytes)) => Some(bytes),
+        _ => None,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn supported_varlena_len(len: usize) -> Result<u32> {
+    let len = u32::try_from(len).map_err(|_| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "varlena value exceeds the supported length",
+        )
+    })?;
+    if len > crate::codec::VARLENA_LEN_MASK {
+        return Err(DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "varlena value exceeds the supported length",
+        ));
+    }
+    Ok(len)
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn inline_compressed_stored_len(payload_len: usize) -> usize {
+    1 + 4 + 4 + 4 + payload_len
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn planned_row_meets_toast_goal(
+    schema: &TableSchema,
+    row: &Row,
+    plans: &[ToastColumnPlan],
+) -> Result<bool> {
+    let len = planned_row_len(schema, row, plans)?;
+    Ok(len <= schema.toast.tuple_target as usize && row_len_fits_page(len))
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn ensure_planned_row_fits_page(
+    schema: &TableSchema,
+    row: &Row,
+    plans: &[ToastColumnPlan],
+) -> Result<()> {
+    ensure_row_len_fits_page(planned_row_len(schema, row, plans)?)
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn ensure_row_len_fits_page(row_len: usize) -> Result<()> {
+    if !row_len_fits_page(row_len) {
+        return Err(DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "row is too large for a data page",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn row_len_fits_page(row_len: usize) -> bool {
+    row_len
+        .checked_add(page_overhead())
+        .is_some_and(|len| len <= buffer::PAGE_SIZE)
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn planned_row_len(schema: &TableSchema, row: &Row, plans: &[ToastColumnPlan]) -> Result<usize> {
+    if row.values.len() != schema.columns.len() || plans.len() != schema.columns.len() {
+        return Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            format!(
+                "row has {} values but table {} has {} columns",
+                row.values.len(),
+                schema.name,
+                schema.columns.len()
+            ),
+        ));
+    }
+
+    let mut len = 1 + crate::codec::V2_MVCC_HEADER_LEN + crate::codec::null_bitmap_len(plans.len());
+    for ((column, value), plan) in schema.columns.iter().zip(&row.values).zip(plans) {
+        len = checked_row_len_add(
+            len,
+            planned_column_len(column, value, plan, schema.toast_table_id.is_some())?,
+        )?;
+    }
+    Ok(len)
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn planned_column_len(
+    column: &ColumnDef,
+    value: &Value,
+    plan: &ToastColumnPlan,
+    has_toast_relation: bool,
+) -> Result<usize> {
+    match plan {
+        ToastColumnPlan::Null => {
+            if !column.nullable {
+                return Err(DbError::storage(
+                    SqlState::NotNullViolation,
+                    format!("column {} cannot be NULL", column.name),
+                ));
+            }
+            Ok(0)
+        }
+        ToastColumnPlan::Value => logical_value_v3_len(column, value),
+        ToastColumnPlan::Varlena(varlena) => {
+            if column.data_type != DataType::Text && column.data_type != DataType::Bytea {
+                return Err(DbError::storage(
+                    SqlState::DatatypeMismatch,
+                    format!("value type does not match column {}", column.name),
+                ));
+            }
+            match varlena {
+                ToastVarlenaPlan::Plain => {
+                    let raw = toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+                        DbError::storage(
+                            SqlState::DatatypeMismatch,
+                            format!("value type does not match column {}", column.name),
+                        )
+                    })?;
+                    supported_varlena_len(raw.len())?;
+                    checked_varlena_len_add(4, raw.len())
+                }
+                ToastVarlenaPlan::Compressed { payload, .. } => {
+                    let stored_len = inline_compressed_stored_len(payload.len());
+                    supported_varlena_len(stored_len)?;
+                    checked_varlena_len_add(4, stored_len)
+                }
+                ToastVarlenaPlan::External(pointer) => {
+                    if !has_toast_relation {
+                        return Err(crate::toast::toast_corruption(
+                            "external toast value requires a hidden TOAST relation",
+                        ));
+                    }
+                    pointer.encode()?;
+                    checked_varlena_len_add(4, crate::codec::TOAST_POINTER_LEN)
+                }
+            }
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn logical_value_v3_len(column: &ColumnDef, value: &Value) -> Result<usize> {
+    match value {
+        Value::Null => Err(DbError::storage(
+            SqlState::InternalError,
+            "NULL should be represented by ToastColumnPlan::Null",
+        )),
+        Value::Integer(_) if column.data_type == DataType::Integer => Ok(8),
+        Value::Float(_) if column.data_type == DataType::Double => Ok(8),
+        Value::Real(_) if column.data_type == DataType::Real => Ok(4),
+        Value::Numeric(_) if matches!(column.data_type, DataType::Numeric { .. }) => Ok(20),
+        Value::Text(value) if column.data_type == DataType::Text => {
+            supported_varlena_len(value.len())?;
+            checked_varlena_len_add(4, value.len())
+        }
+        Value::Boolean(_) if column.data_type == DataType::Boolean => Ok(1),
+        Value::Date(_) if column.data_type == DataType::Date => Ok(8),
+        Value::Timestamp(_) if column.data_type == DataType::Timestamp => Ok(8),
+        Value::Time(_) if column.data_type == DataType::Time => Ok(8),
+        Value::TimestampTz(_) if column.data_type == DataType::TimestampTz => Ok(8),
+        Value::Interval(_) if column.data_type == DataType::Interval => Ok(16),
+        Value::Bytes(value) if column.data_type == DataType::Bytea => {
+            supported_varlena_len(value.len())?;
+            checked_varlena_len_add(4, value.len())
+        }
+        Value::Uuid(_) if column.data_type == DataType::Uuid => Ok(16),
+        _ => Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            format!("value type does not match column {}", column.name),
+        )),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn checked_varlena_len_add(prefix_len: usize, payload_len: usize) -> Result<usize> {
+    prefix_len.checked_add(payload_len).ok_or_else(|| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "varlena value length overflows usize",
+        )
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn checked_row_len_add(row_len: usize, column_len: usize) -> Result<usize> {
+    row_len.checked_add(column_len).ok_or_else(|| {
+        DbError::storage(SqlState::ProgramLimitExceeded, "row length overflows usize")
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn external_stream_stored_len(codec: u8, dict_id: Option<u32>, payload_len: usize) -> Result<u32> {
+    let header_len: usize = match codec {
+        compress::CODEC_NONE | compress::CODEC_ZSTD => {
+            if dict_id.is_some() {
+                return Err(crate::toast::toast_corruption(
+                    "dict-less TOAST stream codec cannot carry a dictionary id",
+                ));
+            }
+            4
+        }
+        compress::CODEC_ZSTD_DICT => match dict_id {
+            Some(0) | None => {
+                return Err(crate::toast::toast_corruption(
+                    "zstd-dict TOAST stream is missing dictionary id",
+                ));
+            }
+            Some(_) => 8,
+        },
+        _ => {
+            return Err(crate::toast::toast_corruption(
+                "unknown external TOAST stream codec",
+            ));
+        }
+    };
+    let len = header_len.checked_add(payload_len).ok_or_else(|| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "external TOAST stream length overflows usize",
+        )
+    })?;
+    supported_varlena_len(len)
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn candidate_stream_payload<'a>(
+    schema: &TableSchema,
+    row: &'a Row,
+    candidate: &'a ToastCandidate,
+) -> Result<&'a [u8]> {
+    match &candidate.stream_payload {
+        ToastStreamPayload::RawColumn => {
+            let column = schema.columns.get(candidate.column).ok_or_else(|| {
+                DbError::storage(SqlState::InternalError, "TOAST candidate column is invalid")
+            })?;
+            let value = row.values.get(candidate.column).ok_or_else(|| {
+                DbError::storage(
+                    SqlState::InternalError,
+                    "TOAST candidate row value is missing",
+                )
+            })?;
+            toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+                DbError::storage(
+                    SqlState::InternalError,
+                    "TOAST raw candidate no longer references a varlena value",
+                )
+            })
+        }
+        ToastStreamPayload::Owned(payload) => Ok(payload),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "staged TOAST row preparation is wired into DML in the next phase"
+)]
+fn materialize_prepared_values(
+    schema: &TableSchema,
+    row: &Row,
+    plans: &[ToastColumnPlan],
+) -> Result<Vec<crate::codec::PreparedColumnValue>> {
+    if row.values.len() != schema.columns.len() || plans.len() != schema.columns.len() {
+        return Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            format!(
+                "row has {} values but table {} has {} columns",
+                row.values.len(),
+                schema.name,
+                schema.columns.len()
+            ),
+        ));
+    }
+
+    let mut values = Vec::with_capacity(plans.len());
+    for ((column, value), plan) in schema.columns.iter().zip(&row.values).zip(plans) {
+        match plan {
+            ToastColumnPlan::Null => values.push(crate::codec::PreparedColumnValue::Null),
+            ToastColumnPlan::Value => {
+                values.push(crate::codec::PreparedColumnValue::Value(value.clone()));
+            }
+            ToastColumnPlan::Varlena(ToastVarlenaPlan::Plain) => {
+                let raw = toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+                    DbError::storage(
+                        SqlState::DatatypeMismatch,
+                        format!("value type does not match column {}", column.name),
+                    )
+                })?;
+                values.push(crate::codec::PreparedColumnValue::Varlena(
+                    crate::codec::VarlenaPhysical::Plain(raw.to_vec()),
+                ));
+            }
+            ToastColumnPlan::Varlena(ToastVarlenaPlan::Compressed {
+                codec,
+                dict_id,
+                raw_len,
+                raw_crc32,
+                payload,
+            }) => {
+                values.push(crate::codec::PreparedColumnValue::Varlena(
+                    crate::codec::VarlenaPhysical::Compressed {
+                        codec: *codec,
+                        dict_id: *dict_id,
+                        raw_len: *raw_len,
+                        raw_crc32: *raw_crc32,
+                        payload: payload.to_vec(),
+                    },
+                ));
+            }
+            ToastColumnPlan::Varlena(ToastVarlenaPlan::External(pointer)) => {
+                values.push(crate::codec::PreparedColumnValue::Varlena(
+                    crate::codec::VarlenaPhysical::External(pointer.clone()),
+                ));
+            }
+        }
+    }
+    Ok(values)
+}
+
 impl PageBackedStorageEngine {
+    #[allow(
+        dead_code,
+        reason = "staged TOAST row preparation is wired into DML in the next phase"
+    )]
+    pub(crate) fn prepare_row_for_storage(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        header: &crate::codec::MvccHeader,
+        row: &Row,
+    ) -> Result<Vec<u8>> {
+        validate_logical_index_keys_fit(self, schema, row)?;
+        if matches!(schema.relation_kind, RelationKind::Toast { .. })
+            || schema.toast_table_id.is_none()
+        {
+            let values = plain_prepared_values(row);
+            let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(bytes);
+        }
+
+        let (mut plans, mut candidates) = self.prepare_inline_toast_candidates(schema, row)?;
+        if planned_row_meets_toast_goal(schema, row, &plans)? {
+            let values = materialize_prepared_values(schema, row, &plans)?;
+            let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(bytes);
+        }
+        if schema.toast.mode == common::ToastMode::Off {
+            ensure_planned_row_fits_page(schema, row, &plans)?;
+            let values = materialize_prepared_values(schema, row, &plans)?;
+            let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(bytes);
+        }
+
+        candidates.sort_by(|a, b| {
+            b.current_stored_len
+                .cmp(&a.current_stored_len)
+                .then_with(|| a.column.cmp(&b.column))
+        });
+        let mut planned = Vec::new();
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            let payload = candidate_stream_payload(schema, row, candidate)?;
+            let stored_len = external_stream_stored_len(
+                candidate.stream_codec,
+                candidate.stream_dict_id,
+                payload.len(),
+            )?;
+            let pointer = ToastPointer {
+                value_id: crate::toast::FIRST_TOAST_VALUE_ID,
+                raw_len: candidate.raw_len,
+                stored_len,
+                codec: candidate.stream_codec,
+            };
+            pointer.encode()?;
+            plans[candidate.column] = ToastColumnPlan::Varlena(ToastVarlenaPlan::External(pointer));
+            planned.push(candidate_index);
+            if planned_row_meets_toast_goal(schema, row, &plans)? {
+                break;
+            }
+        }
+        ensure_planned_row_fits_page(schema, row, &plans)?;
+
+        for candidate_index in planned {
+            let candidate = &candidates[candidate_index];
+            let payload = candidate_stream_payload(schema, row, candidate)?;
+            let stream = crate::toast::build_external_stream(
+                candidate.stream_codec,
+                candidate.stream_dict_id,
+                candidate.raw_crc32,
+                payload,
+            )?;
+            let pointer = self.write_toast_stream(
+                ctx,
+                schema,
+                candidate.raw_len,
+                candidate.stream_codec,
+                &stream,
+            )?;
+            plans[candidate.column] = ToastColumnPlan::Varlena(ToastVarlenaPlan::External(pointer));
+        }
+
+        let values = materialize_prepared_values(schema, row, &plans)?;
+        let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
+        ensure_row_len_fits_page(bytes.len())?;
+        Ok(bytes)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "staged TOAST row preparation is wired into DML in the next phase"
+    )]
+    fn prepare_inline_toast_candidates(
+        &self,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Result<(Vec<ToastColumnPlan>, Vec<ToastCandidate>)> {
+        let mut plans = Vec::with_capacity(row.values.len());
+        let mut candidates = Vec::new();
+        for (column_index, value) in row.values.iter().enumerate() {
+            let Some(column) = schema.columns.get(column_index) else {
+                plans.push(ToastColumnPlan::Value);
+                continue;
+            };
+            if matches!(value, Value::Null) {
+                plans.push(ToastColumnPlan::Null);
+                continue;
+            }
+            let Some(raw) = toastable_raw_bytes(&column.data_type, value) else {
+                plans.push(ToastColumnPlan::Value);
+                continue;
+            };
+            let raw_len = supported_varlena_len(raw.len())?;
+            let raw_crc32 = crc32fast::hash(raw);
+            let mut plan = ToastVarlenaPlan::Plain;
+            let mut stream_codec = compress::CODEC_NONE;
+            let mut stream_dict_id = None;
+            let mut stream_payload = ToastStreamPayload::RawColumn;
+            let mut current_stored_len = raw.len();
+
+            if raw.len() >= schema.toast.min_value_size as usize
+                && schema.toast.compression != common::ToastCompression::None
+                && let Some(compressed) = self.try_toast_value_compression(schema, raw)?
+                && raw.len()
+                    >= inline_compressed_stored_len(compressed.payload.len())
+                        .saturating_add(common::ToastOptions::MIN_TOAST_COMPRESSION_SAVINGS)
+            {
+                current_stored_len = inline_compressed_stored_len(compressed.payload.len());
+                stream_codec = compressed.codec;
+                stream_dict_id = compressed.dict_id;
+                stream_payload = ToastStreamPayload::Owned(compressed.payload.clone());
+                plan = ToastVarlenaPlan::Compressed {
+                    codec: compressed.codec,
+                    dict_id: compressed.dict_id,
+                    raw_len,
+                    raw_crc32,
+                    payload: compressed.payload,
+                };
+            }
+
+            if raw.len() >= schema.toast.min_value_size as usize {
+                candidates.push(ToastCandidate {
+                    column: column_index,
+                    raw_len,
+                    raw_crc32,
+                    stream_codec,
+                    stream_dict_id,
+                    stream_payload,
+                    current_stored_len,
+                });
+            }
+            plans.push(ToastColumnPlan::Varlena(plan));
+        }
+        Ok((plans, candidates))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "staged TOAST row preparation is wired into DML in the next phase"
+    )]
+    fn try_toast_value_compression(
+        &self,
+        schema: &TableSchema,
+        raw: &[u8],
+    ) -> Result<Option<CompressedToastValue>> {
+        match schema.toast.compression {
+            common::ToastCompression::None => Ok(None),
+            common::ToastCompression::Zstd => Ok(Some(CompressedToastValue {
+                codec: compress::CODEC_ZSTD,
+                dict_id: None,
+                payload: compress::compress_value_zstd(raw)?.into(),
+            })),
+            common::ToastCompression::ZstdDict => {
+                if let Some(dict_id) = schema.toast.active_dict_id {
+                    Ok(Some(CompressedToastValue {
+                        codec: compress::CODEC_ZSTD_DICT,
+                        dict_id: Some(dict_id),
+                        payload: self
+                            .compression
+                            .compress_value_zstd_dict(dict_id, raw)?
+                            .into(),
+                    }))
+                } else {
+                    Ok(Some(CompressedToastValue {
+                        codec: compress::CODEC_ZSTD,
+                        dict_id: None,
+                        payload: compress::compress_value_zstd(raw)?.into(),
+                    }))
+                }
+            }
+        }
+    }
+
     pub(super) fn write_new_row(
         &self,
         schema: &TableSchema,

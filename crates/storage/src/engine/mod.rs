@@ -42,10 +42,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
-    ColumnId, ColumnInfo, CompressionSetting, DbError, FileId, IndexId, IndexSchema, Key, KeyRange,
-    Lsn, PageNum, RelationKind, Result, Row, RowId, SequenceId, SequenceManager, SequenceSchema,
-    Snapshot, SqlState, StatementContext, StoredRow, TableId, TableSchema, TxnStatusView,
-    UniqueConflict, Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
+    ColumnDef, ColumnId, ColumnInfo, CompressionSetting, DataType, DbError, FileId, IndexId,
+    IndexSchema, Key, KeyRange, Lsn, PageNum, RelationKind, Result, Row, RowId, SequenceId,
+    SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow, TableId,
+    TableSchema, TxnStatusView, UniqueConflict, Value, WriteConflict, classify_unique_conflict,
+    is_visible, write_conflict,
 };
 use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};

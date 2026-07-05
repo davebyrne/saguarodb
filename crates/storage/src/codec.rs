@@ -21,7 +21,7 @@ pub(crate) const ROW_FORMAT_VERSION_V3: u8 = 3;
 /// Byte width of the v2 MVCC header that precedes the v1-style null bitmap:
 /// `infomask(2) + xmin(8) + xmax(8) + t_ctid(6)`. The version byte and null
 /// bitmap are accounted for separately.
-const V2_MVCC_HEADER_LEN: usize = 2 + 8 + 8 + 6;
+pub(crate) const V2_MVCC_HEADER_LEN: usize = 2 + 8 + 8 + 6;
 
 pub(crate) const VARLENA_TAG_SHIFT: u32 = 30;
 pub(crate) const VARLENA_LEN_MASK: u32 = (1 << VARLENA_TAG_SHIFT) - 1;
@@ -1151,7 +1151,7 @@ pub(crate) fn set_mvcc_header_fields(
     Ok(())
 }
 
-fn null_bitmap_len(columns: usize) -> usize {
+pub(crate) fn null_bitmap_len(columns: usize) -> usize {
     columns.div_ceil(8)
 }
 

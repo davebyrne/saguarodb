@@ -218,7 +218,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     pub(crate) fn insert(&self, txn_id: u64, key: &Key, value: &V) -> Result<()> {
         let key_bytes = encode_key(key)?;
         let value = value.encode()?;
-        reject_oversized_entry(key_bytes.len(), value.len())?;
+        validate_index_entry_fits(key_bytes.len(), value.len())?;
         let probe = Probe {
             key,
             value: Some(&value),
@@ -856,7 +856,7 @@ fn append_entries(
     Ok(())
 }
 
-fn reject_oversized_entry(key_len: usize, value_len: usize) -> Result<()> {
+pub(crate) fn validate_index_entry_fits(key_len: usize, value_len: usize) -> Result<()> {
     let separator_len = key_len.checked_add(value_len).ok_or_else(|| {
         DbError::storage(
             SqlState::ProgramLimitExceeded,
@@ -926,6 +926,15 @@ fn split_point(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
         }
     }
     mid.clamp(1, entries.len() - 1)
+}
+
+#[allow(
+    dead_code,
+    reason = "used by staged TOAST row preparation before INSERT/UPDATE integration"
+)]
+pub(crate) fn validate_index_key_fits(key: &Key) -> Result<()> {
+    let key_bytes = encode_key(key)?;
+    validate_index_entry_fits(key_bytes.len(), LOCATION_LEN)
 }
 
 fn encode_child(page: PageNum) -> [u8; CHILD_LEN] {
