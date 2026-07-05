@@ -94,10 +94,12 @@ and `parser`/binder can reference it without depending on `compress`.
   lowercased per the identifier rules.
 - **`ALTER TABLE <name> SET (compression = 'none' | 'zstd')`** — the first
   `ALTER` form in the grammar; every other `ALTER` remains rejected.
-  Semantics in §8. Dispatched like `VACUUM`: autocommit only, rejected
-  inside a transaction block, runs under the exclusive statement guard.
-  Unlike `VACUUM` it parses/binds normally (it names a table and carries
-  options) but does not plan/execute relationally.
+  Semantics in §8. Classified `StatementClass::Maintenance` and dispatched
+  like `VACUUM`: autocommit only, rejected inside a transaction block, runs
+  under the exclusive statement guard, and does not bind or plan — the
+  binder never sees `AlterTableSetCompression`. The compression value
+  (`'none'`/`'zstd'`) is validated at parse time; table existence is
+  checked by `run_alter_table_compression` itself once it holds the guard.
 - A table's secondary indexes and primary-key index inherit the table's
   setting for their files, but compress **dict-less** (a heap-trained
   dictionary does not fit B-tree node content; per-index dictionaries are
@@ -189,7 +191,11 @@ error kind** (corruption-class):
   This is sound: a torn page was mid-write ⇒ it was dirty ⇒ its first
   post-checkpoint modification logged an FPI that redo will replay. (This
   is strictly better than today's raw-page behavior, where a torn write
-  yields garbage bytes whose garbage PageLSN the redo gate trusts.)
+  yields garbage bytes whose garbage PageLSN the redo gate trusts.) This
+  covers the `ALTER TABLE ... SET (compression)` rewrite too (§8): every
+  page it re-encodes is preceded by its own `FullPageImage`, so a page torn
+  mid-rewrite is repaired by the same fetch_for_redo → zeroed frame → FPI
+  replay path as any other page write.
 
 ### 5a. Store configuration
 
@@ -277,10 +283,16 @@ envelopes are self-describing and mixed encodings are legal.
 ## 8. `ALTER TABLE ... SET (compression = ...)` semantics
 
 Runs autocommit-only under the exclusive statement guard (writers drained,
-like `VACUUM` / `CREATE INDEX` backfill). Ordered steps:
+like `VACUUM` / `CREATE INDEX` backfill). Classified `StatementClass::Maintenance`
+and dispatched before binding, exactly like `VACUUM` — the binder never sees
+`AlterTableSetCompression`. Ordered steps:
 
-1. Bind: table must exist; value must be `'none'` or `'zstd'`.
-2. Take the exclusive guard.
+1. Parse: the compression value must be `'none'` or `'zstd'` (checked by the
+   parser, `SqlState::FeatureNotSupported` otherwise). Table existence is
+   NOT checked here (there is no bind step); `run_alter_table_compression`
+   checks it below, once it holds the guard.
+2. Take the exclusive guard; look up the table by name
+   (`SqlState::UndefinedTable` if it does not exist).
 3. If the new setting is `zstd` and the table has data: train a dictionary
    from current heap page images; persist the dict file (§7). If training
    is skipped/fails, `active_dict_id` becomes `None`.
@@ -293,25 +305,26 @@ like `VACUUM` / `CREATE INDEX` backfill). Ordered steps:
    index files of the table).
 6. `wal.flush()` — everything below is plain page I/O and must be
    write-ahead covered.
-7. **Rewrite pass (no WAL records):** for each page `0..page_count` of the
-   heap file, the PK index file, and every secondary index file (skipping
-   buffer-reported abandoned holes and pages that are not yet initialized):
-   fault the logical image into the buffer pool and mark it dirty by taking
-   its write guard, without touching a single logical byte — `rewrite_table_pages`
-   is a pure "dirty every initialized page" pass. The actual re-encoding
-   happens afterward, when the caller flushes those now-dirty pages through
-   the buffer pool (`flush_dirty_pages`) and syncs the store (`sync_all`):
-   `flush_dirty_pages` calls `PageStore::write_page` for each flushable dirty
-   page, and `write_page` is exactly where the envelope encode step (§5) runs
-   under the just-installed config. Logical bytes and PageLSN are unchanged
-   throughout, so no WAL is needed; the envelope is below the WAL contract.
-   Same effect as re-encoding page-by-page during the pass itself — every
-   page ends up written through `write_page` under the new config — but the
-   plumbing is dirty-then-flush rather than an inline write per page. A
-   resident page that was ALREADY dirty (from other in-flight work) is
-   likewise re-dirtied by this pass and is naturally re-encoded by the same
-   follow-on flush.
-8. `store.sync_all()`, release the guard, return command tag `ALTER TABLE`.
+7. **Rewrite pass (an FPI per page — torn-page repair, exactly like
+   VACUUM):** for each page `0..page_count` of the heap file, the PK index
+   file, and every secondary index file (skipping buffer-reported abandoned
+   holes and pages that are not yet initialized): take its write guard,
+   capture the current image, log it as a single unconditional
+   `FullPageImage`/`FullPageImageCompressed` under the maintenance txn id
+   (`VACUUM_TXN = 0`), and stamp the FPI's assigned LSN as the page's new
+   PageLSN (`rewrite_table_pages`, mirroring `vacuum_heap` /
+   `reclaim_line_pointers`). Logical bytes are unchanged — only the
+   page-header PageLSN (and its checksum) advances. `wal.flush()` runs
+   immediately after this pass and before the page flush (step 8): the
+   rewrite FPIs must be durable write-ahead of the pages that now carry a
+   higher PageLSN, or `flush_dirty_pages` would error on an unflushable
+   dirty page. A resident page that was ALREADY dirty (from other
+   in-flight work) is likewise FPI-logged and re-stamped by this pass.
+8. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
+   pool: `PageStore::write_page` re-encodes each flushable dirty page under
+   the just-installed config — the envelope encode step (§5) runs here.
+   Then `store.sync_all()`, release the guard, return command tag
+   `ALTER TABLE`.
 
 **Crash behavior:**
 
@@ -321,9 +334,14 @@ like `VACUUM` / `CREATE INDEX` backfill). Ordered steps:
   work). The old setting stands.
 - Crash during/after the rewrite: the catalog change is durable; files hold
   a mix of old- and new-encoding slots, every one self-describing and
-  readable; subsequent writes follow the new setting. The rewrite is **not**
-  resumed automatically — re-running the same `ALTER` completes it. This is
-  documented behavior, not corruption.
+  readable; subsequent writes follow the new setting. A page torn mid-write
+  during the rewrite's own page flush (step 8) is **repaired by redo**
+  replaying that page's `FullPageImage` from step 7, exactly like any other
+  page-write path (§5) — it is not left corrupt, and recovery does not
+  depend on the `ALTER` being re-run. The rewrite as a whole is still **not**
+  resumed automatically past whatever page range it reached: re-running the
+  same `ALTER` completes an interrupted (cleanly mixed-encoding) rewrite.
+  This is documented behavior, not corruption.
 
 `compression = 'none'`: steps 3 is skipped, `active_dict_id` becomes `None`,
 and the rewrite writes raw images (un-punching holes as a side effect of

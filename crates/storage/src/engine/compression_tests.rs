@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
@@ -9,7 +10,8 @@ use compress::CompressionRegistry;
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use crate::engine::{PageBackedStorageEngine, StorageMode};
-use crate::heap::HeapPageStore;
+use crate::heap::{HeapPageStore, index_file_id};
+use crate::page;
 use crate::traits::{SchemaOperations, StorageEngine};
 
 const TABLE_ID: u32 = 1;
@@ -155,46 +157,154 @@ fn dml_on_zstd_table_logs_compressed_fpis() {
     assert_eq!(raw, 0, "raw FPIs slipped through on compressible pages");
 }
 
+/// Normalize a `FullPageImageCompressed` record to the raw `FullPageImage`
+/// shape `apply_physical_redo` accepts (decompressing via a fresh dict-less
+/// registry — every FPI in this fixture is dict-less, since no test here
+/// registers a dictionary). Every other record kind passes through
+/// unchanged. Mirrors `vacuum_tests::resolve_to_raw_fpi`.
+fn resolve_to_raw_fpi(kind: WalRecordKind) -> WalRecordKind {
+    match kind {
+        WalRecordKind::FullPageImageCompressed {
+            file_id,
+            page_num,
+            codec,
+            dict_id,
+            payload,
+        } => {
+            let registry = CompressionRegistry::new();
+            let image = registry
+                .decompress_fpi(codec, dict_id, &payload, buffer::PAGE_SIZE)
+                .unwrap();
+            WalRecordKind::FullPageImage {
+                file_id,
+                page_num,
+                image,
+            }
+        }
+        other => other,
+    }
+}
+
 #[test]
-fn rewrite_table_pages_dirties_every_initialized_page() {
+fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
     let fixture = Fixture::new();
     fixture.insert_rows(101, 20);
     // Checkpoint-style flush, then mark everything clean so the following
-    // assertion is about pages `rewrite_table_pages` newly dirtied.
+    // assertions are about exactly what `rewrite_table_pages` itself does.
     fixture.buffer.flush_dirty_pages().unwrap();
     fixture.buffer.mark_all_clean().unwrap();
 
-    // Task 12's ALTER rewrite path depends on `rewrite_table_pages` being a
-    // pure "mark dirty" no-op: it must not append WAL records, and it must
-    // not change any page's logical bytes (only the caller's own follow-up
-    // flush/WAL emission does that). Capture both witnesses before the call.
-    let heap_before: [u8; buffer::PAGE_SIZE] = {
-        let guard = fixture.buffer.read_page(TABLE_ID, 0).unwrap();
-        *guard.data()
-    };
+    let pk_file_id = index_file_id(TABLE_ID);
+    let files = [TABLE_ID, pk_file_id];
+
+    // Snapshot every initialized page's image before the rewrite.
+    let mut before: HashMap<(u32, u32), [u8; buffer::PAGE_SIZE]> = HashMap::new();
+    for &file_id in &files {
+        let page_count = fixture.buffer.page_count(file_id).unwrap();
+        for page_num in 0..page_count {
+            if fixture.buffer.is_page_abandoned(file_id, page_num) {
+                continue;
+            }
+            let guard = fixture.buffer.read_page(file_id, page_num).unwrap();
+            if page::is_any_page_initialized(guard.data()) {
+                before.insert((file_id, page_num), *guard.data());
+            }
+        }
+    }
+    assert!(
+        before.len() >= 2,
+        "heap page + at least the index metapage/root"
+    );
+
     let wal_len_before = fixture.wal.replay_from(0).unwrap().count();
 
     let touched = fixture
         .engine
         .rewrite_table_pages(&users_schema_zstd())
         .unwrap();
-    assert!(touched >= 2, "heap page + at least the index metapage/root");
-
     assert_eq!(
-        fixture.wal.replay_from(0).unwrap().count(),
-        wal_len_before,
-        "rewrite_table_pages must append no WAL records of its own"
-    );
-    let heap_after: [u8; buffer::PAGE_SIZE] = {
-        let guard = fixture.buffer.read_page(TABLE_ID, 0).unwrap();
-        *guard.data()
-    };
-    assert_eq!(
-        heap_before, heap_after,
-        "rewrite_table_pages must dirty pages without mutating their bytes"
+        touched,
+        before.len(),
+        "one page touched per initialized page"
     );
 
-    // Pages are dirty again: flush succeeds and the store re-encodes.
+    // The rewrite must append exactly one FullPageImage[Compressed] per
+    // touched page and nothing else.
+    let mut fpi_by_page: HashMap<(u32, u32), (u64, WalRecordKind)> = HashMap::new();
+    let mut new_record_count = 0usize;
+    for (i, record) in fixture.wal.replay_from(0).unwrap().enumerate() {
+        if i < wal_len_before {
+            continue;
+        }
+        let record = record.unwrap();
+        new_record_count += 1;
+        match &record.kind {
+            WalRecordKind::FullPageImage {
+                file_id, page_num, ..
+            }
+            | WalRecordKind::FullPageImageCompressed {
+                file_id, page_num, ..
+            } => {
+                let key = (*file_id, *page_num);
+                assert!(
+                    fpi_by_page
+                        .insert(key, (record.lsn, record.kind.clone()))
+                        .is_none(),
+                    "duplicate FPI logged for {key:?}"
+                );
+            }
+            other => panic!("rewrite_table_pages must log only FPIs, found {other:?}"),
+        }
+    }
+    assert_eq!(
+        new_record_count,
+        before.len(),
+        "rewrite_table_pages must append exactly one WAL record per touched page"
+    );
+    assert_eq!(
+        fpi_by_page.keys().copied().collect::<HashSet<_>>(),
+        before.keys().copied().collect::<HashSet<_>>(),
+        "an FPI must be logged for exactly the touched pages"
+    );
+
+    // Logical content is unchanged; only the PageLSN (and its checksum)
+    // advances. For every touched page, also prove a torn write during the
+    // page flush is repaired: replaying the page's FPI onto a zeroed frame
+    // (what recovery sees for a torn page) reconstructs the post-rewrite
+    // image byte-for-byte.
+    for (&(file_id, page_num), pre_image) in &before {
+        let post_image: [u8; buffer::PAGE_SIZE] = {
+            let guard = fixture.buffer.read_page(file_id, page_num).unwrap();
+            *guard.data()
+        };
+        assert_ne!(
+            page::page_lsn(&post_image),
+            page::page_lsn(pre_image),
+            "{file_id}/{page_num}: PageLSN must advance"
+        );
+        let mut pre_norm = *pre_image;
+        let mut post_norm = post_image;
+        page::set_page_lsn(&mut pre_norm, 0);
+        page::set_page_lsn(&mut post_norm, 0);
+        assert_eq!(
+            pre_norm, post_norm,
+            "{file_id}/{page_num}: rewrite must change nothing but the PageLSN"
+        );
+
+        let (lsn, kind) = fpi_by_page.get(&(file_id, page_num)).unwrap();
+        let raw_kind = resolve_to_raw_fpi(kind.clone());
+        let mut recovered = [0u8; buffer::PAGE_SIZE];
+        crate::redo::apply_physical_redo(&mut recovered, *lsn, &raw_kind).unwrap();
+        assert_eq!(
+            recovered, post_image,
+            "{file_id}/{page_num}: FPI redo onto a zeroed (torn-write) frame must \
+             reconstruct the rewritten page byte-for-byte"
+        );
+    }
+
+    // The rewrite FPIs are durable ahead of the following page flush
+    // (write-ahead), so the flush succeeds without erroring on an
+    // unflushable PageLSN.
     fixture.buffer.flush_dirty_pages().unwrap();
 }
 

@@ -996,24 +996,30 @@ into `write_page`'s encode step and `load_page`'s decode step.
   The caller holds the exclusive checkpoint guard, so the sampled images are a
   stable snapshot; an abandoned fresh-page hole is skipped without being
   faulted in.
-- **`rewrite_table_pages(schema)`.** Dirties every **initialized** page —
+- **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
   `sample_heap_pages` uses) — of the table's heap file, primary-key index
   file, and every live secondary-index file, across each file's full current
-  extent, skipping abandoned fresh-page holes. It does this purely by
-  acquiring each page's buffer-pool write guard under that file's structural
-  latch: acquiring the guard marks the frame dirty without touching a single
-  logical byte. Because logical bytes and PageLSNs are completely unchanged,
-  **no WAL record is appended** — the envelope lives below the WAL contract,
-  so re-encoding a page at rest needs no redo record, only a later flush.
-  Returns the number of pages touched. The caller (`ALTER TABLE`) subsequently
-  flushes the buffer pool and fsyncs the store so every dirtied page is
-  actually re-encoded under the new config (see
-  `docs/specs/crates/server.md` and `docs/specs/compression.md` §8) — the
-  caller holds the exclusive checkpoint guard for the whole ALTER, so no
-  concurrent writer observes an inconsistent mix of dirtied-but-unflushed and
-  not-yet-dirtied pages.
+  extent, skipping abandoned fresh-page holes. For each such page, under that
+  file's structural latch and the page's buffer-pool write guard, it captures
+  the current image, logs it as a single unconditional
+  `FullPageImage`/`FullPageImageCompressed` under the maintenance txn id
+  (`VACUUM_TXN`), and stamps the FPI's assigned LSN as the page's new
+  PageLSN — exactly the `vacuum_heap`/`reclaim_line_pointers` pattern
+  (`docs/specs/compression.md` §8). Logical bytes are unchanged; only the
+  page-header PageLSN (and its checksum) advances. This is what makes a torn
+  write during the caller's subsequent page flush repairable by redo
+  replaying the page's own FPI, instead of the WAL-free "just dirty it"
+  version this once was. Returns the number of pages touched (and so the
+  number of FPIs logged). The caller (`ALTER TABLE`) must flush the WAL
+  (write-ahead of the page writes — `flush_dirty_pages` errors on a dirty
+  page whose PageLSN exceeds the flushed WAL) before flushing the buffer pool
+  and fsyncing the store so every dirtied page is actually re-encoded under
+  the new config (see `docs/specs/crates/server.md` and
+  `docs/specs/compression.md` §8) — the caller holds the exclusive
+  checkpoint guard for the whole ALTER, so no concurrent writer observes an
+  inconsistent mix of dirtied-but-unflushed and not-yet-dirtied pages.
 - **Corruption semantics.** An envelope validation failure is a distinct
   structured corruption-class error (`SqlState::InternalError`), never
   confused with "this is a raw page." A normal `load_page`/`write_page` fault
@@ -1095,9 +1101,11 @@ impl PageBackedStorageEngine {
     /// Up to `cap` evenly-sampled initialized heap page images, for
     /// dictionary training.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
-    /// Dirty every initialized page (heap + all index files) of `schema`'s
-    /// table so a following flush re-encodes them under the current config.
-    /// Appends no WAL. Returns the number of pages touched.
+    /// Re-encode every initialized page (heap + all index files) of
+    /// `schema`'s table so a following flush writes them under the current
+    /// config. Logs a FullPageImage per page and stamps its LSN as the new
+    /// PageLSN (torn-page repair, like VACUUM). Returns the number of pages
+    /// touched.
     pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize>;
 }
 ```

@@ -13,9 +13,11 @@ const DICT_TRAINING_PAGE_CAP: usize = 4096;
 
 impl QueryService {
     /// `ALTER TABLE <t> SET (compression = ...)`: immediate-commit DDL under
-    /// the exclusive guard, then a WAL-free full rewrite (`compression.md` §8).
+    /// the exclusive guard, then a full rewrite that logs a FullPageImage per
+    /// page (torn-page repair, exactly like VACUUM) (`compression.md` §8).
     /// Ordering is load-bearing: dict file durable → WAL records flushed →
-    /// catalog/registry updated → rewrite → fsync.
+    /// catalog/registry updated → rewrite (FPI per page) → rewrite FPIs
+    /// flushed (write-ahead) → page flush → fsync.
     pub(super) fn run_alter_table_compression(
         &self,
         statement: Statement,
@@ -92,10 +94,15 @@ impl QueryService {
                 .set_table_compression(schema.id, compression, active_dict_id)?;
         components.storage.set_table_compression(&schema)?;
 
-        // 6-8. WAL-free rewrite: dirty every page, flush under the new
-        // at-rest config, fsync. Logical bytes and PageLSNs are unchanged;
-        // a crash mid-rewrite leaves self-describing mixed encodings (§8).
+        // 6-8. Rewrite: re-encode every page, logging a FullPageImage per
+        // page and stamping the FPI's LSN as the page's new PageLSN (§8).
+        // The rewrite FPIs must be durable BEFORE the page flush
+        // (write-ahead) — `flush_dirty_pages` errors on a dirty page whose
+        // PageLSN exceeds the flushed WAL. A crash mid-rewrite leaves
+        // self-describing mixed encodings, and a torn page write is
+        // repaired by redo replaying its FPI (§8).
         components.storage.rewrite_table_pages(&schema)?;
+        components.wal.flush()?;
         components.buffer_pool.flush_dirty_pages()?;
         components.store.sync_all()?;
 

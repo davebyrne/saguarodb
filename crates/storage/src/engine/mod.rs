@@ -511,10 +511,15 @@ impl PageBackedStorageEngine {
         Ok(samples)
     }
 
-    /// Dirty every initialized page of the table's heap, PK-index, and live
-    /// secondary-index files so the following flush re-encodes them at rest
-    /// under the updated registry config. Logical bytes and PageLSNs are
-    /// untouched, so NO WAL records are appended (`compression.md` §8 step 7).
+    /// Re-encode every initialized page of the table's heap, PK-index, and
+    /// live secondary-index files at rest under the updated registry config.
+    /// Each page is logged as a single unconditional `FullPageImage` (under
+    /// the maintenance txn id, [`VACUUM_TXN`]) and the FPI's LSN is stamped
+    /// as the page's new PageLSN — exactly the `vacuum_heap` /
+    /// `reclaim_line_pointers` pattern — so a torn write during the
+    /// following flush is repaired by redo replaying the FPI
+    /// (`compression.md` §8 step 7). Logical content is unchanged; only the
+    /// PageLSN header field advances.
     pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize> {
         let mut files = vec![schema.id, index_file_id(schema.id)];
         {
@@ -545,9 +550,14 @@ impl PageBackedStorageEngine {
                     }
                 }
                 let _structural = latch.lock();
-                // Acquiring the write guard marks the frame dirty under the
-                // maintenance txn id; the page bytes are not modified.
-                let _guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
+                let mut guard = self.buffer_pool.write_page(file_id, page_num, VACUUM_TXN)?;
+                let image = *guard.data();
+                let fpi_lsn = self.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id: VACUUM_TXN,
+                    kind: fpi_record_kind(&self.compression, file_id, page_num, &image),
+                })?;
+                page::set_page_lsn(guard.data_mut(), fpi_lsn);
                 touched += 1;
             }
         }
