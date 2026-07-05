@@ -712,8 +712,17 @@ value.
     with nonzero `dict_id`
   `raw_crc32` is IEEE CRC-32 over the uncompressed logical bytes. The pointer's
   `stored_len` is the total external stream length including this stream header.
-  Detoast reconstructs the stream from chunks, verifies `stored_len`,
-  decompresses when needed, verifies `raw_len`, and then verifies `raw_crc32`.
+  Storage splits external streams into hidden-relation chunk rows with
+  `TOAST_CHUNK_PAYLOAD = 1900` bytes per chunk. The chunk size is chosen to keep
+  one v3 row `(value_id, seq, data BYTEA)` with a full chunk on a fresh 8 KiB heap
+  page including line-pointer overhead. Stream writes require the base schema's
+  `toast_table_id`, allocate a monotonic `value_id`, and insert chunks under the
+  caller's transaction with contiguous `seq` values starting at `0`. Stream reads
+  scan the hidden relation by primary-key prefix `(value_id)`, require visible
+  chunks to be contiguous and in order, concatenate `data`, and verify the byte
+  length equals the pointer's `stored_len`. Missing, duplicate, out-of-order, or
+  mismatched chunks are corruption-class storage errors. Detoast then decompresses
+  when needed, verifies `raw_len`, and verifies `raw_crc32`.
 - `Boolean`: 1 byte.
 - `Null`: bit set in null bitmap, no bytes.
 

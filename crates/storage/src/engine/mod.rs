@@ -51,7 +51,7 @@ use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 use crate::btree::BTree;
-use crate::codec::{decode_row, encode_row};
+use crate::codec::{ToastPointer, decode_row, encode_row};
 use crate::heap::{index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{RowIterator, SchemaOperations, StorageEngine};
@@ -434,6 +434,119 @@ impl PageBackedStorageEngine {
             .entry(toast_table)
             .or_insert(seeded_next_value_id);
         crate::toast::allocate_next_value_id(next_value_id)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "called by the row TOAST preparation path added in a later phase"
+    )]
+    pub(crate) fn write_toast_stream(
+        &self,
+        ctx: &StatementContext,
+        base: &TableSchema,
+        raw_len: u32,
+        codec: u8,
+        stream: &[u8],
+    ) -> Result<ToastPointer> {
+        crate::toast::parse_external_stream(codec, stream)?;
+        let toast_table_id = base.toast_table_id.ok_or_else(|| {
+            storage_internal(format!(
+                "table {} does not have a hidden TOAST relation",
+                base.name
+            ))
+        })?;
+        let stored_len = u32::try_from(stream.len()).map_err(|_| {
+            DbError::storage(
+                SqlState::ProgramLimitExceeded,
+                "external TOAST stream exceeds the supported length",
+            )
+        })?;
+        let value_id = self.alloc_toast_value_id(toast_table_id)?;
+        let pointer = ToastPointer {
+            value_id,
+            raw_len,
+            stored_len,
+            codec,
+        };
+        pointer.encode()?;
+
+        for (seq, chunk) in stream.chunks(crate::toast::TOAST_CHUNK_PAYLOAD).enumerate() {
+            self.insert(
+                ctx,
+                toast_table_id,
+                crate::toast::chunk_row(value_id, seq, chunk)?,
+            )?;
+        }
+
+        Ok(pointer)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "called by the detoast read path added in a later phase"
+    )]
+    pub(crate) fn read_toast_stream(
+        &self,
+        ctx: &StatementContext,
+        base: &TableSchema,
+        pointer: &ToastPointer,
+    ) -> Result<Vec<u8>> {
+        pointer.encode()?;
+        let toast_table_id = base.toast_table_id.ok_or_else(|| {
+            storage_internal(format!(
+                "table {} does not have a hidden TOAST relation",
+                base.name
+            ))
+        })?;
+        let mut iter = self.scan_range(
+            ctx,
+            toast_table_id,
+            &KeyRange::Exact(Key(vec![Value::Integer(pointer.value_id as i64)])),
+        )?;
+        let mut stream = Vec::with_capacity(pointer.stored_len as usize);
+        let mut expected_seq = 0i64;
+        while let Some(stored) = iter.next()? {
+            let (value_id, seq, data) = toast_chunk_parts(&stored.row)?;
+            if value_id != pointer.value_id {
+                return Err(crate::toast::toast_corruption(format!(
+                    "TOAST chunk value_id {value_id} does not match pointer value_id {}",
+                    pointer.value_id
+                )));
+            }
+            if stored.key
+                != Key(vec![
+                    Value::Integer(pointer.value_id as i64),
+                    Value::Integer(seq),
+                ])
+            {
+                return Err(crate::toast::toast_corruption(
+                    "TOAST chunk primary key does not match row contents",
+                ));
+            }
+            if seq != expected_seq {
+                return Err(crate::toast::toast_corruption(format!(
+                    "TOAST chunks for value_id {} are missing, duplicate, or out of order at seq {seq}",
+                    pointer.value_id
+                )));
+            }
+            stream.extend_from_slice(&data);
+            expected_seq = expected_seq.checked_add(1).ok_or_else(|| {
+                DbError::storage(
+                    SqlState::ProgramLimitExceeded,
+                    "TOAST chunk sequence exceeds i64::MAX",
+                )
+            })?;
+        }
+        if stream.len() != pointer.stored_len as usize {
+            return Err(crate::toast::toast_corruption(format!(
+                "TOAST stream for value_id {} has {} bytes, expected {}",
+                pointer.value_id,
+                stream.len(),
+                pointer.stored_len
+            )));
+        }
+        crate::toast::parse_external_stream(pointer.codec, &stream)?;
+        Ok(stream)
     }
 
     fn seed_toast_next_value_id(&self, schema: &TableSchema) -> Result<u64> {
@@ -1566,6 +1679,55 @@ fn live_toast_table_id(state: &StorageState, table: TableId) -> Option<TableId> 
         return None;
     }
     table_state.schema.toast_table_id
+}
+
+fn toast_chunk_parts(row: &Row) -> Result<(u64, i64, Vec<u8>)> {
+    let value_id = match row.values.first() {
+        Some(Value::Integer(value)) if *value > 0 => *value as u64,
+        Some(Value::Integer(value)) => {
+            return Err(crate::toast::toast_corruption(format!(
+                "TOAST chunk has invalid value_id {value}"
+            )));
+        }
+        Some(_) => {
+            return Err(crate::toast::toast_corruption(
+                "TOAST chunk value_id is not an integer",
+            ));
+        }
+        None => {
+            return Err(crate::toast::toast_corruption(
+                "TOAST chunk is missing value_id",
+            ));
+        }
+    };
+    let seq = match row.values.get(1) {
+        Some(Value::Integer(seq)) if *seq >= 0 => *seq,
+        Some(Value::Integer(seq)) => {
+            return Err(crate::toast::toast_corruption(format!(
+                "TOAST chunk has negative seq {seq}"
+            )));
+        }
+        Some(_) => {
+            return Err(crate::toast::toast_corruption(
+                "TOAST chunk seq is not an integer",
+            ));
+        }
+        None => return Err(crate::toast::toast_corruption("TOAST chunk is missing seq")),
+    };
+    let data = match row.values.get(2) {
+        Some(Value::Bytes(data)) => data.clone(),
+        Some(_) => {
+            return Err(crate::toast::toast_corruption(
+                "TOAST chunk data is not BYTEA",
+            ));
+        }
+        None => {
+            return Err(crate::toast::toast_corruption(
+                "TOAST chunk is missing data",
+            ));
+        }
+    };
+    Ok((value_id, seq, data))
 }
 
 fn mark_table_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {

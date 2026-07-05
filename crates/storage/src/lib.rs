@@ -34,7 +34,12 @@ mod tests {
 
     use crate::{
         PageBackedStorageEngine, RecoveryOperations, RowIterator, SchemaOperations, StorageEngine,
-        StorageMode, apply_physical_redo, decode_row, encode_row,
+        StorageMode, apply_physical_redo,
+        btree::BTree,
+        decode_row, encode_row,
+        engine::RowLocation,
+        heap::index_file_id,
+        toast::{TOAST_CHUNK_PAYLOAD, build_external_stream},
     };
 
     #[test]
@@ -1510,6 +1515,177 @@ mod tests {
         assert_eq!(err.code, SqlState::ProgramLimitExceeded);
     }
 
+    #[test]
+    fn write_toast_stream_creates_expected_chunks() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = vec![b'x'; TOAST_CHUNK_PAYLOAD * 2 + 37];
+        let stream =
+            build_external_stream(compress::CODEC_NONE, None, crc32fast::hash(&raw), &raw).unwrap();
+
+        let pointer = harness
+            .storage
+            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_NONE, &stream)
+            .unwrap();
+
+        assert_eq!(pointer.value_id, 1);
+        assert_eq!(pointer.raw_len, raw.len() as u32);
+        assert_eq!(pointer.stored_len, stream.len() as u32);
+        assert_eq!(pointer.codec, compress::CODEC_NONE);
+        assert_eq!(
+            visible_toast_chunk_sizes(&harness, &ctx, pointer.value_id),
+            vec![TOAST_CHUNK_PAYLOAD, TOAST_CHUNK_PAYLOAD, 41]
+        );
+    }
+
+    #[test]
+    fn read_toast_stream_reconstructs_exact_stream() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = b"external logical bytes";
+        let stream = build_external_stream(
+            compress::CODEC_ZSTD,
+            None,
+            crc32fast::hash(raw),
+            b"zstd-payload",
+        )
+        .unwrap();
+        let pointer = harness
+            .storage
+            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_ZSTD, &stream)
+            .unwrap();
+
+        let read = harness
+            .storage
+            .read_toast_stream(&ctx, &base, &pointer)
+            .unwrap();
+
+        assert_eq!(read, stream);
+    }
+
+    #[test]
+    fn read_toast_stream_rejects_missing_sequence() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(1, 0, b"abcd"))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(1, 2, b"efgh"))
+            .unwrap();
+        let pointer = crate::codec::ToastPointer {
+            value_id: 1,
+            raw_len: 4,
+            stored_len: 8,
+            codec: compress::CODEC_NONE,
+        };
+
+        let err = harness
+            .storage
+            .read_toast_stream(&ctx, &base, &pointer)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("missing, duplicate, or out of order"));
+    }
+
+    #[test]
+    fn read_toast_stream_rejects_duplicate_sequence() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row_id = harness
+            .storage
+            .insert(&ctx, 2, toast_chunk_row(1, 0, b"abcd"))
+            .unwrap();
+        let btree = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            index_file_id(2),
+            harness.storage.compression.as_ref(),
+        );
+        btree
+            .insert(
+                ctx.txn_id,
+                &Key(vec![Value::Integer(1), Value::Integer(0)]),
+                &RowLocation {
+                    file_id: 2,
+                    page_num: row_id.page_num,
+                    slot_num: row_id.slot_num,
+                },
+            )
+            .unwrap();
+        let pointer = crate::codec::ToastPointer {
+            value_id: 1,
+            raw_len: 4,
+            stored_len: 8,
+            codec: compress::CODEC_NONE,
+        };
+
+        let err = harness
+            .storage
+            .read_toast_stream(&ctx, &base, &pointer)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("missing, duplicate, or out of order"));
+    }
+
+    #[test]
+    fn read_toast_stream_rejects_wrong_stored_length() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let raw = b"raw";
+        let stream =
+            build_external_stream(compress::CODEC_NONE, None, crc32fast::hash(raw), raw).unwrap();
+        let mut pointer = harness
+            .storage
+            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_NONE, &stream)
+            .unwrap();
+        pointer.stored_len += 1;
+
+        let err = harness
+            .storage
+            .read_toast_stream(&ctx, &base, &pointer)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("expected"));
+    }
+
+    #[test]
+    fn write_toast_stream_requires_hidden_toast_relation() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let base = users_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        let stream = build_external_stream(compress::CODEC_NONE, None, 0, b"raw").unwrap();
+
+        let err = harness
+            .storage
+            .write_toast_stream(&ctx, &base, 3, compress::CODEC_NONE, &stream)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("hidden TOAST relation"));
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
@@ -1931,6 +2107,29 @@ mod tests {
                 Value::Bytes(data.to_vec()),
             ],
         }
+    }
+
+    fn visible_toast_chunk_sizes(
+        harness: &StorageHarness,
+        ctx: &StatementContext,
+        value_id: u64,
+    ) -> Vec<usize> {
+        let mut iter = harness
+            .storage
+            .scan_range(
+                ctx,
+                2,
+                &KeyRange::Exact(Key(vec![Value::Integer(value_id as i64)])),
+            )
+            .unwrap();
+        let mut sizes = Vec::new();
+        while let Some(stored) = iter.next().unwrap() {
+            match stored.row.values.get(2) {
+                Some(Value::Bytes(data)) => sizes.push(data.len()),
+                other => panic!("expected TOAST chunk BYTEA, got {other:?}"),
+            }
+        }
+        sizes
     }
 
     fn redo_toast_chunk(
