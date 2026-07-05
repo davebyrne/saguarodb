@@ -2982,7 +2982,7 @@ fn classify_marks_a_redirect_target_as_a_member_not_a_root() {
     };
     let plan = fixture
         .engine
-        .classify_page_for_prune(&data, 200, true)
+        .classify_page_for_prune(&hot_schema(), &data, 200, true)
         .expect("classify must not error");
 
     // No slot is freed to UNUSED more than once.

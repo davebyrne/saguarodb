@@ -2518,6 +2518,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vacuum_toast_cleanup_deletes_chunks_before_parent_prune() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let delete_ctx = StatementContext::new(2);
+        let cleanup_ctx = StatementContext::new(3);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+        harness.storage.insert(&insert_ctx, 1, row).unwrap();
+        assert!(!visible_toast_chunk_sizes(&harness, &insert_ctx, 1).is_empty());
+        assert!(harness.storage.delete(&delete_ctx, 1, &pk(1)).unwrap());
+
+        assert_eq!(
+            harness
+                .storage
+                .toast_value_ids_pending_vacuum(&base, 10)
+                .unwrap(),
+            vec![1]
+        );
+        let deleted = harness
+            .storage
+            .delete_toast_values(&cleanup_ctx, &base, &[1])
+            .unwrap();
+        assert!(deleted > 0);
+        assert!(visible_toast_chunk_sizes(&harness, &cleanup_ctx, 1).is_empty());
+
+        assert!(harness.storage.vacuum(&base, 10).unwrap() > 0);
+        assert!(
+            harness
+                .storage
+                .vacuum_hidden_toast_relation(&base, cleanup_ctx.txn_id + 1)
+                .unwrap()
+                > 0
+        );
+        assert!(visible_toast_chunk_sizes(&harness, &cleanup_ctx, 1).is_empty());
+        assert!(
+            harness
+                .storage
+                .toast_value_ids_pending_vacuum(&base, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn vacuum_hidden_toast_relation_reclaims_aborted_chunks() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let read_ctx = StatementContext::new(2);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+        harness.storage.insert(&insert_ctx, 1, row).unwrap();
+        harness.wal.mark_aborted(insert_ctx.txn_id);
+
+        assert!(visible_toast_chunk_sizes(&harness, &read_ctx, 1).is_empty());
+        assert_eq!(
+            harness
+                .storage
+                .toast_value_ids_pending_vacuum(&base, 10)
+                .unwrap(),
+            vec![1]
+        );
+        assert!(harness.storage.vacuum(&base, 10).unwrap() > 0);
+        assert!(
+            harness
+                .storage
+                .vacuum_hidden_toast_relation(&base, 10)
+                .unwrap()
+                > 0
+        );
+        assert!(
+            harness
+                .storage
+                .toast_value_ids_pending_vacuum(&base, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// A secondary index on the `name` column (column id 1) of `users`.
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {

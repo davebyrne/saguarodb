@@ -1,5 +1,7 @@
 use common::{DbError, RelationKind, Result, Row, SqlState, TableSchema, Value};
 
+use crate::codec::{DecodedPhysicalValue, ToastPointer, decode_physical_row};
+
 pub(crate) const FIRST_TOAST_VALUE_ID: u64 = 1;
 #[allow(
     dead_code,
@@ -120,6 +122,20 @@ pub(crate) fn parse_external_stream(codec: u8, stream: &[u8]) -> Result<(Option<
             "unknown external TOAST stream codec {other}"
         ))),
     }
+}
+
+pub(crate) fn external_pointers_in_tuple(
+    schema: &TableSchema,
+    tuple_bytes: &[u8],
+) -> Result<Vec<ToastPointer>> {
+    let physical = decode_physical_row(schema, tuple_bytes)?;
+    let mut pointers = Vec::new();
+    for value in physical.values {
+        if let DecodedPhysicalValue::External { pointer, .. } = value {
+            pointers.push(pointer);
+        }
+    }
+    Ok(pointers)
 }
 
 pub(crate) fn chunk_row(value_id: u64, seq: usize, data: &[u8]) -> Result<Row> {

@@ -1,8 +1,11 @@
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{DbError, Result, SqlState};
+use common::{DbError, RelationKind, Result, SqlState, StatementContext, TableSchema};
 use executor::ExecutionResult;
 use parser::Statement;
+use storage::StorageEngine;
+use wal::{WalRecord, WalRecordKind};
 
 use super::{PreparedStatement, QueryService};
 use crate::app::ServerComponents;
@@ -132,13 +135,119 @@ impl QueryService {
 /// outside-the-guard horizon.
 fn vacuum_tables(
     components: &ServerComponents,
-    tables: &[common::TableSchema],
+    tables: &[TableSchema],
     horizon: u64,
 ) -> Result<()> {
     for schema in tables {
+        let cleanup_txn = delete_toast_values_pending_parent_vacuum(components, schema, horizon)?;
         components.storage.vacuum(schema, horizon)?;
+        let toast_horizon = cleanup_txn
+            .map(|txn_id| horizon.max(txn_id.saturating_add(1)))
+            .unwrap_or(horizon);
+        components
+            .storage
+            .vacuum_hidden_toast_relation(schema, toast_horizon)?;
     }
     Ok(())
+}
+
+fn delete_toast_values_pending_parent_vacuum(
+    components: &ServerComponents,
+    schema: &TableSchema,
+    horizon: u64,
+) -> Result<Option<u64>> {
+    let value_ids = components
+        .storage
+        .toast_value_ids_pending_vacuum(schema, horizon)?;
+    if value_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let txn_id = components
+        .active_txns
+        .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+    let ctx = StatementContext::new(txn_id).with_conflict_waiter(
+        components.lock_manager.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let deleted = match components
+        .storage
+        .delete_toast_values(&ctx, schema, &value_ids)
+    {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            rollback_toast_cleanup_txn_or_die(components, txn_id);
+            return Err(err);
+        }
+    };
+    if deleted == 0 {
+        components.active_txns.deregister(txn_id);
+        components.lock_manager.on_txn_finished();
+        return Ok(None);
+    }
+
+    if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
+        rollback_toast_cleanup_txn_or_die(components, txn_id);
+        return Err(err);
+    }
+    if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
+        fatal_after_durable_maintenance_commit(components, err);
+    }
+    components.active_txns.deregister(txn_id);
+    components.lock_manager.on_txn_finished();
+
+    Ok(Some(txn_id))
+}
+
+fn append_and_flush_maintenance_commit(components: &ServerComponents, txn_id: u64) -> Result<()> {
+    components.wal.append(WalRecord {
+        lsn: 0,
+        txn_id,
+        kind: WalRecordKind::Commit,
+    })?;
+    components.wal.flush()?;
+    Ok(())
+}
+
+fn rollback_toast_cleanup_txn_or_die(components: &ServerComponents, txn_id: u64) {
+    if let Err(err) = components.wal.append(WalRecord {
+        lsn: 0,
+        txn_id,
+        kind: WalRecordKind::Abort,
+    }) {
+        eprintln!("failed to append Abort record for TOAST cleanup txn {txn_id}: {err}");
+    }
+    components.active_txns.deregister(txn_id);
+    components.lock_manager.on_txn_finished();
+    if let Err(err) = components.storage.rollback_txn(txn_id) {
+        fatal_pre_durable_maintenance_rollback(err);
+    }
+    if let Err(err) = components.buffer_pool.rollback(txn_id) {
+        fatal_pre_durable_maintenance_rollback(DbError::internal(format!(
+            "buffer rollback failed for TOAST cleanup txn {txn_id}: {err}",
+        )));
+    }
+}
+
+fn cleanup_after_durable_maintenance_commit(
+    components: &ServerComponents,
+    txn_id: u64,
+) -> Result<()> {
+    components.storage.commit_txn(txn_id)?;
+    components.buffer_pool.commit(txn_id)?;
+    Ok(())
+}
+
+fn fatal_after_durable_maintenance_commit(components: &ServerComponents, err: DbError) -> ! {
+    eprintln!("fatal TOAST cleanup failure after durable commit: {err}");
+    let _ = components.wal.flush();
+    std::process::exit(1);
+}
+
+fn fatal_pre_durable_maintenance_rollback(err: DbError) -> ! {
+    eprintln!("fatal TOAST cleanup rollback failure before durable commit: {err}");
+    std::process::exit(1);
 }
 
 /// Run a FULL VACUUM pass over every user table AND advance the WAL **vacuum floor**
@@ -146,22 +255,24 @@ fn vacuum_tables(
 /// (no table) and the checkpoint auto-prune (F4b) — the two full-pass callers.
 ///
 /// The boundary `B = next_txn_id` is captured BEFORE the pass and the floor is
-/// advanced to `B` AFTER it. Both reads happen under the exclusive guard the caller
+/// advanced to `B` AFTER it. The capture happens under the exclusive guard the caller
 /// holds (same contract as [`vacuum_tables`]: `horizon` was captured under it), so no
-/// id is allocated mid-pass and `B` is the exact id high-water at scan time. A full
-/// pass leaves EVERY aborted transaction with id `< B` with NO surviving on-disk
-/// reference, as creator OR deleter: `vacuum_heap` RECLAIMS every aborted-creator tuple
-/// (heap + index; aborted-creator reclaim has NO age requirement) and ABORT-CLEANS every
-/// aborted-deleter stamp in place (resetting `xmax → INVALID`, `t_ctid → INVALID`, and
-/// un-HOTing an aborted root — the surviving predecessor of an aborted UPDATE/DELETE,
-/// which stays live and is NOT reclaimed). Advancing the floor to `B` is therefore safe:
-/// the next checkpoint's `persist_clog` may drop those aborted txns' explicit `Aborted`
-/// entries from `clog.dat` and let the implicit-committed floor cover them (the catalog
-/// is NOT MVCC-versioned, so user-table tuples are the only place an aborted txn's
-/// on-disk reference lives). Without the abort-cleanup, an aborted UPDATE/DELETE's
-/// surviving predecessor would keep an `xmax = T` that reads as an implicit-committed
-/// delete once `T`'s entry is dropped from the snapshot, wrongly removing the row after a
-/// crash — the hazard for ALL aborted UPDATE/DELETE, HOT or non-HOT.
+/// user writer can allocate an id below or during the pass. TOAST cleanup may allocate
+/// committed maintenance xids during the pass; those ids are `>= B` and are not covered
+/// by this floor advance. A full pass leaves EVERY aborted transaction with id `< B`
+/// with NO surviving on-disk reference, as creator OR deleter: `vacuum_heap` RECLAIMS
+/// every aborted-creator tuple (heap + index; aborted-creator reclaim has NO age
+/// requirement) and ABORT-CLEANS every aborted-deleter stamp in place (resetting `xmax →
+/// INVALID`, `t_ctid → INVALID`, and un-HOTing an aborted root — the surviving
+/// predecessor of an aborted UPDATE/DELETE, which stays live and is NOT reclaimed).
+/// Advancing the floor to `B` is therefore safe: the next checkpoint's `persist_clog`
+/// may drop those aborted txns' explicit `Aborted` entries from `clog.dat` and let the
+/// implicit-committed floor cover them (the catalog is NOT MVCC-versioned, so user-table
+/// tuples are the only place an aborted txn's on-disk reference lives). Without the
+/// abort-cleanup, an aborted UPDATE/DELETE's surviving predecessor would keep an `xmax =
+/// T` that reads as an implicit-committed delete once `T`'s entry is dropped from the
+/// snapshot, wrongly removing the row after a crash — the hazard for ALL aborted
+/// UPDATE/DELETE, HOT or non-HOT.
 ///
 /// **Durability ordering.** The floor is only ever CONSULTED by `persist_clog`,
 /// which a checkpoint runs AFTER `flush_dirty_pages` + `store.sync_all` — so by the
@@ -183,6 +294,11 @@ pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> R
 /// `horizon` was captured under it. This does NOT advance the vacuum floor; callers
 /// that perform a *full* pass and want the floor advanced use [`full_vacuum_pass`].
 fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
-    let tables = components.catalog.list_tables()?;
+    let tables: Vec<_> = components
+        .catalog
+        .list_tables()?
+        .into_iter()
+        .filter(|schema| matches!(&schema.relation_kind, RelationKind::User))
+        .collect();
     vacuum_tables(components, &tables, horizon)
 }

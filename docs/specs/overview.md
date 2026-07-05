@@ -1353,6 +1353,14 @@ Storage uses a TOAST-aware row preparation helper for ordinary INSERT and normal
 
 User-facing storage reads resolve tuple visibility from MVCC headers before materializing v3 TOAST values. Only visible parent tuples decompress inline compressed values or read external chunks from the hidden TOAST relation; invisible tuples with missing or corrupt chunks are skipped without touching those chunks.
 
+VACUUM integrates hidden TOAST cleanup before discarding parent tuple bytes. Under
+the exclusive maintenance guard, storage first identifies external value ids owned by
+parent tuples that full VACUUM would prune without detoasting. The server deletes
+visible hidden chunks for those value ids in a real committed maintenance transaction,
+then prunes the parent table normally and runs ordinary VACUUM on the hidden TOAST
+relation. Update-path HOT pruning leaves chains with external pointers for full
+VACUUM, preserving the parent bytes needed to find chunk ownership.
+
 ### File Layout
 
 Files are named by stable numeric ID, not by user-visible names. This avoids rename issues (future `ALTER TABLE RENAME`), filesystem-unsafe characters in table names, and name collisions.
@@ -1969,7 +1977,7 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
 - **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` also gets a stable physical chain view for backfill.
-- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. See `docs/specs/mvcc.md` §9/§10 Milestone F for the orchestration (heap-prune → index-vacuum → line-pointer-reclaim) and the GC-horizon safety argument.
+- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. For TOAST-enabled tables it commits hidden chunk deletes before pruning the parent tuples that own those chunks, then vacuums the hidden relation. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the orchestration, TOAST cleanup, and the GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
 The concrete `ConcurrencyController` is an `RwLock`: `begin_writer()` takes it shared (DML writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint, VACUUM, and DDL. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.

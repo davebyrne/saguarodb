@@ -99,7 +99,7 @@ impl PageBackedStorageEngine {
             // in-place header resets (abort-cleanup). Pure read over the page bytes.
             // `allow_dead_roots = true`: VACUUM may mark a fully-dead chain's root DEAD
             // (it then runs F3a/F3b on the returned TIDs).
-            let plan = self.classify_page_for_prune(guard.data(), horizon, true)?;
+            let plan = self.classify_page_for_prune(schema, guard.data(), horizon, true)?;
             if plan.is_empty() {
                 continue;
             }
@@ -248,6 +248,7 @@ impl PageBackedStorageEngine {
     /// `xmax` status is settled (never reset/redirect against an in-flight txn).
     pub(super) fn classify_page_for_prune(
         &self,
+        schema: &TableSchema,
         data: &[u8; buffer::PAGE_SIZE],
         horizon: u64,
         allow_dead_roots: bool,
@@ -327,6 +328,9 @@ impl PageBackedStorageEngine {
 
             // Walk the chain from `head_slot`, collecting (slot, xmin, xmax, infomask).
             let chain = self.collect_prune_chain(data, head_slot)?;
+            if !allow_dead_roots && self.chain_contains_external_pointers(schema, data, &chain)? {
+                continue;
+            }
             self.plan_chain(
                 root_slot,
                 &chain,
@@ -337,6 +341,24 @@ impl PageBackedStorageEngine {
             )?;
         }
         Ok(plan)
+    }
+    fn chain_contains_external_pointers(
+        &self,
+        schema: &TableSchema,
+        data: &[u8; buffer::PAGE_SIZE],
+        chain: &[ChainMember],
+    ) -> Result<bool> {
+        if schema.toast_table_id.is_none() {
+            return Ok(false);
+        }
+        for member in chain {
+            let bytes = page::read_row(data, member.slot)?
+                .ok_or_else(|| storage_internal("HOT chain member is not a live tuple"))?;
+            if !crate::toast::external_pointers_in_tuple(schema, &bytes)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// Walk a HOT chain from `head_slot` (already resolved through any REDIRECT),
     /// returning each member as `(slot, xmin, xmax, infomask)` in chain order. Follows
@@ -676,6 +698,108 @@ impl PageBackedStorageEngine {
 
         Ok(())
     }
+    pub fn toast_value_ids_pending_vacuum(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+    ) -> Result<Vec<u64>> {
+        if schema.toast_table_id.is_none() || !matches!(schema.relation_kind, RelationKind::User) {
+            return Ok(Vec::new());
+        }
+
+        let file_id = schema.id;
+        let page_count = self.buffer_pool.page_count(file_id)?;
+        let mut value_ids = BTreeSet::new();
+        for page_num in 0..page_count {
+            if self.buffer_pool.is_page_abandoned(file_id, page_num) {
+                continue;
+            }
+            let guard = self.buffer_pool.read_page(file_id, page_num)?;
+            if !page::is_initialized(guard.data()) {
+                continue;
+            }
+            let plan = self.classify_page_for_prune(schema, guard.data(), horizon, true)?;
+            if plan.is_empty() {
+                continue;
+            }
+            for slot in slots_removed_by_prune_plan(guard.data(), &plan)? {
+                let bytes = page::read_row(guard.data(), slot)?
+                    .ok_or_else(|| storage_internal("pruned TOAST owner slot is not live"))?;
+                for pointer in crate::toast::external_pointers_in_tuple(schema, &bytes)? {
+                    value_ids.insert(pointer.value_id);
+                }
+            }
+        }
+
+        Ok(value_ids.into_iter().collect())
+    }
+
+    pub fn delete_toast_values(
+        &self,
+        ctx: &StatementContext,
+        base: &TableSchema,
+        value_ids: &[u64],
+    ) -> Result<usize> {
+        if value_ids.is_empty() {
+            return Ok(0);
+        }
+        let toast_table_id = base.toast_table_id.ok_or_else(|| {
+            crate::toast::toast_corruption(format!(
+                "table {} does not have a hidden TOAST relation",
+                base.name
+            ))
+        })?;
+        let (toast_schema, _) = self.table_handle(toast_table_id)?;
+        crate::toast::ensure_toast_relation(&toast_schema)?;
+
+        let mut deleted = 0usize;
+        let mut unique_value_ids = value_ids.to_vec();
+        unique_value_ids.sort_unstable();
+        unique_value_ids.dedup();
+        for value_id in unique_value_ids {
+            if value_id == 0 || value_id > crate::toast::MAX_TOAST_VALUE_ID {
+                return Err(crate::toast::toast_corruption(format!(
+                    "TOAST value_id {value_id} is invalid"
+                )));
+            }
+            let prefix = Key(vec![Value::Integer(value_id as i64)]);
+            let mut iter = self.scan_range(ctx, toast_table_id, &KeyRange::Exact(prefix))?;
+            let mut keys = Vec::new();
+            while let Some(stored) = iter.next()? {
+                let (row_value_id, seq, _data) = toast_chunk_parts(&stored.row)?;
+                if row_value_id != value_id {
+                    return Err(crate::toast::toast_corruption(format!(
+                        "TOAST chunk value_id {row_value_id} does not match requested value_id {value_id}"
+                    )));
+                }
+                let key = Key(vec![Value::Integer(value_id as i64), Value::Integer(seq)]);
+                if stored.key != key {
+                    return Err(crate::toast::toast_corruption(format!(
+                        "TOAST chunk key {:?} does not match row value_id {value_id} seq {seq}",
+                        stored.key
+                    )));
+                }
+                keys.push(key);
+            }
+            for key in keys {
+                if self.delete(ctx, toast_table_id, &key)? {
+                    deleted += 1;
+                }
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    pub fn vacuum_hidden_toast_relation(&self, base: &TableSchema, horizon: u64) -> Result<usize> {
+        let Some(toast_table_id) = base.toast_table_id else {
+            return Ok(0);
+        };
+        let (toast_schema, _) = self.table_handle(toast_table_id)?;
+        crate::toast::ensure_toast_relation(&toast_schema)?;
+        self.vacuum(&toast_schema, horizon)
+    }
+
     /// VACUUM one table (`docs/specs/mvcc.md` §9, §10 Milestone F4a): the live
     /// orchestration that ties the three reclamation phases together in their
     /// mandatory order — heap-prune (F2b) → index-vacuum (F3a) → line-pointer
@@ -724,4 +848,38 @@ impl PageBackedStorageEngine {
         }
         Ok(reclaimed)
     }
+}
+
+fn slots_removed_by_prune_plan(
+    data: &[u8; buffer::PAGE_SIZE],
+    plan: &PagePrunePlan,
+) -> Result<BTreeSet<u16>> {
+    let mut slots = BTreeSet::new();
+    for &slot in &plan.free_to_unused {
+        match page::slot_state(data, slot)? {
+            page::LinePointer::Normal => {
+                slots.insert(slot);
+            }
+            _ => return Err(storage_internal("prune plan frees a non-NORMAL slot")),
+        }
+    }
+    for &slot in &plan.dead_roots {
+        match page::slot_state(data, slot)? {
+            page::LinePointer::Normal => {
+                slots.insert(slot);
+            }
+            page::LinePointer::Redirect(_) => {}
+            _ => return Err(storage_internal("prune plan marks a non-root slot DEAD")),
+        }
+    }
+    for &(slot, _target) in &plan.redirect_roots {
+        match page::slot_state(data, slot)? {
+            page::LinePointer::Normal => {
+                slots.insert(slot);
+            }
+            page::LinePointer::Redirect(_) => {}
+            _ => return Err(storage_internal("prune plan redirects a non-root slot")),
+        }
+    }
+    Ok(slots)
 }

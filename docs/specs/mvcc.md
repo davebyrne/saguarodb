@@ -387,9 +387,11 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
   `>= B` keeps its explicit `Aborted` entry. The dropping is gated STRICTLY on a
   CLOG-recorded `Aborted` status.
   - **Computing/advancing `B`.** `B = next_txn_id` captured at the *start* of a full
-    pass under the exclusive guard (no id is allocated mid-pass), set as
-    `vacuum_floor = max(vacuum_floor, B)` *after* the pass. Only a FULL pass advances
-    it (on-demand `VACUUM` with no table, and the checkpoint auto-prune over all
+    pass under the exclusive guard, set as `vacuum_floor = max(vacuum_floor, B)`
+    *after* the pass. No user writer can allocate an id during the pass. TOAST cleanup
+    may allocate committed maintenance xids while the pass runs, but those ids are
+    `>= B`, so this floor advance does not cover them. Only a FULL pass advances it
+    (on-demand `VACUUM` with no table, and the checkpoint auto-prune over all user
     tables — F4b); a single-table `VACUUM t` does **not** (other tables' aborted
     tuples survive). The catalog is not MVCC-versioned, so user-table tuples are the
     only place an aborted transaction's on-disk reference (creator OR deleter) lives.
@@ -839,6 +841,11 @@ design, because index entries accumulate per version as well as heap tuples.
   table(s), then acquires the **exclusive** checkpoint guard (`begin_checkpoint`) for
   the whole pass, captures `gc_horizon()` **once, after the guard is held**, and calls
   `engine.vacuum(schema, horizon)` for each target; the command tag is `VACUUM`.
+  For TOAST-enabled tables, it first asks storage which external value ids are owned
+  by parent tuples that full VACUUM would prune, deletes visible hidden chunks for
+  those value ids in a real committed maintenance transaction, then prunes the parent
+  and vacuums the hidden TOAST relation. This preserves the parent tuple bytes needed
+  to discover chunk ownership until the chunk deletes are durable.
   **No data loss (the horizon-under-the-guard argument):** under the exclusive guard no
   writer runs, so no committed-deleter appears mid-pass; and the horizon — captured
   after acquiring the guard — is the minimum `xmin` advertised by any live snapshot,

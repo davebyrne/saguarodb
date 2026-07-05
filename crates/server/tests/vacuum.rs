@@ -1,6 +1,10 @@
 mod support;
 
+use std::sync::atomic::Ordering;
+
+use common::{KeyRange, RelationKind, StatementContext};
 use saguarodb_server::config::Config;
+use storage::StorageEngine;
 use support::{Connection, TestServer};
 
 /// A config with a known checkpoint cadence and auto-vacuum threshold for the F4b
@@ -15,6 +19,43 @@ fn auto_vacuum_config(threshold: u64) -> Config {
         shutdown_timeout_ms: 1_000,
         ..Config::default()
     }
+}
+
+fn visible_toast_chunk_count(server: &TestServer, table: &str) -> usize {
+    let app = server.app();
+    let base = app
+        .components
+        .catalog
+        .get_table_by_name(table)
+        .expect("catalog lookup")
+        .expect("base table exists");
+    let toast_table_id = base.toast_table_id.expect("base table has TOAST relation");
+    let toast = app
+        .components
+        .catalog
+        .get_table(toast_table_id)
+        .expect("toast catalog lookup")
+        .expect("toast table exists");
+    assert!(matches!(toast.relation_kind, RelationKind::Toast { .. }));
+    let reader_txn = app
+        .components
+        .next_txn_id
+        .load(Ordering::Acquire)
+        .saturating_add(1_000);
+    let mut iter = app
+        .components
+        .storage
+        .scan_range(
+            &StatementContext::new(reader_txn),
+            toast_table_id,
+            &KeyRange::All,
+        )
+        .expect("scan hidden TOAST relation");
+    let mut count = 0;
+    while iter.next().expect("scan hidden TOAST chunk").is_some() {
+        count += 1;
+    }
+    count
 }
 
 /// VACUUM is a maintenance command: `VACUUM` and `VACUUM <table>` succeed, and the
@@ -103,6 +144,33 @@ async fn vacuum_runs_over_the_extended_protocol() {
         "extended-protocol VACUUM should succeed"
     );
     assert_eq!(outcome.status, b'I');
+}
+
+#[tokio::test]
+async fn vacuum_deletes_toast_chunks_before_parent_prune() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("create table docs (id integer primary key, body text) \
+         with (toast_min_value_size = 128, toast_compression = none)")
+        .await;
+    let body = "toast-visible-through-server-vacuum-".repeat(300);
+    conn.ok(&format!("insert into docs (id, body) values (1, '{body}')"))
+        .await;
+    assert!(
+        visible_toast_chunk_count(&server, "docs") > 0,
+        "large text should have visible hidden TOAST chunks after insert"
+    );
+
+    conn.ok("delete from docs where id = 1").await;
+    assert!(
+        visible_toast_chunk_count(&server, "docs") > 0,
+        "parent DELETE leaves hidden chunks visible until VACUUM cleanup"
+    );
+
+    let vacuum = conn.ok("vacuum docs").await;
+    assert!(vacuum.result.is_ok(), "VACUUM docs should succeed");
+    assert_eq!(visible_toast_chunk_count(&server, "docs"), 0);
 }
 
 /// End-to-end reclamation: insert N rows (+ a secondary index), DELETE half and

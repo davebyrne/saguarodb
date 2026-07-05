@@ -149,7 +149,10 @@ results are unchanged from the pre-MVCC engine.
   pointers (incl. any new `REDIRECT`), so they stay correct; the writer never takes the
   exclusive guard. The GC horizon is read from `StatementContext::gc_horizon` (the
   server captures `gc_horizon()` for the write); a stale/smaller horizon only prunes
-  less, never unsafely.
+  less, never unsafely. For TOAST-enabled tables, any chain containing an external
+  TOAST pointer is left for full VACUUM rather than update-path pruning, so the
+  parent tuple bytes that own hidden chunk rows are not discarded outside the
+  server-owned TOAST cleanup sequence.
 - **Index backfill; DML locates the visible version; HOT broken-chain guard.**
   `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
   the chain view is stable) with the GC horizon threaded in. A non-HOT single-version
@@ -524,6 +527,34 @@ so no writer runs during the pass and the horizon accounts for every live reader
 snapshot — VACUUM reclaims only versions `xmax < horizon` that no current-or-future
 snapshot can see live (no data loss; see `docs/specs/crates/server.md` and `mvcc.md`
 §9/§10 F4a).
+
+### TOAST VACUUM Helpers
+
+TOAST chunk cleanup is intentionally outside the public `StorageEngine` trait and
+owned by `PageBackedStorageEngine` plus server VACUUM orchestration:
+
+- `toast_value_ids_pending_vacuum(schema, horizon) -> Vec<u64>` scans a user table's
+  heap pages, computes the same full-VACUUM prune plan as `vacuum_heap`, and decodes
+  the physical v3 parent tuple bytes that the plan would remove. It extracts external
+  TOAST pointers without detoasting or reading hidden chunks. It does not mutate the
+  parent table.
+- `delete_toast_values(ctx, base_schema, value_ids) -> usize` deletes hidden
+  `(value_id, seq)` chunk rows through the normal MVCC delete path using the supplied
+  transaction context. It scans the hidden relation by primary-key prefix
+  `(value_id)`, validates each row's full key `(value_id, seq)`, stamps `xmax` on
+  visible chunks, and relies on ordinary WAL, visibility, index, commit/abort, and
+  later VACUUM behavior. It must not physically remove chunks directly.
+- `vacuum_hidden_toast_relation(base_schema, horizon)` runs ordinary `vacuum` on the
+  linked hidden TOAST relation. This reclaims chunks deleted by a committed TOAST
+  cleanup transaction and aborted chunks whose creating transaction rolled back or was
+  resolved aborted during recovery.
+
+The server must delete visible hidden chunks in a real maintenance transaction and
+commit it before parent heap pruning removes the owning tuple bytes. After that commit,
+the parent table's normal `vacuum` may discard the parent tuple, and the hidden TOAST
+relation can be vacuumed with a horizon that includes the committed cleanup xid. If a
+chunk delete transaction aborts before commit, the parent prune must not run for that
+table in that pass; a later VACUUM can retry from still-present parent tuple bytes.
 
 ### MVCC Delete
 

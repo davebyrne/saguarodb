@@ -742,7 +742,7 @@ impl PageBackedStorageEngine {
             let Some(horizon) = prune_horizon else {
                 return Ok(None);
             };
-            let plan = self.classify_page_for_prune(guard.data(), horizon, false)?;
+            let plan = self.classify_page_for_prune(schema, guard.data(), horizon, false)?;
             if plan.is_empty() {
                 return Ok(None);
             }

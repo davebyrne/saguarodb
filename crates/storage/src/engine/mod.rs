@@ -37,7 +37,7 @@
 //! on its latch, while writers on different indexes/heaps run in parallel. A
 //! checkpoint takes the exclusive concurrency guard and so never overlaps a writer.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use buffer::{BufferPool, PageWriteGuard};
