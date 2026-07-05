@@ -647,10 +647,14 @@ value.
 [row_format_version: 1 byte][infomask: 2][xmin: 8][xmax: 8][t_ctid: 6][null_bitmap][col1_data][col2_data]...
 ```
 
-- `row_format_version`: `2`. `decode_row` also accepts legacy `1` tuples (which
-  omit the MVCC header — `[version=1][null_bitmap][columns]`); all other versions
-  are rejected as corrupt.
-- MVCC tuple header (v2 only), all little-endian:
+- `row_format_version`: ordinary DML currently emits `2`. The codec also defines
+  prepared row format `3` for the TOAST write path. `decode_row` accepts legacy
+  `1` tuples (which omit the MVCC header —
+  `[version=1][null_bitmap][columns]`), v2 tuples, and v3 tuples whose varlena
+  columns are physically plain. All other versions are rejected as corrupt. V3
+  compressed/external varlena payloads are exposed by the storage-private
+  physical decoder until the detoast read path materializes them.
+- MVCC tuple header (v2 and v3 only), all little-endian:
   - `infomask`: 2-byte hint bits. Bit 0 `XMIN_COMMITTED`, bit 1 `XMIN_ABORTED`,
     bit 2 `XMAX_COMMITTED`, bit 3 `XMAX_ABORTED` cache settled transaction status
     to skip a CLOG probe; bit 4 `HEAP_ONLY` and bit 5 `HOT_UPDATED` are reserved
@@ -675,7 +679,41 @@ value.
   `FROZEN_XID = 2`; the transaction-id allocator must assign real ids strictly
   above the reserved range (`FIRST_NORMAL_XID = 3`).
 - `Integer`: 8-byte little-endian i64.
-- `Text`: 4-byte length prefix plus UTF-8 bytes.
+- `Text` and `Bytea` in v1/v2: 4-byte length prefix plus UTF-8/raw bytes.
+- `Text` and `Bytea` in v3: the same 4-byte little-endian length word uses the
+  top two bits as a physical tag and the low 30 bits as `stored_len`:
+  - `00 PLAIN`: `stored_len` bytes are the raw logical bytes. This is
+    byte-identical to v2 for every supported plain value; v3 plain rows add no
+    per-column overhead beyond the row version byte.
+  - `01 COMPRESSED`: `stored_len` bytes are
+    `[codec:u8][dict_id:u32 LE][raw_len:u32 LE][raw_crc32:u32 LE][payload]`.
+    `codec = 1` means zstd with `dict_id = 0`; `codec = 2` means zstd with a
+    nonzero `dict_id`. `codec = 0` is invalid for inline compressed values.
+    `raw_crc32` is IEEE CRC-32 over the uncompressed logical bytes and is
+    preserved in physical decode for later detoast validation.
+  - `10 EXTERNAL`: `stored_len` must be exactly `17`, and the bytes are
+    `[value_id:u64 LE][raw_len:u32 LE][stored_len:u32 LE][codec:u8]`.
+    The base table schema supplies the hidden TOAST relation id; the pointer
+    stores only the value id within that relation and the external stream
+    metadata. Pointer `codec` is `0` for raw external streams, `1` for zstd, or
+    `2` for zstd with a dictionary. The 17-byte pointer intentionally has no
+    dictionary-id slot; dictionary-compressed streams store the dictionary id in
+    the stream header so the pointer stays fixed-width.
+  - `11`: reserved; decoding returns a corruption-class storage error.
+  The low 30-bit length limit (`2^30 - 1`) is the supported v3 varlena length
+  cap; encode attempts above it return `SqlState::ProgramLimitExceeded`.
+  Decode attempts that find persisted v3 varlena metadata above this cap return
+  a corruption-class storage error.
+- External TOAST stream bytes, stored in the hidden TOAST relation's chunk rows,
+  are self-describing after consulting the pointer codec:
+  - `codec = 0`: `[raw_crc32:u32 LE][raw bytes]`
+  - `codec = 1`: `[raw_crc32:u32 LE][zstd payload bytes]`
+  - `codec = 2`: `[dict_id:u32 LE][raw_crc32:u32 LE][zstd-dict payload bytes]`
+    with nonzero `dict_id`
+  `raw_crc32` is IEEE CRC-32 over the uncompressed logical bytes. The pointer's
+  `stored_len` is the total external stream length including this stream header.
+  Detoast reconstructs the stream from chunks, verifies `stored_len`,
+  decompresses when needed, verifies `raw_len`, and then verifies `raw_crc32`.
 - `Boolean`: 1 byte.
 - `Null`: bit set in null bitmap, no bytes.
 

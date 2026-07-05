@@ -1,22 +1,34 @@
 use common::{
-    DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row, SqlState,
-    TableSchema, TxnId, Value, XMIN_COMMITTED,
+    ColumnDef, DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row,
+    SqlState, TableSchema, TxnId, Value, XMIN_COMMITTED,
 };
 
-/// On-page row encoding version. The current MVCC layout (v2) is
-/// `[version=2][infomask:2][xmin:8][xmax:8][t_ctid:6][null_bitmap][columns]`;
-/// the legacy pre-MVCC layout (v1) is `[version=1][null_bitmap][columns]`.
-/// `decode_row` reads both so pre-MVCC heaps keep decoding.
-const ROW_FORMAT_VERSION: u8 = 2;
+/// On-page row encoding version currently emitted by the regular DML path. The
+/// MVCC layout (v2) is
+/// `[version=2][infomask:2][xmin:8][xmax:8][t_ctid:6][null_bitmap][columns]`.
+/// Row format v3 keeps the same MVCC header and null bitmap, but uses tagged
+/// varlena length words for `TEXT`/`BYTEA`. The legacy pre-MVCC layout (v1) is
+/// `[version=1][null_bitmap][columns]`. `decode_row` reads all three so old heaps
+/// keep decoding while the TOAST write path is introduced in phases.
+const ROW_FORMAT_VERSION: u8 = ROW_FORMAT_VERSION_V2;
 
 /// Legacy pre-MVCC row layout: `[version=1][null_bitmap][columns]` with no
 /// per-version transaction header. Still decoded for backward compatibility.
 const ROW_FORMAT_VERSION_V1: u8 = 1;
+const ROW_FORMAT_VERSION_V2: u8 = 2;
+pub(crate) const ROW_FORMAT_VERSION_V3: u8 = 3;
 
 /// Byte width of the v2 MVCC header that precedes the v1-style null bitmap:
 /// `infomask(2) + xmin(8) + xmax(8) + t_ctid(6)`. The version byte and null
 /// bitmap are accounted for separately.
 const V2_MVCC_HEADER_LEN: usize = 2 + 8 + 8 + 6;
+
+pub(crate) const VARLENA_TAG_SHIFT: u32 = 30;
+pub(crate) const VARLENA_LEN_MASK: u32 = (1 << VARLENA_TAG_SHIFT) - 1;
+pub(crate) const TAG_PLAIN: u8 = 0;
+pub(crate) const TAG_COMPRESSED: u8 = 1;
+pub(crate) const TAG_EXTERNAL: u8 = 2;
+pub(crate) const TOAST_POINTER_LEN: usize = 17;
 
 /// Sentinel `t_ctid` meaning "no successor / this is the latest version". Used in
 /// place of a literal self-pointer because the encoder does not know the slot a
@@ -49,6 +61,121 @@ pub(crate) const INVALID_TID: (PageNum, u16) = (u32::MAX, u16::MAX);
 pub(crate) const HEAP_ONLY: u16 = 1 << 4;
 /// HOT: the tuple was HOT-updated in place; its `t_ctid` successor is `HEAP_ONLY`.
 pub(crate) const HOT_UPDATED: u16 = 1 << 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MvccHeader {
+    pub xmin: TxnId,
+    pub xmax: TxnId,
+    pub t_ctid: (PageNum, u16),
+    pub infomask: u16,
+}
+
+impl MvccHeader {
+    pub(crate) fn fresh(txn_id: TxnId, infomask: u16) -> Self {
+        Self {
+            xmin: txn_id,
+            xmax: INVALID_XID,
+            t_ctid: INVALID_TID,
+            infomask,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToastPointer {
+    pub value_id: u64,
+    pub raw_len: u32,
+    pub stored_len: u32,
+    pub codec: u8,
+}
+
+impl ToastPointer {
+    pub(crate) fn encode(&self) -> Result<[u8; TOAST_POINTER_LEN]> {
+        validate_toast_pointer_value_id(self.value_id)?;
+        validate_varlena_u32_len(self.raw_len, "toast pointer raw length")?;
+        validate_varlena_u32_len(self.stored_len, "toast pointer stored length")?;
+        validate_toast_pointer_codec(self.codec)?;
+
+        let mut bytes = [0u8; TOAST_POINTER_LEN];
+        bytes[0..8].copy_from_slice(&self.value_id.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.raw_len.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.stored_len.to_le_bytes());
+        bytes[16] = self.codec;
+        Ok(bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != TOAST_POINTER_LEN {
+            return Err(corrupt_row(format!(
+                "toast pointer has {} bytes, expected {TOAST_POINTER_LEN}",
+                bytes.len()
+            )));
+        }
+        let pointer = Self {
+            value_id: u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")),
+            raw_len: u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")),
+            stored_len: u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes")),
+            codec: bytes[16],
+        };
+        validate_toast_pointer_value_id(pointer.value_id)?;
+        validate_decoded_varlena_u32_len(pointer.raw_len, "toast pointer raw length")?;
+        validate_decoded_varlena_u32_len(pointer.stored_len, "toast pointer stored length")?;
+        validate_toast_pointer_codec(pointer.codec)?;
+        Ok(pointer)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by the TOAST write path added after the v3 codec phase"
+)]
+pub(crate) enum VarlenaPhysical {
+    Plain(Vec<u8>),
+    Compressed {
+        codec: u8,
+        dict_id: Option<u32>,
+        raw_len: u32,
+        raw_crc32: u32,
+        payload: Vec<u8>,
+    },
+    External(ToastPointer),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by the TOAST write path added after the v3 codec phase"
+)]
+pub(crate) enum PreparedColumnValue {
+    Null,
+    Value(Value),
+    Varlena(VarlenaPhysical),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DecodedPhysicalRow {
+    pub header: MvccHeader,
+    pub values: Vec<DecodedPhysicalValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DecodedPhysicalValue {
+    Null,
+    Value(Value),
+    Compressed {
+        column: usize,
+        codec: u8,
+        dict_id: Option<u32>,
+        raw_len: u32,
+        raw_crc32: u32,
+        payload: Vec<u8>,
+    },
+    External {
+        column: usize,
+        pointer: ToastPointer,
+    },
+}
 
 /// A decoded row plus its MVCC tuple header. Later milestones (visibility,
 /// versioning) read `xmin`/`xmax`/`t_ctid`/`infomask`; current callers that only
@@ -388,23 +515,111 @@ pub(crate) fn encode_row_with_infomask(
     Ok(bytes)
 }
 
+#[allow(
+    dead_code,
+    reason = "called by the TOAST write path added after the v3 codec phase"
+)]
+pub(crate) fn encode_row_v3_prepared(
+    schema: &TableSchema,
+    header: &MvccHeader,
+    physical_values: &[PreparedColumnValue],
+) -> Result<Vec<u8>> {
+    if physical_values.len() != schema.columns.len() {
+        return Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            format!(
+                "row has {} values but table {} has {} columns",
+                physical_values.len(),
+                schema.name,
+                schema.columns.len()
+            ),
+        ));
+    }
+
+    let bitmap_len = null_bitmap_len(schema.columns.len());
+    let mut bytes = vec![0; 1 + V2_MVCC_HEADER_LEN + bitmap_len];
+    bytes[0] = ROW_FORMAT_VERSION_V3;
+    write_mvcc_header(&mut bytes[1..1 + V2_MVCC_HEADER_LEN], header);
+
+    let bitmap_start = 1 + V2_MVCC_HEADER_LEN;
+    let bitmap_end = bitmap_start + bitmap_len;
+    for (index, (column, value)) in schema.columns.iter().zip(physical_values).enumerate() {
+        match value {
+            PreparedColumnValue::Null => {
+                if !column.nullable {
+                    return Err(DbError::storage(
+                        SqlState::NotNullViolation,
+                        format!("column {} cannot be NULL", column.name),
+                    ));
+                }
+                set_null(&mut bytes[bitmap_start..bitmap_end], index);
+            }
+            PreparedColumnValue::Value(value) => {
+                encode_column_value_v3(&mut bytes, column, value)?;
+            }
+            PreparedColumnValue::Varlena(physical) => {
+                encode_varlena_physical(
+                    &mut bytes,
+                    column.data_type.clone(),
+                    schema.toast_table_id.is_some(),
+                    physical,
+                )?;
+            }
+        }
+    }
+
+    Ok(bytes)
+}
+
 pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
+    let decoded = decode_physical_row(schema, bytes)?;
+    let mut values = Vec::with_capacity(decoded.values.len());
+    for value in decoded.values {
+        match value {
+            DecodedPhysicalValue::Null => values.push(Value::Null),
+            DecodedPhysicalValue::Value(value) => values.push(value),
+            DecodedPhysicalValue::Compressed { column, .. } => {
+                return Err(corrupt_row(format!(
+                    "column {column} is an inline compressed TOAST value"
+                )));
+            }
+            DecodedPhysicalValue::External { column, .. } => {
+                return Err(corrupt_row(format!(
+                    "column {column} is an external TOAST value"
+                )));
+            }
+        }
+    }
+
+    Ok(DecodedRow {
+        row: Row { values },
+        xmin: decoded.header.xmin,
+        xmax: decoded.header.xmax,
+        t_ctid: decoded.header.t_ctid,
+        infomask: decoded.header.infomask,
+    })
+}
+
+pub(crate) fn decode_physical_row(
+    schema: &TableSchema,
+    bytes: &[u8],
+) -> Result<DecodedPhysicalRow> {
     let bitmap_len = null_bitmap_len(schema.columns.len());
     if bytes.is_empty() {
         return Err(corrupt_row("row is shorter than its header"));
     }
 
-    // Branch on the version byte: v2 carries the MVCC header before the null
+    // Branch on the version byte: v2/v3 carry the MVCC header before the null
     // bitmap; v1 has only the bitmap and synthesizes a frozen, never-deleted
     // header so pre-MVCC tuples are visible to every snapshot.
-    let (xmin, xmax, t_ctid, infomask, header_len) = match bytes[0] {
-        ROW_FORMAT_VERSION => {
+    let (version, header, header_len) = match bytes[0] {
+        ROW_FORMAT_VERSION_V2 | ROW_FORMAT_VERSION_V3 => {
             let header_len = 1 + V2_MVCC_HEADER_LEN + bitmap_len;
             if bytes.len() < header_len {
                 return Err(corrupt_row("row is shorter than its header"));
             }
-            let (xmin, xmax, t_ctid, infomask) = read_v2_header(&bytes[1..1 + V2_MVCC_HEADER_LEN])?;
-            (xmin, xmax, t_ctid, infomask, header_len)
+            let header = read_mvcc_header(&bytes[1..1 + V2_MVCC_HEADER_LEN])?;
+            (bytes[0], header, header_len)
         }
         ROW_FORMAT_VERSION_V1 => {
             let header_len = 1 + bitmap_len;
@@ -412,10 +627,13 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 return Err(corrupt_row("row is shorter than its header"));
             }
             (
-                FROZEN_XID,
-                INVALID_XID,
-                INVALID_TID,
-                XMIN_COMMITTED,
+                ROW_FORMAT_VERSION_V1,
+                MvccHeader {
+                    xmin: FROZEN_XID,
+                    xmax: INVALID_XID,
+                    t_ctid: INVALID_TID,
+                    infomask: XMIN_COMMITTED,
+                },
                 header_len,
             )
         }
@@ -432,7 +650,7 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
 
     for (index, column) in schema.columns.iter().enumerate() {
         if is_null(null_bitmap, index) {
-            values.push(Value::Null);
+            values.push(DecodedPhysicalValue::Null);
             continue;
         }
 
@@ -457,14 +675,15 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
                 Value::Real(f32::from_le_bytes(array).into())
             }
             DataType::Text => {
-                let raw_len = read_exact(bytes, &mut offset, 4)?;
-                let mut array = [0; 4];
-                array.copy_from_slice(raw_len);
-                let len = u32::from_le_bytes(array) as usize;
-                let raw = read_exact(bytes, &mut offset, len)?;
-                let text = String::from_utf8(raw.to_vec())
-                    .map_err(|_| corrupt_row("text value is not valid UTF-8"))?;
-                Value::Text(text)
+                values.push(decode_varlena_physical(
+                    bytes,
+                    &mut offset,
+                    version,
+                    index,
+                    DataType::Text,
+                    schema.toast_table_id.is_some(),
+                )?);
+                continue;
             }
             DataType::Boolean => {
                 let raw = read_exact(bytes, &mut offset, 1)?[0];
@@ -500,31 +719,336 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
             }
             DataType::Interval => Value::Interval(read_interval(bytes, &mut offset)?),
             DataType::Bytea => {
-                let raw_len = read_exact(bytes, &mut offset, 4)?;
-                let mut array = [0; 4];
-                array.copy_from_slice(raw_len);
-                let len = u32::from_le_bytes(array) as usize;
-                Value::Bytes(read_exact(bytes, &mut offset, len)?.to_vec())
+                values.push(decode_varlena_physical(
+                    bytes,
+                    &mut offset,
+                    version,
+                    index,
+                    DataType::Bytea,
+                    schema.toast_table_id.is_some(),
+                )?);
+                continue;
             }
             DataType::Uuid => {
                 let raw = read_exact(bytes, &mut offset, 16)?;
                 Value::Uuid(raw.try_into().expect("16 bytes"))
             }
         };
-        values.push(value);
+        values.push(DecodedPhysicalValue::Value(value));
     }
 
     if offset != bytes.len() {
         return Err(corrupt_row("row has trailing bytes"));
     }
 
-    Ok(DecodedRow {
-        row: Row { values },
-        xmin,
-        xmax,
-        t_ctid,
-        infomask,
+    Ok(DecodedPhysicalRow { header, values })
+}
+
+#[allow(
+    dead_code,
+    reason = "called by encode_row_v3_prepared once the TOAST write path is wired in"
+)]
+fn encode_column_value_v3(bytes: &mut Vec<u8>, column: &ColumnDef, value: &Value) -> Result<()> {
+    match value {
+        Value::Null => Err(DbError::storage(
+            SqlState::InternalError,
+            "NULL should be represented by PreparedColumnValue::Null",
+        )),
+        Value::Integer(value) if column.data_type == DataType::Integer => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::Float(value) if column.data_type == DataType::Double => {
+            bytes.extend_from_slice(&value.0.to_le_bytes());
+            Ok(())
+        }
+        Value::Real(value) if column.data_type == DataType::Real => {
+            bytes.extend_from_slice(&value.0.to_le_bytes());
+            Ok(())
+        }
+        Value::Numeric(value) if matches!(column.data_type, DataType::Numeric { .. }) => {
+            put_numeric(bytes, value);
+            Ok(())
+        }
+        Value::Text(value) if column.data_type == DataType::Text => {
+            put_varlena(bytes, TAG_PLAIN, value.as_bytes())
+        }
+        Value::Boolean(value) if column.data_type == DataType::Boolean => {
+            bytes.push(u8::from(*value));
+            Ok(())
+        }
+        Value::Date(value) if column.data_type == DataType::Date => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::Timestamp(value) if column.data_type == DataType::Timestamp => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::Time(value) if column.data_type == DataType::Time => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::TimestampTz(value) if column.data_type == DataType::TimestampTz => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+        Value::Interval(value) if column.data_type == DataType::Interval => {
+            put_interval(bytes, value);
+            Ok(())
+        }
+        Value::Bytes(value) if column.data_type == DataType::Bytea => {
+            put_varlena(bytes, TAG_PLAIN, value)
+        }
+        Value::Uuid(value) if column.data_type == DataType::Uuid => {
+            bytes.extend_from_slice(value);
+            Ok(())
+        }
+        _ => Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            format!("value type does not match column {}", column.name),
+        )),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "called by encode_row_v3_prepared once the TOAST write path is wired in"
+)]
+fn encode_varlena_physical(
+    bytes: &mut Vec<u8>,
+    data_type: DataType,
+    has_toast_relation: bool,
+    physical: &VarlenaPhysical,
+) -> Result<()> {
+    if data_type != DataType::Text && data_type != DataType::Bytea {
+        return Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            "physical varlena value supplied for a fixed-width column",
+        ));
+    }
+
+    match physical {
+        VarlenaPhysical::Plain(raw) => {
+            if data_type == DataType::Text && std::str::from_utf8(raw).is_err() {
+                return Err(corrupt_row("text value is not valid UTF-8"));
+            }
+            put_varlena(bytes, TAG_PLAIN, raw)
+        }
+        VarlenaPhysical::Compressed {
+            codec,
+            dict_id,
+            raw_len,
+            raw_crc32,
+            payload,
+        } => {
+            validate_inline_compressed_metadata(*codec, *dict_id, *raw_len)?;
+            let stored_len = 1usize
+                .checked_add(4)
+                .and_then(|len| len.checked_add(4))
+                .and_then(|len| len.checked_add(4))
+                .and_then(|len| len.checked_add(payload.len()))
+                .ok_or_else(|| corrupt_row("inline compressed varlena length overflow"))?;
+            let mut stored = Vec::with_capacity(stored_len);
+            stored.push(*codec);
+            stored.extend_from_slice(&dict_id.unwrap_or(0).to_le_bytes());
+            stored.extend_from_slice(&raw_len.to_le_bytes());
+            stored.extend_from_slice(&raw_crc32.to_le_bytes());
+            stored.extend_from_slice(payload);
+            put_varlena(bytes, TAG_COMPRESSED, &stored)
+        }
+        VarlenaPhysical::External(pointer) => {
+            if !has_toast_relation {
+                return Err(corrupt_row(
+                    "external toast value requires a hidden TOAST relation",
+                ));
+            }
+            let pointer = pointer.encode()?;
+            put_varlena(bytes, TAG_EXTERNAL, &pointer)
+        }
+    }
+}
+
+fn decode_varlena_physical(
+    bytes: &[u8],
+    offset: &mut usize,
+    version: u8,
+    column: usize,
+    data_type: DataType,
+    has_toast_relation: bool,
+) -> Result<DecodedPhysicalValue> {
+    let word = read_u32(bytes, offset)?;
+    let (tag, stored_len) = if version == ROW_FORMAT_VERSION_V3 {
+        unpack_varlena_len(word)?
+    } else {
+        (TAG_PLAIN, word as usize)
+    };
+    let stored = read_exact(bytes, offset, stored_len)?;
+
+    match tag {
+        TAG_PLAIN => match data_type {
+            DataType::Text => {
+                let text = String::from_utf8(stored.to_vec())
+                    .map_err(|_| corrupt_row("text value is not valid UTF-8"))?;
+                Ok(DecodedPhysicalValue::Value(Value::Text(text)))
+            }
+            DataType::Bytea => Ok(DecodedPhysicalValue::Value(Value::Bytes(stored.to_vec()))),
+            _ => Err(corrupt_row("plain varlena decoded for fixed-width column")),
+        },
+        TAG_COMPRESSED => decode_inline_compressed(column, stored),
+        TAG_EXTERNAL => {
+            if !has_toast_relation {
+                return Err(corrupt_row(
+                    "external toast value requires a hidden TOAST relation",
+                ));
+            }
+            if stored_len != TOAST_POINTER_LEN {
+                return Err(corrupt_row(format!(
+                    "external toast pointer has {stored_len} bytes, expected {TOAST_POINTER_LEN}"
+                )));
+            }
+            Ok(DecodedPhysicalValue::External {
+                column,
+                pointer: ToastPointer::decode(stored)?,
+            })
+        }
+        _ => Err(corrupt_row("reserved varlena tag")),
+    }
+}
+
+fn decode_inline_compressed(column: usize, stored: &[u8]) -> Result<DecodedPhysicalValue> {
+    let mut offset = 0;
+    let codec = read_exact(stored, &mut offset, 1)?[0];
+    let dict_id_raw = read_u32(stored, &mut offset)?;
+    let dict_id = (dict_id_raw != 0).then_some(dict_id_raw);
+    let raw_len = read_u32(stored, &mut offset)?;
+    let raw_crc32 = read_u32(stored, &mut offset)?;
+    validate_decoded_inline_compressed_metadata(codec, dict_id, raw_len)?;
+    let payload_len = stored.len() - offset;
+    let payload = read_exact(stored, &mut offset, payload_len)?.to_vec();
+    Ok(DecodedPhysicalValue::Compressed {
+        column,
+        codec,
+        dict_id,
+        raw_len,
+        raw_crc32,
+        payload,
     })
+}
+
+fn validate_inline_compressed_metadata(
+    codec: u8,
+    dict_id: Option<u32>,
+    raw_len: u32,
+) -> Result<()> {
+    validate_varlena_u32_len(raw_len, "inline compressed raw length")?;
+    validate_inline_compressed_codec_metadata(codec, dict_id)
+}
+
+fn validate_decoded_inline_compressed_metadata(
+    codec: u8,
+    dict_id: Option<u32>,
+    raw_len: u32,
+) -> Result<()> {
+    validate_decoded_varlena_u32_len(raw_len, "inline compressed raw length")?;
+    validate_inline_compressed_codec_metadata(codec, dict_id)
+}
+
+fn validate_inline_compressed_codec_metadata(codec: u8, dict_id: Option<u32>) -> Result<()> {
+    match (codec, dict_id) {
+        (compress::CODEC_ZSTD, None) => Ok(()),
+        (compress::CODEC_ZSTD_DICT, Some(dict_id)) if dict_id != 0 => Ok(()),
+        (compress::CODEC_ZSTD_DICT, Some(_)) => Err(corrupt_row(
+            "dictionary id 0 is invalid for zstd-dict value",
+        )),
+        (compress::CODEC_NONE, _) => {
+            Err(corrupt_row("codec none is invalid for inline compression"))
+        }
+        (compress::CODEC_ZSTD, Some(_)) => {
+            Err(corrupt_row("dict id is invalid for dict-less zstd value"))
+        }
+        (compress::CODEC_ZSTD_DICT, None) => {
+            Err(corrupt_row("missing dictionary id for zstd-dict value"))
+        }
+        (other, _) => Err(corrupt_row(format!(
+            "unknown inline compressed codec {other}"
+        ))),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "called by encode_row_v3_prepared once the TOAST write path is wired in"
+)]
+fn put_varlena(bytes: &mut Vec<u8>, tag: u8, payload: &[u8]) -> Result<()> {
+    let word = pack_varlena_len(tag, payload.len())?;
+    bytes.extend_from_slice(&word.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "called by encode_row_v3_prepared once the TOAST write path is wired in"
+)]
+pub(crate) fn pack_varlena_len(tag: u8, stored_len: usize) -> Result<u32> {
+    if tag > TAG_EXTERNAL {
+        return Err(corrupt_row(format!("invalid varlena tag {tag}")));
+    }
+    let stored_len = u32::try_from(stored_len).map_err(|_| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "varlena value exceeds the supported length",
+        )
+    })?;
+    validate_varlena_u32_len(stored_len, "varlena value length")?;
+    Ok(((tag as u32) << VARLENA_TAG_SHIFT) | stored_len)
+}
+
+pub(crate) fn unpack_varlena_len(word: u32) -> Result<(u8, usize)> {
+    let tag = (word >> VARLENA_TAG_SHIFT) as u8;
+    if tag > TAG_EXTERNAL {
+        return Err(corrupt_row("reserved varlena tag"));
+    }
+    Ok((tag, (word & VARLENA_LEN_MASK) as usize))
+}
+
+fn validate_varlena_u32_len(len: u32, what: &str) -> Result<()> {
+    if len > VARLENA_LEN_MASK {
+        return Err(DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            format!("{what} exceeds the supported length"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoded_varlena_u32_len(len: u32, what: &str) -> Result<()> {
+    if len > VARLENA_LEN_MASK {
+        return Err(corrupt_row(format!("{what} exceeds the supported length")));
+    }
+    Ok(())
+}
+
+fn validate_toast_pointer_value_id(value_id: u64) -> Result<()> {
+    if value_id == 0 || value_id > i64::MAX as u64 {
+        return Err(corrupt_row(format!(
+            "toast pointer has invalid value_id {value_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_toast_pointer_codec(codec: u8) -> Result<()> {
+    if !matches!(
+        codec,
+        compress::CODEC_NONE | compress::CODEC_ZSTD | compress::CODEC_ZSTD_DICT
+    ) {
+        return Err(corrupt_row(format!(
+            "toast pointer uses unsupported codec {codec}"
+        )));
+    }
+    Ok(())
 }
 
 /// Decode just the MVCC header of a tuple buffer (version byte included),
@@ -538,11 +1062,12 @@ pub fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<DecodedRow> {
 /// header fields, not the row values, and has no schema in hand.
 pub(crate) fn decode_mvcc_header(tuple: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> {
     match tuple.first() {
-        Some(&ROW_FORMAT_VERSION) => {
+        Some(&ROW_FORMAT_VERSION_V2) | Some(&ROW_FORMAT_VERSION_V3) => {
             let header = tuple
                 .get(1..1 + V2_MVCC_HEADER_LEN)
                 .ok_or_else(|| corrupt_row("tuple is shorter than its v2 header"))?;
-            read_v2_header(header)
+            let header = read_mvcc_header(header)?;
+            Ok((header.xmin, header.xmax, header.t_ctid, header.infomask))
         }
         Some(&ROW_FORMAT_VERSION_V1) => Ok((FROZEN_XID, INVALID_XID, INVALID_TID, XMIN_COMMITTED)),
         Some(other) => Err(corrupt_row(format!(
@@ -555,18 +1080,20 @@ pub(crate) fn decode_mvcc_header(tuple: &[u8]) -> Result<(TxnId, TxnId, (PageNum
 /// Write the v2 MVCC header into `header` (exactly `V2_MVCC_HEADER_LEN` bytes):
 /// `[infomask:2][xmin:8][xmax:8][t_ctid:6]` for a freshly inserted tuple.
 fn write_v2_header(header: &mut [u8], txn_id: TxnId) {
+    write_mvcc_header(header, &MvccHeader::fresh(txn_id, 0));
+}
+
+fn write_mvcc_header(header: &mut [u8], mvcc: &MvccHeader) {
     debug_assert_eq!(header.len(), V2_MVCC_HEADER_LEN);
-    header[0..2].copy_from_slice(&0u16.to_le_bytes());
-    header[2..10].copy_from_slice(&txn_id.to_le_bytes());
-    header[10..18].copy_from_slice(&INVALID_XID.to_le_bytes());
-    let (page, slot) = INVALID_TID;
+    header[0..2].copy_from_slice(&mvcc.infomask.to_le_bytes());
+    header[2..10].copy_from_slice(&mvcc.xmin.to_le_bytes());
+    header[10..18].copy_from_slice(&mvcc.xmax.to_le_bytes());
+    let (page, slot) = mvcc.t_ctid;
     header[18..22].copy_from_slice(&page.to_le_bytes());
     header[22..24].copy_from_slice(&slot.to_le_bytes());
 }
 
-/// Read the v2 MVCC header (`[infomask:2][xmin:8][xmax:8][t_ctid:6]`) from
-/// exactly `V2_MVCC_HEADER_LEN` bytes, returning `(xmin, xmax, t_ctid, infomask)`.
-fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> {
+fn read_mvcc_header(header: &[u8]) -> Result<MvccHeader> {
     if header.len() != V2_MVCC_HEADER_LEN {
         return Err(corrupt_row("row v2 header has the wrong length"));
     }
@@ -575,10 +1102,15 @@ fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> 
     let xmax = u64::from_le_bytes(header[10..18].try_into().expect("8 bytes"));
     let page = u32::from_le_bytes(header[18..22].try_into().expect("4 bytes"));
     let slot = u16::from_le_bytes(header[22..24].try_into().expect("2 bytes"));
-    Ok((xmin, xmax, (page, slot), infomask))
+    Ok(MvccHeader {
+        xmin,
+        xmax,
+        t_ctid: (page, slot),
+        infomask,
+    })
 }
 
-/// Mutate the in-place MVCC header fields of an existing v2 tuple, overwriting
+/// Mutate the in-place MVCC header fields of an existing v2/v3 tuple, overwriting
 /// `xmax`, `t_ctid`, and `infomask` in `tuple` (the full tuple byte buffer,
 /// version byte included). `xmin` is the immutable creator and is left untouched.
 ///
@@ -587,8 +1119,9 @@ fn read_v2_header(header: &[u8]) -> Result<(TxnId, TxnId, (PageNum, u16), u16)> 
 /// page. This is the single codec chokepoint for header-field offsets, so
 /// `page.rs` mutates a tuple header through here rather than duplicating layout.
 ///
-/// Returns `InternalError` if the buffer is not a v2 tuple or is shorter than the
-/// v2 header, so misuse surfaces as a structured `DbError` instead of a panic.
+/// Returns `InternalError` if the buffer is not an MVCC tuple or is shorter than
+/// the MVCC header, so misuse surfaces as a structured `DbError` instead of a
+/// panic.
 ///
 /// Reachable via `page::set_tuple_header` ← `apply_physical_redo`'s
 /// `HeapUpdateHeader` arm; the engine's `UPDATE`/`DELETE` emission paths arrive
@@ -599,9 +1132,10 @@ pub(crate) fn set_mvcc_header_fields(
     t_ctid: (PageNum, u16),
     infomask: u16,
 ) -> Result<()> {
-    if tuple.is_empty() || tuple[0] != ROW_FORMAT_VERSION {
+    if tuple.is_empty() || (tuple[0] != ROW_FORMAT_VERSION_V2 && tuple[0] != ROW_FORMAT_VERSION_V3)
+    {
         return Err(corrupt_row(
-            "cannot mutate header of a non-v2 (or empty) tuple",
+            "cannot mutate header of a non-MVCC (or empty) tuple",
         ));
     }
     let header = tuple
@@ -640,6 +1174,12 @@ fn read_exact<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a
     Ok(raw)
 }
 
+fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"),
+    ))
+}
+
 fn corrupt_row(message: impl Into<String>) -> common::DbError {
     DbError::storage(SqlState::InternalError, message)
 }
@@ -652,9 +1192,12 @@ mod tests {
     };
 
     use super::{
-        INVALID_TID, ROW_FORMAT_VERSION, ROW_FORMAT_VERSION_V1, V2_MVCC_HEADER_LEN, decode_key,
-        decode_row, encode_key, encode_row, null_bitmap_len, put_interval, put_numeric,
-        set_mvcc_header_fields,
+        DecodedPhysicalValue, INVALID_TID, MvccHeader, PreparedColumnValue, ROW_FORMAT_VERSION,
+        ROW_FORMAT_VERSION_V1, ROW_FORMAT_VERSION_V3, TAG_COMPRESSED, TAG_EXTERNAL, TAG_PLAIN,
+        TOAST_POINTER_LEN, ToastPointer, V2_MVCC_HEADER_LEN, VARLENA_LEN_MASK, VarlenaPhysical,
+        decode_inline_compressed, decode_key, decode_physical_row, decode_row, encode_key,
+        encode_row, encode_row_v3_prepared, null_bitmap_len, pack_varlena_len, put_interval,
+        put_numeric, set_mvcc_header_fields, unpack_varlena_len,
     };
 
     fn schema() -> TableSchema {
@@ -688,6 +1231,37 @@ mod tests {
             toast_table_id: None,
             relation_kind: RelationKind::User,
         }
+    }
+
+    fn two_text_schema() -> TableSchema {
+        let mut schema = schema();
+        schema.columns.push(ColumnDef {
+            id: 2,
+            name: "note2".to_string(),
+            data_type: DataType::Text,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        });
+        schema
+    }
+
+    fn schema_with_toast_relation() -> TableSchema {
+        let mut schema = schema();
+        schema.toast_table_id = Some(2);
+        schema
+    }
+
+    fn prepared_from_row(row: &Row) -> Vec<PreparedColumnValue> {
+        row.values
+            .iter()
+            .cloned()
+            .map(|value| match value {
+                Value::Null => PreparedColumnValue::Null,
+                other => PreparedColumnValue::Value(other),
+            })
+            .collect()
     }
 
     /// Build a legacy v1 tuple buffer (`[version=1][null_bitmap][columns]`) by
@@ -763,6 +1337,320 @@ mod tests {
     }
 
     #[test]
+    fn varlena_tagged_length_words_round_trip() {
+        for tag in [TAG_PLAIN, TAG_COMPRESSED, TAG_EXTERNAL] {
+            let word = pack_varlena_len(tag, 123).unwrap();
+            assert_eq!(unpack_varlena_len(word).unwrap(), (tag, 123));
+        }
+    }
+
+    #[test]
+    fn reserved_varlena_tag_is_corruption() {
+        let word = 3u32 << 30;
+        let err = unpack_varlena_len(word).unwrap_err();
+        assert!(err.message.contains("reserved varlena tag"));
+    }
+
+    #[test]
+    fn v3_row_with_reserved_varlena_tag_is_corruption() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Text("plain".to_string())],
+        };
+        let mut bytes = encode_row_v3_prepared(
+            &schema(),
+            &MvccHeader::fresh(7, 0),
+            &prepared_from_row(&row),
+        )
+        .unwrap();
+        let text_len_offset = 1 + V2_MVCC_HEADER_LEN + null_bitmap_len(schema().columns.len()) + 8;
+        bytes[text_len_offset..text_len_offset + 4].copy_from_slice(&(3u32 << 30).to_le_bytes());
+
+        let err = decode_physical_row(&schema(), &bytes).unwrap_err();
+        assert!(err.message.contains("reserved varlena tag"));
+    }
+
+    #[test]
+    fn oversized_varlena_length_is_rejected() {
+        let err = pack_varlena_len(TAG_PLAIN, VARLENA_LEN_MASK as usize + 1).unwrap_err();
+        assert_eq!(err.code, common::SqlState::ProgramLimitExceeded);
+    }
+
+    #[test]
+    fn v3_plain_row_round_trips() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Text("plain".to_string())],
+        };
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(42)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::Plain(b"plain".to_vec())),
+        ];
+        let bytes = encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &values).unwrap();
+
+        assert_eq!(bytes[0], ROW_FORMAT_VERSION_V3);
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+        assert_eq!(decoded.row, row);
+        assert_eq!(decoded.xmin, 7);
+        assert_eq!(decoded.xmax, INVALID_XID);
+    }
+
+    #[test]
+    fn v3_plain_varlena_length_word_matches_v2() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Text("same bytes".to_string())],
+        };
+        let mut v2 = encode_row(&schema(), &row, 7).unwrap();
+        let v3 = encode_row_v3_prepared(
+            &schema(),
+            &MvccHeader::fresh(7, 0),
+            &prepared_from_row(&row),
+        )
+        .unwrap();
+        v2[0] = ROW_FORMAT_VERSION_V3;
+
+        assert_eq!(v3, v2);
+    }
+
+    #[test]
+    fn v3_plain_two_text_columns_adds_no_per_column_overhead() {
+        let schema = two_text_schema();
+        let row = Row {
+            values: vec![
+                Value::Integer(42),
+                Value::Text("first".to_string()),
+                Value::Text("second".to_string()),
+            ],
+        };
+        let v2 = encode_row(&schema, &row, 7).unwrap();
+        let v3 =
+            encode_row_v3_prepared(&schema, &MvccHeader::fresh(7, 0), &prepared_from_row(&row))
+                .unwrap();
+
+        assert_eq!(v3.len(), v2.len());
+    }
+
+    #[test]
+    fn v3_inline_compressed_metadata_decodes_physically() {
+        let raw = b"hello compressed";
+        let payload = b"zstd bytes".to_vec();
+        let raw_crc32 = crc32fast::hash(raw);
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                codec: compress::CODEC_ZSTD,
+                dict_id: None,
+                raw_len: raw.len() as u32,
+                raw_crc32,
+                payload: payload.clone(),
+            }),
+        ];
+        let bytes = encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &values).unwrap();
+        let decoded = decode_physical_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(decoded.header, MvccHeader::fresh(7, 0));
+        assert_eq!(
+            decoded.values[1],
+            DecodedPhysicalValue::Compressed {
+                column: 1,
+                codec: compress::CODEC_ZSTD,
+                dict_id: None,
+                raw_len: raw.len() as u32,
+                raw_crc32,
+                payload,
+            }
+        );
+    }
+
+    #[test]
+    fn v3_inline_zstd_dict_metadata_preserves_dict_id_and_crc() {
+        let raw = b"dictionary compressed";
+        let payload = b"dict payload".to_vec();
+        let raw_crc32 = crc32fast::hash(raw);
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                codec: compress::CODEC_ZSTD_DICT,
+                dict_id: Some(9),
+                raw_len: raw.len() as u32,
+                raw_crc32,
+                payload: payload.clone(),
+            }),
+        ];
+        let bytes = encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &values).unwrap();
+        let decoded = decode_physical_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(
+            decoded.values[1],
+            DecodedPhysicalValue::Compressed {
+                column: 1,
+                codec: compress::CODEC_ZSTD_DICT,
+                dict_id: Some(9),
+                raw_len: raw.len() as u32,
+                raw_crc32,
+                payload,
+            }
+        );
+    }
+
+    #[test]
+    fn v3_inline_zstd_dict_rejects_zero_dict_id() {
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                codec: compress::CODEC_ZSTD_DICT,
+                dict_id: Some(0),
+                raw_len: 4,
+                raw_crc32: 0,
+                payload: b"dict payload".to_vec(),
+            }),
+        ];
+
+        let err = encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &values).unwrap_err();
+        assert!(err.message.contains("dictionary id 0"));
+    }
+
+    #[test]
+    fn v3_external_pointer_is_exactly_seventeen_bytes() {
+        let schema = schema_with_toast_relation();
+        let pointer = ToastPointer {
+            value_id: 99,
+            raw_len: 1234,
+            stored_len: 567,
+            codec: compress::CODEC_ZSTD,
+        };
+        let encoded = pointer.encode().unwrap();
+        assert_eq!(encoded.len(), TOAST_POINTER_LEN);
+        assert_eq!(ToastPointer::decode(&encoded).unwrap(), pointer);
+
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::External(pointer.clone())),
+        ];
+        let bytes = encode_row_v3_prepared(&schema, &MvccHeader::fresh(7, 0), &values).unwrap();
+        let decoded = decode_physical_row(&schema, &bytes).unwrap();
+        assert_eq!(
+            decoded.values[1],
+            DecodedPhysicalValue::External { column: 1, pointer }
+        );
+    }
+
+    #[test]
+    fn toast_pointer_accepts_dict_codec_with_dict_id_in_stream_header() {
+        let pointer = ToastPointer {
+            value_id: 99,
+            raw_len: 1234,
+            stored_len: 567,
+            codec: compress::CODEC_ZSTD_DICT,
+        };
+
+        let encoded = pointer.encode().unwrap();
+        assert_eq!(ToastPointer::decode(&encoded).unwrap(), pointer);
+    }
+
+    #[test]
+    fn v3_external_pointer_requires_hidden_toast_relation() {
+        let pointer = ToastPointer {
+            value_id: 99,
+            raw_len: 1234,
+            stored_len: 567,
+            codec: compress::CODEC_ZSTD,
+        };
+        let values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::External(pointer)),
+        ];
+
+        let err = encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &values).unwrap_err();
+        assert!(err.message.contains("requires a hidden TOAST relation"));
+
+        let toast_schema = schema_with_toast_relation();
+        let bytes =
+            encode_row_v3_prepared(&toast_schema, &MvccHeader::fresh(7, 0), &values).unwrap();
+        let err = decode_physical_row(&schema(), &bytes).unwrap_err();
+        assert!(err.message.contains("requires a hidden TOAST relation"));
+    }
+
+    #[test]
+    fn toast_pointer_rejects_value_id_outside_hidden_key_range() {
+        for value_id in [0, i64::MAX as u64 + 1] {
+            let pointer = ToastPointer {
+                value_id,
+                raw_len: 1234,
+                stored_len: 567,
+                codec: compress::CODEC_ZSTD,
+            };
+
+            let err = pointer.encode().unwrap_err();
+            assert!(err.message.contains("invalid value_id"));
+        }
+    }
+
+    #[test]
+    fn toast_pointer_decode_length_violations_are_corruption() {
+        let pointer = ToastPointer {
+            value_id: 99,
+            raw_len: 1234,
+            stored_len: 567,
+            codec: compress::CODEC_ZSTD,
+        };
+        let mut encoded = pointer.encode().unwrap();
+        encoded[8..12].copy_from_slice(&(VARLENA_LEN_MASK + 1).to_le_bytes());
+
+        let err = ToastPointer::decode(&encoded).unwrap_err();
+        assert_eq!(err.code, common::SqlState::InternalError);
+        assert!(err.message.contains("exceeds the supported length"));
+    }
+
+    #[test]
+    fn inline_compressed_decode_length_violations_are_corruption() {
+        let mut stored = Vec::new();
+        stored.push(compress::CODEC_ZSTD);
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(&(VARLENA_LEN_MASK + 1).to_le_bytes());
+        stored.extend_from_slice(&0u32.to_le_bytes());
+        stored.extend_from_slice(b"payload");
+
+        let err = decode_inline_compressed(1, &stored).unwrap_err();
+        assert_eq!(err.code, common::SqlState::InternalError);
+        assert!(err.message.contains("exceeds the supported length"));
+    }
+
+    #[test]
+    fn public_decode_row_rejects_v3_physical_toast_values_until_detoast_lands() {
+        let compressed_values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                codec: compress::CODEC_ZSTD,
+                dict_id: None,
+                raw_len: 4,
+                raw_crc32: crc32fast::hash(b"test"),
+                payload: b"payload".to_vec(),
+            }),
+        ];
+        let compressed =
+            encode_row_v3_prepared(&schema(), &MvccHeader::fresh(7, 0), &compressed_values)
+                .unwrap();
+
+        let err = decode_row(&schema(), &compressed).unwrap_err();
+        assert!(err.message.contains("inline compressed TOAST value"));
+
+        let schema = schema_with_toast_relation();
+        let external_values = vec![
+            PreparedColumnValue::Value(Value::Integer(1)),
+            PreparedColumnValue::Varlena(VarlenaPhysical::External(ToastPointer {
+                value_id: 99,
+                raw_len: 4,
+                stored_len: 8,
+                codec: compress::CODEC_ZSTD,
+            })),
+        ];
+        let external =
+            encode_row_v3_prepared(&schema, &MvccHeader::fresh(7, 0), &external_values).unwrap();
+
+        let err = decode_row(&schema, &external).unwrap_err();
+        assert!(err.message.contains("external TOAST value"));
+    }
+
+    #[test]
     fn v1_buffer_decodes_as_frozen_visible_row() {
         let row = Row {
             values: vec![Value::Integer(9), Value::Text("legacy".to_string())],
@@ -819,6 +1707,27 @@ mod tests {
     }
 
     #[test]
+    fn set_mvcc_header_fields_accepts_v3_tuple() {
+        let row = Row {
+            values: vec![Value::Integer(42), Value::Text("keep".to_string())],
+        };
+        let mut bytes = encode_row_v3_prepared(
+            &schema(),
+            &MvccHeader::fresh(7, 0),
+            &prepared_from_row(&row),
+        )
+        .unwrap();
+
+        set_mvcc_header_fields(&mut bytes, 99, (4, 5), XMAX_COMMITTED).unwrap();
+        let decoded = decode_row(&schema(), &bytes).unwrap();
+
+        assert_eq!(decoded.xmax, 99);
+        assert_eq!(decoded.t_ctid, (4, 5));
+        assert_eq!(decoded.infomask, XMAX_COMMITTED);
+        assert_eq!(decoded.row, row);
+    }
+
+    #[test]
     fn key_codec_round_trips_mixed_value_types() {
         let key = Key(vec![
             Value::Integer(-9),
@@ -842,7 +1751,7 @@ mod tests {
             values: vec![Value::Integer(7), Value::Null],
         };
         let mut bytes = encode_row(&schema(), &row, 1).unwrap();
-        bytes[0] = ROW_FORMAT_VERSION + 1;
+        bytes[0] = ROW_FORMAT_VERSION_V3 + 1;
 
         let err = decode_row(&schema(), &bytes).unwrap_err();
         assert!(err.message.contains("row format version"));

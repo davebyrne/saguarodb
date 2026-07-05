@@ -1341,11 +1341,11 @@ Development builds do not migrate older page formats. Existing page files withou
 [row_format_version: 1 byte][infomask: 2][xmin: 8][xmax: 8][t_ctid: 6][null_bitmap][col1_data][col2_data]...
 ```
 
-- `row_format_version`: `2`, the MVCC tuple layout. `decode_row` still accepts legacy `1` tuples (`[version=1][null_bitmap][columns]`, no MVCC header); other versions are rejected as corrupt.
-- MVCC tuple header (v2 only, little-endian): `infomask` (2-byte hint bits — `XMIN_COMMITTED`/`XMIN_ABORTED`/`XMAX_COMMITTED`/`XMAX_ABORTED` cache settled CLOG status, `HEAP_ONLY`/`HOT_UPDATED` mark HOT-chain tuples (Milestone H: a heap-only successor and the root that was HOT-updated to it), rest reserved-zero), `xmin` (8-byte creator txn id), `xmax` (8-byte deleter txn id; `0` = live), and `t_ctid` (forward successor pointer `(page: u32, slot: u16)`; sentinel `(u32::MAX, u16::MAX)` = latest version).
+- `row_format_version`: ordinary DML currently emits `2`, the MVCC tuple layout. The codec also supports prepared row format `3` for the TOAST path. `decode_row` still accepts legacy `1` tuples (`[version=1][null_bitmap][columns]`, no MVCC header), v2 tuples, and v3 tuples whose varlena values are plain; other versions are rejected as corrupt.
+- MVCC tuple header (v2/v3, little-endian): `infomask` (2-byte hint bits — `XMIN_COMMITTED`/`XMIN_ABORTED`/`XMAX_COMMITTED`/`XMAX_ABORTED` cache settled CLOG status, `HEAP_ONLY`/`HOT_UPDATED` mark HOT-chain tuples (Milestone H: a heap-only successor and the root that was HOT-updated to it), rest reserved-zero), `xmin` (8-byte creator txn id), `xmax` (8-byte deleter txn id; `0` = live), and `t_ctid` (forward successor pointer `(page: u32, slot: u16)`; sentinel `(u32::MAX, u16::MAX)` = latest version).
 - Insert stamps `xmin = txn_id` (from `StatementContext.txn_id`), `xmax = 0`, `t_ctid = sentinel`, `infomask = 0`. Legacy v1 tuples decode as frozen/always-visible (`xmin = FROZEN_XID`, `xmax = 0`).
 - `INTEGER`: 8 bytes, little-endian i64
-- `TEXT`: 4-byte length prefix + UTF-8 bytes
+- `TEXT`/`BYTEA`: v1/v2 use a 4-byte length prefix plus bytes. V3 uses the top two bits of that same length word as a tag: `00` plain (byte-identical to v2), `01` inline compressed (`codec`, `dict_id`, `raw_len`, `raw_crc32`, payload), `10` a 17-byte external TOAST pointer, and `11` reserved/corrupt. The low 30 bits are the supported varlena length cap. External TOAST stream bytes are stored in the hidden TOAST relation as `[raw_crc32][raw]` for codec `none`, `[raw_crc32][zstd payload]` for codec `zstd`, or `[dict_id][raw_crc32][zstd-dict payload]` for codec `zstd_dict`; the pointer's `stored_len` includes this stream header.
 - `BOOLEAN`: 1 byte
 - `NULL`: represented in the null bitmap, no data bytes
 
