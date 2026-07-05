@@ -31,6 +31,7 @@ const TYPE_SET_SEQUENCE_VALUE: u8 = 17;
 pub(crate) const TYPE_FULL_PAGE_IMAGE_COMPRESSED: u8 = 18;
 pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
 pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
+pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -169,6 +170,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::FullPageImageCompressed { .. } => TYPE_FULL_PAGE_IMAGE_COMPRESSED,
         WalRecordKind::CreateDictionary { .. } => TYPE_CREATE_DICTIONARY,
         WalRecordKind::AlterTableCompression { .. } => TYPE_ALTER_TABLE_COMPRESSION,
+        WalRecordKind::AlterTableToast { .. } => TYPE_ALTER_TABLE_TOAST,
     }
 }
 
@@ -262,7 +264,8 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             buf.extend_from_slice(bytes);
             Ok(buf)
         }
-        // AlterTableCompression: no arm — the `_ =>` serde_json fallback handles it.
+        // AlterTableCompression/AlterTableToast: no arms — the `_ =>` serde_json
+        // fallback handles logical DDL records.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -533,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_compression_records() {
+    fn round_trips_compression_and_toast_records() {
         let kinds = [
             WalRecordKind::FullPageImageCompressed {
                 file_id: 3,
@@ -556,6 +559,17 @@ mod tests {
                 table_id: 4,
                 compression: common::CompressionSetting::None,
                 active_dict_id: None,
+            },
+            WalRecordKind::AlterTableToast {
+                table_id: 5,
+                toast: common::ToastOptions {
+                    mode: common::ToastMode::Aggressive,
+                    tuple_target: 4096,
+                    min_value_size: 512,
+                    compression: common::ToastCompression::Zstd,
+                    active_dict_id: None,
+                },
+                toast_table_id: Some(6),
             },
         ];
         for kind in kinds {

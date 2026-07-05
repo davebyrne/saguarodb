@@ -149,6 +149,13 @@ pub fn open_app(config: Config) -> Result<AppState> {
         )?;
         replay_applied = true;
     }
+    if replay_applied {
+        validate_referenced_dictionaries(
+            catalog.as_ref(),
+            compression.as_ref(),
+            &config.data_dir.join("dicts"),
+        )?;
+    }
 
     let next_txn_id = next_txn_id(wal.as_ref())?;
     // Establish the CLOG implicit-committed floor (`docs/specs/mvcc.md` §5.4, §8).
@@ -277,6 +284,7 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::DropSequence { .. }
             | WalRecordKind::CreateDictionary { .. }
             | WalRecordKind::AlterTableCompression { .. }
+            | WalRecordKind::AlterTableToast { .. }
     )
 }
 
@@ -301,7 +309,8 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         WalRecordKind::DropTable { .. }
         | WalRecordKind::DropIndex { .. }
         | WalRecordKind::DropSequence { .. }
-        | WalRecordKind::AlterTableCompression { .. } => Ok(false),
+        | WalRecordKind::AlterTableCompression { .. }
+        | WalRecordKind::AlterTableToast { .. } => Ok(false),
         _ => Ok(false),
     }
 }
@@ -416,6 +425,15 @@ fn apply_redo(
         } => {
             let schema = catalog.set_table_compression(*table_id, *setting, *active_dict_id)?;
             storage.apply_set_table_compression(schema)
+        }
+        WalRecordKind::AlterTableToast {
+            table_id,
+            toast,
+            toast_table_id,
+        } => {
+            let schema =
+                catalog.set_table_toast_metadata(*table_id, toast.clone(), *toast_table_id)?;
+            storage.apply_set_table_toast_metadata(schema)
         }
         // Normalized away above: `FullPageImageCompressed` never reaches this match
         // (it is rewritten to `FullPageImage` before the match runs).
@@ -585,6 +603,204 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn recovery_applies_committed_alter_table_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        let toast_table_id;
+        let updated_toast = common::ToastOptions {
+            mode: common::ToastMode::Aggressive,
+            tuple_target: 4096,
+            min_value_size: 512,
+            compression: common::ToastCompression::Zstd,
+            active_dict_id: None,
+        };
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, bio text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            let users = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap();
+            table_id = users.id;
+            toast_table_id = users.toast_table_id;
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 41,
+                    kind: WalRecordKind::AlterTableToast {
+                        table_id,
+                        toast: updated_toast.clone(),
+                        toast_table_id,
+                    },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 41,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table(table_id)
+            .unwrap()
+            .expect("users table exists after recovery");
+        assert_eq!(users.toast, updated_toast);
+        assert_eq!(users.toast_table_id, toast_table_id);
+    }
+
+    #[test]
+    fn recovery_skips_uncommitted_alter_table_toast() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        let original_toast;
+        let original_toast_table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, bio text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            let users = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap();
+            table_id = users.id;
+            original_toast = users.toast.clone();
+            original_toast_table_id = users.toast_table_id;
+
+            let aborted_toast = common::ToastOptions {
+                mode: common::ToastMode::Aggressive,
+                tuple_target: 4096,
+                min_value_size: 512,
+                compression: common::ToastCompression::Zstd,
+                active_dict_id: None,
+            };
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::AlterTableToast {
+                        table_id,
+                        toast: aborted_toast,
+                        toast_table_id: original_toast_table_id,
+                    },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+
+            let in_flight_toast = common::ToastOptions {
+                mode: common::ToastMode::Off,
+                tuple_target: 3072,
+                min_value_size: 2048,
+                compression: common::ToastCompression::None,
+                active_dict_id: None,
+            };
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 43,
+                    kind: WalRecordKind::AlterTableToast {
+                        table_id,
+                        toast: in_flight_toast,
+                        toast_table_id: original_toast_table_id,
+                    },
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table(table_id)
+            .unwrap()
+            .expect("users table exists after recovery");
+        assert_eq!(users.toast, original_toast);
+        assert_eq!(users.toast_table_id, original_toast_table_id);
+    }
+
+    #[test]
+    fn recovery_validates_replayed_toast_active_dictionary() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        let toast_table_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, bio text)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+            let users = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap();
+            table_id = users.id;
+            toast_table_id = users.toast_table_id;
+            let mut toast = users.toast.clone();
+            toast.active_dict_id = Some(99);
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 44,
+                    kind: WalRecordKind::AlterTableToast {
+                        table_id,
+                        toast,
+                        toast_table_id,
+                    },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 44,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+        }
+
+        let err = AppState::open_for_test(dir.path())
+            .err()
+            .expect("replayed TOAST dictionary reference should be validated");
+        assert!(
+            err.message.contains("TOAST active dictionary 99"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("users"), "{}", err.message);
     }
 
     #[test]

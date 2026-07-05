@@ -26,7 +26,8 @@ mod tests {
     use common::{
         ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
         KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
-        StatementContext, TableSchema, ToastOptions, TxnId, TxnStatus, TxnStatusView, Value,
+        StatementContext, TableSchema, ToastCompression, ToastMode, ToastOptions, TxnId, TxnStatus,
+        TxnStatusView, Value,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -1323,6 +1324,48 @@ mod tests {
             .storage
             .get(&ctx, 2, &Key(vec![Value::Integer(1)]))
             .expect_err("a dropped table's hidden TOAST relation should not be readable");
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn recovery_toast_metadata_update_is_wal_free_and_drives_drop_cascade() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let base = users_schema();
+        let mut toast_relation = users_schema();
+        toast_relation.id = 2;
+        toast_relation.name = "\0toast_1".to_string();
+        toast_relation.relation_kind = RelationKind::Toast { base_table: 1 };
+        harness
+            .storage
+            .install_schemas(vec![base.clone(), toast_relation])
+            .unwrap();
+
+        let mut updated = base;
+        updated.toast_table_id = Some(2);
+        updated.toast.mode = ToastMode::Aggressive;
+        updated.toast.min_value_size = 512;
+        updated.toast.compression = ToastCompression::Zstd;
+        harness
+            .storage
+            .apply_set_table_toast_metadata(updated)
+            .unwrap();
+        assert_eq!(
+            harness.wal.record_count(),
+            0,
+            "recovery metadata apply must not append WAL"
+        );
+
+        harness.storage.apply_drop_table(1).unwrap();
+        assert_eq!(
+            harness.wal.record_count(),
+            0,
+            "recovery drop apply must remain WAL-free"
+        );
+        let err = harness
+            .storage
+            .get(&ctx, 2, &Key(vec![Value::Integer(1)]))
+            .expect_err("updated TOAST link should cascade-drop the hidden relation");
         assert_eq!(err.code, SqlState::UndefinedTable);
     }
 

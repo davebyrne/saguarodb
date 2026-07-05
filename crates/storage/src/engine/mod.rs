@@ -488,6 +488,22 @@ impl PageBackedStorageEngine {
         Ok(())
     }
 
+    /// Install an ALTERed TOAST schema: swap the TableState schema. No WAL — the
+    /// caller (server ALTER / recovery replay) owns record emission and ordering.
+    pub fn set_table_toast_metadata(&self, schema: &TableSchema) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("state lock poisoned"))?;
+        let table = state
+            .tables
+            .get_mut(&schema.id)
+            .filter(|t| !t.dropped)
+            .ok_or_else(|| DbError::internal(format!("table {} is not installed", schema.id)))?;
+        table.schema = schema.clone();
+        Ok(())
+    }
+
     /// Evenly-sampled initialized heap page images for dictionary training.
     /// Caller holds the exclusive guard, so the images are stable.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>> {

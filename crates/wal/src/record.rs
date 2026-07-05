@@ -1,6 +1,6 @@
 use common::{
     CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId, SequenceSchema,
-    TableId, TableSchema,
+    TableId, TableSchema, ToastOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +127,13 @@ pub enum WalRecordKind {
         table_id: TableId,
         compression: CompressionSetting,
         active_dict_id: Option<u32>,
+    },
+    /// DDL: updates a table's TOAST policy and linked hidden TOAST relation
+    /// (CLOG-gated on replay like other DDL).
+    AlterTableToast {
+        table_id: TableId,
+        toast: ToastOptions,
+        toast_table_id: Option<TableId>,
     },
 }
 

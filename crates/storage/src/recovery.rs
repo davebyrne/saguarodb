@@ -44,4 +44,8 @@ impl RecoveryOperations for PageBackedStorageEngine {
     fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()> {
         self.set_table_compression(&schema)
     }
+
+    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()> {
+        self.set_table_toast_metadata(&schema)
+    }
 }

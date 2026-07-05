@@ -62,6 +62,9 @@ pub trait RecoveryOperations: Send + Sync {
     /// updated schema and re-registers the file compression configs. Must not
     /// append WAL (see At-Rest Page Compression).
     fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
+    /// Recovery apply for `ALTER TABLE ... SET (toast...)`: installs the updated
+    /// schema metadata. Must not append WAL.
+    fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
 }
 ```
 
@@ -1111,6 +1114,9 @@ impl PageBackedStorageEngine {
     /// state and re-register file configs. No WAL (see At-Rest Page
     /// Compression).
     pub fn set_table_compression(&self, schema: &TableSchema) -> Result<()>;
+    /// Install an ALTERed table schema's TOAST metadata into the live state.
+    /// No WAL; the caller owns logical record emission and commit ordering.
+    pub fn set_table_toast_metadata(&self, schema: &TableSchema) -> Result<()>;
     /// Up to `cap` evenly-sampled initialized heap page images, for
     /// dictionary training.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
@@ -1127,7 +1133,7 @@ impl PageBackedStorageEngine {
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
-`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
+`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 
 ## Structural Write Latches (Milestone E2a)
 
