@@ -5,14 +5,15 @@
 
 ## Purpose
 
-`compress` owns the compression codecs, the at-rest page envelope, per-table
-dictionary training and the durable dictionary-file format, and the shared
-`CompressionRegistry` that both the at-rest heap-page path and the WAL
-full-page-image path consult (`docs/specs/compression.md`). It knows nothing
-about pages, files, WAL records, or the catalog — callers pass raw bytes in and
-get raw or enveloped bytes back; every policy decision (which file compresses,
-which dictionary a file uses) lives in the caller's `FileId → FileCompression`
-configuration, not in this crate.
+`compress` owns the compression codecs, the at-rest page envelope, TOAST
+value-level compression helpers, per-table dictionary training and the durable
+dictionary-file format, and the shared `CompressionRegistry` that the at-rest
+heap-page path, WAL full-page-image path, and dictionary-backed TOAST value
+path consult (`docs/specs/compression.md`). It knows nothing about pages,
+files, WAL records, rows, or the catalog — callers pass raw bytes in and get
+raw, compressed, or enveloped bytes back; every policy decision (which file
+compresses, which dictionary a file uses, whether a compressed value is worth
+storing) lives in the caller's configuration and size checks, not in this crate.
 
 ## Depends On
 
@@ -23,8 +24,9 @@ configuration, not in this crate.
 - `parking_lot` — `CompressionRegistry`'s internal locking
 
 Leaf crate: no dependents besides `common`. Consumed by `storage` (at-rest
-`HeapPageStore` envelopes and the engine's WAL-FPI compression) and `server`
-(constructs and shares one `CompressionRegistry` instance, owns the
+`HeapPageStore` envelopes, the engine's WAL-FPI compression, and TOAST value
+payload compression/decompression) and `server` (constructs and shares one
+`CompressionRegistry` instance, owns the
 `DictStore`). `wal` does **not** depend on `compress`: its record types carry
 plain codec-id/dict-id fields and already-compressed bytes; compression and
 decompression happen at the `storage`/`server` call sites (`docs/specs/crates/wal.md`,
@@ -33,13 +35,17 @@ decompression happen at the `storage`/`server` call sites (`docs/specs/crates/wa
 ## Public API
 
 ```rust
-// Codec ids stored in envelopes and WAL records (`compression.md` §3).
+// Codec ids shared by page/WAL compression and TOAST value payloads.
+// CODEC_NONE is valid only for value payloads; page envelopes and compressed
+// WAL FPIs must use a real codec.
+pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZSTD: u8 = 1;
 pub const CODEC_ZSTD_DICT: u8 = 2;
 
-// Fixed zstd levels: at-rest runs on background flush/rewrite paths,
-// WAL runs inline on the DML path.
+// Fixed zstd levels: at-rest and TOAST value compression run off the hottest
+// DML path, while WAL FPI compression runs inline on the DML path.
 pub const LEVEL_AT_REST: i32 = 3;
+pub const TOAST_ZSTD_LEVEL: i32 = LEVEL_AT_REST;
 pub const LEVEL_WAL: i32 = 1;
 
 // Envelope layout constants (see byte-layout table below).
@@ -56,6 +62,8 @@ pub struct Envelope<'a> {
 pub fn is_envelope(slot: &[u8]) -> bool;
 pub fn encode_envelope(codec: u8, dict_id: u32, payload: &[u8]) -> Result<Vec<u8>>;
 pub fn decode_envelope(slot: &[u8]) -> Result<Envelope<'_>>;
+
+pub fn compress_value_zstd(raw: &[u8]) -> Result<Vec<u8>>;
 
 /// A table/index file's at-rest compression config (`compression.md` §4/§5a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -92,6 +100,15 @@ impl CompressionRegistry {
         payload: &[u8],
         expected_len: usize,
     ) -> Result<Vec<u8>>;
+
+    pub fn compress_value_zstd_dict(&self, dict_id: u32, raw: &[u8]) -> Result<Vec<u8>>;
+    pub fn decompress_value(
+        &self,
+        codec: u8,
+        dict_id: Option<u32>,
+        payload: &[u8],
+        raw_len: usize,
+    ) -> Result<Vec<u8>>;
 }
 
 /// Train a zstd dictionary from page-image samples (`compression.md` §7).
@@ -112,8 +129,10 @@ impl DictStore {
 - `is_envelope(slot)` — `true` iff `slot` is at least 6 bytes and its first 6
   bytes equal `ENVELOPE_MARKER`. Pure prefix check; does not validate the rest
   of the header.
-- `encode_envelope(codec, dict_id, payload)` — builds the 18-byte header plus
-  `payload`. `Err` only if `payload.len()` does not fit `u16` (unreachable in
+- `encode_envelope(codec, dict_id, payload)` — validates `codec` is a real
+  page-envelope codec (`CODEC_ZSTD` or `CODEC_ZSTD_DICT`) and builds the
+  18-byte header plus `payload`. `Err` if `codec` is `CODEC_NONE`/unknown or
+  if `payload.len()` does not fit `u16` (the length case is unreachable in
   practice: at-rest payloads are only ever stored compressed when smaller than
   `PAGE_SIZE`, and WAL FPI payloads are checked the same way before this is
   called).
@@ -121,11 +140,31 @@ impl DictStore {
   declared length against the slice actually present, and the payload CRC, and
   returns the borrowed `Envelope`. `Err` (a structured corruption-class
   `DbError`, `SqlState::InternalError`) on any mismatch: not-an-envelope,
-  truncated header, unknown version, unknown codec, a declared length that
-  would read past the end of `slot`, or a CRC mismatch. `decode_envelope` does
-  **not** decompress or check the decompressed length — that is a
+  truncated header, unknown version, unknown codec, value-only `CODEC_NONE`, a
+  declared length that would read past the end of `slot`, or a CRC mismatch.
+  `decode_envelope` does **not** decompress or check the decompressed length — that is a
   `CompressionRegistry` concern (`decompress_page`/`decompress_fpi`), so this
   function has no dependency on `PAGE_SIZE`.
+
+### TOAST value helpers
+
+- `compress_value_zstd(raw)` — compresses a single value payload with dict-less
+  zstd at `TOAST_ZSTD_LEVEL` and returns the bytes. It does **not** compare
+  compressed size against raw size and does **not** add a page envelope or any
+  TOAST-specific header; storage owns those decisions and wrappers.
+- `CompressionRegistry::compress_value_zstd_dict(dict_id, raw)` — same policy
+  boundary as `compress_value_zstd`, but uses the registered prepared
+  dictionary for `dict_id`. This is a registry method rather than a free
+  function because a durable `dict_id` is only meaningful after resolution
+  through the registry. An unregistered id is a structured corruption-class
+  error.
+- `CompressionRegistry::decompress_value(codec, dict_id, payload, raw_len)` —
+  decodes a single TOAST value payload to exactly `raw_len` bytes. `CODEC_NONE`
+  returns the raw payload after a length check and requires `dict_id == None`;
+  `CODEC_ZSTD` uses dict-less zstd and also requires `dict_id == None`;
+  `CODEC_ZSTD_DICT` requires `Some(dict_id)` and a registered dictionary.
+  Unknown codecs, invalid codec/dictionary pairings, zstd failures, and
+  wrong decompressed lengths are structured corruption-class errors.
 
 ### `CompressionRegistry`
 
@@ -136,7 +175,9 @@ impl DictStore {
 - `register_dictionary(dict_id, bytes)` — `Err` if `dict_id == 0` (reserved to
   mean "no dictionary"); otherwise prepares and installs three handles per
   dictionary — an at-rest encoder (`LEVEL_AT_REST`), a WAL encoder
-  (`LEVEL_WAL`), and one decoder — amortizing zstd's dictionary-processing
+  (`LEVEL_WAL`), and one decoder. TOAST dictionary value compression reuses the
+  at-rest encoder because `TOAST_ZSTD_LEVEL == LEVEL_AT_REST` in v1. These
+  prepared handles amortize zstd's dictionary-processing
   cost across every later use rather than redoing it per page.
 - `has_dictionary(dict_id)` — membership probe (used by `server` recovery when
   reconciling durable dictionary files against WAL `CreateDictionary` records).
@@ -196,7 +237,7 @@ A compressed page slot begins with an 18-byte header:
 [4]      0xFF              (position of a raw page's PageType; 0xFF is invalid)
 [5]      0xFF              (position of a raw page's PageVersion; 0xFF is invalid)
 [6]      envelope format version = 1
-[7]      codec id       (1 = zstd, 2 = zstd + dictionary)
+[7]      codec id       (1 = zstd, 2 = zstd + dictionary; 0 is rejected)
 [8..12)  dict_id  u32 LE    (0 when codec = 1)
 [12..14) payload length u16 LE
 [14..18) CRC32 over payload, LE
@@ -229,7 +270,7 @@ dictionary files are small and immutable; garbage collection is future work
 
 - Envelope round-trips with and without a dictionary id; detection correctly
   distinguishes a raw v2 page and an all-zero slot from an envelope; CRC
-  tamper, version tamper, unknown-codec tamper, and truncation are all
+  tamper, version tamper, value-only `CODEC_NONE`, unknown-codec tamper, and truncation are all
   rejected by `decode_envelope`; an oversized payload (`> u16::MAX`) is
   rejected by `encode_envelope`.
 - `CompressionRegistry`: a file with no config round-trips raw; a configured
@@ -241,6 +282,11 @@ dictionary files are small and immutable; garbage collection is future work
   dict-less zstd when one is configured; an unresolvable dictionary id is a
   structured error on decompress; the `CompressionRegistry: Send + Sync`
   assertion holds.
+- TOAST value helpers: dict-less zstd value compression round-trips;
+  dictionary-backed value compression round-trips with a trained test
+  dictionary; `CODEC_NONE` raw value payloads are accepted only through
+  `decompress_value`; wrong `raw_len`, unknown codecs, invalid codec/dict-id
+  pairings, and page envelopes using `CODEC_NONE` are structured errors.
 - `train_dictionary` returns `None` on an empty corpus and on a corpus below
   the minimum sample count.
 - `DictStore` save/load round-trips with CRC validation; re-`save`ing an

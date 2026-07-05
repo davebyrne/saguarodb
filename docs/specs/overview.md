@@ -49,7 +49,7 @@ saguarodb/
 │   ├── buffer/             (buffer pool — in-memory page cache)
 │   ├── wal/                (write-ahead log)
 │   ├── catalog/            (table metadata, schema definitions)
-│   ├── compress/           (compression codecs, at-rest page envelope, dictionaries)
+│   ├── compress/           (compression codecs, at-rest page envelope, TOAST value helpers, dictionaries)
 │   └── common/             (shared types: DataType, Value, Row, errors, config)
 ```
 
@@ -69,7 +69,7 @@ catalog → common
 compress → common
 ```
 
-No circular dependencies. `common` and `compress` are leaf crates (`compress` also depends only on `common`). `server` is the root. `compress` is consumed by `storage` (at-rest page compression, WAL full-page-image compression) and `server` (constructs and shares the `CompressionRegistry`/`DictStore`); `wal` does not depend on `compress` (`docs/specs/compression.md`, `docs/specs/crates/compress.md`).
+No circular dependencies. `common` and `compress` are leaf crates (`compress` also depends only on `common`). `server` is the root. `compress` is consumed by `storage` (at-rest page compression, WAL full-page-image compression, and TOAST value payload compression/decompression) and `server` (constructs and shares the `CompressionRegistry`/`DictStore`); `wal` does not depend on `compress` (`docs/specs/compression.md`, `docs/specs/crates/compress.md`).
 
 ### Cargo Package and Crate Naming
 

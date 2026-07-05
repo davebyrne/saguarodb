@@ -1,11 +1,16 @@
 use common::{DbError, Result, SqlState};
 
-/// Codec ids stored in envelopes and WAL records (`compression.md` §3).
+/// Codec ids shared by page/WAL compression and TOAST value payloads
+/// (`compression.md` §3). `CODEC_NONE` is valid only for value payloads;
+/// page-at-rest envelopes and compressed WAL FPIs must use a real codec.
+pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZSTD: u8 = 1;
 pub const CODEC_ZSTD_DICT: u8 = 2;
 
-/// zstd levels: at-rest runs on background flush paths, WAL on the DML path.
+/// zstd levels: at-rest and TOAST value compression run off the hottest DML
+/// path, while WAL FPI compression runs inline on the DML path.
 pub const LEVEL_AT_REST: i32 = 3;
+pub const TOAST_ZSTD_LEVEL: i32 = LEVEL_AT_REST;
 pub const LEVEL_WAL: i32 = 1;
 
 /// First 6 bytes of a compressed page slot. Bytes 4 and 5 sit where a raw v2
@@ -27,11 +32,19 @@ fn corrupt(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
 }
 
+fn validate_envelope_codec(codec: u8) -> Result<()> {
+    if codec != CODEC_ZSTD && codec != CODEC_ZSTD_DICT {
+        return Err(corrupt(format!("unknown envelope codec {codec}")));
+    }
+    Ok(())
+}
+
 pub fn is_envelope(slot: &[u8]) -> bool {
     slot.len() >= ENVELOPE_MARKER.len() && slot[..ENVELOPE_MARKER.len()] == ENVELOPE_MARKER
 }
 
 pub fn encode_envelope(codec: u8, dict_id: u32, payload: &[u8]) -> Result<Vec<u8>> {
+    validate_envelope_codec(codec)?;
     let payload_len = u16::try_from(payload.len())
         .map_err(|_| corrupt(format!("envelope payload too large: {}", payload.len())))?;
     let mut out = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len());
@@ -43,6 +56,33 @@ pub fn encode_envelope(codec: u8, dict_id: u32, payload: &[u8]) -> Result<Vec<u8
     out.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// Compress a single TOAST value payload with dict-less zstd.
+///
+/// The caller owns all policy decisions: this helper always returns the
+/// compressed bytes if zstd succeeds, even when the output is larger than the
+/// raw input.
+pub fn compress_value_zstd(raw: &[u8]) -> Result<Vec<u8>> {
+    zstd::bulk::compress(raw, TOAST_ZSTD_LEVEL)
+        .map_err(|err| corrupt(format!("zstd value compress failed: {err}")))
+}
+
+pub(crate) fn decompress_value_zstd(payload: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+    let value = zstd::bulk::decompress(payload, raw_len)
+        .map_err(|err| corrupt(format!("zstd value decompress failed: {err}")))?;
+    ensure_value_len(&value, raw_len)?;
+    Ok(value)
+}
+
+pub(crate) fn ensure_value_len(value: &[u8], raw_len: usize) -> Result<()> {
+    if value.len() != raw_len {
+        return Err(corrupt(format!(
+            "decompressed value is {} bytes, expected {raw_len}",
+            value.len()
+        )));
+    }
+    Ok(())
 }
 
 pub fn decode_envelope(slot: &[u8]) -> Result<Envelope<'_>> {
@@ -57,9 +97,7 @@ pub fn decode_envelope(slot: &[u8]) -> Result<Envelope<'_>> {
         return Err(corrupt(format!("unknown envelope version {version}")));
     }
     let codec = slot[7];
-    if codec != CODEC_ZSTD && codec != CODEC_ZSTD_DICT {
-        return Err(corrupt(format!("unknown envelope codec {codec}")));
-    }
+    validate_envelope_codec(codec)?;
     let dict_id = u32::from_le_bytes(slot[8..12].try_into().expect("4 bytes"));
     let payload_len = u16::from_le_bytes(slot[12..14].try_into().expect("2 bytes")) as usize;
     let stored_crc = u32::from_le_bytes(slot[14..18].try_into().expect("4 bytes"));
@@ -126,6 +164,10 @@ mod tests {
         bad_codec[7] = 42;
         assert!(decode_envelope(&bad_codec).is_err());
 
+        let mut no_codec = env.clone();
+        no_codec[7] = CODEC_NONE;
+        assert!(decode_envelope(&no_codec).is_err());
+
         let mut truncated = env.clone();
         truncated.truncate(ENVELOPE_HEADER_LEN - 1);
         assert!(decode_envelope(&truncated).is_err());
@@ -140,6 +182,12 @@ mod tests {
     fn encode_rejects_oversized_payload() {
         let too_big = vec![0u8; usize::from(u16::MAX) + 1];
         assert!(encode_envelope(CODEC_ZSTD, 0, &too_big).is_err());
+    }
+
+    #[test]
+    fn encode_rejects_non_envelope_codecs() {
+        assert!(encode_envelope(CODEC_NONE, 0, b"payload").is_err());
+        assert!(encode_envelope(99, 0, b"payload").is_err());
     }
 
     #[test]

@@ -36,12 +36,14 @@ changes meaning.
 - Preserve every existing durability invariant: WAL-before-data, first-touch
   FPI torn-page repair, PageLSN-gated redo, checkpoint ordering, `page_count`
   semantics, stable `(page, slot)` TIDs.
-- Build the shared codec/dictionary infrastructure that future TOAST work
-  will reuse (codec-id registry, versioned envelopes, dictionary store).
+- Build the shared codec/dictionary infrastructure that TOAST reuses
+  (codec-id registry, versioned envelopes, dictionary store).
 
 **Non-goals (explicit)**
 
-- TOAST / out-of-line values (future; reuses the codec registry).
+- TOAST / out-of-line value storage. That is specified separately; this page
+  compression design only defines the shared codec ids and value helpers that
+  TOAST reuses.
 - Multi-page compression groups on the live store (breaks the torn-page
   repair invariant for undirtied group members, or requires COW machinery;
   grouping belongs to future sealed/archival segments).
@@ -74,10 +76,13 @@ Owns:
   errors. Future codecs (e.g. lz4) allocate new ids.
 - **Compression levels** (fixed constants in v1): zstd level 1 on the WAL
   append path (inside statement execution), zstd level 3 for pages at rest
-  (background flush / eviction / rewrite).
+  (background flush / eviction / rewrite), and zstd level 3 for TOAST value
+  payloads.
 - **Dictionary training** (`zstd`'s ZDICT) and dictionary handles for
   compress/decompress.
 - **The at-rest page envelope** (§5).
+- **TOAST value helpers** that compress/decompress raw value payload bytes
+  without page envelopes and without deciding whether compression wins.
 - **The dictionary file format** (§7).
 
 The `CompressionSetting` enum (`None | Zstd`) lives in `common` so `catalog`
@@ -265,10 +270,11 @@ envelopes are self-describing and mixed encodings are legal.
   resolver. Like other DDL effects it is gated on the creating
   transaction's committed status via the rebuilt CLOG.
 - **Durability order (load-bearing):** dictionary file durable → WAL record
-  appended → anything (page envelope or WAL FPI record) may reference the
-  dict id. Consequently a referenced dictionary is always resolvable: at
-  recovery, dictionaries referenced by post-checkpoint records are either
-  in `<data>/dicts/` already or installed by an earlier-LSN
+  appended → anything (page envelope, WAL FPI record, or TOAST value payload)
+  may reference the dict id. Consequently a referenced dictionary is always
+  resolvable: at recovery, dictionaries referenced by post-checkpoint records
+  or TOAST metadata/value payloads are either in `<data>/dicts/` already or
+  installed by an earlier-LSN
   `CreateDictionary` record.
 - **Boot-time validation:** after seeding the dictionary resolver from
   `<data>/dicts/` (and before replay), recovery (`open_app`) checks every
@@ -530,4 +536,4 @@ Decisions here deliberately keep a future data-dir-creation-time page size
 - Page-map/COW store (byte-granular savings) behind the same trait, reusing
   the envelope as the extent format.
 - Sealed multi-page segments for cold data (where multi-page compression
-  groups are safe); TOAST value compression via the same codec registry.
+  groups are safe).

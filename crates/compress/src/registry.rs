@@ -6,8 +6,8 @@ use parking_lot::RwLock;
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
 use crate::codec::{
-    CODEC_ZSTD, CODEC_ZSTD_DICT, LEVEL_AT_REST, LEVEL_WAL, decode_envelope, encode_envelope,
-    is_envelope,
+    CODEC_NONE, CODEC_ZSTD, CODEC_ZSTD_DICT, LEVEL_AT_REST, LEVEL_WAL, decode_envelope,
+    decompress_value_zstd, encode_envelope, ensure_value_len, is_envelope,
 };
 #[cfg(test)]
 use crate::dict::train_dictionary;
@@ -157,6 +157,67 @@ impl CompressionRegistry {
         Some((codec, dict_id, payload))
     }
 
+    /// Compress a single TOAST value payload with the registered dictionary.
+    ///
+    /// The caller owns all policy decisions: this helper always returns the
+    /// compressed bytes if zstd succeeds, even when the output is larger than
+    /// the raw input.
+    pub fn compress_value_zstd_dict(&self, dict_id: u32, raw: &[u8]) -> Result<Vec<u8>> {
+        let dict = self.dictionary(dict_id).ok_or_else(|| {
+            corrupt(format!(
+                "compression dictionary {dict_id} is not registered"
+            ))
+        })?;
+        zstd::bulk::Compressor::with_prepared_dictionary(&dict.enc_rest)
+            .and_then(|mut c| c.compress(raw))
+            .map_err(|err| corrupt(format!("zstd dict value compress failed: {err}")))
+    }
+
+    /// Decompress a single TOAST value payload to exactly `raw_len` bytes.
+    pub fn decompress_value(
+        &self,
+        codec: u8,
+        dict_id: Option<u32>,
+        payload: &[u8],
+        raw_len: usize,
+    ) -> Result<Vec<u8>> {
+        let value = match codec {
+            CODEC_NONE => {
+                if let Some(dict_id) = dict_id {
+                    return Err(corrupt(format!(
+                        "raw value codec must not name dictionary {dict_id}"
+                    )));
+                }
+                ensure_value_len(payload, raw_len)?;
+                payload.to_vec()
+            }
+            CODEC_ZSTD => {
+                if let Some(dict_id) = dict_id {
+                    return Err(corrupt(format!(
+                        "zstd value codec must not name dictionary {dict_id}"
+                    )));
+                }
+                decompress_value_zstd(payload, raw_len)?
+            }
+            CODEC_ZSTD_DICT => {
+                let dict_id =
+                    dict_id.ok_or_else(|| corrupt("zstd-dict value codec missing dict id"))?;
+                let dict = self.dictionary(dict_id).ok_or_else(|| {
+                    corrupt(format!(
+                        "compression dictionary {dict_id} is not registered"
+                    ))
+                })?;
+                let value = zstd::bulk::Decompressor::with_prepared_dictionary(&dict.dec)
+                    .and_then(|mut d| d.decompress(payload, raw_len))
+                    .map_err(|err| corrupt(format!("zstd dict value decompress failed: {err}")))?;
+                ensure_value_len(&value, raw_len)?;
+                value
+            }
+            other => return Err(corrupt(format!("unknown value compression codec {other}"))),
+        };
+        Ok(value)
+    }
+
     /// Decompress a compressed payload (WAL record or envelope body) back to
     /// exactly `expected_len` bytes.
     pub fn decompress_fpi(
@@ -194,6 +255,7 @@ impl CompressionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compress_value_zstd;
 
     // Repetitive page-like images compress well even at level 1.
     fn sample_image(seed: u8) -> Vec<u8> {
@@ -308,6 +370,97 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored, image);
+    }
+
+    fn sample_value(seed: u8) -> Vec<u8> {
+        let chunk = format!("toast-value-{seed}-name-email-bio-location;");
+        chunk.as_bytes().iter().copied().cycle().take(768).collect()
+    }
+
+    #[test]
+    fn value_zstd_round_trips() {
+        let registry = CompressionRegistry::new();
+        let raw = sample_value(1);
+        let payload = compress_value_zstd(&raw).unwrap();
+
+        let restored = registry
+            .decompress_value(CODEC_ZSTD, None, &payload, raw.len())
+            .unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn value_raw_payload_round_trips() {
+        let registry = CompressionRegistry::new();
+        let raw = sample_value(2);
+
+        let restored = registry
+            .decompress_value(CODEC_NONE, None, &raw, raw.len())
+            .unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn value_zstd_dict_round_trips() {
+        let registry = CompressionRegistry::new();
+        let samples: Vec<Vec<u8>> = (0..64).map(|i| sample_value(i as u8)).collect();
+        let dict = train_dictionary(&samples).unwrap();
+        registry.register_dictionary(11, &dict).unwrap();
+
+        let raw = sample_value(3);
+        let payload = registry.compress_value_zstd_dict(11, &raw).unwrap();
+        let restored = registry
+            .decompress_value(CODEC_ZSTD_DICT, Some(11), &payload, raw.len())
+            .unwrap();
+        assert_eq!(restored, raw);
+    }
+
+    #[test]
+    fn value_decompress_rejects_wrong_raw_len() {
+        let registry = CompressionRegistry::new();
+        let raw = sample_value(4);
+        let payload = compress_value_zstd(&raw).unwrap();
+
+        let err = registry
+            .decompress_value(CODEC_ZSTD, None, &payload, raw.len() + 1)
+            .unwrap_err();
+        assert_eq!(err.kind, common::ErrorKind::Storage);
+        assert_eq!(err.code, common::SqlState::InternalError);
+
+        assert!(
+            registry
+                .decompress_value(CODEC_NONE, None, &raw, raw.len() + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn value_decompress_rejects_unknown_codec() {
+        let registry = CompressionRegistry::new();
+        let err = registry
+            .decompress_value(99, None, b"payload", 7)
+            .unwrap_err();
+        assert_eq!(err.kind, common::ErrorKind::Storage);
+        assert_eq!(err.code, common::SqlState::InternalError);
+    }
+
+    #[test]
+    fn value_decompress_validates_dictionary_metadata() {
+        let registry = CompressionRegistry::new();
+        let raw = sample_value(5);
+        let payload = compress_value_zstd(&raw).unwrap();
+
+        assert!(
+            registry
+                .decompress_value(CODEC_ZSTD, Some(1), &payload, raw.len())
+                .is_err()
+        );
+        assert!(
+            registry
+                .decompress_value(CODEC_ZSTD_DICT, None, &payload, raw.len())
+                .is_err()
+        );
+        assert!(registry.compress_value_zstd_dict(1, &raw).is_err());
     }
 
     #[test]
