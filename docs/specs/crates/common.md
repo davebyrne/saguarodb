@@ -37,6 +37,10 @@
   version dead to **every** snapshot?" against a single scalar GC `horizon`, used
   by VACUUM (Milestone F) rather than by snapshot-relative reads.
 - Cross-cutting traits: `FlushPolicy`, `ConcurrencyController`, `TxnStatusView`.
+- The scalar function-dispatch registry: a table pairing each built-in scalar
+  function's bind-time signature check with its run-time evaluator, so a function
+  is defined once and consulted by both `planner` (binding) and `executor`
+  (evaluation). See "Scalar Function Registry" below.
 
 ## Public Types
 
@@ -483,6 +487,44 @@ values. `session_info` carries connection identity (`user`, `database`,
 real per-connection value when system information functions are wired into query
 execution. Default contexts install loud/no-op test implementations where
 appropriate. `StatementContext` is `Clone` but not `Copy`.
+
+## Scalar Function Registry
+
+`common` owns the built-in scalar function registry so that each function is
+defined in one place instead of split across `planner` (binding) and `executor`
+(evaluation). Each function is one `ScalarFunction` entry:
+
+```rust
+pub struct ScalarFunction {
+    pub name: &'static str,
+    pub null_handling: NullHandling,                       // Propagate | NeverNull
+    pub signature: fn(name: &str, args: &[ArgType]) -> Result<DataType>,
+    pub eval: fn(ctx: &StatementContext, values: &[Value]) -> Result<Value>,
+}
+```
+
+`lookup_scalar_function(name) -> Option<&'static ScalarFunction>` resolves a
+lowercase name against the table (the sole authority for which scalar functions
+exist). The binder builds an `ArgType { data_type, literal }` per bound argument
+(the `literal` value is populated only for constants, and consulted only by
+`EXTRACT` to validate its field name) and calls `signature`, which validates arity
+and argument types and returns the result `DataType`; signature failures are
+`ErrorKind::Plan`. Result nullability is not returned by `signature` — it is
+derived centrally by `ScalarFunction::result_nullable`: a `Propagate` function's
+result is nullable when any argument is, and a `NeverNull` function's result is
+never nullable. The executor evaluates the arguments, applies the same NULL
+policy (`Propagate` short-circuits to `NULL` when any argument is `NULL`;
+`NeverNull` is always evaluated), and calls `eval`; evaluation domain failures
+are `ErrorKind::Execute`. `NeverNull` covers `CONCAT` (which ignores `NULL`
+arguments) and the zero-argument system information functions.
+
+The registry holds the ordinary scalar functions (text, math, string,
+`SUBSTRING`, `EXTRACT`) and the system information functions; their per-function
+signatures and semantics are specified in `docs/specs/crates/planner.md` (binding)
+and `docs/specs/crates/executor.md` (evaluation). Aggregate functions, sequence
+functions (`nextval`/`currval`/`setval`), and the NULL-folding forms
+`COALESCE`/`NULLIF` are intentionally not registry entries: they have their own
+bound representations and binding rules.
 
 ## MVCC Types
 
