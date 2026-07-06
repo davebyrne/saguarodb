@@ -474,6 +474,9 @@ fn convert_column_def(
 /// volatile form accepted here is `nextval('sequence')`, which the catalog later
 /// resolves to a durable sequence id.
 fn convert_column_default(expr: &sql::Expr) -> Result<ParsedDefault> {
+    // Canonical SQL text, kept for the non-constant case so the binder can
+    // re-parse and bind the expression at CREATE TABLE and each INSERT.
+    let text = expr.to_string();
     match convert_expr(expr)? {
         Expr::Literal(value) => Ok(ParsedDefault::Const(value)),
         Expr::Function {
@@ -499,9 +502,13 @@ fn convert_column_default(expr: &sql::Expr) -> Result<ParsedDefault> {
             Expr::Literal(Value::Numeric(value)) => {
                 Ok(ParsedDefault::Const(Value::Numeric(-value)))
             }
-            _ => unsupported("DEFAULT must be a constant expression"),
+            // A negation of a non-constant operand is a general expression default.
+            _ => Ok(ParsedDefault::Expr(text)),
         },
-        _ => unsupported("DEFAULT must be a constant expression"),
+        // Any other expression (function calls, arithmetic, casts, ...) is carried
+        // as text and bound later; column references in it fail to bind, so a
+        // default cannot reference table columns.
+        _ => Ok(ParsedDefault::Expr(text)),
     }
 }
 

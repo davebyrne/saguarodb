@@ -70,6 +70,7 @@ pub(super) fn bind_insert(
 
     let on_conflict = bind_on_conflict(catalog, &table, on_conflict, declared)?;
     let returning = bind_returning(catalog, &table, returning, declared)?;
+    let default_exprs = bind_omitted_expr_defaults(catalog, &table, &columns)?;
 
     Ok(BoundStatement::Insert {
         table: table.id,
@@ -77,7 +78,30 @@ pub(super) fn bind_insert(
         source,
         on_conflict,
         returning,
+        default_exprs,
     })
+}
+
+/// Bind the expression `DEFAULT`s of columns omitted by this INSERT, so the
+/// executor can evaluate them per row. Constant and sequence defaults need no
+/// bound expression (the executor reads them from the schema); only
+/// `ColumnDefault::Expr` columns appear here.
+fn bind_omitted_expr_defaults(
+    catalog: &dyn CatalogManager,
+    table: &TableSchema,
+    columns: &[ColumnId],
+) -> Result<Vec<(ColumnId, BoundExpr)>> {
+    let provided: HashSet<_> = columns.iter().copied().collect();
+    let mut defaults = Vec::new();
+    for column in &table.columns {
+        if provided.contains(&column.id) {
+            continue;
+        }
+        if let Some(ColumnDefault::Expr(text)) = &column.default {
+            defaults.push((column.id, super::bind_default_expr(catalog, text)?));
+        }
+    }
+    Ok(defaults)
 }
 
 /// Bind an `ON CONFLICT` clause. The arbiter is always the primary key: an
@@ -412,12 +436,17 @@ fn insert_columns(table: &TableSchema, column_names: &[String]) -> Result<Vec<Co
 fn validate_insert_omissions(table: &TableSchema, columns: &[ColumnId]) -> Result<()> {
     let provided: HashSet<_> = columns.iter().copied().collect();
     for column in &table.columns {
-        // A NOT NULL column may be omitted only when it supplies a non-NULL
-        // DEFAULT; otherwise the omitted value would be NULL.
+        // A NOT NULL column may be omitted only when it supplies a DEFAULT that
+        // can produce a non-NULL value. A constant NULL default cannot; a sequence
+        // default never does; an expression default might, so it is allowed here
+        // and a NULL result is caught per row at insert time (matching PostgreSQL).
         let has_usable_default = matches!(
             &column.default,
             Some(ColumnDefault::Const(value)) if !matches!(value, common::Value::Null)
-        ) || matches!(&column.default, Some(ColumnDefault::Nextval(_)));
+        ) || matches!(
+            &column.default,
+            Some(ColumnDefault::Nextval(_)) | Some(ColumnDefault::Expr(_))
+        );
         if !column.nullable && !has_usable_default && !provided.contains(&column.id) {
             return Err(plan_error(
                 SqlState::NotNullViolation,

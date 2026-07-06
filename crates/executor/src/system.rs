@@ -584,6 +584,9 @@ fn render_default(catalog: &dyn CatalogManager, default: &ColumnDefault) -> Resu
                 .unwrap_or_else(|| format!("<missing sequence {sequence}>"));
             Ok(Some(format!("nextval('{}')", quote_sql_text(&name))))
         }
+        // A non-constant default is stored as canonical SQL text, which is exactly
+        // what `column_default` should report.
+        ColumnDefault::Expr(text) => Ok(Some(text.clone())),
     }
 }
 

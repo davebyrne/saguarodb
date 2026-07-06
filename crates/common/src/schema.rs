@@ -164,6 +164,10 @@ pub enum RelationKind {
 pub enum ParsedDefault {
     Const(Value),
     Nextval(String),
+    /// A non-constant `DEFAULT` expression carried as canonical SQL text. The
+    /// binder re-parses and binds it at `CREATE TABLE` (to validate) and at each
+    /// `INSERT` (to evaluate per row); it may not reference table columns.
+    Expr(String),
     /// Internal form used while executing `SERIAL` desugaring. Explicit user
     /// defaults use `Nextval` and may not borrow a serial-owned sequence.
     OwnedNextval(String),
@@ -183,6 +187,10 @@ pub enum ParsedDefault {
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
+    /// A non-constant `DEFAULT` expression, persisted as canonical SQL text. The
+    /// binder re-parses and binds it against an empty column scope at each
+    /// `INSERT`; the executor evaluates the bound form per row.
+    Expr(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -201,11 +201,13 @@ pub enum ParsedDefault {
     Nextval(String),
     OwnedNextval(String),
     Serial,
+    Expr(String),  // non-constant default, as canonical SQL text
 }
 
 pub enum ColumnDefault {
     Const(Value),
     Nextval(SequenceId),
+    Expr(String),  // non-constant default, as canonical SQL text
 }
 
 pub struct ParsedColumnDef {
@@ -317,7 +319,12 @@ is the catalog-owned durable sequence metadata. `last_value`/`is_called` are the
 checkpoint baseline for the storage runtime's current sequence state.
 `ColumnDefault::Nextval(SequenceId)` is the stored form of
 `DEFAULT nextval('<sequence>')` and is evaluated by the executor through the
-statement's sequence manager. `ParsedDefault::Serial` is the parse-time marker
+statement's sequence manager. `ColumnDefault::Expr(String)` / `ParsedDefault::Expr(String)`
+are the stored form of a non-constant `DEFAULT` expression, held as canonical SQL
+text: the binder re-parses it (`parser::parse_expression`) and binds it against an
+empty column scope both at `CREATE TABLE` (to validate its type and reject column
+references, aggregates, subqueries, and parameters) and at each `INSERT` (to
+evaluate it per omitted row). `ParsedDefault::Serial` is the parse-time marker
 for a `SERIAL` family column during `CREATE TABLE`; the executor replaces it with
 the internal `ParsedDefault::OwnedNextval(name)` after creating the owned
 sequence, and the catalog resolves that internal form to

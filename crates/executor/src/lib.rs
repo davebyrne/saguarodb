@@ -665,6 +665,7 @@ mod tests {
             &schema,
             &[0],
             vec![Value::Integer(9)],
+            &[],
         )
         .unwrap();
 
@@ -703,7 +704,7 @@ mod tests {
             relation_kind: RelationKind::User,
         };
 
-        let row = crate::query::build_insert_row(&statement, &schema, &[], vec![]).unwrap();
+        let row = crate::query::build_insert_row(&statement, &schema, &[], vec![], &[]).unwrap();
 
         assert_eq!(
             row,
@@ -844,6 +845,7 @@ mod tests {
             columns: vec![0, 1],
             on_conflict: None,
             returning: None,
+            default_exprs: vec![],
             source: Box::new(PhysicalPlan::Values {
                 rows: vec![vec![
                     BoundExpr::Literal {

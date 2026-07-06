@@ -137,6 +137,7 @@ impl QueryEngine {
                 source,
                 on_conflict,
                 returning,
+                default_exprs,
             } => execute_insert(
                 ctx,
                 *table,
@@ -144,6 +145,7 @@ impl QueryEngine {
                 source,
                 on_conflict.as_ref(),
                 returning.as_ref(),
+                default_exprs,
             ),
             PhysicalPlan::Update {
                 table,
@@ -460,6 +462,7 @@ fn execute_insert(
     source: &PhysicalPlan,
     on_conflict: Option<&BoundOnConflict>,
     returning: Option<&BoundReturning>,
+    default_exprs: &[(ColumnId, BoundExpr)],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
@@ -479,7 +482,13 @@ fn execute_insert(
                 "INSERT source produced the wrong number of values",
             ));
         }
-        let row = build_insert_row(&ctx.statement, &schema, columns, source_row.row.values)?;
+        let row = build_insert_row(
+            &ctx.statement,
+            &schema,
+            columns,
+            source_row.row.values,
+            default_exprs,
+        )?;
 
         // ON CONFLICT: the arbiter is the primary key. Probe the visible row at the
         // proposed primary key; on a conflict, take the action (skip for DO NOTHING,
@@ -605,6 +614,7 @@ pub(crate) fn build_insert_row(
     schema: &TableSchema,
     columns: &[ColumnId],
     values: Vec<Value>,
+    default_exprs: &[(ColumnId, BoundExpr)],
 ) -> Result<Row> {
     debug_assert_eq!(values.len(), columns.len());
     let mut full = vec![Value::Null; schema.columns.len()];
@@ -615,7 +625,7 @@ pub(crate) fn build_insert_row(
     }
     for (slot, column) in schema.columns.iter().enumerate() {
         if !columns.contains(&column.id) {
-            full[slot] = evaluate_column_default(statement, column)?;
+            full[slot] = evaluate_column_default(statement, column, default_exprs)?;
         }
     }
     coerce_numeric_columns(schema, &mut full)?;
@@ -626,18 +636,43 @@ pub(crate) fn build_insert_row(
 fn evaluate_column_default(
     statement: &StatementContext,
     column: &common::ColumnDef,
+    default_exprs: &[(ColumnId, BoundExpr)],
 ) -> Result<Value> {
     match &column.default {
         Some(ColumnDefault::Const(value)) => Ok(value.clone()),
         Some(ColumnDefault::Nextval(sequence)) => Ok(Value::Integer(
             statement.nextval_recording_currval(*sequence)?,
         )),
+        Some(ColumnDefault::Expr(_)) => {
+            // The binder bound this column's default expression against an empty
+            // scope; evaluate it over an empty row (it cannot reference columns).
+            let bound = default_exprs
+                .iter()
+                .find(|(id, _)| *id == column.id)
+                .map(|(_, expr)| expr)
+                .ok_or_else(|| {
+                    DbError::execute(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "expression DEFAULT for column {} is not supported here",
+                            column.name
+                        ),
+                    )
+                })?;
+            let empty = ExecRow {
+                row: Row { values: Vec::new() },
+                identity: None,
+            };
+            eval_expr(statement, bound, &empty)
+        }
         None => Ok(Value::Null),
     }
 }
 
 /// Map a row's `columns`-ordered values onto a full table row and insert it.
-/// Shared by INSERT and the COPY FROM path.
+/// Shared by INSERT and the COPY FROM path. `default_exprs` carries bound
+/// expression defaults for omitted columns (empty for COPY, which does not yet
+/// support expression defaults).
 pub(crate) fn map_and_insert_row(
     ctx: &ExecutionContext<'_>,
     table: TableId,
@@ -645,7 +680,7 @@ pub(crate) fn map_and_insert_row(
     columns: &[ColumnId],
     values: Vec<Value>,
 ) -> Result<()> {
-    let row = build_insert_row(&ctx.statement, schema, columns, values)?;
+    let row = build_insert_row(&ctx.statement, schema, columns, values, &[])?;
     ctx.storage.insert(&ctx.statement, table, row)?;
     Ok(())
 }

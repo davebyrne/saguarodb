@@ -140,12 +140,17 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             source,
             on_conflict,
             returning,
+            default_exprs,
         } => LogicalPlan::Insert {
             table,
             columns,
             source: Box::new(simplify_logical(*source)),
             on_conflict: on_conflict.map(simplify_on_conflict),
             returning,
+            default_exprs: default_exprs
+                .into_iter()
+                .map(|(column, expr)| (column, fold_expr(expr)))
+                .collect(),
         },
         LogicalPlan::Update {
             table,

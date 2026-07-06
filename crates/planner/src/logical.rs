@@ -46,6 +46,9 @@ pub enum LogicalPlan {
         source: Box<LogicalPlan>,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        /// Bound expression `DEFAULT`s for omitted columns (see
+        /// `BoundStatement::Insert`), carried through to execution.
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
     },
     Update {
         table: TableId,
@@ -167,6 +170,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             source,
             on_conflict,
             returning,
+            default_exprs,
         } => {
             let source = match source {
                 BoundInsertSource::Values {
@@ -184,6 +188,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 source: Box::new(source),
                 on_conflict: on_conflict.clone(),
                 returning: returning.clone(),
+                default_exprs: default_exprs.clone(),
             })
         }
         BoundStatement::Query(query) => plan_query(query),

@@ -418,7 +418,10 @@ fn substitute_expr(expr: &mut BoundExpr, params: &[Value]) -> Result<()> {
 
 // --- shared child traversal ---
 
-fn for_each_child(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr) -> Result<()>) -> Result<()> {
+pub(crate) fn for_each_child(
+    expr: &BoundExpr,
+    f: &mut impl FnMut(&BoundExpr) -> Result<()>,
+) -> Result<()> {
     match expr {
         // The subquery body is reached via `subquery_select`, not as a BoundExpr
         // child; only `InSubquery`'s left operand is a direct child here.

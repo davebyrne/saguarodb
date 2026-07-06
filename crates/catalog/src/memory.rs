@@ -671,6 +671,9 @@ fn convert_column_default(
         )),
         Some(ParsedDefault::Nextval(name)) => resolve_sequence_default(snapshot, name, false),
         Some(ParsedDefault::OwnedNextval(name)) => resolve_sequence_default(snapshot, name, true),
+        // A non-constant expression default is stored as canonical SQL text; the
+        // binder validated it against the column at CREATE TABLE time.
+        Some(ParsedDefault::Expr(text)) => Ok(Some(ColumnDefault::Expr(text))),
         None => Ok(None),
     }
 }

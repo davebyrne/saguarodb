@@ -47,6 +47,9 @@ pub enum PhysicalPlan {
         source: Box<PhysicalPlan>,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        /// Bound expression `DEFAULT`s for omitted columns (see
+        /// `BoundStatement::Insert`), evaluated per row by the executor.
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
     },
     Update {
         table: TableId,
@@ -180,12 +183,14 @@ pub fn physical_plan(
             source,
             on_conflict,
             returning,
+            default_exprs,
         } => Ok(PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(physical_plan(source, catalog)?),
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
+            default_exprs: default_exprs.clone(),
         }),
         LogicalPlan::Update {
             table,

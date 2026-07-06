@@ -40,12 +40,16 @@ pub(crate) fn resolve_plan_subqueries(
             source,
             on_conflict,
             returning,
+            default_exprs,
         } => PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
+            // Default expressions cannot contain subqueries (rejected at bind), so
+            // they are carried through this rewrite unchanged.
+            default_exprs: default_exprs.clone(),
         },
         PhysicalPlan::Update {
             table,

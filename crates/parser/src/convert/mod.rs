@@ -65,6 +65,23 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     convert_statement(statements.remove(0))
 }
 
+/// Parse a single SQL scalar expression (not a statement). Used to re-parse the
+/// canonical text of a stored non-constant column `DEFAULT` so the binder can bind
+/// it. The whole input must be one expression; trailing tokens are rejected.
+pub fn parse_expression(sql: &str) -> Result<crate::Expr> {
+    let dialect = PostgreSqlDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|err| parse_error(format!("failed to parse expression: {err}")))?;
+    let expr = parser
+        .parse_expr()
+        .map_err(|err| parse_error(format!("failed to parse expression: {err}")))?;
+    if parser.peek_token().token != Token::EOF {
+        return Err(parse_error("unexpected trailing tokens after expression"));
+    }
+    convert_expr(&expr)
+}
+
 fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     match statement {
         sql::Statement::CreateTable(table) => convert_create_table(table),

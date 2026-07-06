@@ -159,6 +159,10 @@ pub enum BoundStatement {
         source: BoundInsertSource,
         on_conflict: Option<BoundOnConflict>,
         returning: Option<BoundReturning>,
+        /// Bound expression `DEFAULT`s for columns this INSERT omits, evaluated per
+        /// row by the executor. Only `ColumnDefault::Expr` columns appear here;
+        /// constant and sequence defaults are read from the schema.
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
     },
     Query(BoundQuery),
     Update {

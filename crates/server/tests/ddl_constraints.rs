@@ -131,6 +131,131 @@ async fn column_default_survives_restart() {
     assert_eq!(rows, vec![vec![Some("5".to_string())]]);
 }
 
+/// A non-constant expression `DEFAULT` (a scalar function, arithmetic) is
+/// evaluated when the column is omitted; an explicit value still overrides it.
+#[tokio::test]
+async fn expression_default_applied_on_omitted_column() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table t (id integer primary key, \
+             n integer default 2 * 3, s text not null default upper('hi'))",
+        )
+        .await
+        .unwrap();
+
+    server
+        .simple_query("insert into t (id) values (1)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, n, s) values (2, 10, 'x')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id, n, s from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("6".to_string()),
+                Some("HI".to_string()),
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("10".to_string()),
+                Some("x".to_string()),
+            ],
+        ]
+    );
+}
+
+/// Invalid expression `DEFAULT`s are rejected at `CREATE TABLE`: one referencing a
+/// table column (a default is bound in an empty scope), one whose result type does
+/// not match the column, and one calling an unknown function.
+#[tokio::test]
+async fn expression_default_invalid_is_rejected() {
+    let server = TestServer::start().await.unwrap();
+
+    let err = server
+        .simple_query("create table t (a integer primary key, b integer default a + 1)")
+        .await
+        .err()
+        .expect("column-referencing default should fail");
+    assert!(
+        err.message.contains("42703"),
+        "expected UndefinedColumn: {}",
+        err.message
+    );
+
+    let err = server
+        .simple_query("create table t (id integer primary key, n integer default upper('x'))")
+        .await
+        .err()
+        .expect("type-mismatched default should fail");
+    assert!(
+        err.message.contains("42804"),
+        "expected DatatypeMismatch: {}",
+        err.message
+    );
+
+    let err = server
+        .simple_query("create table t (id integer primary key, n integer default bogus_fn())")
+        .await
+        .err()
+        .expect("unknown-function default should fail");
+    assert!(
+        err.message.contains("42601"),
+        "expected SyntaxError: {}",
+        err.message
+    );
+}
+
+/// An expression `DEFAULT` survives a restart (replayed from the durable catalog /
+/// `CreateTable` WAL record) and is still evaluated for inserts after recovery.
+#[tokio::test]
+async fn expression_default_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key, n integer default 3 + 4)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id) values (1)")
+            .await
+            .unwrap();
+        // No checkpoint: force recovery to replay the CreateTable WAL record.
+    }
+
+    let server = restart(&path).await;
+    let rows = server
+        .simple_query("select n from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("7".to_string())]]);
+
+    // The default metadata also survived: a new insert still evaluates it.
+    server
+        .simple_query("insert into t (id) values (2)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select n from t where id = 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("7".to_string())]]);
+}
+
 #[tokio::test]
 async fn sequence_ddl_create_drop_and_if_exists() {
     let server = TestServer::start().await.unwrap();

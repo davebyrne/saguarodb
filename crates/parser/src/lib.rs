@@ -13,6 +13,13 @@ pub fn parse(sql: &str) -> Result<Statement> {
     convert::parse_statement(sql)
 }
 
+/// Parse a single SQL scalar expression (not a statement). The binder uses this
+/// to re-parse the stored canonical text of a non-constant column `DEFAULT`
+/// before binding it.
+pub fn parse_expression(sql: &str) -> Result<Expr> {
+    convert::parse_expression(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use common::{
@@ -1409,12 +1416,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_constant_default() {
-        // A column reference / arithmetic default is not a foldable constant.
-        let err = parse("create table t (a integer, b integer default a + 1)").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        // Non-nextval function defaults remain unsupported.
-        assert!(parse("create table t (a timestamp default now())").is_err());
+    fn carries_non_constant_default_as_expression_text() {
+        // A non-constant default is no longer rejected at parse time: it is carried
+        // as canonical SQL text for the binder to bind (and to reject if invalid,
+        // e.g. an arithmetic default that references a column).
+        let Statement::CreateTable { columns, .. } =
+            parse("create table t (a integer, b integer default a + 1)").unwrap()
+        else {
+            panic!("expected create table");
+        };
+        assert_eq!(
+            columns[1].default,
+            Some(common::ParsedDefault::Expr("a + 1".to_string()))
+        );
+
+        let Statement::CreateTable { columns, .. } =
+            parse("create table t (a timestamp default now())").unwrap()
+        else {
+            panic!("expected create table");
+        };
+        assert_eq!(
+            columns[0].default,
+            Some(common::ParsedDefault::Expr("now()".to_string()))
+        );
+
+        // A malformed nextval default (non-string argument) is still a parse error.
         assert!(parse("create table t (a integer default nextval(42))").is_err());
     }
 

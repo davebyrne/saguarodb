@@ -439,6 +439,25 @@ fn validate_default_value(catalog: &dyn CatalogManager, column: &ParsedColumnDef
                 "OwnedNextval default reached bind-time validation",
             ));
         }
+        ParsedDefault::Expr(text) => {
+            // A non-constant expression default: bind it in an empty column scope
+            // (so it cannot reference table columns) and require its result type be
+            // assignable to the column. It is bound again per row at INSERT time; a
+            // NULL result is caught then by the NOT NULL check, so it is not
+            // rejected here (matching PostgreSQL).
+            let bound = bind_default_expr(catalog, text)?;
+            let expr_type = bound.data_type();
+            if !default_expr_type_matches(&column.data_type, &expr_type) {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    format!(
+                        "DEFAULT expression for column {} has type {:?}, expected {:?}",
+                        column.name, expr_type, column.data_type
+                    ),
+                ));
+            }
+            return Ok(());
+        }
     };
     if matches!(value, Value::Null) {
         if column.nullable {
@@ -477,6 +496,63 @@ fn default_value_matches(data_type: &DataType, value: &Value) -> bool {
             | (DataType::Bytea, Value::Bytes(_))
             | (DataType::Uuid, Value::Uuid(_))
     )
+}
+
+/// Whether a `DEFAULT` expression's result type may feed a column of `column_type`,
+/// under the same no-implicit-cast rule as `INSERT` assignability: the types must
+/// match, except any `NUMERIC` value is assignable to any `NUMERIC` column
+/// (rounded/range-checked at store time).
+fn default_expr_type_matches(column_type: &DataType, expr_type: &DataType) -> bool {
+    if matches!(
+        (expr_type, column_type),
+        (DataType::Numeric { .. }, DataType::Numeric { .. })
+    ) {
+        return true;
+    }
+    expr_type == column_type
+}
+
+/// Parse and bind a column `DEFAULT` expression's canonical text in an empty
+/// column scope, so it cannot reference table columns (a column reference fails as
+/// an unresolved column). Forms not valid in a constraint context — aggregates,
+/// subqueries, and query parameters — are rejected.
+pub(super) fn bind_default_expr(catalog: &dyn CatalogManager, text: &str) -> Result<BoundExpr> {
+    let parsed = parser::parse_expression(text)?;
+    let mut ctx = BindContext::new(catalog, &[]);
+    let bound = expr::bind_expr(&mut ctx, &parsed, None)?;
+    reject_non_constraint_safe(&bound)?;
+    Ok(bound)
+}
+
+/// Reject expression forms not permitted in a `CHECK` constraint or a column
+/// `DEFAULT`: aggregates, subqueries, and query parameters. Column references are
+/// allowed here — a `DEFAULT` is bound in an empty scope so it cannot produce one,
+/// and a `CHECK` legitimately references the row's columns.
+fn reject_non_constraint_safe(expr: &BoundExpr) -> Result<()> {
+    match expr {
+        BoundExpr::AggregateCall { .. } => {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "aggregate functions are not allowed in DEFAULT or CHECK expressions",
+            ));
+        }
+        BoundExpr::Parameter { .. } => {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "parameters are not allowed in DEFAULT or CHECK expressions",
+            ));
+        }
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "subqueries are not allowed in DEFAULT or CHECK expressions",
+            ));
+        }
+        _ => {}
+    }
+    crate::params::for_each_child(expr, &mut |child| reject_non_constraint_safe(child))
 }
 
 fn plan_error(code: SqlState, message: impl Into<String>) -> DbError {
