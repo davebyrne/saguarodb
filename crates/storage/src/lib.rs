@@ -37,8 +37,8 @@ mod tests {
         StorageMode, apply_physical_redo,
         btree::BTree,
         codec::{
-            DecodedPhysicalValue, MvccHeader, PreparedColumnValue, ToastPointer, VarlenaPhysical,
-            decode_physical_row, encode_row_v3_prepared,
+            DecodedPhysicalValue, HEAP_ONLY, HOT_UPDATED, MvccHeader, PreparedColumnValue,
+            ToastPointer, VarlenaPhysical, decode_physical_row, encode_row_v3_prepared,
         },
         decode_row, encode_row,
         engine::RowLocation,
@@ -2519,6 +2519,325 @@ mod tests {
     }
 
     #[test]
+    fn update_inline_toastable_text_uses_hot() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&insert_ctx, &name_index(false), 0)
+            .unwrap();
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text("inline note".to_string()),
+            ],
+        };
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(false),
+                Value::Text("inline note".to_string()),
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
+        assert_eq!(pk_tids.len(), 1, "HOT update should not add a PK entry");
+        assert_eq!(
+            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            1,
+            "HOT update should not add a secondary index entry"
+        );
+        let root = physical_row_at(&harness, &base, pk_tids[0]);
+        assert_ne!(root.header.infomask & HOT_UPDATED, 0);
+        let successor = physical_row_at(
+            &harness,
+            &base,
+            RowLocation {
+                file_id: base.id,
+                page_num: root.header.t_ctid.0,
+                slot_num: root.header.t_ctid.1,
+            },
+        );
+        assert_ne!(successor.header.infomask & HEAP_ONLY, 0);
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+        assert!(visible_toast_chunk_sizes(&harness, &update_ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn update_inline_compressed_toastable_text_uses_hot() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::Zstd;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&insert_ctx, &name_index(false), 0)
+            .unwrap();
+        let note = "compressible inline note ".repeat(80);
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text(note.clone()),
+            ],
+        };
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(false),
+                Value::Text(note),
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
+        assert_eq!(pk_tids.len(), 1, "HOT update should not add a PK entry");
+        let root = physical_row_at(&harness, &base, pk_tids[0]);
+        let successor = physical_row_at(
+            &harness,
+            &base,
+            RowLocation {
+                file_id: base.id,
+                page_num: root.header.t_ctid.0,
+                slot_num: root.header.t_ctid.1,
+            },
+        );
+        assert_ne!(successor.header.infomask & HEAP_ONLY, 0);
+        assert!(matches!(
+            &successor.values[3],
+            DecodedPhysicalValue::Compressed { .. }
+        ));
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+        assert!(visible_toast_chunk_sizes(&harness, &update_ctx, 1).is_empty());
+    }
+
+    #[test]
+    fn update_external_toastable_text_falls_back_to_normal_update() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&insert_ctx, &name_index(false), 0)
+            .unwrap();
+        let note = "external note ".repeat(700);
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text(note.clone()),
+            ],
+        };
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(false),
+                Value::Text(note),
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
+        assert_eq!(
+            pk_tids.len(),
+            2,
+            "external TOAST owner should use the normal indexed update path"
+        );
+        assert_eq!(
+            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            2,
+            "normal update keeps one secondary entry per version"
+        );
+        for location in pk_tids {
+            let physical = physical_row_at(&harness, &base, location);
+            assert_eq!(physical.header.infomask & HEAP_ONLY, 0);
+        }
+        assert_eq!(
+            external_value_ids_for_key(&harness, &base, &pk(1), 3),
+            vec![1, 2]
+        );
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+    }
+
+    #[test]
+    fn update_inline_to_external_toastable_text_falls_back_to_normal_update() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let (mut base, toast) = base_and_toast_schema();
+        base.toast = ToastOptions::default_new_table();
+        base.toast.min_value_size = 128;
+        base.toast.compression = ToastCompression::None;
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        harness
+            .storage
+            .create_index(&insert_ctx, &name_index(false), 0)
+            .unwrap();
+        let old_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text("inline note".to_string()),
+            ],
+        };
+        let new_row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("Ada".to_string()),
+                Value::Boolean(true),
+                Value::Text("external note ".repeat(700)),
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
+        assert_eq!(
+            pk_tids.len(),
+            2,
+            "would-be external successor should use the normal indexed update path"
+        );
+        assert_eq!(
+            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            2,
+            "normal update keeps one secondary entry per version"
+        );
+        for location in pk_tids {
+            let physical = physical_row_at(&harness, &base, location);
+            assert_eq!(physical.header.infomask & HEAP_ONLY, 0);
+        }
+        assert_eq!(
+            external_value_ids_present_for_key(&harness, &base, &pk(1), 3),
+            vec![1]
+        );
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+    }
+
+    #[test]
+    fn update_toast_enabled_row_above_target_without_candidates_uses_hot() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let update_ctx = StatementContext::new(2);
+        let integer_columns = 270;
+        let (base, toast) = wide_bytea_base_and_toast_schema(integer_columns);
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let wide_row = |second_value: i64| {
+            let mut values = Vec::with_capacity(integer_columns + 1);
+            for index in 0..integer_columns {
+                let value = match index {
+                    0 => 1,
+                    1 => second_value,
+                    _ => index as i64,
+                };
+                values.push(Value::Integer(value));
+            }
+            values.push(Value::Bytes(vec![7; 8]));
+            Row { values }
+        };
+        let old_row = wide_row(10);
+        let new_row = wide_row(11);
+        harness.storage.insert(&insert_ctx, 1, old_row).unwrap();
+
+        assert!(
+            harness
+                .storage
+                .update(&update_ctx, 1, &pk(1), new_row.clone())
+                .unwrap()
+        );
+
+        let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
+        assert_eq!(
+            pk_tids.len(),
+            1,
+            "inline row above toast_tuple_target but with no externalization candidates should still HOT-update"
+        );
+        let root = physical_row_at(&harness, &base, pk_tids[0]);
+        assert_ne!(root.header.infomask & HOT_UPDATED, 0);
+        let successor = physical_row_at(
+            &harness,
+            &base,
+            RowLocation {
+                file_id: base.id,
+                page_num: root.header.t_ctid.0,
+                slot_num: root.header.t_ctid.1,
+            },
+        );
+        assert_ne!(successor.header.infomask & HEAP_ONLY, 0);
+        assert!(visible_toast_chunk_sizes(&harness, &update_ctx, 1).is_empty());
+        assert_eq!(
+            harness.storage.get(&update_ctx, 1, &pk(1)).unwrap(),
+            Some(new_row)
+        );
+    }
+
+    #[test]
     fn vacuum_toast_cleanup_deletes_chunks_before_parent_prune() {
         let harness = StorageHarness::new();
         let insert_ctx = StatementContext::new(1);
@@ -2686,6 +3005,69 @@ mod tests {
         }
         value_ids.sort_unstable();
         value_ids
+    }
+
+    fn external_value_ids_present_for_key(
+        harness: &StorageHarness,
+        schema: &TableSchema,
+        key: &Key,
+        column: usize,
+    ) -> Vec<u64> {
+        let mut value_ids = Vec::new();
+        for location in pk_index_tids_for_key(harness, schema, key) {
+            let physical = physical_row_at(harness, schema, location);
+            if let DecodedPhysicalValue::External { pointer, .. } = &physical.values[column] {
+                value_ids.push(pointer.value_id);
+            }
+        }
+        value_ids.sort_unstable();
+        value_ids
+    }
+
+    fn pk_index_tids_for_key(
+        harness: &StorageHarness,
+        schema: &TableSchema,
+        key: &Key,
+    ) -> Vec<RowLocation> {
+        let btree: BTree<'_, RowLocation> = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            index_file_id(schema.id),
+            harness.storage.compression.as_ref(),
+        );
+        btree.scan_key(key).unwrap()
+    }
+
+    fn secondary_index_tids_for_text(
+        harness: &StorageHarness,
+        index: IndexId,
+        value: &str,
+    ) -> Vec<RowLocation> {
+        let btree: BTree<'_, RowLocation> = BTree::new(
+            harness.storage.buffer_pool.as_ref(),
+            harness.storage.wal.as_ref(),
+            secondary_index_file_id(index),
+            harness.storage.compression.as_ref(),
+        );
+        btree
+            .scan_key(&Key(vec![Value::Text(value.to_string())]))
+            .unwrap()
+    }
+
+    fn physical_row_at(
+        harness: &StorageHarness,
+        schema: &TableSchema,
+        location: RowLocation,
+    ) -> crate::codec::DecodedPhysicalRow {
+        let readable = harness
+            .storage
+            .buffer_pool
+            .read_page(location.file_id, location.page_num)
+            .unwrap();
+        let bytes = crate::page::read_row(readable.data(), location.slot_num)
+            .unwrap()
+            .unwrap();
+        decode_physical_row(schema, &bytes).unwrap()
     }
 
     struct StorageHarness {

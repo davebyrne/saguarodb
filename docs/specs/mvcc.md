@@ -1235,17 +1235,22 @@ savepoints via sub-transaction xids (optional, deferred).
        the primary key (already required — a PK change is rejected) AND for every
        secondary index (`secondary_index_key`). If all index keys match, only
        non-indexed columns differ.
-    2. **Same-page room.** The new tuple, encoded, fits in the free space of the SAME
-       heap page as the predecessor (`previous_location.page_num`, the version
+    2. **Inline physical storage.** For TOAST-enabled tables, neither the predecessor
+       nor the prepared successor may contain an external TOAST pointer. Inline raw and
+       inline-compressed varlenas remain eligible; external-pointer owners and
+       would-be-externalized successors fall back to the normal fully-indexed update
+       path so hidden chunk cleanup remains owned by full VACUUM.
+    3. **Same-page room.** The prepared tuple fits in the free space of the SAME heap
+       page as the predecessor (`previous_location.page_num`, the version
        `locate_visible_version` resolved). Reusing an `UNUSED` slot or appending both
        count; if it does not fit, NOT eligible (fall back).
 
     When eligible: write the new tuple ONTO THE PREDECESSOR'S PAGE
-    (`try_hot_insert_on_page` → `page::try_insert_row`, the page-local insert-or-fail
-    primitive) stamped `xmin = txn`, `xmax = invalid`, `t_ctid = self`, and `HEAP_ONLY`
-    in `infomask` (carried into the logged `HeapInsert` image via
-    `codec::encode_row_with_infomask`, so recovery redoes it — the row bytes are the
-    source of truth for `infomask`). Then stamp the predecessor `xmax = txn`,
+    (`try_hot_insert_on_page`, the page-local insert-or-fail primitive) already
+    prepared as v3 row bytes stamped `xmin = txn`, `xmax = invalid`, `t_ctid = self`,
+    and `HEAP_ONLY` in `infomask` (carried into the logged `HeapInsert` image, so
+    recovery redoes it — the row bytes are the source of truth for `infomask`). Then
+    stamp the predecessor `xmax = txn`,
     `t_ctid → new`, and `HOT_UPDATED` via `stamp_xmax_logged` (which keeps the atomic
     first-updater-wins check — E1b/§7.3: a concurrent claimer yields `40001`). Insert
     **no index entries**: the index keeps pointing at the chain root, and H1's bounded
@@ -1254,8 +1259,9 @@ savepoints via sub-transaction xids (optional, deferred).
     **Orphan-on-conflict** is safe exactly as in the non-HOT path: the heap-only tuple
     is placed before the conflict-checked stamp, so a `40001` leaves it unreferenced —
     its aborting `xmin` makes it invisible via CLOG ⇒ dead-to-all ⇒ VACUUM-reclaimable.
-    When NOT eligible, `update` falls back to the unchanged non-HOT path
-    (update-path pruning-to-make-room is H3, not H2 — a full page simply falls back).
+    When NOT eligible, `update` falls back to the unchanged non-HOT path. If the only
+    blocker is same-page room, H3 update-path pruning may first collapse committed-dead
+    HOT prefixes on that page and retry before falling back.
 
   - **Guard 1 — CREATE INDEX broken-HOT-chain safety (fail-fast).** A "broken HOT
     chain" disagrees, across its versions, on a column a later `CREATE INDEX` targets;

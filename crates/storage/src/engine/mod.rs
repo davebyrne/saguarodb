@@ -1073,14 +1073,14 @@ impl StorageEngine for PageBackedStorageEngine {
         // own page, write the new version as a heap-only tuple on that page, chain the
         // predecessor to it, and insert NO index entries — the index keeps pointing at
         // the chain root, and H1's bounded `t_ctid` walk reaches the new version via
-        // the `HOT_UPDATED → HEAP_ONLY` segment. Falls through to the normal
-        // fully-indexed path when ineligible. When the predecessor's page is full, the
-        // H3 update-path prune (under the heap latch, `ctx.gc_horizon` threaded in)
-        // tries to reclaim same-page room first; only if it still cannot fit does it
-        // fall back.
-        if schema.toast_table_id.is_none()
-            && let Some(result) =
-                self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
+        // the `HOT_UPDATED → HEAP_ONLY` segment. TOAST-enabled tables use this path
+        // only when the predecessor and successor both stay inline; external TOAST
+        // pointers fall back to the fully-indexed path so chunk cleanup remains owned
+        // by full VACUUM. When the predecessor's page is full, the H3 update-path
+        // prune (under the heap latch, `ctx.gc_horizon` threaded in) tries to reclaim
+        // same-page room first; only if it still cannot fit does it fall back.
+        if let Some(result) =
+            self.try_hot_update(ctx, &schema, table, previous_location, infomask, &row)?
         {
             // SSI: a successful HOT update overwrote the row a concurrent serializable
             // reader may have read (`docs/specs/ssi.md` §6).

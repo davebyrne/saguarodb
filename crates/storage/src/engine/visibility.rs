@@ -16,28 +16,21 @@ fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> 
 }
 
 impl PageBackedStorageEngine {
-    /// Read the *current physical* row at `location`, ignoring snapshot
-    /// visibility, and materialize any TOAST values. Used by index-maintenance paths
-    /// that must see the live tuple to recompute index keys, not the version a
-    /// reader's snapshot would observe. User-facing reads use
-    /// [`Self::read_visible_row`] instead. Returns `None` if the line pointer is
-    /// absent (DEAD/UNUSED).
-    pub(super) fn read_location_materialized(
+    /// Read the *current physical* row at `location`, ignoring snapshot visibility
+    /// and without materializing TOAST values. Returns `None` when the line pointer is
+    /// not a live tuple.
+    pub(super) fn read_location_physical(
         &self,
-        ctx: &StatementContext,
         schema: &TableSchema,
         location: RowLocation,
-    ) -> Result<Option<Row>> {
+    ) -> Result<Option<crate::codec::DecodedPhysicalRow>> {
         let readable = self
             .buffer_pool
             .read_page(location.file_id, location.page_num)?;
         let Some(bytes) = page::read_row(readable.data(), location.slot_num)? else {
             return Ok(None);
         };
-        let physical = decode_physical_row(schema, &bytes)?;
-        drop(readable);
-        self.materialize_physical_row(ctx, schema, physical)
-            .map(Some)
+        decode_physical_row(schema, &bytes).map(Some)
     }
 
     pub(super) fn materialize_physical_row(

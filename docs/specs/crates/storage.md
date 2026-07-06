@@ -124,15 +124,20 @@ results are unchanged from the pre-MVCC engine.
   a duplicate of the unchanged key.
 - **HOT-update fast path (Milestone H2).** `update` attempts a HOT update before the
   normal path (`try_hot_update`): eligible when no indexed column changed (the new
-  row's PK and every secondary key match the predecessor's) AND the new tuple fits on
-  the predecessor's own page (`try_hot_insert_on_page` → `page::try_insert_row`). When
-  eligible it writes the new version as a `HEAP_ONLY` tuple on that page
-  (`codec::encode_row_with_infomask`), stamps the predecessor `xmax`/`t_ctid → new`
-  with `HOT_UPDATED` (`stamp_xmax_logged`, keeping the first-updater-wins `40001`
-  check), and inserts **no index entries** — the H1 walk reaches the new version via
-  the root. Logged with existing `HeapInsert` (`HEAP_ONLY` carried in the row bytes) +
-  `HeapUpdateHeader` records; recovery redoes both. When ineligible (indexed column
-  changed) it falls back to the normal fully-indexed update.
+  row's PK and every secondary key match the predecessor's), the TOAST physical state
+  is inline-only (no external pointer in the predecessor and the successor can be
+  prepared without externalizing any value), AND the prepared tuple fits on the
+  predecessor's own page (`try_hot_insert_on_page`). Inline raw and inline-compressed
+  `TEXT`/`BYTEA` values are eligible; rows that own external TOAST chunks fall back to
+  the normal fully-indexed update path. When eligible it writes the prepared v3
+  version as a `HEAP_ONLY` tuple on that page, stamps the predecessor
+  `xmax`/`t_ctid → new` with `HOT_UPDATED` (`stamp_xmax_logged`, keeping the
+  first-updater-wins `40001` check), and inserts **no index entries** — the H1 walk
+  reaches the new version via the root. Logged with existing `HeapInsert`
+  (`HEAP_ONLY` carried in the row bytes) + `HeapUpdateHeader` records; recovery redoes
+  both. When ineligible (indexed column changed, external TOAST ownership, or no
+  same-page room after update-path prune) it falls back to the normal fully-indexed
+  update.
 - **Update-path pruning (Milestone H3).** When a HOT update has no same-page room,
   `try_hot_insert_on_page(.., prune_horizon = Some(ctx.gc_horizon))` first runs the H3
   prune on that page — `classify_page_for_prune(.., allow_dead_roots = false)` then
@@ -1302,13 +1307,16 @@ external values, storage writes the complete external stream to the hidden
 relation under the caller's transaction, stores real `ToastPointer`s in the
 parent row, and returns the v3 parent bytes.
 
-HOT updates remain enabled for tables without a hidden TOAST relation. Tables
-with `toast_table_id = Some(_)` currently route UPDATE through the normal
-fully-indexed path even when the indexed columns are unchanged. This avoids
-committing unreferenced chunks when same-page HOT placement fails after external
-chunk writes. Re-enabling HOT for TOAST-enabled tables requires a placement path
-that can decide same-page fit before chunk writes without violating structural
-latch ordering.
+HOT updates are enabled for TOAST-enabled tables only while the HOT chain remains
+inline-only. The HOT path prepares the successor tuple with the same v3 inline
+representation used by normal writes, including configured inline compression, but
+does not write external chunks. If normal TOAST policy would externalize the
+successor, or if the predecessor already contains an external pointer, HOT declines
+and the normal fully-indexed update writes a fresh parent tuple plus any required
+TOAST chunks. This is an intentional v1 limitation: it recovers HOT for common
+small/medium `TEXT` and `BYTEA` values without making update-path HOT pruning
+responsible for hidden chunk cleanup. Full VACUUM remains the only path that may
+discard parent tuple bytes that own external chunks.
 
 ## TOAST Read Materialization
 

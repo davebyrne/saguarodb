@@ -50,6 +50,13 @@ enum ToastVarlenaPlan {
     External(ToastPointer),
 }
 
+fn physical_row_has_external_toast_pointer(physical: &crate::codec::DecodedPhysicalRow) -> bool {
+    physical
+        .values
+        .iter()
+        .any(|value| matches!(value, DecodedPhysicalValue::External { .. }))
+}
+
 fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
     row.values
         .iter()
@@ -467,6 +474,42 @@ impl PageBackedStorageEngine {
         Ok(bytes)
     }
 
+    fn prepare_row_for_hot_storage(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_logical_index_keys_fit(self, schema, row)?;
+        let header = crate::codec::MvccHeader::fresh(ctx.txn_id, crate::codec::HEAP_ONLY);
+        if matches!(schema.relation_kind, RelationKind::Toast { .. })
+            || schema.toast_table_id.is_none()
+        {
+            let values = plain_prepared_values(row);
+            let bytes = crate::codec::encode_row_v3_prepared(schema, &header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(Some(bytes));
+        }
+
+        let (plans, candidates) = self.prepare_inline_toast_candidates(schema, row)?;
+        if planned_row_meets_toast_goal(schema, row, &plans)? {
+            let values = materialize_prepared_values(schema, row, &plans)?;
+            let bytes = crate::codec::encode_row_v3_prepared(schema, &header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(Some(bytes));
+        }
+
+        if schema.toast.mode == common::ToastMode::Off || candidates.is_empty() {
+            ensure_planned_row_fits_page(schema, row, &plans)?;
+            let values = materialize_prepared_values(schema, row, &plans)?;
+            let bytes = crate::codec::encode_row_v3_prepared(schema, &header, &values)?;
+            ensure_row_len_fits_page(bytes.len())?;
+            return Ok(Some(bytes));
+        }
+
+        Ok(None)
+    }
+
     fn prepare_inline_toast_candidates(
         &self,
         schema: &TableSchema,
@@ -695,10 +738,11 @@ impl PageBackedStorageEngine {
     /// new version on the predecessor's page so the bounded `t_ctid` walk (H1) reaches
     /// it from the indexed root without a new index entry.
     ///
-    /// The tuple is encoded with [`crate::codec::HEAP_ONLY`] set in its header
-    /// (`xmin = txn_id`, `xmax = invalid`, `t_ctid = self`), so the bit is carried
-    /// into the logged `HeapInsert` image and redone on recovery (the row bytes are
-    /// the source of truth for `infomask`). It is logged exactly like
+    /// The caller supplies row bytes already prepared with [`crate::codec::HEAP_ONLY`]
+    /// set in the MVCC header (`xmin = txn_id`, `xmax = invalid`, `t_ctid = self`),
+    /// so the bit is carried into the logged `HeapInsert` image and redone on
+    /// recovery (the row bytes are the source of truth for `infomask`). It is logged
+    /// exactly like
     /// [`Self::log_insert`] (a `FullPageImage` on first touch since the checkpoint,
     /// else a `HeapInsert` delta), so recovery reinstalls it identically.
     ///
@@ -719,13 +763,11 @@ impl PageBackedStorageEngine {
         &self,
         schema: &TableSchema,
         page_num: PageNum,
-        row: &Row,
+        row_bytes: &[u8],
         txn_id: u64,
         prune_horizon: Option<u64>,
     ) -> Result<Option<RowLocation>> {
         let file_id = schema.id;
-        let row_bytes =
-            crate::codec::encode_row_with_infomask(schema, row, txn_id, crate::codec::HEAP_ONLY)?;
 
         let latch = self.structural_latch(file_id);
         let _heap_guard = latch.lock();
@@ -754,7 +796,7 @@ impl PageBackedStorageEngine {
             }
         }
 
-        let slot_num = self.log_insert(&mut guard, txn_id, file_id, page_num, &row_bytes)?;
+        let slot_num = self.log_insert(&mut guard, txn_id, file_id, page_num, row_bytes)?;
         Ok(Some(RowLocation {
             file_id,
             page_num,
@@ -915,8 +957,12 @@ impl PageBackedStorageEngine {
     ///    for the primary key (already enforced by the caller — a PK change is
     ///    rejected) AND for every secondary index ([`secondary_index_key`]). If all
     ///    index keys match, only non-indexed columns differ.
-    /// 2. **Same-page room.** The new heap-only tuple, encoded, fits in the free space
-    ///    of the predecessor's own page ([`Self::try_hot_insert_on_page`] returns
+    /// 2. **Inline physical storage.** For TOAST-enabled tables, neither the
+    ///    predecessor nor the prepared successor may contain an external TOAST pointer.
+    ///    Inline raw and inline-compressed varlenas are eligible; any value that would
+    ///    be externalized falls back to the normal fully-indexed update path.
+    /// 3. **Same-page room.** The prepared heap-only tuple fits in the free space of
+    ///    the predecessor's own page ([`Self::try_hot_insert_on_page`] returns
     ///    `Some`). Reusing an `UNUSED` slot or appending both count. **Update-path
     ///    pruning (H3):** if there is no same-page room, the engine first runs the H3
     ///    prune on that page (collapsing its committed-dead HOT prefixes under the heap
@@ -953,10 +999,14 @@ impl PageBackedStorageEngine {
         // compare every secondary index's key against the new row's. The primary key
         // is already known unchanged (the caller rejects a PK change). A missing
         // predecessor here means it was reclaimed under us — not eligible.
-        let Some(previous_row) = self.read_location_materialized(ctx, schema, previous_location)?
+        let Some(previous_physical) = self.read_location_physical(schema, previous_location)?
         else {
             return Ok(None);
         };
+        if physical_row_has_external_toast_pointer(&previous_physical) {
+            return Ok(None);
+        }
+        let previous_row = self.materialize_physical_row(ctx, schema, previous_physical)?;
         for index in self.table_indexes(table)? {
             let (old_key, _) = secondary_index_key(schema, &index, &previous_row)?;
             let (new_key, _) = secondary_index_key(schema, &index, row)?;
@@ -967,6 +1017,10 @@ impl PageBackedStorageEngine {
             }
         }
 
+        let Some(row_bytes) = self.prepare_row_for_hot_storage(ctx, schema, row)? else {
+            return Ok(None);
+        };
+
         // Eligibility (2): the new heap-only tuple fits on the predecessor's page —
         // possibly after the H3 update-path prune reclaims same-page room from this
         // page's committed-dead HOT prefixes (`Some(ctx.gc_horizon)`). The prune keeps
@@ -976,7 +1030,7 @@ impl PageBackedStorageEngine {
         let Some(new_location) = self.try_hot_insert_on_page(
             schema,
             previous_location.page_num,
-            row,
+            &row_bytes,
             ctx.txn_id,
             Some(ctx.gc_horizon),
         )?
