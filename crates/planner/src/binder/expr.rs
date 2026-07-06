@@ -536,44 +536,9 @@ fn bind_function(
         "nullif" => return bind_nullif(ctx, args),
         _ => {}
     }
-    if is_system_info_function(&name) {
-        return bind_system_info_function(&name, args);
-    }
+    // System information functions (version(), current_user, ...) are ordinary
+    // zero-argument registry entries, so they flow through bind_scalar_function.
     bind_scalar_function(ctx, &name, args)
-}
-
-fn bind_system_info_function(name: &str, args: &[FunctionArg]) -> Result<BoundExpr> {
-    let args = expr_args(name, args)?;
-    if !args.is_empty() {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            format!("function {name} expects no arguments"),
-        ));
-    }
-    let data_type = match name {
-        "pg_backend_pid" => DataType::Integer,
-        _ => DataType::Text,
-    };
-    Ok(BoundExpr::Function {
-        name: name.to_string(),
-        args: Vec::new(),
-        data_type,
-        nullable: false,
-    })
-}
-
-fn is_system_info_function(name: &str) -> bool {
-    matches!(
-        name,
-        "version"
-            | "current_database"
-            | "current_catalog"
-            | "current_schema"
-            | "current_user"
-            | "session_user"
-            | "user"
-            | "pg_backend_pid"
-    )
 }
 
 fn bind_nextval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
@@ -906,7 +871,25 @@ fn bind_scalar_function(
         }
     }
 
-    let (data_type, nullable) = scalar_signature(name, &bound_args)?;
+    bind_registered_function(name, bound_args)
+}
+
+/// Resolve a call against the scalar function registry: validate the (already
+/// bound) arguments through the function's signature and assign its result type
+/// and nullability. The registry is the sole authority for which scalar functions
+/// exist, so an unregistered name is rejected here.
+fn bind_registered_function(name: &str, bound_args: Vec<BoundExpr>) -> Result<BoundExpr> {
+    let Some(func) = common::lookup_scalar_function(name) else {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("function {name} is not supported in v1"),
+        ));
+    };
+    let data_type = {
+        let arg_types: Vec<common::ArgType> = bound_args.iter().map(arg_type_of).collect();
+        (func.signature)(func.name, &arg_types)?
+    };
+    let nullable = func.result_nullable(bound_args.iter().map(BoundExpr::nullable));
     Ok(BoundExpr::Function {
         name: name.to_string(),
         args: bound_args,
@@ -915,167 +898,17 @@ fn bind_scalar_function(
     })
 }
 
-/// Validates a scalar function's arity and argument types, returning its result
-/// type and nullability. All v1 scalar functions are NULL-propagating, so the
-/// result is nullable when any argument is.
-fn scalar_signature(name: &str, args: &[BoundExpr]) -> Result<(DataType, bool)> {
-    let nullable = args.iter().any(BoundExpr::nullable);
-    match name {
-        "upper" | "lower" | "trim" => {
-            expect_arity(name, args, 1)?;
-            require_type(&args[0], DataType::Text)?;
-            Ok((DataType::Text, nullable))
-        }
-        "length" => {
-            expect_arity(name, args, 1)?;
-            require_type(&args[0], DataType::Text)?;
-            Ok((DataType::Integer, nullable))
-        }
-        // ABS, FLOOR, CEIL/CEILING, and ROUND accept either numeric type and
-        // return that same type (FLOOR/CEIL/ROUND of an INTEGER is the integer
-        // itself; of a DOUBLE they round and stay DOUBLE).
-        "abs" | "floor" | "ceil" | "ceiling" | "round" => {
-            expect_arity(name, args, 1)?;
-            let data_type = numeric_arg_type(name, &args[0])?;
-            Ok((data_type, nullable))
-        }
-        // SQRT always returns DOUBLE; an INTEGER argument is widened (PostgreSQL's
-        // sqrt(int) → double precision).
-        "sqrt" => {
-            expect_arity(name, args, 1)?;
-            require_numeric(name, &args[0])?;
-            Ok((DataType::Double, nullable))
-        }
-        // POWER/POW take two numeric arguments and return DOUBLE.
-        "power" | "pow" => {
-            expect_arity(name, args, 2)?;
-            require_numeric(name, &args[0])?;
-            require_numeric(name, &args[1])?;
-            Ok((DataType::Double, nullable))
-        }
-        // MOD is integer-only (matching the `%` operator, which rejects DOUBLE).
-        "mod" => {
-            expect_arity(name, args, 2)?;
-            require_type(&args[0], DataType::Integer)?;
-            require_type(&args[1], DataType::Integer)?;
-            Ok((DataType::Integer, nullable))
-        }
-        "replace" => {
-            expect_arity(name, args, 3)?;
-            for arg in args {
-                require_type(arg, DataType::Text)?;
-            }
-            Ok((DataType::Text, nullable))
-        }
-        // POSITION(substring, string) -> 1-based index, 0 if not found.
-        "position" => {
-            expect_arity(name, args, 2)?;
-            require_type(&args[0], DataType::Text)?;
-            require_type(&args[1], DataType::Text)?;
-            Ok((DataType::Integer, nullable))
-        }
-        "left" | "right" => {
-            expect_arity(name, args, 2)?;
-            require_type(&args[0], DataType::Text)?;
-            require_type(&args[1], DataType::Integer)?;
-            Ok((DataType::Text, nullable))
-        }
-        // CONCAT is variadic over TEXT, ignores NULL arguments, and never returns
-        // NULL (empty string when every argument is NULL). Non-text arguments must
-        // be cast explicitly (no implicit cast).
-        "concat" => {
-            if args.is_empty() {
-                return Err(plan_error(
-                    SqlState::SyntaxError,
-                    "concat requires at least one argument",
-                ));
-            }
-            for arg in args {
-                require_type(arg, DataType::Text)?;
-            }
-            Ok((DataType::Text, false))
-        }
-        // EXTRACT(field FROM source) -> extract('field', source). The field is a
-        // text literal (validated here when literal); the source is a DATE or
-        // TIMESTAMP. The result is DOUBLE (PostgreSQL returns numeric).
-        "extract" => {
-            expect_arity(name, args, 2)?;
-            require_type(&args[0], DataType::Text)?;
-            if let BoundExpr::Literal {
-                value: Value::Text(field),
-                ..
-            } = &args[0]
-                && !is_supported_extract_field(field)
-            {
-                return Err(plan_error(
-                    SqlState::FeatureNotSupported,
-                    format!("EXTRACT field {field} is not supported"),
-                ));
-            }
-            let source_type = args[1].data_type();
-            if !matches!(source_type, DataType::Date | DataType::Timestamp) {
-                return Err(plan_error(
-                    SqlState::DatatypeMismatch,
-                    format!("EXTRACT requires a date or timestamp argument, got {source_type:?}"),
-                ));
-            }
-            Ok((DataType::Double, nullable))
-        }
-        "substring" => {
-            if args.len() != 2 && args.len() != 3 {
-                return Err(plan_error(
-                    SqlState::SyntaxError,
-                    "substring expects 2 or 3 arguments",
-                ));
-            }
-            require_type(&args[0], DataType::Text)?;
-            require_type(&args[1], DataType::Integer)?;
-            if let Some(length) = args.get(2) {
-                require_type(length, DataType::Integer)?;
-            }
-            Ok((DataType::Text, nullable))
-        }
-        _ => Err(plan_error(
-            SqlState::SyntaxError,
-            format!("function {name} is not supported in v1"),
-        )),
+/// View a bound argument as the registry's signature checkers expect: its type,
+/// plus the literal value when the argument is a constant (only `EXTRACT` inspects
+/// it, to validate its field name).
+fn arg_type_of(expr: &BoundExpr) -> common::ArgType<'_> {
+    common::ArgType {
+        data_type: expr.data_type(),
+        literal: match expr {
+            BoundExpr::Literal { value, .. } => Some(value),
+            _ => None,
+        },
     }
-}
-
-/// The numeric type (`Integer` or `Double`) of an argument for functions that
-/// return their argument's type (`ABS`, `FLOOR`, `CEIL`, `ROUND`).
-fn numeric_arg_type(name: &str, arg: &BoundExpr) -> Result<DataType> {
-    match arg.data_type() {
-        data_type @ (DataType::Integer | DataType::Double) => Ok(data_type),
-        other => Err(plan_error(
-            SqlState::DatatypeMismatch,
-            format!("function {name} requires a numeric argument, got {other:?}"),
-        )),
-    }
-}
-
-/// Validate that an argument is numeric (`Integer` or `Double`) without fixing
-/// the result type (`SQRT`, `POWER`).
-fn require_numeric(name: &str, arg: &BoundExpr) -> Result<()> {
-    numeric_arg_type(name, arg).map(|_| ())
-}
-
-/// The `EXTRACT` fields SaguaroDB supports.
-fn is_supported_extract_field(field: &str) -> bool {
-    matches!(
-        field,
-        "year" | "month" | "day" | "hour" | "minute" | "second"
-    )
-}
-
-fn expect_arity(name: &str, args: &[BoundExpr], arity: usize) -> Result<()> {
-    if args.len() != arity {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            format!("function {name} expects {arity} argument(s)"),
-        ));
-    }
-    Ok(())
 }
 
 fn bind_in_list(
@@ -1346,7 +1179,7 @@ fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Resu
     match matches.as_slice() {
         [(binding, column)] => Ok(input_ref(binding, column)),
         [] if table.is_none() && column.eq_ignore_ascii_case("current_schema") => {
-            bind_system_info_function("current_schema", &[])
+            bind_registered_function("current_schema", Vec::new())
         }
         [] => Err(plan_error(
             SqlState::UndefinedColumn,
