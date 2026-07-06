@@ -557,6 +557,7 @@ mod tests {
             toast: common::ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: common::RelationKind::User,
+            checks: Vec::new(),
         }
     }
 

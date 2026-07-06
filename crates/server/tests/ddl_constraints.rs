@@ -256,6 +256,235 @@ async fn expression_default_survives_restart() {
     assert_eq!(rows, vec![vec![Some("7".to_string())]]);
 }
 
+/// A `CHECK` constraint — both column-level (`n INT CHECK (n > 0)`) and table-level
+/// (`CHECK (a <= b)`) — rejects a violating `INSERT` with `SqlState::CheckViolation`
+/// (`23514`) and admits a conforming row.
+#[tokio::test]
+async fn check_constraint_enforced_on_insert() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query(
+            "create table t (id integer primary key, n integer check (n > 0), \
+             lo integer, hi integer, check (lo <= hi))",
+        )
+        .await
+        .unwrap();
+
+    // A conforming row is accepted.
+    server
+        .simple_query("insert into t (id, n, lo, hi) values (1, 5, 2, 9)")
+        .await
+        .unwrap();
+
+    // The column-level check (n > 0) rejects n = 0.
+    let err = server
+        .simple_query("insert into t (id, n, lo, hi) values (2, 0, 2, 9)")
+        .await
+        .err()
+        .expect("column check violation should fail");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
+
+    // The table-level check (lo <= hi) rejects lo > hi.
+    let err = server
+        .simple_query("insert into t (id, n, lo, hi) values (3, 5, 9, 2)")
+        .await
+        .err()
+        .expect("table check violation should fail");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
+
+    let rows = server
+        .simple_query("select id from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+/// A `CHECK` that evaluates to `NULL` (unknown) passes, matching PostgreSQL's
+/// three-valued semantics: only an explicit `false` violates.
+#[tokio::test]
+async fn check_constraint_null_operand_passes() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n integer check (n > 0))")
+        .await
+        .unwrap();
+
+    // n is NULL, so `n > 0` is NULL (not false): the row is admitted.
+    server
+        .simple_query("insert into t (id, n) values (1, null)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, n from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string()), None]]);
+}
+
+/// A `CHECK` constraint is enforced on `UPDATE`: an assignment that would make the
+/// row violate the check is rejected, and the row is unchanged.
+#[tokio::test]
+async fn check_constraint_enforced_on_update() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n integer check (n > 0))")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, n) values (1, 5)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("update t set n = -1 where id = 1")
+        .await
+        .err()
+        .expect("update violating the check should fail");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
+
+    // The row is unchanged; a conforming update succeeds.
+    server
+        .simple_query("update t set n = 10 where id = 1")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select n from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("10".to_string())]]);
+}
+
+/// A `CHECK` is enforced when `INSERT ... ON CONFLICT DO UPDATE` produces the new
+/// row: an upsert whose resulting row violates the check is rejected.
+#[tokio::test]
+async fn check_constraint_enforced_on_upsert() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, n integer check (n > 0))")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, n) values (1, 5)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query(
+            "insert into t (id, n) values (1, 5) \
+             on conflict (id) do update set n = -1",
+        )
+        .await
+        .err()
+        .expect("upsert producing a violating row should fail");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
+}
+
+/// Invalid `CHECK` expressions are rejected at `CREATE TABLE`: a non-boolean result,
+/// a reference to an unknown column, and an aggregate (not allowed in a constraint).
+#[tokio::test]
+async fn check_constraint_invalid_at_create() {
+    let server = TestServer::start().await.unwrap();
+
+    let err = server
+        .simple_query("create table t (id integer primary key, n integer check (n + 1))")
+        .await
+        .err()
+        .expect("non-boolean check should fail");
+    assert!(
+        err.message.contains("42804"),
+        "expected DatatypeMismatch: {}",
+        err.message
+    );
+
+    let err = server
+        .simple_query("create table t (id integer primary key, n integer check (missing > 0))")
+        .await
+        .err()
+        .expect("check referencing an unknown column should fail");
+    assert!(
+        err.message.contains("42703"),
+        "expected UndefinedColumn: {}",
+        err.message
+    );
+
+    let err = server
+        .simple_query("create table t (id integer primary key, n integer check (count(*) > 0))")
+        .await
+        .err()
+        .expect("aggregate in a check should fail");
+    assert!(
+        err.message.contains("0A000"),
+        "expected FeatureNotSupported: {}",
+        err.message
+    );
+}
+
+/// A `CHECK` constraint survives a restart (replayed from the durable catalog /
+/// `CreateTable` WAL record) and is still enforced for inserts after recovery.
+#[tokio::test]
+async fn check_constraint_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key, n integer check (n > 0))")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id, n) values (1, 5)")
+            .await
+            .unwrap();
+        // No checkpoint: force recovery to replay the CreateTable WAL record.
+    }
+
+    let server = restart(&path).await;
+    // The check metadata survived: a violating insert is still rejected...
+    let err = server
+        .simple_query("insert into t (id, n) values (2, 0)")
+        .await
+        .err()
+        .expect("check should still be enforced after restart");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
+    // ...and a conforming insert still succeeds.
+    server
+        .simple_query("insert into t (id, n) values (3, 7)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]
+    );
+}
+
 #[tokio::test]
 async fn sequence_ddl_create_drop_and_if_exists() {
     let server = TestServer::start().await.unwrap();

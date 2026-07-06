@@ -778,6 +778,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 

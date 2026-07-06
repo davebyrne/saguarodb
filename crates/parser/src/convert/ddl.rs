@@ -183,9 +183,10 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
 
     let mut primary_key = Vec::new();
     let mut unique = Vec::new();
+    let mut checks = Vec::new();
     let columns = columns
         .into_iter()
-        .map(|column| convert_column_def(column, &mut primary_key, &mut unique))
+        .map(|column| convert_column_def(column, &mut primary_key, &mut unique, &mut checks))
         .collect::<Result<Vec<_>>>()?;
 
     for constraint in constraints {
@@ -237,6 +238,12 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
                 }
                 unique.push(columns);
             }
+            sql::TableConstraint::Check { name, expr } => {
+                if name.is_some() {
+                    return unsupported("named CHECK constraints are not supported");
+                }
+                checks.push(expr.to_string());
+            }
             _ => return unsupported("unsupported table constraint"),
         }
     }
@@ -250,6 +257,7 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         unique,
         compression: options.compression,
         toast: options.toast,
+        checks,
     })
 }
 
@@ -394,6 +402,7 @@ fn convert_column_def(
     column: sql::ColumnDef,
     primary_key: &mut Vec<String>,
     unique: &mut Vec<Vec<String>>,
+    checks: &mut Vec<String>,
 ) -> Result<ParsedColumnDef> {
     let mut nullable = true;
     let mut default = None;
@@ -432,6 +441,10 @@ fn convert_column_def(
                     unique.push(vec![column_name]);
                 }
             }
+            // Column-level `CHECK (expr)` flattens into the table's check list, as
+            // in PostgreSQL. A named form (`CONSTRAINT c CHECK ...`) sets
+            // `option.name` and is already rejected above.
+            sql::ColumnOption::Check(expr) => checks.push(expr.to_string()),
             _ => return unsupported("unsupported column option"),
         }
     }

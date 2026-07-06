@@ -1613,9 +1613,16 @@ mod tests {
             primary_key: Vec<String>,
             compression: common::CompressionSetting,
             toast: common::ToastOptions,
+            checks: Vec<String>,
         ) -> Result<TableSchema> {
-            self.inner
-                .create_table_with_options(name, columns, primary_key, compression, toast)
+            self.inner.create_table_with_options(
+                name,
+                columns,
+                primary_key,
+                compression,
+                toast,
+                checks,
+            )
         }
 
         fn drop_table(&self, id: TableId) -> Result<()> {

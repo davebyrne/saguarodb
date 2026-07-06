@@ -41,21 +41,24 @@ pub(crate) fn resolve_plan_subqueries(
             on_conflict,
             returning,
             default_exprs,
+            check_exprs,
         } => PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
-            // Default expressions cannot contain subqueries (rejected at bind), so
-            // they are carried through this rewrite unchanged.
+            // Default and CHECK expressions cannot contain subqueries (rejected at
+            // bind), so they are carried through this rewrite unchanged.
             default_exprs: default_exprs.clone(),
+            check_exprs: check_exprs.clone(),
         },
         PhysicalPlan::Update {
             table,
             assignments,
             source,
             returning,
+            check_exprs,
         } => PhysicalPlan::Update {
             table: *table,
             assignments: assignments
@@ -64,6 +67,8 @@ pub(crate) fn resolve_plan_subqueries(
                 .collect::<Result<Vec<_>>>()?,
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
             returning: returning.clone(),
+            // CHECK expressions cannot contain subqueries (rejected at bind).
+            check_exprs: check_exprs.clone(),
         },
         PhysicalPlan::Delete {
             table,

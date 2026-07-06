@@ -56,6 +56,10 @@ pub enum SqlState {
     BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
+    /// `23514`: a row violates a table's `CHECK` constraint — the constraint
+    /// expression evaluated to `false` for the proposed row (a `NULL`/unknown
+    /// result passes, matching PostgreSQL).
+    CheckViolation,
     /// `21000`: a subquery used as an expression returned more than one row where
     /// at most one was expected (a scalar subquery).
     CardinalityViolation,

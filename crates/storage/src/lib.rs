@@ -3401,6 +3401,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 
@@ -3497,6 +3498,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 
@@ -3547,6 +3549,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -3591,6 +3594,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 
@@ -3626,6 +3630,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         base.toast.min_value_size = 128;
         let toast = toast_schema(&base, 2);
@@ -3672,6 +3677,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
         base.toast.min_value_size = 128;

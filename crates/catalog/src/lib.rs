@@ -37,6 +37,7 @@ pub trait CatalogManager: Send + Sync {
             primary_key,
             compression,
             ToastOptions::legacy_catalog_default(),
+            Vec::new(),
         )
     }
     fn create_table_with_options(
@@ -46,6 +47,7 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
     /// Applies an ALTER (or replays one during recovery): locates the live
@@ -143,6 +145,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 
@@ -548,6 +551,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -596,6 +600,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -638,6 +643,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
 
         let err = catalog.apply_create_table(schema).unwrap_err();
@@ -800,6 +806,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -842,6 +849,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -877,6 +885,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
@@ -1054,6 +1063,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
 
         catalog.apply_create_table(schema.clone()).unwrap();
@@ -1385,6 +1395,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1429,6 +1440,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
         let snapshot = CatalogSnapshot {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
@@ -1522,6 +1534,7 @@ mod tests {
                 vec!["id".to_string()],
                 CompressionSetting::None,
                 toast.clone(),
+                Vec::new(),
             )
             .unwrap();
 
@@ -1571,6 +1584,7 @@ mod tests {
                 vec!["id".to_string()],
                 CompressionSetting::None,
                 ToastOptions::default_new_table(),
+                Vec::new(),
             )
             .unwrap();
 

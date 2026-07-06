@@ -244,6 +244,7 @@ impl CatalogManager for MemoryCatalog {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
         reject_duplicate_table_name(&snapshot, &name)?;
@@ -260,6 +261,7 @@ impl CatalogManager for MemoryCatalog {
             primary_key,
             compression,
             toast,
+            checks,
         )?;
         validate_toast_options(&schema)?;
         let hidden_toast = if needs_toast_relation(&schema) {
@@ -567,6 +569,7 @@ fn reserve_id(next: &mut u32, id: u32, kind: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_schema(
     snapshot: &CatalogSnapshot,
     table_id: TableId,
@@ -575,6 +578,7 @@ fn build_schema(
     primary_key: Vec<String>,
     compression: CompressionSetting,
     toast: ToastOptions,
+    checks: Vec<String>,
 ) -> Result<TableSchema> {
     let mut seen_names = HashSet::new();
     let mut column_ids_by_name = HashMap::new();
@@ -657,6 +661,7 @@ fn build_schema(
         toast,
         toast_table_id: None,
         relation_kind: RelationKind::User,
+        checks,
     })
 }
 

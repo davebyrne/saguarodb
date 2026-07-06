@@ -658,6 +658,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
 
         let row = crate::query::build_insert_row(
@@ -702,6 +703,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         };
 
         let row = crate::query::build_insert_row(&statement, &schema, &[], vec![], &[]).unwrap();
@@ -846,6 +848,7 @@ mod tests {
             on_conflict: None,
             returning: None,
             default_exprs: vec![],
+            check_exprs: vec![],
             source: Box::new(PhysicalPlan::Values {
                 rows: vec![vec![
                     BoundExpr::Literal {

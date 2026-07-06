@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use catalog::{CatalogManager, resolve_system_view};
 use common::{
-    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, ParsedDefault, RelationKind, Result,
-    SqlState, TableId, TableSchema, Value,
+    BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault,
+    RelationKind, Result, SqlState, TableId, TableSchema, Value,
 };
 use parser::Statement;
 
@@ -129,6 +129,7 @@ fn bind_inner(
             unique,
             compression,
             toast,
+            checks,
         } => {
             let mut seen_primary_key_names = HashSet::new();
             for primary_key_name in primary_key {
@@ -148,6 +149,14 @@ fn bind_inner(
             for column in columns {
                 validate_default_value(catalog, column)?;
             }
+            // Validate each CHECK against the (not-yet-created) columns: it must
+            // parse, bind, be boolean, and be constraint-safe. The bound form is
+            // discarded; the text is stored and re-bound per statement at
+            // INSERT/UPDATE (matching how expression DEFAULTs are handled).
+            let check_columns = parsed_columns_as_column_defs(columns);
+            for check in checks {
+                bind_check_expr(catalog, name, &check_columns, check)?;
+            }
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
                 columns: columns.clone(),
@@ -155,6 +164,7 @@ fn bind_inner(
                 unique: unique.clone(),
                 compression: compression.unwrap_or_default(),
                 toast: common::ToastOptions::default_new_table().apply_patch(toast),
+                checks: checks.clone(),
             })
         }
         Statement::DropTable { name } => {
@@ -553,6 +563,77 @@ fn reject_non_constraint_safe(expr: &BoundExpr) -> Result<()> {
         _ => {}
     }
     crate::params::for_each_child(expr, &mut |child| reject_non_constraint_safe(child))
+}
+
+/// Bind a `CHECK` constraint's canonical text against a table's columns registered
+/// as a single binding at slot 0 — the same full-row layout the executor validates,
+/// so each `InputRef`'s slot equals its column position. The result must be boolean;
+/// aggregates, subqueries, and parameters are rejected (`reject_non_constraint_safe`),
+/// and a column reference resolves normally (unlike a `DEFAULT`, a `CHECK` may name
+/// the row's columns).
+fn bind_check_expr(
+    catalog: &dyn CatalogManager,
+    table_name: &str,
+    columns: &[ColumnDef],
+    text: &str,
+) -> Result<BoundExpr> {
+    let parsed = parser::parse_expression(text)?;
+    let mut ctx = BindContext::new(catalog, &[]);
+    ctx.bindings.push(Binding {
+        id: 0,
+        table_id: None,
+        table_name: table_name.to_string(),
+        visible_name: table_name.to_string(),
+        columns: columns.to_vec(),
+        slot_start: 0,
+        qualified_only: false,
+    });
+    ctx.next_binding = 1;
+    ctx.next_slot = columns.len();
+    let bound = expr::bind_expr(&mut ctx, &parsed, None)?;
+    reject_non_constraint_safe(&bound)?;
+    if bound.data_type() != DataType::Boolean {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            format!(
+                "CHECK constraint must be a boolean expression, got {:?}",
+                bound.data_type()
+            ),
+        ));
+    }
+    Ok(bound)
+}
+
+/// Bind all of a table's stored `CHECK` expressions against its columns, for the
+/// executor to enforce per row at `INSERT`/`UPDATE`. Empty when the table has none.
+pub(super) fn bind_table_checks(
+    catalog: &dyn CatalogManager,
+    table: &TableSchema,
+) -> Result<Vec<BoundExpr>> {
+    table
+        .checks
+        .iter()
+        .map(|text| bind_check_expr(catalog, &table.name, &table.columns, text))
+        .collect()
+}
+
+/// View a `CREATE TABLE`'s not-yet-created columns as `ColumnDef`s (id = declaration
+/// order) so a `CHECK` can be bound and validated before the table exists. Only the
+/// name/type/nullability matter for binding; the default is irrelevant here.
+fn parsed_columns_as_column_defs(columns: &[ParsedColumnDef]) -> Vec<ColumnDef> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| ColumnDef {
+            id: index as ColumnId,
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            max_length: column.max_length,
+            default: None,
+            pg_type: column.pg_type.clone(),
+        })
+        .collect()
 }
 
 fn plan_error(code: SqlState, message: impl Into<String>) -> DbError {

@@ -296,6 +296,13 @@ pub struct TableSchema {
     /// User table vs. hidden toast relation metadata.
     #[serde(default)]
     pub relation_kind: RelationKind,
+    /// `CHECK` constraint expressions, held as canonical SQL text (column-level
+    /// and table-level checks are flattened here, as in PostgreSQL). The binder
+    /// re-parses and binds each against the table's columns at `CREATE TABLE` (to
+    /// validate) and at each `INSERT`/`UPDATE` (to enforce per row); the executor
+    /// rejects a row whose check evaluates to `false` (a `NULL` result passes).
+    #[serde(default)]
+    pub checks: Vec<String>,
 }
 
 pub fn needs_toast_relation(schema: &TableSchema) -> bool {
@@ -351,6 +358,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
         relation_kind: RelationKind::Toast {
             base_table: base.id,
         },
+        checks: Vec::new(),
     }
 }
 

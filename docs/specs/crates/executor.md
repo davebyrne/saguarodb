@@ -198,6 +198,7 @@ Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and e
 - Validate runtime values match destination column types. `NULL` is accepted at this step and checked by row-constraint validation.
 - Coerce `NUMERIC(p, s)` column values to the column scale (`coerce_numeric_columns`): each `Value::Numeric` is rounded to `s` (half away from zero) and rejected with `SqlState::NumericValueOutOfRange` when the integer part exceeds `p - s` digits. Bare `NUMERIC` columns and non-numeric values are unchanged. Runs before constraint validation, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, and `COPY ... FROM`.
 - Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
+- Validate `CHECK` constraints (`validate_check_constraints`) over the full proposed row, using the bound `CHECK` expressions the binder attached to the INSERT: each constraint that evaluates to `false` is rejected with `SqlState::CheckViolation` (`23514`); a `true` or `NULL` (unknown) result passes. This runs before conflict arbitration, so a proposed row that violates a check is rejected even under `ON CONFLICT DO NOTHING` (matching PostgreSQL). COPY does not yet supply bound `CHECK` expressions, so `CHECK` constraints are not enforced on `COPY ... FROM`.
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.
 
@@ -210,6 +211,7 @@ Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and e
 - Evaluate assignments against the source row.
 - Build a full replacement row. The primary-key column cannot change; storage rejects an update whose replacement key differs with `SqlState::DatatypeMismatch` ("primary key updates are not supported").
 - Validate per-column row constraints on the replacement row (`validate_row_constraints`): non-null and bounded character-type length, same as INSERT.
+- Validate `CHECK` constraints on the replacement row (`validate_check_constraints`), same as INSERT: a constraint evaluating to `false` is rejected with `SqlState::CheckViolation` (`23514`); `true`/`NULL` passes. The `ON CONFLICT DO UPDATE` path applies the same check to the row it writes.
 - Call `StorageEngine::update`.
 - Return count.
 

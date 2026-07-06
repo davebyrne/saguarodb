@@ -19,6 +19,9 @@ pub enum LogicalPlan {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        /// `CHECK` constraint texts, persisted with the schema (see
+        /// `BoundStatement::CreateTable`).
+        checks: Vec<String>,
     },
     DropTable {
         table: TableId,
@@ -49,12 +52,18 @@ pub enum LogicalPlan {
         /// Bound expression `DEFAULT`s for omitted columns (see
         /// `BoundStatement::Insert`), carried through to execution.
         default_exprs: Vec<(ColumnId, BoundExpr)>,
+        /// Bound `CHECK` expressions enforced per inserted row (see
+        /// `BoundStatement::Insert`).
+        check_exprs: Vec<BoundExpr>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<LogicalPlan>,
         returning: Option<BoundReturning>,
+        /// Bound `CHECK` expressions enforced per updated row (see
+        /// `BoundStatement::Update`).
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,
@@ -135,6 +144,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             unique,
             compression,
             toast,
+            checks,
         } => Ok(LogicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
@@ -142,6 +152,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             unique: unique.clone(),
             compression: *compression,
             toast: toast.clone(),
+            checks: checks.clone(),
         }),
         BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
         BoundStatement::CreateIndex {
@@ -171,6 +182,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             on_conflict,
             returning,
             default_exprs,
+            check_exprs,
         } => {
             let source = match source {
                 BoundInsertSource::Values {
@@ -189,6 +201,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
                 on_conflict: on_conflict.clone(),
                 returning: returning.clone(),
                 default_exprs: default_exprs.clone(),
+                check_exprs: check_exprs.clone(),
             })
         }
         BoundStatement::Query(query) => plan_query(query),
@@ -197,11 +210,13 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             assignments,
             source,
             returning,
+            check_exprs,
         } => Ok(LogicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
             source: Box::new(plan_select_source(source)?),
             returning: returning.clone(),
+            check_exprs: check_exprs.clone(),
         }),
         BoundStatement::Delete {
             table,

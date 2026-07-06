@@ -20,6 +20,9 @@ pub enum PhysicalPlan {
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        /// `CHECK` constraint texts, persisted with the schema (see
+        /// `BoundStatement::CreateTable`).
+        checks: Vec<String>,
     },
     DropTable {
         table: TableId,
@@ -50,12 +53,18 @@ pub enum PhysicalPlan {
         /// Bound expression `DEFAULT`s for omitted columns (see
         /// `BoundStatement::Insert`), evaluated per row by the executor.
         default_exprs: Vec<(ColumnId, BoundExpr)>,
+        /// Bound `CHECK` expressions enforced per inserted row (see
+        /// `BoundStatement::Insert`).
+        check_exprs: Vec<BoundExpr>,
     },
     Update {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<PhysicalPlan>,
         returning: Option<BoundReturning>,
+        /// Bound `CHECK` expressions enforced per updated row (see
+        /// `BoundStatement::Update`).
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,
@@ -148,6 +157,7 @@ pub fn physical_plan(
             unique,
             compression,
             toast,
+            checks,
         } => Ok(PhysicalPlan::CreateTable {
             name: name.clone(),
             columns: columns.clone(),
@@ -155,6 +165,7 @@ pub fn physical_plan(
             unique: unique.clone(),
             compression: *compression,
             toast: toast.clone(),
+            checks: checks.clone(),
         }),
         LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
         LogicalPlan::CreateIndex {
@@ -184,6 +195,7 @@ pub fn physical_plan(
             on_conflict,
             returning,
             default_exprs,
+            check_exprs,
         } => Ok(PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
@@ -191,17 +203,20 @@ pub fn physical_plan(
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
             default_exprs: default_exprs.clone(),
+            check_exprs: check_exprs.clone(),
         }),
         LogicalPlan::Update {
             table,
             assignments,
             source,
             returning,
+            check_exprs,
         } => Ok(PhysicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
             source: Box::new(physical_plan(source, catalog)?),
             returning: returning.clone(),
+            check_exprs: check_exprs.clone(),
         }),
         LogicalPlan::Delete {
             table,

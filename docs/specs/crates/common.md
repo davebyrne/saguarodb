@@ -244,6 +244,7 @@ pub struct TableSchema {
     pub toast: ToastOptions,
     pub toast_table_id: Option<TableId>,
     pub relation_kind: RelationKind,
+    pub checks: Vec<String>,  // CHECK constraint expressions, canonical SQL text
 }
 
 pub struct IndexSchema {
@@ -371,6 +372,7 @@ pub enum SqlState {
     BadCopyFileFormat,
     NotNullViolation,
     UniqueViolation,
+    CheckViolation,
     DependentObjectsStillExist,
     ObjectNotInPrerequisiteState,
     QueryCanceled,
@@ -389,6 +391,15 @@ pub type Result<T> = std::result::Result<T, DbError>;
 ```
 
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
+
+`SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
+table's `CHECK` constraint — the constraint expression evaluated to `false` for
+the row (a `NULL`/unknown result passes, matching PostgreSQL). `TableSchema.checks`
+holds each `CHECK` expression as canonical SQL text (column-level and table-level
+checks flattened together); the binder re-parses and binds each against the table's
+columns at `CREATE TABLE` (to validate: boolean result, resolvable columns, no
+aggregates/subqueries/parameters) and at each `INSERT`/`UPDATE` (to enforce per
+row).
 
 `SqlState::UndefinedObject` maps to SQLSTATE `42704`: an object-like name is not
 recognized when no more specific relation/column SQLSTATE applies. The server

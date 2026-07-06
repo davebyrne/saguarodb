@@ -669,6 +669,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::BadCopyFileFormat => "22P04",
         SqlState::NotNullViolation => "23502",
         SqlState::UniqueViolation => "23505",
+        SqlState::CheckViolation => "23514",
         SqlState::CardinalityViolation => "21000",
         SqlState::DependentObjectsStillExist => "2BP01",
         SqlState::ObjectNotInPrerequisiteState => "55000",

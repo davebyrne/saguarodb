@@ -210,6 +210,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            checks: Vec::new(),
         }
     }
 

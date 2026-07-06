@@ -108,6 +108,7 @@ impl QueryEngine {
                 unique,
                 compression,
                 toast,
+                checks,
             } => execute_create_table(
                 ctx,
                 name,
@@ -116,6 +117,7 @@ impl QueryEngine {
                 unique,
                 *compression,
                 toast.clone(),
+                checks,
             ),
             PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
             PhysicalPlan::CreateIndex {
@@ -138,6 +140,7 @@ impl QueryEngine {
                 on_conflict,
                 returning,
                 default_exprs,
+                check_exprs,
             } => execute_insert(
                 ctx,
                 *table,
@@ -146,13 +149,22 @@ impl QueryEngine {
                 on_conflict.as_ref(),
                 returning.as_ref(),
                 default_exprs,
+                check_exprs,
             ),
             PhysicalPlan::Update {
                 table,
                 assignments,
                 source,
                 returning,
-            } => execute_update(ctx, *table, assignments, source, returning.as_ref()),
+                check_exprs,
+            } => execute_update(
+                ctx,
+                *table,
+                assignments,
+                source,
+                returning.as_ref(),
+                check_exprs,
+            ),
             PhysicalPlan::Delete {
                 table,
                 source,
@@ -455,6 +467,7 @@ impl RowSink for VecRowSink {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_insert(
     ctx: &ExecutionContext<'_>,
     table: TableId,
@@ -463,6 +476,7 @@ fn execute_insert(
     on_conflict: Option<&BoundOnConflict>,
     returning: Option<&BoundReturning>,
     default_exprs: &[(ColumnId, BoundExpr)],
+    check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
@@ -489,6 +503,10 @@ fn execute_insert(
             source_row.row.values,
             default_exprs,
         )?;
+        // CHECK constraints are evaluated on the proposed row before conflict
+        // arbitration, matching PostgreSQL (a DO NOTHING that conflicts still
+        // raises a check violation on the proposed row).
+        validate_check_constraints(&ctx.statement, &schema, check_exprs, &row.values)?;
 
         // ON CONFLICT: the arbiter is the primary key. Probe the visible row at the
         // proposed primary key; on a conflict, take the action (skip for DO NOTHING,
@@ -519,6 +537,7 @@ fn execute_insert(
                         &row,
                         assignments,
                         filter.as_ref(),
+                        check_exprs,
                     )?
                 {
                     count += 1;
@@ -569,6 +588,7 @@ fn apply_conflict_update(
     proposed: &Row,
     assignments: &[(ColumnId, BoundExpr)],
     filter: Option<&BoundExpr>,
+    check_exprs: &[BoundExpr],
 ) -> Result<Option<Vec<Value>>> {
     let mut combined = existing.values.clone();
     combined.extend(proposed.values.iter().cloned());
@@ -594,6 +614,7 @@ fn apply_conflict_update(
     }
     coerce_numeric_columns(schema, &mut new_values)?;
     validate_row_constraints(schema, &new_values)?;
+    validate_check_constraints(&ctx.statement, schema, check_exprs, &new_values)?;
     let updated = new_values.clone();
     if ctx
         .storage
@@ -862,6 +883,7 @@ fn execute_update(
     assignments: &[(ColumnId, planner::BoundExpr)],
     source: &PhysicalPlan,
     returning: Option<&BoundReturning>,
+    check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
     let mut executor = build_executor(ctx, source)?;
@@ -886,6 +908,7 @@ fn execute_update(
             }
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
+            validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
             // Evaluate RETURNING over the NEW row before it is moved into storage;
             // only keep it if the update actually affected a row.
             let returned_row = returning
@@ -941,6 +964,7 @@ fn execute_delete(
     close_after(executor.as_mut(), result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_create_table(
     ctx: &ExecutionContext<'_>,
     name: &str,
@@ -949,6 +973,7 @@ fn execute_create_table(
     unique: &[Vec<String>],
     compression: CompressionSetting,
     toast: ToastOptions,
+    checks: &[String],
 ) -> Result<ExecutionResult> {
     let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
     let mut created_sequences = Vec::new();
@@ -969,6 +994,7 @@ fn execute_create_table(
         primary_key.to_vec(),
         compression,
         toast,
+        checks.to_vec(),
     ) {
         Ok(schema) => schema,
         Err(err) => {
@@ -1299,6 +1325,48 @@ fn coerce_numeric_columns(schema: &TableSchema, values: &mut [Value]) -> Result<
                 )
             })?;
             *value = Value::Numeric(coerced);
+        }
+    }
+    Ok(())
+}
+
+/// Evaluate a table's `CHECK` constraints over a full row (catalog slot order).
+/// A constraint that evaluates to `false` violates; `true` or `NULL` (unknown)
+/// passes, matching PostgreSQL's three-valued semantics.
+///
+/// Enforcement is driven by `check_exprs` (the binder's bound form of the table's
+/// checks, in the same order as `schema.checks`), so no check can be skipped by a
+/// length mismatch; `schema.checks` supplies the constraint's text for the error
+/// message when the two arrays line up, with a generic fallback otherwise.
+fn validate_check_constraints(
+    statement: &StatementContext,
+    schema: &TableSchema,
+    check_exprs: &[BoundExpr],
+    values: &[Value],
+) -> Result<()> {
+    if check_exprs.is_empty() {
+        return Ok(());
+    }
+    let row = ExecRow {
+        row: Row {
+            values: values.to_vec(),
+        },
+        identity: None,
+    };
+    for (index, expr) in check_exprs.iter().enumerate() {
+        if matches!(eval_expr(statement, expr, &row)?, Value::Boolean(false)) {
+            let text = schema
+                .checks
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("check constraint");
+            return Err(DbError::execute(
+                SqlState::CheckViolation,
+                format!(
+                    "new row for relation \"{}\" violates check constraint ({text})",
+                    schema.name
+                ),
+            ));
         }
     }
     Ok(())

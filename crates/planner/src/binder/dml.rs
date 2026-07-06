@@ -71,6 +71,7 @@ pub(super) fn bind_insert(
     let on_conflict = bind_on_conflict(catalog, &table, on_conflict, declared)?;
     let returning = bind_returning(catalog, &table, returning, declared)?;
     let default_exprs = bind_omitted_expr_defaults(catalog, &table, &columns)?;
+    let check_exprs = super::bind_table_checks(catalog, &table)?;
 
     Ok(BoundStatement::Insert {
         table: table.id,
@@ -79,6 +80,7 @@ pub(super) fn bind_insert(
         on_conflict,
         returning,
         default_exprs,
+        check_exprs,
     })
 }
 
@@ -364,6 +366,8 @@ pub(super) fn bind_update(
         bound_assignments.push((column.id, value));
     }
 
+    let check_exprs = super::bind_table_checks(catalog, &table)?;
+
     Ok(BoundStatement::Update {
         table: table.id,
         assignments: bound_assignments,
@@ -377,6 +381,7 @@ pub(super) fn bind_update(
             output_schema: table_output_schema(&table),
         },
         returning,
+        check_exprs,
     })
 }
 

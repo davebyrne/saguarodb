@@ -25,6 +25,12 @@ pub enum Statement {
         /// `WITH (toast..., toast_compression...)` storage options. Empty when
         /// omitted; the binder merges this patch with new-table defaults.
         toast: ToastOptionPatch,
+        /// `CHECK (...)` constraint expressions as canonical SQL text. Column-level
+        /// (`n INT CHECK (n > 0)`) and table-level (`CHECK (a < b)`) checks are
+        /// flattened here in declaration order. The binder re-parses and binds each
+        /// against the table's columns. Empty when the table has no checks; a named
+        /// check (`CONSTRAINT c CHECK (...)`) is rejected at parse time.
+        checks: Vec<String>,
     },
     DropTable {
         name: String,

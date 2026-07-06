@@ -132,6 +132,9 @@ pub enum BoundStatement {
         /// The table's TOAST policy, resolved from `WITH (toast...)` options at
         /// bind time.
         toast: ToastOptions,
+        /// `CHECK` constraint expressions (canonical SQL text), validated against
+        /// the table's columns at bind time and persisted with the schema.
+        checks: Vec<String>,
     },
     DropTable {
         table: TableId,
@@ -163,6 +166,10 @@ pub enum BoundStatement {
         /// row by the executor. Only `ColumnDefault::Expr` columns appear here;
         /// constant and sequence defaults are read from the schema.
         default_exprs: Vec<(ColumnId, BoundExpr)>,
+        /// The table's bound `CHECK` constraint expressions, evaluated over each
+        /// inserted (or upserted) full row by the executor. Empty when the table
+        /// has no checks.
+        check_exprs: Vec<BoundExpr>,
     },
     Query(BoundQuery),
     Update {
@@ -170,6 +177,10 @@ pub enum BoundStatement {
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: BoundSelect,
         returning: Option<BoundReturning>,
+        /// The table's bound `CHECK` constraint expressions, evaluated over each
+        /// updated (new) full row by the executor. Empty when the table has no
+        /// checks.
+        check_exprs: Vec<BoundExpr>,
     },
     Delete {
         table: TableId,

@@ -1445,6 +1445,26 @@ mod tests {
     }
 
     #[test]
+    fn collects_column_and_table_check_constraints_as_text() {
+        // Column-level and table-level CHECKs flatten into `checks` as canonical
+        // SQL text, in declaration order, for the binder to bind against the table.
+        let Statement::CreateTable { checks, .. } = parse(
+            "create table t (id integer primary key, n integer check (n > 0), \
+             lo integer, hi integer, check (lo <= hi))",
+        )
+        .unwrap() else {
+            panic!("expected create table");
+        };
+        assert_eq!(checks, vec!["n > 0".to_string(), "lo <= hi".to_string()]);
+
+        // A named CHECK is rejected (only unnamed checks are supported).
+        assert!(
+            parse("create table t (id integer primary key, constraint c check (id > 0))").is_err()
+        );
+        assert!(parse("create table t (id integer primary key check (id > 0))").is_ok());
+    }
+
+    #[test]
     fn parses_representative_expressions() {
         let stmt = parse(
             "select -id + 2 * 3, not active, name || 'x', id is not null, \

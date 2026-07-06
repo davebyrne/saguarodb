@@ -141,6 +141,7 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             on_conflict,
             returning,
             default_exprs,
+            check_exprs,
         } => LogicalPlan::Insert {
             table,
             columns,
@@ -151,12 +152,14 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .into_iter()
                 .map(|(column, expr)| (column, fold_expr(expr)))
                 .collect(),
+            check_exprs: check_exprs.into_iter().map(fold_expr).collect(),
         },
         LogicalPlan::Update {
             table,
             assignments,
             source,
             returning,
+            check_exprs,
         } => LogicalPlan::Update {
             table,
             assignments: assignments
@@ -165,6 +168,7 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .collect(),
             source: Box::new(simplify_logical(*source)),
             returning,
+            check_exprs: check_exprs.into_iter().map(fold_expr).collect(),
         },
         LogicalPlan::Delete {
             table,
