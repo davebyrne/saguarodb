@@ -59,7 +59,7 @@ impl QueryService {
             IsolationLevel::default(),
             gc_horizon,
             Arc::from([txn_id]),
-            session.statement_runtime(),
+            session.statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
         );
 
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
@@ -120,7 +120,10 @@ impl QueryService {
                 txn.isolation,
                 gc_horizon,
                 txn.live_txns(),
-                session.statement_runtime(),
+                session.statement_runtime(
+                    txn.current_default_isolation(IsolationLevel::default()),
+                    txn.isolation,
+                ),
             );
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
@@ -167,7 +170,7 @@ impl QueryService {
             IsolationLevel::default(),
             0,
             Arc::from([0]),
-            session.statement_runtime(),
+            session.statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
         );
         drive_copy_out(&ctx, job, frame_tx)
     }
@@ -192,7 +195,10 @@ impl QueryService {
                 txn.isolation,
                 0,
                 txn.live_txns(),
-                session.statement_runtime(),
+                session.statement_runtime(
+                    txn.current_default_isolation(IsolationLevel::default()),
+                    txn.isolation,
+                ),
             );
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);

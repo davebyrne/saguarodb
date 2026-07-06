@@ -101,6 +101,7 @@ impl QueryEngine {
 |---|---|
 | `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present |
 | `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. Converts `StoredRow` to `ExecRow`, then applies `PhysicalPlan::IndexScan.filter` when present |
+| `SystemScanOp` | Materializes rows for a virtual `pg_catalog`/`information_schema` system view from catalog metadata, the static registry, and `StatementContext.system_state`; applies scan filter if present; emits rows with no identity |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
 | `FilterOp` | Evaluates predicate, preserves identity |
@@ -114,9 +115,26 @@ impl QueryEngine {
 ## Identity Rules
 
 - Scans set `identity = Some(RowIdentity { row_id, key })`.
+- System scans set `identity = None`; they are read-only virtual relations.
 - Filter, sort, limit, and projection preserve identity.
 - Join, aggregate, and distinct clear identity.
 - `UPDATE` and `DELETE` require identity on each source row. If a plan produces a row without identity for DML, executor returns `ErrorKind::Internal`.
+
+## Virtual System Scans
+
+`SystemScanOp` evaluates `PhysicalPlan::SystemScan` for the read-only virtual
+system catalog surface. `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+`pg_index`, `information_schema.schemata`, `information_schema.tables`, and
+`information_schema.columns` are computed from `CatalogManager` metadata and the
+static registry owned by the catalog crate. `pg_settings` combines
+`StatementContext.system_state.settings()` with synthesized transaction isolation
+rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`;
+with the no-op provider used by library tests it is empty.
+
+Rows are rebuilt for each execution, sorted deterministically, and filtered with
+the bound scan predicate using the same `predicate_matches` semantics as storage
+scans. System scans never record SSI reads and never carry `RowIdentity`, so they
+cannot be a DML source.
 
 ## Expression Evaluation
 
@@ -281,6 +299,7 @@ Statement guards are owned by server query orchestration, not by the executor cr
 ## Acceptance Tests
 
 - `SeqScanOp` returns rows with identity.
+- `SystemScanOp` executes filters, joins, ordering, and projection over virtual catalog rows and returns rows with no identity.
 - `FilterOp` preserves identity.
 - `ProjectionOp` preserves identity while changing values.
 - `NestedLoopJoinOp` clears identity.

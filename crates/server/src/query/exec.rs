@@ -110,18 +110,17 @@ impl QueryService {
         match slot {
             // A data statement with an open explicit transaction runs inside it.
             Some(txn) => {
-                let (slot, result) = self.run_in_transaction(
-                    txn,
-                    class,
-                    statement,
-                    session.statement_runtime(),
-                    sink,
+                let runtime = session.statement_runtime(
+                    txn.current_default_isolation(default_isolation),
+                    txn.isolation,
                 );
+                let (slot, result) = self.run_in_transaction(txn, class, statement, runtime, sink);
                 (slot, default_isolation, result)
             }
             // No open transaction: this is an autocommit unit.
             None => {
-                let result = self.run_autocommit(class, statement, session, sink);
+                let result =
+                    self.run_autocommit(class, statement, session, default_isolation, sink);
                 (None, default_isolation, result)
             }
         }
@@ -342,25 +341,34 @@ impl QueryService {
         class: StatementClass,
         statement: Statement,
         session: &QuerySessionContext,
+        default_isolation: IsolationLevel,
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
         match class {
             StatementClass::Read => {
                 let bound = bind(&statement, self.components.catalog.as_ref())?;
                 match classify_bound(class, &bound) {
-                    StatementClass::Read => {
-                        self.autocommit_read(bound, session.statement_runtime(), sink)
-                    }
+                    StatementClass::Read => self.autocommit_read(
+                        bound,
+                        session.statement_runtime(default_isolation, default_isolation),
+                        sink,
+                    ),
                     // A read promoted to a write (e.g. `SELECT nextval(...)`) is
                     // materialized, not streamed.
                     StatementClass::Write => self
-                        .autocommit_bound_write(bound, session.statement_runtime())
+                        .autocommit_bound_write(
+                            bound,
+                            session.statement_runtime(default_isolation, default_isolation),
+                        )
                         .map(StreamOutcome::Direct),
                     _ => unreachable!("classify_bound only promotes reads to writes"),
                 }
             }
             StatementClass::Write | StatementClass::Ddl => self
-                .autocommit_write(statement, session.statement_runtime())
+                .autocommit_write(
+                    statement,
+                    session.statement_runtime(default_isolation, default_isolation),
+                )
                 .map(StreamOutcome::Direct),
             // Maintenance (VACUUM, ALTER TABLE ... SET (compression = ...)) never
             // reaches here: `dispatch` runs it via `run_maintenance` before the

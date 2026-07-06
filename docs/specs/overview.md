@@ -989,6 +989,12 @@ pub enum BoundFrom {
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
+    System {
+        view: SystemView,
+        binding: BindingId,
+        alias: Option<String>,
+        schema: Vec<ColumnDef>,
+    },
     // A derived table (SELECT ...) AS alias [(cols)], bound in its own scope; its
     // columns are projected into the outer scope at `binding`'s slots.
     Derived {
@@ -1007,6 +1013,13 @@ pub enum BoundFrom {
 ```
 
 `BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The executor treats `None` as `TRUE` only for cross joins.
+
+`BoundFrom::System` is a read-only virtual system view from `pg_catalog` or
+`information_schema`. Bare FROM names prefer CTEs and user tables before falling
+back to `pg_catalog`; qualified `information_schema` views must name that schema.
+System-view columns bind like ordinary input slots but carry no underlying table
+id. Unknown schemas are `InvalidSchemaName`, and system catalog names are not
+valid DML or COPY targets.
 
 ### Bound Expressions
 
@@ -1162,6 +1175,7 @@ pub enum LogicalPlan {
 
     // Query operators
     Scan { table: TableId, filter: Option<BoundExpr> },
+    SystemScan { view: SystemView, filter: Option<BoundExpr> },
     Join { left: Box<LogicalPlan>, right: Box<LogicalPlan>, condition: Option<BoundExpr>, join_type: JoinType },
     Filter { source: Box<LogicalPlan>, predicate: BoundExpr },
     Projection { source: Box<LogicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
@@ -1256,6 +1270,7 @@ pub enum PhysicalPlan {
 
     // Access methods
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
+    SystemScan { view: SystemView, output_schema: Vec<ColumnInfo>, filter: Option<BoundExpr> },
     IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
 
     // Join algorithms
@@ -1296,6 +1311,11 @@ pub enum PhysicalPlan {
 The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column access is by slot index (`row.values[slot]`) — O(1), no lookups. The `BindingId` and `ColumnId` fields in `InputRef` exist only for EXPLAIN output and debugging.
 
 `PRIMARY_KEY_INDEX_ID = 0` identifies the primary-key index; secondary indexes use their own ids. An `IndexScan` carries the chosen index id, and `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` on the primary key and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
+
+`SystemScan` is the planner and executor source for virtual system views. It is
+not considered for storage index selection and carries the view plus full output
+schema so execution and EXPLAIN/debug output do not need to re-resolve the
+registry entry.
 
 The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a future cost-based optimizer replaces only `physical_plan`, choosing among multiple physical alternatives per logical operator. The binder and logical planner are unchanged.
 
@@ -1377,6 +1397,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 
 **ExecRow identity flow:**
 - **Scan operators** (`SeqScanOp`, `IndexScanOp`): Construct `ExecRow` from `StoredRow`, populating `identity` from the `StoredRow`'s `row_id` and `key`.
+- **System scan operator** (`SystemScanOp`): Materializes read-only virtual system catalog rows from catalog metadata and `StatementContext.system_state`, applies the scan filter, and emits rows with no identity.
 - **Filter, Sort, Limit**: Pass `ExecRow` through unchanged (identity preserved).
 - **Projection**: Rewrites `exec_row.row` (narrowed columns) but preserves `identity`.
 - **Join, Aggregate**: Produce new rows — `identity` is `None` (these rows don't correspond to a single source row).
@@ -1389,6 +1410,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 |---|---|
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
 | `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the primary key, `index_scan` for a secondary index — and applies residual `IndexScan.filter` when present |
+| `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right input keyed by `right_keys`, probes with `left_keys`; rows with a NULL key never match. |
 | `FilterOp` | Passes through rows matching the predicate |

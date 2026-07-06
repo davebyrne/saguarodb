@@ -89,6 +89,67 @@ async fn set_show_reset_and_accept_all_gucs_are_session_local() {
 }
 
 #[tokio::test]
+async fn pg_settings_reflects_session_gucs() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("SET application_name = 'catalog-app'").await.rows();
+    assert_eq!(
+        conn.ok("select setting, source \
+             from pg_settings \
+             where name = 'application_name'")
+            .await
+            .rows(),
+        vec![vec![
+            Some("catalog-app".to_string()),
+            Some("session".to_string())
+        ]]
+    );
+
+    conn.ok("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("select setting \
+             from pg_settings \
+             where name = 'default_transaction_isolation'")
+            .await
+            .rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select setting \
+             from pg_settings \
+             where name = 'transaction_isolation'")
+            .await
+            .rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET LOCAL default_transaction_isolation TO SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("select setting \
+             from pg_settings \
+             where name = 'default_transaction_isolation'")
+            .await
+            .rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select setting \
+             from pg_settings \
+             where name = 'transaction_isolation'")
+            .await
+            .rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+}
+
+#[tokio::test]
 async fn changing_application_name_sends_parameter_status() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

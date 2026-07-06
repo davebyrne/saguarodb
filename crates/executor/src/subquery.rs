@@ -79,6 +79,15 @@ pub(crate) fn resolve_plan_subqueries(
             table_name: table_name.clone(),
             filter: resolve_opt(ctx, filter)?,
         },
+        PhysicalPlan::SystemScan {
+            view,
+            output_schema,
+            filter,
+        } => PhysicalPlan::SystemScan {
+            view: *view,
+            output_schema: output_schema.clone(),
+            filter: resolve_opt(ctx, filter)?,
+        },
         PhysicalPlan::IndexScan {
             table,
             table_name,

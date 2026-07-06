@@ -129,7 +129,7 @@ fn select_mutates_sequences(select: &BoundSelect) -> bool {
 
 fn from_mutates_sequences(from: &BoundFrom) -> bool {
     match from {
-        BoundFrom::Table { .. } => false,
+        BoundFrom::Table { .. } | BoundFrom::System { .. } => false,
         BoundFrom::Derived { query, .. } => query_mutates_sequences(query),
         BoundFrom::Join {
             left,
@@ -197,7 +197,7 @@ fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use catalog::{CatalogManager, MemoryCatalog};
+    use catalog::{CatalogManager, MemoryCatalog, SystemView};
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
         PRIMARY_KEY_INDEX_ID, ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression,
@@ -746,17 +746,125 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_system_and_unknown_schemas_until_system_scan_lands() {
+    fn binder_binds_system_views() {
         let catalog = catalog_with_users();
-        let err = bind(
-            &parse("select * from pg_catalog.pg_class").unwrap(),
+        let bound = bind(
+            &parse("select oid, relname from pg_catalog.pg_class").unwrap(),
             &catalog,
         )
-        .unwrap_err();
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::Select(select) = &query.body else {
+            panic!("expected select");
+        };
+        let Some(BoundFrom::System {
+            view,
+            alias,
+            schema,
+            ..
+        }) = &select.from
+        else {
+            panic!("expected system view from item");
+        };
+        assert_eq!(*view, SystemView::PgClass);
+        assert_eq!(alias, &None);
+        assert_eq!(schema[0].name, "oid");
+        assert_eq!(query.output_schema()[0].name, "oid");
+        assert!(
+            query
+                .output_schema()
+                .iter()
+                .all(|column| column.table_id.is_none())
+        );
+    }
+
+    #[test]
+    fn binder_binds_information_schema_only_when_schema_qualified() {
+        let catalog = catalog_with_users();
+        let bound = bind(
+            &parse("select table_name from information_schema.tables").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::Select(select) = &query.body else {
+            panic!("expected select");
+        };
+        let Some(BoundFrom::System { view, .. }) = &select.from else {
+            panic!("expected system view from item");
+        };
+        assert_eq!(*view, SystemView::InformationSchemaTables);
+
+        let err = bind(&parse("select * from columns").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn binder_user_table_shadows_bare_system_catalog_name() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "pg_class".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                }],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+
+        let bound = bind(&parse("select id from pg_class").unwrap(), &catalog).unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::Select(select) = &query.body else {
+            panic!("expected select");
+        };
+        assert!(matches!(select.from, Some(BoundFrom::Table { .. })));
+
+        let bound = bind(
+            &parse("select oid from pg_catalog.pg_class").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        let BoundQueryBody::Select(select) = &query.body else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.from,
+            Some(BoundFrom::System {
+                view: SystemView::PgClass,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn binder_rejects_unknown_schema() {
+        let catalog = catalog_with_users();
 
         let err = bind(&parse("select * from nosuch.users").unwrap(), &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::InvalidSchemaName);
+    }
+
+    #[test]
+    fn binder_rejects_modifying_bare_system_catalog() {
+        let catalog = catalog_with_users();
+
+        let err = bind(&parse("insert into pg_class values (1)").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     #[test]
@@ -1673,6 +1781,42 @@ mod tests {
         let physical = physical_plan(&logical, &catalog).unwrap();
 
         assert!(format!("{physical:?}").contains("SeqScan"));
+    }
+
+    #[test]
+    fn logical_and_physical_planners_preserve_system_scan() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select oid from pg_catalog.pg_class where oid = 1").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+
+        let LogicalPlan::Projection { source, .. } = &logical else {
+            panic!("expected projection, got {logical:?}");
+        };
+        let LogicalPlan::SystemScan { view, filter } = source.as_ref() else {
+            panic!("expected system scan, got {source:?}");
+        };
+        assert_eq!(*view, SystemView::PgClass);
+        assert!(filter.is_some());
+
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let PhysicalPlan::Projection { source, .. } = &physical else {
+            panic!("expected projection, got {physical:?}");
+        };
+        let PhysicalPlan::SystemScan {
+            view,
+            output_schema,
+            filter,
+        } = source.as_ref()
+        else {
+            panic!("expected system scan, got {source:?}");
+        };
+        assert_eq!(*view, SystemView::PgClass);
+        assert!(output_schema.iter().any(|column| column.name == "relname"));
+        assert!(filter.is_some());
+
+        let text = format_explain(&physical);
+        assert!(text.contains("SystemScan view=pg_catalog.pg_class filter=yes"));
     }
 
     #[test]

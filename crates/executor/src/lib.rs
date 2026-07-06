@@ -3,6 +3,7 @@ mod expr;
 mod query;
 mod result;
 mod subquery;
+mod system;
 
 pub mod ops;
 
@@ -125,6 +126,171 @@ mod tests {
 
         let err = eval_expr(&StatementContext::new(0), &expr, &row).unwrap_err();
         assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn system_scan_executes_pg_class_filter() {
+        let harness = ExecutorHarness::with_users();
+        let rows = harness
+            .select_rows("select relname, relkind from pg_catalog.pg_class where relname = 'users'")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Text("users".to_string()),
+                    Value::Text("r".to_string())
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn system_scan_executes_information_schema_columns() {
+        let harness = ExecutorHarness::with_users();
+        let rows = harness
+            .select_rows(
+                "select column_name, ordinal_position, data_type, is_nullable \
+                 from information_schema.columns \
+                 where table_schema = 'public' and table_name = 'users' \
+                 order by ordinal_position",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("id".to_string()),
+                        Value::Integer(1),
+                        Value::Text("bigint".to_string()),
+                        Value::Text("NO".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("name".to_string()),
+                        Value::Integer(2),
+                        Value::Text("text".to_string()),
+                        Value::Text("YES".to_string()),
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select is_updatable \
+                 from information_schema.columns \
+                 where table_schema = 'pg_catalog' \
+                   and table_name = 'pg_class' \
+                   and column_name = 'oid'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("NO".to_string())],
+            }]
+        );
+    }
+
+    #[test]
+    fn system_scan_renders_information_schema_column_defaults() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute(
+                "create table defaults (\
+                 id integer primary key default 7, \
+                 name text default 'Ada', \
+                 active boolean default true)",
+            )
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select column_name, column_default, is_updatable \
+                 from information_schema.columns \
+                 where table_schema = 'public' and table_name = 'defaults' \
+                 order by ordinal_position",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("id".to_string()),
+                        Value::Text("7".to_string()),
+                        Value::Text("YES".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("name".to_string()),
+                        Value::Text("'Ada'".to_string()),
+                        Value::Text("YES".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("active".to_string()),
+                        Value::Text("TRUE".to_string()),
+                        Value::Text("YES".to_string()),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn system_scan_participates_in_joins_and_ordering() {
+        let harness = ExecutorHarness::with_users();
+        let rows = harness
+            .select_rows(
+                "select c.relname, a.attname \
+                 from pg_catalog.pg_class c \
+                 join pg_catalog.pg_attribute a on c.oid = a.attrelid \
+                 where c.relname = 'users' \
+                 order by a.attnum",
+            )
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("users".to_string()),
+                        Value::Text("id".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("users".to_string()),
+                        Value::Text("name".to_string()),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn system_scan_synthesizes_pg_settings_isolation_rows() {
+        let harness = ExecutorHarness::with_users();
+        let rows = harness
+            .select_rows("select setting from pg_settings where name = 'transaction_isolation'")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("read committed".to_string())],
+            }]
+        );
     }
 
     #[test]

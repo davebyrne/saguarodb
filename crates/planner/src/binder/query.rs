@@ -1,4 +1,4 @@
-use catalog::{CatalogManager, is_system_schema};
+use catalog::{CatalogManager, SystemView, is_system_schema, resolve_system_view};
 use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
     Value,
@@ -598,23 +598,55 @@ fn bind_table_or_schema_qualified_name(
             // is mutated.
             if let Some(cte) = ctx.cte_scope.lookup(name).cloned() {
                 Ok(bind_cte_reference(ctx, cte, alias.clone()))
-            } else {
-                let table = require_table(catalog, name)?;
+            } else if let Some(table) = catalog.get_table_by_name(name)? {
                 Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            } else if let Some(view) = resolve_system_view(None, name) {
+                Ok(bind_system_view(ctx, view, alias.clone()))
+            } else {
+                Err(plan_error(
+                    SqlState::UndefinedTable,
+                    format!("table {name} does not exist"),
+                ))
             }
         }
         Some("public") => {
             let table = require_table(catalog, name)?;
             Ok(bind_table_from_schema(ctx, table, alias.clone()))
         }
-        Some(schema) if is_system_schema(schema) => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "system catalog scans are not implemented yet",
-        )),
+        Some(schema) if is_system_schema(schema) => match resolve_system_view(Some(schema), name) {
+            Some(view) => Ok(bind_system_view(ctx, view, alias.clone())),
+            None => Err(plan_error(
+                SqlState::UndefinedTable,
+                format!("table {schema}.{name} does not exist"),
+            )),
+        },
         Some(schema) => Err(plan_error(
             SqlState::InvalidSchemaName,
             format!("schema \"{schema}\" does not exist"),
         )),
+    }
+}
+
+fn bind_system_view(ctx: &mut BindContext, view: SystemView, alias: Option<String>) -> BoundFrom {
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let columns = view.columns();
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += columns.len();
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: None,
+        table_name: view.qualified_name(),
+        visible_name: alias.clone().unwrap_or_else(|| view.name().to_string()),
+        columns: columns.clone(),
+        slot_start,
+        qualified_only: false,
+    });
+    BoundFrom::System {
+        view,
+        binding,
+        alias,
+        schema: columns,
     }
 }
 

@@ -197,6 +197,12 @@ pub enum BoundFrom {
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
+    System {
+        view: SystemView,
+        binding: BindingId,
+        alias: Option<String>,
+        schema: Vec<ColumnDef>,
+    },
     Derived {                     // (SELECT ...) AS alias [(cols)]
         query: Box<BoundQuery>,
         binding: BindingId,
@@ -222,6 +228,15 @@ For `CREATE TABLE`, binder defaults an absent `compression` option to
 do not bind.
 
 A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
+
+A `BoundFrom::System` represents a virtual system view from `pg_catalog` or
+`information_schema`. Bare names resolve in this order: CTE, user table, then
+`pg_catalog` system view, so a user table named `pg_class` shadows the bare
+system view. Qualified `public.<name>` resolves only user tables; qualified
+system schemas resolve only the registry view named in that schema; unknown
+schemas fail with `SqlState::InvalidSchemaName`. System-view output columns have
+no underlying table id. DML and COPY targets cannot modify system catalog names
+and are rejected before planning.
 
 A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `BoundQuery` binds its body (a `BoundSelect`) and, for a `SELECT` body, binds the query-level `ORDER BY` against that block's output columns (the `ORDER BY`/`DISTINCT` validation is coupled and stays together). Logical planning lowers the body, then applies the wrapper's `ORDER BY`/`LIMIT`/`OFFSET`; the aggregate-context `ORDER BY` rewrite stays with the body because it depends on the body's `group_by`/aggregates. `BoundSelect` (without the query-level modifiers) is also used directly as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
 
@@ -457,6 +472,7 @@ pub enum LogicalPlan {
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Scan { table: TableId, filter: Option<BoundExpr> },
+    SystemScan { view: SystemView, filter: Option<BoundExpr> },
     Join { left: Box<LogicalPlan>, right: Box<LogicalPlan>, condition: Option<BoundExpr>, join_type: JoinType },
     Filter { source: Box<LogicalPlan>, predicate: BoundExpr },
     Projection { source: Box<LogicalPlan>, expressions: Vec<BoundExpr>, output_schema: Vec<ColumnInfo> },
@@ -474,7 +490,9 @@ pub enum LogicalPlan {
 }
 ```
 
-Logical plan contains no access method choices.
+Logical plan contains no access method choices. `SystemScan` is the logical
+source for a bound virtual system view; its optional `filter` is the bound `WHERE`
+predicate pushed to the source the same way it is for a base-table `Scan`.
 
 For a `SELECT DISTINCT` (`BoundSelect.distinct`), logical planning inserts a
 `Distinct` node between any `Sort` and the `Projection`, so keeping the first
@@ -540,6 +558,7 @@ pub enum PhysicalPlan {
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
+    SystemScan { view: SystemView, output_schema: Vec<ColumnInfo>, filter: Option<BoundExpr> },
     IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
@@ -576,6 +595,9 @@ pub enum PhysicalPlan {
 - `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
 - A lower-bound and an upper-bound comparison on the *same* index column fuse into one two-sided `KeyRange::Range`, consuming both conjuncts. For `WHERE id > 5 AND id < 10`, the range is `(5, 10)` (both bounds excluded) and the residual filter is `None`. This remains a single-column range; multi-column composite-index ranges are not produced.
 - Otherwise scans are `SeqScan`.
+- A `LogicalPlan::SystemScan` maps directly to `PhysicalPlan::SystemScan`; it is
+  not considered for storage index selection and carries the system view's full
+  output schema for later execution and EXPLAIN/debug output.
 - Only a literal comparand of type `Integer`, `Text`, or `Boolean` qualifies for an `IndexScan`; a parameter, expression, or other-typed comparand falls back to `SeqScan`.
 - The planner emits only `Exact` or bounded `Range` key ranges. The EXPLAIN formatter can additionally render a full-index `KeyRange::All` as `all`, but the planner never produces one.
 - `table_name` is captured at planning time solely for EXPLAIN/debug output; execution still uses `table`.
@@ -596,7 +618,7 @@ pub enum PhysicalPlan {
 
 The executor crate is not called for `EXPLAIN`.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 
@@ -604,7 +626,9 @@ The executor crate is not called for `EXPLAIN`.
 - Binder rejects ambiguous unqualified columns.
 - Binder expands wildcard projection into explicit bound expressions.
 - Binder binds `INSERT ... SELECT` into `BoundInsertSource::Query`, rejecting column-count, type, and nullability mismatches against the target.
+- Binder resolves `pg_catalog` and `information_schema` views as `BoundFrom::System`, while preserving CTE/user-table precedence for bare names and rejecting system-catalog write targets.
 - Logical planner emits logical nodes without `SeqScan` or `IndexScan`.
+- Logical and physical planning preserve system views as `SystemScan`.
 - Physical planner chooses `IndexScan` for an equality or range predicate on a primary-key or secondary-index leading column, preferring the primary key and exact matches, and preserves residual predicates in `IndexScan.filter`.
 - Physical planner falls back to `SeqScan` when no index's leading column is constrained.
 - Physical planner chooses `HashJoin` for an inner join with a column-equality `ON` predicate and falls back to `NestedLoopJoin` for outer, cross, and non-equi joins.

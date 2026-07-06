@@ -1,3 +1,4 @@
+use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
     IndexId, ParsedColumnDef, SequenceOptions, TableId, ToastOptions,
@@ -254,6 +255,12 @@ pub struct BoundSelectItem {
 pub enum BoundFrom {
     Table {
         table: TableId,
+        binding: common::BindingId,
+        alias: Option<String>,
+        schema: Vec<ColumnDef>,
+    },
+    System {
+        view: SystemView,
         binding: common::BindingId,
         alias: Option<String>,
         schema: Vec<ColumnDef>,

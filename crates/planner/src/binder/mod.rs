@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use catalog::CatalogManager;
+use catalog::{CatalogManager, resolve_system_view};
 use common::{
     BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, ParsedDefault, RelationKind, Result,
     SqlState, TableId, TableSchema, Value,
@@ -273,10 +273,17 @@ fn bind_inner(
 
 fn require_table(catalog: &dyn CatalogManager, name: &str) -> Result<TableSchema> {
     let table = catalog.get_table_by_name(name)?.ok_or_else(|| {
-        plan_error(
-            SqlState::UndefinedTable,
-            format!("table {name} does not exist"),
-        )
+        if resolve_system_view(None, name).is_some() {
+            plan_error(
+                SqlState::FeatureNotSupported,
+                "cannot modify system catalog",
+            )
+        } else {
+            plan_error(
+                SqlState::UndefinedTable,
+                format!("table {name} does not exist"),
+            )
+        }
     })?;
     if matches!(table.relation_kind, RelationKind::Toast { .. }) {
         return Err(plan_error(

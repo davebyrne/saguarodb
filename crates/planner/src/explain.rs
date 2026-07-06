@@ -61,6 +61,13 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
                 if filter.is_some() { "yes" } else { "none" }
             ));
         }
+        PhysicalPlan::SystemScan { view, filter, .. } => {
+            output.push_str(&format!(
+                "{padding}SystemScan view={} filter={}\n",
+                view.qualified_name(),
+                if filter.is_some() { "yes" } else { "none" }
+            ));
+        }
         PhysicalPlan::IndexScan {
             table,
             table_name,

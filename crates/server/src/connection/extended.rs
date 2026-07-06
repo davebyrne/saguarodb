@@ -83,8 +83,13 @@ impl Session {
         } else {
             let default_isolation = self.default_isolation;
             tokio::task::spawn_blocking(move || {
-                let result = service
-                    .execute_prepared_cancelable_streamed(&statement, &params, session, row_tx);
+                let result = service.execute_prepared_cancelable_streamed(
+                    &statement,
+                    &params,
+                    session,
+                    default_isolation,
+                    row_tx,
+                );
                 (None, default_isolation, result)
             })
         };

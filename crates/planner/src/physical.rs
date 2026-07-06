@@ -1,5 +1,6 @@
 use std::ops::Bound;
 
+use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DataType, IndexId, Key, KeyRange,
     PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId, ToastOptions, Value,
@@ -61,6 +62,11 @@ pub enum PhysicalPlan {
     SeqScan {
         table: TableId,
         table_name: String,
+        filter: Option<BoundExpr>,
+    },
+    SystemScan {
+        view: SystemView,
+        output_schema: Vec<ColumnInfo>,
         filter: Option<BoundExpr>,
     },
     IndexScan {
@@ -202,6 +208,11 @@ pub fn physical_plan(
             returning: returning.clone(),
         }),
         LogicalPlan::Scan { table, filter } => plan_scan(*table, filter.clone(), catalog),
+        LogicalPlan::SystemScan { view, filter } => Ok(PhysicalPlan::SystemScan {
+            view: *view,
+            output_schema: system_output_schema(*view),
+            filter: filter.clone(),
+        }),
         LogicalPlan::Join {
             left,
             right,
@@ -413,6 +424,7 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         PhysicalPlan::SeqScan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
             table_column_count(*table, catalog)
         }
+        PhysicalPlan::SystemScan { output_schema, .. } => Ok(output_schema.len()),
         PhysicalPlan::NestedLoopJoin { left, right, .. }
         | PhysicalPlan::HashJoin { left, right, .. } => {
             Ok(output_width(left, catalog)? + output_width(right, catalog)?)
@@ -438,6 +450,19 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
             "DML and DDL plans have no row output width",
         )),
     }
+}
+
+fn system_output_schema(view: SystemView) -> Vec<ColumnInfo> {
+    view.columns()
+        .into_iter()
+        .map(|column| ColumnInfo {
+            name: column.name,
+            data_type: column.data_type,
+            table_id: None,
+            column_id: Some(column.id),
+            pg_type: column.pg_type,
+        })
+        .collect()
 }
 
 fn table_column_count(table: TableId, catalog: &dyn catalog::CatalogManager) -> Result<usize> {

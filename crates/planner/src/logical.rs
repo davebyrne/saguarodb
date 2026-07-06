@@ -1,3 +1,4 @@
+use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result,
     SequenceOptions, TableId, ToastOptions,
@@ -59,6 +60,10 @@ pub enum LogicalPlan {
     },
     Scan {
         table: TableId,
+        filter: Option<BoundExpr>,
+    },
+    SystemScan {
+        view: SystemView,
         filter: Option<BoundExpr>,
     },
     Join {
@@ -456,6 +461,10 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
     match from {
         BoundFrom::Table { table, .. } => Ok(LogicalPlan::Scan {
             table: *table,
+            filter,
+        }),
+        BoundFrom::System { view, .. } => Ok(LogicalPlan::SystemScan {
+            view: *view,
             filter,
         }),
         // A derived table lowers to its inner query's plan. Its columns already

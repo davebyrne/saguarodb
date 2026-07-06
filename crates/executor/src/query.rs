@@ -14,6 +14,7 @@ use storage::{RowIterator, SchemaOperations, StorageEngine};
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
+use crate::ops::SystemScanOp;
 use crate::ops::{
     AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
     ProjectionOp, SeqScanOp, SetOpOp, SortOp, ValuesOp,
@@ -202,6 +203,16 @@ pub(crate) fn build_executor<'a>(
                 table_output_schema(ctx.catalog, *table)?,
             )))
         }
+        PhysicalPlan::SystemScan {
+            view,
+            output_schema,
+            filter,
+        } => Ok(Box::new(SystemScanOp::new(
+            ctx.statement.clone(),
+            crate::system::rows_for(*view, ctx.catalog, &ctx.statement)?,
+            output_schema.clone(),
+            filter.clone(),
+        ))),
         PhysicalPlan::IndexScan {
             table,
             index,

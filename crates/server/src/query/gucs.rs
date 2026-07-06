@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use common::{
-    ColumnInfo, DataType, DbError, IsolationLevel, POSTGRES_COMPAT_VERSION, Result, Row,
-    SessionSequenceState, SqlState, Value,
+    ColumnInfo, DataType, DbError, GucSetting, IsolationLevel, POSTGRES_COMPAT_VERSION, Result,
+    Row, SessionSequenceState, SqlState, Value,
 };
 use executor::ExecutionResult;
 use parser::{SetScope, Statement};
@@ -69,6 +69,57 @@ impl SessionGucs {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
+    }
+
+    pub fn settings(
+        &self,
+        default_isolation: IsolationLevel,
+        transaction_isolation: IsolationLevel,
+    ) -> Vec<GucSetting> {
+        let settings = self.lock().clone();
+        let mut rows = settings
+            .into_iter()
+            .map(|(name, setting)| {
+                let boot_val = self.defaults.get(&name).cloned().unwrap_or_default();
+                let source = if self.defaults.get(&name) == Some(&setting) {
+                    "default"
+                } else {
+                    "session"
+                };
+                GucSetting {
+                    name,
+                    setting,
+                    boot_val: boot_val.clone(),
+                    reset_val: boot_val,
+                    source: source.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let boot_val = isolation_setting(IsolationLevel::default()).to_string();
+        rows.push(GucSetting {
+            name: "default_transaction_isolation".to_string(),
+            setting: isolation_setting(default_isolation).to_string(),
+            boot_val: boot_val.clone(),
+            reset_val: boot_val.clone(),
+            source: if default_isolation == IsolationLevel::default() {
+                "default".to_string()
+            } else {
+                "session".to_string()
+            },
+        });
+        rows.push(GucSetting {
+            name: "transaction_isolation".to_string(),
+            setting: isolation_setting(transaction_isolation).to_string(),
+            boot_val: boot_val.clone(),
+            reset_val: boot_val,
+            source: if transaction_isolation == IsolationLevel::default() {
+                "default".to_string()
+            } else {
+                "session".to_string()
+            },
+        });
+        rows.sort_by(|left, right| left.name.cmp(&right.name));
+        rows
     }
 
     pub fn application_name(&self) -> String {

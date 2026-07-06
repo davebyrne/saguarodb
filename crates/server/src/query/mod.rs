@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use common::{
-    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, PgType, Result,
-    SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider, Value, WriteGuard,
-    no_system_state,
+    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, GucSetting, IsolationLevel,
+    PgType, Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState,
+    SystemStateProvider, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -48,7 +48,7 @@ pub struct QuerySessionContext {
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     gucs: Arc<SessionGucs>,
-    system_state: Arc<dyn SystemStateProvider>,
+    system_state_override: Option<Arc<dyn SystemStateProvider>>,
 }
 
 impl QuerySessionContext {
@@ -63,13 +63,13 @@ impl QuerySessionContext {
             session_sequences,
             session_info,
             gucs,
-            system_state: no_system_state(),
+            system_state_override: None,
         }
     }
 
     #[must_use]
     pub fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
-        self.system_state = system_state;
+        self.system_state_override = Some(system_state);
         self
     }
 
@@ -85,13 +85,42 @@ impl QuerySessionContext {
         self.gucs.as_ref()
     }
 
-    fn statement_runtime(&self) -> StatementRuntime<'_> {
+    fn statement_runtime(
+        &self,
+        default_isolation: IsolationLevel,
+        transaction_isolation: IsolationLevel,
+    ) -> StatementRuntime<'_> {
+        let system_state = self.system_state_override.clone().unwrap_or_else(|| {
+            Arc::new(QuerySystemState {
+                gucs: self.gucs.clone(),
+                default_isolation,
+                transaction_isolation,
+            })
+        });
         StatementRuntime::new(
             &self.cancel,
             self.session_sequences.clone(),
             self.session_info.clone(),
         )
-        .with_system_state(self.system_state.clone())
+        .with_system_state(system_state)
+    }
+}
+
+#[derive(Debug)]
+struct QuerySystemState {
+    gucs: Arc<SessionGucs>,
+    default_isolation: IsolationLevel,
+    transaction_isolation: IsolationLevel,
+}
+
+impl SystemStateProvider for QuerySystemState {
+    fn settings(&self) -> Vec<GucSetting> {
+        self.gucs
+            .settings(self.default_isolation, self.transaction_isolation)
+    }
+
+    fn sessions(&self) -> Vec<SessionActivityRow> {
+        Vec::new()
     }
 }
 
@@ -527,8 +556,14 @@ impl QueryService {
             Arc::new(SessionInfo::default()),
             Arc::new(SessionGucs::default()),
         );
-        self.execute_prepared_cancelable_with_session_context(prepared, params, &session, None)
-            .map(StreamOutcome::expect_direct)
+        self.execute_prepared_cancelable_with_session_context(
+            prepared,
+            params,
+            &session,
+            IsolationLevel::default(),
+            None,
+        )
+        .map(StreamOutcome::expect_direct)
     }
 
     pub fn execute_prepared_cancelable_with_session_context(
@@ -536,6 +571,7 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
         session: &QuerySessionContext,
+        default_isolation: IsolationLevel,
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
@@ -557,18 +593,26 @@ impl QueryService {
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
             StatementClass::Read => match class {
-                StatementClass::Read => {
-                    self.autocommit_read(bound, session.statement_runtime(), sink)
-                }
+                StatementClass::Read => self.autocommit_read(
+                    bound,
+                    session.statement_runtime(default_isolation, default_isolation),
+                    sink,
+                ),
                 // A read promoted to a write (e.g. `SELECT nextval(...)`) is
                 // materialized, not streamed.
                 StatementClass::Write => self
-                    .autocommit_bound_write(bound, session.statement_runtime())
+                    .autocommit_bound_write(
+                        bound,
+                        session.statement_runtime(default_isolation, default_isolation),
+                    )
                     .map(StreamOutcome::Direct),
                 _ => unreachable!("classify_bound only promotes reads to writes"),
             },
             StatementClass::Write | StatementClass::Ddl => self
-                .autocommit_bound_write(bound, session.statement_runtime())
+                .autocommit_bound_write(
+                    bound,
+                    session.statement_runtime(default_isolation, default_isolation),
+                )
                 .map(StreamOutcome::Direct),
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
@@ -605,6 +649,7 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
         session: QuerySessionContext,
+        default_isolation: IsolationLevel,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> Result<StreamOutcome> {
         let mut sink = ChannelRowSink::new(row_tx);
@@ -612,6 +657,7 @@ impl QueryService {
             prepared,
             params,
             &session,
+            default_isolation,
             Some(&mut sink),
         )
     }
@@ -710,11 +756,15 @@ impl QueryService {
         match slot {
             Some(txn) => {
                 let class = classify_bound(prepared.class, &bound);
+                let runtime = session.statement_runtime(
+                    txn.current_default_isolation(default_isolation),
+                    txn.isolation,
+                );
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
                     class,
                     BindSource::Bound(bound),
-                    session.statement_runtime(),
+                    runtime,
                     sink,
                 );
                 (slot, default_isolation, result)
@@ -727,17 +777,25 @@ impl QueryService {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
                         match class {
-                            StatementClass::Read => {
-                                self.autocommit_read(bound, session.statement_runtime(), sink)
-                            }
+                            StatementClass::Read => self.autocommit_read(
+                                bound,
+                                session.statement_runtime(default_isolation, default_isolation),
+                                sink,
+                            ),
                             StatementClass::Write => self
-                                .autocommit_bound_write(bound, session.statement_runtime())
+                                .autocommit_bound_write(
+                                    bound,
+                                    session.statement_runtime(default_isolation, default_isolation),
+                                )
                                 .map(StreamOutcome::Direct),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
                     StatementClass::Write | StatementClass::Ddl => self
-                        .autocommit_bound_write(bound, session.statement_runtime())
+                        .autocommit_bound_write(
+                            bound,
+                            session.statement_runtime(default_isolation, default_isolation),
+                        )
                         .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")

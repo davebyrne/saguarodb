@@ -8,6 +8,7 @@ mod projection;
 mod scan;
 mod set_op;
 mod sort;
+mod system_scan;
 mod values;
 
 pub use aggregate::AggregateOp;
@@ -22,6 +23,7 @@ pub use projection::project_row;
 pub use scan::{IndexScanOp, SeqScanOp};
 pub use set_op::SetOpOp;
 pub use sort::SortOp;
+pub use system_scan::SystemScanOp;
 pub use values::ValuesOp;
 
 use common::{Result, StatementContext, Value};

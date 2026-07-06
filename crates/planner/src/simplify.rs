@@ -33,6 +33,10 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             table,
             filter: filter.map(fold_expr).filter(|expr| !is_true(expr)),
         },
+        LogicalPlan::SystemScan { view, filter } => LogicalPlan::SystemScan {
+            view,
+            filter: filter.map(fold_expr).filter(|expr| !is_true(expr)),
+        },
         LogicalPlan::Join {
             left,
             right,
