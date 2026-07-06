@@ -45,3 +45,6 @@ Each crate owns focused unit tests for its public contract. Cross-crate behavior
 - Execution: SELECT, INSERT, UPDATE, DELETE against in-memory storage.
 - Durability: commit, rollback, checkpoint, recovery replay.
 - Protocol: startup, SSL negotiation (accept/reject), simple query response shape.
+- Virtual system catalogs: `pg_catalog`/`information_schema` driver query
+  shapes, `RowDescription` wire metadata, shadowing rules, read-only error
+  paths, `pg_settings`, and live `pg_stat_activity` state.

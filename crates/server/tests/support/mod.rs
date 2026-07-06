@@ -340,6 +340,10 @@ impl Connection {
         bind_bytes("", "")
     }
 
+    pub fn extended_describe_statement(name: &str) -> Vec<u8> {
+        describe_bytes(b'S', name)
+    }
+
     pub fn extended_execute_portal() -> Vec<u8> {
         execute_bytes("")
     }
@@ -496,6 +500,35 @@ impl QueryOutcome {
     pub fn unwrap(self) -> SimpleQueryResult {
         self.result.expect("expected query success")
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowDescriptionField {
+    pub name: String,
+    pub table_oid: i32,
+    pub attr_num: i16,
+    pub type_oid: i32,
+    pub type_size: i16,
+    pub type_modifier: i32,
+    pub format_code: i16,
+}
+
+pub fn first_row_description(bytes: &[u8]) -> Result<Vec<RowDescriptionField>> {
+    let mut row_description = None;
+    for_each_message(bytes, |tag, body| {
+        if tag == b'T' {
+            row_description = Some(body.to_vec());
+            return true;
+        }
+        false
+    })?;
+    let body = row_description.ok_or_else(|| {
+        common::DbError::protocol(
+            common::SqlState::InternalError,
+            "response did not include RowDescription",
+        )
+    })?;
+    decode_row_description_body(&body)
 }
 
 /// Extract the transaction-status byte from the trailing `ReadyForQuery` (`Z`)
@@ -969,6 +1002,13 @@ fn bind_text_param_bytes(portal: &str, statement: &str, param: &str) -> Vec<u8> 
     tagged(b'B', &body)
 }
 
+fn describe_bytes(kind: u8, name: &str) -> Vec<u8> {
+    let mut body = vec![kind];
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    tagged(b'D', &body)
+}
+
 /// An `Execute` message for `portal` with no row limit (all rows).
 fn execute_bytes(portal: &str) -> Vec<u8> {
     let mut body = Vec::new();
@@ -1017,6 +1057,75 @@ fn read_i32(bytes: &[u8]) -> Result<i32> {
         ));
     }
     Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn decode_row_description_body(body: &[u8]) -> Result<Vec<RowDescriptionField>> {
+    let mut offset = 0;
+    let count = read_i16_at(body, &mut offset)? as usize;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = read_cstr_at(body, &mut offset)?;
+        fields.push(RowDescriptionField {
+            name,
+            table_oid: read_i32_at(body, &mut offset)?,
+            attr_num: read_i16_at(body, &mut offset)?,
+            type_oid: read_i32_at(body, &mut offset)?,
+            type_size: read_i16_at(body, &mut offset)?,
+            type_modifier: read_i32_at(body, &mut offset)?,
+            format_code: read_i16_at(body, &mut offset)?,
+        });
+    }
+    if offset != body.len() {
+        return Err(common::DbError::protocol(
+            common::SqlState::InternalError,
+            "RowDescription has trailing bytes",
+        ));
+    }
+    Ok(fields)
+}
+
+fn read_i16_at(bytes: &[u8], offset: &mut usize) -> Result<i16> {
+    if *offset + 2 > bytes.len() {
+        return Err(common::DbError::protocol(
+            common::SqlState::InternalError,
+            "expected two-byte integer",
+        ));
+    }
+    let value = i16::from_be_bytes([bytes[*offset], bytes[*offset + 1]]);
+    *offset += 2;
+    Ok(value)
+}
+
+fn read_i32_at(bytes: &[u8], offset: &mut usize) -> Result<i32> {
+    if *offset + 4 > bytes.len() {
+        return Err(common::DbError::protocol(
+            common::SqlState::InternalError,
+            "expected four-byte integer",
+        ));
+    }
+    let value = read_i32(&bytes[*offset..*offset + 4])?;
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_cstr_at(bytes: &[u8], offset: &mut usize) -> Result<String> {
+    let Some(relative_nul) = bytes[*offset..].iter().position(|byte| *byte == 0) else {
+        return Err(common::DbError::protocol(
+            common::SqlState::InternalError,
+            "unterminated string in RowDescription",
+        ));
+    };
+    let end = *offset + relative_nul;
+    let value = std::str::from_utf8(&bytes[*offset..end])
+        .map_err(|_| {
+            common::DbError::protocol(
+                common::SqlState::InternalError,
+                "RowDescription field name is not UTF-8",
+            )
+        })?
+        .to_string();
+    *offset = end + 1;
+    Ok(value)
 }
 
 fn find_workspace_root(start: &Path) -> io::Result<PathBuf> {
