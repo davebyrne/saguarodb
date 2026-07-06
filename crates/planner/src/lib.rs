@@ -746,6 +746,14 @@ mod tests {
     }
 
     #[test]
+    fn binder_schema_qualified_public_system_named_table_is_not_system_fallback() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select * from public.pg_class").unwrap(), &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
     fn binder_binds_system_views() {
         let catalog = catalog_with_users();
         let bound = bind(

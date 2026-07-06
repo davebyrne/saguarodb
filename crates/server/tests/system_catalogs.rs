@@ -233,6 +233,14 @@ async fn system_catalogs_reject_unsupported_names_with_stable_sqlstates() {
     assert!(err.message.contains("C=3F000"), "message: {}", err.message);
 
     let err = conn
+        .ok("select * from public.pg_class")
+        .await
+        .result
+        .err()
+        .expect("missing public table should fail");
+    assert!(err.message.contains("C=42P01"), "message: {}", err.message);
+
+    let err = conn
         .ok("select * from columns")
         .await
         .result

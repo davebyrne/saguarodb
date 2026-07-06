@@ -13,7 +13,7 @@ use crate::{
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::{
     BindContext, Binding, CteBinding, CteScope, contains_aggregate, input_ref, plan_error,
-    reject_aggregate, require_table, require_type,
+    reject_aggregate, require_type,
 };
 
 /// Bind a query expression: bind any `WITH` CTEs into a child scope, then bind the
@@ -610,7 +610,12 @@ fn bind_table_or_schema_qualified_name(
             }
         }
         Some("public") => {
-            let table = require_table(catalog, name)?;
+            let table = catalog.get_table_by_name(name)?.ok_or_else(|| {
+                plan_error(
+                    SqlState::UndefinedTable,
+                    format!("table public.{name} does not exist"),
+                )
+            })?;
             Ok(bind_table_from_schema(ctx, table, alias.clone()))
         }
         Some(schema) if is_system_schema(schema) => match resolve_system_view(Some(schema), name) {
