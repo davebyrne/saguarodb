@@ -57,6 +57,57 @@ index, sequence, and dictionary-id fields deserialize with defaults (empty
 maps and initial allocator values), so catalogs persisted before secondary
 indexes, sequences, or compression existed still load.
 
+The crate also exposes a static virtual system-catalog registry. This registry
+describes view names, schemas, columns, and deterministic virtual OIDs for the
+driver-oriented system-catalog surface; it is not part of `CatalogSnapshot`, WAL,
+manifest state, heap storage, or `RelationKind`. Virtual rows are built later by
+the executor from ordinary catalog/session/server state.
+
+```rust
+pub enum SystemSchema {
+    PgCatalog,
+    InformationSchema,
+}
+
+pub enum SystemView {
+    PgNamespace,
+    PgClass,
+    PgAttribute,
+    PgType,
+    PgIndex,
+    PgSettings,
+    PgStatActivity,
+    InformationSchemaSchemata,
+    InformationSchemaTables,
+    InformationSchemaColumns,
+}
+
+pub fn resolve_system_view(schema: Option<&str>, name: &str) -> Option<SystemView>;
+pub fn is_system_schema(name: &str) -> bool;
+```
+
+`resolve_system_view(None, name)` searches only `pg_catalog`, matching the binder's
+bare-name fallback rule. Qualified `pg_catalog.<view>` and
+`information_schema.<view>` names resolve only within their named virtual schema.
+`public` is not a system schema.
+
+Virtual OIDs are deterministic and derived rather than persisted. User-object
+OIDs use tagged `i64` spaces (`tag << 40 | durable_id`) so the full `u32`
+durable ID domains remain disjoint:
+
+- schemas: `pg_catalog = 11`, `public = 2200`, `information_schema = 13000`;
+- user tables: tag `1`;
+- user indexes: tag `2`;
+- user sequences: tag `3`;
+- synthetic primary-key indexes: tag `4`;
+- core system views use stable PostgreSQL OIDs where practical, otherwise
+  project-reserved constants.
+
+OID-like catalog columns use existing integer semantic types with `int8` wire
+presentation so tagged virtual OIDs stay representable. `name`/`char`/`int2vector`-
+like columns use text presentation types. These are wire-shape approximations only;
+they do not introduce new storage or semantic types.
+
 ## Public API
 
 ```rust

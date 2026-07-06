@@ -2008,6 +2008,12 @@ pub struct TableSchema {
 
 The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` resolves by name at execution time to preserve extended-protocol prepared-statement semantics, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
+The catalog crate also owns a static virtual system-view registry for the
+driver-oriented `pg_catalog` and `information_schema` surface. The registry
+describes virtual schemas, relation names, column descriptors, and deterministic
+OID derivation, but it is not serialized in `CatalogSnapshot`, WAL, manifests, or
+heap storage.
+
 ### Catalog Trait
 
 ```rust

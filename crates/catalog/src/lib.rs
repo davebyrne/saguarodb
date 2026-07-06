@@ -1,8 +1,14 @@
 mod memory;
 mod serialize;
+pub mod system;
 
 pub use memory::{CatalogSnapshot, MemoryCatalog};
 pub use serialize::{deserialize_catalog, serialize_catalog};
+pub use system::{
+    INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
+    index_oid, is_system_schema, resolve_system_view, sequence_oid, synthetic_primary_key_oid,
+    table_oid,
+};
 
 use common::{
     CompressionSetting, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions,
