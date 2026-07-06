@@ -27,6 +27,8 @@ pub enum SqlState {
     SuccessfulCompletion,
     SyntaxError,
     UndefinedTable,
+    /// `3F000`: a schema name is not recognized.
+    InvalidSchemaName,
     UndefinedColumn,
     /// `42704`: an object-like name is not recognized, e.g. a `SHOW` of an
     /// unknown configuration parameter.

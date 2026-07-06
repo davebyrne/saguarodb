@@ -350,6 +350,7 @@ pub enum SqlState {
     SuccessfulCompletion,
     SyntaxError,
     UndefinedTable,
+    InvalidSchemaName,
     UndefinedColumn,
     UndefinedObject,
     InvalidColumnReference,
@@ -385,6 +386,9 @@ All crates return `common::Result<T>`. Crates should map low-level errors into t
 `SqlState::UndefinedObject` maps to SQLSTATE `42704`: an object-like name is not
 recognized when no more specific relation/column SQLSTATE applies. The server
 uses it for `SHOW` of an unknown configuration parameter.
+
+`SqlState::InvalidSchemaName` maps to SQLSTATE `3F000`: a schema-qualified SQL
+name referenced a schema that SaguaroDB does not expose.
 
 `SqlState::InFailedSqlTransaction` maps to SQLSTATE `25P02`: a statement other
 than `COMMIT`/`ROLLBACK` issued inside an already-failed (`'E'`) transaction block.
@@ -451,6 +455,7 @@ pub struct StatementContext {
     pub sequence_manager: Arc<dyn SequenceManager>,
     pub session_sequences: Arc<SessionSequenceState>,
     pub session_info: Arc<SessionInfo>,
+    pub system_state: Arc<dyn SystemStateProvider>,
 }
 ```
 
@@ -485,8 +490,57 @@ values. `session_info` carries connection identity (`user`, `database`,
 `backend_pid`) for system information functions; it defaults to the single built-in
 `saguarodb` database/user with pid `0`. Server connection plumbing installs the
 real per-connection value when system information functions are wired into query
-execution. Default contexts install loud/no-op test implementations where
-appropriate. `StatementContext` is `Clone` but not `Copy`.
+execution. `system_state` is the runtime provider for virtual system catalog
+session data (`pg_settings`, `pg_stat_activity`, and `current_setting`); default
+contexts install an empty no-op provider. Default contexts install loud/no-op test
+implementations where appropriate. `StatementContext` is `Clone` but not `Copy`.
+
+```rust
+pub struct GucSetting {
+    pub name: String,
+    pub setting: String,
+    pub boot_val: String,
+    pub reset_val: String,
+    pub source: String,
+}
+
+pub enum SessionState {
+    Active,
+    Idle,
+    IdleInTransaction,
+    IdleInTransactionAborted,
+}
+
+pub struct SessionActivityRow {
+    pub datid: i32,
+    pub datname: String,
+    pub pid: i32,
+    pub usesysid: i32,
+    pub usename: String,
+    pub application_name: String,
+    pub backend_start: i64,
+    pub xact_start: Option<i64>,
+    pub query_start: Option<i64>,
+    pub state_change: Option<i64>,
+    pub state: SessionState,
+    pub query: String,
+}
+
+pub trait SystemStateProvider: Send + Sync + Debug {
+    fn settings(&self) -> Vec<GucSetting>;
+    fn setting(&self, name: &str) -> Option<String>;
+    fn sessions(&self) -> Vec<SessionActivityRow>;
+}
+```
+
+`SystemStateProvider` lives in `common` so `executor` can read virtual-catalog
+session data without depending on `server`. Callers that have session/server state
+install a provider with `StatementContext::with_system_state`; contexts without
+that state use `no_system_state()`, whose methods return empty rows or `None`.
+`setting(name)` defaults to a case-insensitive lookup over `settings()`, so
+`pg_settings` and `current_setting` stay consistent unless an implementation
+deliberately overrides the lookup for efficiency while preserving the same
+semantics.
 
 ## Scalar Function Registry
 

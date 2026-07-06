@@ -19,8 +19,8 @@ use tokio::task::JoinHandle;
 use crate::app::AppState;
 use crate::cancel::BackendKey;
 use crate::query::{
-    CopyInChunk, PreparedStatement, SessionGucs, SessionTxnStatus, StreamOutcome, Transaction,
-    abort_session_transaction,
+    CopyInChunk, PreparedStatement, QuerySessionContext, SessionGucs, SessionTxnStatus,
+    StreamOutcome, Transaction, abort_session_transaction,
 };
 use crate::shutdown::InFlightQueryGuard;
 
@@ -366,6 +366,15 @@ impl Session {
         self.cancel.clone()
     }
 
+    fn query_session_context(&self, cancel: Arc<AtomicBool>) -> QuerySessionContext {
+        QuerySessionContext::new(
+            cancel,
+            self.session_sequences.clone(),
+            self.session_info.clone(),
+            self.session_gucs.clone(),
+        )
+    }
+
     /// Report `application_name` changes after `SET`/`RESET`/`DISCARD ALL`.
     /// Other startup-reported parameters are fixed in this server.
     fn application_name_status_change(&mut self) -> Option<ServerMessage> {
@@ -612,6 +621,7 @@ fn sqlstate_code(code: SqlState) -> &'static str {
         SqlState::SuccessfulCompletion => "00000",
         SqlState::SyntaxError => "42601",
         SqlState::UndefinedTable => "42P01",
+        SqlState::InvalidSchemaName => "3F000",
         SqlState::UndefinedColumn => "42703",
         SqlState::UndefinedObject => "42704",
         SqlState::InvalidColumnReference => "42P10",

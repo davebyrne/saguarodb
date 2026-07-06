@@ -276,6 +276,7 @@ pub enum SqlState {
     SuccessfulCompletion,       // 00000
     SyntaxError,                // 42601
     UndefinedTable,             // 42P01
+    InvalidSchemaName,          // 3F000
     UndefinedColumn,            // 42703
     UndefinedObject,            // 42704
     InvalidColumnReference,     // 42P10
@@ -309,7 +310,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Passed to every storage operation. Carries the transaction id, the MVCC
 /// snapshot used for visibility, the isolation level, the GC horizon, and the
 /// server-installed runtime handles (row-lock conflict waiter, cancel flag,
-/// live subxid set, SSI tracker, sequence runtime, session identity).
+/// live subxid set, SSI tracker, sequence runtime, session identity, system state).
 /// docs/specs/crates/common.md "Statement Context" is the authoritative
 /// field-by-field contract.
 pub struct StatementContext {
@@ -324,6 +325,7 @@ pub struct StatementContext {
     pub sequence_manager: Arc<dyn SequenceManager>,
     pub session_sequences: Arc<SessionSequenceState>,
     pub session_info: Arc<SessionInfo>,
+    pub system_state: Arc<dyn SystemStateProvider>,
 }
 ```
 

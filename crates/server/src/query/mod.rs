@@ -4,7 +4,8 @@ use std::sync::atomic::AtomicBool;
 
 use common::{
     CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, IsolationLevel, PgType, Result,
-    SessionInfo, SessionSequenceState, Snapshot, SqlState, Value, WriteGuard,
+    SessionInfo, SessionSequenceState, Snapshot, SqlState, SystemStateProvider, Value, WriteGuard,
+    no_system_state,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -47,6 +48,7 @@ pub struct QuerySessionContext {
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     gucs: Arc<SessionGucs>,
+    system_state: Arc<dyn SystemStateProvider>,
 }
 
 impl QuerySessionContext {
@@ -61,7 +63,14 @@ impl QuerySessionContext {
             session_sequences,
             session_info,
             gucs,
+            system_state: no_system_state(),
         }
+    }
+
+    #[must_use]
+    pub fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
+        self.system_state = system_state;
+        self
     }
 
     fn cancel(&self) -> &Arc<AtomicBool> {
@@ -82,6 +91,7 @@ impl QuerySessionContext {
             self.session_sequences.clone(),
             self.session_info.clone(),
         )
+        .with_system_state(self.system_state.clone())
     }
 }
 

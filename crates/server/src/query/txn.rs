@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
     DbError, IsolationLevel, Result, SequenceManager, SessionInfo, SessionSequenceState, Snapshot,
-    SqlState, StatementContext,
+    SqlState, StatementContext, SystemStateProvider, no_system_state,
 };
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
@@ -21,6 +21,7 @@ pub(super) struct StatementRuntime<'a> {
     cancel: &'a Arc<AtomicBool>,
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
+    system_state: Arc<dyn SystemStateProvider>,
 }
 
 impl<'a> StatementRuntime<'a> {
@@ -33,7 +34,14 @@ impl<'a> StatementRuntime<'a> {
             cancel,
             session_sequences,
             session_info,
+            system_state: no_system_state(),
         }
+    }
+
+    #[must_use]
+    pub(super) fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
+        self.system_state = system_state;
+        self
     }
 }
 
@@ -650,6 +658,7 @@ impl QueryService {
                 .with_sequence_manager(sequence_manager)
                 .with_session_sequences(runtime.session_sequences)
                 .with_session_info(runtime.session_info)
+                .with_system_state(runtime.system_state)
                 // Install the lock manager (so an in-progress row-lock conflict blocks
                 // instead of failing fast) and the connection's cancel flag (so a
                 // blocked writer is interruptible) — `docs/specs/deadlock.md`.

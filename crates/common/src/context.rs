@@ -141,6 +141,85 @@ impl Default for SessionInfo {
     }
 }
 
+/// One row from the session configuration source shared by `SHOW ALL` and
+/// `pg_catalog.pg_settings`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GucSetting {
+    pub name: String,
+    pub setting: String,
+    pub boot_val: String,
+    pub reset_val: String,
+    pub source: String,
+}
+
+/// Coarse PostgreSQL-compatible activity state for `pg_stat_activity`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Active,
+    Idle,
+    IdleInTransaction,
+    IdleInTransactionAborted,
+}
+
+impl SessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionState::Active => "active",
+            SessionState::Idle => "idle",
+            SessionState::IdleInTransaction => "idle in transaction",
+            SessionState::IdleInTransactionAborted => "idle in transaction (aborted)",
+        }
+    }
+}
+
+/// One activity row supplied to the virtual `pg_stat_activity` scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionActivityRow {
+    pub datid: i32,
+    pub datname: String,
+    pub pid: i32,
+    pub usesysid: i32,
+    pub usename: String,
+    pub application_name: String,
+    pub backend_start: i64,
+    pub xact_start: Option<i64>,
+    pub query_start: Option<i64>,
+    pub state_change: Option<i64>,
+    pub state: SessionState,
+    pub query: String,
+}
+
+/// Server/session state consumed by virtual system catalogs. Library crates get a
+/// no-op provider by default so non-server tests and recovery scaffolding do not
+/// need to manufacture session registries.
+pub trait SystemStateProvider: Send + Sync + std::fmt::Debug {
+    fn settings(&self) -> Vec<GucSetting>;
+    fn setting(&self, name: &str) -> Option<String> {
+        self.settings()
+            .into_iter()
+            .find(|setting| setting.name.eq_ignore_ascii_case(name))
+            .map(|setting| setting.setting)
+    }
+    fn sessions(&self) -> Vec<SessionActivityRow>;
+}
+
+#[derive(Debug)]
+struct NoSystemStateProvider;
+
+impl SystemStateProvider for NoSystemStateProvider {
+    fn settings(&self) -> Vec<GucSetting> {
+        Vec::new()
+    }
+
+    fn sessions(&self) -> Vec<SessionActivityRow> {
+        Vec::new()
+    }
+}
+
+pub fn no_system_state() -> Arc<dyn SystemStateProvider> {
+    Arc::new(NoSystemStateProvider)
+}
+
 /// Records what a `SERIALIZABLE` transaction reads (SIREAD locks) and forms
 /// rw-antidependency edges when a write overwrites a concurrent read, so the server's
 /// serializable-conflict manager can detect dangerous structures and abort to preserve
@@ -242,6 +321,9 @@ pub struct StatementContext {
     pub session_sequences: Arc<SessionSequenceState>,
     /// Connection identity for system information functions.
     pub session_info: Arc<SessionInfo>,
+    /// Server/session state visible through virtual system catalogs and
+    /// `current_setting`.
+    pub system_state: Arc<dyn SystemStateProvider>,
 }
 
 impl StatementContext {
@@ -263,6 +345,7 @@ impl StatementContext {
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
+            system_state: no_system_state(),
         }
     }
 
@@ -283,6 +366,7 @@ impl StatementContext {
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
+            system_state: no_system_state(),
         }
     }
 
@@ -305,6 +389,7 @@ impl StatementContext {
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
+            system_state: no_system_state(),
         }
     }
 
@@ -364,6 +449,14 @@ impl StatementContext {
     #[must_use]
     pub fn with_session_info(mut self, session_info: Arc<SessionInfo>) -> Self {
         self.session_info = session_info;
+        self
+    }
+
+    /// Install the server/session provider used by virtual system catalogs and
+    /// `current_setting`.
+    #[must_use]
+    pub fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
+        self.system_state = system_state;
         self
     }
 

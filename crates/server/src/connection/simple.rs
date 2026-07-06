@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::{QuerySessionContext, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 
 use super::{
     Session, TransactionState, command_complete_tag, encode_row, error_response,
@@ -47,11 +47,7 @@ impl Session {
         };
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
-        let session_sequences = self.session_sequences.clone();
-        let session_info = self.session_info.clone();
-        let session_gucs = self.session_gucs.clone();
-        let session =
-            QuerySessionContext::new(cancel, session_sequences, session_info, session_gucs);
+        let session = self.query_session_context(cancel);
         // A SELECT streams its rows through this bounded channel: the blocking
         // producer sends `Start` (columns) then `Rows` batches; this async task
         // drains them to the socket while the producer runs, giving TCP

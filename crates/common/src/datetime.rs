@@ -4,6 +4,16 @@
 //! external date dependency is needed. `TIMESTAMP` builds on this in a later
 //! change.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current UTC time as microseconds since the Unix epoch.
+pub fn now_micros() -> i64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
+}
+
 /// Days from the Unix epoch (1970-01-01) for a proleptic-Gregorian Y-M-D.
 /// `month` is 1..=12 and `day` is 1..=31; out-of-range components produce a
 /// value that will not round-trip (callers validate via [`civil_from_days`]).
