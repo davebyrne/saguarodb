@@ -1,4 +1,4 @@
-use catalog::CatalogManager;
+use catalog::{CatalogManager, is_system_schema};
 use common::{
     ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
     Value,
@@ -535,18 +535,11 @@ fn bind_from_item(
     item: &FromItem,
 ) -> Result<BoundFrom> {
     match item {
-        FromItem::Table { name, alias } => {
-            // A CTE name shadows a catalog table (matching PostgreSQL). Taking the
-            // binding out of the scope by value (the one unavoidable clone of the
-            // inlined plan) also ends the `ctx.cte_scope` borrow before `ctx` is
-            // mutated.
-            if let Some(cte) = ctx.cte_scope.lookup(name).cloned() {
-                Ok(bind_cte_reference(ctx, cte, alias.clone()))
-            } else {
-                let table = require_table(catalog, name)?;
-                Ok(bind_table_from_schema(ctx, table, alias.clone()))
-            }
-        }
+        FromItem::Table {
+            schema,
+            name,
+            alias,
+        } => bind_table_or_schema_qualified_name(catalog, ctx, schema.as_deref(), name, alias),
         FromItem::Derived {
             subquery,
             alias,
@@ -587,6 +580,41 @@ fn bind_from_item(
                 condition,
             })
         }
+    }
+}
+
+fn bind_table_or_schema_qualified_name(
+    catalog: &dyn CatalogManager,
+    ctx: &mut BindContext,
+    schema: Option<&str>,
+    name: &str,
+    alias: &Option<String>,
+) -> Result<BoundFrom> {
+    match schema {
+        None => {
+            // A bare CTE name shadows a catalog table (matching PostgreSQL). Taking
+            // the binding out of the scope by value (the one unavoidable clone of
+            // the inlined plan) also ends the `ctx.cte_scope` borrow before `ctx`
+            // is mutated.
+            if let Some(cte) = ctx.cte_scope.lookup(name).cloned() {
+                Ok(bind_cte_reference(ctx, cte, alias.clone()))
+            } else {
+                let table = require_table(catalog, name)?;
+                Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            }
+        }
+        Some("public") => {
+            let table = require_table(catalog, name)?;
+            Ok(bind_table_from_schema(ctx, table, alias.clone()))
+        }
+        Some(schema) if is_system_schema(schema) => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "system catalog scans are not implemented yet",
+        )),
+        Some(schema) => Err(plan_error(
+            SqlState::InvalidSchemaName,
+            format!("schema \"{schema}\" does not exist"),
+        )),
     }
 }
 

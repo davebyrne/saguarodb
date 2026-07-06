@@ -560,6 +560,44 @@ fn object_name(name: &sql::ObjectName) -> Result<String> {
     ident_name(ident)
 }
 
+fn relation_name(name: &sql::ObjectName) -> Result<(Option<String>, String)> {
+    match name.0.as_slice() {
+        [name] => {
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported relation name part"))?;
+            Ok((None, ident_name(name)?))
+        }
+        [schema, name] => {
+            let schema = schema
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported relation schema part"))?;
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported relation name part"))?;
+            Ok((Some(ident_name(schema)?), ident_name(name)?))
+        }
+        _ => unsupported("qualified names with more than one schema are not supported"),
+    }
+}
+
+fn dml_target_name(name: &sql::ObjectName) -> Result<String> {
+    let (schema, name) = relation_name(name)?;
+    fold_dml_target_name(schema.as_deref(), name)
+}
+
+fn fold_dml_target_name(schema: Option<&str>, name: String) -> Result<String> {
+    match schema {
+        None | Some("public") => Ok(name),
+        Some("pg_catalog" | "information_schema") => {
+            feature_not_supported("system catalogs are read-only")
+        }
+        Some(schema) => Err(invalid_schema_name(format!(
+            "schema \"{schema}\" does not exist"
+        ))),
+    }
+}
+
 fn ident_name(ident: &sql::Ident) -> Result<String> {
     if ident.quote_style.is_some() {
         return Err(parse_error("quoted identifiers are not supported"));
@@ -1140,6 +1178,10 @@ fn matches_word(token: Option<&Token>, expected: &str) -> bool {
 
 fn parse_error(message: impl Into<String>) -> DbError {
     DbError::parse(SqlState::SyntaxError, message)
+}
+
+fn invalid_schema_name(message: impl Into<String>) -> DbError {
+    DbError::parse(SqlState::InvalidSchemaName, message)
 }
 
 fn invalid_parameter_value(message: impl Into<String>) -> DbError {

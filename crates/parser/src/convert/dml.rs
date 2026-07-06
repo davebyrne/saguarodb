@@ -8,7 +8,7 @@ use super::query::{
     convert_assignment, convert_query, convert_returning, query_has_modifiers,
     table_name_from_table_with_joins,
 };
-use super::{feature_not_supported, ident_name, object_name, parse_error, unsupported};
+use super::{dml_target_name, feature_not_supported, ident_name, parse_error, unsupported};
 
 pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
     let sql::Insert {
@@ -73,7 +73,7 @@ pub(super) fn convert_insert(insert: sql::Insert) -> Result<Statement> {
     };
 
     Ok(Statement::Insert {
-        table: object_name(&table)?,
+        table: dml_target_name(&table)?,
         columns: columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?,
         source,
         on_conflict,
@@ -145,7 +145,7 @@ pub(super) fn convert_copy(
             return feature_not_supported("COPY (query) TO STDOUT is not supported");
         }
     };
-    let table = object_name(&table_name)?;
+    let table = dml_target_name(&table_name)?;
     let columns = columns.iter().map(ident_name).collect::<Result<Vec<_>>>()?;
 
     let direction = if to {

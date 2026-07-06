@@ -22,8 +22,8 @@ mod tests {
     };
 
     use crate::{
-        BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody, SelectItem,
-        SetOp, SetScope, Statement, UnaryOp, parse,
+        Assignment, BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody,
+        SelectItem, SetOp, SetScope, Statement, UnaryOp, parse,
     };
 
     #[test]
@@ -983,6 +983,7 @@ mod tests {
         assert!(matches!(
             select.from[0],
             FromItem::Table {
+                schema: None,
                 ref name,
                 alias: Some(ref alias)
             } if name == "users" && alias == "u"
@@ -994,10 +995,100 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schema_qualified_table_name() {
-        let err = parse("select id from schema.users").unwrap_err();
+    fn parses_schema_qualified_table_names() {
+        let stmt = parse("select id from public.users").unwrap();
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.from[0],
+            FromItem::Table {
+                schema: Some(ref schema),
+                ref name,
+                alias: None
+            } if schema == "public" && name == "users"
+        ));
+
+        let stmt = parse("select c.oid from pg_catalog.pg_class as c").unwrap();
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
+            panic!("expected select");
+        };
+        assert!(matches!(
+            select.from[0],
+            FromItem::Table {
+                schema: Some(ref schema),
+                ref name,
+                alias: Some(ref alias)
+            } if schema == "pg_catalog" && name == "pg_class" && alias == "c"
+        ));
+    }
+
+    #[test]
+    fn rejects_too_deep_qualified_table_name() {
+        let err = parse("select id from a.b.c").unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn folds_public_dml_targets_and_rejects_system_or_unknown_schemas() {
+        assert_eq!(
+            parse("insert into public.users values (1)").unwrap(),
+            Statement::Insert {
+                table: "users".to_string(),
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![Expr::Literal(Value::Integer(1))]]),
+                on_conflict: None,
+                returning: None,
+            }
+        );
+
+        let err = parse("insert into pg_catalog.pg_class values (1)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        let err = parse("insert into nosuch.users values (1)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::InvalidSchemaName);
+
+        assert_eq!(
+            parse("update public.users set name = 'Ada'").unwrap(),
+            Statement::Update {
+                table: "users".to_string(),
+                assignments: vec![Assignment {
+                    column: "name".to_string(),
+                    value: Expr::Literal(Value::Text("Ada".to_string())),
+                }],
+                filter: None,
+                returning: None,
+            }
+        );
+
+        let err = parse("delete from pg_catalog.pg_class").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        let err = parse("copy nosuch.users from stdin").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::InvalidSchemaName);
+
+        assert_eq!(
+            parse("copy public.users to stdout").unwrap(),
+            Statement::Copy {
+                table: "users".to_string(),
+                columns: vec![],
+                direction: CopyDirection::To,
+                options: CopyOptions::defaults_for(CopyFormat::Text),
+            }
+        );
     }
 
     #[test]

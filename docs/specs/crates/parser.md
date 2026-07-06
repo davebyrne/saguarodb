@@ -167,6 +167,8 @@ pub enum Distinct {
 layer translates both forms; the binder binds and validates each.
 
 Identifiers remain strings in parser output. Name resolution is not a parser responsibility.
+Unquoted relation names in `FROM` may be one or two parts; the parser stores the
+optional schema separately on `FromItem::Table`.
 
 ## Expression AST
 
@@ -178,7 +180,7 @@ pub enum SelectItem {
 }
 
 pub enum FromItem {
-    Table { name: String, alias: Option<String> },
+    Table { schema: Option<String>, name: String, alias: Option<String> },
     // Derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required.
     Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
     Join {
@@ -284,6 +286,13 @@ Parser may produce AST variants for syntax that binder rejects. The parser parse
 - `DROP INDEX name`.
 - `CREATE SEQUENCE name [INCREMENT [BY] n] [START [WITH] n] [MINVALUE n | NO MINVALUE] [MAXVALUE n | NO MAXVALUE] [CACHE n] [[NO] CYCLE]`. Options may be written in any order and are normalized into `SequenceOptions`; duplicate options are rejected. `CACHE` must be positive and is accepted as parser input but ignored downstream. `TEMP`/`TEMPORARY`, `IF NOT EXISTS`, `AS <type>`, qualified or quoted names, and `OWNED BY` are rejected as unsupported.
 - `DROP SEQUENCE [IF EXISTS] name`.
+- Relation names in `FROM` accept unquoted one- or two-part names, supporting
+  `public.<table>`, `pg_catalog.<view>`, and `information_schema.<view>` as parser
+  output. Three-or-more-part names and quoted identifiers are rejected. CREATE and
+  DROP object paths remain single-part only. DML/COPY targets fold `public.<name>`
+  to `<name>`, reject `pg_catalog.<name>` and `information_schema.<name>` as
+  read-only (`FeatureNotSupported`), and reject any other schema with
+  `InvalidSchemaName`.
 - `INSERT INTO ... VALUES` and `INSERT INTO ... SELECT`.
 - `INSERT ... ON CONFLICT [(col, ...)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`: parsed into `on_conflict: Option<OnConflict>` on the `Insert` node. `OnConflict { target: Option<ConflictTarget>, action: ConflictAction }`; `ConflictTarget::Columns(Vec<String>)` (the binder requires the primary key); `ConflictAction::{ DoNothing, DoUpdate { assignments, filter } }`. `ON CONSTRAINT <name>` is rejected (`FeatureNotSupported`); MySQL's `ON DUPLICATE KEY UPDATE` is rejected. `excluded` resolution is a binder concern.
 - `SELECT` with optional `DISTINCT` / `DISTINCT ON (...)`, projection, an optional `FROM`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`. The `FROM` clause may be omitted (`Select.from` is empty) for a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)`; the binder evaluates it over a single unit row. A top-level `SELECT` is represented as `Statement::Query(Query)` whose `body` is `QueryBody::Select`; the query-level `ORDER BY`/`LIMIT`/`OFFSET` live on the `Query` wrapper. `SELECT`, `VALUES`, and set-operation bodies are supported, and an optional `WITH` clause on the wrapper.

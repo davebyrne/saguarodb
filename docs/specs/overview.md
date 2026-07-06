@@ -748,7 +748,7 @@ pub enum SelectItem {
 }
 
 pub enum FromItem {
-    Table { name: String, alias: Option<String> },
+    Table { schema: Option<String>, name: String, alias: Option<String> },
     // A derived table: (SELECT ...) AS alias [(col, ...)]. The alias is required;
     // column_aliases optionally renames the subquery's output columns.
     Derived { subquery: Box<Query>, alias: String, column_aliases: Vec<String> },
@@ -830,6 +830,9 @@ pub enum UnaryOp {
     Not,   // NOT x
 }
 ```
+
+`FROM` relation names may be unquoted one- or two-part names. The parser stores a
+two-part name's schema on `FromItem::Table`; binder owns resolution.
 
 `FromItem::Join.condition` is `None` only for `JoinType::Cross`. Inner, left, right, and full joins require an `ON` predicate. The parser rejects `USING` and `NATURAL` joins, and rejects `ON`/`USING` with `CROSS JOIN`.
 

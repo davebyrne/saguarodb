@@ -308,6 +308,7 @@ pub enum SelectItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FromItem {
     Table {
+        schema: Option<String>,
         name: String,
         alias: Option<String>,
     },

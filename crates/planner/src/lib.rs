@@ -731,6 +731,35 @@ mod tests {
     }
 
     #[test]
+    fn binder_schema_qualified_public_table_bypasses_cte_shadow() {
+        let catalog = catalog_with_users();
+        let bound = bind(
+            &parse("with users as (select 1 as x) select id from public.users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(query) = &bound else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.output_schema().len(), 1);
+        assert_eq!(query.output_schema()[0].name, "id");
+    }
+
+    #[test]
+    fn binder_rejects_system_and_unknown_schemas_until_system_scan_lands() {
+        let catalog = catalog_with_users();
+        let err = bind(
+            &parse("select * from pg_catalog.pg_class").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        let err = bind(&parse("select * from nosuch.users").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidSchemaName);
+    }
+
+    #[test]
     fn from_less_select_lowers_to_projection_over_unit_row() {
         let catalog = catalog_with_users();
         let bound = bind(&parse("select 1").unwrap(), &catalog).unwrap();

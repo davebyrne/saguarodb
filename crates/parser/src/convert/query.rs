@@ -7,7 +7,9 @@ use crate::{
 };
 
 use super::expr::convert_expr;
-use super::{ident_name, object_name, parse_error, unsupported};
+use super::{
+    fold_dml_target_name, ident_name, object_name, parse_error, relation_name, unsupported,
+};
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
 /// `WITH` CTEs and query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's
@@ -323,8 +325,10 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 return unsupported("unsupported table factor");
             }
             let alias = alias.as_ref().map(table_alias_name).transpose()?;
+            let (schema, name) = relation_name(name)?;
             Ok(FromItem::Table {
-                name: object_name(name)?,
+                schema,
+                name,
                 alias,
             })
         }
@@ -367,10 +371,15 @@ pub(super) fn table_name_from_table_with_joins(table: &sql::TableWithJoins) -> R
     if !table.joins.is_empty() {
         return unsupported("joins are not supported here");
     }
-    let FromItem::Table { name, alias: None } = convert_table_factor(&table.relation)? else {
+    let FromItem::Table {
+        schema,
+        name,
+        alias: None,
+    } = convert_table_factor(&table.relation)?
+    else {
         return unsupported("expected table name");
     };
-    Ok(name)
+    fold_dml_target_name(schema.as_deref(), name)
 }
 
 fn convert_order_by(order_by: sql::OrderBy) -> Result<Vec<OrderByItem>> {
