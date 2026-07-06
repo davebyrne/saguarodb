@@ -52,7 +52,9 @@ Binder output is fully resolved for DML and most DDL. No downstream phase perfor
 
 Binder responsibilities:
 
-- Resolve table names to `TableId`.
+- Resolve table names to `TableId`; if a catalog bug or corrupted snapshot exposes a
+  hidden TOAST relation through name lookup, reject it with `FeatureNotSupported`
+  rather than binding it as a user-queryable relation.
 - Assign unique `BindingId` to every table occurrence.
 - Resolve columns to `BoundExpr::InputRef`.
 - Assign slot indices in operator input rows.

@@ -797,7 +797,7 @@ impl PageBackedStorageEngine {
         };
         let (toast_schema, _) = self.table_handle(toast_table_id)?;
         crate::toast::ensure_toast_relation(&toast_schema)?;
-        self.vacuum(&toast_schema, horizon)
+        self.vacuum_relation(&toast_schema, horizon)
     }
 
     /// VACUUM one table (`docs/specs/mvcc.md` §9, §10 Milestone F4a): the live
@@ -829,6 +829,26 @@ impl PageBackedStorageEngine {
     /// reader that starts mid-pass freezes `xmin >= horizon` (the deleter is in its
     /// settled past). VACUUM therefore never reclaims a version a snapshot needs.
     pub fn vacuum(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
+        if matches!(schema.relation_kind, RelationKind::User)
+            && schema.toast_table_id.is_some()
+            && !self
+                .toast_value_ids_pending_vacuum(schema, horizon)?
+                .is_empty()
+        {
+            return Err(storage_internal(
+                "TOAST-enabled parent vacuum requires coordinated TOAST chunk cleanup/check first",
+            ));
+        }
+        self.vacuum_relation(schema, horizon)
+    }
+
+    /// Run parent-table VACUUM after the caller has performed the coordinated
+    /// TOAST chunk cleanup/check required by [`Self::toast_value_ids_pending_vacuum`].
+    pub fn vacuum_after_toast_cleanup(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
+        self.vacuum_relation(schema, horizon)
+    }
+
+    fn vacuum_relation(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
         // Phase F2b — heap-prune dead-to-all tuples + collapse HOT chains, collecting
         // the DEAD-root TIDs (the slots whose index entries F3a must strip and F3b must
         // reclaim) and the total count of reclaimed slots (DEAD roots + heap-only

@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use catalog::CatalogManager;
 use common::{
-    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, ParsedDefault, Result, SqlState,
-    TableId, TableSchema, Value,
+    BindingId, ColumnDef, DataType, DbError, ParsedColumnDef, ParsedDefault, RelationKind, Result,
+    SqlState, TableId, TableSchema, Value,
 };
 use parser::Statement;
 
@@ -268,12 +268,19 @@ fn bind_inner(
 }
 
 fn require_table(catalog: &dyn CatalogManager, name: &str) -> Result<TableSchema> {
-    catalog.get_table_by_name(name)?.ok_or_else(|| {
+    let table = catalog.get_table_by_name(name)?.ok_or_else(|| {
         plan_error(
             SqlState::UndefinedTable,
             format!("table {name} does not exist"),
         )
-    })
+    })?;
+    if matches!(table.relation_kind, RelationKind::Toast { .. }) {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "hidden TOAST relations are not queryable",
+        ));
+    }
+    Ok(table)
 }
 
 fn require_index(catalog: &dyn CatalogManager, name: &str) -> Result<common::IndexSchema> {

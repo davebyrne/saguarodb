@@ -137,7 +137,13 @@ fn vacuum_tables(
 ) -> Result<()> {
     for schema in tables {
         let cleanup_txn = delete_toast_values_pending_parent_vacuum(components, schema, horizon)?;
-        components.storage.vacuum(schema, horizon)?;
+        if schema.toast_table_id.is_some() {
+            components
+                .storage
+                .vacuum_after_toast_cleanup(schema, horizon)?;
+        } else {
+            components.storage.vacuum(schema, horizon)?;
+        }
         let toast_horizon = cleanup_txn
             .map(|txn_id| horizon.max(txn_id.saturating_add(1)))
             .unwrap_or(horizon);

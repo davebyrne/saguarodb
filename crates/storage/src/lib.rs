@@ -38,7 +38,8 @@ mod tests {
         btree::BTree,
         codec::{
             DecodedPhysicalValue, HEAP_ONLY, HOT_UPDATED, MvccHeader, PreparedColumnValue,
-            ToastPointer, VarlenaPhysical, decode_physical_row, encode_row_v3_prepared,
+            ToastPointer, V2_MVCC_HEADER_LEN, VarlenaPhysical, decode_physical_row,
+            encode_row_v3_prepared, null_bitmap_len,
         },
         decode_row, encode_row,
         engine::RowLocation,
@@ -1956,6 +1957,50 @@ mod tests {
     }
 
     #[test]
+    fn sample_toast_values_skips_invisible_tuple_before_varlena_decode() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let sample_ctx = StatementContext::new(2);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![
+                Value::Integer(1),
+                Value::Text("discarded".to_string()),
+                Value::Boolean(true),
+                Value::Null,
+            ],
+        };
+        harness.storage.insert(&insert_ctx, 1, row).unwrap();
+        harness.wal.mark_aborted(insert_ctx.txn_id);
+
+        {
+            let mut guard = harness
+                .storage
+                .buffer_pool
+                .fetch_for_redo(base.id, 0)
+                .unwrap();
+            let row_bytes = crate::page::read_row(guard.data(), 0).unwrap().unwrap();
+            let row_start = guard
+                .data()
+                .windows(row_bytes.len())
+                .position(|window| window == row_bytes.as_slice())
+                .expect("inserted row bytes are on page");
+            let text_len_offset =
+                row_start + 1 + V2_MVCC_HEADER_LEN + null_bitmap_len(base.columns.len()) + 8;
+            guard.data_mut()[text_len_offset + 3] |= 0xC0;
+            crate::page::set_page_lsn(guard.data_mut(), 99);
+        }
+
+        let samples = harness
+            .storage
+            .sample_toast_values(&sample_ctx, &base, 16, 1024)
+            .unwrap();
+        assert!(samples.is_empty());
+    }
+
+    #[test]
     fn prepare_externalizes_largest_value_first() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
@@ -2838,6 +2883,32 @@ mod tests {
     }
 
     #[test]
+    fn vacuum_rejects_toast_parent_when_chunk_cleanup_pending() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let delete_ctx = StatementContext::new(2);
+        let (base, toast) = bytea_base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Bytes(entropy_bytes(9000))],
+        };
+        harness.storage.insert(&insert_ctx, 1, row).unwrap();
+        assert!(harness.storage.delete(&delete_ctx, 1, &pk(1)).unwrap());
+
+        assert_eq!(
+            harness
+                .storage
+                .toast_value_ids_pending_vacuum(&base, 10)
+                .unwrap(),
+            vec![1]
+        );
+        let err = harness.storage.vacuum(&base, 10).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("TOAST-enabled parent vacuum"));
+    }
+
+    #[test]
     fn vacuum_toast_cleanup_deletes_chunks_before_parent_prune() {
         let harness = StorageHarness::new();
         let insert_ctx = StatementContext::new(1);
@@ -2867,7 +2938,13 @@ mod tests {
         assert!(deleted > 0);
         assert!(visible_toast_chunk_sizes(&harness, &cleanup_ctx, 1).is_empty());
 
-        assert!(harness.storage.vacuum(&base, 10).unwrap() > 0);
+        assert!(
+            harness
+                .storage
+                .vacuum_after_toast_cleanup(&base, 10)
+                .unwrap()
+                > 0
+        );
         assert!(
             harness
                 .storage
@@ -2907,7 +2984,13 @@ mod tests {
                 .unwrap(),
             vec![1]
         );
-        assert!(harness.storage.vacuum(&base, 10).unwrap() > 0);
+        assert!(
+            harness
+                .storage
+                .vacuum_after_toast_cleanup(&base, 10)
+                .unwrap()
+                > 0
+        );
         assert!(
             harness
                 .storage

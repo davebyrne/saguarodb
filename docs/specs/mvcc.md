@@ -840,12 +840,13 @@ design, because index entries accumulate per version as well as heap tuples.
   `VACUUM` is non-transactional). `QueryService::run_vacuum` resolves the target
   table(s), then acquires the **exclusive** checkpoint guard (`begin_checkpoint`) for
   the whole pass, captures `gc_horizon()` **once, after the guard is held**, and calls
-  `engine.vacuum(schema, horizon)` for each target; the command tag is `VACUUM`.
+  `engine.vacuum(schema, horizon)` for ordinary targets; the command tag is `VACUUM`.
   For TOAST-enabled tables, it first asks storage which external value ids are owned
   by parent tuples that full VACUUM would prune, deletes visible hidden chunks for
-  those value ids in a real committed maintenance transaction, then prunes the parent
-  and vacuums the hidden TOAST relation. This preserves the parent tuple bytes needed
-  to discover chunk ownership until the chunk deletes are durable.
+  those value ids in a real committed maintenance transaction when needed, then calls
+  `engine.vacuum_after_toast_cleanup(schema, horizon)` for the parent and vacuums the
+  hidden TOAST relation. This preserves the parent tuple bytes needed to discover
+  chunk ownership until the chunk deletes are durable.
   **No data loss (the horizon-under-the-guard argument):** under the exclusive guard no
   writer runs, so no committed-deleter appears mid-pass; and the horizon — captured
   after acquiring the guard — is the minimum `xmin` advertised by any live snapshot,

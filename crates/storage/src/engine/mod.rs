@@ -52,7 +52,9 @@ use parking_lot::Mutex as PlMutex;
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 use crate::btree::BTree;
-use crate::codec::{DecodedPhysicalValue, ToastPointer, decode_physical_row, decode_row};
+use crate::codec::{
+    DecodedPhysicalValue, ToastPointer, decode_mvcc_header, decode_physical_row, decode_row,
+};
 use crate::heap::{index_file_id, secondary_index_file_id};
 use crate::page;
 use crate::traits::{RowIterator, SchemaOperations, StorageEngine};
@@ -791,17 +793,18 @@ impl PageBackedStorageEngine {
             };
 
             for bytes in page_rows {
-                let physical = decode_physical_row(schema, &bytes)?;
+                let (xmin, xmax, _t_ctid, infomask) = decode_mvcc_header(&bytes)?;
                 if !is_visible(
-                    physical.header.xmin,
-                    physical.header.xmax,
-                    physical.header.infomask,
+                    xmin,
+                    xmax,
+                    infomask,
                     &ctx.snapshot,
                     ctx.live_txns.as_ref(),
                     self.txn_status_view(),
                 ) {
                     continue;
                 }
+                let physical = decode_physical_row(schema, &bytes)?;
                 let row = self.materialize_physical_row(ctx, schema, physical)?;
                 for &column_index in &toastable_columns {
                     if samples.len() >= max_samples || sampled_bytes >= max_bytes {

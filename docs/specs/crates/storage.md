@@ -553,13 +553,23 @@ owned by `PageBackedStorageEngine` plus server VACUUM orchestration:
   linked hidden TOAST relation. This reclaims chunks deleted by a committed TOAST
   cleanup transaction and aborted chunks whose creating transaction rolled back or was
   resolved aborted during recovery.
+- Direct `vacuum(schema, horizon)` on a TOAST-enabled user table rejects the pass if
+  the parent heap contains external value ids that full VACUUM would prune. This keeps
+  storage-level callers from discarding the only parent bytes that identify committed
+  hidden chunks needing cleanup. The server's coordinated VACUUM path must call
+  `toast_value_ids_pending_vacuum`, attempt the hidden-chunk cleanup, and then use
+  `vacuum_after_toast_cleanup(schema, horizon)` for the parent prune.
 
 The server must delete visible hidden chunks in a real maintenance transaction and
 commit it before parent heap pruning removes the owning tuple bytes. After that commit,
-the parent table's normal `vacuum` may discard the parent tuple, and the hidden TOAST
-relation can be vacuumed with a horizon that includes the committed cleanup xid. If a
-chunk delete transaction aborts before commit, the parent prune must not run for that
-table in that pass; a later VACUUM can retry from still-present parent tuple bytes.
+the parent table's coordinated `vacuum_after_toast_cleanup` may discard the parent
+tuple, and the hidden TOAST relation can be vacuumed with a horizon that includes the
+committed cleanup xid. If a chunk delete transaction aborts before commit, the parent
+prune must not run for that table in that pass; a later VACUUM can retry from
+still-present parent tuple bytes. If no visible chunks are deleted because the pending
+parents and chunks belong to aborted transactions, the server may still use
+`vacuum_after_toast_cleanup`; the hidden relation's own VACUUM reclaims those aborted
+chunks by their MVCC headers.
 
 ### MVCC Delete
 
@@ -1097,13 +1107,14 @@ into `write_page`'s encode step and `load_page`'s decode step.
 - **`sample_toast_values(ctx, schema, max_samples, max_bytes)`.** Returns
   bounded logical `TEXT`/`BYTEA` samples for TOAST value-dictionary training.
   It walks heap pages directly instead of calling the public scan iterator so
-  `max_samples`/`max_bytes` bound memory on large tables. Each physical tuple is
-  filtered through the normal MVCC visibility predicate using `ctx`; visible
-  rows are then routed through the same materialization path as user reads, so
-  inline raw, inline compressed, and external TOAST values all contribute their
-  logical bytes. Empty values and non-toastable columns are skipped. The server
-  calls this under the exclusive maintenance guard for `ALTER TABLE ... SET
-  (toast_compression = zstd_dict)`.
+  `max_samples`/`max_bytes` bound memory on large tables. Each tuple's MVCC header
+  is decoded first and filtered through the normal visibility predicate using `ctx`;
+  only visible rows are then decoded as full physical rows and routed through the same
+  materialization path as user reads, so inline raw, inline compressed, and external
+  TOAST values all contribute their logical bytes. Invisible rows are skipped without
+  decoding varlena bodies or reading hidden chunks. Empty values and non-toastable
+  columns are skipped. The server calls this under the exclusive maintenance guard for
+  `ALTER TABLE ... SET (toast_compression = zstd_dict)`.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
@@ -1223,6 +1234,13 @@ impl PageBackedStorageEngine {
         max_samples: usize,
         max_bytes: usize,
     ) -> Result<Vec<Vec<u8>>>;
+    /// Parent-table VACUUM after the server has performed the coordinated TOAST
+    /// chunk cleanup/check and any required committed hidden-chunk deletes.
+    pub fn vacuum_after_toast_cleanup(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+    ) -> Result<usize>;
     /// Re-encode every initialized page (heap + all index files) of
     /// `schema`'s table so a following flush writes them under the current
     /// config. Logs a FullPageImage per page and stamps its LSN as the new

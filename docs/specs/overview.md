@@ -1357,9 +1357,11 @@ VACUUM integrates hidden TOAST cleanup before discarding parent tuple bytes. Und
 the exclusive maintenance guard, storage first identifies external value ids owned by
 parent tuples that full VACUUM would prune without detoasting. The server deletes
 visible hidden chunks for those value ids in a real committed maintenance transaction,
-then prunes the parent table normally and runs ordinary VACUUM on the hidden TOAST
-relation. Update-path HOT pruning leaves chains with external pointers for full
-VACUUM, preserving the parent bytes needed to find chunk ownership.
+then uses the coordinated TOAST parent-prune path and runs ordinary VACUUM on the
+hidden TOAST relation. Direct storage-level parent `vacuum` rejects TOAST-enabled
+tables when full VACUUM would prune external pointers before this cleanup check.
+Update-path HOT pruning leaves chains with external pointers for full VACUUM,
+preserving the parent bytes needed to find chunk ownership.
 
 ### File Layout
 
