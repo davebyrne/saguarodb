@@ -198,6 +198,13 @@ pub enum BoundStatement {
         columns: Vec<ColumnId>,
         direction: CopyDirection,
         options: CopyOptions,
+        /// Bound expression `DEFAULT`s for columns omitted by `COPY FROM`, evaluated
+        /// per row by the executor (empty for `COPY TO` and when no omitted column
+        /// has an expression default).
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
+        /// The table's bound `CHECK` constraints, enforced per row by `COPY FROM`
+        /// (empty for `COPY TO` and when the table has no checks).
+        check_exprs: Vec<BoundExpr>,
     },
 }
 

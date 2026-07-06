@@ -49,6 +49,82 @@ async fn copy_from_stdin_csv_skips_header_and_splits_chunks() {
     assert_eq!(rows, vec![vec![Some("dave".to_string())]]);
 }
 
+/// `COPY FROM` enforces the table's `CHECK` constraints per row, aborting the
+/// whole COPY (one transaction) with `CheckViolation` (`23514`) on a violating row.
+#[tokio::test]
+async fn copy_from_enforces_check_constraint() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key, n integer check (n > 0))")
+        .await;
+
+    // The second row violates `n > 0`; the autocommit COPY aborts and rolls back.
+    let copy = conn
+        .copy_from("copy t from stdin", &[b"1\t5\n2\t0\n"])
+        .await
+        .unwrap();
+    assert_eq!(
+        copy.error_code.as_deref(),
+        Some("23514"),
+        "expected CheckViolation"
+    );
+    let rows = conn.ok("select count(*) from t").await.rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("0".to_string())]],
+        "a failed COPY commits no rows"
+    );
+
+    // A fully conforming COPY succeeds.
+    let copy = conn
+        .copy_from("copy t from stdin", &[b"1\t5\n3\t7\n"])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 2"));
+    let rows = conn.ok("select id from t order by id").await.rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]
+    );
+}
+
+/// `COPY FROM` evaluates a non-constant expression `DEFAULT` for each omitted
+/// column, per row — the same as INSERT (previously rejected as unsupported).
+#[tokio::test]
+async fn copy_from_applies_expression_default() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok(
+        "create table t (id integer primary key, n integer default 2 * 3, \
+         s text not null default upper('hi'))",
+    )
+    .await;
+
+    // Only `id` is supplied; `n` and `s` take their expression defaults each row.
+    let copy = conn
+        .copy_from("copy t (id) from stdin", &[b"1\n2\n"])
+        .await
+        .unwrap();
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 2"));
+
+    let rows = conn.ok("select id, n, s from t order by id").await.rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("6".to_string()),
+                Some("HI".to_string()),
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("6".to_string()),
+                Some("HI".to_string()),
+            ],
+        ]
+    );
+}
+
 #[tokio::test]
 async fn copy_to_stdout_text_and_csv() {
     let (_server, mut conn) = server_with_table().await;

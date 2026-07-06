@@ -3049,6 +3049,8 @@ mod tests {
                 columns: all_columns,
                 direction: CopyDirection::From,
                 options: CopyOptions::defaults_for(CopyFormat::Text),
+                default_exprs: vec![],
+                check_exprs: vec![],
             }
         );
     }
@@ -3069,6 +3071,7 @@ mod tests {
             columns,
             direction,
             options,
+            ..
         } = bind(
             &parse("copy users (name) to stdout with (format csv, header true)").unwrap(),
             &catalog,

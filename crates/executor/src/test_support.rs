@@ -163,7 +163,8 @@ impl ExecutorHarness {
             cancel: &cancel,
         };
         let result = (|| {
-            let mut copy_in = CopyIn::new(&ctx, table_id, column_ids, options)?;
+            let mut copy_in =
+                CopyIn::new(&ctx, table_id, column_ids, options, Vec::new(), Vec::new())?;
             for chunk in chunks {
                 copy_in.push_chunk(chunk)?;
             }

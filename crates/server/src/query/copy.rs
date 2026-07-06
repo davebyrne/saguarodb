@@ -222,7 +222,14 @@ fn drive_copy_in(
     job: CopyJob,
     mut rx: mpsc::Receiver<CopyInChunk>,
 ) -> Result<u64> {
-    let mut copy_in = CopyIn::new(ctx, job.table, job.columns, job.options)?;
+    let mut copy_in = CopyIn::new(
+        ctx,
+        job.table,
+        job.columns,
+        job.options,
+        job.default_exprs,
+        job.check_exprs,
+    )?;
     loop {
         match rx.blocking_recv() {
             Some(CopyInChunk::Chunk(bytes)) => copy_in.push_chunk(&bytes)?,

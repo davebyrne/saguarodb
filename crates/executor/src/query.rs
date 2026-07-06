@@ -690,18 +690,21 @@ fn evaluate_column_default(
     }
 }
 
-/// Map a row's `columns`-ordered values onto a full table row and insert it.
-/// Shared by INSERT and the COPY FROM path. `default_exprs` carries bound
-/// expression defaults for omitted columns (empty for COPY, which does not yet
-/// support expression defaults).
+/// Map a row's `columns`-ordered values onto a full table row, enforce the table's
+/// constraints, and insert it. The COPY FROM insert path: `default_exprs` supplies
+/// omitted columns' bound expression defaults (evaluated per row) and `check_exprs`
+/// the table's bound `CHECK` constraints (enforced per row), so COPY matches INSERT.
 pub(crate) fn map_and_insert_row(
     ctx: &ExecutionContext<'_>,
     table: TableId,
     schema: &TableSchema,
     columns: &[ColumnId],
     values: Vec<Value>,
+    default_exprs: &[(ColumnId, BoundExpr)],
+    check_exprs: &[BoundExpr],
 ) -> Result<()> {
-    let row = build_insert_row(&ctx.statement, schema, columns, values, &[])?;
+    let row = build_insert_row(&ctx.statement, schema, columns, values, default_exprs)?;
+    validate_check_constraints(&ctx.statement, schema, check_exprs, &row.values)?;
     ctx.storage.insert(&ctx.statement, table, row)?;
     Ok(())
 }
@@ -760,6 +763,10 @@ pub struct CopyIn<'a> {
     table: TableId,
     schema: TableSchema,
     columns: Vec<ColumnId>,
+    /// Bound expression defaults for omitted columns and the table's bound `CHECK`
+    /// constraints, so COPY FROM applies defaults and enforces checks like INSERT.
+    default_exprs: Vec<(ColumnId, BoundExpr)>,
+    check_exprs: Vec<BoundExpr>,
     parser: CopyParser,
     count: u64,
 }
@@ -770,6 +777,8 @@ impl<'a> CopyIn<'a> {
         table: TableId,
         columns: Vec<ColumnId>,
         options: CopyOptions,
+        default_exprs: Vec<(ColumnId, BoundExpr)>,
+        check_exprs: Vec<BoundExpr>,
     ) -> Result<Self> {
         let schema = require_table(ctx.catalog, table)?;
         let column_types = columns
@@ -785,6 +794,8 @@ impl<'a> CopyIn<'a> {
             table,
             schema,
             columns,
+            default_exprs,
+            check_exprs,
             parser: CopyParser::new(column_types, options),
             count: 0,
         })
@@ -794,7 +805,15 @@ impl<'a> CopyIn<'a> {
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         check_canceled(self.ctx)?;
         for row in self.parser.push(chunk)? {
-            map_and_insert_row(self.ctx, self.table, &self.schema, &self.columns, row)?;
+            map_and_insert_row(
+                self.ctx,
+                self.table,
+                &self.schema,
+                &self.columns,
+                row,
+                &self.default_exprs,
+                &self.check_exprs,
+            )?;
             self.count += 1;
         }
         Ok(())
@@ -803,7 +822,15 @@ impl<'a> CopyIn<'a> {
     /// Flush the trailing record (if any) and return the total rows inserted.
     pub fn finish(mut self) -> Result<u64> {
         for row in self.parser.finish()? {
-            map_and_insert_row(self.ctx, self.table, &self.schema, &self.columns, row)?;
+            map_and_insert_row(
+                self.ctx,
+                self.table,
+                &self.schema,
+                &self.columns,
+                row,
+                &self.default_exprs,
+                &self.check_exprs,
+            )?;
             self.count += 1;
         }
         Ok(self.count)

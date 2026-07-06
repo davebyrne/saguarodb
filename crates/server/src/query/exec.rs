@@ -156,6 +156,8 @@ impl QueryService {
             table,
             columns,
             options,
+            default_exprs,
+            check_exprs,
             ..
         } = bound
         else {
@@ -169,6 +171,8 @@ impl QueryService {
             table,
             columns,
             options,
+            default_exprs,
+            check_exprs,
         };
         let result = match direction {
             CopyDirection::From => Ok(ExecutionResult::BeginCopyIn(job)),

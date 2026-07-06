@@ -1,4 +1,5 @@
 use common::{ColumnId, ColumnInfo, CopyOptions, Row, TableId};
+use planner::BoundExpr;
 
 /// A bound `COPY` request. Binding resolves the table and column list; the server
 /// then drives the COPY sub-protocol (the executor's `CopyIn`/`CopyOut` do the
@@ -9,6 +10,12 @@ pub struct CopyJob {
     /// Columns in COPY order (defaulted to all columns in catalog order).
     pub columns: Vec<ColumnId>,
     pub options: CopyOptions,
+    /// Bound expression `DEFAULT`s for columns omitted by `COPY FROM`, evaluated
+    /// per row (empty for `COPY TO`). See [`crate::CopyIn`].
+    pub default_exprs: Vec<(ColumnId, BoundExpr)>,
+    /// The table's bound `CHECK` constraints, enforced per row by `COPY FROM`
+    /// (empty for `COPY TO`).
+    pub check_exprs: Vec<BoundExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

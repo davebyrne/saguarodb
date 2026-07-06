@@ -38,11 +38,23 @@ pub(super) fn bind_copy(
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let columns = insert_columns(&table, column_names)?;
+    // COPY FROM inserts rows, so — like INSERT — it needs the omitted columns'
+    // expression defaults evaluated per row and the table's CHECK constraints
+    // enforced per row. COPY TO only reads, so it binds neither.
+    let (default_exprs, check_exprs) = match direction {
+        CopyDirection::From => (
+            bind_omitted_expr_defaults(catalog, &table, &columns)?,
+            super::bind_table_checks(catalog, &table)?,
+        ),
+        CopyDirection::To => (Vec::new(), Vec::new()),
+    };
     Ok(BoundStatement::Copy {
         table: table.id,
         columns,
         direction,
         options: options.clone(),
+        default_exprs,
+        check_exprs,
     })
 }
 
