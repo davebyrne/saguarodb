@@ -6,6 +6,7 @@ pub mod datetime;
 pub mod error;
 pub mod float;
 pub mod flush;
+pub mod functions;
 pub mod ids;
 pub mod interval;
 pub mod mvcc;
@@ -31,6 +32,7 @@ pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};
+pub use functions::{ArgType, NullHandling, ScalarFunction, lookup_scalar_function};
 pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, SequenceId, TableId, TxnId,
