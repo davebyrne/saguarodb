@@ -150,6 +150,58 @@ async fn pg_settings_reflects_session_gucs() {
 }
 
 #[tokio::test]
+async fn current_setting_reflects_session_gucs() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("SET application_name = 'current-app'").await.rows();
+    assert_eq!(
+        conn.ok("select current_setting('application_name')")
+            .await
+            .rows(),
+        vec![vec![Some("current-app".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select current_setting(null)").await.rows(),
+        vec![vec![None]]
+    );
+
+    conn.ok("SET default_transaction_isolation TO 'repeatable read'")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("select current_setting('transaction_isolation')")
+            .await
+            .rows(),
+        vec![vec![Some("repeatable read".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .rows();
+    assert_eq!(
+        conn.ok("select current_setting('transaction_isolation')")
+            .await
+            .rows(),
+        vec![vec![Some("serializable".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+
+    assert_eq!(
+        conn.extended_execute_text_param("select current_setting($1)", "application_name")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("current-app".to_string())]]
+    );
+
+    let missing = conn.ok("select current_setting('no_such_parameter')").await;
+    let message = error_message(&missing);
+    assert!(message.contains("C=42704"), "got {message}");
+}
+
+#[tokio::test]
 async fn changing_application_name_sends_parameter_status() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

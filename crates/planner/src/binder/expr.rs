@@ -534,6 +534,7 @@ fn bind_function(
         "setval" => return bind_setval(ctx, args),
         "coalesce" => return bind_coalesce(ctx, args),
         "nullif" => return bind_nullif(ctx, args),
+        "current_setting" => return bind_current_setting(ctx, args),
         _ => {}
     }
     // System information functions (version(), current_user, ...) are ordinary
@@ -585,6 +586,24 @@ fn bind_setval(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr>
         is_called,
         data_type: DataType::Integer,
         nullable,
+    })
+}
+
+fn bind_current_setting(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<BoundExpr> {
+    let exprs = expr_args("current_setting", args)?;
+    let [name] = exprs.as_slice() else {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            "current_setting expects exactly one argument",
+        ));
+    };
+    let name = bind_expr(ctx, name, Some(DataType::Text))?;
+    require_type(&name, DataType::Text)?;
+    Ok(BoundExpr::Function {
+        name: "current_setting".to_string(),
+        nullable: name.nullable(),
+        args: vec![name],
+        data_type: DataType::Text,
     })
 }
 

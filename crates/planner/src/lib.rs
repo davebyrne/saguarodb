@@ -1217,6 +1217,35 @@ mod tests {
     }
 
     #[test]
+    fn binder_types_current_setting_and_infers_parameter() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select current_setting($1), current_setting(null)").unwrap();
+        let (bound, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+
+        assert_eq!(params, vec![DataType::Text]);
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].data_type, DataType::Text);
+        assert_eq!(select.output_schema[1].data_type, DataType::Text);
+        assert!(matches!(
+            select.columns[0].expr,
+            BoundExpr::Function {
+                nullable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            select.columns[1].expr,
+            BoundExpr::Function { nullable: true, .. }
+        ));
+    }
+
+    #[test]
     fn binder_types_system_information_functions() {
         let catalog = catalog_with_users();
         let stmt = parse(
@@ -1487,6 +1516,16 @@ mod tests {
         let err = bind(&stmt, &catalog).unwrap_err();
 
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_rejects_current_setting_wrong_shape() {
+        let catalog = catalog_with_users();
+        let err = bind(&parse("select current_setting()").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+
+        let err = bind(&parse("select current_setting(1)").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
     }
 
     #[test]

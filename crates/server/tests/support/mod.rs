@@ -306,6 +306,24 @@ impl Connection {
         self.extended_raw(seq).await
     }
 
+    /// Run one extended-protocol statement with a single text parameter. The parse
+    /// message leaves the parameter type unspecified (`0`), so the binder must infer
+    /// it from context.
+    pub async fn extended_execute_text_param(
+        &mut self,
+        sql: &str,
+        param: &str,
+    ) -> Result<QueryOutcome> {
+        let mut seq = parse_bytes("", sql, &[0]);
+        seq.extend(bind_text_param_bytes("", "", param));
+        seq.extend(execute_bytes(""));
+        seq.extend(sync_bytes());
+        let response = self.extended_raw(seq).await?;
+        let status = ready_for_query_status(&response)?;
+        let result = decode_simple_query_response(&response);
+        Ok(QueryOutcome { result, status })
+    }
+
     /// Send raw extended-protocol messages and return bytes through `ReadyForQuery`.
     pub async fn extended_raw(&mut self, bytes: Vec<u8>) -> Result<Vec<u8>> {
         self.stream.write_all(&bytes).await.map_err(|err| {
@@ -933,6 +951,20 @@ fn bind_bytes(portal: &str, statement: &str) -> Vec<u8> {
     body.push(0);
     body.extend_from_slice(&0i16.to_be_bytes()); // parameter format codes
     body.extend_from_slice(&0i16.to_be_bytes()); // parameters
+    body.extend_from_slice(&0i16.to_be_bytes()); // result format codes
+    tagged(b'B', &body)
+}
+
+fn bind_text_param_bytes(portal: &str, statement: &str, param: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(statement.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i16.to_be_bytes()); // parameter format codes (all text)
+    body.extend_from_slice(&1i16.to_be_bytes()); // parameters
+    body.extend_from_slice(&i32::try_from(param.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(param.as_bytes());
     body.extend_from_slice(&0i16.to_be_bytes()); // result format codes
     tagged(b'B', &body)
 }

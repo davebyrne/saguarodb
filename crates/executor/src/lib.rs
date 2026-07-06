@@ -22,9 +22,10 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog};
     use common::{
         ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, CopyFormat, CopyOptions,
-        DataType, ExecRow, Key, POSTGRES_COMPAT_VERSION, ParsedColumnDef, RelationKind, Result,
-        Row, RowId, RowIdentity, SequenceManager, SessionInfo, SessionSequenceState, SqlState,
-        StatementContext, TableSchema, ToastOptions, Value,
+        DataType, ExecRow, GucSetting, Key, POSTGRES_COMPAT_VERSION, ParsedColumnDef, RelationKind,
+        Result, Row, RowId, RowIdentity, SequenceManager, SessionActivityRow, SessionInfo,
+        SessionSequenceState, SqlState, StatementContext, SystemStateProvider, TableSchema,
+        ToastOptions, Value,
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
@@ -71,6 +72,21 @@ mod tests {
                 .unwrap()
                 .push((txn_id, sequence, value, is_called));
             Ok(value)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestSystemState {
+        settings: Vec<GucSetting>,
+    }
+
+    impl SystemStateProvider for TestSystemState {
+        fn settings(&self) -> Vec<GucSetting> {
+            self.settings.clone()
+        }
+
+        fn sessions(&self) -> Vec<SessionActivityRow> {
+            Vec::new()
         }
     }
 
@@ -1714,6 +1730,55 @@ mod tests {
             eval("pg_backend_pid", DataType::Integer),
             Value::Integer(4242)
         );
+    }
+
+    #[test]
+    fn current_setting_reads_system_state_provider() {
+        let ctx = StatementContext::new(0).with_system_state(Arc::new(TestSystemState {
+            settings: vec![GucSetting {
+                name: "application_name".to_string(),
+                setting: "demo-app".to_string(),
+                boot_val: String::new(),
+                reset_val: String::new(),
+                source: "session".to_string(),
+            }],
+        }));
+        let row = ExecRow {
+            row: Row { values: vec![] },
+            identity: None,
+        };
+        let current_setting = |value: Value, nullable: bool| BoundExpr::Function {
+            name: "current_setting".to_string(),
+            args: vec![BoundExpr::Literal {
+                value,
+                data_type: DataType::Text,
+                nullable,
+            }],
+            data_type: DataType::Text,
+            nullable,
+        };
+
+        assert_eq!(
+            eval_expr(
+                &ctx,
+                &current_setting(Value::Text("Application_Name".to_string()), false),
+                &row
+            )
+            .unwrap(),
+            Value::Text("demo-app".to_string())
+        );
+        assert_eq!(
+            eval_expr(&ctx, &current_setting(Value::Null, true), &row).unwrap(),
+            Value::Null
+        );
+
+        let err = eval_expr(
+            &ctx,
+            &current_setting(Value::Text("missing_parameter".to_string()), false),
+            &row,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedObject);
     }
 
     #[test]

@@ -210,7 +210,7 @@ static SCALAR_FUNCTIONS: &[ScalarFunction] = &[
         signature: sig_extract,
         eval: eval_extract,
     },
-    // --- System information (zero-argument, never NULL) ---
+    // --- System information ---
     ScalarFunction {
         name: "version",
         null_handling: NullHandling::NeverNull,
@@ -258,6 +258,12 @@ static SCALAR_FUNCTIONS: &[ScalarFunction] = &[
         null_handling: NullHandling::NeverNull,
         signature: sig_no_args_integer,
         eval: eval_pg_backend_pid,
+    },
+    ScalarFunction {
+        name: "current_setting",
+        null_handling: NullHandling::Propagate,
+        signature: sig_text_to_text,
+        eval: eval_current_setting,
     },
 ];
 
@@ -671,6 +677,17 @@ fn eval_current_user(ctx: &StatementContext, _values: &[Value]) -> Result<Value>
 
 fn eval_pg_backend_pid(ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
     Ok(Value::Integer(i64::from(ctx.session_info.backend_pid)))
+}
+
+fn eval_current_setting(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let name = text_arg(&values[0])?;
+    let Some(setting) = ctx.system_state.setting(name) else {
+        return Err(exec_err(
+            SqlState::UndefinedObject,
+            format!("unrecognized configuration parameter \"{name}\""),
+        ));
+    };
+    Ok(Value::Text(setting))
 }
 
 // ---------------------------------------------------------------------------
