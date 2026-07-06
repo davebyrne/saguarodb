@@ -215,6 +215,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         ssi_manager,
         tls,
         cancel_registry: crate::cancel::CancelRegistry::new(),
+        session_registry: Arc::new(crate::session_registry::SessionRegistry::new()),
     });
 
     // Persist the redone state to the heap/index and advance the redo boundary.

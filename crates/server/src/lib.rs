@@ -7,6 +7,7 @@ pub mod lock_manager;
 pub mod query;
 pub mod recovery;
 pub mod registry;
+pub(crate) mod session_registry;
 pub mod shutdown;
 pub mod ssi_manager;
 pub mod tls;

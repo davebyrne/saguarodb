@@ -109,6 +109,7 @@ impl Session {
         self.txn = txn;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
+        self.end_activity();
 
         match result {
             Ok(count) => {
@@ -201,8 +202,10 @@ impl Session {
         let status = self.status_byte();
 
         if let Some(err) = write_err {
+            self.end_activity();
             return Err(err);
         }
+        self.end_activity();
         match result {
             Ok(count) => {
                 write_messages(

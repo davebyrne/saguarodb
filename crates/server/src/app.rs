@@ -63,6 +63,8 @@ pub struct ServerComponents {
     pub tls: Option<TlsAcceptor>,
     /// Per-connection cancellation keys, used to act on `CancelRequest`.
     pub cancel_registry: CancelRegistry,
+    /// Live session activity rows backing the virtual `pg_stat_activity` view.
+    pub(crate) session_registry: Arc<crate::session_registry::SessionRegistry>,
 }
 
 impl ServerComponents {

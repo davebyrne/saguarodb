@@ -48,6 +48,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session = self.query_session_context(cancel);
+        self.begin_activity(&sql);
         // A SELECT streams its rows through this bounded channel: the blocking
         // producer sends `Start` (columns) then `Rows` batches; this async task
         // drains them to the socket while the producer runs, giving TCP
@@ -121,6 +122,7 @@ impl Session {
         // terminal message the client cannot receive.
         if let Some(err) = write_err {
             drop(guard);
+            self.end_activity();
             return Err(err);
         }
 
@@ -134,6 +136,7 @@ impl Session {
             // authoritative row count) and status.
             Ok(StreamOutcome::Streamed { count }) => {
                 drop(guard);
+                self.end_activity();
                 write_messages(
                     stream,
                     codec,
@@ -158,16 +161,19 @@ impl Session {
                 self.prepared.clear();
                 self.portals.clear();
                 drop(guard);
+                self.end_activity();
                 write_execution_result(stream, codec, result, status).await?
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
             Ok(StreamOutcome::Direct(result)) => {
                 drop(guard);
+                self.end_activity();
                 write_execution_result(stream, codec, result, status).await?
             }
             Err(err) => {
                 drop(guard);
+                self.end_activity();
                 write_messages(
                     stream,
                     codec,

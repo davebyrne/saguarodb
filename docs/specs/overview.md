@@ -1397,7 +1397,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 
 **ExecRow identity flow:**
 - **Scan operators** (`SeqScanOp`, `IndexScanOp`): Construct `ExecRow` from `StoredRow`, populating `identity` from the `StoredRow`'s `row_id` and `key`.
-- **System scan operator** (`SystemScanOp`): Materializes read-only virtual system catalog rows from catalog metadata and `StatementContext.system_state`, applies the scan filter, and emits rows with no identity.
+- **System scan operator** (`SystemScanOp`): Materializes read-only virtual system catalog rows from catalog metadata and `StatementContext.system_state`, applies the scan filter, and emits rows with no identity. `pg_settings` reads the connection-backed GUC provider, and `pg_stat_activity` reads the server `SessionRegistry` in real connections; library/no-op contexts return empty activity rows.
 - **Filter, Sort, Limit**: Pass `ExecRow` through unchanged (identity preserved).
 - **Projection**: Rewrites `exec_row.row` (narrowed columns) but preserves `identity`.
 - **Join, Aggregate**: Produce new rows — `identity` is `None` (these rows don't correspond to a single source row).

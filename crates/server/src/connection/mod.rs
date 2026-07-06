@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionInfo, SessionSequenceState, SqlState,
-    Value,
+    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionInfo, SessionSequenceState,
+    SessionState, SqlState, Value,
 };
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -22,6 +22,7 @@ use crate::query::{
     CopyInChunk, PreparedStatement, QuerySessionContext, SessionGucs, SessionTxnStatus,
     StreamOutcome, Transaction, abort_session_transaction,
 };
+use crate::session_registry::SessionActivityRecord;
 use crate::shutdown::InFlightQueryGuard;
 
 mod copy;
@@ -256,6 +257,8 @@ struct Session {
     /// This connection's cancellation key, registered at startup and removed on
     /// disconnect.
     backend_key: Option<BackendKey>,
+    /// Registered activity row backing `pg_stat_activity` after startup.
+    activity: Option<Arc<SessionActivityRecord>>,
     /// Set while a `COPY ... FROM STDIN` is streaming: subsequent client messages
     /// are routed as copy-in data until `CopyDone`/`CopyFail`. On disconnect this
     /// drops, closing the channel so the blocking task aborts the COPY.
@@ -266,6 +269,9 @@ impl Drop for Session {
     fn drop(&mut self) {
         if let Some(key) = self.backend_key {
             self.app.components.cancel_registry.deregister(key);
+        }
+        if let Some(activity) = self.activity.take() {
+            self.app.components.session_registry.deregister(&activity);
         }
         // A client that disconnected mid-transaction leaves an open transaction:
         // abort it so the exclusive write guard and the registry entry are not
@@ -348,6 +354,7 @@ impl Session {
             reported_application_name: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             backend_key: None,
+            activity: None,
             copy_in: None,
         }
     }
@@ -373,6 +380,24 @@ impl Session {
             self.session_info.clone(),
             self.session_gucs.clone(),
         )
+        .with_session_registry(self.app.components.session_registry.clone())
+    }
+
+    fn begin_activity(&self, query: &str) {
+        if let Some(activity) = &self.activity {
+            activity.begin_statement(query);
+        }
+    }
+
+    fn end_activity(&self) {
+        let state = match self.tx {
+            TransactionState::Idle => SessionState::Idle,
+            TransactionState::InTransaction => SessionState::IdleInTransaction,
+            TransactionState::Failed => SessionState::IdleInTransactionAborted,
+        };
+        if let Some(activity) = &self.activity {
+            activity.end_statement(state);
+        }
     }
 
     /// Report `application_name` changes after `SET`/`RESET`/`DISCARD ALL`.
@@ -501,6 +526,15 @@ impl Session {
                     database: session_database,
                     backend_pid: key.process_id,
                 });
+                if let Some(activity) = self.activity.take() {
+                    self.app.components.session_registry.deregister(&activity);
+                }
+                self.activity = Some(
+                    self.app
+                        .components
+                        .session_registry
+                        .register(self.session_info.clone(), self.session_gucs.clone()),
+                );
                 let insert_at = replies.len().saturating_sub(1);
                 replies.insert(
                     insert_at,

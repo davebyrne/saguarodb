@@ -30,6 +30,7 @@ impl Session {
         let statement = portal.statement.clone();
         let params = portal.params.clone();
         let result_formats = portal.result_formats.clone();
+        let query_text = statement.sql().to_string();
 
         let guard = match self.app.components.shutdown.begin_query() {
             Ok(guard) => guard,
@@ -41,6 +42,7 @@ impl Session {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session = self.query_session_context(cancel);
+        self.begin_activity(&query_text);
 
         // When an explicit transaction is open on this session, the extended-
         // protocol `Execute` participates in THAT transaction rather than starting
@@ -136,6 +138,7 @@ impl Session {
         // surface it (closing the connection) rather than writing a terminal
         // message the client cannot receive.
         if let Some(err) = write_err {
+            self.end_activity();
             return Err(err);
         }
 
@@ -143,6 +146,7 @@ impl Session {
             // A streamed SELECT: `DataRow`s were already written above; finish with
             // the DML-less `SELECT n` tag (no `RowDescription`, no `ReadyForQuery`).
             Ok(StreamOutcome::Streamed { count }) => {
+                self.end_activity();
                 let mut messages = Vec::new();
                 if let Some(message) = self.application_name_status_change() {
                     messages.push(message);
@@ -153,12 +157,14 @@ impl Session {
             Ok(StreamOutcome::SessionReset(result)) => {
                 self.prepared.clear();
                 self.portals.clear();
+                self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
                     write_messages(stream, codec, &[message]).await?;
                 }
                 write_portal_result(stream, codec, result, &result_formats).await
             }
             Ok(StreamOutcome::Direct(result)) => {
+                self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
                     write_messages(stream, codec, &[message]).await?;
                 }
@@ -166,6 +172,7 @@ impl Session {
             }
             Err(err) => {
                 self.failed = true;
+                self.end_activity();
                 write_messages(stream, codec, &[error_response(&err)]).await
             }
         }

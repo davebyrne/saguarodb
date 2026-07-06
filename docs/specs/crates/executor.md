@@ -128,8 +128,9 @@ system catalog surface. `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
 `information_schema.columns` are computed from `CatalogManager` metadata and the
 static registry owned by the catalog crate. `pg_settings` combines
 `StatementContext.system_state.settings()` with synthesized transaction isolation
-rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`;
-with the no-op provider used by library tests it is empty.
+rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`; the
+server wires this to its live `SessionRegistry`, while the no-op provider used by
+library tests is empty.
 
 Rows are rebuilt for each execution, sorted deterministically, and filtered with
 the bound scan predicate using the same `predicate_matches` semantics as storage

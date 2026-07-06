@@ -379,6 +379,23 @@ impl Connection {
         Ok(())
     }
 
+    /// Finish a COPY FROM that was opened with [`Self::begin_copy_from`], streaming
+    /// the supplied chunks followed by `CopyDone`.
+    pub async fn finish_copy_from(&mut self, chunks: &[&[u8]]) -> Result<CopyCompletion> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&tagged(b'd', chunk));
+        }
+        out.extend_from_slice(&tagged(b'c', &[])); // CopyDone
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY data: {err}")))?;
+
+        let response = read_until_ready(&mut self.stream).await?;
+        parse_copy_completion(&response)
+    }
+
     /// Like [`copy_from`](Self::copy_from) but aborts with `CopyFail(message)`
     /// instead of `CopyDone`.
     pub async fn copy_fail(

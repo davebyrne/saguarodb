@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::app::ServerComponents;
 use crate::registry::AdvertisedSnapshot;
+use crate::session_registry::SessionRegistry;
 
 mod alter;
 mod copy;
@@ -48,6 +49,7 @@ pub struct QuerySessionContext {
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     gucs: Arc<SessionGucs>,
+    session_registry: Option<Arc<SessionRegistry>>,
     system_state_override: Option<Arc<dyn SystemStateProvider>>,
 }
 
@@ -63,8 +65,15 @@ impl QuerySessionContext {
             session_sequences,
             session_info,
             gucs,
+            session_registry: None,
             system_state_override: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_session_registry(mut self, session_registry: Arc<SessionRegistry>) -> Self {
+        self.session_registry = Some(session_registry);
+        self
     }
 
     #[must_use]
@@ -93,6 +102,7 @@ impl QuerySessionContext {
         let system_state = self.system_state_override.clone().unwrap_or_else(|| {
             Arc::new(QuerySystemState {
                 gucs: self.gucs.clone(),
+                session_registry: self.session_registry.clone(),
                 default_isolation,
                 transaction_isolation,
             })
@@ -109,6 +119,7 @@ impl QuerySessionContext {
 #[derive(Debug)]
 struct QuerySystemState {
     gucs: Arc<SessionGucs>,
+    session_registry: Option<Arc<SessionRegistry>>,
     default_isolation: IsolationLevel,
     transaction_isolation: IsolationLevel,
 }
@@ -120,7 +131,10 @@ impl SystemStateProvider for QuerySystemState {
     }
 
     fn sessions(&self) -> Vec<SessionActivityRow> {
-        Vec::new()
+        self.session_registry
+            .as_ref()
+            .map(|registry| registry.sessions())
+            .unwrap_or_default()
     }
 }
 
@@ -454,6 +468,7 @@ impl QueryService {
             // transaction lifecycle (`handle_transaction_control`) exactly like the
             // simple-query path, rather than as an independent autocommit unit.
             return Ok(PreparedStatement {
+                sql: sql.to_string(),
                 class,
                 bound: None,
                 maintenance: None,
@@ -467,6 +482,7 @@ impl QueryService {
             // bind/plan. Carry the parsed statement so an extended-protocol `Execute`
             // routes it through `run_maintenance`, exactly like the simple path.
             return Ok(PreparedStatement {
+                sql: sql.to_string(),
                 class,
                 bound: None,
                 maintenance: Some(statement),
@@ -478,6 +494,7 @@ impl QueryService {
         if let StatementClass::SessionConfig = class {
             let result_columns = gucs::session_config_result_columns(&statement);
             return Ok(PreparedStatement {
+                sql: sql.to_string(),
                 class,
                 bound: None,
                 maintenance: None,
@@ -512,6 +529,7 @@ impl QueryService {
             .collect();
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
+            sql: sql.to_string(),
             class,
             bound: Some(bound),
             maintenance: None,
@@ -1083,6 +1101,7 @@ enum StatementClass {
 /// configuration) carry their parsed statement/class instead and are dispatched
 /// through the session path without binding.
 pub struct PreparedStatement {
+    sql: String,
     class: StatementClass,
     bound: Option<BoundStatement>,
     /// The parsed maintenance statement (`VACUUM`, `ALTER TABLE ... SET
@@ -1103,6 +1122,10 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
     /// Resolved parameter wire types, by position.
     pub fn param_pg_types(&self) -> &[PgType] {
         &self.param_pg_types
@@ -1335,6 +1358,7 @@ mod tests {
             ssi_manager,
             tls: None,
             cancel_registry: crate::cancel::CancelRegistry::new(),
+            session_registry: Arc::new(crate::session_registry::SessionRegistry::new()),
         });
         AppState {
             components: components.clone(),
