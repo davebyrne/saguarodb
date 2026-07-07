@@ -14,7 +14,10 @@ mod dml;
 mod expr;
 mod query;
 
-use ddl::{convert_create_index, convert_create_table};
+use ddl::{
+    CreateViewParts, convert_alter_table, convert_create_index, convert_create_table,
+    convert_create_view, convert_truncate,
+};
 use dml::{convert_copy, convert_delete, convert_insert};
 use expr::convert_expr;
 use query::{
@@ -28,10 +31,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     if let Some(statement) = try_parse_vacuum(sql)? {
         return Ok(statement);
     }
-    // sqlparser 0.56's ALTER TABLE coverage does not match our supported subset
-    // (only `SET (compression = ...)`), so ALTER is intercepted the same way as
-    // VACUUM: this owns the whole ALTER namespace and every other ALTER form is
-    // rejected here rather than falling through to sqlparser.
+    // sqlparser 0.56 does not parse PostgreSQL storage-parameter ALTER forms
+    // consistently, so keep that narrow form in the hand parser and let
+    // schema-evolution ALTER TABLE forms fall through to sqlparser.
     if let Some(statement) = try_parse_alter_table(sql)? {
         return Ok(statement);
     }
@@ -39,6 +41,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
         return Ok(statement);
     }
     reject_set_global(sql)?;
+    reject_comma_separated_truncate(sql)?;
     if let Some(statement) = try_parse_create_sequence(sql)? {
         return Ok(statement);
     }
@@ -86,6 +89,54 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
     match statement {
         sql::Statement::CreateTable(table) => convert_create_table(table),
         sql::Statement::CreateIndex(index) => convert_create_index(index),
+        sql::Statement::CreateView {
+            or_alter,
+            name,
+            or_replace,
+            columns,
+            query,
+            materialized,
+            options,
+            cluster_by,
+            comment,
+            with_no_schema_binding,
+            if_not_exists,
+            temporary,
+            to,
+            params,
+        } => convert_create_view(CreateViewParts {
+            or_alter,
+            or_replace,
+            materialized,
+            name,
+            columns,
+            query: *query,
+            options,
+            cluster_by,
+            comment,
+            with_no_schema_binding,
+            if_not_exists,
+            temporary,
+            to,
+            params,
+        }),
+        sql::Statement::AlterTable {
+            name,
+            if_exists,
+            only,
+            operations,
+            location,
+            on_cluster,
+        } => convert_alter_table(name, if_exists, only, operations, location, on_cluster),
+        sql::Statement::Truncate {
+            table_names,
+            partitions,
+            table: _,
+            only,
+            identity,
+            cascade,
+            on_cluster,
+        } => convert_truncate(table_names, partitions, only, identity, cascade, on_cluster),
         sql::Statement::Drop {
             object_type,
             if_exists,
@@ -101,6 +152,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             let name = object_name(&names.remove(0))?;
             match object_type {
                 sql::ObjectType::Table => Ok(Statement::DropTable { name, if_exists }),
+                sql::ObjectType::View => Ok(Statement::DropView { name, if_exists }),
                 sql::ObjectType::Index if !if_exists => Ok(Statement::DropIndex { name }),
                 sql::ObjectType::Sequence => Ok(Statement::DropSequence { name, if_exists }),
                 sql::ObjectType::Index => unsupported("unsupported DROP form"),
@@ -234,38 +286,6 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             legacy_options,
             values,
         } => convert_copy(source, to, target, options, legacy_options, values),
-        sql::Statement::Truncate {
-            mut table_names,
-            partitions,
-            table: _,
-            only,
-            identity,
-            cascade,
-            on_cluster,
-        } => {
-            if table_names.len() != 1 {
-                return feature_not_supported("TRUNCATE supports one table only in v1");
-            }
-            if only {
-                return feature_not_supported("TRUNCATE ONLY is not supported in v1");
-            }
-            if partitions.is_some() {
-                return feature_not_supported("TRUNCATE PARTITION is not supported in v1");
-            }
-            if identity.is_some() {
-                return feature_not_supported("TRUNCATE identity options are not supported in v1");
-            }
-            if cascade.is_some() {
-                return feature_not_supported("TRUNCATE CASCADE/RESTRICT is not supported in v1");
-            }
-            if on_cluster.is_some() {
-                return feature_not_supported("TRUNCATE ON CLUSTER is not supported in v1");
-            }
-
-            Ok(Statement::Truncate {
-                table: object_name(&table_names.remove(0).name)?,
-            })
-        }
         _ => unsupported("unsupported SQL statement"),
     }
 }
@@ -738,6 +758,30 @@ fn reject_set_global(sql: &str) -> Result<()> {
     Ok(())
 }
 
+fn reject_comma_separated_truncate(sql: &str) -> Result<()> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens: Vec<_> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    let Some(Token::Word(keyword)) = tokens.first() else {
+        return Ok(());
+    };
+    if keyword.quote_style.is_some() || !keyword.value.eq_ignore_ascii_case("truncate") {
+        return Ok(());
+    }
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    if tokens.contains(&Token::Comma) {
+        return feature_not_supported("unsupported TRUNCATE form");
+    }
+    Ok(())
+}
+
 /// Intercept `VACUUM` (and `VACUUM <table>`) before sqlparser, which cannot parse
 /// it. Returns `Ok(Some(_))` for a VACUUM statement, `Ok(None)` when the input does
 /// not start with the `vacuum` keyword (so the normal parse path runs), and `Err`
@@ -821,12 +865,10 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
     Ok(target.to_ascii_lowercase())
 }
 
-/// Intercept `ALTER ...` before sqlparser (the VACUUM pattern above). Owns the
-/// whole ALTER namespace: supported table forms parse here; every other
-/// `ALTER ...` input, however well-formed, is `FeatureNotSupported` rather than
-/// falling through to sqlparser (whose ALTER TABLE coverage does not match our
-/// supported subset). A malformed option list (missing `(...)`, missing `=`, …)
-/// is a plain syntax error.
+/// Intercept only the storage-parameter `ALTER TABLE ... SET (...)` forms that
+/// sqlparser does not parse consistently, plus primary-key ALTER forms currently
+/// handled by SaguaroDB's narrower grammar. Other ALTER TABLE statements fall
+/// through to sqlparser so schema-evolution DDL can use its AST.
 fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     let trimmed = sql.trim();
     let Some(first) = trimmed.split_whitespace().next() else {
@@ -846,34 +888,27 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
         .filter(|token| !matches!(token, Token::Whitespace(_)))
         .collect();
 
-    let unsupported_form = || {
-        Err(DbError::parse(
-            SqlState::FeatureNotSupported,
-            "only ALTER TABLE <name> SET (...), ADD PRIMARY KEY, and DROP PRIMARY KEY are supported",
-        ))
-    };
-
     let mut i = 0;
     if !expect_word(&tokens, &mut i, "alter") {
         return Ok(None);
     }
     if !expect_word(&tokens, &mut i, "table") {
-        return unsupported_form();
+        return Ok(None);
     }
     let _only = expect_word(&tokens, &mut i, "only");
     // Table identifier: unquoted word, lowercased (the `ident_name` rule).
     let table = parse_alter_identifier(&tokens, &mut i, "expected table name after ALTER TABLE")?;
     if !expect_word(&tokens, &mut i, "set") {
         if expect_word(&tokens, &mut i, "add") {
-            return parse_alter_table_add_primary_key(&tokens, i, table);
+            return try_parse_alter_table_add_primary_key(&tokens, i, table);
         }
         if expect_word(&tokens, &mut i, "drop") {
-            return parse_alter_table_drop_primary_key(&tokens, i, table);
+            return try_parse_alter_table_drop_primary_key(&tokens, i, table);
         }
-        return unsupported_form();
+        return Ok(None);
     }
     if !matches!(tokens.get(i), Some(Token::LParen)) {
-        return Err(parse_error("expected ( after ALTER TABLE ... SET"));
+        return Ok(None);
     }
     i += 1;
     let options = parse_alter_table_options(&tokens, &mut i)?;
@@ -897,6 +932,28 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
         }));
     }
     Err(parse_error("ALTER TABLE SET requires at least one option"))
+}
+
+fn try_parse_alter_table_add_primary_key(
+    tokens: &[Token],
+    i: usize,
+    table: String,
+) -> Result<Option<Statement>> {
+    let mut lookahead = i;
+    if expect_word(tokens, &mut lookahead, "constraint") {
+        let Some(Token::Word(word)) = tokens.get(lookahead) else {
+            return Ok(None);
+        };
+        if word.quote_style.is_some() {
+            return Ok(None);
+        }
+        lookahead += 1;
+    }
+    if !matches!(tokens.get(lookahead), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary"))
+    {
+        return Ok(None);
+    }
+    parse_alter_table_add_primary_key(tokens, i, table)
 }
 
 fn parse_alter_table_add_primary_key(
@@ -936,6 +993,18 @@ fn parse_alter_table_add_primary_key(
         columns,
         constraint_name,
     }))
+}
+
+fn try_parse_alter_table_drop_primary_key(
+    tokens: &[Token],
+    i: usize,
+    table: String,
+) -> Result<Option<Statement>> {
+    if matches!(tokens.get(i), Some(Token::Word(word)) if word.value.eq_ignore_ascii_case("primary") || word.value.eq_ignore_ascii_case("constraint"))
+    {
+        return parse_alter_table_drop_primary_key(tokens, i, table);
+    }
+    Ok(None)
 }
 
 fn parse_alter_table_drop_primary_key(

@@ -16,7 +16,7 @@ This directory decomposes the overview spec into crate-level contracts for the i
 | `common` | [common.md](common.md) | Shared IDs, values, rows, errors, execution envelopes, cross-crate traits, and the scalar function registry |
 | `compress` | [compress.md](compress.md) | Compression codecs, at-rest page envelope, dictionary training/store, shared `CompressionRegistry` |
 | `parser` | [parser.md](parser.md) | SQL text to SaguaroDB AST |
-| `catalog` | [catalog.md](catalog.md) | Table metadata, stable IDs, schema snapshots |
+| `catalog` | [catalog.md](catalog.md) | Table metadata, stable relation IDs, schema snapshots |
 | `planner` | [planner.md](planner.md) | Bind, logical plan, physical plan |
 | `executor` | [executor.md](executor.md) | Volcano operators, expression evaluation, DML/DDL execution |
 | `storage` | [storage.md](storage.md) | Page-backed table storage, primary-key B-tree index, row serialization, recovery operations |

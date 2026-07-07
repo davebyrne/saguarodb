@@ -34,6 +34,7 @@ pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
 pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
 pub(crate) const TYPE_TRUNCATE_TABLE: u8 = 22;
 pub(crate) const TYPE_ALTER_TABLE_PRIMARY_KEY: u8 = 23;
+pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -59,7 +60,7 @@ pub fn decode_record(bytes: &[u8]) -> Result<WalRecord> {
         DecodeResult::Record {
             record,
             next_offset,
-        } if next_offset == bytes.len() => Ok(record),
+        } if next_offset == bytes.len() => Ok(*record),
         DecodeResult::Record { .. } => Err(wal_error("WAL buffer contains trailing bytes")),
         DecodeResult::Incomplete => Err(wal_error("incomplete WAL record")),
     }
@@ -75,7 +76,7 @@ pub(crate) fn read_records(bytes: &[u8]) -> Result<(Vec<(WalRecord, u64)>, usize
                 record,
                 next_offset,
             } => {
-                records.push((record, (next_offset - offset) as u64));
+                records.push((*record, (next_offset - offset) as u64));
                 offset = next_offset;
             }
             DecodeResult::Incomplete if suffix_contains_complete_record(bytes, offset + 1)? => {
@@ -145,7 +146,7 @@ fn decode_one(bytes: &[u8], offset: usize) -> Result<DecodeResult> {
     let kind = decode_payload(type_id, &bytes[header_end..payload_end])?;
 
     Ok(DecodeResult::Record {
-        record: WalRecord { lsn, txn_id, kind },
+        record: Box::new(WalRecord { lsn, txn_id, kind }),
         next_offset: record_end,
     })
 }
@@ -175,6 +176,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::AlterTableToast { .. } => TYPE_ALTER_TABLE_TOAST,
         WalRecordKind::TruncateTable { .. } => TYPE_TRUNCATE_TABLE,
         WalRecordKind::AlterTablePrimaryKey { .. } => TYPE_ALTER_TABLE_PRIMARY_KEY,
+        WalRecordKind::UpdateTableSchema { .. } => TYPE_UPDATE_TABLE_SCHEMA,
     }
 }
 
@@ -268,9 +270,9 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             buf.extend_from_slice(bytes);
             Ok(buf)
         }
-        // AlterTableCompression/AlterTableToast/TruncateTable/AlterTablePrimaryKey:
-        // no arms —
-        // the `_ =>` serde_json fallback handles logical DDL records.
+        // AlterTableCompression/AlterTableToast/TruncateTable/AlterTablePrimaryKey/
+        // UpdateTableSchema: no arms — the `_ =>` serde_json fallback handles
+        // logical DDL records.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -406,7 +408,7 @@ fn suffix_contains_complete_record(bytes: &[u8], start: usize) -> Result<bool> {
 
 enum DecodeResult {
     Record {
-        record: WalRecord,
+        record: Box<WalRecord>,
         next_offset: usize,
     },
     Incomplete,
@@ -488,6 +490,50 @@ mod tests {
                     unique: true,
                     constraint: common::IndexConstraintKind::None,
                 },
+            },
+            WalRecordKind::UpdateTableSchema {
+                schema: common::TableSchema {
+                    id: 1,
+                    storage_id: 10,
+                    name: "users".to_string(),
+                    columns: vec![
+                        common::ColumnDef {
+                            id: 0,
+                            name: "id".to_string(),
+                            data_type: common::DataType::Integer,
+                            nullable: false,
+                            max_length: None,
+                            default: None,
+                            pg_type: None,
+                        },
+                        common::ColumnDef {
+                            id: 1,
+                            name: "code".to_string(),
+                            data_type: common::DataType::Integer,
+                            nullable: true,
+                            max_length: None,
+                            default: None,
+                            pg_type: None,
+                        },
+                    ],
+                    primary_key: vec![0],
+                    schema_version: 2,
+                    compression: common::CompressionSetting::None,
+                    active_dict_id: None,
+                    toast: common::ToastOptions::legacy_catalog_default(),
+                    toast_table_id: None,
+                    relation_kind: common::RelationKind::User,
+                    checks: Vec::new(),
+                },
+                indexes: vec![common::IndexSchema {
+                    id: 3,
+                    storage_id: 31,
+                    table: 1,
+                    name: "users_code".to_string(),
+                    columns: vec![1],
+                    unique: false,
+                    constraint: common::IndexConstraintKind::None,
+                }],
             },
             WalRecordKind::DropIndex { index: 3 },
             WalRecordKind::CreateSequence {

@@ -7,7 +7,7 @@ mod params;
 mod physical;
 mod simplify;
 
-pub use binder::{bind, bind_parameterized};
+pub use binder::{bind, bind_default_expr, bind_parameterized};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
     BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
@@ -26,10 +26,16 @@ pub fn mutates_sequences(statement: &BoundStatement) -> bool {
     match statement {
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
+        | BoundStatement::AlterTableAddColumn { .. }
+        | BoundStatement::AlterTableDropColumn { .. }
+        | BoundStatement::AlterTableRenameColumn { .. }
+        | BoundStatement::AlterTableRenameTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
         | BoundStatement::DropSequence { .. }
+        | BoundStatement::CreateView { .. }
+        | BoundStatement::DropView { .. }
         | BoundStatement::Copy { .. }
         | BoundStatement::Explain(_) => false,
         BoundStatement::Query(query) => query_mutates_sequences(query),
@@ -1096,6 +1102,15 @@ mod tests {
     }
 
     #[test]
+    fn bind_create_table_rejects_qualified_check_column_refs() {
+        let catalog = MemoryCatalog::empty();
+        let stmt = parse("create table t (id integer, check (t.id > 0))").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
     fn alter_table_does_not_bind() {
         let catalog = MemoryCatalog::empty();
         let stmt = parse("alter table t set (compression = 'zstd')").unwrap();
@@ -1790,6 +1805,47 @@ mod tests {
         let stmt = parse("select d.a from (select id from users) as d(a, b)").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_binds_create_view_with_exact_column_aliases() {
+        let catalog = catalog_with_users();
+        let stmt =
+            parse("create view v (user_id, user_name) as select id, name from users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::CreateView { columns, query, .. } = bound else {
+            panic!("expected CREATE VIEW");
+        };
+        assert_eq!(
+            columns,
+            vec!["user_id".to_string(), "user_name".to_string()]
+        );
+        assert_eq!(query.output_schema().len(), 2);
+    }
+
+    #[test]
+    fn binder_rejects_create_view_column_alias_count_mismatch() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create view v (a, b) as select id from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_rejects_duplicate_create_view_column_aliases() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create view v (a, a) as select id, name from users").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_rejects_create_view_parameters() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create view v as select $1").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     #[test]
@@ -3131,6 +3187,7 @@ mod tests {
             bind(&parse("copy users from stdin").unwrap(), &catalog).unwrap(),
             BoundStatement::Copy {
                 table: table.id,
+                table_schema: table.clone(),
                 columns: all_columns,
                 direction: CopyDirection::From,
                 options: CopyOptions::defaults_for(CopyFormat::Text),

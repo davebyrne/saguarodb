@@ -18,6 +18,8 @@ pub struct Catalog {
     tables_by_name: HashMap<String, TableId>,
     tables_by_id: HashMap<TableId, TableSchema>,
     next_table_id: TableId,
+    views_by_name: HashMap<String, TableId>,
+    views_by_id: HashMap<TableId, ViewSchema>,
     indexes_by_name: HashMap<String, IndexId>,
     indexes_by_id: HashMap<IndexId, IndexSchema>,
     next_index_id: IndexId,
@@ -34,6 +36,8 @@ pub struct CatalogSnapshot {
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
+    pub views_by_name: HashMap<String, TableId>,
+    pub views_by_id: HashMap<TableId, ViewSchema>,
     pub indexes_by_name: HashMap<String, IndexId>,
     pub indexes_by_id: HashMap<IndexId, IndexSchema>,
     pub next_index_id: IndexId,
@@ -45,12 +49,13 @@ pub struct CatalogSnapshot {
 }
 ```
 
-`TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`, and
-`SequenceSchema` live in `common`. `TableSchema` additionally carries
-`compression: CompressionSetting` and `active_dict_id: Option<u32>` (see
+`TableSchema`, `ColumnDef`, `ColumnDefault`, `DataType`, `IndexSchema`,
+`ViewColumn`, `ViewDependency`, `ViewSchema`, and `SequenceSchema` live in
+`common`. `TableSchema` additionally carries `schema_version: u64`,
+`compression: CompressionSetting`, and `active_dict_id: Option<u32>` (see
 "Compression" below). `TableSchema.storage_id` and `IndexSchema.storage_id` are
 physical relation-generation ids used by storage file-id derivation; the logical
-table/index ids remain stable catalog identities.
+table/index/view ids remain stable catalog identities.
 
 Table IDs, index IDs, sequence IDs, and storage IDs are independent namespaces;
 all are monotonically increasing and never reused. `next_index_id` starts at
@@ -122,10 +127,19 @@ pub trait CatalogManager: Send + Sync {
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
     fn get_table(&self, id: TableId) -> Result<Option<TableSchema>>;
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
+    fn get_view_by_name(&self, name: &str) -> Result<Option<ViewSchema>>;
+    fn get_view(&self, id: TableId) -> Result<Option<ViewSchema>>;
+    fn list_views(&self) -> Result<Vec<ViewSchema>>;
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
     fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_and_index_schemas(
+        &self,
+        schema: TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
     fn create_table(
         &self,
@@ -141,8 +155,30 @@ pub trait CatalogManager: Send + Sync {
         primary_key: Vec<String>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+    fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema>;
+    fn preflight_add_table_column(
+        &self,
+        id: TableId,
+        if_not_exists: bool,
+        column: &ParsedColumnDef,
+    ) -> Result<TableColumnAlteration>;
+    fn add_table_column(&self, id: TableId, column: ParsedColumnDef) -> Result<TableSchema>;
+    fn preflight_drop_table_column(
+        &self,
+        id: TableId,
+        if_exists: bool,
+        column: &str,
+    ) -> Result<TableColumnAlteration>;
+    fn drop_table_column(&self, id: TableId, column: &str) -> Result<TableSchema>;
+    fn rename_table_column(
+        &self,
+        id: TableId,
+        old_name: &str,
+        new_name: String,
+    ) -> Result<TableSchema>;
     /// Applies an ALTER (or replays one during recovery): locates the live
     /// table by id and mutates its `compression`/`active_dict_id` in place,
     /// returning the updated clone. Also high-water-reserves `active_dict_id`
@@ -159,6 +195,15 @@ pub trait CatalogManager: Send + Sync {
         toast: ToastOptions,
         toast_table_id: Option<TableId>,
     ) -> Result<TableSchema>;
+    fn set_table_primary_key(&self, table: TableId, primary_key: Vec<ColumnId>)
+        -> Result<TableSchema>;
+    fn add_table_primary_key_index(
+        &self,
+        table: TableId,
+        primary_key: Vec<ColumnId>,
+        index: IndexSchema,
+    ) -> Result<TableSchema>;
+    fn drop_table_primary_key_index(&self, table: TableId, index: IndexId) -> Result<TableSchema>;
     /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
     /// "no dictionary").
     fn allocate_dictionary_id(&self) -> Result<u32>;
@@ -183,6 +228,7 @@ pub trait CatalogManager: Send + Sync {
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
     fn reserve_index_id(&self, id: IndexId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, id: IndexId) -> Result<()>;
     fn create_index(
         &self,
@@ -190,6 +236,14 @@ pub trait CatalogManager: Send + Sync {
         table: &str,
         columns: &[String],
         unique: bool,
+    ) -> Result<IndexSchema>;
+    fn create_index_with_constraint(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+        constraint: IndexConstraintKind,
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
 
@@ -206,12 +260,40 @@ pub trait CatalogManager: Send + Sync {
         owned: bool,
     ) -> Result<SequenceSchema>;
     fn drop_sequence(&self, id: SequenceId) -> Result<()>;
+
+    fn apply_create_view(&self, schema: ViewSchema) -> Result<()>;
+    fn apply_replace_view(&self, schema: ViewSchema) -> Result<()>;
+    fn apply_drop_view(&self, id: TableId) -> Result<()>;
+    fn create_view(
+        &self,
+        name: String,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema>;
+    fn replace_view(
+        &self,
+        id: TableId,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema>;
+    fn drop_view(&self, id: TableId) -> Result<()>;
 }
 ```
 
-Methods return owned schema copies. The catalog is stored behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success. `restore` reinstalls the snapshot's object maps but must not lower `next_table_id`, `next_index_id`, `next_sequence_id`, or `next_storage_id` below the current in-memory high-water mark; failed DDL can leave aborted page/index artifacts behind, so future IDs are still monotonically assigned and never reused. `reserve_table_id` / `reserve_index_id` / `reserve_sequence_id` / `reserve_storage_id` advance only the allocator high-water marks and install no object maps; recovery uses them for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` WAL records whose physical page records may still replay or whose IDs must not be reused.
+Methods return owned schema copies. The catalog is stored behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success. `restore` reinstalls the snapshot's object maps but must not lower `next_table_id`, `next_index_id`, `next_sequence_id`, or `next_storage_id` below the current in-memory high-water mark; failed DDL can leave aborted page/index artifacts behind, so future IDs are still monotonically assigned and never reused. `reserve_table_id` / `reserve_index_id` / `reserve_sequence_id` / `reserve_storage_id` advance only the allocator high-water marks and install no object maps; recovery uses them for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records whose physical page records may still replay or whose IDs and rewrite storage IDs must not be reused. `apply_update_table_and_index_schemas` is the committed-recovery path for schema-evolution replay: it validates the replayed table schema and all carried index schemas in one candidate snapshot before publishing any of them.
 
 The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
+
+User views share the table-id relation namespace and user relation-name
+namespace with tables, but they are stored in separate `views_by_*` maps so
+storage startup installs only physical relations. `create_view` assigns dense
+output column IDs, stores canonical SQL text plus dependency metadata, and starts
+`schema_version` at `1`; `replace_view` increments the view schema version and
+revalidates dependencies. View dependencies may target user tables only. A
+dependency with `all_columns = true` blocks column-level schema evolution for
+that relation; named dependencies block only those columns.
 
 `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting IDs, rejects conflicting names for user tables, rejects duplicate live table/TOAST `storage_id`s, adds only user tables to the name map, and advances `next_table_id` to at least `schema.id + 1` and `next_storage_id` past `schema.storage_id`. Hidden TOAST relations are installed by ID only and never inserted into `tables_by_name`. `reserve_table_id(id)` advances `next_table_id` to at least `id + 1` without installing a schema. Neither method reassigns table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs; dropping a user table also removes its linked hidden TOAST relation metadata and that relation's indexes, while directly dropping a linked hidden TOAST relation is rejected as catalog corruption. A missing ID returns `SqlState::UndefinedTable`.
 
@@ -276,6 +358,22 @@ table, hidden TOAST table, and secondary indexes, reserves every planned storage
 id, and returns `TruncateCatalogUpdate` for storage publication after durable
 commit.
 
+Schema-evolution helpers are catalog operations used by `ALTER TABLE`
+execution. `rename_table`, `add_table_column`, `drop_table_column`, and
+`rename_table_column` require a user table and increment
+`TableSchema.schema_version` on changes. ADD/DROP column preflight helpers run
+the same no-op/dependency checks without mutating state so the server can avoid
+snapshot fencing for harmless conditional statements. ADD/DROP column rewrites
+use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as
+part of the logical schema change, then storage publishes the matching
+`UpdateTableSchema` record. Renames are metadata-only and keep existing storage
+ids. Table/column renames reject dependent views. Table rename allows stored
+CHECK constraints because the binder rejects table-qualified CHECK references at
+CREATE time; column rename and drop reject stored CHECK constraints so stored
+SQL text cannot become stale. Dropping a column also rejects primary-key, indexed,
+view-dependent, and
+owned-sequence-default columns.
+
 ## Create Table Rules
 
 - Table name must be unique; a duplicate name returns `SqlState::DuplicateTable`.
@@ -306,9 +404,9 @@ commit.
   suppressing a duplicate-table error for `CREATE TABLE IF NOT EXISTS`, so invalid
   table definitions are still rejected even when the named table already exists.
 - `set_table_toast_metadata(table, toast, toast_table_id)` validates the target is a user table, validates TOAST bounds, validates any supplied hidden relation cross-link, updates `toast` and `toast_table_id` atomically in the catalog snapshot, and reserves `toast.active_dict_id` when present.
-- `set_table_primary_key(table, primary_key)` validates the target is a user table, validates that every `ColumnId` exists and appears once, replaces `TableSchema.primary_key`, and marks those columns non-null. Clearing the primary-key list does not restore earlier nullability. Recovery uses this while replaying `AlterTablePrimaryKey`; normal runtime `ADD PRIMARY KEY` uses the atomic helper below so readers do not observe a table primary key without its backing constraint index.
-- `add_table_primary_key_index(table, primary_key, index)` atomically installs `TableSchema.primary_key` and the backing primary-key constraint index in the same catalog snapshot. It validates the target is a user table with no current primary key, validates the primary-key columns, validates the supplied index name/id/table/columns/constraint metadata, marks key columns non-null, and advances the index allocator.
-- `drop_table_primary_key_index(table, index)` atomically clears `TableSchema.primary_key` and removes the named primary-key constraint index from the same catalog snapshot. It is the runtime `ALTER TABLE ... DROP PRIMARY KEY` path, so readers never observe a table with `primary_key = []` while the old primary-key constraint index is still catalog-visible. Former primary-key columns remain non-null.
+- `set_table_primary_key(table, primary_key)` validates the target is a user table, validates that every `ColumnId` exists and appears once, replaces `TableSchema.primary_key`, increments `TableSchema.schema_version`, and marks those columns non-null. Clearing the primary-key list does not restore earlier nullability. Recovery uses this while replaying `AlterTablePrimaryKey`; normal runtime `ADD PRIMARY KEY` uses the atomic helper below so readers do not observe a table primary key without its backing constraint index.
+- `add_table_primary_key_index(table, primary_key, index)` atomically installs `TableSchema.primary_key` and the backing primary-key constraint index in the same catalog snapshot. It validates the target is a user table with no current primary key, validates the primary-key columns, validates the supplied index name/id/table/columns/constraint metadata, marks key columns non-null, increments `TableSchema.schema_version`, and advances the index allocator.
+- `drop_table_primary_key_index(table, index)` atomically clears `TableSchema.primary_key`, increments `TableSchema.schema_version`, and removes the named primary-key constraint index from the same catalog snapshot. It is the runtime `ALTER TABLE ... DROP PRIMARY KEY` path, so readers never observe a table with `primary_key = []` while the old primary-key constraint index is still catalog-visible. Former primary-key columns remain non-null.
 
 ## Create Sequence Rules
 

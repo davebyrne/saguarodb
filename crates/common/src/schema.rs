@@ -1,6 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{ColumnId, FileId, IndexId, PgType, SequenceId, TableId, Value};
+
+pub const INITIAL_SCHEMA_VERSION: u64 = 1;
+
+fn initial_schema_version() -> u64 {
+    INITIAL_SCHEMA_VERSION
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -275,6 +281,17 @@ impl ColumnInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    /// The declared PostgreSQL wire type for this view output column. `None`
+    /// resolves to the collapsed default from `data_type`.
+    #[serde(default)]
+    pub pg_type: Option<PgType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: TableId,
     /// Physical storage-generation id for this table's heap and primary index.
@@ -285,6 +302,10 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
+    /// Monotonic logical schema version. It starts at 1 for a newly created
+    /// relation and increments on public schema metadata changes.
+    #[serde(default = "initial_schema_version")]
+    pub schema_version: u64,
     /// At-rest page compression for this table's heap and index files.
     #[serde(default)]
     pub compression: CompressionSetting,
@@ -308,6 +329,54 @@ pub struct TableSchema {
     /// rejects a row whose check evaluates to `false` (a `NULL` result passes).
     #[serde(default)]
     pub checks: Vec<String>,
+}
+
+/// A durable dependency from a view to another relation. `columns` tracks specific
+/// referenced columns. `all_columns` means the view depends on the relation's full
+/// column set (for example `SELECT *`) and column-level DDL should treat every
+/// column as referenced. A dependency with neither specific columns nor
+/// `all_columns` is a relation-existence dependency such as `count(*)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ViewDependency {
+    pub relation: TableId,
+    pub columns: Vec<ColumnId>,
+    pub all_columns: bool,
+}
+
+impl<'de> Deserialize<'de> for ViewDependency {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawViewDependency {
+            relation: TableId,
+            #[serde(default)]
+            columns: Vec<ColumnId>,
+            all_columns: Option<bool>,
+        }
+
+        let raw = RawViewDependency::deserialize(deserializer)?;
+        let all_columns = raw.all_columns.unwrap_or(raw.columns.is_empty());
+        Ok(Self {
+            relation: raw.relation,
+            columns: raw.columns,
+            all_columns,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSchema {
+    pub id: TableId,
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    /// Canonical SQL text for the view query.
+    pub definition: String,
+    #[serde(default)]
+    pub dependencies: Vec<ViewDependency>,
+    #[serde(default = "initial_schema_version")]
+    pub schema_version: u64,
 }
 
 pub fn needs_toast_relation(schema: &TableSchema) -> bool {
@@ -357,6 +426,7 @@ pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
             },
         ],
         primary_key: vec![0, 1],
+        schema_version: INITIAL_SCHEMA_VERSION,
         compression: CompressionSetting::None,
         active_dict_id: None,
         toast: ToastOptions::legacy_catalog_default(),
@@ -449,8 +519,8 @@ pub struct TruncateCatalogUpdate {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnDef, ColumnInfo, CompressionSetting, DataType, PgType, RelationKind, TableSchema,
-        ToastCompression, ToastMode, ToastOptions,
+        ColumnDef, ColumnInfo, CompressionSetting, DataType, INITIAL_SCHEMA_VERSION, PgType,
+        RelationKind, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewDependency,
     };
 
     #[test]
@@ -503,6 +573,7 @@ mod tests {
         let schema: TableSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.compression, CompressionSetting::None);
         assert_eq!(schema.storage_id, 0);
+        assert_eq!(schema.schema_version, INITIAL_SCHEMA_VERSION);
         assert_eq!(schema.active_dict_id, None);
         assert_eq!(schema.toast, ToastOptions::legacy_catalog_default());
         assert_eq!(schema.toast_table_id, None);
@@ -512,6 +583,17 @@ mod tests {
     #[test]
     fn compression_setting_defaults_to_none() {
         assert_eq!(CompressionSetting::default(), CompressionSetting::None);
+    }
+
+    #[test]
+    fn legacy_empty_view_dependency_deserializes_as_all_columns() {
+        let json = r#"{"relation": 7, "columns": []}"#;
+        let dependency: ViewDependency = serde_json::from_str(json).unwrap();
+        assert!(dependency.all_columns);
+
+        let relation_only_json = r#"{"relation": 7, "columns": [], "all_columns": false}"#;
+        let dependency: ViewDependency = serde_json::from_str(relation_only_json).unwrap();
+        assert!(!dependency.all_columns);
     }
 
     #[test]

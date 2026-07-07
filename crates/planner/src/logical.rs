@@ -29,6 +29,29 @@ pub enum LogicalPlan {
         if_exists: bool,
         table: Option<TableId>,
     },
+    AlterTableAddColumn {
+        table: TableId,
+        table_name: String,
+        if_not_exists: bool,
+        column: ParsedColumnDef,
+    },
+    AlterTableDropColumn {
+        table: TableId,
+        table_name: String,
+        if_exists: bool,
+        column: String,
+    },
+    AlterTableRenameColumn {
+        table: TableId,
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterTableRenameTable {
+        table: TableId,
+        table_name: String,
+        new_name: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -43,6 +66,17 @@ pub enum LogicalPlan {
         options: SequenceOptions,
     },
     DropSequence {
+        name: String,
+        if_exists: bool,
+    },
+    CreateView {
+        name: String,
+        or_replace: bool,
+        columns: Vec<String>,
+        query: BoundQuery,
+        definition: String,
+    },
+    DropView {
         name: String,
         if_exists: bool,
     },
@@ -168,6 +202,48 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             if_exists: *if_exists,
             table: *table,
         }),
+        BoundStatement::AlterTableAddColumn {
+            table,
+            table_name,
+            if_not_exists,
+            column,
+        } => Ok(LogicalPlan::AlterTableAddColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            if_not_exists: *if_not_exists,
+            column: column.clone(),
+        }),
+        BoundStatement::AlterTableDropColumn {
+            table,
+            table_name,
+            if_exists,
+            column,
+        } => Ok(LogicalPlan::AlterTableDropColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            if_exists: *if_exists,
+            column: column.clone(),
+        }),
+        BoundStatement::AlterTableRenameColumn {
+            table,
+            table_name,
+            old_name,
+            new_name,
+        } => Ok(LogicalPlan::AlterTableRenameColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        }),
+        BoundStatement::AlterTableRenameTable {
+            table,
+            table_name,
+            new_name,
+        } => Ok(LogicalPlan::AlterTableRenameTable {
+            table: *table,
+            table_name: table_name.clone(),
+            new_name: new_name.clone(),
+        }),
         BoundStatement::CreateIndex {
             name,
             table,
@@ -185,6 +261,23 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             options: options.clone(),
         }),
         BoundStatement::DropSequence { name, if_exists } => Ok(LogicalPlan::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        BoundStatement::CreateView {
+            name,
+            or_replace,
+            columns,
+            query,
+            definition,
+        } => Ok(LogicalPlan::CreateView {
+            name: name.clone(),
+            or_replace: *or_replace,
+            columns: columns.clone(),
+            query: query.clone(),
+            definition: definition.clone(),
+        }),
+        BoundStatement::DropView { name, if_exists } => Ok(LogicalPlan::DropView {
             name: name.clone(),
             if_exists: *if_exists,
         }),

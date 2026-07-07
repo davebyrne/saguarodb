@@ -7,7 +7,7 @@ use common::{
 use planner::{PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
@@ -108,6 +108,10 @@ impl ExecutorHarness {
         }
     }
 
+    pub fn storage_scan_count(&self) -> usize {
+        self.storage.scan_count()
+    }
+
     pub fn select_rows(&self, sql: &str) -> Result<Vec<Row>> {
         match self.execute(sql)? {
             ExecutionResult::Query { rows, .. } => Ok(rows),
@@ -150,7 +154,7 @@ impl ExecutorHarness {
             .execute_query_streamed(&ctx, &physical, sink, batch_size)
     }
 
-    fn resolve_columns(&self, table: &str, columns: &[&str]) -> (TableId, Vec<ColumnId>) {
+    fn resolve_columns(&self, table: &str, columns: &[&str]) -> (TableSchema, Vec<ColumnId>) {
         let schema = self.catalog.get_table_by_name(table).unwrap().unwrap();
         let ids = if columns.is_empty() {
             schema.columns.iter().map(|c| c.id).collect()
@@ -160,7 +164,21 @@ impl ExecutorHarness {
                 .map(|name| schema.columns.iter().find(|c| c.name == *name).unwrap().id)
                 .collect()
         };
-        (schema.id, ids)
+        (schema, ids)
+    }
+
+    pub fn table_schema(&self, table: &str) -> TableSchema {
+        self.catalog.get_table_by_name(table).unwrap().unwrap()
+    }
+
+    pub fn rename_catalog_column(&self, table: &str, old_name: &str, new_name: &str) -> Result<()> {
+        let schema = self
+            .catalog
+            .get_table_by_name(table)?
+            .ok_or_else(|| undefined_table_by_name(table))?;
+        self.catalog
+            .rename_table_column(schema.id, old_name, new_name.to_string())?;
+        Ok(())
     }
 
     /// Run a `COPY FROM` over the given chunks in one (committed) transaction,
@@ -172,7 +190,7 @@ impl ExecutorHarness {
         options: CopyOptions,
         chunks: &[&[u8]],
     ) -> Result<u64> {
-        let (table_id, column_ids) = self.resolve_columns(table, columns);
+        let (schema, column_ids) = self.resolve_columns(table, columns);
         let cancel = AtomicBool::new(false);
         let statement = StatementContext::new(1);
         let txn_id = statement.txn_id;
@@ -187,7 +205,7 @@ impl ExecutorHarness {
         };
         let result = (|| {
             let mut copy_in =
-                CopyIn::new(&ctx, table_id, column_ids, options, Vec::new(), Vec::new())?;
+                CopyIn::new(&ctx, schema, column_ids, options, Vec::new(), Vec::new())?;
             for chunk in chunks {
                 copy_in.push_chunk(chunk)?;
             }
@@ -207,7 +225,16 @@ impl ExecutorHarness {
 
     /// Run a `COPY TO`, returning the full wire byte stream (header + rows).
     pub fn copy_out(&self, table: &str, columns: &[&str], options: CopyOptions) -> Result<Vec<u8>> {
-        let (table_id, column_ids) = self.resolve_columns(table, columns);
+        let (schema, column_ids) = self.resolve_columns(table, columns);
+        self.copy_out_with_schema(schema, &column_ids, options)
+    }
+
+    pub fn copy_out_with_schema(
+        &self,
+        schema: TableSchema,
+        columns: &[ColumnId],
+        options: CopyOptions,
+    ) -> Result<Vec<u8>> {
         let cancel = AtomicBool::new(false);
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
@@ -218,7 +245,7 @@ impl ExecutorHarness {
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
         };
-        let mut out = CopyOut::new(&ctx, table_id, &column_ids, options)?;
+        let mut out = CopyOut::new(&ctx, schema, columns, options)?;
         let mut bytes = Vec::new();
         if let Some(header) = out.header_line() {
             bytes.extend(header);
@@ -239,23 +266,28 @@ impl ExecutorHarness {
 }
 
 fn is_read_plan(plan: &PhysicalPlan) -> bool {
-    !matches!(
+    matches!(
         plan,
-        PhysicalPlan::CreateTable { .. }
-            | PhysicalPlan::DropTable { .. }
-            | PhysicalPlan::CreateIndex { .. }
-            | PhysicalPlan::DropIndex { .. }
-            | PhysicalPlan::CreateSequence { .. }
-            | PhysicalPlan::DropSequence { .. }
-            | PhysicalPlan::Insert { .. }
-            | PhysicalPlan::Update { .. }
-            | PhysicalPlan::Delete { .. }
+        PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::SystemScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::NestedLoopJoin { .. }
+            | PhysicalPlan::HashJoin { .. }
+            | PhysicalPlan::Filter { .. }
+            | PhysicalPlan::Projection { .. }
+            | PhysicalPlan::Sort { .. }
+            | PhysicalPlan::Distinct { .. }
+            | PhysicalPlan::Limit { .. }
+            | PhysicalPlan::Aggregate { .. }
+            | PhysicalPlan::Values { .. }
+            | PhysicalPlan::SetOp { .. }
     )
 }
 
 #[derive(Default)]
 pub struct MemoryStorage {
     state: Mutex<MemoryStorageState>,
+    scan_calls: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -290,6 +322,10 @@ impl MemoryStorage {
             .get(&table)
             .map(|rows| rows.keys().cloned().collect())
             .unwrap_or_default())
+    }
+
+    pub fn scan_count(&self) -> usize {
+        self.scan_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -416,6 +452,7 @@ impl StorageEngine for MemoryStorage {
         _relations: &dyn RelationSnapshot,
         table: TableId,
     ) -> Result<Box<dyn RowIterator>> {
+        self.scan_calls.fetch_add(1, Ordering::SeqCst);
         let state = self
             .state
             .lock()
@@ -568,6 +605,24 @@ impl SchemaOperations for MemoryStorage {
         state.schemas.remove(&table);
         state.indexes.retain(|_, index| index.table != table);
         state.rows.remove(&table);
+        Ok(())
+    }
+
+    fn update_table_schema(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        begin_txn(&mut state, ctx.txn_id);
+        state.schemas.insert(schema.id, schema.clone());
+        for index in indexes {
+            state.indexes.insert(index.id, index.clone());
+        }
         Ok(())
     }
 

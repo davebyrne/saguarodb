@@ -7,8 +7,8 @@ use sqlparser::ast as sql;
 use crate::{Expr, Statement, UnaryOp};
 
 use super::{
-    column_char_length, compression_from_str, convert_expr, convert_pg_type, feature_not_supported,
-    ident_name, object_name, parse_error, serial_pg_type, unsupported,
+    column_char_length, compression_from_str, convert_expr, convert_pg_type, convert_query,
+    feature_not_supported, ident_name, object_name, parse_error, serial_pg_type, unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -55,6 +55,175 @@ pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement>
         table,
         columns,
         unique,
+    })
+}
+
+pub(super) fn convert_alter_table(
+    name: sql::ObjectName,
+    if_exists: bool,
+    only: bool,
+    operations: Vec<sql::AlterTableOperation>,
+    location: Option<sql::HiveSetLocation>,
+    on_cluster: Option<sql::Ident>,
+) -> Result<Statement> {
+    if if_exists || only || location.is_some() || on_cluster.is_some() || operations.len() != 1 {
+        return unsupported("unsupported ALTER TABLE form");
+    }
+    let table = object_name(&name)?;
+    match operations
+        .into_iter()
+        .next()
+        .expect("checked exactly one operation")
+    {
+        sql::AlterTableOperation::AddColumn {
+            if_not_exists,
+            column_def,
+            column_position,
+            ..
+        } => {
+            if column_position.is_some() {
+                return unsupported("ALTER TABLE ADD COLUMN position is not supported");
+            }
+            let mut primary_key = Vec::new();
+            let mut unique = Vec::new();
+            let mut checks = Vec::new();
+            let column =
+                convert_column_def(column_def, &mut primary_key, &mut unique, &mut checks)?;
+            if matches!(column.default, Some(ParsedDefault::Serial)) {
+                return unsupported("ALTER TABLE ADD COLUMN SERIAL is not supported");
+            }
+            if !primary_key.is_empty() || !unique.is_empty() || !checks.is_empty() {
+                return unsupported("ALTER TABLE ADD COLUMN constraints are not supported in v1");
+            }
+            Ok(Statement::AlterTableAddColumn {
+                table,
+                if_not_exists,
+                column,
+            })
+        }
+        sql::AlterTableOperation::DropColumn {
+            column_name,
+            if_exists,
+            drop_behavior,
+        } => {
+            if drop_behavior.is_some() {
+                return unsupported("ALTER TABLE DROP COLUMN CASCADE/RESTRICT is not supported");
+            }
+            Ok(Statement::AlterTableDropColumn {
+                table,
+                if_exists,
+                column: ident_name(&column_name)?,
+            })
+        }
+        sql::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => Ok(Statement::AlterTableRenameColumn {
+            table,
+            old_name: ident_name(&old_column_name)?,
+            new_name: ident_name(&new_column_name)?,
+        }),
+        sql::AlterTableOperation::RenameTable { table_name } => {
+            Ok(Statement::AlterTableRenameTable {
+                table,
+                new_name: object_name(&table_name)?,
+            })
+        }
+        _ => unsupported("unsupported ALTER TABLE operation"),
+    }
+}
+
+pub(super) struct CreateViewParts {
+    pub(super) or_alter: bool,
+    pub(super) or_replace: bool,
+    pub(super) materialized: bool,
+    pub(super) name: sql::ObjectName,
+    pub(super) columns: Vec<sql::ViewColumnDef>,
+    pub(super) query: sql::Query,
+    pub(super) options: sql::CreateTableOptions,
+    pub(super) cluster_by: Vec<sql::Ident>,
+    pub(super) comment: Option<String>,
+    pub(super) with_no_schema_binding: bool,
+    pub(super) if_not_exists: bool,
+    pub(super) temporary: bool,
+    pub(super) to: Option<sql::ObjectName>,
+    pub(super) params: Option<sql::CreateViewParams>,
+}
+
+pub(super) fn convert_create_view(parts: CreateViewParts) -> Result<Statement> {
+    let CreateViewParts {
+        or_alter,
+        or_replace,
+        materialized,
+        name,
+        columns,
+        query,
+        options,
+        cluster_by,
+        comment,
+        with_no_schema_binding,
+        if_not_exists,
+        temporary,
+        to,
+        params,
+    } = parts;
+    if or_alter
+        || materialized
+        || !matches!(options, sql::CreateTableOptions::None)
+        || !cluster_by.is_empty()
+        || comment.is_some()
+        || with_no_schema_binding
+        || if_not_exists
+        || temporary
+        || to.is_some()
+        || params.is_some()
+    {
+        return unsupported("unsupported CREATE VIEW form");
+    }
+    let columns = columns
+        .into_iter()
+        .map(|column| {
+            if column.data_type.is_some()
+                || column.options.as_ref().is_some_and(|opts| !opts.is_empty())
+            {
+                return unsupported("CREATE VIEW column types/options are not supported");
+            }
+            ident_name(&column.name)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let definition = query.to_string();
+    Ok(Statement::CreateView {
+        name: object_name(&name)?,
+        or_replace,
+        columns,
+        query: convert_query(query)?,
+        definition,
+    })
+}
+
+pub(super) fn convert_truncate(
+    table_names: Vec<sql::TruncateTableTarget>,
+    partitions: Option<Vec<sql::Expr>>,
+    only: bool,
+    identity: Option<sql::TruncateIdentityOption>,
+    cascade: Option<sql::CascadeOption>,
+    on_cluster: Option<sql::Ident>,
+) -> Result<Statement> {
+    if table_names.len() != 1
+        || partitions.is_some()
+        || only
+        || identity.is_some()
+        || cascade.is_some()
+        || on_cluster.is_some()
+    {
+        return feature_not_supported("unsupported TRUNCATE form");
+    }
+    let table = table_names
+        .into_iter()
+        .next()
+        .expect("checked exactly one table");
+    Ok(Statement::Truncate {
+        table: object_name(&table.name)?,
     })
 }
 

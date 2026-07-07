@@ -1,6 +1,6 @@
 use common::{
-    ColumnInfo, ExecRow, IndexId, KeyRange, PRIMARY_KEY_INDEX_ID, Result, RowIdentity, SqlState,
-    StatementContext, TableId,
+    ColumnInfo, DbError, ExecRow, IndexId, KeyRange, PRIMARY_KEY_INDEX_ID, Result, RowIdentity,
+    SqlState, StatementContext, StoredRow, TableId,
 };
 use planner::BoundExpr;
 use std::sync::Arc;
@@ -47,8 +47,16 @@ impl PlanExecutor for SeqScanOp<'_> {
 
     fn open(&mut self) -> Result<()> {
         self.iter = Some(
-            self.storage
-                .scan(&self.ctx, self.relations.as_ref(), self.table)?,
+            match self
+                .storage
+                .scan(&self.ctx, self.relations.as_ref(), self.table)
+            {
+                Ok(iter) => iter,
+                Err(err) if missing_table_is_empty(self.relations.as_ref(), &err) => {
+                    empty_iterator(&self.output_schema)
+                }
+                Err(err) => return Err(err),
+            },
         );
         Ok(())
     }
@@ -148,8 +156,18 @@ impl PlanExecutor for IndexScanOp<'_> {
         // The primary-key index resolves to a row location directly; a secondary
         // index resolves each entry's primary key through the primary-key index.
         let iter = if self.index == PRIMARY_KEY_INDEX_ID {
-            self.storage
-                .scan_range(&self.ctx, self.relations.as_ref(), self.table, &self.range)?
+            match self.storage.scan_range(
+                &self.ctx,
+                self.relations.as_ref(),
+                self.table,
+                &self.range,
+            ) {
+                Ok(iter) => iter,
+                Err(err) if missing_table_is_empty(self.relations.as_ref(), &err) => {
+                    empty_iterator(&self.output_schema)
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             match self.storage.index_scan(
                 &self.ctx,
@@ -161,8 +179,16 @@ impl PlanExecutor for IndexScanOp<'_> {
                 Ok(iter) => iter,
                 Err(err) if err.code == SqlState::UndefinedTable => {
                     self.filter = self.full_filter.clone();
-                    self.storage
-                        .scan(&self.ctx, self.relations.as_ref(), self.table)?
+                    match self
+                        .storage
+                        .scan(&self.ctx, self.relations.as_ref(), self.table)
+                    {
+                        Ok(iter) => iter,
+                        Err(err) if missing_table_is_empty(self.relations.as_ref(), &err) => {
+                            empty_iterator(&self.output_schema)
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -200,5 +226,29 @@ impl PlanExecutor for IndexScanOp<'_> {
     fn close(&mut self) -> Result<()> {
         self.iter = None;
         Ok(())
+    }
+}
+
+fn missing_table_is_empty(relations: &dyn RelationSnapshot, err: &DbError) -> bool {
+    err.code == SqlState::UndefinedTable && relations.missing_tables_are_empty()
+}
+
+fn empty_iterator(output_schema: &[ColumnInfo]) -> Box<dyn RowIterator> {
+    Box::new(EmptyRowIterator {
+        schema: output_schema.to_vec(),
+    })
+}
+
+struct EmptyRowIterator {
+    schema: Vec<ColumnInfo>,
+}
+
+impl RowIterator for EmptyRowIterator {
+    fn next(&mut self) -> Result<Option<StoredRow>> {
+        Ok(None)
+    }
+
+    fn schema(&self) -> &[ColumnInfo] {
+        &self.schema
     }
 }

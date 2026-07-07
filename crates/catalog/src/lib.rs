@@ -12,17 +12,38 @@ pub use system::{
 use common::{
     ColumnId, CompressionSetting, FileId, IndexConstraintKind, IndexId, IndexSchema,
     ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
-    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableColumnAlteration {
+    Noop,
+    Rewrite,
+}
+
+impl TableColumnAlteration {
+    pub fn rewrites_storage(self) -> bool {
+        matches!(self, Self::Rewrite)
+    }
+}
 
 pub trait CatalogManager: Send + Sync {
     fn get_table_by_name(&self, name: &str) -> Result<Option<TableSchema>>;
     fn get_table(&self, id: TableId) -> Result<Option<TableSchema>>;
     fn list_tables(&self) -> Result<Vec<TableSchema>>;
+    fn get_view_by_name(&self, name: &str) -> Result<Option<ViewSchema>>;
+    fn get_view(&self, id: TableId) -> Result<Option<ViewSchema>>;
+    fn list_views(&self) -> Result<Vec<ViewSchema>>;
     fn snapshot(&self) -> Result<CatalogSnapshot>;
     fn restore(&self, snapshot: CatalogSnapshot) -> Result<()>;
     fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_and_index_schemas(
+        &self,
+        schema: TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
     fn create_table(
         &self,
@@ -50,6 +71,27 @@ pub trait CatalogManager: Send + Sync {
         checks: Vec<String>,
     ) -> Result<TableSchema>;
     fn drop_table(&self, id: TableId) -> Result<()>;
+    fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema>;
+    fn preflight_add_table_column(
+        &self,
+        id: TableId,
+        if_not_exists: bool,
+        column: &ParsedColumnDef,
+    ) -> Result<TableColumnAlteration>;
+    fn add_table_column(&self, id: TableId, column: ParsedColumnDef) -> Result<TableSchema>;
+    fn preflight_drop_table_column(
+        &self,
+        id: TableId,
+        if_exists: bool,
+        column: &str,
+    ) -> Result<TableColumnAlteration>;
+    fn drop_table_column(&self, id: TableId, column: &str) -> Result<TableSchema>;
+    fn rename_table_column(
+        &self,
+        id: TableId,
+        old_name: &str,
+        new_name: String,
+    ) -> Result<TableSchema>;
     /// Applies an ALTER (or replays one during recovery): locates the live
     /// table by id and mutates its compression setting and active dictionary
     /// id in place, returning the updated clone.
@@ -112,6 +154,7 @@ pub trait CatalogManager: Send + Sync {
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
     fn reserve_index_id(&self, id: IndexId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, id: IndexId) -> Result<()>;
     fn create_index(
         &self,
@@ -145,6 +188,25 @@ pub trait CatalogManager: Send + Sync {
         owned: bool,
     ) -> Result<SequenceSchema>;
     fn drop_sequence(&self, id: SequenceId) -> Result<()>;
+
+    fn apply_create_view(&self, schema: ViewSchema) -> Result<()>;
+    fn apply_replace_view(&self, schema: ViewSchema) -> Result<()>;
+    fn apply_drop_view(&self, id: TableId) -> Result<()>;
+    fn create_view(
+        &self,
+        name: String,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema>;
+    fn replace_view(
+        &self,
+        id: TableId,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema>;
+    fn drop_view(&self, id: TableId) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -154,7 +216,8 @@ mod tests {
     use common::{
         ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexConstraintKind,
         IndexSchema, ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema,
-        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, toast_schema,
+        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
+        ViewDependency, toast_schema,
     };
 
     use crate::{
@@ -169,6 +232,15 @@ mod tests {
             nullable,
             max_length: None,
             default: None,
+            pg_type: None,
+        }
+    }
+
+    fn view_column(name: &str, data_type: DataType, nullable: bool) -> ViewColumn {
+        ViewColumn {
+            name: name.to_string(),
+            data_type,
+            nullable,
             pg_type: None,
         }
     }
@@ -188,6 +260,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: Vec::new(),
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -215,6 +288,31 @@ mod tests {
                     },
                 ],
                 vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+    }
+
+    /// A `users(id INTEGER NOT NULL, name TEXT)` table for schema/view tests that
+    /// are not exercising primary-key constraint-index metadata.
+    fn catalog_with_users_without_primary_key() -> MemoryCatalog {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -272,7 +370,7 @@ mod tests {
             .create_table(
                 "users".to_string(),
                 vec![id_column(false)],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap_err();
@@ -441,6 +539,481 @@ mod tests {
 
         assert_eq!(recreated_table.id, failed_table.id + 1);
         assert_eq!(recreated_index.id, failed_index.id + 1);
+    }
+
+    #[test]
+    fn table_schema_ddl_helpers_update_schema_versions() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        assert_eq!(users.schema_version, common::INITIAL_SCHEMA_VERSION);
+
+        let with_email = catalog
+            .add_table_column(
+                users.id,
+                ParsedColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Text),
+                },
+            )
+            .unwrap();
+        assert_eq!(with_email.schema_version, users.schema_version + 1);
+        assert_eq!(with_email.columns[2].id, 2);
+
+        let renamed_column = catalog
+            .rename_table_column(users.id, "email", "contact_email".to_string())
+            .unwrap();
+        assert_eq!(renamed_column.schema_version, with_email.schema_version + 1);
+        assert_eq!(renamed_column.columns[2].name, "contact_email");
+
+        let dropped_column = catalog
+            .drop_table_column(users.id, "contact_email")
+            .unwrap();
+        assert_eq!(
+            dropped_column.schema_version,
+            renamed_column.schema_version + 1
+        );
+        assert_eq!(dropped_column.columns.len(), 2);
+
+        let renamed_table = catalog
+            .rename_table(users.id, "people".to_string())
+            .unwrap();
+        assert_eq!(
+            renamed_table.schema_version,
+            dropped_column.schema_version + 1
+        );
+        assert!(catalog.get_table_by_name("users").unwrap().is_none());
+        assert_eq!(
+            catalog.get_table_by_name("people").unwrap().unwrap().id,
+            users.id
+        );
+    }
+
+    #[test]
+    fn rename_table_allows_stored_check_constraints() {
+        let catalog = MemoryCatalog::empty();
+        let accounts = catalog
+            .create_table_with_options(
+                "accounts".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                CompressionSetting::None,
+                ToastOptions::legacy_catalog_default(),
+                vec!["id > 0".to_string()],
+            )
+            .unwrap();
+
+        let renamed = catalog
+            .rename_table(accounts.id, "customers".to_string())
+            .unwrap();
+
+        assert_eq!(renamed.name, "customers");
+        assert_eq!(renamed.checks, vec!["id > 0".to_string()]);
+        assert!(catalog.get_table_by_name("accounts").unwrap().is_none());
+        assert_eq!(
+            catalog.get_table_by_name("customers").unwrap().unwrap().id,
+            accounts.id
+        );
+    }
+
+    #[test]
+    fn views_share_relation_namespace_and_persist() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let view = catalog
+            .create_view(
+                "active_users".to_string(),
+                vec![
+                    view_column("id", DataType::Integer, false),
+                    view_column("name", DataType::Text, true),
+                ],
+                "SELECT id, name FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![0, 1],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+
+        // `users(name text)` owns a hidden TOAST relation, so the next relation id
+        // after the user table is already burned before the view is created.
+        assert_eq!(view.id, users.id + 2);
+        assert_eq!(view.schema_version, common::INITIAL_SCHEMA_VERSION);
+        assert_eq!(
+            catalog
+                .get_view_by_name("active_users")
+                .unwrap()
+                .unwrap()
+                .id,
+            view.id
+        );
+
+        let duplicate = catalog
+            .create_table(
+                "active_users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap_err();
+        assert_eq!(duplicate.code, SqlState::DuplicateTable);
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+        let restored_view = restored.get_view(view.id).unwrap().unwrap();
+        assert_eq!(restored_view.name, "active_users");
+        assert_eq!(restored_view.dependencies[0].relation, users.id);
+
+        let replacement = restored
+            .replace_view(
+                view.id,
+                vec![view_column("id", DataType::Integer, false)],
+                "SELECT id FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![0],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(replacement.id, view.id);
+        assert_eq!(replacement.schema_version, view.schema_version + 1);
+        assert_eq!(replacement.columns.len(), 1);
+    }
+
+    #[test]
+    fn view_dependencies_block_unsafe_relation_and_column_changes() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let view = catalog
+            .create_view(
+                "user_names".to_string(),
+                vec![view_column("name", DataType::Text, true)],
+                "SELECT name FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![1],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+
+        let drop_table = catalog.drop_table(users.id).unwrap_err();
+        assert_eq!(drop_table.code, SqlState::DependentObjectsStillExist);
+
+        let rename_table = catalog
+            .rename_table(users.id, "people".to_string())
+            .unwrap_err();
+        assert_eq!(rename_table.code, SqlState::DependentObjectsStillExist);
+
+        let drop_column = catalog.drop_table_column(users.id, "name").unwrap_err();
+        assert_eq!(drop_column.code, SqlState::DependentObjectsStillExist);
+
+        let rename_column = catalog
+            .rename_table_column(users.id, "name", "full_name".to_string())
+            .unwrap_err();
+        assert_eq!(rename_column.code, SqlState::DependentObjectsStillExist);
+
+        catalog.drop_view(view.id).unwrap();
+        catalog
+            .rename_table_column(users.id, "name", "full_name".to_string())
+            .unwrap();
+    }
+
+    #[test]
+    fn view_on_view_dependencies_are_rejected_for_now() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let base_view = catalog
+            .create_view(
+                "base_user_names".to_string(),
+                vec![view_column("name", DataType::Text, true)],
+                "SELECT name FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: vec![1],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+
+        let err = catalog
+            .create_view(
+                "derived_user_names".to_string(),
+                vec![view_column("name", DataType::Text, true)],
+                "SELECT name FROM base_user_names".to_string(),
+                vec![ViewDependency {
+                    relation: base_view.id,
+                    columns: vec![0],
+                    all_columns: false,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(
+            catalog
+                .get_view_by_name("derived_user_names")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn apply_update_table_schema_remaps_view_dependencies_by_column_identity() {
+        let catalog = MemoryCatalog::empty();
+        let accounts = catalog
+            .create_table(
+                "accounts".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "legacy_score".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Int8),
+                    },
+                    ParsedColumnDef {
+                        name: "balance".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Int8),
+                    },
+                ],
+                Vec::new(),
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        let view = catalog
+            .create_view(
+                "account_balances".to_string(),
+                vec![view_column("balance", DataType::Integer, true)],
+                "SELECT balance FROM accounts".to_string(),
+                vec![ViewDependency {
+                    relation: accounts.id,
+                    columns: vec![2],
+                    all_columns: false,
+                }],
+            )
+            .unwrap();
+
+        let mut replayed_schema = accounts;
+        replayed_schema.columns.remove(1);
+        replayed_schema.columns[1].id = 1;
+        replayed_schema.schema_version += 1;
+        catalog.apply_update_table_schema(replayed_schema).unwrap();
+
+        let stored_view = catalog.get_view(view.id).unwrap().unwrap();
+        assert_eq!(stored_view.dependencies[0].columns, vec![1]);
+    }
+
+    #[test]
+    fn apply_update_schemas_reserve_replayed_storage_ids() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        let mut replayed_index = index.clone();
+        replayed_index.storage_id = 50;
+        catalog.apply_update_index_schema(replayed_index).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 51);
+
+        let mut replayed_table = users;
+        replayed_table.storage_id = 75;
+        replayed_table.schema_version += 1;
+        catalog.apply_update_table_schema(replayed_table).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 76);
+    }
+
+    #[test]
+    fn apply_update_table_and_index_schemas_validates_primary_key_against_replayed_table() {
+        let catalog = MemoryCatalog::empty();
+        let accounts = catalog
+            .create_table(
+                "accounts".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                    id_column(false),
+                ],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        let primary_key = catalog
+            .create_index_with_constraint(
+                "accounts_pkey".to_string(),
+                "accounts",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+        assert_eq!(primary_key.columns, vec![1]);
+
+        let mut replayed_table = accounts;
+        replayed_table.columns.remove(0);
+        replayed_table.columns[0].id = 0;
+        replayed_table.primary_key = vec![0];
+        replayed_table.schema_version += 1;
+        replayed_table.storage_id = 50;
+
+        let mut replayed_primary_key = primary_key;
+        replayed_primary_key.columns = vec![0];
+        replayed_primary_key.storage_id = 51;
+
+        catalog
+            .apply_update_table_and_index_schemas(replayed_table.clone(), &[replayed_primary_key])
+            .unwrap();
+
+        let stored_table = catalog.get_table(replayed_table.id).unwrap().unwrap();
+        let stored_primary_key = catalog.get_index_by_name("accounts_pkey").unwrap().unwrap();
+        assert_eq!(stored_table.primary_key, vec![0]);
+        assert_eq!(stored_primary_key.columns, vec![0]);
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 52);
+    }
+
+    #[test]
+    fn relation_wide_view_dependency_blocks_add_column() {
+        let catalog = catalog_with_users_without_primary_key();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .create_view(
+                "all_users".to_string(),
+                vec![
+                    view_column("id", DataType::Integer, false),
+                    view_column("name", DataType::Text, true),
+                ],
+                "SELECT * FROM users".to_string(),
+                vec![ViewDependency {
+                    relation: users.id,
+                    columns: Vec::new(),
+                    all_columns: true,
+                }],
+            )
+            .unwrap();
+
+        let err = catalog
+            .add_table_column(
+                users.id,
+                ParsedColumnDef {
+                    name: "active".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Bool),
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+    }
+
+    #[test]
+    fn add_toastable_column_allocates_hidden_toast_relation() {
+        let catalog = MemoryCatalog::empty();
+        let table = catalog
+            .create_table(
+                "numbers".to_string(),
+                vec![id_column(false)],
+                Vec::new(),
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+
+        let updated = catalog
+            .add_table_column(
+                table.id,
+                ParsedColumnDef {
+                    name: "note".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: Some(PgType::Text),
+                },
+            )
+            .unwrap();
+
+        let toast_id = updated.toast_table_id.expect("hidden TOAST relation id");
+        let toast = catalog
+            .get_table(toast_id)
+            .unwrap()
+            .expect("hidden TOAST relation exists");
+        assert_eq!(
+            toast.relation_kind,
+            RelationKind::Toast {
+                base_table: updated.id
+            }
+        );
+        assert_eq!(catalog.get_table_by_name(&toast.name).unwrap(), None);
+    }
+
+    #[test]
+    fn dropping_owned_sequence_default_column_is_rejected() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_sequence(
+                "serial_col_seq".to_string(),
+                SequenceOptions::default(),
+                true,
+            )
+            .unwrap();
+        let table = catalog
+            .create_table(
+                "t".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "serial_col".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        max_length: None,
+                        default: Some(common::ParsedDefault::OwnedNextval(
+                            "serial_col_seq".to_string(),
+                        )),
+                        pg_type: Some(PgType::Int8),
+                    },
+                ],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+
+        let err = catalog
+            .drop_table_column(table.id, "serial_col")
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert!(
+            catalog
+                .get_sequence_by_name("serial_col_seq")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -873,6 +1446,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: Vec::new(),
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -923,6 +1497,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: Vec::new(),
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -942,6 +1517,8 @@ mod tests {
             next_sequence_id: 2,
             next_dictionary_id: 1,
             next_storage_id: 4,
+            views_by_name: HashMap::new(),
+            views_by_id: HashMap::new(),
         };
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
@@ -968,6 +1545,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -1132,6 +1710,7 @@ mod tests {
                 },
             ],
             primary_key: vec![0, 1],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -1187,6 +1766,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -1222,6 +1802,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -1259,6 +1840,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![1],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -1330,11 +1912,13 @@ mod tests {
         let updated = catalog.set_table_primary_key(schema.id, vec![0]).unwrap();
         assert_eq!(updated.primary_key, vec![0]);
         assert!(!updated.columns[0].nullable);
+        assert_eq!(updated.schema_version, schema.schema_version + 1);
 
         let cleared = catalog
             .set_table_primary_key(schema.id, Vec::new())
             .unwrap();
         assert!(cleared.primary_key.is_empty());
+        assert_eq!(cleared.schema_version, updated.schema_version + 1);
         assert!(
             !cleared.columns[0].nullable,
             "dropping a primary key does not restore prior nullability"
@@ -1369,6 +1953,7 @@ mod tests {
 
         assert_eq!(updated.primary_key, vec![0]);
         assert!(!updated.columns[0].nullable);
+        assert_eq!(updated.schema_version, schema.schema_version + 1);
         assert_eq!(catalog.get_index(index.id).unwrap(), Some(index));
         assert_eq!(
             catalog.get_table(schema.id).unwrap().unwrap().primary_key,
@@ -1440,6 +2025,7 @@ mod tests {
             .unwrap();
 
         assert!(updated.primary_key.is_empty());
+        assert_eq!(updated.schema_version, schema.schema_version + 1);
         assert!(
             !updated.columns[0].nullable,
             "dropping a primary key does not restore prior nullability"
@@ -1579,6 +2165,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -2065,6 +2652,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -2113,6 +2701,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -2389,6 +2978,23 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 1)]),
             tables_by_id: HashMap::from([(1, base), (2, toast)]),
             next_table_id: 3,
+            ..CatalogSnapshot::default()
+        };
+
+        MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_hidden_toast_storage_id_change() {
+        let mut base = stored_id_table(1, "users");
+        base.toast_table_id = Some(2);
+        let mut toast = toast_schema(&base, 2);
+        toast.storage_id = 7;
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, base), (2, toast)]),
+            next_table_id: 3,
+            next_storage_id: 8,
             ..CatalogSnapshot::default()
         };
 

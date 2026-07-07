@@ -2,11 +2,14 @@
 //! blocking producer (which owns the `PlanExecutor`) to the async connection task
 //! that writes them to the socket (`docs/specs/streaming.md`).
 
+use std::fmt;
 use std::ops::ControlFlow;
 
-use common::{ColumnInfo, Result, Row};
-use executor::{ExecutionResult, RowSink};
+use common::{ColumnInfo, DbError, Result, Row, SqlState};
+use executor::{CopyJob, ExecutionResult, RowSink};
 use tokio::sync::mpsc;
+
+use super::{CapturedSnapshots, TransactionSnapshots, WriteUnitGuard};
 
 /// Rows pulled per `PlanExecutor` batch and carried per channel message
 /// (`docs/specs/streaming.md` §7). A tuning knob only: it bounds peak buffered
@@ -29,30 +32,70 @@ pub enum StreamMessage {
     Rows(Vec<Row>),
 }
 
+/// The snapshot captured before binding a COPY statement. COPY crosses the query
+/// and protocol layers, so the captured snapshot must cross with it; otherwise a
+/// schema rewrite can publish a new relation generation between COPY bind and
+/// COPY execution.
+pub(crate) enum CopySnapshots {
+    Autocommit {
+        snapshots: CapturedSnapshots,
+        write_guard: Option<WriteUnitGuard>,
+    },
+    Transaction(TransactionSnapshots),
+}
+
+impl fmt::Debug for CopySnapshots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CopySnapshots::Autocommit { .. } => f.write_str("CopySnapshots::Autocommit(..)"),
+            CopySnapshots::Transaction(_) => f.write_str("CopySnapshots::Transaction(..)"),
+        }
+    }
+}
+
 /// The outcome of a (possibly streaming) statement execution.
 #[derive(Debug)]
-pub enum StreamOutcome {
+pub(crate) enum StreamOutcome {
     /// A SELECT whose rows were streamed through the channel. `count` is the
     /// authoritative number of rows produced by the drive (used for the
     /// `SELECT n` command tag).
     Streamed { count: u64 },
-    /// Any non-streamed result — DML, DDL, EXPLAIN, a COPY request, or a SELECT
-    /// run on the materializing path — returned in full.
+    /// Any non-streamed result — DML, DDL, EXPLAIN, or a SELECT run on the
+    /// materializing path — returned in full.
     Direct(ExecutionResult),
+    /// `COPY ... FROM STDIN`: the connection loop sends `CopyInResponse` and
+    /// streams client data while holding `snapshots` for the COPY lifetime.
+    BeginCopyIn {
+        job: CopyJob,
+        snapshots: CopySnapshots,
+    },
+    /// `COPY ... TO STDOUT`: the connection loop sends `CopyOutResponse` and
+    /// streams table data while holding `snapshots` for the COPY lifetime.
+    BeginCopyOut {
+        job: CopyJob,
+        snapshots: CopySnapshots,
+    },
     /// A non-streamed result that also requires connection-scoped session objects
     /// outside the query service (prepared statements and portals) to be reset.
     SessionReset(ExecutionResult),
 }
 
 impl StreamOutcome {
-    /// Unwrap a non-streamed result. A `Streamed` outcome only arises when a row
-    /// sink was supplied, which the materializing (sink-less) callers never do,
-    /// so this cannot panic on those paths.
-    pub(crate) fn expect_direct(self) -> ExecutionResult {
+    /// Convert a non-streamed result for callers that cannot drive protocol-level
+    /// streaming. `SELECT` cannot stream without a row sink, but COPY still needs
+    /// the connection sub-protocol, so surface a structured error instead of
+    /// panicking.
+    pub(crate) fn into_direct_result(self) -> Result<ExecutionResult> {
         match self {
-            StreamOutcome::Direct(result) | StreamOutcome::SessionReset(result) => result,
+            StreamOutcome::Direct(result) | StreamOutcome::SessionReset(result) => Ok(result),
+            StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. } => {
+                Err(DbError::plan(
+                    SqlState::FeatureNotSupported,
+                    "COPY requires the PostgreSQL COPY sub-protocol",
+                ))
+            }
             StreamOutcome::Streamed { .. } => {
-                unreachable!("a streamed outcome cannot arise without a row sink")
+                unreachable!("this outcome cannot arise without protocol-level driving")
             }
         }
     }

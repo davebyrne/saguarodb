@@ -3,14 +3,14 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use catalog::CatalogManager;
+use catalog::{CatalogManager, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result,
-    Row, SequenceOptions, SequenceSchema, SqlState, StatementContext, TableId, TableSchema,
-    ToastOptions, Value,
+    Row, SequenceOptions, SequenceSchema, SqlState, StatementContext, StoredRow, TableId,
+    TableSchema, ToastOptions, TruncateCatalogUpdate, Value,
 };
-use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
+use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, bind_default_expr};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -129,6 +129,35 @@ impl QueryEngine {
                 if_exists,
                 table,
             } => execute_drop_table(ctx, name, *if_exists, *table),
+            PhysicalPlan::AlterTableAddColumn {
+                table,
+                table_name: _,
+                if_not_exists,
+                column,
+            } => execute_alter_table_add_column(ctx, *table, *if_not_exists, column),
+            PhysicalPlan::AlterTableDropColumn {
+                table,
+                table_name: _,
+                if_exists,
+                column,
+            } => execute_alter_table_drop_column(ctx, *table, *if_exists, column),
+            PhysicalPlan::AlterTableRenameColumn {
+                table,
+                table_name: _,
+                old_name,
+                new_name,
+            } => execute_alter_table_rename_column(ctx, *table, old_name, new_name),
+            PhysicalPlan::AlterTableRenameTable {
+                table,
+                table_name: _,
+                new_name,
+            } => execute_alter_table_rename_table(ctx, *table, new_name),
+            PhysicalPlan::CreateView { .. } | PhysicalPlan::DropView { .. } => {
+                Err(DbError::execute(
+                    SqlState::FeatureNotSupported,
+                    "views are not implemented yet",
+                ))
+            }
             PhysicalPlan::CreateIndex {
                 name,
                 table,
@@ -381,10 +410,16 @@ pub(crate) fn build_executor<'a>(
         ))),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }
         | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(DbError::internal(
@@ -828,7 +863,6 @@ fn modified_result(
 /// runs in one transaction (the server owns the txn/guard and commit).
 pub struct CopyIn<'a> {
     ctx: &'a ExecutionContext<'a>,
-    table: TableId,
     schema: TableSchema,
     columns: Vec<ColumnId>,
     /// Bound expression defaults for omitted columns and the table's bound `CHECK`
@@ -842,13 +876,12 @@ pub struct CopyIn<'a> {
 impl<'a> CopyIn<'a> {
     pub fn new(
         ctx: &'a ExecutionContext<'a>,
-        table: TableId,
+        schema: TableSchema,
         columns: Vec<ColumnId>,
         options: CopyOptions,
         default_exprs: Vec<(ColumnId, BoundExpr)>,
         check_exprs: Vec<BoundExpr>,
     ) -> Result<Self> {
-        let schema = require_table(ctx.catalog, table)?;
         let column_types = columns
             .iter()
             .map(|column| {
@@ -859,7 +892,6 @@ impl<'a> CopyIn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             ctx,
-            table,
             schema,
             columns,
             default_exprs,
@@ -875,7 +907,7 @@ impl<'a> CopyIn<'a> {
         for row in self.parser.push(chunk)? {
             map_and_insert_row(
                 self.ctx,
-                self.table,
+                self.schema.id,
                 &self.schema,
                 &self.columns,
                 row,
@@ -892,7 +924,7 @@ impl<'a> CopyIn<'a> {
         for row in self.parser.finish()? {
             map_and_insert_row(
                 self.ctx,
-                self.table,
+                self.schema.id,
                 &self.schema,
                 &self.columns,
                 row,
@@ -919,11 +951,10 @@ pub struct CopyOut {
 impl CopyOut {
     pub fn new(
         ctx: &ExecutionContext<'_>,
-        table: TableId,
+        schema: TableSchema,
         columns: &[ColumnId],
         options: CopyOptions,
     ) -> Result<Self> {
-        let schema = require_table(ctx.catalog, table)?;
         let mut slots = Vec::with_capacity(columns.len());
         let mut column_names = Vec::with_capacity(columns.len());
         for column in columns {
@@ -937,10 +968,22 @@ impl CopyOut {
         // NoSsiTracker (autocommit COPY TO is Read Committed and records nothing).
         ctx.statement
             .ssi_tracker
-            .record_relation_read(ctx.statement.txn_id, table);
-        let iter = ctx
+            .record_relation_read(ctx.statement.txn_id, schema.id);
+        let iter = match ctx
             .storage
-            .scan(&ctx.statement, ctx.relations.as_ref(), table)?;
+            .scan(&ctx.statement, ctx.relations.as_ref(), schema.id)
+        {
+            Ok(iter) => iter,
+            Err(err)
+                if err.code == SqlState::UndefinedTable
+                    && ctx.relations.missing_tables_are_empty() =>
+            {
+                Box::new(EmptyRowIterator {
+                    schema: output_schema_for_table(&schema),
+                })
+            }
+            Err(err) => return Err(err),
+        };
         Ok(Self {
             iter,
             slots,
@@ -971,6 +1014,20 @@ impl CopyOut {
             }
             None => Ok(None),
         }
+    }
+}
+
+struct EmptyRowIterator {
+    schema: Vec<ColumnInfo>,
+}
+
+impl RowIterator for EmptyRowIterator {
+    fn next(&mut self) -> Result<Option<StoredRow>> {
+        Ok(None)
+    }
+
+    fn schema(&self) -> &[ColumnInfo] {
+        &self.schema
     }
 }
 
@@ -1339,6 +1396,193 @@ fn execute_drop_table(
     })
 }
 
+fn apply_rewrite_storage_ids(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+) -> Result<TruncateCatalogUpdate> {
+    let plan = ctx.catalog.prepare_truncate_table(table)?;
+    ctx.catalog.apply_truncate_table(&plan)
+}
+
+fn execute_alter_table_add_column(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    if_not_exists: bool,
+    column: &ParsedColumnDef,
+) -> Result<ExecutionResult> {
+    let old_schema = require_table(ctx.catalog, table)?;
+    if matches!(
+        ctx.catalog
+            .preflight_add_table_column(old_schema.id, if_not_exists, column)?,
+        TableColumnAlteration::Noop
+    ) {
+        return Ok(alter_table_result());
+    }
+
+    let old_relations = ctx.relations.clone();
+    let added = ctx
+        .catalog
+        .add_table_column(old_schema.id, column.clone())?;
+    let rewrite = apply_rewrite_storage_ids(ctx, added.id)?;
+    let schema = rewrite.table;
+    if old_schema.toast_table_id != schema.toast_table_id
+        && let Some(toast_schema) = rewrite.toast_table.as_ref()
+    {
+        ctx.schema_ops.create_table(&ctx.statement, toast_schema)?;
+    } else if let Some(toast_schema) = rewrite.toast_table.as_ref() {
+        ctx.schema_ops
+            .update_table_schema(&ctx.statement, toast_schema, &[])?;
+    }
+    let indexes = rewrite.indexes;
+    let added_column = schema
+        .columns
+        .last()
+        .ok_or_else(|| DbError::internal("ALTER TABLE ADD COLUMN produced no column"))?;
+    let default_exprs = expression_default_for_column(ctx, added_column)?;
+    ctx.schema_ops
+        .update_table_schema(&ctx.statement, &schema, &indexes)?;
+    let rewrite_relations = ctx.storage.capture_relation_snapshot()?;
+
+    ctx.storage.for_each_visible_row(
+        &ctx.statement,
+        old_relations.as_ref(),
+        old_schema.id,
+        &mut |mut stored| {
+            check_canceled(ctx)?;
+            let row = &mut stored.row;
+            row.values.push(evaluate_column_default(
+                &ctx.statement,
+                added_column,
+                &default_exprs,
+            )?);
+            coerce_numeric_columns(&schema, &mut row.values)?;
+            validate_row_constraints(&schema, &row.values)?;
+            ctx.storage.insert(
+                &ctx.statement,
+                rewrite_relations.as_ref(),
+                schema.id,
+                stored.row,
+            )?;
+            Ok(())
+        },
+    )?;
+
+    Ok(alter_table_result())
+}
+
+fn execute_alter_table_drop_column(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    if_exists: bool,
+    column: &str,
+) -> Result<ExecutionResult> {
+    let old_schema = require_table(ctx.catalog, table)?;
+    if matches!(
+        ctx.catalog
+            .preflight_drop_table_column(old_schema.id, if_exists, column)?,
+        TableColumnAlteration::Noop
+    ) {
+        return Ok(alter_table_result());
+    }
+    let position = old_schema
+        .columns
+        .iter()
+        .position(|existing| existing.name == column)
+        .ok_or_else(|| DbError::internal("preflight accepted a missing dropped column"))?;
+
+    let old_relations = ctx.relations.clone();
+    let dropped = ctx.catalog.drop_table_column(old_schema.id, column)?;
+    let rewrite = apply_rewrite_storage_ids(ctx, dropped.id)?;
+    let schema = rewrite.table;
+    if let Some(toast_schema) = rewrite.toast_table.as_ref() {
+        ctx.schema_ops
+            .update_table_schema(&ctx.statement, toast_schema, &[])?;
+    }
+    let indexes = rewrite.indexes;
+    ctx.schema_ops
+        .update_table_schema(&ctx.statement, &schema, &indexes)?;
+    let rewrite_relations = ctx.storage.capture_relation_snapshot()?;
+
+    ctx.storage.for_each_visible_row(
+        &ctx.statement,
+        old_relations.as_ref(),
+        old_schema.id,
+        &mut |stored| {
+            check_canceled(ctx)?;
+            let mut values = stored.row.values;
+            if position >= values.len() {
+                return Err(DbError::internal(
+                    "stored row is missing the dropped column position",
+                ));
+            }
+            values.remove(position);
+            coerce_numeric_columns(&schema, &mut values)?;
+            validate_row_constraints(&schema, &values)?;
+            ctx.storage.insert(
+                &ctx.statement,
+                rewrite_relations.as_ref(),
+                schema.id,
+                Row { values },
+            )?;
+            Ok(())
+        },
+    )?;
+
+    Ok(alter_table_result())
+}
+
+fn execute_alter_table_rename_column(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    old_name: &str,
+    new_name: &str,
+) -> Result<ExecutionResult> {
+    let old_schema = require_table(ctx.catalog, table)?;
+    let schema = ctx
+        .catalog
+        .rename_table_column(old_schema.id, old_name, new_name.to_string())?;
+    let indexes = ctx.catalog.list_indexes_for_table(schema.id)?;
+    ctx.schema_ops
+        .update_table_schema(&ctx.statement, &schema, &indexes)?;
+    Ok(alter_table_result())
+}
+
+fn execute_alter_table_rename_table(
+    ctx: &ExecutionContext<'_>,
+    table: TableId,
+    new_name: &str,
+) -> Result<ExecutionResult> {
+    let old_schema = require_table(ctx.catalog, table)?;
+    let schema = ctx
+        .catalog
+        .rename_table(old_schema.id, new_name.to_string())?;
+    if schema != old_schema {
+        let indexes = ctx.catalog.list_indexes_for_table(schema.id)?;
+        ctx.schema_ops
+            .update_table_schema(&ctx.statement, &schema, &indexes)?;
+    }
+    Ok(alter_table_result())
+}
+
+fn alter_table_result() -> ExecutionResult {
+    ExecutionResult::Modified {
+        command: "ALTER TABLE".to_string(),
+        count: 0,
+    }
+}
+
+fn expression_default_for_column(
+    ctx: &ExecutionContext<'_>,
+    column: &common::ColumnDef,
+) -> Result<Vec<(ColumnId, BoundExpr)>> {
+    match &column.default {
+        Some(ColumnDefault::Expr(text)) => {
+            Ok(vec![(column.id, bind_default_expr(ctx.catalog, text)?)])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 fn owned_sequences_for_table(
     ctx: &ExecutionContext<'_>,
     table: TableId,
@@ -1451,17 +1695,21 @@ fn execute_drop_sequence(
 }
 
 fn table_output_schema(catalog: &dyn CatalogManager, table: TableId) -> Result<Vec<ColumnInfo>> {
-    Ok(require_table(catalog, table)?
+    Ok(output_schema_for_table(&require_table(catalog, table)?))
+}
+
+fn output_schema_for_table(schema: &TableSchema) -> Vec<ColumnInfo> {
+    schema
         .columns
-        .into_iter()
+        .iter()
         .map(|column| ColumnInfo {
-            name: column.name,
-            data_type: column.data_type,
-            table_id: Some(table),
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            table_id: Some(schema.id),
             column_id: Some(column.id),
             pg_type: None,
         })
-        .collect())
+        .collect()
 }
 
 fn require_table(catalog: &dyn CatalogManager, table: TableId) -> Result<TableSchema> {

@@ -11,6 +11,14 @@ impl RecoveryOperations for PageBackedStorageEngine {
         self.apply_create_table_without_wal(schema)
     }
 
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()> {
+        self.apply_update_table_schema_without_wal(schema)
+    }
+
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()> {
+        self.apply_update_index_schema_without_wal(schema)
+    }
+
     fn apply_drop_table(&self, table: TableId) -> Result<()> {
         self.apply_drop_table_without_wal(table)
     }

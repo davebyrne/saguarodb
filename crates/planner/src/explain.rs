@@ -21,6 +21,40 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             let conditional = if *if_exists { " if_exists=true" } else { "" };
             output.push_str(&format!("{padding}DropTable {name}{conditional}\n"));
         }
+        PhysicalPlan::AlterTableAddColumn {
+            table_name, column, ..
+        } => {
+            output.push_str(&format!(
+                "{padding}AlterTableAddColumn {table_name}.{}\n",
+                column.name
+            ));
+        }
+        PhysicalPlan::AlterTableDropColumn {
+            table_name, column, ..
+        } => {
+            output.push_str(&format!(
+                "{padding}AlterTableDropColumn {table_name}.{column}\n"
+            ));
+        }
+        PhysicalPlan::AlterTableRenameColumn {
+            table_name,
+            old_name,
+            new_name,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{padding}AlterTableRenameColumn {table_name}.{old_name} to {new_name}\n"
+            ));
+        }
+        PhysicalPlan::AlterTableRenameTable {
+            table_name,
+            new_name,
+            ..
+        } => {
+            output.push_str(&format!(
+                "{padding}AlterTableRenameTable {table_name} to {new_name}\n"
+            ));
+        }
         PhysicalPlan::CreateIndex {
             name,
             table,
@@ -40,6 +74,12 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!(
                 "{padding}DropSequence {name} if_exists={if_exists}\n"
             ));
+        }
+        PhysicalPlan::CreateView { name, .. } => {
+            output.push_str(&format!("{padding}CreateView {name}\n"));
+        }
+        PhysicalPlan::DropView { name, if_exists } => {
+            output.push_str(&format!("{padding}DropView {name} if_exists={if_exists}\n"));
         }
         PhysicalPlan::Insert { table, source, .. } => {
             output.push_str(&format!("{padding}Insert table={table}\n"));

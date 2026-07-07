@@ -4,7 +4,7 @@ use protocol::{PostgresCodec, ServerMessage};
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::CopyInChunk;
+use crate::query::{CopyInChunk, CopySnapshots};
 use crate::shutdown::InFlightQueryGuard;
 
 use super::{
@@ -21,6 +21,7 @@ impl Session {
         stream: &mut S,
         codec: &PostgresCodec,
         job: CopyJob,
+        snapshots: CopySnapshots,
         guard: InFlightQueryGuard,
     ) -> Result<()>
     where
@@ -45,7 +46,7 @@ impl Session {
         let cancel = self.begin_cancelable();
         let session = self.query_session_context(cancel);
         let task = tokio::task::spawn_blocking(move || {
-            service.run_copy_in_stream(job, txn, session, receiver)
+            service.run_copy_in_stream(job, txn, session, snapshots, receiver)
         });
         self.copy_in = Some(CopyInSession {
             sender,
@@ -151,6 +152,7 @@ impl Session {
         stream: &mut S,
         codec: &PostgresCodec,
         job: CopyJob,
+        snapshots: CopySnapshots,
         // Held for the COPY's lifetime so it counts as an in-flight query during the
         // streaming scan; dropped when this returns.
         _guard: InFlightQueryGuard,
@@ -175,7 +177,7 @@ impl Session {
         let cancel = self.begin_cancelable();
         let session = self.query_session_context(cancel);
         let task = tokio::task::spawn_blocking(move || {
-            service.run_copy_out_stream(job, txn, session, frame_tx)
+            service.run_copy_out_stream(job, txn, session, snapshots, frame_tx)
         });
 
         let mut write_err = None;

@@ -170,6 +170,12 @@ impl Session {
                 }
                 write_portal_result(stream, codec, result, &result_formats).await
             }
+            Ok(StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. }) => {
+                self.failed = true;
+                self.end_activity();
+                let err = DbError::internal("COPY outcome reached extended-protocol Execute");
+                write_messages(stream, codec, &[error_response(&err)]).await
+            }
             Err(err) => {
                 self.failed = true;
                 self.end_activity();

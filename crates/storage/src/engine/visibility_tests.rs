@@ -324,6 +324,7 @@ fn users_schema() -> TableSchema {
         toast: ToastOptions::legacy_catalog_default(),
         toast_table_id: None,
         relation_kind: RelationKind::User,
+        schema_version: common::INITIAL_SCHEMA_VERSION,
         checks: Vec::new(),
     }
 }
@@ -2074,6 +2075,7 @@ fn hot_schema() -> TableSchema {
         toast: ToastOptions::legacy_catalog_default(),
         toast_table_id: None,
         relation_kind: RelationKind::User,
+        schema_version: common::INITIAL_SCHEMA_VERSION,
         checks: Vec::new(),
     }
 }

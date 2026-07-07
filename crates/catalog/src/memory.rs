@@ -6,10 +6,10 @@ use common::{
     IndexConstraintKind, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
     ParsedDefault, RelationKind, Result, SequenceId, SequenceOptions, SequenceSchema, SqlState,
     TableId, TableSchema, ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    needs_toast_relation, toast_schema,
+    ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
 };
 
-use crate::CatalogManager;
+use crate::{CatalogManager, TableColumnAlteration};
 
 const STORAGE_ID_KIND_BITS: FileId = 0xC000_0000;
 const MAX_STORAGE_ID: FileId = !STORAGE_ID_KIND_BITS;
@@ -20,6 +20,10 @@ pub struct CatalogSnapshot {
     pub tables_by_name: HashMap<String, TableId>,
     pub tables_by_id: HashMap<TableId, TableSchema>,
     pub next_table_id: TableId,
+    #[serde(default)]
+    pub views_by_name: HashMap<String, TableId>,
+    #[serde(default)]
+    pub views_by_id: HashMap<TableId, ViewSchema>,
     // Secondary-index fields default so catalogs written before secondary
     // indexes existed still deserialize (no indexes, ids start after the
     // reserved primary-key id).
@@ -53,6 +57,8 @@ impl Default for CatalogSnapshot {
             tables_by_name: HashMap::new(),
             tables_by_id: HashMap::new(),
             next_table_id: 1,
+            views_by_name: HashMap::new(),
+            views_by_id: HashMap::new(),
             indexes_by_name: HashMap::new(),
             indexes_by_id: HashMap::new(),
             next_index_id: default_next_index_id(),
@@ -152,6 +158,30 @@ impl CatalogManager for MemoryCatalog {
         Ok(tables)
     }
 
+    fn get_view_by_name(&self, name: &str) -> Result<Option<ViewSchema>> {
+        let snapshot = self.read_snapshot()?;
+        Ok(snapshot
+            .views_by_name
+            .get(name)
+            .and_then(|id| snapshot.views_by_id.get(id))
+            .cloned())
+    }
+
+    fn get_view(&self, id: TableId) -> Result<Option<ViewSchema>> {
+        Ok(self.read_snapshot()?.views_by_id.get(&id).cloned())
+    }
+
+    fn list_views(&self) -> Result<Vec<ViewSchema>> {
+        let mut views: Vec<_> = self
+            .read_snapshot()?
+            .views_by_id
+            .values()
+            .cloned()
+            .collect();
+        views.sort_by_key(|view| view.id);
+        Ok(views)
+    }
+
     fn snapshot(&self) -> Result<CatalogSnapshot> {
         Ok(self.read_snapshot()?.clone())
     }
@@ -179,9 +209,9 @@ impl CatalogManager for MemoryCatalog {
         normalize_table_storage_id(&mut schema, &snapshot)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
         if schema.relation_kind == RelationKind::User {
-            reject_duplicate_table_name(&snapshot, &schema.name)?;
+            reject_duplicate_relation_name(&snapshot, &schema.name)?;
         }
-        reject_duplicate_table_id(&snapshot, schema.id)?;
+        reject_duplicate_relation_id(&snapshot, schema.id)?;
         validate_storage_id("table", schema.storage_id)?;
         reject_duplicate_table_storage_id(&snapshot, schema.storage_id, "table storage id")?;
 
@@ -198,6 +228,25 @@ impl CatalogManager for MemoryCatalog {
         reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
         snapshot.tables_by_id.insert(schema.id, schema);
         Ok(())
+    }
+
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
+        replace_table_schema(&mut snapshot, schema)
+    }
+
+    fn apply_update_table_and_index_schemas(
+        &self,
+        schema: TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
+        for index in indexes {
+            reserve_storage_id_value(&mut snapshot.next_storage_id, index.storage_id)?;
+        }
+        replace_table_and_index_schemas(&mut snapshot, schema, indexes)
     }
 
     fn apply_drop_table(&self, id: TableId) -> Result<()> {
@@ -219,6 +268,8 @@ impl CatalogManager for MemoryCatalog {
                 schema.name, base_table
             )));
         }
+
+        reject_dependent_views(&snapshot, id, None)?;
 
         let mut table_ids = vec![id];
         if let RelationKind::User = schema.relation_kind
@@ -268,9 +319,10 @@ impl CatalogManager for MemoryCatalog {
         checks: Vec<String>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_table_name(&snapshot, &name)?;
+        reject_duplicate_relation_name(&snapshot, &name)?;
 
         let table_id = snapshot.next_table_id;
+        reject_duplicate_relation_id(&snapshot, table_id)?;
         let table_storage_id = snapshot.next_storage_id;
         let mut next_storage_id =
             next_storage_id_after(table_storage_id, "catalog storage id overflow")?;
@@ -293,6 +345,7 @@ impl CatalogManager for MemoryCatalog {
         validate_toast_options(&schema)?;
         let hidden_toast = if needs_toast_relation(&schema) {
             let toast_id = next_table_id;
+            reject_duplicate_relation_id(&snapshot, toast_id)?;
             next_table_id = toast_id
                 .checked_add(1)
                 .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
@@ -321,6 +374,166 @@ impl CatalogManager for MemoryCatalog {
 
     fn drop_table(&self, id: TableId) -> Result<()> {
         self.apply_drop_table(id)
+    }
+
+    fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        ensure_user_table(&schema)?;
+        if schema.name == new_name {
+            return Ok(schema);
+        }
+        reject_duplicate_relation_name(&snapshot, &new_name)?;
+        reject_dependent_views(&snapshot, id, None)?;
+        schema.name = new_name;
+        bump_schema_version(&mut schema.schema_version)?;
+        replace_table_schema(&mut snapshot, schema.clone())?;
+        Ok(schema)
+    }
+
+    fn preflight_add_table_column(
+        &self,
+        id: TableId,
+        if_not_exists: bool,
+        column: &ParsedColumnDef,
+    ) -> Result<TableColumnAlteration> {
+        let snapshot = self.read_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        match validate_add_table_column(&snapshot, schema, column, if_not_exists)? {
+            AddColumnValidation::Noop => Ok(TableColumnAlteration::Noop),
+            AddColumnValidation::Rewrite { .. } => Ok(TableColumnAlteration::Rewrite),
+        }
+    }
+
+    fn add_table_column(&self, id: TableId, column: ParsedColumnDef) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        let AddColumnValidation::Rewrite {
+            column,
+            toast_table_id,
+        } = validate_add_table_column(&snapshot, &schema, &column, false)?
+        else {
+            return Err(DbError::internal(
+                "ADD COLUMN unexpectedly validated as a no-op",
+            ));
+        };
+        schema.columns.push(column);
+        bump_schema_version(&mut schema.schema_version)?;
+        let hidden_toast = if let Some(toast_id) = toast_table_id {
+            snapshot.next_table_id = toast_id
+                .checked_add(1)
+                .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
+            let toast_storage_id = allocate_storage_id_from_snapshot(&mut snapshot)?;
+            schema.toast_table_id = Some(toast_id);
+            let mut hidden_toast = toast_schema(&schema, toast_id);
+            hidden_toast.storage_id = toast_storage_id;
+            Some(hidden_toast)
+        } else {
+            None
+        };
+        if let Some(hidden_toast) = hidden_toast {
+            snapshot.tables_by_id.insert(hidden_toast.id, hidden_toast);
+        }
+        replace_table_schema(&mut snapshot, schema.clone())?;
+        Ok(schema)
+    }
+
+    fn preflight_drop_table_column(
+        &self,
+        id: TableId,
+        if_exists: bool,
+        column: &str,
+    ) -> Result<TableColumnAlteration> {
+        let snapshot = self.read_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        match validate_drop_table_column(&snapshot, schema, column, if_exists)? {
+            DropColumnValidation::Noop => Ok(TableColumnAlteration::Noop),
+            DropColumnValidation::Rewrite { .. } => Ok(TableColumnAlteration::Rewrite),
+        }
+    }
+
+    fn drop_table_column(&self, id: TableId, column: &str) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        let DropColumnValidation::Rewrite {
+            position,
+            column_id,
+        } = validate_drop_table_column(&snapshot, &schema, column, false)?
+        else {
+            return Err(DbError::internal(
+                "DROP COLUMN unexpectedly validated as a no-op",
+            ));
+        };
+
+        schema.columns.remove(position);
+        remap_columns_after_drop(&mut schema, column_id);
+        remap_indexes_after_drop(&mut snapshot, id, column_id);
+        bump_schema_version(&mut schema.schema_version)?;
+        replace_table_schema(&mut snapshot, schema.clone())?;
+        Ok(schema)
+    }
+
+    fn rename_table_column(
+        &self,
+        id: TableId,
+        old_name: &str,
+        new_name: String,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {id} does not exist")))?;
+        ensure_user_table(&schema)?;
+        if schema.columns.iter().any(|column| column.name == new_name) {
+            return Err(DbError::plan(
+                SqlState::DuplicateTable,
+                format!("column {new_name} already exists"),
+            ));
+        }
+        let column = schema
+            .columns
+            .iter_mut()
+            .find(|column| column.name == old_name)
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!("column {old_name} does not exist"),
+                )
+            })?;
+        if !schema.checks.is_empty() {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot rename column {old_name} because table {} has CHECK constraints",
+                    schema.name
+                ),
+            ));
+        }
+        reject_view_column_dependency(&snapshot, id, column.id, "rename")?;
+        column.name = new_name;
+        bump_schema_version(&mut schema.schema_version)?;
+        replace_table_schema(&mut snapshot, schema.clone())?;
+        Ok(schema)
     }
 
     fn set_table_compression(
@@ -409,6 +622,7 @@ impl CatalogManager for MemoryCatalog {
 
         set_primary_key_columns(&mut schema, primary_key)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
+        bump_schema_version(&mut schema.schema_version)?;
         snapshot.tables_by_id.insert(table, schema.clone());
         Ok(schema)
     }
@@ -440,6 +654,7 @@ impl CatalogManager for MemoryCatalog {
 
         set_primary_key_columns(&mut schema, primary_key)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
+        bump_schema_version(&mut schema.schema_version)?;
         if index.table != table {
             return Err(DbError::internal(format!(
                 "primary-key index {} references table {}, expected {table}",
@@ -497,6 +712,7 @@ impl CatalogManager for MemoryCatalog {
 
         schema.primary_key.clear();
         validate_schema(&schema, &snapshot.sequences_by_id)?;
+        bump_schema_version(&mut schema.schema_version)?;
         snapshot.indexes_by_id.remove(&index);
         snapshot.indexes_by_name.remove(&index_schema.name);
         snapshot.tables_by_id.insert(table, schema.clone());
@@ -671,6 +887,26 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        let old = snapshot
+            .indexes_by_id
+            .get(&schema.id)
+            .cloned()
+            .ok_or_else(|| undefined_index(format!("index id {} does not exist", schema.id)))?;
+        if old.name != schema.name {
+            reject_duplicate_index_name(&snapshot, &schema.name)?;
+            snapshot.indexes_by_name.remove(&old.name);
+            snapshot
+                .indexes_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
+        validate_index_schema(&schema, &snapshot.tables_by_id)?;
+        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
+        snapshot.indexes_by_id.insert(schema.id, schema);
+        Ok(())
+    }
+
     fn apply_drop_index(&self, id: IndexId) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
         let schema = snapshot
@@ -835,6 +1071,101 @@ impl CatalogManager for MemoryCatalog {
             .ok_or_else(|| undefined_sequence_id(id))?;
         snapshot.sequences_by_name.remove(&schema.name);
         Ok(())
+    }
+
+    fn apply_create_view(&self, schema: ViewSchema) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        validate_view_schema(&schema, &snapshot)?;
+        reject_duplicate_relation_name(&snapshot, &schema.name)?;
+        reject_duplicate_relation_id(&snapshot, schema.id)?;
+        let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
+            DbError::internal("catalog view id overflow while applying create view")
+        })?;
+        snapshot
+            .views_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.next_table_id = snapshot.next_table_id.max(next_after_schema);
+        snapshot.views_by_id.insert(schema.id, schema);
+        Ok(())
+    }
+
+    fn apply_replace_view(&self, schema: ViewSchema) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        validate_view_schema(&schema, &snapshot)?;
+        let old = snapshot
+            .views_by_id
+            .get(&schema.id)
+            .cloned()
+            .ok_or_else(|| undefined_view(format!("view id {} does not exist", schema.id)))?;
+        if old.name != schema.name {
+            reject_duplicate_relation_name(&snapshot, &schema.name)?;
+            snapshot.views_by_name.remove(&old.name);
+            snapshot
+                .views_by_name
+                .insert(schema.name.clone(), schema.id);
+        }
+        snapshot.views_by_id.insert(schema.id, schema);
+        Ok(())
+    }
+
+    fn apply_drop_view(&self, id: TableId) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        reject_dependent_views(&snapshot, id, Some(id))?;
+        let schema = snapshot
+            .views_by_id
+            .remove(&id)
+            .ok_or_else(|| undefined_view(format!("view id {id} does not exist")))?;
+        snapshot.views_by_name.remove(&schema.name);
+        Ok(())
+    }
+
+    fn create_view(
+        &self,
+        name: String,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        reject_duplicate_relation_name(&snapshot, &name)?;
+        let id = snapshot.next_table_id;
+        reject_duplicate_relation_id(&snapshot, id)?;
+        let next_table_id = id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog view id overflow"))?;
+        let schema = build_view_schema(id, name, columns, definition, dependencies)?;
+        validate_live_view_schema(&schema, &snapshot)?;
+        snapshot
+            .views_by_name
+            .insert(schema.name.clone(), schema.id);
+        snapshot.views_by_id.insert(schema.id, schema.clone());
+        snapshot.next_table_id = next_table_id;
+        Ok(schema)
+    }
+
+    fn replace_view(
+        &self,
+        id: TableId,
+        columns: Vec<ViewColumn>,
+        definition: String,
+        dependencies: Vec<ViewDependency>,
+    ) -> Result<ViewSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let old = snapshot
+            .views_by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| undefined_view(format!("view id {id} does not exist")))?;
+        let mut schema = build_view_schema(id, old.name, columns, definition, dependencies)?;
+        schema.schema_version = old.schema_version;
+        bump_schema_version(&mut schema.schema_version)?;
+        validate_live_view_schema(&schema, &snapshot)?;
+        snapshot.views_by_id.insert(schema.id, schema.clone());
+        Ok(schema)
+    }
+
+    fn drop_view(&self, id: TableId) -> Result<()> {
+        self.apply_drop_view(id)
     }
 }
 
@@ -1378,6 +1709,7 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         name,
         columns: assigned_columns,
         primary_key: primary_key_ids,
+        schema_version: common::INITIAL_SCHEMA_VERSION,
         compression,
         active_dict_id: None,
         toast,
@@ -1403,6 +1735,181 @@ fn convert_column_default(
         Some(ParsedDefault::Expr(text)) => Ok(Some(ColumnDefault::Expr(text))),
         None => Ok(None),
     }
+}
+
+enum AddColumnValidation {
+    Noop,
+    Rewrite {
+        column: ColumnDef,
+        toast_table_id: Option<TableId>,
+    },
+}
+
+fn validate_add_table_column(
+    snapshot: &CatalogSnapshot,
+    schema: &TableSchema,
+    column: &ParsedColumnDef,
+    if_not_exists: bool,
+) -> Result<AddColumnValidation> {
+    ensure_user_table(schema)?;
+    if schema
+        .columns
+        .iter()
+        .any(|existing| existing.name == column.name)
+    {
+        if if_not_exists {
+            return Ok(AddColumnValidation::Noop);
+        }
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("column {} already exists", column.name),
+        ));
+    }
+
+    reject_relation_wide_view_dependency(snapshot, schema.id, "add column")?;
+    let column_id: ColumnId = schema
+        .columns
+        .len()
+        .try_into()
+        .map_err(|_| DbError::internal("catalog column id overflow"))?;
+    let default = convert_column_default(snapshot, column.default.clone())?;
+    if matches!(default, Some(ColumnDefault::Nextval(_))) && column.data_type != DataType::Integer {
+        return Err(DbError::plan(
+            SqlState::DatatypeMismatch,
+            format!(
+                "DEFAULT nextval for column {} requires INTEGER, got {:?}",
+                column.name, column.data_type
+            ),
+        ));
+    }
+
+    let column = ColumnDef {
+        id: column_id,
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+        max_length: column.max_length,
+        default,
+        pg_type: column.pg_type.clone(),
+    };
+    let mut schema_after = schema.clone();
+    schema_after.columns.push(column.clone());
+    let new_column_is_toastable = matches!(&column.data_type, DataType::Text | DataType::Bytea);
+    let toast_table_id = if new_column_is_toastable
+        && schema.toast_table_id.is_none()
+        && needs_toast_relation(&schema_after)
+    {
+        let toast_id = snapshot.next_table_id;
+        reject_duplicate_relation_id(snapshot, toast_id)?;
+        toast_id
+            .checked_add(1)
+            .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
+        Some(toast_id)
+    } else {
+        None
+    };
+    Ok(AddColumnValidation::Rewrite {
+        column,
+        toast_table_id,
+    })
+}
+
+enum DropColumnValidation {
+    Noop,
+    Rewrite {
+        position: usize,
+        column_id: ColumnId,
+    },
+}
+
+fn validate_drop_table_column(
+    snapshot: &CatalogSnapshot,
+    schema: &TableSchema,
+    column: &str,
+    if_exists: bool,
+) -> Result<DropColumnValidation> {
+    ensure_user_table(schema)?;
+    let Some(position) = schema
+        .columns
+        .iter()
+        .position(|existing| existing.name == column)
+    else {
+        if if_exists {
+            return Ok(DropColumnValidation::Noop);
+        }
+        return Err(DbError::plan(
+            SqlState::UndefinedColumn,
+            format!("column {column} does not exist"),
+        ));
+    };
+    let column_id = schema.columns[position].id;
+    if schema.primary_key.contains(&column_id) {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!("cannot drop primary key column {column}"),
+        ));
+    }
+    if !schema.checks.is_empty() {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot drop column {column} because table {} has CHECK constraints",
+                schema.name
+            ),
+        ));
+    }
+    reject_index_dependency(snapshot, schema.id, column_id, "drop")?;
+    reject_view_column_dependency(snapshot, schema.id, column_id, "drop")?;
+    reject_owned_sequence_default_drop(snapshot, &schema.columns[position])?;
+    Ok(DropColumnValidation::Rewrite {
+        position,
+        column_id,
+    })
+}
+
+fn build_view_schema(
+    id: TableId,
+    name: String,
+    columns: Vec<ViewColumn>,
+    definition: String,
+    dependencies: Vec<ViewDependency>,
+) -> Result<ViewSchema> {
+    let mut assigned_columns = Vec::with_capacity(columns.len());
+    let mut seen_names = HashSet::new();
+    for (index, column) in columns.into_iter().enumerate() {
+        if !seen_names.insert(column.name.clone()) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!("duplicate view column {}", column.name),
+            ));
+        }
+        let column_id: ColumnId = index
+            .try_into()
+            .map_err(|_| DbError::internal("catalog view column id overflow"))?;
+        assigned_columns.push(ColumnDef {
+            id: column_id,
+            name: column.name,
+            data_type: column.data_type,
+            nullable: column.nullable,
+            max_length: None,
+            default: None,
+            pg_type: column.pg_type,
+        });
+    }
+    if assigned_columns.is_empty() {
+        return Err(DbError::plan(
+            SqlState::SyntaxError,
+            "view requires at least one output column",
+        ));
+    }
+    Ok(ViewSchema {
+        id,
+        name,
+        columns: assigned_columns,
+        definition,
+        dependencies,
+        schema_version: common::INITIAL_SCHEMA_VERSION,
+    })
 }
 
 fn resolve_sequence_default(
@@ -1553,7 +2060,7 @@ pub fn validate_create_table_definition(
 }
 
 fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
-    let mut max_table_id = 0;
+    let mut max_relation_id = 0;
     validate_sequences(snapshot)?;
 
     for (name, id) in &snapshot.tables_by_name {
@@ -1570,6 +2077,23 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
         if &schema.name != name || schema.id != *id {
             return Err(DbError::internal(format!(
                 "catalog snapshot name/id mismatch for table {name}",
+            )));
+        }
+    }
+    for (name, id) in &snapshot.views_by_name {
+        let schema = snapshot.views_by_id.get(id).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog snapshot view name index {name} points to missing view id {id}",
+            ))
+        })?;
+        if &schema.name != name || schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot name/id mismatch for view {name}",
+            )));
+        }
+        if snapshot.tables_by_name.contains_key(name) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot relation name {name} is used by both a table and a view",
             )));
         }
     }
@@ -1600,10 +2124,32 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
             }
         }
         validate_schema(schema, &snapshot.sequences_by_id)?;
-        max_table_id = max_table_id.max(*id);
+        max_relation_id = max_relation_id.max(*id);
     }
 
-    let required_next = max_table_id
+    for (id, schema) in &snapshot.views_by_id {
+        if schema.id != *id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view id key {id} does not match schema id {}",
+                schema.id
+            )));
+        }
+        if snapshot.views_by_name.get(&schema.name) != Some(id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} is missing from name index",
+                schema.name
+            )));
+        }
+        if snapshot.tables_by_id.contains_key(id) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot relation id {id} is used by both a table and a view",
+            )));
+        }
+        validate_view_schema(schema, snapshot)?;
+        max_relation_id = max_relation_id.max(*id);
+    }
+
+    let required_next = max_relation_id
         .checked_add(1)
         .ok_or_else(|| DbError::internal("catalog snapshot table id overflow"))?;
     if snapshot.next_table_id < required_next {
@@ -1972,6 +2518,12 @@ fn validate_schema(
     schema: &TableSchema,
     sequences_by_id: &HashMap<SequenceId, SequenceSchema>,
 ) -> Result<()> {
+    if schema.schema_version == 0 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} has schema_version 0",
+            schema.name
+        )));
+    }
     validate_toast_options(schema)?;
 
     let mut column_ids = HashSet::new();
@@ -2054,6 +2606,215 @@ fn set_primary_key_columns(schema: &mut TableSchema, primary_key: Vec<ColumnId>)
     Ok(())
 }
 
+fn validate_view_schema(schema: &ViewSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    if schema.schema_version == 0 {
+        return Err(DbError::internal(format!(
+            "catalog snapshot view {} has schema_version 0",
+            schema.name
+        )));
+    }
+    if schema.definition.trim().is_empty() {
+        return Err(DbError::internal(format!(
+            "catalog snapshot view {} has an empty definition",
+            schema.name
+        )));
+    }
+    validate_view_columns(schema)?;
+    validate_view_dependencies(schema, snapshot)
+}
+
+fn validate_live_view_schema(schema: &ViewSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    if schema.definition.trim().is_empty() {
+        return Err(DbError::plan(
+            SqlState::SyntaxError,
+            format!("view {} requires a non-empty definition", schema.name),
+        ));
+    }
+    validate_view_columns(schema)?;
+    validate_live_view_dependencies(schema, snapshot)
+}
+
+fn validate_view_columns(schema: &ViewSchema) -> Result<()> {
+    if schema.columns.is_empty() {
+        return Err(DbError::internal(format!(
+            "catalog snapshot view {} must have at least one column",
+            schema.name
+        )));
+    }
+    let mut seen_names = HashSet::new();
+    for (expected_id, column) in schema.columns.iter().enumerate() {
+        let expected_id: ColumnId = expected_id
+            .try_into()
+            .map_err(|_| DbError::internal("catalog snapshot view column id overflow"))?;
+        if column.id != expected_id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} has column id {} at position {}, expected {}",
+                schema.name,
+                column.id,
+                usize::from(expected_id),
+                expected_id
+            )));
+        }
+        if !seen_names.insert(column.name.clone()) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} has duplicate column {}",
+                schema.name, column.name
+            )));
+        }
+        if column.default.is_some() {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} column {} has a column default",
+                schema.name, column.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_live_view_dependencies(schema: &ViewSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut seen = HashSet::new();
+    for dependency in &schema.dependencies {
+        if dependency.relation == schema.id {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                format!("view {} cannot depend on itself", schema.name),
+            ));
+        }
+        if dependency.all_columns && !dependency.columns.is_empty() {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!(
+                    "view {} dependency on relation {} cannot be both column-specific and all-column",
+                    schema.name, dependency.relation
+                ),
+            ));
+        }
+        if !seen.insert((
+            dependency.relation,
+            dependency.columns.clone(),
+            dependency.all_columns,
+        )) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!(
+                    "view {} has duplicate dependency on relation {}",
+                    schema.name, dependency.relation
+                ),
+            ));
+        }
+        if snapshot.views_by_id.contains_key(&dependency.relation) {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "view {} cannot depend on view relation {} yet",
+                    schema.name, dependency.relation
+                ),
+            ));
+        }
+        let table = snapshot
+            .tables_by_id
+            .get(&dependency.relation)
+            .ok_or_else(|| {
+                undefined_table(format!("relation {} does not exist", dependency.relation))
+            })?;
+        if table.relation_kind != RelationKind::User {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "view {} cannot depend on hidden relation {}",
+                    schema.name, dependency.relation
+                ),
+            ));
+        }
+        let mut seen_columns = HashSet::new();
+        for column_id in &dependency.columns {
+            if !table.columns.iter().any(|column| column.id == *column_id) {
+                return Err(DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!(
+                        "view {} references missing column {} on relation {}",
+                        schema.name, column_id, dependency.relation
+                    ),
+                ));
+            }
+            if !seen_columns.insert(*column_id) {
+                return Err(DbError::plan(
+                    SqlState::SyntaxError,
+                    format!(
+                        "view {} has duplicate dependency column {} on relation {}",
+                        schema.name, column_id, dependency.relation
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_view_dependencies(schema: &ViewSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut seen = HashSet::new();
+    for dependency in &schema.dependencies {
+        if dependency.relation == schema.id {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} depends on itself",
+                schema.name
+            )));
+        }
+        if dependency.all_columns && !dependency.columns.is_empty() {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} dependency on relation {} is both column-specific and all-column",
+                schema.name, dependency.relation
+            )));
+        }
+        if !seen.insert((
+            dependency.relation,
+            dependency.columns.clone(),
+            dependency.all_columns,
+        )) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} has duplicate dependency on relation {}",
+                schema.name, dependency.relation
+            )));
+        }
+        if snapshot.views_by_id.contains_key(&dependency.relation) {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} references view relation {}",
+                schema.name, dependency.relation
+            )));
+        }
+        if let Some(table) = snapshot.tables_by_id.get(&dependency.relation)
+            && table.relation_kind != RelationKind::User
+        {
+            return Err(DbError::internal(format!(
+                "catalog snapshot view {} references hidden relation {}",
+                schema.name, dependency.relation
+            )));
+        }
+        let columns = relation_columns(snapshot, dependency.relation).ok_or_else(|| {
+            DbError::internal(format!(
+                "catalog snapshot view {} references missing relation {}",
+                schema.name, dependency.relation
+            ))
+        })?;
+        let mut seen_columns = HashSet::new();
+        for column_id in &dependency.columns {
+            if !columns.iter().any(|column| column.id == *column_id) {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot view {} references missing column {} on relation {}",
+                    schema.name, column_id, dependency.relation
+                )));
+            }
+            if !seen_columns.insert(*column_id) {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot view {} has duplicate dependency column {} on relation {}",
+                    schema.name, column_id, dependency.relation
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_toast_options(schema: &TableSchema) -> Result<()> {
     if !(ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET)
         .contains(&schema.toast.tuple_target)
@@ -2099,21 +2860,359 @@ fn validate_column_default(
     }
 }
 
-fn reject_duplicate_table_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
-    if snapshot.tables_by_name.contains_key(name) {
+fn relation_columns(snapshot: &CatalogSnapshot, relation: TableId) -> Option<&[ColumnDef]> {
+    snapshot
+        .tables_by_id
+        .get(&relation)
+        .map(|schema| schema.columns.as_slice())
+        .or_else(|| {
+            snapshot
+                .views_by_id
+                .get(&relation)
+                .map(|schema| schema.columns.as_slice())
+        })
+}
+
+fn ensure_user_table(schema: &TableSchema) -> Result<()> {
+    if schema.relation_kind != RelationKind::User {
         return Err(DbError::plan(
-            SqlState::DuplicateTable,
-            format!("table {name} already exists"),
+            SqlState::UndefinedTable,
+            format!("table id {} is not a user table", schema.id),
         ));
     }
     Ok(())
 }
 
-fn reject_duplicate_table_id(snapshot: &CatalogSnapshot, id: TableId) -> Result<()> {
-    if snapshot.tables_by_id.contains_key(&id) {
+fn replace_table_schema(snapshot: &mut CatalogSnapshot, schema: TableSchema) -> Result<()> {
+    replace_table_and_index_schemas(snapshot, schema, &[])
+}
+
+fn replace_table_and_index_schemas(
+    snapshot: &mut CatalogSnapshot,
+    schema: TableSchema,
+    indexes: &[IndexSchema],
+) -> Result<()> {
+    let old = snapshot
+        .tables_by_id
+        .get(&schema.id)
+        .cloned()
+        .ok_or_else(|| undefined_table(format!("table id {} does not exist", schema.id)))?;
+    if old.relation_kind != schema.relation_kind {
+        return Err(DbError::internal(format!(
+            "cannot change relation kind for table id {}",
+            schema.id
+        )));
+    }
+    validate_schema(&schema, &snapshot.sequences_by_id)?;
+
+    let mut candidate = snapshot.clone();
+    carry_view_dependencies_for_table_update(&old, &schema, &mut candidate.views_by_id)?;
+    if old.relation_kind == RelationKind::User {
+        if old.name != schema.name {
+            reject_duplicate_relation_name(snapshot, &schema.name)?;
+            candidate.tables_by_name.remove(&old.name);
+            candidate
+                .tables_by_name
+                .insert(schema.name.clone(), schema.id);
+        } else if candidate.tables_by_name.get(&schema.name) != Some(&schema.id) {
+            return Err(DbError::internal(format!(
+                "catalog table {} is missing from name index",
+                schema.name
+            )));
+        }
+    }
+    candidate.tables_by_id.insert(schema.id, schema);
+    for index in indexes {
+        let old_index = snapshot
+            .indexes_by_id
+            .get(&index.id)
+            .cloned()
+            .ok_or_else(|| undefined_index(format!("index id {} does not exist", index.id)))?;
+        if index.table != old.id {
+            return Err(DbError::internal(format!(
+                "catalog index {} references table {}, expected {}",
+                index.name, index.table, old.id
+            )));
+        }
+        if old_index.name != index.name {
+            if candidate
+                .indexes_by_name
+                .get(&index.name)
+                .is_some_and(|existing| *existing != index.id)
+            {
+                return Err(DbError::plan(
+                    SqlState::DuplicateTable,
+                    format!("index {} already exists", index.name),
+                ));
+            }
+            candidate.indexes_by_name.remove(&old_index.name);
+            candidate
+                .indexes_by_name
+                .insert(index.name.clone(), index.id);
+        } else if candidate.indexes_by_name.get(&index.name) != Some(&index.id) {
+            return Err(DbError::internal(format!(
+                "catalog index {} is missing from name index",
+                index.name
+            )));
+        }
+        candidate.indexes_by_id.insert(index.id, index.clone());
+    }
+    validate_snapshot(&candidate)?;
+    *snapshot = candidate;
+    Ok(())
+}
+
+fn carry_view_dependencies_for_table_update(
+    old: &TableSchema,
+    new: &TableSchema,
+    views: &mut HashMap<TableId, ViewSchema>,
+) -> Result<()> {
+    let columns_changed =
+        !table_columns_equivalent_for_view_dependencies(&old.columns, &new.columns);
+    for view in views.values_mut() {
+        for dependency in &mut view.dependencies {
+            if dependency.relation != old.id {
+                continue;
+            }
+            if old.name != new.name {
+                return Err(DbError::internal(format!(
+                    "cannot apply table rename for {} because view {} depends on it",
+                    old.name, view.name
+                )));
+            }
+            if dependency.all_columns {
+                if columns_changed {
+                    return Err(DbError::internal(format!(
+                        "cannot apply table schema update for {} because view {} depends on all columns",
+                        old.name, view.name
+                    )));
+                }
+                continue;
+            }
+
+            let mut remapped = Vec::with_capacity(dependency.columns.len());
+            let mut seen = HashSet::new();
+            for old_column_id in &dependency.columns {
+                let old_column = old
+                    .columns
+                    .iter()
+                    .find(|column| column.id == *old_column_id)
+                    .ok_or_else(|| {
+                        DbError::internal(format!(
+                            "view {} dependency references missing column {} on old table {}",
+                            view.name, old_column_id, old.name
+                        ))
+                    })?;
+                let new_column = new
+                    .columns
+                    .iter()
+                    .find(|column| column.name == old_column.name)
+                    .ok_or_else(|| {
+                        DbError::internal(format!(
+                            "cannot apply table schema update for {} because view {} depends on removed or renamed column {}",
+                            old.name, view.name, old_column.name
+                        ))
+                    })?;
+                if !view_dependency_column_compatible(old_column, new_column) {
+                    return Err(DbError::internal(format!(
+                        "cannot apply table schema update for {} because view {} depends on changed column {}",
+                        old.name, view.name, old_column.name
+                    )));
+                }
+                if !seen.insert(new_column.id) {
+                    return Err(DbError::internal(format!(
+                        "table schema update for {} maps duplicate view dependency column {} in view {}",
+                        old.name, new_column.id, view.name
+                    )));
+                }
+                remapped.push(new_column.id);
+            }
+            dependency.columns = remapped;
+        }
+    }
+    Ok(())
+}
+
+fn table_columns_equivalent_for_view_dependencies(left: &[ColumnDef], right: &[ColumnDef]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right.iter()).all(|(left, right)| {
+            left.id == right.id && view_dependency_column_compatible(left, right)
+        })
+}
+
+fn view_dependency_column_compatible(left: &ColumnDef, right: &ColumnDef) -> bool {
+    left.name == right.name
+        && left.data_type == right.data_type
+        && left.max_length == right.max_length
+        && left.pg_type == right.pg_type
+}
+
+fn bump_schema_version(version: &mut u64) -> Result<()> {
+    *version = version
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("catalog schema version overflow"))?;
+    Ok(())
+}
+
+fn reject_dependent_views(
+    snapshot: &CatalogSnapshot,
+    relation: TableId,
+    excluding_view: Option<TableId>,
+) -> Result<()> {
+    for view in snapshot.views_by_id.values() {
+        if Some(view.id) == excluding_view {
+            continue;
+        }
+        if view
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.relation == relation)
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop relation {relation} because view {} depends on it",
+                    view.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_relation_wide_view_dependency(
+    snapshot: &CatalogSnapshot,
+    relation: TableId,
+    action: &str,
+) -> Result<()> {
+    for view in snapshot.views_by_id.values() {
+        if view
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.relation == relation && dependency.all_columns)
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot {action} on relation {relation} because view {} depends on all columns",
+                    view.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_view_column_dependency(
+    snapshot: &CatalogSnapshot,
+    relation: TableId,
+    column: ColumnId,
+    action: &str,
+) -> Result<()> {
+    for view in snapshot.views_by_id.values() {
+        for dependency in &view.dependencies {
+            if dependency.relation == relation
+                && (dependency.all_columns || dependency.columns.contains(&column))
+            {
+                return Err(DbError::plan(
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot {action} column {column} because view {} depends on it",
+                        view.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_owned_sequence_default_drop(
+    snapshot: &CatalogSnapshot,
+    column: &ColumnDef,
+) -> Result<()> {
+    let Some(ColumnDefault::Nextval(sequence_id)) = column.default.as_ref() else {
+        return Ok(());
+    };
+    let sequence = snapshot.sequences_by_id.get(sequence_id).ok_or_else(|| {
+        DbError::internal(format!(
+            "column {} references missing sequence {sequence_id}",
+            column.name
+        ))
+    })?;
+    if sequence.owned {
+        return Err(DbError::plan(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot drop column {} because it owns sequence {}",
+                column.name, sequence.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_index_dependency(
+    snapshot: &CatalogSnapshot,
+    table: TableId,
+    column: ColumnId,
+    action: &str,
+) -> Result<()> {
+    for index in snapshot.indexes_by_id.values() {
+        if index.table == table && index.columns.contains(&column) {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot {action} column {column} because index {} depends on it",
+                    index.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remap_columns_after_drop(schema: &mut TableSchema, dropped: ColumnId) {
+    for column in &mut schema.columns {
+        if column.id > dropped {
+            column.id -= 1;
+        }
+    }
+    for column_id in &mut schema.primary_key {
+        if *column_id > dropped {
+            *column_id -= 1;
+        }
+    }
+}
+
+fn remap_indexes_after_drop(snapshot: &mut CatalogSnapshot, table: TableId, dropped: ColumnId) {
+    for index in snapshot.indexes_by_id.values_mut() {
+        if index.table != table {
+            continue;
+        }
+        for column_id in &mut index.columns {
+            if *column_id > dropped {
+                *column_id -= 1;
+            }
+        }
+    }
+}
+
+fn reject_duplicate_relation_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
+    if snapshot.tables_by_name.contains_key(name) || snapshot.views_by_name.contains_key(name) {
         return Err(DbError::plan(
             SqlState::DuplicateTable,
-            format!("table id {id} already exists"),
+            format!("relation {name} already exists"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_relation_id(snapshot: &CatalogSnapshot, id: TableId) -> Result<()> {
+    if snapshot.tables_by_id.contains_key(&id) || snapshot.views_by_id.contains_key(&id) {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("relation id {id} already exists"),
         ));
     }
     Ok(())
@@ -2140,6 +3239,10 @@ fn reject_duplicate_sequence_id(snapshot: &CatalogSnapshot, id: SequenceId) -> R
 }
 
 fn undefined_table(message: String) -> DbError {
+    DbError::plan(SqlState::UndefinedTable, message)
+}
+
+fn undefined_view(message: String) -> DbError {
     DbError::plan(SqlState::UndefinedTable, message)
 }
 

@@ -5,7 +5,7 @@ use common::{
     BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault,
     RelationKind, Result, SqlState, TableId, TableSchema, Value,
 };
-use parser::Statement;
+use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statement};
 
 use crate::{BoundExpr, BoundQuery, BoundStatement};
 
@@ -175,6 +175,60 @@ fn bind_inner(
                 table,
             })
         }
+        Statement::AlterTableAddColumn {
+            table,
+            if_not_exists,
+            column,
+        } => {
+            validate_default_value(catalog, column)?;
+            if matches!(column.default, Some(ParsedDefault::Serial)) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "ALTER TABLE ADD COLUMN does not support SERIAL columns yet",
+                ));
+            }
+            let table_schema = require_table(catalog, table)?;
+            Ok(BoundStatement::AlterTableAddColumn {
+                table: table_schema.id,
+                table_name: table.clone(),
+                if_not_exists: *if_not_exists,
+                column: column.clone(),
+            })
+        }
+        Statement::AlterTableDropColumn {
+            table,
+            if_exists,
+            column,
+        } => {
+            let table_schema = require_table(catalog, table)?;
+            Ok(BoundStatement::AlterTableDropColumn {
+                table: table_schema.id,
+                table_name: table.clone(),
+                if_exists: *if_exists,
+                column: column.clone(),
+            })
+        }
+        Statement::AlterTableRenameColumn {
+            table,
+            old_name,
+            new_name,
+        } => {
+            let table_schema = require_table(catalog, table)?;
+            Ok(BoundStatement::AlterTableRenameColumn {
+                table: table_schema.id,
+                table_name: table.clone(),
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            })
+        }
+        Statement::AlterTableRenameTable { table, new_name } => {
+            let table_schema = require_table(catalog, table)?;
+            Ok(BoundStatement::AlterTableRenameTable {
+                table: table_schema.id,
+                table_name: table.clone(),
+                new_name: new_name.clone(),
+            })
+        }
         Statement::CreateIndex {
             name,
             table,
@@ -195,6 +249,33 @@ fn bind_inner(
             options: options.clone(),
         }),
         Statement::DropSequence { name, if_exists } => Ok(BoundStatement::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        Statement::CreateView {
+            name,
+            or_replace,
+            columns,
+            query,
+            definition,
+        } => {
+            if query_has_placeholder(query) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "CREATE VIEW does not support query parameters",
+                ));
+            }
+            let query = bind_query(catalog, query, declared, &CteScope::default(), None)?;
+            validate_create_view_columns(columns, &query)?;
+            Ok(BoundStatement::CreateView {
+                name: name.clone(),
+                or_replace: *or_replace,
+                columns: columns.clone(),
+                query,
+                definition: definition.clone(),
+            })
+        }
+        Statement::DropView { name, if_exists } => Ok(BoundStatement::DropView {
             name: name.clone(),
             if_exists: *if_exists,
         }),
@@ -264,16 +345,12 @@ fn bind_inner(
         // VACUUM/TRUNCATE are maintenance commands dispatched before binding (they
         // are not relational and never bind/plan). These defensive arms keep the
         // public `bind` API total if called directly.
-        Statement::Vacuum { .. } => Err(plan_error(
+        Statement::Vacuum { .. } | Statement::Truncate { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
-            "VACUUM is a maintenance command and does not bind",
+            "maintenance commands do not bind",
         )),
-        Statement::Truncate { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "TRUNCATE is a maintenance command and does not bind",
-        )),
-        // ALTER TABLE maintenance commands are dispatched before binding (the
-        // VACUUM pattern); this arm keeps `bind` total.
+        // ALTER TABLE maintenance commands are dispatched before binding; this
+        // arm keeps `bind` total while schema-evolution ALTER TABLE binds above.
         Statement::AlterTableSetCompression { .. }
         | Statement::AlterTableSetOptions { .. }
         | Statement::AlterTableAddPrimaryKey { .. }
@@ -535,7 +612,7 @@ fn default_expr_type_matches(column_type: &DataType, expr_type: &DataType) -> bo
 /// column scope, so it cannot reference table columns (a column reference fails as
 /// an unresolved column). Forms not valid in a constraint context — aggregates,
 /// subqueries, and query parameters — are rejected.
-pub(super) fn bind_default_expr(catalog: &dyn CatalogManager, text: &str) -> Result<BoundExpr> {
+pub fn bind_default_expr(catalog: &dyn CatalogManager, text: &str) -> Result<BoundExpr> {
     let parsed = parser::parse_expression(text)?;
     let mut ctx = BindContext::new(catalog, &[]);
     let bound = expr::bind_expr(&mut ctx, &parsed, None)?;
@@ -574,6 +651,72 @@ fn reject_non_constraint_safe(expr: &BoundExpr) -> Result<()> {
     crate::params::for_each_child(expr, &mut |child| reject_non_constraint_safe(child))
 }
 
+fn reject_qualified_check_column_refs(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::ColumnRef { table: Some(_), .. } => {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "table-qualified column references are not allowed in CHECK constraints",
+            ));
+        }
+        Expr::ColumnRef { table: None, .. }
+        | Expr::Literal(_)
+        | Expr::Placeholder(_)
+        | Expr::Subquery(_)
+        | Expr::Exists { .. } => {}
+        Expr::InSubquery { expr, .. }
+        | Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => reject_qualified_check_column_refs(expr)?,
+        Expr::BinaryOp { left, right, .. } => {
+            reject_qualified_check_column_refs(left)?;
+            reject_qualified_check_column_refs(right)?;
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                if let FunctionArg::Expr(arg) = arg {
+                    reject_qualified_check_column_refs(arg)?;
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            reject_qualified_check_column_refs(expr)?;
+            for item in list {
+                reject_qualified_check_column_refs(item)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            reject_qualified_check_column_refs(expr)?;
+            reject_qualified_check_column_refs(low)?;
+            reject_qualified_check_column_refs(high)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            reject_qualified_check_column_refs(expr)?;
+            reject_qualified_check_column_refs(pattern)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                reject_qualified_check_column_refs(operand)?;
+            }
+            for (when, then) in when_clauses {
+                reject_qualified_check_column_refs(when)?;
+                reject_qualified_check_column_refs(then)?;
+            }
+            if let Some(else_clause) = else_clause {
+                reject_qualified_check_column_refs(else_clause)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bind a `CHECK` constraint's canonical text against a table's columns registered
 /// as a single binding at slot 0 — the same full-row layout the executor validates,
 /// so each `InputRef`'s slot equals its column position. The result must be boolean;
@@ -587,6 +730,7 @@ fn bind_check_expr(
     text: &str,
 ) -> Result<BoundExpr> {
     let parsed = parser::parse_expression(text)?;
+    reject_qualified_check_column_refs(&parsed)?;
     let mut ctx = BindContext::new(catalog, &[]);
     ctx.bindings.push(Binding {
         id: 0,
@@ -647,4 +791,141 @@ fn parsed_columns_as_column_defs(columns: &[ParsedColumnDef]) -> Vec<ColumnDef> 
 
 fn plan_error(code: SqlState, message: impl Into<String>) -> DbError {
     DbError::plan(code, message)
+}
+
+fn validate_create_view_columns(columns: &[String], query: &BoundQuery) -> Result<()> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let output_len = query.output_schema().len();
+    if columns.len() != output_len {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!(
+                "CREATE VIEW specifies {} column names but query returns {} columns",
+                columns.len(),
+                output_len
+            ),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(plan_error(
+                SqlState::SyntaxError,
+                format!("duplicate view column {column}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn query_has_placeholder(query: &Query) -> bool {
+    query
+        .with
+        .iter()
+        .any(|cte| query_has_placeholder(&cte.query))
+        || query_body_has_placeholder(&query.body)
+        || query
+            .order_by
+            .iter()
+            .any(|order_by| expr_has_placeholder(&order_by.expr))
+}
+
+fn query_body_has_placeholder(body: &QueryBody) -> bool {
+    match body {
+        QueryBody::Select(select) => {
+            select.columns.iter().any(select_item_has_placeholder)
+                || select.from.iter().any(from_item_has_placeholder)
+                || select.filter.as_ref().is_some_and(expr_has_placeholder)
+                || select.group_by.iter().any(expr_has_placeholder)
+                || select.having.as_ref().is_some_and(expr_has_placeholder)
+                || select
+                    .distinct
+                    .as_ref()
+                    .is_some_and(|distinct| match distinct {
+                        parser::Distinct::All => false,
+                        parser::Distinct::On(exprs) => exprs.iter().any(expr_has_placeholder),
+                    })
+        }
+        QueryBody::Values(rows) => rows.iter().flatten().any(expr_has_placeholder),
+        QueryBody::SetOp { left, right, .. } => {
+            query_has_placeholder(left) || query_has_placeholder(right)
+        }
+    }
+}
+
+fn select_item_has_placeholder(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        SelectItem::Expression { expr, .. } => expr_has_placeholder(expr),
+    }
+}
+
+fn from_item_has_placeholder(item: &FromItem) -> bool {
+    match item {
+        FromItem::Table { .. } => false,
+        FromItem::Derived { subquery, .. } => query_has_placeholder(subquery),
+        FromItem::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            from_item_has_placeholder(left)
+                || from_item_has_placeholder(right)
+                || condition.as_ref().is_some_and(expr_has_placeholder)
+        }
+    }
+}
+
+fn expr_has_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Placeholder(_) => true,
+        Expr::Literal(_) | Expr::ColumnRef { .. } => false,
+        Expr::Subquery(query) => query_has_placeholder(query),
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_has_placeholder(expr) || query_has_placeholder(subquery)
+        }
+        Expr::Exists { subquery, .. } => query_has_placeholder(subquery),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_placeholder(left) || expr_has_placeholder(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => expr_has_placeholder(expr),
+        Expr::Function { args, .. } => args.iter().any(function_arg_has_placeholder),
+        Expr::InList { expr, list, .. } => {
+            expr_has_placeholder(expr) || list.iter().any(expr_has_placeholder)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_placeholder(expr) || expr_has_placeholder(low) || expr_has_placeholder(high),
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_placeholder(expr) || expr_has_placeholder(pattern)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_has_placeholder(expr))
+                || when_clauses
+                    .iter()
+                    .any(|(when, then)| expr_has_placeholder(when) || expr_has_placeholder(then))
+                || else_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_placeholder(expr))
+        }
+    }
+}
+
+fn function_arg_has_placeholder(arg: &FunctionArg) -> bool {
+    match arg {
+        FunctionArg::Expr(expr) => expr_has_placeholder(expr),
+        FunctionArg::Wildcard => false,
+    }
 }

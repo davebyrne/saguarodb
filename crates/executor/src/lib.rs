@@ -723,6 +723,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -769,6 +770,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -957,6 +959,25 @@ mod tests {
 
         assert_eq!(err.code, SqlState::DatatypeMismatch);
         assert!(err.message.contains("expected column id"));
+    }
+
+    #[test]
+    fn alter_drop_column_dependency_rejects_before_scan() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let err = harness
+            .execute("alter table users drop column id")
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert_eq!(
+            harness.storage_scan_count(),
+            0,
+            "dependency validation should reject before materializing rows for a rewrite"
+        );
     }
 
     #[test]
@@ -2439,6 +2460,34 @@ mod tests {
                 .copy_out("users", &["name", "id"], text_opts())
                 .unwrap(),
             b"ann\t1\nbob\t2\n"
+        );
+    }
+
+    #[test]
+    fn copy_out_uses_bound_schema_after_live_catalog_rename() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'ann')")
+            .unwrap();
+        let bound_schema = harness.table_schema("users");
+        let name_id = bound_schema
+            .columns
+            .iter()
+            .find(|column| column.name == "name")
+            .unwrap()
+            .id;
+
+        harness
+            .rename_catalog_column("users", "name", "full_name")
+            .unwrap();
+
+        let mut options = csv_opts();
+        options.header = true;
+        assert_eq!(
+            harness
+                .copy_out_with_schema(bound_schema, &[name_id], options)
+                .unwrap(),
+            b"name\nann\n"
         );
     }
 

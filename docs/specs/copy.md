@@ -182,19 +182,26 @@ Server-generated `CopyData` frames for `COPY TO` are batched and kept well under
 ## 5. Connection state machine (server)
 
 The per-connection `serve()` loop gains a COPY mode entered only from a simple
-`Query` that classifies as COPY. The classification step parses, binds, and
-validates the statement on the blocking pool *before* any COPY response is sent,
-so an invalid COPY fails like any other query (`ErrorResponse` + `ReadyForQuery`,
-connection stays in normal mode).
+`Query` that classifies as COPY. The classification step captures the statement
+MVCC/relation snapshot, parses, binds, and validates the statement on the
+blocking pool *before* any COPY response is sent, so an invalid COPY fails like
+any other query (`ErrorResponse` + `ReadyForQuery`, connection stays in normal
+mode). `COPY FROM` also acquires the shared writer guard before `CopyInResponse`
+and carries it into the worker; this prevents relation/schema DDL from slipping
+between validation and protocol mode.
 
 ### 5.1 COPY FROM STDIN (bounded streaming)
 
-1. Classify (blocking): parse → bind → validate. On error, normal error reply.
+1. Classify (blocking): capture snapshot → parse → bind → validate. On error,
+   normal error reply. For `COPY FROM`, the validation is write-strict: missing
+   target relations in a retained transaction snapshot are rejected before
+   protocol mode, and the writer guard is acquired before success is returned.
 2. Send `CopyInResponse`. Create a bounded chunk channel (capacity 64) and an
    abort flag.
 3. Spawn the insert task (blocking): it takes ownership of the session's
-   transaction (autocommit: acquire a write guard, allocate a txn id, capture a
-   snapshot; in a `BEGIN` block: reuse the open transaction), then repeatedly
+   transaction (autocommit: allocate/register a txn id and use the snapshot and
+   writer guard captured by classification; in a `BEGIN` block: reuse the open
+   transaction), then repeatedly
    receives byte chunks from the channel, parses complete rows (buffering a
    partial trailing line across chunks), validates each value
    (`validate_value_type`, `validate_not_null`), and calls `storage.insert`. On a
@@ -299,7 +306,7 @@ transferred, matching PostgreSQL.
 - `parser`: `Statement::Copy` AST and translation from `sqlparser::Statement::Copy`,
   including option normalization and rejection of unsupported forms.
 - `planner`: `BoundStatement::Copy` (binding: resolve table + columns to ids,
-  carrying `direction`/`options`). `COPY` is not lowered by `logical_plan`
+  retain the bound table schema, and carry `direction`/`options`). `COPY` is not lowered by `logical_plan`
   (which rejects it); the server drives both directions directly over the
   storage scan/insert paths.
 - `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), plus the

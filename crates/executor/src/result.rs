@@ -1,4 +1,4 @@
-use common::{ColumnId, ColumnInfo, CopyOptions, Row, TableId};
+use common::{ColumnId, ColumnInfo, CopyOptions, Row, TableSchema};
 use planner::BoundExpr;
 
 /// A bound `COPY` request. Binding resolves the table and column list; the server
@@ -6,7 +6,10 @@ use planner::BoundExpr;
 /// actual insert/scan). See `docs/specs/copy.md`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyJob {
-    pub table: TableId,
+    /// Frozen table schema resolved during bind. COPY may start its streaming
+    /// worker after replying with CopyInResponse/CopyOutResponse, so it must not
+    /// re-read the live catalog for column names, types, or defaults.
+    pub schema: TableSchema,
     /// Columns in COPY order (defaulted to all columns in catalog order).
     pub columns: Vec<ColumnId>,
     pub options: CopyOptions,

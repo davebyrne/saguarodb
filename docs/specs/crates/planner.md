@@ -48,7 +48,7 @@ crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
 
 ## Binder Contract
 
-Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP TABLE IF EXISTS` and `DROP SEQUENCE` are deliberate exceptions: they carry the normalized object name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE IF NOT EXISTS` also carries the table name through execution so the duplicate-table no-op decision uses the current catalog. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
+Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. Schema-evolution `ALTER TABLE` binds the target table to `TableId` and carries the original name only for diagnostics/explain output, so prepared schema-evolution DDL is rejected if the bound table is dropped or its `schema_version` changes before execution. `DROP TABLE IF EXISTS` and `DROP SEQUENCE` are deliberate exceptions: they carry the normalized object name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE IF NOT EXISTS` also carries the table name through execution so the duplicate-table no-op decision uses the current catalog. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
 
 Binder responsibilities:
 
@@ -67,10 +67,10 @@ Binder responsibilities:
 - Validate `WHERE` and join predicates are boolean.
 - Validate insert/update value types and nullability. `INSERT ... VALUES`, `UPDATE SET`, and `ON CONFLICT DO UPDATE SET` expression assignments are strict except for PostgreSQL-compatible `TIMESTAMPTZ` expressions assigned to `TIMESTAMP` columns, which the binder wraps in an explicit `BoundExpr::Cast` to `TIMESTAMP`; nullability is still checked after the cast. For `INSERT ... SELECT`, bind the query, require its output column count to match the target columns, and validate each output expression's type and nullability against the target column with no assignment cast. A `NOT NULL` column may be omitted from an `INSERT` only when it has a non-`NULL` `ColumnDefault::Const`, a `ColumnDefault::Nextval`, or a `ColumnDefault::Expr` (an expression default may still evaluate to `NULL`, caught per row at insert time); otherwise the omission is rejected with `SqlState::NotNullViolation`. For each omitted column with a `ColumnDefault::Expr`, the binder re-parses and binds the default's text against an empty scope and attaches the bound expression to the `INSERT`, so the executor evaluates it per row.
 - Validate each `CREATE TABLE` column `DEFAULT` against the column type (no implicit casts): `ParsedDefault::Const(value)` must match the column's `DataType` (any `Numeric` value matches any `NUMERIC(p, s)` column), else `SqlState::DatatypeMismatch`; a `NULL` default is accepted only on a nullable column (else `SqlState::NotNullViolation`). `ParsedDefault::Nextval(name)` must resolve to an existing non-owned sequence (`SqlState::UndefinedTable` if missing, `SqlState::DependentObjectsStillExist` if it names an owned SERIAL sequence) and requires an `INTEGER` target column. `ParsedDefault::Serial` requires an `INTEGER` target column; the marker stays on the parsed column list (nothing extra is recorded on the bound `CREATE TABLE`), and the executor derives the SERIAL columns and chooses generated owned sequence names at execution time. `ParsedDefault::Expr(text)` is a non-constant default: the binder re-parses the text (`parser::parse_expression`) and binds it against an empty column scope (so a column reference fails as `SqlState::UndefinedColumn`), rejects aggregates/subqueries/parameters (`SqlState::FeatureNotSupported`), and requires the result type be assignable to the column (`SqlState::DatatypeMismatch`); a `NULL` result is not checked here (it is caught per row at insert). The text is stored as `ColumnDefault::Expr` and re-bound per statement at `INSERT`.
-- Validate each `CREATE TABLE` `CHECK` constraint (`Statement::CreateTable.checks`, canonical text): the binder re-parses the text (`parser::parse_expression`) and binds it against the table's not-yet-created columns registered as a single binding at slot 0 (`bind_check_expr`), so a column reference resolves (a `CHECK` may name the row's columns, unlike a `DEFAULT`), an unknown column fails as `SqlState::UndefinedColumn`, aggregates/subqueries/parameters are rejected (`SqlState::FeatureNotSupported`, shared with `DEFAULT` via `reject_non_constraint_safe`), and a non-boolean result is `SqlState::DatatypeMismatch`. The bound form is discarded at `CREATE TABLE`; the text is stored on `TableSchema.checks`. At each `INSERT`/`UPDATE`, the binder re-binds the table's checks against the table's columns (`bind_table_checks`) and attaches the bound expressions to the statement, so the executor evaluates them over each affected full row.
+- Validate each `CREATE TABLE` `CHECK` constraint (`Statement::CreateTable.checks`, canonical text): the binder re-parses the text (`parser::parse_expression`) and binds it against the table's not-yet-created columns registered as a single binding at slot 0 (`bind_check_expr`), so an unqualified column reference resolves (a `CHECK` may name the row's columns, unlike a `DEFAULT`), an unknown column fails as `SqlState::UndefinedColumn`, table-qualified column references are rejected with `SqlState::FeatureNotSupported` so stored check text remains table-rename-safe, aggregates/subqueries/parameters are rejected (`SqlState::FeatureNotSupported`, shared with `DEFAULT` via `reject_non_constraint_safe`), and a non-boolean result is `SqlState::DatatypeMismatch`. The bound form is discarded at `CREATE TABLE`; the text is stored on `TableSchema.checks`. At each `INSERT`/`UPDATE`, the binder re-binds the table's checks against the table's columns (`bind_table_checks`) and attaches the bound expressions to the statement, so the executor evaluates them over each affected full row.
 - Bind `ON CONFLICT` (`bind_on_conflict`): the arbiter is **always the primary key**. An explicit conflict target must name exactly the primary-key column(s) — any other column list (a secondary unique index) is rejected with `FeatureNotSupported`; a missing target is allowed for `DO NOTHING` but rejected for `DO UPDATE`. The bound form stores the arbiter column IDs when a primary key exists, including targetless `DO NOTHING`, so prepared statements revalidate the same arbiter after primary-key DDL; if no primary key exists at bind time, targetless `DO NOTHING` binds with no arbiter. `DO UPDATE SET ... [WHERE ...]` binds over **two** bindings — the target table (slots `0..n`, bare columns resolve here) and a `qualified_only` `excluded` pseudo-table (slots `n..2n`, only `excluded.<col>` resolves) — so a bare column means the existing row and `excluded.<col>` the proposed row (matching PostgreSQL, no ambiguity). Duplicate assignments are rejected, as in `UPDATE`.
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
-- Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). For `COPY FROM` the binder also attaches the omitted columns' bound expression `DEFAULT`s (`bind_omitted_expr_defaults`) and the table's bound `CHECK` constraints (`bind_table_checks`) to `BoundStatement::Copy`, so the executor applies defaults and enforces checks per row exactly as INSERT does; `COPY TO` binds neither. COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
+- Bind `COPY` (`bind_copy`): resolve the table to `TableId`, retain the bound `TableSchema`, and resolve the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). For `COPY FROM` the binder also attaches the omitted columns' bound expression `DEFAULT`s (`bind_omitted_expr_defaults`) and the table's bound `CHECK` constraints (`bind_table_checks`) to `BoundStatement::Copy`, so the executor applies defaults and enforces checks per row exactly as INSERT does; `COPY TO` binds neither. COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
 - Bind `DROP TABLE` by resolving the table to `TableId` when `IF EXISTS` is
   absent. Bind `DROP TABLE IF EXISTS` as a pass-through carrying the normalized
   table name and `IF EXISTS`; the executor resolves the table at statement
@@ -98,10 +98,16 @@ pub enum BoundStatement {
         checks: Vec<String>,
     },
     DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
+    AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
+    AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
+    AlterTableRenameTable { table: TableId, table_name: String, new_name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Query(BoundQuery),
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: BoundSelect, returning: Option<BoundReturning> },
@@ -232,8 +238,18 @@ For `CREATE TABLE`, binder defaults an absent `compression` option to
 `toast = aggressive` with no explicit `toast_min_value_size` stores
 `ToastOptions::AGGRESSIVE_TOAST_MIN_VALUE_SIZE`, and any explicit
 `toast_compression` clears `active_dict_id` in the resolved `ToastOptions`
-(new tables have no active dictionary yet). `ALTER TABLE` maintenance statements
-do not bind.
+(new tables have no active dictionary yet). Storage-parameter `ALTER TABLE`
+maintenance statements do not bind. Schema-evolution `ALTER TABLE` and
+`CREATE`/`DROP VIEW` statements have `BoundStatement` → `LogicalPlan` →
+`PhysicalPlan` variants so the parser/planner surface is explicit.
+Schema-evolution ALTER statements execute through the executor/server DDL path;
+view DDL remains staged and the server rejects those statements with
+`SqlState::FeatureNotSupported` before binding until view execution support
+lands. Direct planner API calls may still bind their defaults or view queries.
+`CREATE VIEW` binding rejects query parameters (`SqlState::FeatureNotSupported`)
+so stored view SQL is never coupled to execute-time parameter substitution. When
+a view supplies an explicit column list, its length must exactly match the bound
+query output width and names must be unique (`SqlState::SyntaxError`).
 
 A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
@@ -472,10 +488,16 @@ Scalar functions remain `BoundExpr::Function`. The set of scalar functions and t
 pub enum LogicalPlan {
     CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
     DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
+    AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
+    AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
+    AlterTableRenameTable { table: TableId, table_name: String, new_name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
@@ -558,10 +580,16 @@ usable (e.g. `id = 3 + 4` folds to `id = 7`).
 pub enum PhysicalPlan {
     CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
     DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
+    AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
+    AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
+    AlterTableRenameTable { table: TableId, table_name: String, new_name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },

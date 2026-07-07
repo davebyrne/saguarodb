@@ -24,13 +24,13 @@ pub(super) struct StatementRuntime<'a> {
     system_state: Arc<dyn SystemStateProvider>,
 }
 
-pub(super) struct CapturedSnapshots {
+pub(crate) struct CapturedSnapshots {
     pub(super) snapshot: Arc<Snapshot>,
     pub(super) relations: Arc<dyn RelationSnapshot>,
     pub(super) advertised: AdvertisedSnapshot,
 }
 
-pub(super) struct TransactionSnapshots {
+pub(crate) struct TransactionSnapshots {
     pub(super) snapshot: Arc<Snapshot>,
     pub(super) relations: Arc<dyn RelationSnapshot>,
     pub(super) advertised: Option<AdvertisedSnapshot>,
@@ -632,11 +632,15 @@ impl QueryService {
     ) -> Result<TransactionSnapshots> {
         match txn.isolation {
             IsolationLevel::ReadCommitted => {
+                let bypass_snapshot_exclusion = txn.write_guard.is_some();
                 let CapturedSnapshots {
                     snapshot,
                     relations,
                     advertised,
-                } = self.capture_consistent_snapshots(txn.txn_id)?;
+                } = self.capture_consistent_snapshots_with_exclusion_bypass(
+                    txn.txn_id,
+                    bypass_snapshot_exclusion,
+                )?;
                 Ok(TransactionSnapshots {
                     snapshot,
                     relations,
@@ -657,7 +661,8 @@ impl QueryService {
                         snapshot,
                         relations,
                         advertised,
-                    } = self.capture_consistent_snapshots(txn.txn_id)?;
+                    } =
+                        self.capture_consistent_snapshots_allowing_missing_table_reads(txn.txn_id)?;
                     txn.rr_snapshot = Some(snapshot.clone());
                     txn.rr_relations = Some(relations.clone());
                     // Hold the advertisement for the transaction's life (released
@@ -675,15 +680,53 @@ impl QueryService {
     }
 
     pub(super) fn capture_consistent_snapshots(&self, own_txn: u64) -> Result<CapturedSnapshots> {
-        let _relation_publish_read = self
-            .components
-            .relation_publish_gate
-            .read()
-            .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
+        self.capture_consistent_snapshots_with_options(own_txn, false, false)
+    }
+
+    fn capture_consistent_snapshots_allowing_missing_table_reads(
+        &self,
+        own_txn: u64,
+    ) -> Result<CapturedSnapshots> {
+        self.capture_consistent_snapshots_with_options(own_txn, false, true)
+    }
+
+    fn capture_consistent_snapshots_with_exclusion_bypass(
+        &self,
+        own_txn: u64,
+        bypass_snapshot_exclusion: bool,
+    ) -> Result<CapturedSnapshots> {
+        self.capture_consistent_snapshots_with_options(own_txn, bypass_snapshot_exclusion, false)
+    }
+
+    fn capture_consistent_snapshots_with_options(
+        &self,
+        own_txn: u64,
+        bypass_snapshot_exclusion: bool,
+        missing_table_reads_are_empty: bool,
+    ) -> Result<CapturedSnapshots> {
         loop {
+            let relation_publish_read = self
+                .components
+                .relation_publish_gate
+                .read()
+                .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
             let relation_epoch = self.components.storage.relation_epoch()?;
-            let (snapshot, advertised) = self.capture_snapshot(own_txn);
-            let relations = match self.components.storage.capture_relation_snapshot() {
+            let Some((snapshot, advertised)) =
+                self.try_capture_snapshot_for_transaction(own_txn, bypass_snapshot_exclusion)
+            else {
+                drop(relation_publish_read);
+                self.components
+                    .active_txns
+                    .wait_for_snapshot_exclusion_clear();
+                continue;
+            };
+            let relations = match if missing_table_reads_are_empty {
+                self.components
+                    .storage
+                    .capture_relation_snapshot_with_missing_table_reads_empty()
+            } else {
+                self.components.storage.capture_relation_snapshot()
+            } {
                 Ok(relations) => relations,
                 Err(err) => {
                     drop(advertised);
@@ -698,6 +741,7 @@ impl QueryService {
                 });
             }
             drop(advertised);
+            drop(relation_publish_read);
         }
     }
 
@@ -757,10 +801,10 @@ impl QueryService {
     /// Capture a visibility snapshot consistently with the active-transaction
     /// registry and the id allocator (`docs/specs/mvcc.md` §5.5, §7.1, §9), and
     /// **advertise its `xmin`** to the GC horizon for the snapshot's lifetime.
-    /// Captured under the registry's brief latch (via `capture`) so the snapshot is
-    /// not torn relative to `next_txn_id` AND its `xmin` is published in the same
-    /// critical section that reads the active set (closing the capture-vs-horizon
-    /// race; see [`ActiveTxnRegistry::capture`](crate::registry::ActiveTxnRegistry::capture)):
+    /// Captured under the registry's brief latch (via try-capture) so the snapshot
+    /// is not torn relative to `next_txn_id` AND its `xmin` is published in the
+    /// same critical section that reads the active set (closing the
+    /// capture-vs-horizon race).
     ///
     /// - `xmax` is the next id to be assigned; every already-allocated id is below
     ///   it (read after the latched active set so no concurrently-begun writer is
@@ -770,25 +814,24 @@ impl QueryService {
     ///   `own_txn = 0`; nothing is excluded.
     /// - `xmin` is the oldest active id, or `xmax` if none are active.
     ///
-    /// Returns the `Arc<Snapshot>` (shared by the executor across scan operators
-    /// rather than deep-cloning `xip` per operator) together with the
-    /// [`AdvertisedSnapshot`] guard. **The caller MUST hold the guard for exactly as
-    /// long as the snapshot can still be used to read**: dropping it sooner lets
-    /// VACUUM reclaim a version this snapshot sees live (data loss); holding it
-    /// longer over-pins the horizon (a space cost only).
-    pub(super) fn capture_snapshot(&self, own_txn: u64) -> (Arc<Snapshot>, AdvertisedSnapshot) {
-        // Capture the active set and the allocator boundary under one latch so a
-        // concurrent BEGIN cannot slip a new writer between reading `xmax` and
-        // reading `xip`, and publish the snapshot's `xmin` in the same section.
-        // Reading `next_txn_id` first, then the active set, would risk a writer that
-        // registered after the `xmax` read being both `>= xmax` (so excluded as
-        // "future") and absent from `xip` — but visible. Reading the active set
-        // first guarantees any active id is reflected in `xip`, and `xmax` taken
-        // after only grows, so every active id stays `< xmax`.
+    /// Returns `None` if a schema-rewrite fence is active and the caller is not
+    /// allowed to bypass it. Otherwise returns the `Arc<Snapshot>` (shared by the
+    /// executor across scan operators rather than deep-cloning `xip` per operator)
+    /// together with the [`AdvertisedSnapshot`] guard. **The caller MUST hold the
+    /// guard for exactly as long as the snapshot can still be used to read**:
+    /// dropping it sooner lets VACUUM reclaim a version this snapshot sees live
+    /// (data loss); holding it longer over-pins the horizon (a space cost only).
+    fn try_capture_snapshot_for_transaction(
+        &self,
+        own_txn: u64,
+        bypass_snapshot_exclusion: bool,
+    ) -> Option<(Arc<Snapshot>, AdvertisedSnapshot)> {
         let (active, xmax, advertised) = self
             .components
             .active_txns
-            .capture(|| self.components.next_txn_id.load(Ordering::Acquire));
+            .try_capture_with_exclusion_bypass(bypass_snapshot_exclusion, || {
+                self.components.next_txn_id.load(Ordering::Acquire)
+            })?;
         let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
         let xmin = active.first().copied().unwrap_or(xmax);
         debug_assert_eq!(
@@ -796,7 +839,21 @@ impl QueryService {
             xmin,
             "advertised xmin must match the snapshot's xmin"
         );
-        (Arc::new(Snapshot { xmin, xmax, xip }), advertised)
+        Some((Arc::new(Snapshot { xmin, xmax, xip }), advertised))
+    }
+
+    /// Capture a visibility snapshot without advertising its `xmin`. This is used
+    /// only by schema-rewrite DDL while snapshot capture is excluded and the
+    /// exclusive checkpoint guard prevents VACUUM/checkpoint maintenance from
+    /// advancing the GC horizon around the unadvertised read.
+    pub(super) fn capture_unadvertised_snapshot(&self, own_txn: u64) -> Arc<Snapshot> {
+        let (active, xmax) = self
+            .components
+            .active_txns
+            .capture_unadvertised(|| self.components.next_txn_id.load(Ordering::Acquire));
+        let xip: Vec<u64> = active.iter().copied().filter(|&id| id != own_txn).collect();
+        let xmin = active.first().copied().unwrap_or(xmax);
+        Arc::new(Snapshot { xmin, xmax, xip })
     }
 
     pub(super) fn append_and_flush_commit(

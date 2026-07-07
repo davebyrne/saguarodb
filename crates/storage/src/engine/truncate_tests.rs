@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
     ColumnDef, CompressionSetting, DataType, FileId, IndexConstraintKind, IndexSchema, Key,
-    KeyRange, Lsn, PageFlushInfo, RelationKind, Row, Snapshot, StatementContext, TableSchema,
-    ToastCompression, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId, TxnStatus,
-    TxnStatusView, Value, toast_schema,
+    KeyRange, Lsn, PageFlushInfo, RelationKind, Row, Snapshot, SqlState, StatementContext,
+    TableSchema, ToastCompression, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId,
+    TxnStatus, TxnStatusView, Value, toast_schema,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -317,6 +317,7 @@ fn users_schema(storage_id: FileId) -> TableSchema {
         compression: CompressionSetting::None,
         active_dict_id: None,
         toast,
+        schema_version: common::INITIAL_SCHEMA_VERSION,
         checks: Vec::new(),
         toast_table_id: Some(TOAST_TABLE_ID),
         relation_kind: RelationKind::User,
@@ -424,6 +425,40 @@ fn prepare_truncate_logs_logical_record_before_physical_pages() {
             WalRecordKind::FullPageImage { .. } | WalRecordKind::FullPageImageCompressed { .. }
         )),
         "truncate prepare did not initialize any B-tree pages: {records:?}"
+    );
+}
+
+#[test]
+fn schema_rewrite_logs_logical_record_before_physical_pages() {
+    let fixture = Fixture::new();
+    let mut schema = users_schema(NEW_BASE_STORAGE_ID);
+    schema.schema_version += 1;
+    let index = name_index(NEW_NAME_INDEX_STORAGE_ID);
+
+    fixture
+        .engine
+        .update_table_schema(&ctx(401), &schema, std::slice::from_ref(&index))
+        .unwrap();
+
+    let records = fixture.records_for_txn(401);
+    assert!(
+        matches!(
+            records.first(),
+            Some(WalRecordKind::UpdateTableSchema {
+                schema: logged_schema,
+                indexes,
+            }) if logged_schema.storage_id == NEW_BASE_STORAGE_ID
+                && indexes.len() == 1
+                && indexes[0].storage_id == NEW_NAME_INDEX_STORAGE_ID
+        ),
+        "first schema rewrite WAL record was {records:?}"
+    );
+    assert!(
+        records.iter().skip(1).any(|kind| matches!(
+            kind,
+            WalRecordKind::FullPageImage { .. } | WalRecordKind::FullPageImageCompressed { .. }
+        )),
+        "schema rewrite did not initialize any B-tree pages: {records:?}"
     );
 }
 
@@ -628,6 +663,7 @@ fn table_handle_fallback_pins_current_generation() {
         .capture_pagebacked_relation_snapshot()
         .unwrap();
     old_relations.tables.remove(&TABLE_ID);
+    old_relations.allow_current_fallback = true;
 
     let handle = fixture
         .engine
@@ -648,6 +684,7 @@ fn index_handle_fallback_pins_current_generation() {
         .capture_pagebacked_relation_snapshot()
         .unwrap();
     old_relations.indexes.remove(&NAME_INDEX_ID);
+    old_relations.allow_current_fallback = true;
 
     let handle = fixture
         .engine
@@ -658,6 +695,42 @@ fn index_handle_fallback_pins_current_generation() {
         Arc::strong_count(&handle._generation) >= 2,
         "fallback index handle must pin the current generation while files are used"
     );
+}
+
+#[test]
+fn captured_relation_snapshot_missing_table_is_strict() {
+    let fixture = Fixture::new();
+    let mut relations = fixture
+        .engine
+        .capture_pagebacked_relation_snapshot()
+        .unwrap();
+    relations.tables.remove(&TABLE_ID);
+
+    let err = match fixture.engine.table_handle(&relations, TABLE_ID) {
+        Ok(_) => panic!("missing table in captured relation snapshot should be strict"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, SqlState::UndefinedTable);
+}
+
+#[test]
+fn captured_relation_snapshot_missing_table_does_not_fallback_to_index() {
+    let fixture = Fixture::new();
+    let mut relations = fixture
+        .engine
+        .capture_pagebacked_relation_snapshot()
+        .unwrap();
+    relations.tables.remove(&TABLE_ID);
+    relations.indexes.remove(&NAME_INDEX_ID);
+
+    let err = match fixture
+        .engine
+        .index_handle(&relations, TABLE_ID, NAME_INDEX_ID)
+    {
+        Ok(_) => panic!("missing index in captured relation snapshot should be strict"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, SqlState::UndefinedTable);
 }
 
 #[test]

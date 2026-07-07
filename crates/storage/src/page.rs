@@ -774,6 +774,7 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),

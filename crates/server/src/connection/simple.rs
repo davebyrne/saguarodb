@@ -151,11 +151,13 @@ impl Session {
             // `BeginCopyIn` spawns the streaming insert and routes subsequent
             // CopyData; `BeginCopyOut` streams the table out inline. Both recompute
             // the transaction status themselves, so the `status` above is unused here.
-            Ok(StreamOutcome::Direct(ExecutionResult::BeginCopyIn(job))) => {
-                self.begin_copy_in(stream, codec, job, guard).await?
+            Ok(StreamOutcome::BeginCopyIn { job, snapshots }) => {
+                self.begin_copy_in(stream, codec, job, snapshots, guard)
+                    .await?
             }
-            Ok(StreamOutcome::Direct(ExecutionResult::BeginCopyOut(job))) => {
-                self.run_copy_out(stream, codec, job, guard).await?
+            Ok(StreamOutcome::BeginCopyOut { job, snapshots }) => {
+                self.run_copy_out(stream, codec, job, snapshots, guard)
+                    .await?
             }
             Ok(StreamOutcome::SessionReset(result)) => {
                 self.prepared.clear();

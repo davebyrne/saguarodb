@@ -682,6 +682,159 @@ async fn e2e_delete_then_reinsert_same_key_succeeds() {
 }
 
 #[tokio::test]
+async fn e2e_truncate_clears_heap_and_secondary_indexes() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create index users_name on users (name)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada'), (2, 'Grace')")
+        .await
+        .unwrap();
+
+    server.simple_query("truncate users").await.unwrap();
+
+    let rows = server
+        .simple_query("select id, name from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+    let rows = server
+        .simple_query("select id from users where name = 'Ada'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    server
+        .simple_query("insert into users (id, name) values (1, 'Bea')")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where name = 'Bea'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
+async fn e2e_alter_table_schema_evolution_rewrites_rows_and_indexes() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text, code integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create index users_code on users (code)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name, code) values (1, 'Ada', 10), (2, 'Grace', 20)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("alter table users add column active boolean default true")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, active from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("t".to_string())],
+            vec![Some("2".to_string()), Some("t".to_string())],
+        ]
+    );
+
+    server
+        .simple_query("alter table users rename column active to enabled")
+        .await
+        .unwrap();
+    server
+        .simple_query("alter table users drop column name")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, code, enabled) values (3, 30, false)")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id, code, enabled from users where code = 20")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2".to_string()),
+            Some("20".to_string()),
+            Some("t".to_string()),
+        ]]
+    );
+    let rows = server
+        .simple_query("select id, code, enabled from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("10".to_string()),
+                Some("t".to_string()),
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("20".to_string()),
+                Some("t".to_string()),
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("30".to_string()),
+                Some("f".to_string()),
+            ],
+        ]
+    );
+
+    server
+        .simple_query("create table docs (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into docs (id) values (1)")
+        .await
+        .unwrap();
+    server
+        .simple_query("alter table docs add column body text default 'ready'")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, body from docs")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("ready".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn e2e_update_new_version_is_visible_via_seq_and_index_scans() {
     // MVCC UPDATE writes a new heap version and inserts a per-version entry into
     // *every* index (the changed-column index and the unchanged-column index), so

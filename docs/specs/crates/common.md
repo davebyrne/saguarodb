@@ -16,8 +16,8 @@
   parameter path and the `COPY` import path so both share one accept-set; each
   caller maps `None` to its own SQLSTATE.
 - Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`,
-  `ColumnInfo`, `TableSchema`, `IndexSchema`, `SequenceOptions`, and
-  `SequenceSchema`.
+  `ColumnInfo`, `TableSchema`, `IndexSchema`, `ViewColumn`,
+  `ViewDependency`, `ViewSchema`, `SequenceOptions`, and `SequenceSchema`.
 - Relation-generation catalog handoff types: `TruncateTablePlan` and
   `TruncateCatalogUpdate`.
 - Query access helpers: `KeyRange`.
@@ -242,6 +242,7 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
+    pub schema_version: u64,
     pub compression: CompressionSetting,
     pub active_dict_id: Option<u32>,
     pub toast: ToastOptions,
@@ -264,6 +265,28 @@ pub enum IndexConstraintKind {
     None,
     Unique,
     PrimaryKey,
+}
+
+pub struct ViewColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub pg_type: Option<PgType>,
+}
+
+pub struct ViewDependency {
+    pub relation: TableId,
+    pub columns: Vec<ColumnId>,
+    pub all_columns: bool,
+}
+
+pub struct ViewSchema {
+    pub id: TableId,
+    pub name: String,
+    pub columns: Vec<ColumnDef>,
+    pub definition: String,
+    pub dependencies: Vec<ViewDependency>,
+    pub schema_version: u64,
 }
 
 pub struct SequenceOptions {
@@ -301,7 +324,15 @@ pub struct TruncateCatalogUpdate {
 }
 ```
 
-`ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
+`ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned
+and has dense IDs within a specific `TableSchema.schema_version`: IDs match the
+row slot order and may be renumbered by rewrite-style schema evolution such as
+`DROP COLUMN`. Metadata that survives a schema version change must be remapped
+by the catalog instead of treating `ColumnId` as a cross-version identity.
+`ColumnInfo` describes result columns and may be derived from expressions, so
+table/column IDs are optional. `TableSchema.schema_version` and
+`ViewSchema.schema_version` start at `1` and increment on public schema metadata
+changes.
 
 `TableSchema.id` and `IndexSchema.id` are stable logical catalog identities.
 `storage_id` is the current physical relation-generation id used by storage to
@@ -314,6 +345,13 @@ a secondary index to keep the same raw storage id when their old logical ids
 matched; storage file-kind bits still make the actual heap/primary/secondary
 file ids distinct. Fresh allocations come from one monotonic allocator and do
 not intentionally create those cross-kind raw collisions.
+
+`ViewColumn` is the catalog input shape for view output columns before dense
+`ColumnId`s are assigned. Stored `ViewSchema.columns` use `ColumnDef` with dense
+column IDs and no defaults. `ViewDependency.columns` lists referenced column IDs;
+`all_columns = true` represents relation-wide dependencies such as `SELECT *`;
+neither specific columns nor `all_columns` represents relation-existence-only
+dependencies such as `count(*)`.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and

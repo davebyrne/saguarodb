@@ -30,10 +30,16 @@ pub(crate) fn resolve_plan_subqueries(
     Ok(match plan {
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }
-        | PhysicalPlan::DropSequence { .. } => plan.clone(),
+        | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. } => plan.clone(),
         PhysicalPlan::Insert {
             table,
             columns,

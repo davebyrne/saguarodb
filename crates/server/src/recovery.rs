@@ -105,9 +105,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // redo-committed-only filter (`replay_committed_from`), which could not handle
     // the flushed-but-uncommitted pages the relaxed flush gate (D1) now admits.
     //
-    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`
-    // and sequence DDL) are the exception: they mutate the durable catalog directly
-    // (not idempotent PageLSN-gated page bytes), so an aborted DDL's catalog record
+    // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`TruncateTable`/
+    // `CreateIndex`/`DropIndex` and sequence DDL) are the exception: they mutate
+    // the durable catalog directly (not idempotent PageLSN-gated page bytes), so an aborted DDL's catalog record
     // must NOT take effect. DDL is non-transactional and commits immediately (§4
     // Decision 6), so a committed DDL replays and an aborted/in-flight one is
     // skipped — gated by the rebuilt CLOG. Skipped CreateTable/CreateIndex/
@@ -302,6 +302,8 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
         kind,
         WalRecordKind::CreateTable { .. }
             | WalRecordKind::DropTable { .. }
+            | WalRecordKind::TruncateTable { .. }
+            | WalRecordKind::UpdateTableSchema { .. }
             | WalRecordKind::CreateIndex { .. }
             | WalRecordKind::DropIndex { .. }
             | WalRecordKind::CreateSequence { .. }
@@ -309,7 +311,6 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::CreateDictionary { .. }
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
-            | WalRecordKind::TruncateTable { .. }
             | WalRecordKind::AlterTablePrimaryKey { .. }
     )
 }
@@ -349,6 +350,13 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
             }
             for (_, storage_id) in new_index_storage_ids {
                 catalog.reserve_storage_id(*storage_id)?;
+            }
+            Ok(true)
+        }
+        WalRecordKind::UpdateTableSchema { schema, indexes } => {
+            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
+            for index in indexes {
+                reserve_storage_id(catalog, index.storage_id, index.id)?;
             }
             Ok(true)
         }
@@ -415,6 +423,14 @@ fn apply_redo(
                 ))
             })?;
             storage.apply_create_table(installed)
+        }
+        WalRecordKind::UpdateTableSchema { schema, indexes } => {
+            catalog.apply_update_table_and_index_schemas(schema.clone(), indexes)?;
+            for index in indexes {
+                storage.apply_update_index_schema(index.clone())?;
+            }
+            storage.apply_update_table_schema(schema.clone())?;
+            Ok(())
         }
         WalRecordKind::DropTable { table } => {
             catalog.apply_drop_table(*table)?;
@@ -652,6 +668,7 @@ mod tests {
                 pg_type: None,
             }],
             primary_key: vec![0],
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             compression: common::CompressionSetting::None,
             active_dict_id: None,
             toast: common::ToastOptions::legacy_catalog_default(),
@@ -679,6 +696,16 @@ mod tests {
         }
 
         fn apply_create_index(&self, schema: common::IndexSchema) -> common::Result<()> {
+            self.indexes.lock().expect("indexes lock").push(schema);
+            Ok(())
+        }
+
+        fn apply_update_table_schema(&self, schema: common::TableSchema) -> common::Result<()> {
+            self.tables.lock().expect("tables lock").push(schema);
+            Ok(())
+        }
+
+        fn apply_update_index_schema(&self, schema: common::IndexSchema) -> common::Result<()> {
             self.indexes.lock().expect("indexes lock").push(schema);
             Ok(())
         }
@@ -1328,6 +1355,96 @@ mod tests {
             .unwrap();
         assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 3);
         assert_eq!(index.storage_id, 5);
+    }
+
+    #[test]
+    fn recovery_reserves_storage_ids_from_skipped_update_table_schema_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let skipped_table_storage_id;
+        let skipped_index_storage_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            app.query_service
+                .execute_sql("create index users_name on users (name)")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+
+            let next_storage_id = app.components.catalog.snapshot().unwrap().next_storage_id;
+            skipped_table_storage_id = next_storage_id;
+            skipped_index_storage_id = next_storage_id + 1;
+
+            let mut replayed_table = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .unwrap();
+            let old_table_storage_id = replayed_table.storage_id;
+            replayed_table.storage_id = skipped_table_storage_id;
+            replayed_table.schema_version += 1;
+
+            let mut replayed_index = app
+                .components
+                .catalog
+                .get_index_by_name("users_name")
+                .unwrap()
+                .unwrap();
+            let old_index_storage_id = replayed_index.storage_id;
+            replayed_index.storage_id = skipped_index_storage_id;
+
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::UpdateTableSchema {
+                        schema: replayed_table,
+                        indexes: vec![replayed_index],
+                    },
+                })
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 42,
+                    kind: WalRecordKind::Abort,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+
+            assert_ne!(old_table_storage_id, skipped_table_storage_id);
+            assert_ne!(old_index_storage_id, skipped_index_storage_id);
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let users_name = reopened
+            .components
+            .catalog
+            .get_index_by_name("users_name")
+            .unwrap()
+            .unwrap();
+        assert_ne!(users.storage_id, skipped_table_storage_id);
+        assert_ne!(users_name.storage_id, skipped_index_storage_id);
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_storage_id,
+            skipped_index_storage_id + 1,
+            "recovery must burn storage ids carried by skipped schema rewrites"
+        );
     }
 
     #[test]

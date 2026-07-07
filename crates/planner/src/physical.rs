@@ -31,6 +31,29 @@ pub enum PhysicalPlan {
         if_exists: bool,
         table: Option<TableId>,
     },
+    AlterTableAddColumn {
+        table: TableId,
+        table_name: String,
+        if_not_exists: bool,
+        column: ParsedColumnDef,
+    },
+    AlterTableDropColumn {
+        table: TableId,
+        table_name: String,
+        if_exists: bool,
+        column: String,
+    },
+    AlterTableRenameColumn {
+        table: TableId,
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterTableRenameTable {
+        table: TableId,
+        table_name: String,
+        new_name: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -45,6 +68,17 @@ pub enum PhysicalPlan {
         options: SequenceOptions,
     },
     DropSequence {
+        name: String,
+        if_exists: bool,
+    },
+    CreateView {
+        name: String,
+        or_replace: bool,
+        columns: Vec<String>,
+        query: crate::BoundQuery,
+        definition: String,
+    },
+    DropView {
         name: String,
         if_exists: bool,
     },
@@ -183,6 +217,48 @@ pub fn physical_plan(
             if_exists: *if_exists,
             table: *table,
         }),
+        LogicalPlan::AlterTableAddColumn {
+            table,
+            table_name,
+            if_not_exists,
+            column,
+        } => Ok(PhysicalPlan::AlterTableAddColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            if_not_exists: *if_not_exists,
+            column: column.clone(),
+        }),
+        LogicalPlan::AlterTableDropColumn {
+            table,
+            table_name,
+            if_exists,
+            column,
+        } => Ok(PhysicalPlan::AlterTableDropColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            if_exists: *if_exists,
+            column: column.clone(),
+        }),
+        LogicalPlan::AlterTableRenameColumn {
+            table,
+            table_name,
+            old_name,
+            new_name,
+        } => Ok(PhysicalPlan::AlterTableRenameColumn {
+            table: *table,
+            table_name: table_name.clone(),
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        }),
+        LogicalPlan::AlterTableRenameTable {
+            table,
+            table_name,
+            new_name,
+        } => Ok(PhysicalPlan::AlterTableRenameTable {
+            table: *table,
+            table_name: table_name.clone(),
+            new_name: new_name.clone(),
+        }),
         LogicalPlan::CreateIndex {
             name,
             table,
@@ -200,6 +276,23 @@ pub fn physical_plan(
             options: options.clone(),
         }),
         LogicalPlan::DropSequence { name, if_exists } => Ok(PhysicalPlan::DropSequence {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        LogicalPlan::CreateView {
+            name,
+            or_replace,
+            columns,
+            query,
+            definition,
+        } => Ok(PhysicalPlan::CreateView {
+            name: name.clone(),
+            or_replace: *or_replace,
+            columns: columns.clone(),
+            query: query.clone(),
+            definition: definition.clone(),
+        }),
+        LogicalPlan::DropView { name, if_exists } => Ok(PhysicalPlan::DropView {
             name: name.clone(),
             if_exists: *if_exists,
         }),
@@ -475,10 +568,16 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),
         PhysicalPlan::CreateTable { .. }
         | PhysicalPlan::DropTable { .. }
+        | PhysicalPlan::AlterTableAddColumn { .. }
+        | PhysicalPlan::AlterTableDropColumn { .. }
+        | PhysicalPlan::AlterTableRenameColumn { .. }
+        | PhysicalPlan::AlterTableRenameTable { .. }
         | PhysicalPlan::CreateIndex { .. }
         | PhysicalPlan::DropIndex { .. }
         | PhysicalPlan::CreateSequence { .. }
         | PhysicalPlan::DropSequence { .. }
+        | PhysicalPlan::CreateView { .. }
+        | PhysicalPlan::DropView { .. }
         | PhysicalPlan::Insert { .. }
         | PhysicalPlan::Update { .. }
         | PhysicalPlan::Delete { .. } => Err(common::DbError::internal(

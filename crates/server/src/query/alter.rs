@@ -638,10 +638,14 @@ impl QueryService {
                     .storage
                     .set_table_primary_key_logged(&schema, gc_horizon, txn_id)?;
                 self.components.wal.flush()?;
+                let committed_schema = self.components.catalog.add_table_primary_key_index(
+                    schema.id,
+                    schema.primary_key.clone(),
+                    index,
+                )?;
                 self.components
-                    .catalog
-                    .add_table_primary_key_index(schema.id, schema.primary_key.clone(), index)
-                    .map(|_| ())
+                    .storage
+                    .set_table_primary_key_metadata(&committed_schema)
             }
             PrimaryKeyAlterPostCommit::Drop {
                 txn_id,
@@ -649,15 +653,18 @@ impl QueryService {
                 index_id,
                 gc_horizon,
             } => {
-                self.components
+                let committed_schema = self
+                    .components
                     .catalog
                     .drop_table_primary_key_index(schema.id, index_id)?;
                 self.components
                     .ssi_manager
                     .promote_table_identity_locks_to_relation(schema.id);
-                self.components
-                    .storage
-                    .set_table_primary_key_logged(&schema, gc_horizon, txn_id)?;
+                self.components.storage.set_table_primary_key_logged(
+                    &committed_schema,
+                    gc_horizon,
+                    txn_id,
+                )?;
                 self.components.wal.flush()?;
                 self.components.storage.apply_drop_index(index_id)
             }

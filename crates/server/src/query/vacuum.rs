@@ -11,9 +11,9 @@ use super::{PreparedStatement, QueryService};
 use crate::app::ServerComponents;
 
 impl QueryService {
-    /// Run a prepared (extended-protocol) maintenance command (`VACUUM`,
-    /// `TRUNCATE`, or `ALTER TABLE ... SET (...)`). The statement carries no bound
-    /// payload — it is the raw maintenance `Statement` parsed at `prepare_sql` time.
+    /// Run a prepared (extended-protocol) maintenance command. The statement
+    /// carries no bound payload — it is the raw maintenance `Statement` parsed at
+    /// `prepare_sql` time.
     pub(super) fn run_prepared_maintenance(
         &self,
         prepared: &PreparedStatement,

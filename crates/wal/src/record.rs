@@ -20,6 +20,10 @@ pub enum WalRecordKind {
     DropTable {
         table: TableId,
     },
+    UpdateTableSchema {
+        schema: TableSchema,
+        indexes: Vec<IndexSchema>,
+    },
     CreateIndex {
         schema: IndexSchema,
     },

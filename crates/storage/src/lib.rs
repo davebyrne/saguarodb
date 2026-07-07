@@ -799,6 +799,44 @@ mod tests {
     }
 
     #[test]
+    fn set_table_primary_key_rebuilds_current_storage_generation() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut heap_schema = users_schema();
+        heap_schema.storage_id = 42;
+        heap_schema.primary_key.clear();
+        harness.storage.create_table(&ctx, &heap_schema).unwrap();
+        harness
+            .storage
+            .insert(&ctx, heap_schema.id, user_row(1, "Ada", true))
+            .unwrap();
+
+        let mut pk_schema = heap_schema.clone();
+        pk_schema.primary_key = vec![0];
+        harness
+            .storage
+            .validate_table_primary_key_change(&ctx, &pk_schema, u64::MAX)
+            .unwrap();
+        harness
+            .storage
+            .set_table_primary_key(&pk_schema, u64::MAX)
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, pk_schema.id, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Ada", true))
+        );
+        let err = harness
+            .storage
+            .insert(&ctx, pk_schema.id, user_row(1, "Duplicate", true))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
     fn logged_set_table_primary_key_emits_identity_index_fpis() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
@@ -2478,6 +2516,7 @@ mod tests {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
         let schema = integer_heavy_schema(1100);
+        harness.storage.create_table(&ctx, &schema).unwrap();
         let row = Row {
             values: (0..1100).map(Value::Integer).collect(),
         };
@@ -3901,6 +3940,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         }
     }
@@ -4016,6 +4056,7 @@ mod tests {
             toast: ToastOptions::legacy_catalog_default(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         }
     }
@@ -4068,6 +4109,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         };
         base.toast.min_value_size = 128;
@@ -4114,6 +4156,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: None,
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         }
     }
@@ -4151,6 +4194,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         };
         base.toast.min_value_size = 128;
@@ -4199,6 +4243,7 @@ mod tests {
             toast: ToastOptions::default_new_table(),
             toast_table_id: Some(2),
             relation_kind: RelationKind::User,
+            schema_version: common::INITIAL_SCHEMA_VERSION,
             checks: Vec::new(),
         };
         base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;

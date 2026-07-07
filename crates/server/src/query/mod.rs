@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -5,13 +6,14 @@ use std::sync::atomic::AtomicBool;
 use common::{
     CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, GucSetting, IsolationLevel,
     PgType, Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState,
-    SystemStateProvider, Value, WriteGuard,
+    SystemStateProvider, TableId, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
 use planner::{
-    BoundStatement, bind_parameterized, format_explain, logical_plan, mutates_sequences,
-    physical_plan, substitute_params,
+    BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery,
+    BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues, bind_parameterized,
+    format_explain, logical_plan, mutates_sequences, physical_plan, substitute_params,
 };
 use storage::RelationSnapshot;
 
@@ -33,7 +35,7 @@ mod vacuum;
 pub use copy::CopyInChunk;
 pub use gucs::SessionGucs;
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
-pub use stream::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+pub(crate) use stream::{CopySnapshots, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
 use txn::{CapturedSnapshots, ExecutionContextInput, StatementRuntime, TransactionSnapshots};
 pub(crate) use vacuum::full_vacuum_pass;
 
@@ -149,7 +151,7 @@ impl SystemStateProvider for QuerySystemState {
 /// The inner guards are held purely for their RAII `Drop` (they own the lock), never
 /// read — like `WriteGuard`/`CheckpointGuard`'s own `_guard` fields.
 #[allow(dead_code, reason = "guards are held for RAII Drop, never read")]
-enum WriteUnitGuard {
+pub(crate) enum WriteUnitGuard {
     Shared(WriteGuard),
     Exclusive(CheckpointGuard),
 }
@@ -388,11 +390,13 @@ impl QueryService {
         );
         let (slot, default_isolation, result) =
             self.dispatch(parsed, slot, default_isolation, &session, None);
-        (
-            slot,
-            default_isolation,
-            result.map(StreamOutcome::expect_direct),
-        )
+        let result = result.and_then(StreamOutcome::into_direct_result);
+        let slot = if result.is_err() {
+            mark_failed_on_error(slot)
+        } else {
+            slot
+        };
+        (slot, default_isolation, result)
     }
 
     /// The streaming counterpart of [`Self::execute_simple_with_session_sequences`]:
@@ -404,7 +408,7 @@ impl QueryService {
     /// the snapshot's GC-horizon advertisement and any transaction guard are held
     /// across the stream, exactly as on the materializing path
     /// (`docs/specs/streaming.md` §4, §5).
-    pub fn execute_simple_streamed(
+    pub(crate) fn execute_simple_streamed(
         &self,
         sql: &str,
         slot: Option<Transaction>,
@@ -481,6 +485,7 @@ impl QueryService {
                 sql: sql.to_string(),
                 class,
                 bound: None,
+                schema_versions: Vec::new(),
                 maintenance: None,
                 session_config: None,
                 param_pg_types: Vec::new(),
@@ -495,6 +500,7 @@ impl QueryService {
                 sql: sql.to_string(),
                 class,
                 bound: None,
+                schema_versions: Vec::new(),
                 maintenance: Some(statement),
                 session_config: None,
                 param_pg_types: Vec::new(),
@@ -507,17 +513,22 @@ impl QueryService {
                 sql: sql.to_string(),
                 class,
                 bound: None,
+                schema_versions: Vec::new(),
                 maintenance: None,
                 session_config: Some(statement),
                 param_pg_types: Vec::new(),
                 result_columns,
             });
         }
+        if let Some(err) = staged_schema_ddl_error(&statement) {
+            return Err(err);
+        }
         // The binder resolves parameter types as `DataType` (declared or inferred).
         let declared_data_types: Vec<Option<DataType>> = declared_param_types
             .iter()
             .map(|pg_type| pg_type.as_ref().map(PgType::data_type))
             .collect();
+        let _schema_guard = self.components.concurrency.begin_shared()?;
         let (bound, param_types) = bind_parameterized(
             &statement,
             self.components.catalog.as_ref(),
@@ -537,11 +548,13 @@ impl QueryService {
                     .unwrap_or_else(|| PgType::from(data_type))
             })
             .collect();
+        let schema_versions = prepared_schema_versions(&bound, self.components.catalog.as_ref())?;
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
             sql: sql.to_string(),
             class,
             bound: Some(bound),
+            schema_versions,
             maintenance: None,
             session_config: None,
             param_pg_types,
@@ -591,10 +604,10 @@ impl QueryService {
             IsolationLevel::default(),
             None,
         )
-        .map(StreamOutcome::expect_direct)
+        .and_then(StreamOutcome::into_direct_result)
     }
 
-    pub fn execute_prepared_cancelable_with_session_context(
+    pub(crate) fn execute_prepared_cancelable_with_session_context(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
@@ -620,26 +633,36 @@ impl QueryService {
         let bound = self.substitute_prepared_params(prepared, params)?;
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
-            StatementClass::Read => match class {
-                StatementClass::Read => self.autocommit_read(
-                    bound,
-                    session.statement_runtime(default_isolation, default_isolation),
-                    sink,
-                ),
-                // A read promoted to a write (e.g. `SELECT nextval(...)`) is
-                // materialized, not streamed.
-                StatementClass::Write => self
-                    .autocommit_bound_write(
-                        bound,
-                        session.statement_runtime(default_isolation, default_isolation),
-                    )
-                    .map(StreamOutcome::Direct),
-                _ => unreachable!("classify_bound only promotes reads to writes"),
-            },
+            StatementClass::Read => {
+                let captured = self.capture_consistent_snapshots(0)?;
+                match class {
+                    StatementClass::Read => {
+                        self.validate_prepared_schema_versions(&prepared.schema_versions)?;
+                        self.autocommit_read_with_snapshot(
+                            bound,
+                            session.statement_runtime(default_isolation, default_isolation),
+                            sink,
+                            captured,
+                        )
+                    }
+                    // A read promoted to a write (e.g. `SELECT nextval(...)`) is
+                    // materialized, not streamed.
+                    StatementClass::Write => self
+                        .autocommit_prepared_bound_write_with_snapshot(
+                            bound,
+                            session.statement_runtime(default_isolation, default_isolation),
+                            Some(&prepared.schema_versions),
+                            captured,
+                        )
+                        .map(StreamOutcome::Direct),
+                    _ => unreachable!("classify_bound only promotes reads to writes"),
+                }
+            }
             StatementClass::Write | StatementClass::Ddl => self
-                .autocommit_bound_write(
+                .autocommit_prepared_bound_write(
                     bound,
                     session.statement_runtime(default_isolation, default_isolation),
+                    Some(&prepared.schema_versions),
                 )
                 .map(StreamOutcome::Direct),
             StatementClass::Maintenance => {
@@ -672,7 +695,7 @@ impl QueryService {
     /// streams its rows through `row_tx` and returns [`StreamOutcome::Streamed`];
     /// everything else returns a non-streamed outcome. For the autocommit
     /// extended-protocol `Execute` path (`connection/extended.rs`).
-    pub fn execute_prepared_cancelable_streamed(
+    pub(crate) fn execute_prepared_cancelable_streamed(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
@@ -704,7 +727,7 @@ impl QueryService {
     /// Precondition: `slot` is `Some` (the connection only calls this with an open
     /// transaction; with no open transaction it uses the autocommit
     /// `execute_prepared_cancelable_with_session_context`).
-    pub fn execute_prepared_in_session_with_context(
+    pub(crate) fn execute_prepared_in_session_with_context(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
@@ -791,7 +814,10 @@ impl QueryService {
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
                     class,
-                    BindSource::Bound(bound),
+                    BindSource::Bound {
+                        bound,
+                        schema_versions: prepared.schema_versions.clone(),
+                    },
                     runtime,
                     sink,
                 );
@@ -804,25 +830,43 @@ impl QueryService {
                 let result = match prepared.class {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
+                        let captured = match self.capture_consistent_snapshots(0) {
+                            Ok(captured) => captured,
+                            Err(err) => return (None, default_isolation, Err(err)),
+                        };
                         match class {
-                            StatementClass::Read => self.autocommit_read(
-                                bound,
-                                session.statement_runtime(default_isolation, default_isolation),
-                                sink,
-                            ),
+                            StatementClass::Read => {
+                                match self
+                                    .validate_prepared_schema_versions(&prepared.schema_versions)
+                                {
+                                    Ok(()) => self.autocommit_read_with_snapshot(
+                                        bound,
+                                        session.statement_runtime(
+                                            default_isolation,
+                                            default_isolation,
+                                        ),
+                                        sink,
+                                        captured,
+                                    ),
+                                    Err(err) => Err(err),
+                                }
+                            }
                             StatementClass::Write => self
-                                .autocommit_bound_write(
+                                .autocommit_prepared_bound_write_with_snapshot(
                                     bound,
                                     session.statement_runtime(default_isolation, default_isolation),
+                                    Some(&prepared.schema_versions),
+                                    captured,
                                 )
                                 .map(StreamOutcome::Direct),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
                     StatementClass::Write | StatementClass::Ddl => self
-                        .autocommit_bound_write(
+                        .autocommit_prepared_bound_write(
                             bound,
                             session.statement_runtime(default_isolation, default_isolation),
+                            Some(&prepared.schema_versions),
                         )
                         .map(StreamOutcome::Direct),
                     StatementClass::Maintenance => {
@@ -855,7 +899,7 @@ impl QueryService {
     /// streams its rows through `row_tx`; every other statement returns
     /// a non-streamed outcome. For the in-transaction extended-protocol
     /// `Execute` path (`connection/extended.rs`).
-    pub fn execute_prepared_in_session_streamed(
+    pub(crate) fn execute_prepared_in_session_streamed(
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
@@ -897,6 +941,363 @@ impl QueryService {
             DbError::internal("prepared transaction-control statement has no bound payload")
         })?;
         substitute_params(bound, params)
+    }
+
+    pub(super) fn validate_prepared_schema_versions(
+        &self,
+        schema_versions: &[(TableId, u64)],
+    ) -> Result<()> {
+        for (table_id, prepared_version) in schema_versions {
+            let current = self
+                .components
+                .catalog
+                .get_table(*table_id)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            if current.schema_version != *prepared_version {
+                return Err(prepared_schema_changed_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_relation_snapshot_schema_versions(
+        &self,
+        relations: &dyn RelationSnapshot,
+        schema_versions: &[(TableId, u64)],
+        allow_missing_tables: bool,
+    ) -> Result<()> {
+        for (table_id, bound_version) in schema_versions {
+            match relations.table_schema_version(*table_id) {
+                Some(snapshot_version) if snapshot_version == *bound_version => {}
+                None if allow_missing_tables && relations.missing_tables_are_empty() => {}
+                _ => return Err(relation_snapshot_schema_changed_error(*table_id)),
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_current_schema_versions(
+        &self,
+        schema_versions: &[(TableId, u64)],
+    ) -> Result<()> {
+        for (table_id, bound_version) in schema_versions {
+            let current = self
+                .components
+                .catalog
+                .get_table(*table_id)?
+                .ok_or_else(|| relation_snapshot_schema_changed_error(*table_id))?;
+            if current.schema_version != *bound_version {
+                return Err(relation_snapshot_schema_changed_error(*table_id));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_relation_snapshot_current_for_write(
+        &self,
+        relations: &dyn RelationSnapshot,
+    ) -> Result<()> {
+        let current_epoch = self.components.storage.relation_epoch()?;
+        if relations.relation_epoch() != current_epoch {
+            return Err(DbError::execute(
+                SqlState::SerializationFailure,
+                "relation generation changed while statement snapshot was captured; retry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn prepared_schema_changed_error() -> DbError {
+    DbError::plan(
+        SqlState::FeatureNotSupported,
+        "cached plan must be reprepared after schema change",
+    )
+}
+
+fn relation_snapshot_schema_changed_error(table_id: TableId) -> DbError {
+    DbError::execute(
+        SqlState::SerializationFailure,
+        format!("table id {table_id} changed while statement snapshot was captured; retry"),
+    )
+}
+
+fn prepared_schema_versions(
+    bound: &BoundStatement,
+    catalog: &dyn catalog::CatalogManager,
+) -> Result<Vec<(TableId, u64)>> {
+    let mut tables = BTreeSet::new();
+    collect_bound_statement_tables(bound, &mut tables);
+    tables
+        .into_iter()
+        .map(|table_id| {
+            let schema = catalog
+                .get_table(table_id)?
+                .ok_or_else(prepared_schema_changed_error)?;
+            Ok((table_id, schema.schema_version))
+        })
+        .collect()
+}
+
+fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<TableId>) {
+    match bound {
+        BoundStatement::Query(query) => collect_query_tables(query, tables),
+        BoundStatement::Insert {
+            table,
+            source,
+            on_conflict,
+            returning,
+            default_exprs,
+            check_exprs,
+            ..
+        } => {
+            tables.insert(*table);
+            collect_insert_source_tables(source, tables);
+            if let Some(on_conflict) = on_conflict {
+                collect_on_conflict_tables(on_conflict, tables);
+            }
+            if let Some(returning) = returning {
+                collect_returning_tables(returning, tables);
+            }
+            for (_, expr) in default_exprs {
+                collect_expr_tables(expr, tables);
+            }
+            for expr in check_exprs {
+                collect_expr_tables(expr, tables);
+            }
+        }
+        BoundStatement::Update {
+            table,
+            assignments,
+            source,
+            returning,
+            check_exprs,
+        } => {
+            tables.insert(*table);
+            for (_, expr) in assignments {
+                collect_expr_tables(expr, tables);
+            }
+            collect_select_tables(source, tables);
+            if let Some(returning) = returning {
+                collect_returning_tables(returning, tables);
+            }
+            for expr in check_exprs {
+                collect_expr_tables(expr, tables);
+            }
+        }
+        BoundStatement::Delete {
+            table,
+            source,
+            returning,
+        } => {
+            tables.insert(*table);
+            collect_select_tables(source, tables);
+            if let Some(returning) = returning {
+                collect_returning_tables(returning, tables);
+            }
+        }
+        BoundStatement::Explain(inner) => collect_bound_statement_tables(inner, tables),
+        BoundStatement::AlterTableAddColumn { table, .. }
+        | BoundStatement::AlterTableDropColumn { table, .. }
+        | BoundStatement::AlterTableRenameColumn { table, .. }
+        | BoundStatement::AlterTableRenameTable { table, .. } => {
+            tables.insert(*table);
+        }
+        BoundStatement::CreateTable { .. }
+        | BoundStatement::DropTable { .. }
+        | BoundStatement::CreateIndex { .. }
+        | BoundStatement::DropIndex { .. }
+        | BoundStatement::CreateSequence { .. }
+        | BoundStatement::DropSequence { .. }
+        | BoundStatement::CreateView { .. }
+        | BoundStatement::DropView { .. } => {}
+        BoundStatement::Copy { table, .. } => {
+            tables.insert(*table);
+        }
+    }
+}
+
+fn collect_query_tables(query: &BoundQuery, tables: &mut BTreeSet<TableId>) {
+    match &query.body {
+        BoundQueryBody::Select(select) => collect_select_tables(select, tables),
+        BoundQueryBody::Values(values) => collect_values_tables(values, tables),
+        BoundQueryBody::SetOp(set_op) => {
+            collect_query_tables(&set_op.left, tables);
+            collect_query_tables(&set_op.right, tables);
+        }
+    }
+    for order_by in &query.order_by {
+        collect_expr_tables(&order_by.expr, tables);
+    }
+}
+
+fn collect_values_tables(values: &BoundValues, tables: &mut BTreeSet<TableId>) {
+    for expr in values.rows.iter().flatten() {
+        collect_expr_tables(expr, tables);
+    }
+}
+
+fn collect_select_tables(select: &BoundSelect, tables: &mut BTreeSet<TableId>) {
+    if let Some(distinct) = &select.distinct {
+        collect_distinct_tables(distinct, tables);
+    }
+    for item in &select.columns {
+        collect_expr_tables(&item.expr, tables);
+    }
+    if let Some(from) = &select.from {
+        collect_from_tables(from, tables);
+    }
+    if let Some(filter) = &select.filter {
+        collect_expr_tables(filter, tables);
+    }
+    for expr in &select.group_by {
+        collect_expr_tables(expr, tables);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_tables(having, tables);
+    }
+}
+
+fn collect_distinct_tables(distinct: &BoundDistinct, tables: &mut BTreeSet<TableId>) {
+    match distinct {
+        BoundDistinct::All => {}
+        BoundDistinct::On(exprs) => {
+            for expr in exprs {
+                collect_expr_tables(expr, tables);
+            }
+        }
+    }
+}
+
+fn collect_from_tables(from: &BoundFrom, tables: &mut BTreeSet<TableId>) {
+    match from {
+        BoundFrom::Table { table, .. } => {
+            tables.insert(*table);
+        }
+        BoundFrom::System { .. } => {}
+        BoundFrom::Derived { query, .. } => collect_query_tables(query, tables),
+        BoundFrom::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            collect_from_tables(left, tables);
+            collect_from_tables(right, tables);
+            if let Some(condition) = condition {
+                collect_expr_tables(condition, tables);
+            }
+        }
+    }
+}
+
+fn collect_insert_source_tables(source: &BoundInsertSource, tables: &mut BTreeSet<TableId>) {
+    match source {
+        BoundInsertSource::Values { rows, .. } => {
+            for expr in rows.iter().flatten() {
+                collect_expr_tables(expr, tables);
+            }
+        }
+        BoundInsertSource::Query(query) => collect_query_tables(query, tables),
+    }
+}
+
+fn collect_on_conflict_tables(on_conflict: &BoundOnConflict, tables: &mut BTreeSet<TableId>) {
+    match on_conflict {
+        BoundOnConflict::DoNothing { .. } => {}
+        BoundOnConflict::DoUpdate {
+            assignments,
+            filter,
+            ..
+        } => {
+            for (_, expr) in assignments {
+                collect_expr_tables(expr, tables);
+            }
+            if let Some(filter) = filter {
+                collect_expr_tables(filter, tables);
+            }
+        }
+    }
+}
+
+fn collect_returning_tables(returning: &BoundReturning, tables: &mut BTreeSet<TableId>) {
+    for expr in &returning.exprs {
+        collect_expr_tables(expr, tables);
+    }
+}
+
+fn collect_expr_tables(expr: &BoundExpr, tables: &mut BTreeSet<TableId>) {
+    match expr {
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::InputRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
+        | BoundExpr::AggregateCall { arg: None, .. }
+        | BoundExpr::LocalRef { .. } => {}
+        BoundExpr::BinaryOp { left, right, .. } => {
+            collect_expr_tables(left, tables);
+            collect_expr_tables(right, tables);
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::IsNotNull { expr, .. }
+        | BoundExpr::Cast { expr, .. } => collect_expr_tables(expr, tables),
+        BoundExpr::Function { args, .. } => {
+            for arg in args {
+                collect_expr_tables(arg, tables);
+            }
+        }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            collect_expr_tables(value, tables);
+            if let Some(is_called) = is_called {
+                collect_expr_tables(is_called, tables);
+            }
+        }
+        BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_tables(arg, tables),
+        BoundExpr::InList { expr, list, .. } => {
+            collect_expr_tables(expr, tables);
+            for item in list {
+                collect_expr_tables(item, tables);
+            }
+        }
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_tables(expr, tables);
+            collect_expr_tables(low, tables);
+            collect_expr_tables(high, tables);
+        }
+        BoundExpr::Like { expr, pattern, .. } => {
+            collect_expr_tables(expr, tables);
+            collect_expr_tables(pattern, tables);
+        }
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_tables(operand, tables);
+            }
+            for (when, then) in when_clauses {
+                collect_expr_tables(when, tables);
+                collect_expr_tables(then, tables);
+            }
+            if let Some(else_clause) = else_clause {
+                collect_expr_tables(else_clause, tables);
+            }
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            collect_query_tables(query, tables);
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            collect_expr_tables(expr, tables);
+            collect_query_tables(query, tables);
+        }
     }
 }
 
@@ -1058,7 +1459,10 @@ fn release_complete() -> ExecutionResult {
 /// already substituted).
 enum BindSource {
     Unbound(Statement),
-    Bound(BoundStatement),
+    Bound {
+        bound: BoundStatement,
+        schema_versions: Vec<(TableId, u64)>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1107,16 +1511,20 @@ enum StatementClass {
 
 /// A prepared extended-protocol statement that can be executed repeatedly with
 /// different parameter values. Most statements carry a bound relational payload;
-/// non-relational statements (transaction control, VACUUM, and session
+/// non-relational statements (transaction control, maintenance, and session
 /// configuration) carry their parsed statement/class instead and are dispatched
 /// through the session path without binding.
 pub struct PreparedStatement {
     sql: String,
     class: StatementClass,
     bound: Option<BoundStatement>,
-    /// The parsed maintenance statement (`VACUUM` or supported `ALTER TABLE`),
-    /// carried unbound for the `StatementClass::Maintenance` case so an
-    /// extended-protocol `Execute` can run it through `run_maintenance`.
+    /// Table schema versions captured at prepare time for cached data plans.
+    /// Executing the plan after any referenced table changes shape is rejected so
+    /// stale row slots and RowDescription metadata are never reused silently.
+    schema_versions: Vec<(TableId, u64)>,
+    /// The parsed maintenance statement, carried unbound for the
+    /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can
+    /// run it through `run_maintenance`.
     /// `None` for every other class.
     maintenance: Option<Statement>,
     /// The parsed session-configuration statement (`SET`/`RESET`/`SHOW`/
@@ -1149,10 +1557,9 @@ impl PreparedStatement {
         matches!(self.class, StatementClass::TransactionControl(_))
     }
 
-    /// Whether this is a maintenance command (`VACUUM` or supported `ALTER TABLE`).
-    /// The connection routes such an `Execute` through the
-    /// session path so it is rejected inside an open transaction block and
-    /// otherwise runs as a standalone maintenance unit.
+    /// Whether this is a maintenance command. The connection routes such an
+    /// `Execute` through the session path so it is rejected inside an open
+    /// transaction block and otherwise runs as a standalone maintenance unit.
     pub fn is_maintenance(&self) -> bool {
         matches!(self.class, StatementClass::Maintenance)
     }
@@ -1209,7 +1616,13 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::CreateIndex { .. }
         | Statement::DropIndex { .. }
         | Statement::CreateSequence { .. }
-        | Statement::DropSequence { .. } => Ok(StatementClass::Ddl),
+        | Statement::DropSequence { .. }
+        | Statement::AlterTableAddColumn { .. }
+        | Statement::AlterTableDropColumn { .. }
+        | Statement::AlterTableRenameColumn { .. }
+        | Statement::AlterTableRenameTable { .. }
+        | Statement::CreateView { .. }
+        | Statement::DropView { .. } => Ok(StatementClass::Ddl),
         Statement::Begin { isolation } => Ok(StatementClass::TransactionControl(
             TransactionControl::Begin(*isolation),
         )),
@@ -1241,6 +1654,19 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::ReleaseSavepoint { .. }
         | Statement::RollbackToSavepoint { .. } => Ok(StatementClass::Savepoint),
     }
+}
+
+fn staged_schema_ddl_error(statement: &Statement) -> Option<DbError> {
+    matches!(
+        statement,
+        Statement::CreateView { .. } | Statement::DropView { .. }
+    )
+    .then(|| {
+        DbError::plan(
+            SqlState::FeatureNotSupported,
+            "views are not implemented yet",
+        )
+    })
 }
 
 fn classify_bound(class: StatementClass, bound: &BoundStatement) -> StatementClass {
@@ -1289,10 +1715,10 @@ mod tests {
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
-    use storage::{HeapPageStore, PageBackedStorageEngine, StorageMode};
+    use storage::{HeapPageStore, PageBackedStorageEngine, StorageEngine, StorageMode};
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
-    use super::SessionTxnStatus;
+    use super::{SessionTxnStatus, slot_status};
     use crate::app::{AppState, ServerComponents};
     use crate::checkpoint::CheckpointState;
     use crate::config::Config;
@@ -1586,6 +2012,18 @@ mod tests {
             self.inner.list_tables()
         }
 
+        fn get_view_by_name(&self, name: &str) -> Result<Option<common::ViewSchema>> {
+            self.inner.get_view_by_name(name)
+        }
+
+        fn get_view(&self, id: TableId) -> Result<Option<common::ViewSchema>> {
+            self.inner.get_view(id)
+        }
+
+        fn list_views(&self) -> Result<Vec<common::ViewSchema>> {
+            self.inner.list_views()
+        }
+
         fn snapshot(&self) -> Result<CatalogSnapshot> {
             self.inner.snapshot()
         }
@@ -1601,6 +2039,19 @@ mod tests {
 
         fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
             self.inner.apply_create_table(schema)
+        }
+
+        fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()> {
+            self.inner.apply_update_table_schema(schema)
+        }
+
+        fn apply_update_table_and_index_schemas(
+            &self,
+            schema: TableSchema,
+            indexes: &[IndexSchema],
+        ) -> Result<()> {
+            self.inner
+                .apply_update_table_and_index_schemas(schema, indexes)
         }
 
         fn apply_drop_table(&self, id: TableId) -> Result<()> {
@@ -1639,6 +2090,47 @@ mod tests {
 
         fn drop_table(&self, id: TableId) -> Result<()> {
             self.inner.drop_table(id)
+        }
+
+        fn rename_table(&self, id: TableId, new_name: String) -> Result<TableSchema> {
+            self.inner.rename_table(id, new_name)
+        }
+
+        fn preflight_add_table_column(
+            &self,
+            id: TableId,
+            if_not_exists: bool,
+            column: &ParsedColumnDef,
+        ) -> Result<catalog::TableColumnAlteration> {
+            self.inner
+                .preflight_add_table_column(id, if_not_exists, column)
+        }
+
+        fn add_table_column(&self, id: TableId, column: ParsedColumnDef) -> Result<TableSchema> {
+            self.inner.add_table_column(id, column)
+        }
+
+        fn preflight_drop_table_column(
+            &self,
+            id: TableId,
+            if_exists: bool,
+            column: &str,
+        ) -> Result<catalog::TableColumnAlteration> {
+            self.inner
+                .preflight_drop_table_column(id, if_exists, column)
+        }
+
+        fn drop_table_column(&self, id: TableId, column: &str) -> Result<TableSchema> {
+            self.inner.drop_table_column(id, column)
+        }
+
+        fn rename_table_column(
+            &self,
+            id: TableId,
+            old_name: &str,
+            new_name: String,
+        ) -> Result<TableSchema> {
+            self.inner.rename_table_column(id, old_name, new_name)
         }
 
         fn set_table_compression(
@@ -1741,6 +2233,10 @@ mod tests {
             self.inner.apply_create_index(schema)
         }
 
+        fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()> {
+            self.inner.apply_update_index_schema(schema)
+        }
+
         fn apply_drop_index(&self, id: IndexId) -> Result<()> {
             self.inner.apply_drop_index(id)
         }
@@ -1807,6 +2303,44 @@ mod tests {
         fn drop_sequence(&self, id: SequenceId) -> Result<()> {
             self.inner.drop_sequence(id)
         }
+
+        fn apply_create_view(&self, schema: common::ViewSchema) -> Result<()> {
+            self.inner.apply_create_view(schema)
+        }
+
+        fn apply_replace_view(&self, schema: common::ViewSchema) -> Result<()> {
+            self.inner.apply_replace_view(schema)
+        }
+
+        fn apply_drop_view(&self, id: TableId) -> Result<()> {
+            self.inner.apply_drop_view(id)
+        }
+
+        fn create_view(
+            &self,
+            name: String,
+            columns: Vec<common::ViewColumn>,
+            definition: String,
+            dependencies: Vec<common::ViewDependency>,
+        ) -> Result<common::ViewSchema> {
+            self.inner
+                .create_view(name, columns, definition, dependencies)
+        }
+
+        fn replace_view(
+            &self,
+            id: TableId,
+            columns: Vec<common::ViewColumn>,
+            definition: String,
+            dependencies: Vec<common::ViewDependency>,
+        ) -> Result<common::ViewSchema> {
+            self.inner
+                .replace_view(id, columns, definition, dependencies)
+        }
+
+        fn drop_view(&self, id: TableId) -> Result<()> {
+            self.inner.drop_view(id)
+        }
     }
 
     #[test]
@@ -1848,6 +2382,85 @@ mod tests {
             .then_some(())
             .expect("snapshot capture failed after relation gate released");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_capture_drops_relation_gate_while_waiting_for_schema_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        let exclusion = app.components.active_txns.begin_snapshot_exclusion();
+        let service = app.query_service.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = service.capture_consistent_snapshots(0).is_ok();
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot capture thread did not start");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "snapshot capture should wait while schema exclusion is active"
+        );
+        let publish_write = app
+            .components
+            .relation_publish_gate
+            .try_write()
+            .expect("snapshot waiter must not hold the relation publish read gate");
+        drop(publish_write);
+
+        drop(exclusion);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot capture did not resume after schema exclusion released")
+            .then_some(())
+            .expect("snapshot capture failed after schema exclusion released");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn direct_query_helpers_reject_copy_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table t (id integer primary key)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("copy t from stdin")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(
+            err.message.contains("COPY requires"),
+            "unexpected error message: {}",
+            err.message
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (slot, begin) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        begin.expect("BEGIN should succeed");
+        let (slot, err) =
+            app.query_service
+                .execute_simple_default("copy t from stdin", slot, &cancel);
+        assert_eq!(err.unwrap_err().code, SqlState::FeatureNotSupported);
+        assert_eq!(slot_status(&slot), SessionTxnStatus::Failed);
     }
 
     #[test]
@@ -1978,6 +2591,74 @@ mod tests {
     }
 
     #[test]
+    fn autocommit_copy_from_acquires_writer_guard_before_protocol_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let begin_writer_calls = Arc::new(AtomicUsize::new(0));
+        let begin_checkpoint_calls = Arc::new(AtomicUsize::new(0));
+        let unguarded_lookup = Arc::new(AtomicBool::new(false));
+        let restore_calls = Arc::new(AtomicUsize::new(0));
+        let catalog: Arc<dyn CatalogManager> = Arc::new(RecordingCatalog::new(
+            begin_writer_calls.clone(),
+            unguarded_lookup,
+            restore_calls,
+        ));
+        let concurrency: Arc<dyn ConcurrencyController> = Arc::new(RecordingConcurrency::new(
+            begin_writer_calls.clone(),
+            begin_checkpoint_calls,
+        ));
+        let config = Config {
+            checkpoint_every_n_commits: u64::MAX,
+            checkpoint_wal_bytes: u64::MAX,
+            ..Config::default()
+        };
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            config,
+            catalog,
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            concurrency,
+        );
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+
+        begin_writer_calls.store(0, Ordering::SeqCst);
+        let session = super::QuerySessionContext::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+            Arc::new(super::SessionGucs::default()),
+        );
+        let statement = parser::parse("copy users from stdin").unwrap();
+        let (slot, _, result) = app.query_service.dispatch(
+            statement,
+            None,
+            IsolationLevel::ReadCommitted,
+            &session,
+            None,
+        );
+
+        assert!(
+            slot.is_none(),
+            "autocommit COPY should not open a session txn"
+        );
+        assert!(
+            matches!(result.unwrap(), super::StreamOutcome::BeginCopyIn { .. }),
+            "COPY FROM should enter protocol mode only after validation succeeds"
+        );
+        assert_eq!(
+            begin_writer_calls.load(Ordering::SeqCst),
+            1,
+            "autocommit COPY FROM must hold the writer guard before CopyInResponse"
+        );
+    }
+
+    #[test]
     fn autocommit_ddl_uses_exclusive_guard_and_dml_uses_shared_guard() {
         let dir = tempfile::tempdir().unwrap();
         let begin_writer_calls = Arc::new(AtomicUsize::new(0));
@@ -2039,6 +2720,102 @@ mod tests {
             begin_checkpoint_calls.load(Ordering::SeqCst),
             0,
             "DML should not serialize through the exclusive guard"
+        );
+    }
+
+    #[test]
+    fn staged_schema_ddl_views_reject_and_truncate_executes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        let view_sql = "create view v as select * from missing_table";
+        let simple_err = app.query_service.execute_sql(view_sql).unwrap_err();
+        assert_eq!(simple_err.code, SqlState::FeatureNotSupported);
+        assert!(simple_err.message.contains("views are not implemented yet"));
+
+        let prepared_err = match app.query_service.prepare_sql(view_sql, &[]) {
+            Ok(_) => panic!("expected prepare to reject {view_sql}"),
+            Err(err) => err,
+        };
+        assert_eq!(prepared_err.code, SqlState::FeatureNotSupported);
+        assert!(
+            prepared_err
+                .message
+                .contains("views are not implemented yet")
+        );
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada'), (2, 'Grace')")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users add column active boolean default true")
+            .unwrap();
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select id, active from users order by id")
+            ),
+            vec![
+                vec![Value::Integer(1), Value::Boolean(true)],
+                vec![Value::Integer(2), Value::Boolean(true)],
+            ]
+        );
+        let prepared_alter = app
+            .query_service
+            .prepare_sql("alter table users rename column active to enabled", &[])
+            .unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_prepared(&prepared_alter, &[])
+                .unwrap(),
+            ExecutionResult::Modified {
+                command: "ALTER TABLE".to_string(),
+                count: 0,
+            }
+        );
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select enabled from users order by id")
+            ),
+            vec![vec![Value::Boolean(true)], vec![Value::Boolean(true)]]
+        );
+
+        let truncate_sql = "truncate users";
+        let simple = app.query_service.execute_sql(truncate_sql).unwrap();
+        assert_eq!(
+            simple,
+            ExecutionResult::Modified {
+                command: "TRUNCATE TABLE".to_string(),
+                count: 0,
+            }
+        );
+        assert_eq!(
+            row_count(app.query_service.execute_sql("select id from users")),
+            0
+        );
+
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Bea')")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql(truncate_sql, &[])
+            .expect("TRUNCATE prepares as staged maintenance");
+        let prepared_result = app.query_service.execute_prepared(&prepared, &[]).unwrap();
+        assert_eq!(
+            prepared_result,
+            ExecutionResult::Modified {
+                command: "TRUNCATE TABLE".to_string(),
+                count: 0,
+            }
+        );
+        assert_eq!(
+            row_count(app.query_service.execute_sql("select id from users")),
+            0
         );
     }
 
@@ -3508,6 +4285,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_data_plan_rejects_schema_change_before_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let prepared_select = app
+            .query_service
+            .prepare_sql("select name from users where id = $1", &[])
+            .unwrap();
+        let prepared_insert = app
+            .query_service
+            .prepare_sql("insert into users (id, name) values ($1, $2)", &[])
+            .unwrap();
+
+        app.query_service
+            .execute_sql("alter table users add column email text")
+            .unwrap();
+
+        let select_err = app
+            .query_service
+            .execute_prepared(&prepared_select, &[Value::Integer(1)])
+            .unwrap_err();
+        assert_eq!(select_err.code, SqlState::FeatureNotSupported);
+        assert!(
+            select_err
+                .message
+                .contains("cached plan must be reprepared"),
+            "message was: {}",
+            select_err.message
+        );
+
+        let insert_err = app
+            .query_service
+            .execute_prepared(
+                &prepared_insert,
+                &[Value::Integer(2), Value::Text("Bo".to_string())],
+            )
+            .unwrap_err();
+        assert_eq!(insert_err.code, SqlState::FeatureNotSupported);
+        assert!(
+            insert_err
+                .message
+                .contains("cached plan must be reprepared"),
+            "message was: {}",
+            insert_err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_snapshot_schema_mismatch_is_retryable_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        let old_relations = app.components.storage.capture_relation_snapshot().unwrap();
+
+        app.query_service
+            .execute_sql("alter table users add column name text")
+            .unwrap();
+
+        let statement = parser::parse("select name from users").unwrap();
+        let bound = planner::bind(&statement, app.components.catalog.as_ref()).unwrap();
+        let schema_versions =
+            super::prepared_schema_versions(&bound, app.components.catalog.as_ref()).unwrap();
+        let err = app
+            .query_service
+            .validate_relation_snapshot_schema_versions(
+                old_relations.as_ref(),
+                &schema_versions,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::SerializationFailure);
+
+        let copy_statement = parser::parse("copy users to stdout").unwrap();
+        let copy_bound = planner::bind(&copy_statement, app.components.catalog.as_ref()).unwrap();
+        let copy_schema_versions =
+            super::prepared_schema_versions(&copy_bound, app.components.catalog.as_ref()).unwrap();
+        assert_eq!(
+            copy_schema_versions, schema_versions,
+            "COPY must validate the target table against the captured relation snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn prepared_insert_with_parameters_commits() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -3583,6 +4451,33 @@ mod tests {
             app.query_service.execute_sql("select id from users"),
             Ok(ExecutionResult::Query { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_schema_alter_rejects_dropped_recreated_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("alter table users drop column name", &[])
+            .unwrap();
+
+        app.query_service.execute_sql("drop table users").unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text, email text)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        app.query_service
+            .execute_sql("insert into users (id, name, email) values (1, 'Ada', 'a@b')")
+            .expect("prepared ALTER must not retarget the recreated table");
     }
 
     #[tokio::test]
@@ -3671,7 +4566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_targetless_on_conflict_without_pk_keeps_no_arbiter() {
+    async fn prepared_targetless_on_conflict_without_pk_rejects_schema_change() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
         app.query_service
@@ -3696,7 +4591,7 @@ mod tests {
             .query_service
             .execute_prepared(&prepared, &[])
             .unwrap_err();
-        assert_eq!(err.code, SqlState::UniqueViolation);
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
     }
 
     #[tokio::test]

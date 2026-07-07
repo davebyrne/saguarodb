@@ -377,26 +377,49 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// matches every row sharing the indexed value. Entries are returned with their
     /// full key.
     pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, V)>> {
+        let mut out = Vec::new();
+        self.range_for_each(range, |key, value| {
+            out.push((key, value));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit entries within `range` in `(key, value)` order, buffering only one
+    /// leaf page at a time so callers can process large ranges without building
+    /// one table-sized vector.
+    pub(crate) fn range_for_each<F>(&self, range: &KeyRange, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(Key, V) -> Result<()>,
+    {
         let prefix_len = comparison_prefix_len(range);
         let mut page_num = self.start_leaf(range)?;
-        let mut out = Vec::new();
         loop {
-            let guard = self.buffer.read_page(self.file_id, page_num)?;
-            let data = guard.data();
-            for pos in 0..index_page::entry_count(data) {
-                let (full, value) = leaf_key_value(data, pos)?;
-                let probe = prefix_of(&full, prefix_len);
-                let compared = probe.as_ref().unwrap_or(&full);
-                if beyond_end(compared, range) {
-                    return Ok(out);
+            let (entries, next, done) = {
+                let guard = self.buffer.read_page(self.file_id, page_num)?;
+                let data = guard.data();
+                let mut entries = Vec::new();
+                let mut done = false;
+                for pos in 0..index_page::entry_count(data) {
+                    let (full, value) = leaf_key_value(data, pos)?;
+                    let probe = prefix_of(&full, prefix_len);
+                    let compared = probe.as_ref().unwrap_or(&full);
+                    if beyond_end(compared, range) {
+                        done = true;
+                        break;
+                    }
+                    if key_in_range(compared, range) {
+                        entries.push((full, V::decode(value)?));
+                    }
                 }
-                if key_in_range(compared, range) {
-                    out.push((full, V::decode(value)?));
-                }
+                (entries, index_page::link(data), done)
+            };
+
+            for (key, value) in entries {
+                visitor(key, value)?;
             }
-            let next = index_page::link(data);
-            if next == 0 {
-                return Ok(out);
+            if done || next == 0 {
+                return Ok(());
             }
             page_num = next;
         }

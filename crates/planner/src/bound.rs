@@ -1,7 +1,7 @@
 use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    IndexId, ParsedColumnDef, SequenceOptions, TableId, ToastOptions,
+    IndexId, ParsedColumnDef, SequenceOptions, TableId, TableSchema, ToastOptions,
 };
 use parser::SetOp;
 
@@ -142,6 +142,29 @@ pub enum BoundStatement {
         if_exists: bool,
         table: Option<TableId>,
     },
+    AlterTableAddColumn {
+        table: TableId,
+        table_name: String,
+        if_not_exists: bool,
+        column: ParsedColumnDef,
+    },
+    AlterTableDropColumn {
+        table: TableId,
+        table_name: String,
+        if_exists: bool,
+        column: String,
+    },
+    AlterTableRenameColumn {
+        table: TableId,
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterTableRenameTable {
+        table: TableId,
+        table_name: String,
+        new_name: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -156,6 +179,17 @@ pub enum BoundStatement {
         options: SequenceOptions,
     },
     DropSequence {
+        name: String,
+        if_exists: bool,
+    },
+    CreateView {
+        name: String,
+        or_replace: bool,
+        columns: Vec<String>,
+        query: BoundQuery,
+        definition: String,
+    },
+    DropView {
         name: String,
         if_exists: bool,
     },
@@ -198,6 +232,7 @@ pub enum BoundStatement {
     /// See `docs/specs/copy.md`.
     Copy {
         table: TableId,
+        table_schema: TableSchema,
         columns: Vec<ColumnId>,
         direction: CopyDirection,
         options: CopyOptions,

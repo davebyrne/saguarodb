@@ -2031,7 +2031,7 @@ mod tests {
             let pool = pool.clone();
             let barrier = barrier.clone();
             handles.push(thread::spawn(move || {
-                let file_id: FileId = t; // disjoint file per thread (distinct page space)
+                let file_id: FileId = FileId::from(t); // disjoint file per thread (distinct page space)
                 let txn = u64::from(t) + 1;
                 barrier.wait();
                 let mut pages = Vec::new();

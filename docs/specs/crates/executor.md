@@ -99,8 +99,8 @@ impl QueryEngine {
 
 | Operator | Behavior |
 |---|---|
-| `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present |
-| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a secondary index chosen from the current catalog is unavailable for the retained relation snapshot, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
+| `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present. If the relation snapshot explicitly marks missing catalog-resolved tables as empty, an `UndefinedTable` scan result opens an empty iterator instead of reading current relation files |
+| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a secondary index chosen from the current catalog is unavailable for the retained relation snapshot, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. If that fallback scan or a primary-key range scan hits a relation snapshot that explicitly marks missing catalog-resolved tables as empty, opens an empty iterator. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
 | `SystemScanOp` | Materializes rows for a virtual `pg_catalog`/`information_schema` system view from catalog metadata, the static registry, and `StatementContext.system_state`; applies scan filter if present; emits rows with no identity |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
@@ -111,6 +111,12 @@ impl QueryEngine {
 | `LimitOp` | Skips offset, emits count rows, preserves identity |
 | `AggregateOp` | Groups input by the `GROUP BY` expressions (a single group when there is none), emits one row per group, de-duplicates `DISTINCT` aggregate arguments, clears identity |
 | `ValuesOp` | Emits literal rows, identity is `None` |
+
+`COPY TO` uses the same table scan and row decoding as SELECT, then formats the
+requested columns with the COPY text/CSV encoder. If a retained transaction
+snapshot explicitly marks missing catalog-resolved tables as empty, `COPY TO`
+opens an empty iterator just like `SeqScanOp` instead of reading current relation
+files.
 
 ## Identity Rules
 
@@ -194,15 +200,15 @@ Each subquery's bound SELECT is planned (`logical_plan` + `physical_plan`) and e
 `INSERT` (from `VALUES` or `SELECT`):
 
 - Materialize the source plan fully before inserting any row, so that `INSERT ... SELECT` reading the target table observes only pre-insert rows.
-- For each source row, build row values in table column order. Omitted columns use their catalog default: `ColumnDefault::Const(value)` clones the constant, `ColumnDefault::Nextval(sequence_id)` advances the sequence through `StatementContext.sequence_manager` and records the value for `currval`, and `ColumnDefault::Expr` evaluates the bound default expression the binder attached to the INSERT over an empty row (the expression cannot reference columns); no default yields `NULL`. (COPY FROM supplies the same bound expression defaults — the binder attaches them to `BoundStatement::Copy` for the omitted columns — so an omitted `ColumnDefault::Expr` column is evaluated per row under COPY too.)
+- For each source row, build row values in table column order. Omitted columns use their bound table schema default: `ColumnDefault::Const(value)` clones the constant, `ColumnDefault::Nextval(sequence_id)` advances the sequence through `StatementContext.sequence_manager` and records the value for `currval`, and `ColumnDefault::Expr` evaluates the bound default expression the binder attached to the INSERT over an empty row (the expression cannot reference columns); no default yields `NULL`. (COPY FROM supplies the same bound table schema and expression defaults — the binder attaches them to `BoundStatement::Copy` for the omitted columns — so an omitted `ColumnDefault::Expr` column is evaluated per row under COPY too.)
 - Validate runtime values match destination column types. `NULL` is accepted at this step and checked by row-constraint validation.
 - Coerce `NUMERIC(p, s)` column values to the column scale (`coerce_numeric_columns`): each `Value::Numeric` is rounded to `s` (half away from zero) and rejected with `SqlState::NumericValueOutOfRange` when the integer part exceeds `p - s` digits. Bare `NUMERIC` columns and non-numeric values are unchanged. Runs before constraint validation, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, and `COPY ... FROM`.
 - Validate per-column row constraints (`validate_row_constraints`): non-null, and the bounded character-type length — a `Text` value whose character count exceeds a column's `max_length` (`VARCHAR(n)`/`CHAR(n)`) is rejected with `SqlState::StringDataRightTruncation` (`22001`). This runs on the full row, so it covers `INSERT ... VALUES`, `INSERT ... SELECT`, and `COPY ... FROM`.
-- Validate `CHECK` constraints (`validate_check_constraints`) over the full proposed row, using the bound `CHECK` expressions the binder attached to the INSERT: each constraint that evaluates to `false` is rejected with `SqlState::CheckViolation` (`23514`); a `true` or `NULL` (unknown) result passes. This runs before conflict arbitration, so a proposed row that violates a check is rejected even under `ON CONFLICT DO NOTHING` (matching PostgreSQL). `COPY ... FROM` enforces the same checks per row (the binder attaches the table's bound `CHECK` expressions to `BoundStatement::Copy`), aborting the whole COPY on a violation.
+- Validate `CHECK` constraints (`validate_check_constraints`) over the full proposed row, using the bound `CHECK` expressions the binder attached to the INSERT: each constraint that evaluates to `false` is rejected with `SqlState::CheckViolation` (`23514`); a `true` or `NULL` (unknown) result passes. This runs before conflict arbitration, so a proposed row that violates a check is rejected even under `ON CONFLICT DO NOTHING` (matching PostgreSQL). `COPY ... FROM` enforces the same checks per row (the binder attaches the bound table schema and `CHECK` expressions to `BoundStatement::Copy`), aborting the whole COPY on a violation.
 - Call `StorageEngine::insert`.
 - Return `Modified { command: "INSERT", count }`.
 
-`INSERT ... ON CONFLICT` (arbiter = primary key): before executing, any bound conflict arbiter is rechecked against the current table primary key, so a prepared statement whose arbiter no longer matches primary-key DDL is rejected with `FeatureNotSupported` rather than silently using a different arbiter. For each source row, build the full insert row, then probe the visible row at the proposed primary key through storage's identity lookup (snapshot visibility, so the statement's own earlier inserts are seen — a duplicate key within one multi-row INSERT is caught). On a conflict: `DO NOTHING` skips the row (not counted, no `RETURNING` row); `DO UPDATE` evaluates the assignment values and optional `WHERE` over the combined `existing ++ proposed` row (`excluded.<col>` is the proposed row), and — when the `WHERE` passes — writes the new row via `StorageEngine::update` (counted toward `INSERT 0 n`, and projected by `RETURNING`). With no conflict the row is inserted normally. The arbiter is the primary key only: a conflict on a unique **secondary** index is not arbitrated here and surfaces as a `UniqueViolation` (`23505`) from `insert`, aborting the statement. On a table with no primary key at bind time, targetless `DO NOTHING` has no conflict arbiter and therefore attempts the insert normally even if a primary key is added before prepared execution.
+`INSERT ... ON CONFLICT` (arbiter = primary key): before executing, any bound conflict arbiter is rechecked against the current table primary key, so a prepared statement whose arbiter no longer matches primary-key DDL is rejected with `FeatureNotSupported` rather than silently using a different arbiter. Prepared statements also carry referenced table schema versions, so primary-key DDL after prepare rejects the cached plan even when targetless `DO NOTHING` originally bound with no arbiter. For each source row, build the full insert row, then probe the visible row at the proposed primary key through storage's identity lookup (snapshot visibility, so the statement's own earlier inserts are seen — a duplicate key within one multi-row INSERT is caught). On a conflict: `DO NOTHING` skips the row (not counted, no `RETURNING` row); `DO UPDATE` evaluates the assignment values and optional `WHERE` over the combined `existing ++ proposed` row (`excluded.<col>` is the proposed row), and — when the `WHERE` passes — writes the new row via `StorageEngine::update` (counted toward `INSERT 0 n`, and projected by `RETURNING`). With no conflict the row is inserted normally. The arbiter is the primary key only: a conflict on a unique **secondary** index is not arbitrated here and surfaces as a `UniqueViolation` (`23505`) from `insert`, aborting the statement. A non-prepared statement on a table with no primary key has no conflict arbiter for targetless `DO NOTHING` and therefore attempts the insert normally.
 
 `UPDATE`:
 
@@ -281,6 +287,32 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - `SchemaOperations::drop_index` appends the `DropIndex` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "DROP INDEX", count: 0 }`.
 
+`ALTER TABLE` schema evolution:
+
+- `RENAME TO` and `RENAME COLUMN` are metadata-only. The executor calls the
+  catalog rename helper, fetches the table's secondary indexes, then calls
+  `SchemaOperations::update_table_schema`, which appends `UpdateTableSchema`.
+- `ADD COLUMN` and `DROP COLUMN` first run catalog preflight. No-op conditional
+  statements return the normal `ALTER TABLE` command tag without scanning rows
+  or mutating storage.
+- Real ADD/DROP rewrites apply the catalog schema change, allocate fresh storage
+  ids with the catalog update helpers, call `SchemaOperations::update_table_schema`
+  to log `UpdateTableSchema` before publishing empty replacement heap/index files,
+  then stream visible rows from the retained old relation snapshot through
+  `StorageEngine::for_each_visible_row` into the replacement relation. The
+  page-backed engine walks the old identity B-tree one leaf page at a time instead
+  of materializing the table in executor memory. ADD backfills the new column from
+  its default (`NULL`, constant, sequence `nextval`, or bound expression default);
+  DROP removes the dropped column position from every row.
+
+`CREATE VIEW` / `DROP VIEW`:
+
+- The parser, binder, and planner carry view DDL through bound/logical/physical
+  plan forms, but normal server execution rejects user view DDL with
+  `SqlState::FeatureNotSupported` before binding/planning until view execution
+  support lands. System catalog views are a separate virtual scan path and are
+  implemented.
+
 `CREATE SEQUENCE`:
 
 - Server query orchestration acquires the DDL guard before execution.
@@ -306,7 +338,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, schema-evolution ALTER TABLE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

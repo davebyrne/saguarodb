@@ -1,5 +1,9 @@
 mod support;
 
+use std::time::Duration;
+
+use common::SqlState;
+
 use support::{Connection, TestServer};
 
 async fn server_with_table() -> (TestServer, Connection) {
@@ -151,6 +155,69 @@ async fn copy_to_stdout_text_and_csv() {
 }
 
 #[tokio::test]
+async fn repeatable_read_copy_to_newer_catalog_table_is_empty() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table snapshot_anchor (id integer primary key)")
+        .await;
+
+    let mut reader = Connection::connect(&server).await.unwrap();
+    reader.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        reader
+            .ok("select count(*) from snapshot_anchor")
+            .await
+            .rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+
+    setup
+        .ok("create table copied_later (id integer primary key, name text)")
+        .await;
+    setup
+        .ok("insert into copied_later (id, name) values (1, 'ann')")
+        .await;
+
+    let (data, copy) = reader.copy_to("copy copied_later to stdout").await.unwrap();
+    assert!(data.is_empty());
+    assert_eq!(copy.command_tag.as_deref(), Some("COPY 0"));
+    reader.ok("rollback").await;
+}
+
+#[tokio::test]
+async fn repeatable_read_copy_from_newer_catalog_table_is_rejected_before_copy_mode() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table snapshot_anchor (id integer primary key)")
+        .await;
+
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        writer
+            .ok("select count(*) from snapshot_anchor")
+            .await
+            .rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+
+    setup
+        .ok("create table copied_later (id integer primary key)")
+        .await;
+
+    let outcome = writer.query("copy copied_later from stdin").await.unwrap();
+    let err = match outcome.result {
+        Ok(_) => panic!("COPY FROM should be rejected before CopyInResponse"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, SqlState::SerializationFailure);
+    assert_eq!(outcome.status, b'E');
+    writer.ok("rollback").await;
+}
+
+#[tokio::test]
 async fn copy_from_round_trips_through_copy_to() {
     let (_server, mut conn) = server_with_table().await;
     let payload: &[u8] = b"10\thello world\n11\ttab\\there\n12\t\\N\n";
@@ -293,6 +360,43 @@ async fn copy_from_inside_transaction_commits_and_rolls_back() {
     conn.ok("commit").await;
     let rows = conn.ok("select name from t where id = 6").await.rows();
     assert_eq!(rows, vec![vec![Some("frank".to_string())]]);
+}
+
+#[tokio::test]
+async fn disconnect_mid_transaction_copy_from_aborts_transaction() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (id integer primary key, name text)")
+        .await;
+
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("begin").await;
+    conn.begin_copy_from("copy t (id, name) from stdin")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.active_txn_count(),
+        1,
+        "transaction should be active while COPY is open"
+    );
+
+    conn.close().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server.active_txn_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disconnect should abort the transaction owned by the COPY task");
+
+    assert!(
+        setup.ok("select id from t").await.rows().is_empty(),
+        "aborted COPY transaction should not leave rows visible"
+    );
 }
 
 #[tokio::test]

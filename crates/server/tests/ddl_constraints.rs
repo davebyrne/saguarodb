@@ -575,6 +575,46 @@ async fn check_constraint_invalid_at_create() {
         "expected FeatureNotSupported: {}",
         err.message
     );
+
+    let err = server
+        .simple_query("create table qualified_check (id integer, check (qualified_check.id > 0))")
+        .await
+        .err()
+        .expect("table-qualified check references should fail");
+    assert!(
+        err.message.contains("0A000"),
+        "expected FeatureNotSupported: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn rename_table_with_check_constraint_keeps_constraint_enforced() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, check (id > 0))")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("alter table users rename to accounts")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into accounts (id) values (1)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("insert into accounts (id) values (0)")
+        .await
+        .err()
+        .expect("renamed table should keep enforcing CHECK constraints");
+    assert!(
+        err.message.contains("23514"),
+        "expected CheckViolation: {}",
+        err.message
+    );
 }
 
 /// A `CHECK` constraint survives a restart (replayed from the durable catalog /

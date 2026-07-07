@@ -24,14 +24,25 @@ pub fn parse_expression(sql: &str) -> Result<Expr> {
 mod tests {
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        SequenceOptions, SqlState, TableOptionPatch, ToastCompression, ToastMode, ToastOptionPatch,
-        Value,
+        ParsedColumnDef, ParsedDefault, PgType, SequenceOptions, SqlState, TableOptionPatch,
+        ToastCompression, ToastMode, ToastOptionPatch, Value,
     };
 
     use crate::{
         Assignment, BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody,
         SelectItem, SetOp, SetScope, Statement, UnaryOp, parse,
     };
+
+    fn id_column() -> ParsedColumnDef {
+        ParsedColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Integer,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: Some(PgType::Int4),
+        }
+    }
 
     #[test]
     fn rejects_multiple_statements() {
@@ -242,6 +253,125 @@ mod tests {
         };
         assert!(
             matches!(inner.from.as_slice(), [FromItem::Table { name, .. }] if name == "accounts")
+        );
+    }
+
+    #[test]
+    fn parses_schema_evolution_ddl_surface() {
+        assert_eq!(
+            parse("alter table users add column if not exists age integer").unwrap(),
+            Statement::AlterTableAddColumn {
+                table: "users".to_string(),
+                if_not_exists: true,
+                column: ParsedColumnDef {
+                    name: "age".to_string(),
+                    ..id_column()
+                },
+            }
+        );
+
+        assert_eq!(
+            parse("alter table users drop column if exists age").unwrap(),
+            Statement::AlterTableDropColumn {
+                table: "users".to_string(),
+                if_exists: true,
+                column: "age".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse("alter table users add column nickname text not null default 'anon'").unwrap(),
+            Statement::AlterTableAddColumn {
+                table: "users".to_string(),
+                if_not_exists: false,
+                column: ParsedColumnDef {
+                    name: "nickname".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    max_length: None,
+                    default: Some(ParsedDefault::Const(Value::Text("anon".to_string()))),
+                    pg_type: Some(PgType::Text),
+                },
+            }
+        );
+
+        assert_eq!(
+            parse("alter table users rename column full_name to name").unwrap(),
+            Statement::AlterTableRenameColumn {
+                table: "users".to_string(),
+                old_name: "full_name".to_string(),
+                new_name: "name".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse("alter table users rename to accounts").unwrap(),
+            Statement::AlterTableRenameTable {
+                table: "users".to_string(),
+                new_name: "accounts".to_string(),
+            }
+        );
+
+        assert_eq!(
+            parse("truncate table users").unwrap(),
+            Statement::Truncate {
+                table: "users".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_view_ddl_surface() {
+        let statement =
+            parse("create or replace view active_users (id, name) as select id, name from users")
+                .unwrap();
+        match statement {
+            Statement::CreateView {
+                name,
+                or_replace,
+                columns,
+                query,
+                definition,
+            } => {
+                assert_eq!(name, "active_users");
+                assert!(or_replace);
+                assert_eq!(columns, vec!["id", "name"]);
+                assert!(matches!(query.body, QueryBody::Select(_)));
+                assert!(
+                    definition
+                        .to_ascii_lowercase()
+                        .starts_with("select id, name")
+                );
+            }
+            other => panic!("expected CREATE VIEW, got {other:?}"),
+        }
+
+        assert_eq!(
+            parse("drop view if exists active_users").unwrap(),
+            Statement::DropView {
+                name: "active_users".to_string(),
+                if_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_schema_evolution_forms() {
+        assert_eq!(
+            parse("alter table users drop column age cascade")
+                .unwrap_err()
+                .code,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            parse("truncate users restart identity").unwrap_err().code,
+            SqlState::FeatureNotSupported
+        );
+        assert_eq!(
+            parse("alter table users add column id serial")
+                .unwrap_err()
+                .code,
+            SqlState::SyntaxError
         );
     }
 
@@ -2048,13 +2178,13 @@ mod tests {
     #[test]
     fn rejects_unsupported_alter_forms() {
         for sql in [
-            "alter table users add column x integer",
-            "alter table users rename to people",
             "alter index foo set (compression = 'zstd')",
+            "alter table users alter column x set not null",
+            "alter table users rename constraint old_name to new_name",
         ] {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
-            assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
         }
         let err = parse("alter table users set (fillfactor = 70)").unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);

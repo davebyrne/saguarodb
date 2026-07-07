@@ -37,6 +37,25 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    AlterTableAddColumn {
+        table: String,
+        if_not_exists: bool,
+        column: ParsedColumnDef,
+    },
+    AlterTableDropColumn {
+        table: String,
+        if_exists: bool,
+        column: String,
+    },
+    AlterTableRenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterTableRenameTable {
+        table: String,
+        new_name: String,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -51,6 +70,19 @@ pub enum Statement {
         options: SequenceOptions,
     },
     DropSequence {
+        name: String,
+        if_exists: bool,
+    },
+    CreateView {
+        name: String,
+        or_replace: bool,
+        columns: Vec<String>,
+        query: Query,
+        /// Canonical SQL text for the stored view query. The catalog will persist
+        /// this text and re-parse it when expanding the view.
+        definition: String,
+    },
+    DropView {
         name: String,
         if_exists: bool,
     },
@@ -169,15 +201,15 @@ pub enum Statement {
         table: String,
     },
     /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')`. Intercepted
-    /// before sqlparser (like VACUUM) so the grammar does not depend on
-    /// sqlparser's ALTER coverage; unsupported `ALTER ...` inputs are rejected at
-    /// parse time.
+    /// before sqlparser because sqlparser does not parse PostgreSQL storage
+    /// parameters consistently; schema-evolution `ALTER TABLE` forms are parsed
+    /// through sqlparser.
     AlterTableSetCompression {
         table: String,
         compression: CompressionSetting,
     },
-    /// `ALTER TABLE <name> SET (...)` with at least one TOAST option. Parsed now
-    /// so option semantics are stable; execution is a later storage phase.
+    /// `ALTER TABLE <name> SET (...)` with at least one TOAST option. Parsed as
+    /// maintenance; execution applies the future-write-only TOAST metadata change.
     AlterTableSetOptions {
         table: String,
         options: TableOptionPatch,

@@ -938,6 +938,271 @@ fn publish_relation_swap_for_test(server: &TestServer, table_name: &str) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn schema_rewrite_waits_for_live_repeatable_read_snapshot() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+    setup
+        .ok("insert into users (id, name) values (1, 'Ada')")
+        .await;
+
+    let mut reader = Connection::connect(&server).await.unwrap();
+    reader
+        .ok("start transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        reader
+            .ok("select id, name from users where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
+    );
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let ddl_task =
+        tokio::spawn(async move { ddl.query("alter table users drop column name").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !ddl_task.is_finished(),
+        "schema rewrite must wait while the RR snapshot is live"
+    );
+
+    assert_eq!(
+        reader
+            .ok("select name from users where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("Ada".to_string())]],
+        "the open RR transaction keeps reading the old relation generation"
+    );
+    reader.ok("commit").await;
+
+    let ddl = tokio::time::timeout(Duration::from_secs(5), ddl_task)
+        .await
+        .expect("schema rewrite should finish after the snapshot commits")
+        .expect("DDL task should not panic")
+        .expect("DDL transport should succeed");
+    assert_eq!(ddl.status, b'I');
+    ddl.result.expect("ALTER TABLE should succeed");
+
+    let rows = setup.ok("select id from users").await.rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    let result = setup.query("select name from users").await.unwrap().result;
+    let err = match result {
+        Ok(_) => panic!("dropped column should no longer bind"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("C=42703"),
+        "expected undefined-column SQLSTATE in decoded ErrorResponse, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn conditional_noop_schema_alter_does_not_wait_for_live_snapshot() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+    setup
+        .ok("insert into users (id, name) values (1, 'Ada')")
+        .await;
+
+    let mut reader = Connection::connect(&server).await.unwrap();
+    reader
+        .ok("start transaction isolation level repeatable read")
+        .await;
+    assert_eq!(
+        reader
+            .ok("select id, name from users where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
+    );
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let add = tokio::time::timeout(
+        Duration::from_secs(2),
+        ddl.query("alter table users add column if not exists name text"),
+    )
+    .await
+    .expect("conditional no-op ADD COLUMN must not wait for the live snapshot")
+    .expect("ADD COLUMN transport should succeed");
+    add.result
+        .expect("conditional ADD COLUMN should be a no-op");
+
+    let drop = tokio::time::timeout(
+        Duration::from_secs(2),
+        ddl.query("alter table users drop column if exists missing"),
+    )
+    .await
+    .expect("conditional no-op DROP COLUMN must not wait for the live snapshot")
+    .expect("DROP COLUMN transport should succeed");
+    drop.result
+        .expect("conditional DROP COLUMN should be a no-op");
+
+    assert_eq!(
+        reader
+            .ok("select id, name from users where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
+    );
+    reader.ok("rollback").await;
+}
+
+#[tokio::test]
+async fn schema_rewrite_does_not_deadlock_open_write_transaction_needing_snapshot() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+
+    let mut writer = Connection::connect(&server).await.unwrap();
+    writer.ok("begin").await;
+    writer
+        .ok("insert into users (id, name) values (1, 'Ada')")
+        .await;
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let ddl_task =
+        tokio::spawn(async move { ddl.query("alter table users drop column name").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !ddl_task.is_finished(),
+        "schema rewrite should wait for the open writer"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        writer.ok("insert into users (id, name) values (2, 'Bo')"),
+    )
+    .await
+    .expect("writer must not deadlock while schema rewrite is waiting");
+    writer.ok("commit").await;
+
+    let ddl = tokio::time::timeout(Duration::from_secs(5), ddl_task)
+        .await
+        .expect("schema rewrite should finish after writer commit")
+        .expect("DDL task should not panic")
+        .expect("DDL transport should succeed");
+    ddl.result.expect("ALTER TABLE should succeed");
+
+    assert_eq!(
+        setup.ok("select id from users order by id").await.rows(),
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn schema_rewrite_does_not_deadlock_open_autocommit_copy_from() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+
+    let mut copy = Connection::connect(&server).await.unwrap();
+    copy.begin_copy_from("copy users (id, name) from stdin")
+        .await
+        .unwrap();
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let ddl_task =
+        tokio::spawn(async move { ddl.query("alter table users drop column name").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !ddl_task.is_finished(),
+        "schema rewrite should wait for the open COPY snapshot"
+    );
+
+    let copied = tokio::time::timeout(
+        Duration::from_secs(5),
+        copy.finish_copy_from(&[b"1\tAda\n"]),
+    )
+    .await
+    .expect("COPY FROM must not deadlock while schema rewrite is waiting")
+    .expect("COPY transport should succeed");
+    assert_eq!(copied.command_tag.as_deref(), Some("COPY 1"));
+    assert_eq!(copied.status, b'I');
+
+    let ddl = tokio::time::timeout(Duration::from_secs(5), ddl_task)
+        .await
+        .expect("schema rewrite should finish after COPY completes")
+        .expect("DDL task should not panic")
+        .expect("DDL transport should succeed");
+    ddl.result.expect("ALTER TABLE should succeed");
+
+    assert_eq!(
+        setup.ok("select id from users").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn schema_rewrite_fences_first_copy_from_in_transaction_before_writer_guard() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+
+    let mut blocker = Connection::connect(&server).await.unwrap();
+    blocker.ok("begin").await;
+    blocker
+        .ok("insert into users (id, name) values (1, 'held')")
+        .await;
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let ddl_task =
+        tokio::spawn(async move { ddl.query("alter table users drop column name").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !ddl_task.is_finished(),
+        "schema rewrite should be waiting for the blocker writer"
+    );
+
+    let mut copy = Connection::connect(&server).await.unwrap();
+    copy.ok("begin").await;
+    let copy_task =
+        tokio::spawn(async move { copy.query("copy users (id, name) from stdin").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !copy_task.is_finished(),
+        "a first-write COPY must wait behind the schema-rewrite snapshot fence"
+    );
+
+    blocker.ok("commit").await;
+    let ddl = tokio::time::timeout(Duration::from_secs(5), ddl_task)
+        .await
+        .expect("schema rewrite should finish after blocker commits")
+        .expect("DDL task should not panic")
+        .expect("DDL transport should succeed");
+    ddl.result.expect("ALTER TABLE should succeed");
+
+    let copy = tokio::time::timeout(Duration::from_secs(5), copy_task)
+        .await
+        .expect("COPY should resume after the schema rewrite")
+        .expect("COPY task should not panic")
+        .expect("COPY transport should succeed");
+    assert_eq!(copy.status, b'E');
+    let err = copy
+        .result
+        .err()
+        .expect("COPY should bind against the post-rewrite schema");
+    assert!(
+        err.message.contains("C=42703"),
+        "expected undefined-column SQLSTATE after dropped column, got: {}",
+        err.message
+    );
+}
+
 /// The payoff of Milestone G2: a per-connection default isolation set by
 /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ`.
 /// After the SET, a plain `BEGIN` (no explicit level) inherits Repeatable Read, so

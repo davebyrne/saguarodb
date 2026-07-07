@@ -78,7 +78,7 @@ impl TestServer {
 
     /// The full-extent heap page count for a table (resident + evicted pages), used
     /// to assert space stays bounded under churn. Resolves the table's heap
-    /// `FileId` from the catalog's current storage generation.
+    /// `FileId` from the catalog's current storage id.
     pub fn heap_page_count(&self, table: &str) -> u32 {
         let schema = self
             .app

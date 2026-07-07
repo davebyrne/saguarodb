@@ -50,11 +50,17 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         // COPY carries no expressions/parameters.
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
+        | BoundStatement::AlterTableAddColumn { .. }
+        | BoundStatement::AlterTableDropColumn { .. }
+        | BoundStatement::AlterTableRenameColumn { .. }
+        | BoundStatement::AlterTableRenameTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
         | BoundStatement::DropSequence { .. }
+        | BoundStatement::DropView { .. }
         | BoundStatement::Copy { .. } => Ok(()),
+        BoundStatement::CreateView { query, .. } => reject_create_view_parameters(query),
         BoundStatement::Insert {
             source,
             on_conflict,
@@ -95,6 +101,18 @@ fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>
         }
         BoundStatement::Explain(inner) => collect_statement(inner, used),
     }
+}
+
+fn reject_create_view_parameters(query: &BoundQuery) -> Result<()> {
+    let mut used = Vec::new();
+    collect_query(query, &mut used)?;
+    if used.is_empty() {
+        return Ok(());
+    }
+    Err(plan_error(
+        SqlState::FeatureNotSupported,
+        "CREATE VIEW does not support query parameters",
+    ))
 }
 
 fn collect_on_conflict(
@@ -249,11 +267,17 @@ fn substitute_statement(statement: &mut BoundStatement, params: &[Value]) -> Res
     match statement {
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
+        | BoundStatement::AlterTableAddColumn { .. }
+        | BoundStatement::AlterTableDropColumn { .. }
+        | BoundStatement::AlterTableRenameColumn { .. }
+        | BoundStatement::AlterTableRenameTable { .. }
         | BoundStatement::CreateIndex { .. }
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
         | BoundStatement::DropSequence { .. }
+        | BoundStatement::DropView { .. }
         | BoundStatement::Copy { .. } => Ok(()),
+        BoundStatement::CreateView { query, .. } => reject_create_view_parameters(query),
         BoundStatement::Insert {
             source,
             on_conflict,

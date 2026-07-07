@@ -183,10 +183,16 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
         },
         ddl @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::AlterTableRenameColumn { .. }
+        | LogicalPlan::AlterTableRenameTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateSequence { .. }
-        | LogicalPlan::DropSequence { .. }) => ddl,
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropView { .. }) => ddl,
     }
 }
 

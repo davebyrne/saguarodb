@@ -50,6 +50,7 @@ pub(super) fn bind_copy(
     };
     Ok(BoundStatement::Copy {
         table: table.id,
+        table_schema: table,
         columns,
         direction,
         options: options.clone(),

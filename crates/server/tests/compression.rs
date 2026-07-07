@@ -401,7 +401,7 @@ async fn alter_rejected_inside_transaction_block() {
     assert!(after.rows().is_empty());
 }
 
-/// §13: unknown `WITH` keys/codecs and unsupported ALTER forms are rejected at
+/// §13: unknown `WITH`/`SET` keys and unsupported codecs are rejected at
 /// parse time; nothing reaches storage.
 #[tokio::test]
 async fn bad_options_are_rejected() {
@@ -415,7 +415,7 @@ async fn bad_options_are_rejected() {
         "create table u (id integer primary key) with (fillfactor = 70)",
         "create table u (id integer primary key) with (compression = 'lz4')",
         "alter table t set (compression = 'lz4')",
-        "alter table t add column x integer",
+        "alter table t set (fillfactor = 70)",
     ] {
         server
             .simple_query(sql)
@@ -605,6 +605,7 @@ fn legacy_schema_without_toast() -> TableSchema {
             },
         ],
         primary_key: vec![0],
+        schema_version: common::INITIAL_SCHEMA_VERSION,
         compression: CompressionSetting::None,
         active_dict_id: None,
         toast: ToastOptions::legacy_catalog_default(),

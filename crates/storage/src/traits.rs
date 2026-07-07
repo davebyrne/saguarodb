@@ -14,6 +14,16 @@ pub trait RowIterator: Send {
 pub trait RelationSnapshot: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn relation_epoch(&self) -> u64;
+    fn table_schema_version(&self, _table: TableId) -> Option<u64> {
+        None
+    }
+    /// Some transaction-level catalog lookups intentionally resolve against current
+    /// metadata while their retained relation snapshot predates a new table. Read
+    /// scans may treat that absent relation as empty only when this returns true;
+    /// writes and storage-internal relation lookups remain strict.
+    fn missing_tables_are_empty(&self) -> bool {
+        false
+    }
 }
 
 pub trait StorageEngine: Send + Sync {
@@ -58,6 +68,19 @@ pub trait StorageEngine: Send + Sync {
         relations: &dyn RelationSnapshot,
         table: TableId,
     ) -> Result<Box<dyn RowIterator>>;
+    fn for_each_visible_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        visitor: &mut dyn FnMut(StoredRow) -> Result<()>,
+    ) -> Result<()> {
+        let mut iter = self.scan(ctx, relations, table)?;
+        while let Some(row) = iter.next()? {
+            visitor(row)?;
+        }
+        Ok(())
+    }
     fn scan_range(
         &self,
         ctx: &StatementContext,
@@ -83,6 +106,12 @@ pub trait StorageEngine: Send + Sync {
 pub trait SchemaOperations: Send + Sync {
     fn create_table(&self, ctx: &StatementContext, schema: &TableSchema) -> Result<()>;
     fn drop_table(&self, ctx: &StatementContext, table: TableId) -> Result<()>;
+    fn update_table_schema(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()>;
     /// Build a new secondary index and backfill it from the table's rows.
     ///
     /// `gc_horizon` is the GC horizon (minimum advertised snapshot `xmin`,
@@ -105,6 +134,8 @@ pub trait SchemaOperations: Send + Sync {
 
 pub trait RecoveryOperations: Send + Sync {
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_table_schema(&self, schema: TableSchema) -> Result<()>;
+    fn apply_update_index_schema(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_table(&self, table: TableId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
     fn apply_drop_index(&self, index: IndexId) -> Result<()>;

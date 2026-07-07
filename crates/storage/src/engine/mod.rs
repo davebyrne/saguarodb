@@ -211,6 +211,7 @@ struct TxnRollback {
     tables: BTreeMap<TableId, Option<Arc<TableGeneration>>>,
     indexes: BTreeMap<IndexId, Option<Arc<IndexGeneration>>>,
     sequences: BTreeMap<SequenceId, Option<SequenceState>>,
+    toast_next_value_ids: BTreeMap<TableId, Option<u64>>,
     unpublished_files: Vec<FileId>,
 }
 
@@ -219,6 +220,8 @@ pub(crate) struct PageBackedRelationSnapshot {
     tables: BTreeMap<TableId, Arc<TableGeneration>>,
     indexes: BTreeMap<IndexId, Arc<IndexGeneration>>,
     relation_epoch: u64,
+    allow_current_fallback: bool,
+    missing_table_reads_are_empty: bool,
 }
 
 impl RelationSnapshot for PageBackedRelationSnapshot {
@@ -228,6 +231,17 @@ impl RelationSnapshot for PageBackedRelationSnapshot {
 
     fn relation_epoch(&self) -> u64 {
         self.relation_epoch
+    }
+
+    fn table_schema_version(&self, table: TableId) -> Option<u64> {
+        self.tables
+            .get(&table)
+            .filter(|table_state| !table_state.dropped)
+            .map(|table_state| table_state.schema.schema_version)
+    }
+
+    fn missing_tables_are_empty(&self) -> bool {
+        self.missing_table_reads_are_empty
     }
 }
 
@@ -476,7 +490,17 @@ impl PageBackedStorageEngine {
             tables: state.tables.clone(),
             indexes: state.indexes.clone(),
             relation_epoch: state.relation_epoch,
+            allow_current_fallback: false,
+            missing_table_reads_are_empty: false,
         })
+    }
+
+    pub fn capture_relation_snapshot_with_missing_table_reads_empty(
+        &self,
+    ) -> Result<Arc<dyn RelationSnapshot>> {
+        let mut snapshot = self.capture_pagebacked_relation_snapshot()?;
+        snapshot.missing_table_reads_are_empty = true;
+        Ok(Arc::new(snapshot))
     }
 
     pub fn relation_epoch(&self) -> Result<u64> {
@@ -551,6 +575,9 @@ impl PageBackedStorageEngine {
             Some(table_state) if !table_state.dropped => table_state.clone(),
             Some(_) => return Err(undefined_table(table)),
             None => {
+                if !relations.allow_current_fallback {
+                    return Err(undefined_table(table));
+                }
                 let state = self.lock_state()?;
                 state
                     .tables
@@ -576,6 +603,9 @@ impl PageBackedStorageEngine {
             }
             Some(_) => Ok(None),
             None => {
+                if !relations.allow_current_fallback {
+                    return Ok(None);
+                }
                 let state = self.lock_state()?;
                 Ok(state
                     .tables
@@ -804,6 +834,9 @@ impl PageBackedStorageEngine {
                 .map(|index| index.schema.clone())
                 .collect());
         }
+        if !relations.allow_current_fallback {
+            return Err(undefined_table(table));
+        }
         self.current_table_indexes(table)
     }
 
@@ -857,6 +890,9 @@ impl PageBackedStorageEngine {
                 }
             }
         } else {
+            if !relations.allow_current_fallback {
+                return Err(undefined_index(index));
+            }
             let state = self.lock_state()?;
             state
                 .indexes
@@ -874,7 +910,11 @@ impl PageBackedStorageEngine {
         table: TableId,
     ) -> Result<()> {
         let Some(snapshot_table) = relations.tables.get(&table) else {
-            return Ok(());
+            return if relations.allow_current_fallback {
+                Ok(())
+            } else {
+                Err(undefined_table(table))
+            };
         };
         if snapshot_table.dropped {
             return Err(undefined_table(table));
@@ -1097,7 +1137,9 @@ impl PageBackedStorageEngine {
         self.set_table_primary_key_metadata(schema)
     }
 
-    pub(crate) fn set_table_primary_key_metadata(&self, schema: &TableSchema) -> Result<()> {
+    /// Install the catalog-committed primary-key table schema after the identity
+    /// tree has already been rebuilt for the same primary-key shape.
+    pub fn set_table_primary_key_metadata(&self, schema: &TableSchema) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -1197,18 +1239,19 @@ impl PageBackedStorageEngine {
     }
 
     fn heap_identity_roots(&self, schema: &TableSchema) -> Result<Vec<RowLocation>> {
-        let page_count = self.buffer_pool.page_count(schema.id)?;
+        let heap_file = heap_file_id(schema.storage_id);
+        let page_count = self.buffer_pool.page_count(heap_file)?;
         let mut roots = Vec::new();
         for page_num in 0..page_count {
-            if self.buffer_pool.is_page_abandoned(schema.id, page_num) {
+            if self.buffer_pool.is_page_abandoned(heap_file, page_num) {
                 continue;
             }
             let page_roots = {
-                let guard = self.buffer_pool.read_page(schema.id, page_num)?;
+                let guard = self.buffer_pool.read_page(heap_file, page_num)?;
                 if !page::is_initialized(guard.data()) {
                     Vec::new()
                 } else {
-                    Self::heap_identity_roots_on_page(schema.id, page_num, guard.data())?
+                    Self::heap_identity_roots_on_page(heap_file, page_num, guard.data())?
                 }
             };
             roots.extend(page_roots);
@@ -2128,6 +2171,36 @@ impl StorageEngine for PageBackedStorageEngine {
         <Self as StorageEngine>::scan_range(self, ctx, relations, table, &KeyRange::All)
     }
 
+    fn for_each_visible_row(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        visitor: &mut dyn FnMut(StoredRow) -> Result<()>,
+    ) -> Result<()> {
+        let relations = pagebacked_relations(relations)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_fid = table_handle.primary_index_file_id;
+
+        self.btree(index_fid)
+            .range_for_each(&KeyRange::All, |key, location| {
+                let Some((resolved, row)) =
+                    self.read_visible_row(ctx, relations, &schema, location)?
+                else {
+                    return Ok(());
+                };
+                visitor(StoredRow {
+                    row_id: RowId {
+                        page_num: resolved.page_num,
+                        slot_num: resolved.slot_num,
+                    },
+                    key,
+                    row,
+                })
+            })
+    }
+
     fn scan_range(
         &self,
         ctx: &StatementContext,
@@ -2274,6 +2347,16 @@ impl StorageEngine for PageBackedStorageEngine {
                 }
             }
         }
+        for (table_id, previous) in rollback.toast_next_value_ids.into_iter().rev() {
+            match previous {
+                Some(next_value_id) => {
+                    state.toast_next_value_ids.insert(table_id, next_value_id);
+                }
+                None => {
+                    state.toast_next_value_ids.remove(&table_id);
+                }
+            }
+        }
         for (sequence_id, previous) in rollback.sequences.into_iter().rev() {
             match previous {
                 Some(sequence) => {
@@ -2353,6 +2436,7 @@ impl SchemaOperations for PageBackedStorageEngine {
                 }),
             );
             if matches!(schema.relation_kind, RelationKind::Toast { .. }) {
+                record_toast_next_value_id_before(&mut state, ctx.txn_id, schema.id);
                 state
                     .toast_next_value_ids
                     .insert(schema.id, crate::toast::FIRST_TOAST_VALUE_ID);
@@ -2386,6 +2470,120 @@ impl SchemaOperations for PageBackedStorageEngine {
             mark_table_dropped(&mut state, ctx.txn_id, toast_table_id);
         }
         bump_relation_epoch(&mut state);
+        Ok(())
+    }
+
+    fn update_table_schema(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        indexes: &[IndexSchema],
+    ) -> Result<()> {
+        let (rewrite_storage, secondary_indexes) = {
+            let mut state = self.lock_state()?;
+            let current_table = state
+                .tables
+                .get(&schema.id)
+                .filter(|table| !table.dropped)
+                .cloned()
+                .ok_or_else(|| undefined_table(schema.id))?;
+            if current_table.schema.relation_kind != schema.relation_kind {
+                return Err(storage_internal(format!(
+                    "cannot change relation kind for table {} during schema update",
+                    schema.id
+                )));
+            }
+
+            let rewrite_storage = current_table.schema.storage_id != schema.storage_id;
+            record_table_before(&mut state, ctx.txn_id, schema.id);
+            state.tables.insert(
+                schema.id,
+                Arc::new(TableGeneration {
+                    schema: schema.clone(),
+                    dropped: false,
+                }),
+            );
+            if matches!(schema.relation_kind, RelationKind::Toast { .. }) {
+                record_toast_next_value_id_before(&mut state, ctx.txn_id, schema.id);
+                state
+                    .toast_next_value_ids
+                    .insert(schema.id, crate::toast::FIRST_TOAST_VALUE_ID);
+            }
+
+            for index in indexes {
+                if index.table != schema.id {
+                    return Err(storage_internal(format!(
+                        "index {} belongs to table {}, not updated table {}",
+                        index.id, index.table, schema.id
+                    )));
+                }
+                let current_index = state
+                    .indexes
+                    .get(&index.id)
+                    .filter(|index| !index.dropped)
+                    .cloned()
+                    .ok_or_else(|| undefined_index(index.id))?;
+                record_index_before(&mut state, ctx.txn_id, index.id);
+                state.indexes.insert(
+                    index.id,
+                    Arc::new(IndexGeneration {
+                        schema: index.clone(),
+                        dropped: false,
+                    }),
+                );
+                if current_index.schema.storage_id != index.storage_id && ctx.txn_id != 0 {
+                    state
+                        .rollback
+                        .entry(ctx.txn_id)
+                        .or_default()
+                        .unpublished_files
+                        .push(secondary_index_file_id(index.storage_id));
+                }
+            }
+
+            let secondary_indexes = state
+                .indexes
+                .values()
+                .filter(|index| !index.dropped && index.schema.table == schema.id)
+                .map(|index| index.schema.clone())
+                .collect::<Vec<_>>();
+            if rewrite_storage && ctx.txn_id != 0 {
+                state
+                    .rollback
+                    .entry(ctx.txn_id)
+                    .or_default()
+                    .unpublished_files
+                    .extend(table_files(schema));
+            }
+            bump_relation_epoch(&mut state);
+            (rewrite_storage, secondary_indexes)
+        };
+
+        self.register_table_compression(schema);
+        let index_config = index_compression_for(schema.compression);
+        for index in &secondary_indexes {
+            self.compression
+                .set_file_config(secondary_index_file_id(index.storage_id), index_config);
+        }
+
+        let state = self.lock_state()?;
+        self.append_wal(
+            &state,
+            ctx,
+            WalRecordKind::UpdateTableSchema {
+                schema: schema.clone(),
+                indexes: secondary_indexes.clone(),
+            },
+        )?;
+        drop(state);
+
+        if rewrite_storage {
+            self.btree(primary_index_file_id(schema.storage_id))
+                .create(ctx.txn_id)?;
+            for index in &secondary_indexes {
+                self.secondary_btree(index).create(ctx.txn_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -3174,6 +3372,7 @@ fn mark_table_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {
         matches!(table_state.schema.relation_kind, RelationKind::Toast { .. })
     });
     if is_toast_relation {
+        record_toast_next_value_id_before(state, txn_id, table);
         state.toast_next_value_ids.remove(&table);
     }
     if let Some(schema) = state.tables.get(&table).map(|table| table.schema.clone()) {
@@ -3202,6 +3401,20 @@ fn record_index_before(state: &mut StorageState, txn_id: u64, index: IndexId) {
         .or_default()
         .indexes
         .entry(index)
+        .or_insert(previous);
+}
+
+fn record_toast_next_value_id_before(state: &mut StorageState, txn_id: u64, table: TableId) {
+    if txn_id == 0 {
+        return;
+    }
+    let previous = state.toast_next_value_ids.get(&table).copied();
+    state
+        .rollback
+        .entry(txn_id)
+        .or_default()
+        .toast_next_value_ids
+        .entry(table)
         .or_insert(previous);
 }
 

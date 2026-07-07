@@ -6,18 +6,30 @@ use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext};
 use tokio::sync::mpsc;
 
 use super::{
-    CapturedSnapshots, ExecutionContextInput, QueryService, QuerySessionContext, Transaction,
-    TransactionSnapshots, WriteUnitGuard,
+    CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService, QuerySessionContext,
+    Transaction, TransactionSnapshots, WriteUnitGuard,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
 /// One inbound COPY-from-stdin event, sent by the connection loop to the blocking
 /// COPY transaction task. `Done` (clean end-of-input) commits; `Fail` (client
-/// `CopyFail`) and a dropped channel (client disconnect) both abort.
+/// `CopyFail`) aborts the statement; a dropped channel means the client
+/// disconnected and the task must abort any owned transaction itself.
 pub enum CopyInChunk {
     Chunk(Vec<u8>),
     Done,
     Fail,
+}
+
+enum CopyInError {
+    Db(DbError),
+    Disconnected,
+}
+
+impl From<DbError> for CopyInError {
+    fn from(err: DbError) -> Self {
+        Self::Db(err)
+    }
 }
 
 /// Target size for an outbound `COPY ... TO STDOUT` `CopyData` frame; rows are
@@ -28,16 +40,34 @@ impl QueryService {
     /// Run a `COPY ... FROM STDIN` to completion, owning the transaction. The
     /// connection loop feeds `rx` from `CopyData`/`CopyDone`/`CopyFail`. Returns
     /// the (possibly still-open, in-transaction) slot and the rows inserted.
-    pub fn run_copy_in_stream(
+    pub(crate) fn run_copy_in_stream(
         &self,
         job: CopyJob,
         slot: Option<Transaction>,
         session: QuerySessionContext,
+        snapshots: CopySnapshots,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
-        match slot {
-            None => (None, self.copy_in_autocommit(job, session, rx)),
-            Some(txn) => self.copy_in_transaction(txn, job, session, rx),
+        match (slot, snapshots) {
+            (
+                None,
+                CopySnapshots::Autocommit {
+                    snapshots,
+                    write_guard,
+                },
+            ) => (
+                None,
+                self.copy_in_autocommit(job, session, snapshots, write_guard, rx),
+            ),
+            (Some(txn), CopySnapshots::Transaction(snapshots)) => {
+                self.copy_in_transaction(txn, job, session, snapshots, rx)
+            }
+            (slot, _) => (
+                slot,
+                Err(DbError::internal(
+                    "COPY FROM snapshot mode did not match transaction state",
+                )),
+            ),
         }
     }
 
@@ -48,15 +78,20 @@ impl QueryService {
         &self,
         job: CopyJob,
         session: QuerySessionContext,
+        snapshots: CapturedSnapshots,
+        write_guard: Option<WriteUnitGuard>,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> Result<u64> {
-        let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
-        let txn_id = self.register_active_txn();
         let CapturedSnapshots {
             snapshot,
             relations,
             advertised: _advertised,
-        } = self.capture_consistent_snapshots(txn_id)?;
+        } = snapshots;
+        let guard = match write_guard {
+            Some(guard) => guard,
+            None => WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?),
+        };
+        let txn_id = self.register_active_txn();
         let gc_horizon = self.components.gc_horizon();
         // Autocommit COPY FROM: a fresh txn with no savepoints, so the live-set is
         // just `[txn_id]`.
@@ -74,9 +109,13 @@ impl QueryService {
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
         let count = match outcome {
             Ok(Ok(count)) => count,
-            Ok(Err(err)) => {
+            Ok(Err(CopyInError::Db(err))) => {
                 self.rollback_pre_durable_or_die(txn_id, None);
                 return Err(err);
+            }
+            Ok(Err(CopyInError::Disconnected)) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(copy_disconnected_error());
             }
             Err(_) => {
                 self.rollback_pre_durable_or_die(txn_id, None);
@@ -109,6 +148,7 @@ impl QueryService {
         mut txn: Transaction,
         job: CopyJob,
         session: QuerySessionContext,
+        snapshots: TransactionSnapshots,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
         if txn.write_guard.is_none()
@@ -121,13 +161,7 @@ impl QueryService {
             snapshot,
             relations,
             advertised,
-        } = match self.snapshots_for_transaction(&mut txn) {
-            Ok(snapshots) => snapshots,
-            Err(err) => {
-                txn.failed = true;
-                return (Some(txn), Err(err));
-            }
-        };
+        } = snapshots;
         txn.first_statement_ran = true;
         let gc_horizon = self.components.gc_horizon();
         let result = (|| {
@@ -153,25 +187,47 @@ impl QueryService {
         match result {
             // COPY FROM inserts produce no committed dead versions (dead_versions += 0).
             Ok(count) => (Some(txn), Ok(count)),
-            Err(err) => {
+            Err(CopyInError::Db(err)) => {
                 txn.failed = true;
                 (Some(txn), Err(err))
+            }
+            Err(CopyInError::Disconnected) => {
+                self.abort_transaction(txn);
+                (None, Err(copy_disconnected_error()))
             }
         }
     }
 
     /// Run a `COPY ... TO STDOUT` to completion, pushing rendered frames into
     /// `frame_tx`. Returns the (possibly still-open) slot and the rows exported.
-    pub fn run_copy_out_stream(
+    pub(crate) fn run_copy_out_stream(
         &self,
         job: CopyJob,
         slot: Option<Transaction>,
         session: QuerySessionContext,
+        snapshots: CopySnapshots,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
-        match slot {
-            None => (None, self.copy_out_autocommit(job, session, frame_tx)),
-            Some(txn) => self.copy_out_transaction(txn, job, session, frame_tx),
+        match (slot, snapshots) {
+            (
+                None,
+                CopySnapshots::Autocommit {
+                    snapshots,
+                    write_guard: _write_guard,
+                },
+            ) => (
+                None,
+                self.copy_out_autocommit(job, session, snapshots, frame_tx),
+            ),
+            (Some(txn), CopySnapshots::Transaction(snapshots)) => {
+                self.copy_out_transaction(txn, job, session, snapshots, frame_tx)
+            }
+            (slot, _) => (
+                slot,
+                Err(DbError::internal(
+                    "COPY TO snapshot mode did not match transaction state",
+                )),
+            ),
         }
     }
 
@@ -181,13 +237,14 @@ impl QueryService {
         &self,
         job: CopyJob,
         session: QuerySessionContext,
+        snapshots: CapturedSnapshots,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<u64> {
         let CapturedSnapshots {
             snapshot,
             relations,
             advertised: _advertised,
-        } = self.capture_consistent_snapshots(0)?;
+        } = snapshots;
         let ctx = self.execution_context(ExecutionContextInput {
             txn_id: 0,
             snapshot,
@@ -208,19 +265,14 @@ impl QueryService {
         mut txn: Transaction,
         job: CopyJob,
         session: QuerySessionContext,
+        snapshots: TransactionSnapshots,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
         let TransactionSnapshots {
             snapshot,
             relations,
             advertised,
-        } = match self.snapshots_for_transaction(&mut txn) {
-            Ok(snapshots) => snapshots,
-            Err(err) => {
-                txn.failed = true;
-                return (Some(txn), Err(err));
-            }
-        };
+        } = snapshots;
         txn.first_statement_ran = true;
         let result = (|| {
             // A read inside a savepoint transaction must see its own subxids' writes,
@@ -252,16 +304,16 @@ impl QueryService {
     }
 }
 
-/// Pull COPY-from-stdin chunks until a clean `Done` (returns the rows inserted)
-/// or an abort (`Fail`/dropped channel → error, which the caller rolls back).
+/// Pull COPY-from-stdin chunks until a clean `Done` (returns the rows inserted),
+/// a client abort (`Fail`), or a dropped channel (disconnect).
 fn drive_copy_in(
     ctx: &ExecutionContext<'_>,
     job: CopyJob,
     mut rx: mpsc::Receiver<CopyInChunk>,
-) -> Result<u64> {
+) -> std::result::Result<u64, CopyInError> {
     let mut copy_in = CopyIn::new(
         ctx,
-        job.table,
+        job.schema,
         job.columns,
         job.options,
         job.default_exprs,
@@ -270,17 +322,26 @@ fn drive_copy_in(
     loop {
         match rx.blocking_recv() {
             Some(CopyInChunk::Chunk(bytes)) => copy_in.push_chunk(&bytes)?,
-            Some(CopyInChunk::Done) => return copy_in.finish(),
-            // `Fail` (client CopyFail) or a dropped sender (disconnect): abort. The
-            // connection loop substitutes the client's message for a CopyFail.
-            Some(CopyInChunk::Fail) | None => {
-                return Err(DbError::execute(
+            Some(CopyInChunk::Done) => return copy_in.finish().map_err(CopyInError::from),
+            // The connection loop substitutes the client's message for a CopyFail.
+            Some(CopyInChunk::Fail) => {
+                return Err(CopyInError::Db(DbError::execute(
                     SqlState::QueryCanceled,
                     "COPY from stdin aborted",
-                ));
+                )));
             }
+            // A disconnect has no session left to receive a returned transaction
+            // slot, so the caller must abort the transaction itself.
+            None => return Err(CopyInError::Disconnected),
         }
     }
+}
+
+fn copy_disconnected_error() -> DbError {
+    DbError::execute(
+        SqlState::QueryCanceled,
+        "COPY from stdin client disconnected",
+    )
 }
 
 /// Scan + project + render COPY-to-stdout rows, batching into frames pushed to
@@ -291,7 +352,7 @@ fn drive_copy_out(
     job: CopyJob,
     frame_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<u64> {
-    let mut out = CopyOut::new(ctx, job.table, &job.columns, job.options)?;
+    let mut out = CopyOut::new(ctx, job.schema, &job.columns, job.options)?;
     let mut frame = Vec::new();
     if let Some(header) = out.header_line() {
         frame.extend_from_slice(&header);

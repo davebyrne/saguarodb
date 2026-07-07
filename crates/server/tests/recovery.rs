@@ -758,6 +758,266 @@ async fn committed_update_new_version_survives_restart() {
 }
 
 #[tokio::test]
+async fn committed_truncate_survives_restart_and_resets_indexes_and_toast() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_body = "old-body-".repeat(260);
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (id integer primary key, name text, body text) \
+                 with (toast = aggressive, toast_tuple_target = 512, \
+                       toast_min_value_size = 128, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("create index docs_name on docs (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query(&format!(
+                "insert into docs (id, name, body) values (1, 'old', '{old_body}')"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            visible_toast_chunk_count(&server, "docs") > 0,
+            "large row should create visible TOAST chunks before TRUNCATE"
+        );
+
+        server.simple_query("truncate docs").await.unwrap();
+        assert_eq!(
+            visible_toast_chunk_count(&server, "docs"),
+            0,
+            "TRUNCATE should swap the hidden TOAST relation to an empty generation"
+        );
+        server
+            .simple_query("insert into docs (id, name, body) values (1, 'new', 'small')")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, name, body from docs")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("1".to_string()),
+            Some("new".to_string()),
+            Some("small".to_string()),
+        ]]
+    );
+    let rows = server
+        .simple_query("select id from docs where name = 'old'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+    let rows = server
+        .simple_query("select id from docs where name = 'new'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+    assert_eq!(visible_toast_chunk_count(&server, "docs"), 0);
+}
+
+#[tokio::test]
+async fn committed_alter_table_schema_evolution_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text, code integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index users_code on users (code)")
+            .await
+            .unwrap();
+        server
+            .simple_query(
+                "insert into users (id, name, code) values (1, 'Ada', 10), (2, 'Grace', 20)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table users add column active boolean default true")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table users rename column active to enabled")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table users drop column name")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, code, enabled) values (3, 30, false)")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, code, enabled from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("10".to_string()),
+                Some("t".to_string()),
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("20".to_string()),
+                Some("t".to_string()),
+            ],
+            vec![
+                Some("3".to_string()),
+                Some("30".to_string()),
+                Some("f".to_string()),
+            ],
+        ]
+    );
+    let rows = server
+        .simple_query("select id, code, enabled from users where code = 20")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("2".to_string()),
+            Some("20".to_string()),
+            Some("t".to_string()),
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn alter_drop_column_remapped_last_index_column_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text, code integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index users_code on users (code)")
+            .await
+            .unwrap();
+        server
+            .simple_query(
+                "insert into users (id, name, code) values (1, 'Ada', 10), (2, 'Grace', 20)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table users drop column name")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, code from users where code = 20")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("2".to_string()), Some("20".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn alter_drop_column_remapped_primary_key_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (name text, id integer primary key)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (name, id) values ('Ada', 1), ('Grace', 2)")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table users drop column name")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id from users where id = 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[tokio::test]
+async fn add_primary_key_after_truncate_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table t (id integer not null, v integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id, v) values (1, 10)")
+            .await
+            .unwrap();
+        server.simple_query("truncate t").await.unwrap();
+        server
+            .simple_query("insert into t (id, v) values (1, 99)")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table t add primary key (id)")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select id, v from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("99".to_string())]]
+    );
+
+    let err = server
+        .simple_query("insert into t (id, v) values (1, 100)")
+        .await
+        .err()
+        .expect("primary key should still cover rows in the truncated generation");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("primary key"),
+        "expected primary key violation: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn hot_update_and_its_chain_survive_restart() {
     // A HOT update (only the NON-indexed `note` column changes, the new heap-only
     // tuple fits on the predecessor's page) writes a HeapInsert(HEAP_ONLY) for the
