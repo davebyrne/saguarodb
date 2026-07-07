@@ -1,16 +1,18 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 
 use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
-use common::{DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController};
+use common::{
+    DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController, TruncateTablePlan,
+};
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
 use wal::{FileWalManager, WalManager, WalRecordKind, is_redo_operation};
 
 use crate::app::{AppState, ServerComponents};
-use crate::checkpoint::{CheckpointState, run_checkpoint};
+use crate::checkpoint::{CheckpointState, cleanup_relation_generation_files, run_checkpoint};
 use crate::config::Config;
 use crate::query::QueryService;
 use crate::shutdown::ShutdownState;
@@ -211,6 +213,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
         next_txn_id: AtomicU64::new(next_txn_id),
         dead_rows_since_vacuum: AtomicU64::new(0),
         active_txns,
+        relation_publish_gate: RwLock::new(()),
         lock_manager,
         ssi_manager,
         tls,
@@ -222,6 +225,7 @@ pub fn open_app(config: Config) -> Result<AppState> {
     if replay_applied {
         run_checkpoint(&components)?;
     }
+    cleanup_relation_generation_files(&components)?;
     components.storage.set_mode(StorageMode::Normal)?;
 
     Ok(AppState {
@@ -286,6 +290,7 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::CreateDictionary { .. }
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
+            | WalRecordKind::TruncateTable { .. }
     )
 }
 
@@ -293,10 +298,15 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
     match kind {
         WalRecordKind::CreateTable { schema } => {
             catalog.reserve_table_id(schema.id)?;
+            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
+            if let Some(toast_table_id) = schema.toast_table_id {
+                catalog.reserve_table_id(toast_table_id)?;
+            }
             Ok(true)
         }
         WalRecordKind::CreateIndex { schema } => {
             catalog.reserve_index_id(schema.id)?;
+            reserve_storage_id(catalog, schema.storage_id, schema.id)?;
             Ok(true)
         }
         WalRecordKind::CreateSequence { schema } => {
@@ -307,6 +317,21 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
             catalog.reserve_dictionary_id(*dict_id)?;
             Ok(true)
         }
+        WalRecordKind::TruncateTable {
+            new_table_storage_id,
+            new_toast_storage_id,
+            new_index_storage_ids,
+            ..
+        } => {
+            catalog.reserve_storage_id(*new_table_storage_id)?;
+            if let Some((_, storage_id)) = new_toast_storage_id {
+                catalog.reserve_storage_id(*storage_id)?;
+            }
+            for (_, storage_id) in new_index_storage_ids {
+                catalog.reserve_storage_id(*storage_id)?;
+            }
+            Ok(true)
+        }
         WalRecordKind::DropTable { .. }
         | WalRecordKind::DropIndex { .. }
         | WalRecordKind::DropSequence { .. }
@@ -314,6 +339,18 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         | WalRecordKind::AlterTableToast { .. } => Ok(false),
         _ => Ok(false),
     }
+}
+
+fn reserve_storage_id(
+    catalog: &dyn CatalogManager,
+    storage_id: common::FileId,
+    legacy_id: common::FileId,
+) -> Result<()> {
+    catalog.reserve_storage_id(if storage_id == 0 {
+        legacy_id
+    } else {
+        storage_id
+    })
 }
 
 fn apply_redo(
@@ -350,7 +387,13 @@ fn apply_redo(
     match &kind {
         WalRecordKind::CreateTable { schema } => {
             catalog.apply_create_table(schema.clone())?;
-            storage.apply_create_table(schema.clone())
+            let installed = catalog.get_table(schema.id)?.ok_or_else(|| {
+                DbError::internal(format!(
+                    "replayed CreateTable for table {} did not install a catalog schema",
+                    schema.id
+                ))
+            })?;
+            storage.apply_create_table(installed)
         }
         WalRecordKind::DropTable { table } => {
             catalog.apply_drop_table(*table)?;
@@ -358,7 +401,17 @@ fn apply_redo(
         }
         WalRecordKind::CreateIndex { schema } => {
             catalog.apply_create_index(schema.clone())?;
-            storage.apply_create_index(schema.clone())
+            let installed = catalog
+                .list_indexes_for_table(schema.table)?
+                .into_iter()
+                .find(|index| index.id == schema.id)
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "replayed CreateIndex for index {} did not install a catalog schema",
+                        schema.id
+                    ))
+                })?;
+            storage.apply_create_index(installed)
         }
         WalRecordKind::DropIndex { index } => {
             catalog.apply_drop_index(*index)?;
@@ -435,6 +488,21 @@ fn apply_redo(
             let schema =
                 catalog.set_table_toast_metadata(*table_id, toast.clone(), *toast_table_id)?;
             storage.apply_set_table_toast_metadata(schema)
+        }
+        WalRecordKind::TruncateTable {
+            table_id,
+            new_table_storage_id,
+            new_toast_storage_id,
+            new_index_storage_ids,
+        } => {
+            let plan = TruncateTablePlan {
+                table_id: *table_id,
+                new_table_storage_id: *new_table_storage_id,
+                new_toast_storage_id: *new_toast_storage_id,
+                new_index_storage_ids: new_index_storage_ids.clone(),
+            };
+            let update = catalog.apply_truncate_table(&plan)?;
+            storage.apply_truncate_table(update)
         }
         // Normalized away above: `FullPageImageCompressed` never reaches this match
         // (it is rewritten to `FullPageImage` before the match runs).
@@ -533,14 +601,18 @@ fn validate_dictionary_ref(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use crate::app::AppState;
     use crate::checkpoint::run_checkpoint;
     use catalog::CatalogManager;
+    use storage::RecoveryOperations;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
     fn table_schema(id: common::TableId, name: &str) -> common::TableSchema {
         common::TableSchema {
             id,
+            storage_id: id,
             name: name.to_string(),
             columns: vec![common::ColumnDef {
                 id: 0,
@@ -559,6 +631,151 @@ mod tests {
             relation_kind: common::RelationKind::User,
             checks: Vec::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingRecoveryOps {
+        tables: Mutex<Vec<common::TableSchema>>,
+        indexes: Mutex<Vec<common::IndexSchema>>,
+        truncates: Mutex<Vec<common::TruncateCatalogUpdate>>,
+    }
+
+    impl RecoveryOperations for CapturingRecoveryOps {
+        fn apply_create_table(&self, schema: common::TableSchema) -> common::Result<()> {
+            self.tables.lock().expect("tables lock").push(schema);
+            Ok(())
+        }
+
+        fn apply_drop_table(&self, _table: common::TableId) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_create_index(&self, schema: common::IndexSchema) -> common::Result<()> {
+            self.indexes.lock().expect("indexes lock").push(schema);
+            Ok(())
+        }
+
+        fn apply_drop_index(&self, _index: common::IndexId) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_create_sequence(&self, _schema: common::SequenceSchema) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_drop_sequence(&self, _sequence: common::SequenceId) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_sequence_advance(
+            &self,
+            _sequence: common::SequenceId,
+            _value: i64,
+        ) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_set_sequence_value(
+            &self,
+            _sequence: common::SequenceId,
+            _value: i64,
+            _is_called: bool,
+        ) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_set_table_compression(&self, _schema: common::TableSchema) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_set_table_toast_metadata(
+            &self,
+            _schema: common::TableSchema,
+        ) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_truncate_table(
+            &self,
+            update: common::TruncateCatalogUpdate,
+        ) -> common::Result<()> {
+            self.truncates.lock().expect("truncates lock").push(update);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recovery_applies_catalog_normalized_legacy_create_schemas_to_storage() {
+        let catalog = catalog::MemoryCatalog::empty();
+        let storage = CapturingRecoveryOps::default();
+        let buffer_pool = buffer::MemoryBufferPool::empty(1);
+        let compression = compress::CompressionRegistry::new();
+        let dict_dir = tempfile::tempdir().unwrap();
+        let dict_store = compress::DictStore::open(dict_dir.path()).unwrap();
+
+        let mut legacy_table = table_schema(41, "legacy_table");
+        legacy_table.storage_id = 0;
+        super::apply_redo(
+            &catalog,
+            &storage,
+            &buffer_pool,
+            &compression,
+            &dict_store,
+            1,
+            WalRecordKind::CreateTable {
+                schema: legacy_table.clone(),
+            },
+        )
+        .unwrap();
+
+        let installed_table = catalog
+            .get_table(legacy_table.id)
+            .unwrap()
+            .expect("table installed in catalog");
+        let captured_table = storage
+            .tables
+            .lock()
+            .expect("tables lock")
+            .pop()
+            .expect("storage saw table create");
+        assert_ne!(captured_table.storage_id, 0);
+        assert_eq!(captured_table, installed_table);
+
+        let legacy_index = common::IndexSchema {
+            id: 7,
+            storage_id: 0,
+            table: legacy_table.id,
+            name: "legacy_table_id_idx".to_string(),
+            columns: vec![0],
+            unique: false,
+        };
+        super::apply_redo(
+            &catalog,
+            &storage,
+            &buffer_pool,
+            &compression,
+            &dict_store,
+            2,
+            WalRecordKind::CreateIndex {
+                schema: legacy_index.clone(),
+            },
+        )
+        .unwrap();
+
+        let installed_index = catalog
+            .list_indexes_for_table(legacy_table.id)
+            .unwrap()
+            .into_iter()
+            .find(|index| index.id == legacy_index.id)
+            .expect("index installed in catalog");
+        let captured_index = storage
+            .indexes
+            .lock()
+            .expect("indexes lock")
+            .pop()
+            .expect("storage saw index create");
+        assert_ne!(captured_index.storage_id, 0);
+        assert_eq!(captured_index, installed_index);
     }
 
     #[test]
@@ -605,6 +822,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn recovery_replays_committed_truncate_table_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_id;
+        let new_storage_id;
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            app.query_service
+                .execute_sql("create index users_name_idx on users (name)")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (1, 'Ada'), (2, 'Grace')")
+                .unwrap();
+            run_checkpoint(&app.components).unwrap();
+
+            let users = app
+                .components
+                .catalog
+                .get_table_by_name("users")
+                .unwrap()
+                .expect("users table exists");
+            table_id = users.id;
+            let old_storage_id = users.storage_id;
+            let plan = app
+                .components
+                .catalog
+                .prepare_truncate_table(table_id)
+                .unwrap();
+            new_storage_id = plan.new_table_storage_id;
+            let update = app
+                .components
+                .catalog
+                .build_truncate_table_update(&plan)
+                .unwrap();
+
+            app.components
+                .storage
+                .prepare_truncate_table(&common::StatementContext::new(41), &plan, &update)
+                .unwrap();
+            app.components
+                .wal
+                .append(WalRecord {
+                    lsn: 0,
+                    txn_id: 41,
+                    kind: WalRecordKind::Commit,
+                })
+                .unwrap();
+            app.components.wal.flush().unwrap();
+            assert_ne!(old_storage_id, new_storage_id);
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        let users = reopened
+            .components
+            .catalog
+            .get_table(table_id)
+            .unwrap()
+            .expect("users table exists after recovery");
+        assert_eq!(users.storage_id, new_storage_id);
+        assert_eq!(
+            reopened
+                .query_service
+                .execute_sql("select id, name from users order by id")
+                .unwrap()
+                .row_count(),
+            0
+        );
+        reopened
+            .query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .query_service
+                .execute_sql("select id, name from users")
+                .unwrap()
+                .row_count(),
+            1
+        );
     }
 
     #[test]
@@ -903,6 +1204,16 @@ mod tests {
             skipped_schema.id + 1,
             "recovery must still burn the skipped table id so its storage files are never reused"
         );
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_storage_id,
+            skipped_schema.storage_id + 1,
+            "recovery must still burn the skipped table storage id"
+        );
 
         reopened
             .query_service
@@ -915,6 +1226,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(live.id, skipped_schema.id + 1);
+        assert_eq!(live.storage_id, skipped_schema.storage_id + 1);
     }
 
     #[test]
@@ -956,6 +1268,16 @@ mod tests {
             common::PRIMARY_KEY_INDEX_ID + 2,
             "recovery must burn the aborted index id even though the index catalog record is skipped"
         );
+        assert_eq!(
+            reopened
+                .components
+                .catalog
+                .snapshot()
+                .unwrap()
+                .next_storage_id,
+            4,
+            "recovery must burn the aborted index storage id even though the index catalog record is skipped"
+        );
 
         reopened
             .query_service
@@ -968,6 +1290,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 2);
+        assert_eq!(index.storage_id, 4);
     }
 
     #[test]
@@ -1041,7 +1364,6 @@ mod tests {
     #[test]
     fn recovery_replays_create_index_and_rebuilds_the_secondary_tree() {
         use common::{Key, KeyRange, StatementContext, Value};
-        use storage::StorageEngine;
 
         let dir = tempfile::tempdir().unwrap();
         let table_id;

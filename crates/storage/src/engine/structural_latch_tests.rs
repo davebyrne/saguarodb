@@ -9,8 +9,8 @@ use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::PageBackedStorageEngine;
 use crate::HeapPageStore;
-use crate::heap::{index_file_id, secondary_index_file_id};
-use crate::traits::{SchemaOperations, StorageEngine};
+use crate::heap::{primary_index_file_id, secondary_index_file_id};
+use crate::traits::SchemaOperations;
 
 const TABLE_ID: u32 = 1;
 const NAME_INDEX_ID: u32 = 1;
@@ -61,6 +61,7 @@ fn ctx(txn_id: u64) -> StatementContext {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -95,6 +96,7 @@ fn users_schema() -> TableSchema {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: NAME_INDEX_ID,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),
         columns: vec![1],
@@ -161,11 +163,11 @@ fn insert_registers_heap_and_index_latches() {
 
     assert!(has_latch(&engine, TABLE_ID), "heap latch registered");
     assert!(
-        has_latch(&engine, index_file_id(TABLE_ID)),
+        has_latch(&engine, primary_index_file_id(TABLE_ID)),
         "primary-key index latch registered"
     );
     assert!(
-        has_latch(&engine, secondary_index_file_id(NAME_INDEX_ID)),
+        has_latch(&engine, secondary_index_file_id(name_index().storage_id)),
         "secondary index latch registered"
     );
 }

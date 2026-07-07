@@ -7,9 +7,9 @@ use common::{
 use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use storage::{RowIterator, SchemaOperations, StorageEngine};
+use std::sync::{Arc, Mutex};
+use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
 use crate::{CopyIn, CopyOut, ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 
@@ -72,6 +72,7 @@ impl ExecutorHarness {
         let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
             statement,
+            relations: self.storage.capture_relation_snapshot()?,
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
@@ -118,6 +119,7 @@ impl ExecutorHarness {
         let cancel = AtomicBool::new(false);
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
+            relations: self.storage.capture_relation_snapshot()?,
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
@@ -156,6 +158,7 @@ impl ExecutorHarness {
         let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
             statement,
+            relations: self.storage.capture_relation_snapshot()?,
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
@@ -188,6 +191,7 @@ impl ExecutorHarness {
         let cancel = AtomicBool::new(false);
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
+            relations: self.storage.capture_relation_snapshot()?,
             catalog: &self.catalog,
             storage: &self.storage,
             schema_ops: &self.storage,
@@ -247,8 +251,30 @@ impl MemoryStorage {
     }
 }
 
+struct MemoryRelationSnapshot;
+
+impl RelationSnapshot for MemoryRelationSnapshot {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn relation_epoch(&self) -> u64 {
+        0
+    }
+}
+
 impl StorageEngine for MemoryStorage {
-    fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId> {
+    fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>> {
+        Ok(Arc::new(MemoryRelationSnapshot))
+    }
+
+    fn insert(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        row: Row,
+    ) -> Result<RowId> {
         let mut state = self
             .state
             .lock()
@@ -272,7 +298,13 @@ impl StorageEngine for MemoryStorage {
         Ok(row_id)
     }
 
-    fn get(&self, _ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>> {
+    fn get(
+        &self,
+        _ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+    ) -> Result<Option<Row>> {
         let state = self
             .state
             .lock()
@@ -284,7 +316,13 @@ impl StorageEngine for MemoryStorage {
             .cloned())
     }
 
-    fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool> {
+    fn delete(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+    ) -> Result<bool> {
         let mut state = self
             .state
             .lock()
@@ -297,7 +335,14 @@ impl StorageEngine for MemoryStorage {
             .unwrap_or(false))
     }
 
-    fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool> {
+    fn update(
+        &self,
+        ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool> {
         let mut state = self
             .state
             .lock()
@@ -325,7 +370,12 @@ impl StorageEngine for MemoryStorage {
         Ok(true)
     }
 
-    fn scan(&self, _ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>> {
+    fn scan(
+        &self,
+        _ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
+        table: TableId,
+    ) -> Result<Box<dyn RowIterator>> {
         let state = self
             .state
             .lock()
@@ -346,6 +396,7 @@ impl StorageEngine for MemoryStorage {
     fn scan_range(
         &self,
         _ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
         table: TableId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
@@ -379,6 +430,7 @@ impl StorageEngine for MemoryStorage {
     fn index_scan(
         &self,
         _ctx: &StatementContext,
+        _relations: &dyn RelationSnapshot,
         table: TableId,
         index: IndexId,
         range: &KeyRange,

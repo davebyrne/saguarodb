@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 
 use common::{KeyRange, RelationKind, StatementContext};
 use saguarodb_server::config::Config;
-use storage::StorageEngine;
 use support::{Connection, TestServer};
 
 /// A config with a known checkpoint cadence and auto-vacuum threshold for the F4b

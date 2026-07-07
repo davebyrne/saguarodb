@@ -2,13 +2,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, IndexId,
+    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, IndexId,
     IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, RelationKind, Result,
     SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, ToastMode,
-    ToastOptions, needs_toast_relation, toast_schema,
+    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, needs_toast_relation, toast_schema,
 };
 
 use crate::CatalogManager;
+
+const STORAGE_ID_KIND_BITS: FileId = 0xC000_0000;
+const MAX_STORAGE_ID: FileId = !STORAGE_ID_KIND_BITS;
+const STORAGE_ID_EXHAUSTED: FileId = MAX_STORAGE_ID + 1;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CatalogSnapshot {
@@ -36,6 +40,10 @@ pub struct CatalogSnapshot {
     // dictionary").
     #[serde(default = "default_next_dictionary_id")]
     pub next_dictionary_id: u32,
+    // Physical storage-generation id allocator. Defaults so catalogs written
+    // before relation generations existed migrate from logical ids.
+    #[serde(default = "default_next_storage_id")]
+    pub next_storage_id: FileId,
 }
 
 impl Default for CatalogSnapshot {
@@ -51,6 +59,7 @@ impl Default for CatalogSnapshot {
             sequences_by_id: HashMap::new(),
             next_sequence_id: default_next_sequence_id(),
             next_dictionary_id: default_next_dictionary_id(),
+            next_storage_id: default_next_storage_id(),
         }
     }
 }
@@ -64,6 +73,10 @@ fn default_next_sequence_id() -> SequenceId {
 }
 
 fn default_next_dictionary_id() -> u32 {
+    1
+}
+
+fn default_next_storage_id() -> FileId {
     1
 }
 
@@ -88,7 +101,8 @@ impl MemoryCatalog {
         }
     }
 
-    pub fn try_from_snapshot(snapshot: CatalogSnapshot) -> Result<Self> {
+    pub fn try_from_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
+        normalize_snapshot_storage_ids(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
     }
@@ -142,12 +156,14 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn restore(&self, mut snapshot: CatalogSnapshot) -> Result<()> {
+        normalize_snapshot_storage_ids(&mut snapshot)?;
         validate_snapshot(&snapshot)?;
         let mut current = self.write_snapshot()?;
         snapshot.next_table_id = snapshot.next_table_id.max(current.next_table_id);
         snapshot.next_index_id = snapshot.next_index_id.max(current.next_index_id);
         snapshot.next_sequence_id = snapshot.next_sequence_id.max(current.next_sequence_id);
         snapshot.next_dictionary_id = snapshot.next_dictionary_id.max(current.next_dictionary_id);
+        snapshot.next_storage_id = snapshot.next_storage_id.max(current.next_storage_id);
         *current = snapshot;
         Ok(())
     }
@@ -157,13 +173,16 @@ impl CatalogManager for MemoryCatalog {
         reserve_id(&mut snapshot.next_table_id, id, "table")
     }
 
-    fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
+    fn apply_create_table(&self, mut schema: TableSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
+        normalize_table_storage_id(&mut schema, &snapshot)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
         if schema.relation_kind == RelationKind::User {
             reject_duplicate_table_name(&snapshot, &schema.name)?;
         }
         reject_duplicate_table_id(&snapshot, schema.id)?;
+        validate_storage_id("table", schema.storage_id)?;
+        reject_duplicate_table_storage_id(&snapshot, schema.storage_id, "table storage id")?;
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog table id overflow while applying create table")
@@ -175,6 +194,7 @@ impl CatalogManager for MemoryCatalog {
                 .insert(schema.name.clone(), schema.id);
         }
         snapshot.next_table_id = snapshot.next_table_id.max(next_after_schema);
+        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
         snapshot.tables_by_id.insert(schema.id, schema);
         Ok(())
     }
@@ -250,18 +270,24 @@ impl CatalogManager for MemoryCatalog {
         reject_duplicate_table_name(&snapshot, &name)?;
 
         let table_id = snapshot.next_table_id;
+        let table_storage_id = snapshot.next_storage_id;
+        let mut next_storage_id =
+            next_storage_id_after(table_storage_id, "catalog storage id overflow")?;
         let mut next_table_id = table_id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
         let mut schema = build_schema(
             &snapshot,
-            table_id,
-            name,
-            columns,
-            primary_key,
-            compression,
-            toast,
-            checks,
+            BuildSchemaInput {
+                table_id,
+                storage_id: table_storage_id,
+                name,
+                columns,
+                primary_key,
+                compression,
+                toast,
+                checks,
+            },
         )?;
         validate_toast_options(&schema)?;
         let hidden_toast = if needs_toast_relation(&schema) {
@@ -269,8 +295,13 @@ impl CatalogManager for MemoryCatalog {
             next_table_id = toast_id
                 .checked_add(1)
                 .ok_or_else(|| DbError::internal("catalog table id overflow"))?;
+            let toast_storage_id = next_storage_id;
+            next_storage_id =
+                next_storage_id_after(toast_storage_id, "catalog storage id overflow")?;
             schema.toast_table_id = Some(toast_id);
-            Some(toast_schema(&schema, toast_id))
+            let mut hidden_toast = toast_schema(&schema, toast_id);
+            hidden_toast.storage_id = toast_storage_id;
+            Some(hidden_toast)
         } else {
             None
         };
@@ -283,6 +314,7 @@ impl CatalogManager for MemoryCatalog {
         }
         snapshot.tables_by_id.insert(schema.id, schema.clone());
         snapshot.next_table_id = next_table_id;
+        snapshot.next_storage_id = next_storage_id;
         Ok(schema)
     }
 
@@ -370,6 +402,107 @@ impl CatalogManager for MemoryCatalog {
         reserve_id(&mut snapshot.next_dictionary_id, id, "dictionary")
     }
 
+    fn allocate_storage_id(&self) -> Result<FileId> {
+        let mut snapshot = self.write_snapshot()?;
+        allocate_storage_id_from_snapshot(&mut snapshot)
+    }
+
+    fn reserve_storage_id(&self, id: FileId) -> Result<()> {
+        validate_storage_id("storage", id)?;
+        let mut snapshot = self.write_snapshot()?;
+        reserve_storage_id_value(&mut snapshot.next_storage_id, id)
+    }
+
+    fn prepare_truncate_table(&self, table: TableId) -> Result<TruncateTablePlan> {
+        let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                format!("cannot truncate hidden TOAST relation {}", schema.name),
+            ));
+        }
+
+        let new_table_storage_id = allocate_storage_id_from_snapshot(&mut snapshot)?;
+        let new_toast_storage_id = match schema.toast_table_id {
+            Some(toast_table_id) => {
+                let toast_schema = snapshot.tables_by_id.get(&toast_table_id).ok_or_else(|| {
+                    DbError::internal(format!(
+                        "catalog table {} references missing TOAST relation {}",
+                        schema.name, toast_table_id
+                    ))
+                })?;
+                if toast_schema.relation_kind
+                    != (RelationKind::Toast {
+                        base_table: schema.id,
+                    })
+                {
+                    return Err(DbError::internal(format!(
+                        "catalog table {} references non-matching TOAST relation {}",
+                        schema.name, toast_table_id
+                    )));
+                }
+                Some((
+                    toast_table_id,
+                    allocate_storage_id_from_snapshot(&mut snapshot)?,
+                ))
+            }
+            None => None,
+        };
+
+        let mut indexes = snapshot
+            .indexes_by_id
+            .values()
+            .filter(|index| index.table == table)
+            .map(|index| index.id)
+            .collect::<Vec<_>>();
+        indexes.sort_unstable();
+        let mut new_index_storage_ids = Vec::with_capacity(indexes.len());
+        for index_id in indexes {
+            new_index_storage_ids
+                .push((index_id, allocate_storage_id_from_snapshot(&mut snapshot)?));
+        }
+
+        Ok(TruncateTablePlan {
+            table_id: table,
+            new_table_storage_id,
+            new_toast_storage_id,
+            new_index_storage_ids,
+        })
+    }
+
+    fn build_truncate_table_update(
+        &self,
+        plan: &TruncateTablePlan,
+    ) -> Result<TruncateCatalogUpdate> {
+        let snapshot = self.read_snapshot()?;
+        build_truncate_catalog_update(&snapshot, plan)
+    }
+
+    fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate> {
+        let mut snapshot = self.write_snapshot()?;
+        let update = build_truncate_catalog_update(&snapshot, plan)?;
+
+        reserve_storage_id_value(&mut snapshot.next_storage_id, update.table.storage_id)?;
+        snapshot
+            .tables_by_id
+            .insert(update.table.id, update.table.clone());
+        if let Some(toast) = &update.toast_table {
+            reserve_storage_id_value(&mut snapshot.next_storage_id, toast.storage_id)?;
+            snapshot.tables_by_id.insert(toast.id, toast.clone());
+        }
+        for index in &update.indexes {
+            reserve_storage_id_value(&mut snapshot.next_storage_id, index.storage_id)?;
+            snapshot.indexes_by_id.insert(index.id, index.clone());
+        }
+
+        Ok(update)
+    }
+
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
         let snapshot = self.read_snapshot()?;
         Ok(snapshot
@@ -396,10 +529,13 @@ impl CatalogManager for MemoryCatalog {
         reserve_id(&mut snapshot.next_index_id, id, "index")
     }
 
-    fn apply_create_index(&self, schema: IndexSchema) -> Result<()> {
+    fn apply_create_index(&self, mut schema: IndexSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
+        normalize_index_storage_id(&mut schema, &snapshot)?;
         reject_duplicate_index_name(&snapshot, &schema.name)?;
         reject_duplicate_index_id(&snapshot, schema.id)?;
+        validate_storage_id("index", schema.storage_id)?;
+        reject_duplicate_index_storage_id(&snapshot, schema.storage_id, "index storage id")?;
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog index id overflow while applying create index")
@@ -409,6 +545,7 @@ impl CatalogManager for MemoryCatalog {
             .indexes_by_name
             .insert(schema.name.clone(), schema.id);
         snapshot.next_index_id = snapshot.next_index_id.max(next_after_schema);
+        reserve_storage_id_value(&mut snapshot.next_storage_id, schema.storage_id)?;
         snapshot.indexes_by_id.insert(schema.id, schema);
         Ok(())
     }
@@ -437,6 +574,8 @@ impl CatalogManager for MemoryCatalog {
         let next_index_id = index_id
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog index id overflow"))?;
+        let storage_id = snapshot.next_storage_id;
+        let next_storage_id = next_storage_id_after(storage_id, "catalog storage id overflow")?;
 
         let schema = {
             let table_schema = snapshot
@@ -444,7 +583,7 @@ impl CatalogManager for MemoryCatalog {
                 .get(table)
                 .and_then(|id| snapshot.tables_by_id.get(id))
                 .ok_or_else(|| undefined_table(format!("table {table} does not exist")))?;
-            build_index_schema(index_id, name, table_schema, columns, unique)?
+            build_index_schema(index_id, storage_id, name, table_schema, columns, unique)?
         };
 
         snapshot
@@ -452,6 +591,7 @@ impl CatalogManager for MemoryCatalog {
             .insert(schema.name.clone(), schema.id);
         snapshot.indexes_by_id.insert(schema.id, schema.clone());
         snapshot.next_index_id = next_index_id;
+        snapshot.next_storage_id = next_storage_id;
         Ok(schema)
     }
 
@@ -569,17 +709,465 @@ fn reserve_id(next: &mut u32, id: u32, kind: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_schema(
+fn build_truncate_catalog_update(
     snapshot: &CatalogSnapshot,
+    plan: &TruncateTablePlan,
+) -> Result<TruncateCatalogUpdate> {
+    validate_truncate_plan_storage_ids(plan)?;
+
+    let mut table = snapshot
+        .tables_by_id
+        .get(&plan.table_id)
+        .cloned()
+        .ok_or_else(|| undefined_table(format!("table id {} does not exist", plan.table_id)))?;
+    if table.relation_kind != RelationKind::User {
+        return Err(DbError::plan(
+            SqlState::FeatureNotSupported,
+            format!("cannot truncate hidden TOAST relation {}", table.name),
+        ));
+    }
+
+    let toast_table = match (table.toast_table_id, plan.new_toast_storage_id) {
+        (Some(expected_id), Some((toast_id, storage_id))) if expected_id == toast_id => {
+            let mut toast = snapshot
+                .tables_by_id
+                .get(&toast_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "catalog table {} references missing TOAST relation {}",
+                        table.name, toast_id
+                    ))
+                })?;
+            if toast.relation_kind
+                != (RelationKind::Toast {
+                    base_table: table.id,
+                })
+            {
+                return Err(DbError::internal(format!(
+                    "catalog table {} references non-matching TOAST relation {}",
+                    table.name, toast_id
+                )));
+            }
+            toast.storage_id = storage_id;
+            Some(toast)
+        }
+        (None, None) => None,
+        (Some(expected_id), Some((toast_id, _))) => {
+            return Err(DbError::internal(format!(
+                "truncate plan toast table {toast_id} does not match catalog toast table {expected_id}"
+            )));
+        }
+        (Some(expected_id), None) => {
+            return Err(DbError::internal(format!(
+                "truncate plan missing toast storage id for table {} toast relation {}",
+                table.name, expected_id
+            )));
+        }
+        (None, Some((toast_id, _))) => {
+            return Err(DbError::internal(format!(
+                "truncate plan names toast relation {toast_id} for table {} without one",
+                table.name
+            )));
+        }
+    };
+
+    let live_index_ids = snapshot
+        .indexes_by_id
+        .values()
+        .filter(|index| index.table == table.id)
+        .map(|index| index.id)
+        .collect::<HashSet<_>>();
+    let planned_index_ids = plan
+        .new_index_storage_ids
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<HashSet<_>>();
+    if live_index_ids != planned_index_ids {
+        return Err(DbError::internal(format!(
+            "truncate plan index set does not match catalog indexes for table {}",
+            table.name
+        )));
+    }
+
+    validate_truncate_storage_ids_available(snapshot, plan)?;
+
+    table.storage_id = plan.new_table_storage_id;
+    let mut indexes = Vec::with_capacity(plan.new_index_storage_ids.len());
+    for (index_id, storage_id) in &plan.new_index_storage_ids {
+        let mut index = snapshot
+            .indexes_by_id
+            .get(index_id)
+            .cloned()
+            .ok_or_else(|| undefined_index(format!("index id {index_id} does not exist")))?;
+        if index.table != table.id {
+            return Err(DbError::internal(format!(
+                "truncate plan index {} belongs to table {}, expected {}",
+                index.id, index.table, table.id
+            )));
+        }
+        index.storage_id = *storage_id;
+        indexes.push(index);
+    }
+    indexes.sort_by_key(|index| index.id);
+
+    Ok(TruncateCatalogUpdate {
+        table,
+        toast_table,
+        indexes,
+    })
+}
+
+fn allocate_storage_id_from_snapshot(snapshot: &mut CatalogSnapshot) -> Result<FileId> {
+    let id = snapshot.next_storage_id;
+    validate_storage_id("storage", id)?;
+    snapshot.next_storage_id = next_storage_id_after(id, "catalog storage id overflow")?;
+    Ok(id)
+}
+
+fn reserve_storage_id_value(next: &mut FileId, id: FileId) -> Result<()> {
+    validate_storage_id("storage", id)?;
+    *next = (*next).max(next_storage_id_after(
+        id,
+        "catalog storage id overflow while reserving id",
+    )?);
+    Ok(())
+}
+
+fn next_storage_id_after(id: FileId, overflow_message: &'static str) -> Result<FileId> {
+    validate_storage_id("storage", id)?;
+    id.checked_add(1)
+        .filter(|next| *next <= STORAGE_ID_EXHAUSTED)
+        .ok_or_else(|| DbError::internal(overflow_message))
+}
+
+fn validate_storage_id(kind: &str, id: FileId) -> Result<()> {
+    if id == 0 {
+        return Err(DbError::internal(format!(
+            "catalog {kind} storage id 0 is reserved for legacy missing ids"
+        )));
+    }
+    if id & STORAGE_ID_KIND_BITS != 0 {
+        return Err(DbError::internal(format!(
+            "catalog {kind} storage id {id} contains file-kind high bits"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_snapshot_storage_ids(snapshot: &mut CatalogSnapshot) -> Result<()> {
+    let mut table_assigned = explicit_table_storage_ids(snapshot);
+    let mut index_assigned = explicit_index_storage_ids(snapshot);
+    let mut assigned = table_assigned
+        .iter()
+        .chain(index_assigned.iter())
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut next_storage_id = snapshot
+        .next_storage_id
+        .max(default_next_storage_id())
+        .max(next_after_max_storage_id(&assigned)?);
+
+    let mut table_ids = snapshot.tables_by_id.keys().copied().collect::<Vec<_>>();
+    table_ids.sort_unstable();
+    for table_id in table_ids {
+        let table = snapshot
+            .tables_by_id
+            .get_mut(&table_id)
+            .expect("table id came from map keys");
+        if table.storage_id == 0 {
+            table.storage_id =
+                legacy_or_fresh_storage_id(table.id, &mut next_storage_id, &mut table_assigned)?;
+            assigned.insert(table.storage_id);
+        } else {
+            table_assigned.insert(table.storage_id);
+            assigned.insert(table.storage_id);
+        }
+    }
+
+    let mut index_ids = snapshot.indexes_by_id.keys().copied().collect::<Vec<_>>();
+    index_ids.sort_unstable();
+    for index_id in index_ids {
+        let index = snapshot
+            .indexes_by_id
+            .get_mut(&index_id)
+            .expect("index id came from map keys");
+        if index.storage_id == 0 {
+            index.storage_id =
+                legacy_or_fresh_storage_id(index.id, &mut next_storage_id, &mut index_assigned)?;
+            assigned.insert(index.storage_id);
+        } else {
+            index_assigned.insert(index.storage_id);
+            assigned.insert(index.storage_id);
+        }
+    }
+
+    snapshot.next_storage_id = next_storage_id.max(next_after_max_storage_id(&assigned)?);
+    Ok(())
+}
+
+fn explicit_table_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
+    snapshot
+        .tables_by_id
+        .values()
+        .filter_map(|table| (table.storage_id != 0).then_some(table.storage_id))
+        .collect()
+}
+
+fn explicit_index_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
+    snapshot
+        .indexes_by_id
+        .values()
+        .filter_map(|index| (index.storage_id != 0).then_some(index.storage_id))
+        .collect()
+}
+
+fn legacy_or_fresh_storage_id(
+    preferred: FileId,
+    next_storage_id: &mut FileId,
+    assigned: &mut HashSet<FileId>,
+) -> Result<FileId> {
+    if preferred != 0 && preferred & STORAGE_ID_KIND_BITS == 0 && !assigned.contains(&preferred) {
+        assigned.insert(preferred);
+        return Ok(preferred);
+    }
+    loop {
+        let candidate = *next_storage_id;
+        *next_storage_id = next_storage_id_after(candidate, "catalog storage id overflow")?;
+        if !assigned.contains(&candidate) {
+            assigned.insert(candidate);
+            return Ok(candidate);
+        }
+    }
+}
+
+fn next_after_max_storage_id(ids: &HashSet<FileId>) -> Result<FileId> {
+    match ids.iter().copied().max() {
+        Some(max) => next_storage_id_after(max, "catalog storage id overflow"),
+        None => Ok(default_next_storage_id()),
+    }
+}
+
+fn normalize_table_storage_id(schema: &mut TableSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    if schema.storage_id != 0 {
+        return Ok(());
+    }
+    let mut assigned = live_table_storage_ids(snapshot);
+    let all_assigned = live_storage_ids(snapshot);
+    let mut next_storage_id = snapshot
+        .next_storage_id
+        .max(next_after_max_storage_id(&all_assigned)?);
+    schema.storage_id = legacy_or_fresh_storage_id(schema.id, &mut next_storage_id, &mut assigned)?;
+    Ok(())
+}
+
+fn normalize_index_storage_id(schema: &mut IndexSchema, snapshot: &CatalogSnapshot) -> Result<()> {
+    if schema.storage_id != 0 {
+        return Ok(());
+    }
+    let mut assigned = live_index_storage_ids(snapshot);
+    let all_assigned = live_storage_ids(snapshot);
+    let mut next_storage_id = snapshot
+        .next_storage_id
+        .max(next_after_max_storage_id(&all_assigned)?);
+    schema.storage_id = legacy_or_fresh_storage_id(schema.id, &mut next_storage_id, &mut assigned)?;
+    Ok(())
+}
+
+fn live_table_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
+    snapshot
+        .tables_by_id
+        .values()
+        .map(|table| table.storage_id)
+        .filter(|id| *id != 0)
+        .collect()
+}
+
+fn live_index_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
+    snapshot
+        .indexes_by_id
+        .values()
+        .map(|index| index.storage_id)
+        .filter(|id| *id != 0)
+        .collect()
+}
+
+fn live_storage_ids(snapshot: &CatalogSnapshot) -> HashSet<FileId> {
+    snapshot
+        .tables_by_id
+        .values()
+        .map(|table| table.storage_id)
+        .chain(
+            snapshot
+                .indexes_by_id
+                .values()
+                .map(|index| index.storage_id),
+        )
+        .filter(|id| *id != 0)
+        .collect()
+}
+
+fn validate_storage_ids(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut seen_tables = HashMap::<FileId, String>::new();
+    let mut seen_indexes = HashMap::<FileId, String>::new();
+    let mut max_storage_id = 0;
+    for table in snapshot.tables_by_id.values() {
+        validate_storage_id("table", table.storage_id)?;
+        reject_seen_storage_id(
+            &mut seen_tables,
+            table.storage_id,
+            format!("table {}", table.name),
+        )?;
+        max_storage_id = max_storage_id.max(table.storage_id);
+    }
+    for index in snapshot.indexes_by_id.values() {
+        validate_storage_id("index", index.storage_id)?;
+        reject_seen_storage_id(
+            &mut seen_indexes,
+            index.storage_id,
+            format!("index {}", index.name),
+        )?;
+        max_storage_id = max_storage_id.max(index.storage_id);
+    }
+
+    let required_next = if max_storage_id == 0 {
+        default_next_storage_id()
+    } else {
+        next_storage_id_after(max_storage_id, "catalog storage id overflow")?
+    };
+    if snapshot.next_storage_id < required_next {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_storage_id {} is less than required {required_next}",
+            snapshot.next_storage_id
+        )));
+    }
+    if snapshot.next_storage_id > STORAGE_ID_EXHAUSTED {
+        return Err(DbError::internal(format!(
+            "catalog snapshot next_storage_id {} exceeds the storage-id space",
+            snapshot.next_storage_id
+        )));
+    }
+    Ok(())
+}
+
+fn reject_seen_storage_id(
+    seen: &mut HashMap<FileId, String>,
+    storage_id: FileId,
+    owner: String,
+) -> Result<()> {
+    if let Some(existing) = seen.insert(storage_id, owner.clone()) {
+        return Err(DbError::internal(format!(
+            "catalog storage id {storage_id} is used by both {existing} and {owner}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_table_storage_id(
+    snapshot: &CatalogSnapshot,
+    storage_id: FileId,
+    owner: &str,
+) -> Result<()> {
+    for table in snapshot.tables_by_id.values() {
+        if table.storage_id == storage_id {
+            return Err(DbError::internal(format!(
+                "{owner} {storage_id} collides with table {}",
+                table.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_index_storage_id(
+    snapshot: &CatalogSnapshot,
+    storage_id: FileId,
+    owner: &str,
+) -> Result<()> {
+    for index in snapshot.indexes_by_id.values() {
+        if index.storage_id == storage_id {
+            return Err(DbError::internal(format!(
+                "{owner} {storage_id} collides with index {}",
+                index.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_truncate_plan_storage_ids(plan: &TruncateTablePlan) -> Result<()> {
+    let mut ids = HashSet::new();
+    validate_truncate_plan_storage_id(plan.new_table_storage_id, &mut ids)?;
+    if let Some((_, storage_id)) = plan.new_toast_storage_id {
+        validate_truncate_plan_storage_id(storage_id, &mut ids)?;
+    }
+    for (_, storage_id) in &plan.new_index_storage_ids {
+        validate_truncate_plan_storage_id(*storage_id, &mut ids)?;
+    }
+    Ok(())
+}
+
+fn validate_truncate_plan_storage_id(storage_id: FileId, ids: &mut HashSet<FileId>) -> Result<()> {
+    validate_storage_id("truncate", storage_id)?;
+    if !ids.insert(storage_id) {
+        return Err(DbError::internal(format!(
+            "truncate plan repeats storage id {storage_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_truncate_storage_ids_available(
+    snapshot: &CatalogSnapshot,
+    plan: &TruncateTablePlan,
+) -> Result<()> {
+    let plan_ids = std::iter::once(plan.new_table_storage_id)
+        .chain(plan.new_toast_storage_id.map(|(_, id)| id))
+        .chain(plan.new_index_storage_ids.iter().map(|(_, id)| *id))
+        .collect::<HashSet<_>>();
+
+    for table in snapshot.tables_by_id.values() {
+        if plan_ids.contains(&table.storage_id) {
+            return Err(DbError::internal(format!(
+                "truncate plan storage id collides with table {}",
+                table.name
+            )));
+        }
+    }
+    for index in snapshot.indexes_by_id.values() {
+        if plan_ids.contains(&index.storage_id) {
+            return Err(DbError::internal(format!(
+                "truncate plan storage id collides with index {}",
+                index.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct BuildSchemaInput {
     table_id: TableId,
+    storage_id: FileId,
     name: String,
     columns: Vec<ParsedColumnDef>,
     primary_key: Vec<String>,
     compression: CompressionSetting,
     toast: ToastOptions,
     checks: Vec<String>,
-) -> Result<TableSchema> {
+}
+
+fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<TableSchema> {
+    let BuildSchemaInput {
+        table_id,
+        storage_id,
+        name,
+        columns,
+        primary_key,
+        compression,
+        toast,
+        checks,
+    } = input;
+
     let mut seen_names = HashSet::new();
     let mut column_ids_by_name = HashMap::new();
     let mut assigned_columns = Vec::with_capacity(columns.len());
@@ -653,6 +1241,7 @@ fn build_schema(
 
     Ok(TableSchema {
         id: table_id,
+        storage_id,
         name,
         columns: assigned_columns,
         primary_key: primary_key_ids,
@@ -797,13 +1386,16 @@ pub fn validate_create_table_definition(
         .collect();
     let schema = build_schema(
         &CatalogSnapshot::default(),
-        0,
-        name.to_string(),
-        columns_for_shape,
-        primary_key.to_vec(),
-        CompressionSetting::None,
-        ToastOptions::legacy_catalog_default(),
-        Vec::new(),
+        BuildSchemaInput {
+            table_id: 0,
+            storage_id: 1,
+            name: name.to_string(),
+            columns: columns_for_shape,
+            primary_key: primary_key.to_vec(),
+            compression: CompressionSetting::None,
+            toast: ToastOptions::legacy_catalog_default(),
+            checks: Vec::new(),
+        },
     )?;
     let mut generated_unique_names = HashSet::new();
     for columns in unique {
@@ -814,7 +1406,7 @@ pub fn validate_create_table_definition(
                 format!("index {index_name} already exists"),
             ));
         }
-        build_index_schema(0, index_name, &schema, columns, true)?;
+        build_index_schema(0, 2, index_name, &schema, columns, true)?;
     }
     Ok(())
 }
@@ -882,6 +1474,7 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
 
     validate_indexes(snapshot)?;
     validate_dictionary_ids(snapshot)?;
+    validate_storage_ids(snapshot)?;
     validate_toast_relations(snapshot)?;
     Ok(())
 }
@@ -1008,7 +1601,8 @@ fn validate_toast_relations(snapshot: &CatalogSnapshot) -> Result<()> {
 }
 
 fn validate_hidden_toast_schema(base: &TableSchema, hidden: &TableSchema) -> Result<()> {
-    let expected = toast_schema(base, hidden.id);
+    let mut expected = toast_schema(base, hidden.id);
+    expected.storage_id = hidden.storage_id;
     if hidden != &expected {
         return Err(DbError::internal(format!(
             "catalog snapshot TOAST relation {} does not match the required internal schema",
@@ -1350,6 +1944,7 @@ fn undefined_sequence_id(id: SequenceId) -> DbError {
 
 fn build_index_schema(
     index_id: IndexId,
+    storage_id: FileId,
     name: String,
     table: &TableSchema,
     columns: &[String],
@@ -1387,6 +1982,7 @@ fn build_index_schema(
 
     Ok(IndexSchema {
         id: index_id,
+        storage_id,
         table: table.id,
         name,
         columns: column_ids,

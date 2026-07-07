@@ -102,12 +102,14 @@ pub(crate) fn resolve_plan_subqueries(
             table_name,
             index,
             range,
+            full_filter,
             filter,
         } => PhysicalPlan::IndexScan {
             table: *table,
             table_name: table_name.clone(),
             index: *index,
             range: range.clone(),
+            full_filter: resolve_opt(ctx, full_filter)?,
             filter: resolve_opt(ctx, filter)?,
         },
         PhysicalPlan::NestedLoopJoin {

@@ -29,4 +29,11 @@ pub trait PageStore: PageLoader {
     /// or `0` if the file does not exist. Used to seed page allocation so a freshly
     /// allocated page never reuses one that already exists on disk after recovery.
     fn page_count(&self, file_id: FileId) -> Result<PageNum>;
+
+    /// Remove the durable file for `file_id`, if it exists. Callers must first
+    /// ensure no buffer frames for the file are pinned or still needed.
+    fn remove_file(&self, file_id: FileId) -> Result<()>;
+
+    /// List durable file ids known to this store. Used for startup orphan cleanup.
+    fn list_file_ids(&self) -> Result<Vec<FileId>>;
 }

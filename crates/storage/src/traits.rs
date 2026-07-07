@@ -1,6 +1,9 @@
+use std::any::Any;
+use std::sync::Arc;
+
 use common::{
     ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, SequenceId,
-    SequenceSchema, StatementContext, StoredRow, TableId, TableSchema,
+    SequenceSchema, StatementContext, StoredRow, TableId, TableSchema, TruncateCatalogUpdate,
 };
 
 pub trait RowIterator: Send {
@@ -8,20 +11,57 @@ pub trait RowIterator: Send {
     fn schema(&self) -> &[ColumnInfo];
 }
 
+pub trait RelationSnapshot: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn relation_epoch(&self) -> u64;
+}
+
 pub trait StorageEngine: Send + Sync {
-    fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId>;
-    fn get(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>>;
-    fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool>;
+    fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>>;
+    fn insert(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        row: Row,
+    ) -> Result<RowId>;
+    fn get(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+    ) -> Result<Option<Row>>;
+    fn delete(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+    ) -> Result<bool>;
     /// Update the visible version of `key` to `row`. The HOT update-path prune
     /// (`docs/specs/mvcc.md` §10 Milestone H3) reads the GC horizon from
     /// `ctx.gc_horizon`: when a same-page HOT update finds no room, the engine collapses
     /// that page's committed-dead HOT prefixes (under the heap latch) to reclaim space
     /// before falling back to a normal update. A stale/smaller horizon only prunes less.
-    fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool>;
-    fn scan(&self, ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>>;
+    fn update(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+        key: &Key,
+        row: Row,
+    ) -> Result<bool>;
+    fn scan(
+        &self,
+        ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
+        table: TableId,
+    ) -> Result<Box<dyn RowIterator>>;
     fn scan_range(
         &self,
         ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
         table: TableId,
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>>;
@@ -31,6 +71,7 @@ pub trait StorageEngine: Send + Sync {
     fn index_scan(
         &self,
         ctx: &StatementContext,
+        relations: &dyn RelationSnapshot,
         table: TableId,
         index: IndexId,
         range: &KeyRange,
@@ -82,4 +123,7 @@ pub trait RecoveryOperations: Send + Sync {
     /// Recovery apply for `ALTER TABLE ... SET (toast...)`: installs the updated
     /// schema metadata. Must not append WAL.
     fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
+    /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
+    /// table/index generations produced by catalog replay. Must not append WAL.
+    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
 }

@@ -23,14 +23,20 @@ pub trait RowIterator: Send {
     fn schema(&self) -> &[ColumnInfo];
 }
 
+pub trait RelationSnapshot: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn relation_epoch(&self) -> u64;
+}
+
 pub trait StorageEngine: Send + Sync {
-    fn insert(&self, ctx: &StatementContext, table: TableId, row: Row) -> Result<RowId>;
-    fn get(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<Option<Row>>;
-    fn delete(&self, ctx: &StatementContext, table: TableId, key: &Key) -> Result<bool>;
-    fn update(&self, ctx: &StatementContext, table: TableId, key: &Key, row: Row) -> Result<bool>;
-    fn scan(&self, ctx: &StatementContext, table: TableId) -> Result<Box<dyn RowIterator>>;
-    fn scan_range(&self, ctx: &StatementContext, table: TableId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
-    fn index_scan(&self, ctx: &StatementContext, table: TableId, index: IndexId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
+    fn capture_relation_snapshot(&self) -> Result<Arc<dyn RelationSnapshot>>;
+    fn insert(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, row: Row) -> Result<RowId>;
+    fn get(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<Option<Row>>;
+    fn delete(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key) -> Result<bool>;
+    fn update(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, key: &Key, row: Row) -> Result<bool>;
+    fn scan(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId) -> Result<Box<dyn RowIterator>>;
+    fn scan_range(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
+    fn index_scan(&self, ctx: &StatementContext, relations: &dyn RelationSnapshot, table: TableId, index: IndexId, range: &KeyRange) -> Result<Box<dyn RowIterator>>;
     fn rollback_txn(&self, txn_id: u64) -> Result<()>;
     fn commit_txn(&self, txn_id: u64) -> Result<()>;
 }
@@ -65,10 +71,25 @@ pub trait RecoveryOperations: Send + Sync {
     /// Recovery apply for `ALTER TABLE ... SET (toast...)`: installs the updated
     /// schema metadata. Must not append WAL.
     fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
+    /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
+    /// table/index generations produced by catalog replay. Must not append WAL.
+    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
 }
 ```
 
-`RecoveryOperations` carries storage-owned logical replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. `rollback_txn` restores storage-owned DDL metadata only; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. `commit_txn` discards storage rollback metadata after WAL flush succeeds. `commit_txn` is cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
+`RelationSnapshot` captures the table/index generation `Arc`s a statement should
+resolve plus the storage relation epoch observed while capturing them. The epoch
+increments whenever storage publishes or restores relation metadata. Server
+statement setup uses it to retry MVCC + relation snapshot capture if a relation
+generation swap lands between the two captures. Read Committed/autocommit callers
+capture one per statement; Repeatable Read and Serializable keep the captured
+relation snapshot with the transaction's MVCC snapshot. Reads use captured
+generations for tables present in the snapshot. Writes reject a captured stale
+generation with `SerializationFailure` instead of mutating retired files. A
+later-created secondary index may be used with an older relation snapshot only
+when the table generation itself is unchanged.
+
+`RecoveryOperations` carries storage-owned logical replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate preparation appends the logical `TruncateTable` WAL record before creating replacement heap/index files, so recovery can reserve replacement storage IDs before replaying orphan page records from an uncommitted prepare; committed truncate replay publishes the catalog-provided replacement generations without appending WAL. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
 ## Table Storage
 
@@ -160,8 +181,12 @@ results are unchanged from the pre-MVCC engine.
   server-owned TOAST cleanup sequence.
 - **Index backfill; DML locates the visible version; HOT broken-chain guard.**
   `create_index(ctx, schema, gc_horizon)` backfills under the **exclusive guard** (so
-  the chain view is stable) with the GC horizon threaded in. A non-HOT single-version
-  root is indexed from its *current physical* tuple only when it is not
+  the chain view is stable) with the GC horizon threaded in. The new secondary
+  index generation is not published in storage until its empty tree is created
+  and backfill succeeds; relation snapshots captured during the build treat the
+  catalog-visible index as unavailable and executor fallback must use a table
+  scan. A non-HOT single-version root is indexed from its *current physical*
+  tuple only when it is not
   `is_dead_to_all` at that horizon. A HOT chain (root + heap-only members, via
   `collect_chain_versions`) is checked for a **broken chain**: if two or more
   not-`is_dead_to_all` versions disagree on the new index's key(s), the build aborts
@@ -779,10 +804,11 @@ Serialization uses catalog `TableSchema` column order.
 ## Primary-Key Index
 
 Each table has a durable, non-clustered B+-tree mapping `Key -> RowLocation`, in
-its own file. The index file id is the table id with a high bit set, so it never
-collides with the heap file id (the bare table id); `HeapPageStore` writes it to
-`<data>/heap/<table>.idx`. Rows stay in the heap; the tree replaces the former
-in-memory directory.
+its own file. The heap file id is the table schema's current `storage_id`; the
+primary-key index file id is that same generation id with the high bit set, so it
+never collides with the heap file. `HeapPageStore` writes it to
+`<data>/heap/<storage_id>.idx`. Rows stay in the heap; the tree replaces the
+former in-memory directory.
 
 ### Multi-entry ordering
 
@@ -905,9 +931,10 @@ and uses them as the equal-key tiebreaker.
 
 A table may have any number of secondary indexes. Each is its own durable B-tree
 in its own file, tagged with the top two file-id bits (distinct from the heap and
-the primary-key index) and written to `<data>/heap/<index_id>.sidx`. Index ids
-are a separate id space from table ids; the reserved primary-key index id is never
-used for a secondary index.
+the primary-key index) and written to `<data>/heap/<storage_id>.sidx`, where
+`storage_id` is the secondary index schema's current physical generation. Index
+ids are stable logical catalog identities; storage ids name the current physical
+files and may change on relation-swap truncate.
 
 - **Entry layout.** A secondary index stores `indexed_columns -> RowLocation`
   (heap TID), uniform with the primary-key index — every index is now
@@ -950,9 +977,13 @@ used for a secondary index.
   `update` returns `SqlState::UniqueViolation` for a committed-live duplicate; when
   the key is held only by another in-progress inserter, the writer waits for that
   transaction and rechecks (§7.3).
-- **Create / drop.** `create_index` registers the index, builds an empty tree,
-  and backfills it by scanning the live rows through the primary-key index
-  (a duplicate value for a unique index fails the build with `UniqueViolation`).
+- **Create / drop.** `create_index` appends the logical WAL record, builds an
+  empty tree, and backfills it by scanning the live rows through the primary-key
+  index (a duplicate value for a unique index fails the build with
+  `UniqueViolation`). Storage publishes the new `IndexGeneration` only after
+  the build succeeds and records rollback metadata before publication; until
+  publication, `index_scan` reports the index unavailable for snapshots that do
+  not contain it.
   `drop_index` marks the index dropped and leaves its pages in place (accepted
   bloat, like `drop_table`). `drop_table` (and its recovery replay) cascades to
   mark the table's secondary indexes dropped too; when the table has a hidden
@@ -985,11 +1016,12 @@ sequences. These value changes are non-transactional and are not restored by
 ## Heap Page Store
 
 `HeapPageStore` is the mutable page home for in-place dirty-page flushing. It
-implements `buffer::PageStore` over one file per table: the heap at
-`<data>/heap/<file_id>.heap`, the primary-key index at `<data>/heap/<table>.idx`
-(index file ids carry the high bit), and each secondary index at
-`<data>/heap/<index_id>.sidx` (file ids carry the top two bits), storing page `n`
-at byte offset `n * PAGE_SIZE` with positioned reads/writes. `load_page` returns a complete page or `None`
+implements `buffer::PageStore` over one file per relation generation: table and
+TOAST heaps at `<data>/heap/<storage_id>.heap`, primary-key indexes at
+`<data>/heap/<storage_id>.idx` (file ids carry the high bit), and secondary
+indexes at `<data>/heap/<storage_id>.sidx` (file ids carry the top two bits),
+storing page `n` at byte offset `n * PAGE_SIZE` with positioned reads/writes.
+`load_page` returns a complete page or `None`
 (missing file or beyond-EOF / short tail); `write_page` writes in place without
 fsync; `sync_all` fsyncs all open files and the directory; `page_count` returns a
 file's on-disk extent in pages, used to seed page allocation after recovery.
@@ -1180,7 +1212,7 @@ Server query orchestration appends `Commit` and flushes WAL after the statement 
 The storage engine can be initialized in recovery mode. In recovery mode:
 
 - Normal `StorageEngine` methods are not used.
-- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations` only when their transaction is committed.
+- Row recovery is physiological page redo: the server drives `apply_physical_redo` over every physical page-mutation record, PageLSN-gated and idempotent. DDL records replay via `RecoveryOperations` only when their transaction is committed, including committed relation-swap `TruncateTable` records.
 - Sequence value records replay via `RecoveryOperations` regardless of CLOG
   status because sequence advancement is non-transactional.
 - No WAL append occurs.
@@ -1256,7 +1288,7 @@ impl PageBackedStorageEngine {
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
-`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
+`RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, truncate generation publication, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 
 ## TOAST Value ID Allocation
 
@@ -1384,7 +1416,7 @@ operation closes both windows.
   per file (so writers on different indexes/heaps run concurrently). The engine is
   shared via `Arc`, so the latches are shared across all transactions/connections.
 - **Per-index latch — atomic uniqueness-check-AND-insert.** Every index structural
-  mutation holds that index's `structural_latch(index_file_id)` across the WHOLE
+  mutation holds that physical index file's `structural_latch(file_id)` across the WHOLE
   operation. The critical correctness requirement: the visibility-aware uniqueness
   check (`unique_conflict_kind`, which scans the index) and the `BTree::insert` (which
   mutates it, including any leaf split, parent-split propagation, and root split +
@@ -1433,8 +1465,8 @@ different files can proceed concurrently.
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
 - New pages allocated during a statement are not reclaimed on rollback; their page numbers remain consumed so runtime state matches redo-all recovery.
-- Index and heap page changes (including B-tree splits) are not physically undone on rollback. `rollback_txn(txn_id)` only restores storage-owned table and index metadata; row/index versions written by the aborted transaction stay on pages and are hidden by the CLOG until VACUUM.
-- `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. Storage does not physically delete heap or index pages; committed drops are reflected by omitting the table or index from later checkpoints.
+- Index and heap page changes (including B-tree splits) are not physically undone on rollback. `rollback_txn(txn_id)` restores storage-owned table and index metadata, may delete unpublished truncate replacement files that no committed catalog state can reference, and retires any rollback-removed published generation until retained snapshots release it; row/index versions written by the aborted transaction stay on pages and are hidden by the CLOG until VACUUM.
+- `drop_table` records table metadata in storage rollback metadata before marking the table dropped; `create_index` / `drop_index` record index metadata the same way, so a rolled-back create removes the index and a rolled-back drop restores it. A committed drop queues the previous table/index generations for retired cleanup; dropped metadata no longer protects the files once the commit cleanup has recorded those retired generations.
 
 ## Error Handling
 
@@ -1460,11 +1492,12 @@ different files can proceed concurrently.
 - A B-tree splits correctly under variable-length keys (byte-balanced) and stays searchable.
 - After a restart, inserting a row or growing the index never reuses an on-disk page.
 - Failed insert that allocated a new page rolls back newly allocated pages through buffer rollback.
-- Heap, primary-key index, and secondary index files for the same numeric id stay distinct.
+- Heap, primary-key index, and secondary index files for the same storage id stay distinct.
 - A secondary B-tree stores heap TIDs and a prefix range matches the indexed columns regardless of the trailing TID tiebreaker; an index scan resolves to heap TIDs directly.
 - `create_index` backfills existing rows; `index_scan` returns them, and a non-unique index returns every row for a value.
 - Insert, update, and delete keep a secondary index in sync.
 - A unique index rejects a duplicate value on insert and on backfill, but allows multiple NULLs.
 - A dropped index is no longer maintained or scannable; a rolled-back create removes it.
+- A secondary index is not visible to relation snapshots captured while its physical tree/backfill is still in progress.
 - `create_index` logs a `CreateIndex` record; recovery-apply index methods append no WAL.
 - After a restart, a secondary index created post-checkpoint is replayed (catalog + storage metadata and its rebuilt tree) and remains scannable.

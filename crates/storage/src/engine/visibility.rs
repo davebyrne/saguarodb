@@ -70,6 +70,7 @@ impl PageBackedStorageEngine {
     pub(super) fn materialize_physical_row(
         &self,
         ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         physical: crate::codec::DecodedPhysicalRow,
     ) -> Result<Row> {
@@ -91,7 +92,7 @@ impl PageBackedStorageEngine {
                     values.push(toast_value_for_column(schema, column, raw)?);
                 }
                 DecodedPhysicalValue::External { column, pointer } => {
-                    let stream = self.read_toast_stream(ctx, schema, &pointer)?;
+                    let stream = self.read_toast_stream(ctx, relations, schema, &pointer)?;
                     let (dict_id, raw_crc32, payload) =
                         crate::toast::parse_external_stream(pointer.codec, &stream)?;
                     let raw = self.materialize_toast_payload(
@@ -449,6 +450,7 @@ impl PageBackedStorageEngine {
     pub(super) fn read_visible_row(
         &self,
         ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         location: RowLocation,
     ) -> Result<Option<(RowLocation, Row)>> {
@@ -466,7 +468,7 @@ impl PageBackedStorageEngine {
         };
         let physical = decode_physical_row(schema, &bytes)?;
         drop(readable);
-        let row = self.materialize_physical_row(ctx, schema, physical)?;
+        let row = self.materialize_physical_row(ctx, relations, schema, physical)?;
         Ok(Some((resolved, row)))
     }
     /// Locate the single version of `key` visible to `snapshot` from `current_txns`

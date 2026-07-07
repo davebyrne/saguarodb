@@ -78,7 +78,7 @@ impl TestServer {
 
     /// The full-extent heap page count for a table (resident + evicted pages), used
     /// to assert space stays bounded under churn. Resolves the table's heap
-    /// `FileId` (== its `TableId`) from the catalog.
+    /// `FileId` from the catalog's current storage generation.
     pub fn heap_page_count(&self, table: &str) -> u32 {
         let schema = self
             .app
@@ -90,7 +90,7 @@ impl TestServer {
         self.app
             .components
             .buffer_pool
-            .page_count(schema.id)
+            .page_count(schema.storage_id)
             .expect("page count")
     }
 
@@ -529,6 +529,19 @@ pub fn first_row_description(bytes: &[u8]) -> Result<Vec<RowDescriptionField>> {
         )
     })?;
     decode_row_description_body(&body)
+}
+
+pub fn command_tags(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut tags = Vec::new();
+    for_each_message(bytes, |tag, body| {
+        if tag == b'C' {
+            tags.push(
+                String::from_utf8_lossy(body.split(|&b| b == 0).next().unwrap_or(&[])).into_owned(),
+            );
+        }
+        false
+    })?;
+    Ok(tags)
 }
 
 /// Extract the transaction-status byte from the trailing `ReadyForQuery` (`Z`)

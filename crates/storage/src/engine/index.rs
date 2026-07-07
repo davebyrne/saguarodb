@@ -22,7 +22,7 @@ impl PageBackedStorageEngine {
         has_null: bool,
         location: &RowLocation,
     ) -> Result<()> {
-        let secondary = self.secondary_btree(index.id);
+        let secondary = self.secondary_btree(index);
         // Hold this secondary index's structural latch across the uniqueness check
         // AND the insert atomically (Milestone E2a). For a unique secondary the scan
         // (`unique_conflict_kind`) and the mutation (`insert`, including any split /
@@ -33,7 +33,7 @@ impl PageBackedStorageEngine {
         // latch is released on return, before the caller takes any other structural
         // latch (rule 1: never two structural latches at once). Contended under E2b's
         // concurrent writers: same-secondary writers serialize here.
-        let latch = self.structural_latch(secondary_index_file_id(index.id));
+        let latch = self.structural_latch(secondary_index_file_id(index.storage_id));
         loop {
             let guard = latch.lock();
             if index.unique && !has_null {

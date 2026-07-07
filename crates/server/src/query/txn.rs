@@ -7,7 +7,7 @@ use common::{
 };
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
-use storage::StorageEngine;
+use storage::{RelationSnapshot, StorageEngine};
 use wal::{WalRecord, WalRecordKind};
 
 use super::{
@@ -22,6 +22,28 @@ pub(super) struct StatementRuntime<'a> {
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     system_state: Arc<dyn SystemStateProvider>,
+}
+
+pub(super) struct CapturedSnapshots {
+    pub(super) snapshot: Arc<Snapshot>,
+    pub(super) relations: Arc<dyn RelationSnapshot>,
+    pub(super) advertised: AdvertisedSnapshot,
+}
+
+pub(super) struct TransactionSnapshots {
+    pub(super) snapshot: Arc<Snapshot>,
+    pub(super) relations: Arc<dyn RelationSnapshot>,
+    pub(super) advertised: Option<AdvertisedSnapshot>,
+}
+
+pub(super) struct ExecutionContextInput<'a> {
+    pub(super) txn_id: u64,
+    pub(super) snapshot: Arc<Snapshot>,
+    pub(super) relations: Arc<dyn RelationSnapshot>,
+    pub(super) isolation: IsolationLevel,
+    pub(super) gc_horizon: u64,
+    pub(super) live_txns: Arc<[u64]>,
+    pub(super) runtime: StatementRuntime<'a>,
 }
 
 impl<'a> StatementRuntime<'a> {
@@ -369,6 +391,7 @@ impl QueryService {
             failed: false,
             write_guard: None,
             rr_snapshot: None,
+            rr_relations: None,
             rr_advertised: None,
             dead_versions_pending: 0,
             savepoints: Vec::new(),
@@ -589,9 +612,10 @@ impl QueryService {
             })
     }
 
-    /// The snapshot a statement of `txn` reads with, per isolation level
-    /// (`docs/specs/mvcc.md` §6, §9), together with the per-statement GC-horizon
-    /// advertisement the caller must hold for the statement's execution.
+    /// The MVCC and relation-generation snapshots a statement of `txn` reads with,
+    /// per isolation level (`docs/specs/mvcc.md` §6, §9), together with the
+    /// per-statement GC-horizon advertisement the caller must hold for the
+    /// statement's execution.
     ///
     /// - **Read Committed** captures a fresh snapshot each statement (seeing other
     ///   transactions' commits between statements). Its advertisement is returned as
@@ -602,42 +626,95 @@ impl QueryService {
     ///   (`rr_advertised`) for the transaction's life and released when the
     ///   `Transaction` drops at commit/abort, so this returns `None` (no
     ///   per-statement guard) — the snapshot stays pinned across statements.
-    pub(super) fn snapshot_for_transaction(
+    pub(super) fn snapshots_for_transaction(
         &self,
         txn: &mut Transaction,
-    ) -> (Arc<Snapshot>, Option<AdvertisedSnapshot>) {
+    ) -> Result<TransactionSnapshots> {
         match txn.isolation {
             IsolationLevel::ReadCommitted => {
-                let (snapshot, advertised) = self.capture_snapshot(txn.txn_id);
-                (snapshot, Some(advertised))
+                let CapturedSnapshots {
+                    snapshot,
+                    relations,
+                    advertised,
+                } = self.capture_consistent_snapshots(txn.txn_id)?;
+                Ok(TransactionSnapshots {
+                    snapshot,
+                    relations,
+                    advertised: Some(advertised),
+                })
             }
             // Serializable shares Repeatable Read's single per-transaction snapshot;
             // SSI layers rw-conflict tracking on top of it (`docs/specs/ssi.md`).
             IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
-                if let Some(snapshot) = &txn.rr_snapshot {
-                    (snapshot.clone(), None)
+                if let (Some(snapshot), Some(relations)) = (&txn.rr_snapshot, &txn.rr_relations) {
+                    Ok(TransactionSnapshots {
+                        snapshot: snapshot.clone(),
+                        relations: relations.clone(),
+                        advertised: None,
+                    })
                 } else {
-                    let (snapshot, advertised) = self.capture_snapshot(txn.txn_id);
+                    let CapturedSnapshots {
+                        snapshot,
+                        relations,
+                        advertised,
+                    } = self.capture_consistent_snapshots(txn.txn_id)?;
                     txn.rr_snapshot = Some(snapshot.clone());
+                    txn.rr_relations = Some(relations.clone());
                     // Hold the advertisement for the transaction's life (released
                     // when `txn` drops at commit/abort), so the reusable snapshot's
                     // xmin stays pinned across every statement that reuses it.
                     txn.rr_advertised = Some(advertised);
-                    (snapshot, None)
+                    Ok(TransactionSnapshots {
+                        snapshot,
+                        relations,
+                        advertised: None,
+                    })
                 }
             }
         }
     }
 
+    pub(super) fn capture_consistent_snapshots(&self, own_txn: u64) -> Result<CapturedSnapshots> {
+        let _relation_publish_read = self
+            .components
+            .relation_publish_gate
+            .read()
+            .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
+        loop {
+            let relation_epoch = self.components.storage.relation_epoch()?;
+            let (snapshot, advertised) = self.capture_snapshot(own_txn);
+            let relations = match self.components.storage.capture_relation_snapshot() {
+                Ok(relations) => relations,
+                Err(err) => {
+                    drop(advertised);
+                    return Err(err);
+                }
+            };
+            if relation_epoch == relations.relation_epoch() {
+                return Ok(CapturedSnapshots {
+                    snapshot,
+                    relations,
+                    advertised,
+                });
+            }
+            drop(advertised);
+        }
+    }
+
     pub(super) fn execution_context<'a>(
         &'a self,
-        txn_id: u64,
-        snapshot: Arc<Snapshot>,
-        isolation: IsolationLevel,
-        gc_horizon: u64,
-        live_txns: Arc<[u64]>,
-        runtime: StatementRuntime<'a>,
-    ) -> ExecutionContext<'a> {
+        input: ExecutionContextInput<'a>,
+    ) -> Result<ExecutionContext<'a>> {
+        let ExecutionContextInput {
+            txn_id,
+            snapshot,
+            relations,
+            isolation,
+            gc_horizon,
+            live_txns,
+            runtime,
+        } = input;
+
         // A SERIALIZABLE statement registers its transaction with the SSI manager
         // (idempotent; canonicalized to the top-level id) and installs the real SSI
         // tracker so its reads record SIREAD locks (`docs/specs/ssi.md`). Registering
@@ -666,14 +743,15 @@ impl QueryService {
         if serializable {
             statement = statement.with_ssi_tracker(self.components.ssi_manager.clone());
         }
-        ExecutionContext {
+        Ok(ExecutionContext {
             statement,
+            relations,
             catalog: self.components.catalog.as_ref(),
             storage: self.components.storage.as_ref(),
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,
             cancel: runtime.cancel.as_ref(),
-        }
+        })
     }
 
     /// Capture a visibility snapshot consistently with the active-transaction

@@ -11,6 +11,16 @@ pub(super) enum StampOutcome {
     WouldBlock(u64),
 }
 
+pub(super) struct HotUpdateRequest<'a> {
+    pub(super) ctx: &'a StatementContext,
+    pub(super) relations: &'a PageBackedRelationSnapshot,
+    pub(super) schema: &'a TableSchema,
+    pub(super) table: TableId,
+    pub(super) previous_location: RowLocation,
+    pub(super) infomask: u16,
+    pub(super) row: &'a Row,
+}
+
 enum ToastStreamPayload {
     RawColumn,
     Owned(std::sync::Arc<[u8]>),
@@ -70,11 +80,12 @@ fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
 
 fn validate_logical_index_keys_fit(
     storage: &PageBackedStorageEngine,
+    relations: &PageBackedRelationSnapshot,
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
     crate::btree::validate_index_key_fits(&key_for_row(schema, row)?)?;
-    for index in storage.table_indexes(schema.id)? {
+    for index in storage.table_indexes(relations, schema.id)? {
         let (key, _has_null) = secondary_index_key(schema, &index, row)?;
         crate::btree::validate_index_key_fits(&key)?;
     }
@@ -392,11 +403,12 @@ impl PageBackedStorageEngine {
     pub(crate) fn prepare_row_for_storage(
         &self,
         ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         header: &crate::codec::MvccHeader,
         row: &Row,
     ) -> Result<Vec<u8>> {
-        validate_logical_index_keys_fit(self, schema, row)?;
+        validate_logical_index_keys_fit(self, relations, schema, row)?;
         if matches!(schema.relation_kind, RelationKind::Toast { .. })
             || schema.toast_table_id.is_none()
         {
@@ -460,6 +472,7 @@ impl PageBackedStorageEngine {
             )?;
             let pointer = self.write_toast_stream(
                 ctx,
+                relations,
                 schema,
                 candidate.raw_len,
                 candidate.stream_codec,
@@ -477,10 +490,11 @@ impl PageBackedStorageEngine {
     fn prepare_row_for_hot_storage(
         &self,
         ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         row: &Row,
     ) -> Result<Option<Vec<u8>>> {
-        validate_logical_index_keys_fit(self, schema, row)?;
+        validate_logical_index_keys_fit(self, relations, schema, row)?;
         let header = crate::codec::MvccHeader::fresh(ctx.txn_id, crate::codec::HEAP_ONLY);
         if matches!(schema.relation_kind, RelationKind::Toast { .. })
             || schema.toast_table_id.is_none()
@@ -620,7 +634,7 @@ impl PageBackedStorageEngine {
             ));
         }
 
-        let file_id = schema.id;
+        let file_id = heap_file_id(schema.storage_id);
         // Hold the per-heap-file structural latch across the WHOLE free-space search
         // + allocate + insert (Milestone E2a). This makes "find space / extend /
         // insert / log" atomic against another inserter on the same table heap,
@@ -767,7 +781,7 @@ impl PageBackedStorageEngine {
         txn_id: u64,
         prune_horizon: Option<u64>,
     ) -> Result<Option<RowLocation>> {
-        let file_id = schema.id;
+        let file_id = heap_file_id(schema.storage_id);
 
         let latch = self.structural_latch(file_id);
         let _heap_guard = latch.lock();
@@ -985,15 +999,17 @@ impl PageBackedStorageEngine {
     /// points at it, and it has no index entry), so its aborting `xmin` makes it
     /// invisible via CLOG ⇒ dead-to-all ⇒ reclaimable by VACUUM — harmless, exactly
     /// like the non-HOT orphan.
-    pub(super) fn try_hot_update(
-        &self,
-        ctx: &StatementContext,
-        schema: &TableSchema,
-        table: TableId,
-        previous_location: RowLocation,
-        infomask: u16,
-        row: &Row,
-    ) -> Result<Option<bool>> {
+    pub(super) fn try_hot_update(&self, request: HotUpdateRequest<'_>) -> Result<Option<bool>> {
+        let HotUpdateRequest {
+            ctx,
+            relations,
+            schema,
+            table,
+            previous_location,
+            infomask,
+            row,
+        } = request;
+
         // Eligibility (1): no indexed column changed. Read the predecessor's CURRENT
         // physical row (not a snapshot read — we need its actual indexed values) and
         // compare every secondary index's key against the new row's. The primary key
@@ -1006,8 +1022,9 @@ impl PageBackedStorageEngine {
         if physical_row_has_external_toast_pointer(&previous_physical) {
             return Ok(None);
         }
-        let previous_row = self.materialize_physical_row(ctx, schema, previous_physical)?;
-        for index in self.table_indexes(table)? {
+        let previous_row =
+            self.materialize_physical_row(ctx, relations, schema, previous_physical)?;
+        for index in self.table_indexes(relations, table)? {
             let (old_key, _) = secondary_index_key(schema, &index, &previous_row)?;
             let (new_key, _) = secondary_index_key(schema, &index, row)?;
             if old_key != new_key {
@@ -1017,7 +1034,7 @@ impl PageBackedStorageEngine {
             }
         }
 
-        let Some(row_bytes) = self.prepare_row_for_hot_storage(ctx, schema, row)? else {
+        let Some(row_bytes) = self.prepare_row_for_hot_storage(ctx, relations, schema, row)? else {
             return Ok(None);
         };
 

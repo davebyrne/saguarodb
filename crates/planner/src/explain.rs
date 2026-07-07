@@ -77,6 +77,7 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             index,
             range,
             filter,
+            ..
         } => {
             output.push_str(&format!(
                 "{padding}IndexScan table={} index={} range={} filter={}\n",

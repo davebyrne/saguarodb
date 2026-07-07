@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`/`INT2`, `INTEGER`/`INT`/`INT4`, and `BIGINT`/`INT8` all share one 64-bit integer storage but report their distinct PostgreSQL width OIDs (`int2`/`int4`/`int8`; bare `INTEGER` is `int4`), and `int2`/`int4` values are range-checked at write and cast time (`SqlState::NumericValueOutOfRange` when out of range); `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')` and report their serial kind's width), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time, and reported on the wire as `varchar`/`bpchar`/`text` with the declared length; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE [IF NOT EXISTS]` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, non-constant expression `DEFAULT` (bound against an empty scope, evaluated per row), `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, `CHECK (...)` constraints (column-level and table-level, unnamed; enforced per row on `INSERT`/`UPDATE`/`COPY FROM` with `SqlState::CheckViolation`), and optional trailing `WITH (...)` storage options: `compression = 'none' | 'zstd'`, `toast = 'off' | 'auto' | 'aggressive'`, `toast_tuple_target = <integer>`, `toast_min_value_size = <integer>`, and `toast_compression = 'none' | 'zstd' | 'zstd_dict'`; see `docs/specs/compression.md` and TOAST metadata below), `DROP TABLE [IF EXISTS]`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, sequence functions `nextval`/`currval`/`setval`, statement clock functions `current_timestamp` and `now()`, and PostgreSQL-compatible system information functions `version()`, `current_database()`, `current_catalog`, `current_schema`, `current_user`, `session_user`, `user`, `pg_backend_pid()`, and `current_setting(text)`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; `SET`/`SHOW`/`RESET` of session configuration parameters including PostgreSQL-compatible `transaction_isolation` and `default_transaction_isolation`; `DISCARD ALL`; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]`, `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (full heap/index rewrite), and `ALTER TABLE <table> SET (toast = ..., toast_tuple_target = ..., toast_min_value_size = ..., toast_compression = ...)` (future-write-only TOAST policy update; mixed page-compression/TOAST SET lists are rejected), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
+- SQL subset: `CREATE TABLE [IF NOT EXISTS]` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, non-constant expression `DEFAULT` (bound against an empty scope, evaluated per row), `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, `CHECK (...)` constraints (column-level and table-level, unnamed; enforced per row on `INSERT`/`UPDATE`/`COPY FROM` with `SqlState::CheckViolation`), and optional trailing `WITH (...)` storage options: `compression = 'none' | 'zstd'`, `toast = 'off' | 'auto' | 'aggressive'`, `toast_tuple_target = <integer>`, `toast_min_value_size = <integer>`, and `toast_compression = 'none' | 'zstd' | 'zstd_dict'`; see `docs/specs/compression.md` and TOAST metadata below), `DROP TABLE [IF EXISTS]`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, sequence functions `nextval`/`currval`/`setval`, statement clock functions `current_timestamp` and `now()`, and PostgreSQL-compatible system information functions `version()`, `current_database()`, `current_catalog`, `current_schema`, `current_user`, `session_user`, `user`, `pg_backend_pid()`, and `current_setting(text)`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; `SET`/`SHOW`/`RESET` of session configuration parameters including PostgreSQL-compatible `transaction_isolation` and `default_transaction_isolation`; `DISCARD ALL`; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]`, `TRUNCATE [TABLE] <table>`, `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (full heap/index rewrite), and `ALTER TABLE <table> SET (toast = ..., toast_tuple_target = ..., toast_min_value_size = ..., toast_compression = ...)` (future-write-only TOAST policy update; mixed page-compression/TOAST SET lists are rejected), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -360,14 +360,14 @@ pub trait FlushPolicy: Send + Sync {
 /// before executing DML, DDL, checkpoint, or maintenance statements. Readers are
 /// lock-free and take no guard; `begin_writer()` yields a SHARED writer guard
 /// (concurrent DML writers run simultaneously); `begin_checkpoint()` yields
-/// an EXCLUSIVE guard used by checkpoint, `VACUUM`, and autocommit DDL, which
+/// an EXCLUSIVE guard used by checkpoint, maintenance, and autocommit DDL, which
 /// drains in-flight writers while readers stay lock-free.
 ///
 /// Guards are owned types (no lifetime parameter) that hold Arc references
 /// internally and release the guard on Drop. This keeps the trait object-safe
 /// (usable as Box<dyn ConcurrencyController>) and avoids GAT complexity.
 /// The concrete controller uses an RwLock internally: DML writers share it;
-/// checkpoint/VACUUM/autocommit DDL take it exclusively. Readers take no guard.
+/// checkpoint/maintenance/autocommit DDL take it exclusively. Readers take no guard.
 pub trait ConcurrencyController: Send + Sync {
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
@@ -384,7 +384,7 @@ impl RwLockConcurrencyController {
 /// Concurrent writers hold it simultaneously; releases on Drop. Send safe.
 pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
-/// Owned exclusive guard for checkpoint, VACUUM, and autocommit DDL. Drains
+/// Owned exclusive guard for checkpoint, maintenance, and autocommit DDL. Drains
 /// in-flight writers (readers stay lock-free) and releases on Drop. Send safe.
 pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
 ```
@@ -561,7 +561,7 @@ All integer fields are big-endian. All server messages except the SSL negotiatio
 - Server `ReadyForQuery`: tag `Z`, length `5`, transaction-status byte sourced from the session's transaction state (`I` idle, `T` in a transaction block, `E` failed transaction block). Standalone statements run in autocommit and report `I`; inside a `BEGIN`/`COMMIT` block the byte is `T`, or `E` once a statement in the block has failed.
 - Server `RowDescription`: tag `T`, field count, then for each column `name\0`, `table_oid = 0`, `attr_num = 0`, mapped type OID, type size, `type_modifier = -1`, and text `format_code = 0`.
 - Server `DataRow`: tag `D`, column count, then `int32 byte_length` plus UTF-8 text bytes, or `-1` for `NULL`.
-- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `EXPLAIN`, `SET`, `SHOW`, `RESET`, `DISCARD ALL`, `VACUUM`, or `COPY n`.
+- Server `CommandComplete`: tag `C`, nul-terminated tags `SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `EXPLAIN`, `SET`, `SHOW`, `RESET`, `DISCARD ALL`, `VACUUM`, `TRUNCATE TABLE`, or `COPY n`.
 - Server `ErrorResponse`: tag `E`, fields `S` severity, `C` SQLSTATE, `M` message, then final `\0`.
 
 A `RowDescription` field's type OID, size, and modifier (`atttypmod`) come from the column's declared PostgreSQL wire type (`common::PgType`; see `docs/specs/crates/protocol.md`): the distinct integer widths `int2` (`21`), `int4` (`23`), `int8` (`20`); the character kinds `text` (`25`), `varchar` (`1043`), `bpchar` (`1042`) with a `n + 4` length modifier; `BOOLEAN` (`16`), `DATE` (`1082`), `TIMESTAMP` (`1114`), `TIME` (`1083`), `TIMESTAMP WITH TIME ZONE` (`1184`), `INTERVAL` (`1186`), `BYTEA` (`17`), `UUID` (`2950`), `DOUBLE PRECISION` (`701`), `REAL` (`700`), and `NUMERIC` (`1700`, modifier packing precision/scale). A column with no declared wire type (e.g. a computed expression) falls back to the collapsed default (`Integer` => `int8`, `Text` => `text`). The simple query path always sends text: integers are decimal i64 strings, text is raw UTF-8, booleans are `t`/`f`, dates are `YYYY-MM-DD`, timestamps are `YYYY-MM-DD HH:MM:SS[.ffffff]`, times are `HH:MM:SS[.ffffff]`, timestamptz is `YYYY-MM-DD HH:MM:SS[.ffffff]+00` (always UTC), interval uses PostgreSQL `postgres`-style text (e.g. `1 year 2 mons 3 days 04:05:06`), bytea is hex `\x...`, uuid is the canonical `8-4-4-4-12` form, doubles and reals use a round-trippable form (fixed-point for moderate magnitudes, `e±NN` scientific otherwise; `Infinity`/`-Infinity`/`NaN` for non-finite), numerics use their decimal text preserving scale, and null fields use length `-1`. (A binary integer result uses the column's declared width — an `int2`/`int4` value is 2 or 4 big-endian bytes, not the 8-byte `int8` form; a binary integer parameter may be bound as 2, 4, or 8 bytes and is sign-extended. Binary `DATE` is an i32 day count from 2000-01-01; binary `TIMESTAMP` is an i64 microsecond count from 2000-01-01; binary `TIME` is an i64 microsecond count since midnight; binary `TIMESTAMP WITH TIME ZONE` is an i64 microsecond count from 2000-01-01 UTC; binary `INTERVAL` is i64 micros + i32 days + i32 months; binary `BYTEA` is the raw bytes; binary `UUID` is the 16 raw bytes; binary `DOUBLE PRECISION` is the 8-byte big-endian IEEE 754 value; binary `REAL` is the 4-byte big-endian IEEE 754 value; binary `NUMERIC` is PostgreSQL's base-10000 `NumericVar` format.) The extended query protocol additionally supports binary parameters and results — `RowDescription` carries a per-field format code (`0` = text, `1` = binary) and `DataRow` carries the already-encoded wire bytes for that format.
@@ -662,6 +662,7 @@ pub enum Statement {
     SetTransaction { isolation: Option<IsolationLevel> },            // SET TRANSACTION ... (txn-scoped)
     SetSessionCharacteristics { isolation: Option<IsolationLevel> }, // session default isolation
     Vacuum { table: Option<String> },             // VACUUM [table] — maintenance, not bound/planned
+    Truncate { table: String },                   // TRUNCATE [TABLE] <table> — maintenance, not bound/planned
     Copy {                                        // COPY <table> [(cols)] FROM STDIN | TO STDOUT
         table: String,                            // (docs/specs/copy.md)
         columns: Vec<String>,
@@ -1280,7 +1281,7 @@ pub enum PhysicalPlan {
     // Access methods
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
     SystemScan { view: SystemView, output_schema: Vec<ColumnInfo>, filter: Option<BoundExpr> },
-    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
+    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, full_filter: Option<BoundExpr>, filter: Option<BoundExpr> },
 
     // Join algorithms
     NestedLoopJoin {
@@ -1319,7 +1320,20 @@ pub enum PhysicalPlan {
 
 The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column access is by slot index (`row.values[slot]`) — O(1), no lookups. The `BindingId` and `ColumnId` fields in `InputRef` exist only for EXPLAIN output and debugging.
 
-`PRIMARY_KEY_INDEX_ID = 0` identifies the primary-key index; secondary indexes use their own ids. An `IndexScan` carries the chosen index id, and `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` on the primary key and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
+Statement setup pairs the MVCC snapshot with the storage relation-generation
+snapshot using storage's relation epoch under
+`ServerComponents.relation_publish_gate`: take the gate's read side, read the
+epoch, capture/advertise the MVCC snapshot, capture relation `Arc`s, and retry
+if the relation snapshot's epoch differs. This closes the lock-free read race
+where a relation swap could otherwise land between the two captures and pair an
+old MVCC snapshot with a new empty generation. Relation-swap DDL takes the gate's
+write side before its durable commit point and holds it until catalog/storage
+generation publication finishes, then publishes the storage generation swap
+before it deregisters its committed transaction. A reader can start before the
+DDL commits or after it publishes, but cannot capture an old relation generation
+after the DDL commit is durable.
+
+`PRIMARY_KEY_INDEX_ID = 0` identifies the primary-key index; secondary indexes use their own ids. An `IndexScan` carries the chosen index id, and `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the scan range is `Exact(Key([7]))` on the primary key and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. `IndexScan.full_filter` holds the original scan predicate so execution can fall back to a full scan when a secondary index chosen from the current catalog is unavailable for an older retained relation generation. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 
 `SystemScan` is the planner and executor source for virtual system views. It is
 not considered for storage index selection and carries the view plus full output
@@ -1330,7 +1344,7 @@ The three-phase pipeline (`bind` → `logical_plan` → `physical_plan`) means a
 
 ### Planner Rules (Applied in Order)
 
-1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of an index — the primary-key index (`index = PRIMARY_KEY_INDEX_ID`) or a secondary index (its own id) — emit `IndexScan` with that index, a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, and any residual predicate in `filter`.
+1. **Index lookup:** If `WHERE` has an equality or range comparison on the leading column of an index — the primary-key index (`index = PRIMARY_KEY_INDEX_ID`) or a secondary index (its own id) — emit `IndexScan` with that index, a `KeyRange::Exact` (equality) or `KeyRange::Range` (range) over the column, the original predicate in `full_filter`, and any residual predicate in `filter`.
 2. **Index choice:** When several indexes' leading columns are constrained, prefer an equality over a range, the primary key over a secondary index, then the lower index id.
 3. **Predicate pushdown:** Push `WHERE` conditions as close to the scan nodes as possible.
 4. **Join ordering:** Process joins left to right as written. An inner join whose `ON` predicate is a conjunction of `left_column = right_column` equalities becomes a `HashJoin` (its `left_keys`/`right_keys` are the paired key slots); every other join (outer, cross, non-equi) is a `NestedLoopJoin`. Join `condition` is `None` only for `Cross` and `Some(boolean_expr)` for every other join type.
@@ -1418,7 +1432,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` 
 | Operator | Behavior |
 |---|---|
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
-| `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the primary key, `index_scan` for a secondary index — and applies residual `IndexScan.filter` when present |
+| `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the primary key, `index_scan` for a secondary index — and applies residual `IndexScan.filter` when present. If a secondary index is unavailable for a retained relation generation, falls back to a table scan and applies `IndexScan.full_filter` |
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right input keyed by `right_keys`, probes with `left_keys`; rows with a NULL key never match. |
@@ -1594,8 +1608,9 @@ preserving the parent bytes needed to find chunk ownership.
 Files are named by stable numeric ID, not by user-visible names. This avoids rename issues (future `ALTER TABLE RENAME`), filesystem-unsafe characters in table names, and name collisions.
 
 **Heap and index files (the mutable page home):**
-- `data/heap/<TableId>.heap` — slotted data pages, page `n` at byte offset `n * PAGE_SIZE`. Written in place by checkpoint flush or eviction; files grow by appending pages.
-- `data/heap/<TableId>.idx` — the table's primary-key B-tree (metapage at page 0, then leaf/internal nodes), same page layout and offsets.
+- `data/heap/<storage_id>.heap` — table/TOAST relation-generation slotted data pages, page `n` at byte offset `n * PAGE_SIZE`. Written in place by checkpoint flush or eviction; files grow by appending pages.
+- `data/heap/<storage_id>.idx` — a table/TOAST generation's primary-key B-tree (metapage at page 0, then leaf/internal nodes), same page layout and offsets.
+- `data/heap/<storage_id>.sidx` — a secondary-index generation's B-tree, using a separate tagged `FileId` namespace from heaps and primary-key indexes.
 
 **Control record (the single source of truth for the current checkpoint):**
 - `data/manifest.dat` — a versioned binary envelope (magic `SGMF`, version, payload length, CRC32 over the payload) whose JSON payload holds the redo boundary `checkpoint_lsn`, sorted table IDs, and the catalog snapshot.
@@ -1605,7 +1620,7 @@ The control record is updated atomically via write-to-temp + fsync + rename (ato
 **Other files:**
 - `data/wal.dat` — write-ahead log (append-only)
 
-Table names are purely a catalog-level concept — the storage engine only sees table IDs, which map directly to heap file names.
+Table names are purely a catalog-level concept. The storage engine uses stable logical table/index IDs for metadata lookup, then routes page I/O through the current `storage_id` stored in `TableSchema` / `IndexSchema`.
 
 ## 8. Buffer Pool
 
@@ -1734,7 +1749,7 @@ During normal operation the working set is not bound by the pool size: eviction-
 
 ## 9. Control Store
 
-The `control` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable per-table heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
+The `control` crate owns the durable **control record** — the checkpoint commit point. It does not write whole-table snapshots; table data lives in mutable relation-generation heap files (see Storage Engine) and is flushed in place. The control record is a single atomic file holding the redo boundary, the live table ids, and the catalog snapshot.
 
 ### Trait
 
@@ -1764,11 +1779,11 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `AlterTableCompression`, `AlterTableToast`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index/sequence/dictionary IDs so orphan page files, catalog IDs, or dictionary IDs cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate records still reserve their table/index/sequence/dictionary/storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation-generation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
-Table data lives in mutable per-table heap files; pages are mutated in the buffer pool and written back in place. In-place page writes with a logical-only WAL would be unrecoverable (a torn page has no consistent base), so the engine uses:
+Table data lives in mutable per-generation heap files; pages are mutated in the buffer pool and written back in place. In-place page writes with a logical-only WAL would be unrecoverable (a torn page has no consistent base), so the engine uses:
 
 - **Per-page LSN (PageLSN)** in the page header, stamped with the LSN of the record that last modified the page. Redo is gated by it (apply only if `page_lsn < record.lsn`), making replay idempotent.
 - **Full-page writes (FPW)** for torn-page protection: the first modification of a page after each checkpoint logs a `FullPageImage`; later modifications log deltas. Redo reinstalls the image (repairing any torn write) before applying deltas. A freshly allocated page is its own base via `HeapInit`.
@@ -1807,10 +1822,11 @@ This gives the invariants:
 
 | Type | Payload |
 |---|---|
-| `CreateTable` | serialized `TableSchema` (name, columns, primary key) |
+| `CreateTable` | serialized `TableSchema` (logical id, storage id, name, columns, primary key) |
 | `DropTable` | `TableId` |
-| `CreateIndex` | serialized `IndexSchema` (id, table, name, columns, unique) |
+| `CreateIndex` | serialized `IndexSchema` (logical id, storage id, table, name, columns, unique) |
 | `DropIndex` | `IndexId` |
+| `TruncateTable` | `TableId`, new table/TOAST/index storage ids |
 | `Commit` | (empty — marks the transaction as committed) |
 | `Abort` | (empty — marks the transaction as aborted; `txn_id` in the header) |
 | `Checkpoint` | `redo_lsn` — marks a completed checkpoint. WAL records before it can be truncated. |
@@ -1889,7 +1905,7 @@ Data writes coordinate through the `ConcurrencyController`'s **shared** writer g
 1. Acquire a shared writer guard via `controller.begin_writer()` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers)
 2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
-4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the in-memory CLOG; not fsynced) and only then deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore when the failed statement was DDL), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore only for catalog-mutating DDL; return error to client and drop the statement guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If the Abort append fails before the commit record is durable, log the failure, attempt to flush WAL, and exit without deregistering the transaction. If post-abort cleanup fails, normal query paths also exit fatally rather than returning with uncertain DDL metadata; direct internal callers surface the cleanup error for tests.
+4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the in-memory CLOG; not fsynced) and only then deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore, deletion of unpublished truncate replacement files, and retired-generation protection for rollback-removed published generations), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore only for catalog-mutating DDL; return error to client and drop the statement guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If the Abort append fails before the commit record is durable, log the failure, attempt to flush WAL, and exit without deregistering the transaction. If post-abort cleanup fails, normal query paths also exit fatally rather than returning with uncertain DDL metadata; direct internal callers surface the cleanup error for tests.
 5. Append a `Commit` record for this `txn_id`
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
@@ -1920,7 +1936,7 @@ With MVCC (Milestone D1, `docs/specs/mvcc.md` §4 Decision 3) abort is purely st
 1. `write_page(file, page, txn_id)` — marks the page dirty
 2. ... (statement fails mid-execution) ...
 3. Append an `Abort` record (CLOG → `Aborted`; not fsynced) and deregister the txn from the active-transaction registry only after that append succeeds
-4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index/sequence schema shadow state); it does NOT touch heap/index page content or roll back sequence value advances
+4. `storage.rollback_txn(txn_id)` — restores engine-owned DDL metadata (table/index/sequence schema shadow state), may delete unpublished truncate replacement files, and retires rollback-removed published generations until relation snapshots drain; it does NOT undo heap/index page content or roll back sequence value advances
 5. `buffer_pool.rollback(txn_id)` — no-op bookkeeping clear (the dirty pages stay, hidden by the CLOG)
 6. Catalog restore returns DDL metadata to the pre-statement state when catalog state changed
 7. WAL records for this `txn_id` remain but have no `Commit` — recovery replays them (redo-all) and the CLOG hides them
@@ -1945,7 +1961,8 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 6b. `wal.persist_clog(checkpoint_lsn)` — write the durable CLOG snapshot `clog.dat` (every transaction outcome plus both floors) before truncating, so it remembers every outcome the truncation drops (`mvcc.md` §5.4).
 7. Append `WalRecord { txn_id: <txn-id high-water>, kind: Checkpoint { redo_lsn: checkpoint_lsn } }`, flush WAL, then `truncate_before(checkpoint_lsn)` (unconditional — `persist_clog` ran in step 6b, so every dropped outcome is durable in `clog.dat`; `mvcc.md` §5.4).
 8. `buffer_pool.mark_all_clean()` — clears dirty flags and re-arms full-page-image protection.
-9. Drop write guard.
+9. Attempt relation-generation cleanup: remove unreferenced truncate/drop-retired generations and untracked orphan files only after buffer pin/transition checks. Dropped metadata is not live-file protection once commit has queued the retired generation.
+10. Drop write guard.
 
 **Crash safety analysis:** the ordering is heap fsync (4) → control record (6) → WAL truncation (7).
 - Crash before step 6: the control record is unchanged; recovery falls back to the previous `checkpoint_lsn`, and this cycle's full-page images (logged since that boundary) repair any torn heap write.
@@ -1956,7 +1973,7 @@ The checkpoint flushes dirty pages in place to the heap and advances the redo bo
 
 ### Crash Recovery (REDO)
 
-The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions; skipped aborted/in-flight create records still reserve their table/index/sequence IDs so orphan page files or catalog IDs are not reused.
+The control record names the redo boundary and the catalog. Recovery loads the heap as of that boundary and replays every redo record on top (redo-all); the CLOG, rebuilt from `Commit`/`Abort`, then decides which versions are visible. DDL records install catalog/storage objects only for committed transactions; skipped aborted/in-flight create/truncate records still reserve their table/index/sequence/storage IDs so orphan page files, relation-generation files, or catalog IDs are not reused.
 
 **Recovery uses physiological page redo plus a DDL replay trait** so replayed operations do not re-append to the WAL:
 
@@ -1972,10 +1989,11 @@ pub trait RecoveryOperations: Send + Sync {
     fn apply_set_sequence_value(&self, sequence: SequenceId, value: i64, is_called: bool) -> Result<()>;
     fn apply_set_table_compression(&self, schema: TableSchema) -> Result<()>;
     fn apply_set_table_toast_metadata(&self, schema: TableSchema) -> Result<()>;
+    fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
 }
 ```
 
-Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Table/index/sequence DDL and table metadata ALTER records replay through `RecoveryOperations` when committed. Sequence value records replay through `RecoveryOperations` unconditionally because sequence advancement is non-transactional. Recovery replay must not append WAL.
+Row recovery is `storage::apply_physical_redo(page, lsn, kind)`, gated by the page-LSN. Table/index/sequence DDL, table metadata ALTER records, and committed relation-swap truncate records replay through `RecoveryOperations` when committed. Sequence value records replay through `RecoveryOperations` unconditionally because sequence advancement is non-transactional. Recovery replay must not append WAL.
 
 Concrete storage is opened with:
 
@@ -1996,9 +2014,10 @@ impl PageBackedStorageEngine {
 1. `control.load()` — the redo boundary `checkpoint_lsn` and catalog bytes. If none: fresh database.
 2. Initialize storage in recovery mode and the catalog; install table, index, and sequence schemas from the catalog snapshot.
 3. Enable eviction-flush-on-steal (`buffer.enable_stealing()`) so redo may spill — the durable index means nothing is rebuilt in memory, so the recovery working set is not bounded by the pool.
-4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — committed table/index/sequence DDL and committed table metadata ALTER records through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `CreateDictionary` IDs, and unconditional sequence value records through `RecoveryOperations`. The CLOG (rebuilt from `Commit`/`Abort`) decides tuple visibility; aborted/in-flight versions are invisible.
+4. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo records via `apply_physical_redo` (PageLSN-gated; torn/missing pages are zeroed so a `FullPageImage`/`HeapInit` rebuilds them) — heap and index pages alike, regardless of transaction outcome — committed table/index/sequence DDL, committed table metadata ALTER records, and committed `TruncateTable` generation swaps through catalog plus `RecoveryOperations`; allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `CreateDictionary` / `TruncateTable` IDs; and unconditional sequence value records through `RecoveryOperations`. The CLOG (rebuilt from `Commit`/`Abort`) decides tuple visibility; aborted/in-flight versions are invisible.
 5. If records were replayed: checkpoint to persist the redone state and advance the boundary.
-6. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
+6. Attempt relation-generation cleanup while no user readers exist.
+7. Switch to normal mode with `storage.set_mode(StorageMode::Normal)`.
 
 **Idempotency:** PageLSN gating applies each record's effect at most once, so replay is safe even when the heap already reflects some post-boundary work (e.g. a partially completed prior checkpoint).
 
@@ -2027,6 +2046,7 @@ pub struct Catalog {
 
 pub struct TableSchema {
     pub id: TableId,
+    pub storage_id: FileId,
     pub name: String,
     pub columns: Vec<ColumnDef>,       // ColumnDef with assigned IDs
     pub primary_key: Vec<ColumnId>,
@@ -2038,7 +2058,7 @@ pub struct TableSchema {
 }
 ```
 
-`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's SQL DDL API `create_table_with_options` accepts `ParsedColumnDef`, assigns `ColumnId`s, stores the binder-resolved `ToastOptions`, and creates a hidden TOAST relation for user tables with at least one `TEXT` or `BYTEA` column. The hidden relation is stored by ID only, named `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`, and uses `compression = none`. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, and validates hidden TOAST relation cross-links when `toast_table_id` is present. Hidden TOAST relations must not be present in the user table name index.
+`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). `TableSchema.id`/`IndexSchema.id` are logical catalog identities; `storage_id` is the current physical relation generation and is changed by relation-swap truncate without changing logical identity. The catalog's SQL DDL API `create_table_with_options` accepts `ParsedColumnDef`, assigns `ColumnId`s, stores the binder-resolved `ToastOptions`, and creates a hidden TOAST relation for user tables with at least one `TEXT` or `BYTEA` column. The hidden relation is stored by ID only, named `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`, uses `compression = none`, and has a distinct table/TOAST storage id. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, validates hidden TOAST relation cross-links when `toast_table_id` is present, and requires nonzero storage ids without file-kind high bits. It rejects duplicate storage ids within table/TOAST relations and within secondary indexes, while allowing a legacy table/index raw-id collision because file-kind bits keep the actual files distinct. Hidden TOAST relations must not be present in the user table name index.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
@@ -2066,6 +2086,14 @@ pub trait CatalogManager: Send + Sync {
     fn reserve_table_id(&self, id: TableId) -> Result<()>;
     fn apply_create_table(&self, schema: TableSchema) -> Result<()>;
     fn apply_drop_table(&self, id: TableId) -> Result<()>;
+    fn allocate_storage_id(&self) -> Result<FileId>;
+    fn reserve_storage_id(&self, id: FileId) -> Result<()>;
+    fn prepare_truncate_table(&self, table: TableId) -> Result<TruncateTablePlan>;
+    fn build_truncate_table_update(
+        &self,
+        plan: &TruncateTablePlan,
+    ) -> Result<TruncateCatalogUpdate>;
+    fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
 
     /// Register a new table. Accepts parsed columns (no IDs), assigns
     /// TableId and ColumnIds, returns the completed TableSchema.
@@ -2143,10 +2171,11 @@ pub struct CatalogSnapshot {
     pub sequences_by_id: HashMap<SequenceId, SequenceSchema>,
     pub next_sequence_id: SequenceId,
     pub next_dictionary_id: u32,
+    pub next_storage_id: FileId,
 }
 ```
 
-Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, and `next_sequence_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing IDs and advances `next_table_id` past that schema ID; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` advances the table allocator past an ID without installing a schema; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_drop_index` do the same for secondary indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` WAL records so their IDs are not reused while physical page records or logical sequence IDs may have been observed in WAL.
+Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, `next_sequence_id = 1`, and `next_storage_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing logical IDs and advances `next_table_id` and `next_storage_id` past that schema; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` and `reserve_storage_id` advance allocators without installing schemas; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_drop_index` do the same for secondary indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Normal `CREATE INDEX` may make the catalog index visible before the storage tree is published, but storage publishes the new `IndexGeneration` only after the empty tree is created and backfill succeeds; scans planned from the current catalog fall back to table scans when a retained relation snapshot does not contain that index. `prepare_truncate_table` burns fresh storage ids for the base table, optional hidden TOAST table, and secondary indexes without publishing them; `build_truncate_table_update` returns the updated schemas without mutating the catalog so storage can prepare empty files before commit; `apply_truncate_table` revalidates and swaps only `storage_id` fields after durable commit. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` WAL records so their IDs are not reused while physical page records, relation-generation files, or logical sequence IDs may have been observed in WAL.
 
 ### Persistence
 
@@ -2154,7 +2183,7 @@ The catalog is stored in the control record (`data/manifest.dat`) at each checkp
 
 ### WAL Integration
 
-`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` are logged to the WAL. Conditional table DDL no-ops do not emit logical DDL records. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence` records. Aborted/in-flight create records are not installed, but their IDs are reserved so later objects do not reuse file names or catalog IDs whose orphan records may have been replayed.
+`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, and relation-swap `TRUNCATE` are logged to the WAL. Conditional table DDL no-ops do not emit logical DDL records. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence` records and committed `TruncateTable` records. Aborted/in-flight create and truncate records are not installed, but their IDs are reserved so later objects do not reuse file names, storage-generation IDs, or catalog IDs whose orphan records may have been replayed.
 
 ### Concurrency
 
@@ -2174,10 +2203,11 @@ The `server` crate is the binary entry point.
 6. Initialize storage engine in **recovery mode** with `PageBackedStorageEngine::open(buffer_pool.clone(), wal.clone(), StorageMode::Recovery)`
 7. Initialize catalog from the control catalog bytes (or empty); install table, index, and sequence schemas into storage from the catalog snapshot
 8. Enable eviction-flush-on-steal (`buffer.enable_stealing()`); the durable index means redo rebuilds nothing in memory and may spill
-9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, committed table/index/sequence DDL and committed table metadata ALTER records through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `CreateDictionary` IDs, and unconditional sequence value records through `RecoveryOperations` — the CLOG decides tuple visibility; no WAL appended in recovery mode
+9. Redo-all: replay every record with `LSN > checkpoint_lsn` (`WalManager::replay_from`): physical-redo via `storage::apply_physical_redo` (PageLSN-gated; torn/missing pages zeroed so a `FullPageImage`/`HeapInit` rebuilds them), heap and index pages alike regardless of transaction outcome, committed table/index/sequence DDL, committed table metadata ALTER records, and committed relation-swap truncate records through catalog plus `RecoveryOperations`, allocator-only reservation for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `CreateDictionary` / `TruncateTable` IDs, and unconditional sequence value records through `RecoveryOperations` — the CLOG decides tuple visibility; no WAL appended in recovery mode
 10. Build `ServerComponents` with catalog, storage, buffer pool, WAL, control store, heap store, concurrency controller, shutdown state, checkpoint state initialized from the control `checkpoint_lsn`, and `next_txn_id` initialized from the allocator scan over all retained WAL records (`replay_from(0)`, including committed subxids and the `Checkpoint` marker high-water).
 11. If records were replayed: `run_checkpoint(&components)` to persist the redone state to the heap and index and advance the redo boundary
-12. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
+12. Attempt relation-generation cleanup while no user readers exist.
+13. Switch storage engine to **normal mode** with `storage.set_mode(StorageMode::Normal)` (WAL appending enabled)
 13. Construct `QueryService` from `components`
 14. Start Tokio runtime, bind TCP listener (default port 5433)
 
@@ -2211,7 +2241,7 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
 - **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` also gets a stable physical chain view for backfill.
-- **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. For TOAST-enabled tables it commits hidden chunk deletes before pruning the parent tuples that own those chunks, then vacuums the hidden relation. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the orchestration, TOAST cleanup, and the GC-horizon safety argument.
+- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <table>`): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Implemented maintenance work takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs a relation-generation swap: fresh heap/index storage ids are prepared and logged before commit, then catalog/storage publish the empty generation after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
 The concrete `ConcurrencyController` is an `RwLock`: `begin_writer()` takes it shared (DML writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint, VACUUM, and DDL. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.

@@ -8,11 +8,12 @@ impl PageBackedStorageEngine {
         let mut state = self.lock_state()?;
         state.tables.insert(
             schema.id,
-            TableState {
+            Arc::new(TableGeneration {
                 schema,
                 dropped: false,
-            },
+            }),
         );
+        bump_relation_epoch(&mut state);
         Ok(())
     }
     pub(crate) fn apply_drop_table_without_wal(&self, table: TableId) -> Result<()> {
@@ -25,6 +26,7 @@ impl PageBackedStorageEngine {
         if let Some(toast_table_id) = toast_table_id {
             mark_table_dropped(&mut state, 0, toast_table_id);
         }
+        bump_relation_epoch(&mut state);
         Ok(())
     }
     pub(crate) fn apply_create_index_without_wal(&self, schema: IndexSchema) -> Result<()> {
@@ -47,22 +49,30 @@ impl PageBackedStorageEngine {
             })?;
         state.indexes.insert(
             schema.id,
-            IndexState {
+            Arc::new(IndexGeneration {
                 schema: schema.clone(),
                 dropped: false,
-            },
+            }),
         );
+        bump_relation_epoch(&mut state);
         drop(state);
         self.compression.set_file_config(
-            secondary_index_file_id(schema.id),
+            secondary_index_file_id(schema.storage_id),
             index_compression_for(table_compression),
         );
         Ok(())
     }
     pub(crate) fn apply_drop_index_without_wal(&self, index: IndexId) -> Result<()> {
         let mut state = self.lock_state()?;
-        if let Some(index_state) = state.indexes.get_mut(&index) {
-            index_state.dropped = true;
+        if let Some(schema) = state.indexes.get(&index).map(|index| index.schema.clone()) {
+            state.indexes.insert(
+                index,
+                Arc::new(IndexGeneration {
+                    schema,
+                    dropped: true,
+                }),
+            );
+            bump_relation_epoch(&mut state);
         }
         Ok(())
     }

@@ -14,7 +14,7 @@ use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 use super::PageBackedStorageEngine;
 use super::conflict_wait_test_support::committing_blocker;
 use crate::HeapPageStore;
-use crate::traits::{SchemaOperations, StorageEngine};
+use crate::traits::SchemaOperations;
 
 const TABLE_ID: u32 = 1;
 const NAME_INDEX_ID: u32 = 1;
@@ -87,6 +87,7 @@ fn ctx(txn_id: u64, xmax: u64) -> StatementContext {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -121,6 +122,7 @@ fn users_schema() -> TableSchema {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: NAME_INDEX_ID,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),
         columns: vec![1],
@@ -253,13 +255,14 @@ fn concurrent_heap_inserts_one_table_keep_every_row() {
 /// correctly (a smoke test that cross-table writers do not serialize/corrupt).
 #[test]
 fn cross_table_writers_are_concurrent_and_correct() {
-    // Two heaps: TABLE_ID and a second table id 2.
+    // Two heaps: TABLE_ID and a second table with its own storage generation.
     const TABLE_B: u32 = 2;
     let shared = SharedEngine::new();
     let setup = ctx(100, 101);
     shared.engine.create_table(&setup, &users_schema()).unwrap();
     let mut schema_b = users_schema();
     schema_b.id = TABLE_B;
+    schema_b.storage_id = TABLE_B;
     schema_b.name = "other".to_string();
     shared.engine.create_table(&setup, &schema_b).unwrap();
     shared.commit(100);

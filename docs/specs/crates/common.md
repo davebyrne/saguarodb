@@ -18,6 +18,8 @@
 - Schema description types: `DataType`, `ParsedColumnDef`, `ColumnDef`,
   `ColumnInfo`, `TableSchema`, `IndexSchema`, `SequenceOptions`, and
   `SequenceSchema`.
+- Relation-generation catalog handoff types: `TruncateTablePlan` and
+  `TruncateCatalogUpdate`.
 - Query access helpers: `KeyRange`.
 - Error model: `DbError`, `ErrorKind`, `SqlState`, `Result<T>`.
 - Statement context and the transaction extension point.
@@ -236,6 +238,7 @@ pub struct ColumnInfo {
 
 pub struct TableSchema {
     pub id: TableId,
+    pub storage_id: FileId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
@@ -249,6 +252,7 @@ pub struct TableSchema {
 
 pub struct IndexSchema {
     pub id: IndexId,
+    pub storage_id: FileId,
     pub table: TableId,
     pub name: String,
     pub columns: Vec<ColumnId>,
@@ -275,9 +279,34 @@ pub struct SequenceSchema {
     pub last_value: i64,
     pub is_called: bool,
 }
+
+pub struct TruncateTablePlan {
+    pub table_id: TableId,
+    pub new_table_storage_id: FileId,
+    pub new_toast_storage_id: Option<(TableId, FileId)>,
+    pub new_index_storage_ids: Vec<(IndexId, FileId)>,
+}
+
+pub struct TruncateCatalogUpdate {
+    pub table: TableSchema,
+    pub toast_table: Option<TableSchema>,
+    pub indexes: Vec<IndexSchema>,
+}
 ```
 
 `ParsedColumnDef` is parser output and never has IDs. `ColumnDef` is catalog-owned and always has stable IDs. `ColumnInfo` describes result columns and may be derived from expressions, so table/column IDs are optional.
+
+`TableSchema.id` and `IndexSchema.id` are stable logical catalog identities.
+`storage_id` is the current physical relation-generation id used by storage to
+derive heap, primary-index, and secondary-index file ids. The field is durable
+and serde-defaulted for compatibility; `storage_id == 0` means a legacy catalog
+snapshot omitted the field and must be migrated by the catalog load path before
+validation or use. Live schemas must never retain `storage_id == 0`. Legacy
+catalog migration preserves existing file names by allowing a table relation and
+a secondary index to keep the same raw storage id when their old logical ids
+matched; storage file-kind bits still make the actual heap/primary/secondary
+file ids distinct. Fresh allocations come from one monotonic allocator and do
+not intentionally create those cross-kind raw collisions.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and
@@ -312,7 +341,18 @@ has a `TEXT` or `BYTEA` column. The generated relation is named
 with primary key `(value_id, seq)`, uses at-rest page `compression = none`, and
 has `RelationKind::Toast { base_table }`.
 
-`IndexSchema` is the catalog-owned secondary-index metadata type. A `unique` index rejects duplicate non-NULL indexed values (NULLs are distinct); a non-unique index admits duplicates. On disk every index entry is disambiguated by the heap TID it points at (see `storage` Secondary Indexes), so no metadata distinguishes the two beyond the `unique` flag.
+`IndexSchema` is the catalog-owned secondary-index metadata type. A `unique`
+index rejects duplicate non-NULL indexed values (NULLs are distinct); a
+non-unique index admits duplicates. On disk every index entry is disambiguated by
+the heap TID it points at (see `storage` Secondary Indexes), so no metadata
+distinguishes the two beyond the `unique` flag. Secondary indexes have their own
+`storage_id`; it is independent of the index's logical `id`.
+
+`TruncateTablePlan` is the catalog-produced allocation plan for a future
+relation-generation swap: it names the logical table plus the fresh physical
+storage ids allocated for the base relation, optional hidden TOAST relation, and
+all secondary indexes. `TruncateCatalogUpdate` is the publication handoff: it
+contains the same schemas after only their `storage_id` fields have changed.
 
 `SequenceOptions` is parser/planner input for `CREATE SEQUENCE`; absent
 start/min/max values mean "use the direction-dependent defaults." `SequenceSchema`

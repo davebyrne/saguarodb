@@ -567,7 +567,7 @@ pub enum PhysicalPlan {
     Delete { table: TableId, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },
     SeqScan { table: TableId, table_name: String, filter: Option<BoundExpr> },
     SystemScan { view: SystemView, output_schema: Vec<ColumnInfo>, filter: Option<BoundExpr> },
-    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, filter: Option<BoundExpr> },
+    IndexScan { table: TableId, table_name: String, index: IndexId, range: KeyRange, full_filter: Option<BoundExpr>, filter: Option<BoundExpr> },
     NestedLoopJoin {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
@@ -600,7 +600,7 @@ pub enum PhysicalPlan {
 
 - A scan with an equality or range predicate on the leading column of an index — the primary-key index or a secondary index — becomes an `IndexScan` over that index (`index = PRIMARY_KEY_INDEX_ID` for the primary key, else the secondary index id), with `range` an exact or bounded `KeyRange` over that column.
 - When more than one index's leading column is constrained, the planner picks the best: an equality match beats a range, the primary key beats a secondary index (it is the canonical access path and reads no separate secondary file), and a lower index id breaks remaining ties.
-- `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`.
+- `filter` stores residual predicates not consumed by the chosen index's range, re-checked by the scan operator (so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, the primary-key index wins with exact key `7` and the residual filter is `name = 'Ada'`. For `WHERE id = 7`, `filter` is `None`. `full_filter` stores the original scan predicate for executor fallback when a secondary index chosen from the current catalog is unavailable for an older retained relation generation; normal index scans use only `filter`.
 - A lower-bound and an upper-bound comparison on the *same* index column fuse into one two-sided `KeyRange::Range`, consuming both conjuncts. For `WHERE id > 5 AND id < 10`, the range is `(5, 10)` (both bounds excluded) and the residual filter is `None`. This remains a single-column range; multi-column composite-index ranges are not produced.
 - Otherwise scans are `SeqScan`.
 - A `LogicalPlan::SystemScan` maps directly to `PhysicalPlan::SystemScan`; it is
@@ -637,7 +637,7 @@ The executor crate is not called for `EXPLAIN`.
 - Binder resolves `pg_catalog` and `information_schema` views as `BoundFrom::System`, while preserving CTE/user-table precedence for bare names and rejecting system-catalog write targets.
 - Logical planner emits logical nodes without `SeqScan` or `IndexScan`.
 - Logical and physical planning preserve system views as `SystemScan`.
-- Physical planner chooses `IndexScan` for an equality or range predicate on a primary-key or secondary-index leading column, preferring the primary key and exact matches, and preserves residual predicates in `IndexScan.filter`.
+- Physical planner chooses `IndexScan` for an equality or range predicate on a primary-key or secondary-index leading column, preferring the primary key and exact matches, preserves residual predicates in `IndexScan.filter`, and preserves the original scan predicate in `IndexScan.full_filter` for generation-snapshot fallback.
 - Physical planner falls back to `SeqScan` when no index's leading column is constrained.
 - Physical planner chooses `HashJoin` for an inner join with a column-equality `ON` predicate and falls back to `NestedLoopJoin` for outer, cross, and non-equi joins.
 - `EXPLAIN` returns a readable physical plan tree.

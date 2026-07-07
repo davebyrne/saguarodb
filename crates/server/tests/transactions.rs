@@ -2,6 +2,7 @@ mod support;
 
 use std::time::Duration;
 
+use common::{Snapshot, StatementContext};
 use support::{Connection, TestServer};
 
 /// `BEGIN; INSERT; SELECT (sees own insert); COMMIT;` then a new transaction
@@ -785,6 +786,156 @@ async fn repeatable_read_holds_a_stable_snapshot_unlike_read_committed() {
         ]
     );
     assert_eq!(server.active_txn_count(), 0);
+}
+
+/// Relation-swap DDL publishes new storage generations under the same logical
+/// table id. Repeatable Read must therefore keep both its MVCC snapshot and its
+/// relation-generation snapshot stable for the whole transaction.
+#[tokio::test]
+async fn repeatable_read_holds_relation_generation_across_relation_swap() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key)")
+        .await;
+    setup.ok("insert into users (id) values (1)").await;
+
+    let mut rr = Connection::connect(&server).await.unwrap();
+    rr.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        rr.ok("select id from users").await.rows(),
+        vec![vec![Some("1".to_string())]],
+        "first RR read captures the old relation generation"
+    );
+
+    setup.ok("truncate table users").await;
+
+    let mut fresh = Connection::connect(&server).await.unwrap();
+    assert!(
+        fresh.ok("select id from users").await.rows().is_empty(),
+        "fresh statements use the new empty relation generation"
+    );
+    assert_eq!(
+        rr.ok("select id from users").await.rows(),
+        vec![vec![Some("1".to_string())]],
+        "the open RR transaction keeps reading the old relation generation"
+    );
+
+    let stale_write = rr.query("insert into users (id) values (2)").await.unwrap();
+    let err = match stale_write.result {
+        Ok(_) => panic!("stale write unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(
+        err.message.contains("C=40001"),
+        "unexpected stale write error: {}",
+        err.message
+    );
+    assert_eq!(stale_write.status, b'E');
+    rr.ok("rollback").await;
+    assert!(
+        fresh.ok("select id from users").await.rows().is_empty(),
+        "the stale RR write must not mutate the new relation generation"
+    );
+}
+
+#[tokio::test]
+async fn repeatable_read_can_use_new_index_when_table_generation_is_unchanged() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+    setup
+        .ok("insert into users (id, name) values (1, 'Ada')")
+        .await;
+
+    let mut rr = Connection::connect(&server).await.unwrap();
+    rr.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        rr.ok("select id from users").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    setup.ok("create index users_name on users (name)").await;
+    assert_eq!(
+        rr.ok("select id from users where name = 'Ada'")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]],
+        "a later secondary index is usable because the table generation did not change"
+    );
+    rr.ok("commit").await;
+}
+
+#[tokio::test]
+async fn repeatable_read_falls_back_when_new_index_belongs_to_newer_generation() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table users (id integer primary key, name text)")
+        .await;
+    setup
+        .ok("insert into users (id, name) values (1, 'Ada')")
+        .await;
+
+    let mut rr = Connection::connect(&server).await.unwrap();
+    rr.ok("begin isolation level repeatable read").await;
+    assert_eq!(
+        rr.ok("select id from users").await.rows(),
+        vec![vec![Some("1".to_string())]]
+    );
+
+    setup.ok("create index users_name on users (name)").await;
+    publish_relation_swap_for_test(&server, "users");
+
+    assert!(
+        setup
+            .ok("select id from users where name = 'Ada'")
+            .await
+            .rows()
+            .is_empty(),
+        "fresh statements use the new empty generation"
+    );
+    assert_eq!(
+        rr.ok("select id from users where name = 'Ada'")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string())]],
+        "the RR transaction falls back to scanning its retained old generation"
+    );
+    rr.ok("commit").await;
+}
+
+fn publish_relation_swap_for_test(server: &TestServer, table_name: &str) {
+    let components = &server.app().components;
+    let table = components
+        .catalog
+        .get_table_by_name(table_name)
+        .unwrap()
+        .unwrap();
+    let plan = components.catalog.prepare_truncate_table(table.id).unwrap();
+    let update = components
+        .catalog
+        .build_truncate_table_update(&plan)
+        .unwrap();
+    let ctx = StatementContext::with_snapshot(
+        0,
+        std::sync::Arc::new(Snapshot {
+            xmin: 1,
+            xmax: 1,
+            xip: vec![],
+        }),
+    );
+    components
+        .storage
+        .prepare_truncate_table(&ctx, &plan, &update)
+        .unwrap();
+    let committed_update = components.catalog.apply_truncate_table(&plan).unwrap();
+    components
+        .storage
+        .publish_truncate_table(committed_update)
+        .unwrap();
 }
 
 /// The payoff of Milestone G2: a per-connection default isolation set by

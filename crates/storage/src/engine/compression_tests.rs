@@ -10,9 +10,9 @@ use compress::CompressionRegistry;
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use crate::engine::{PageBackedStorageEngine, StorageMode};
-use crate::heap::{HeapPageStore, index_file_id, secondary_index_file_id};
+use crate::heap::{HeapPageStore, primary_index_file_id, secondary_index_file_id};
 use crate::page;
-use crate::traits::{SchemaOperations, StorageEngine};
+use crate::traits::SchemaOperations;
 
 const TABLE_ID: u32 = 1;
 const NOTE_INDEX_ID: u32 = 7;
@@ -29,6 +29,7 @@ impl common::FlushPolicy for AlwaysFlush {
 fn users_schema_zstd() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -67,6 +68,7 @@ fn users_schema_zstd() -> TableSchema {
 fn note_index() -> IndexSchema {
     IndexSchema {
         id: NOTE_INDEX_ID,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_note".to_string(),
         columns: vec![1],
@@ -218,8 +220,8 @@ fn rewrite_table_pages_logs_fpi_and_repairs_torn_pages() {
     fixture.buffer.flush_dirty_pages().unwrap();
     fixture.buffer.mark_all_clean().unwrap();
 
-    let pk_file_id = index_file_id(TABLE_ID);
-    let secondary_file_id = secondary_index_file_id(NOTE_INDEX_ID);
+    let pk_file_id = primary_index_file_id(TABLE_ID);
+    let secondary_file_id = secondary_index_file_id(note_index().storage_id);
     let files = [TABLE_ID, pk_file_id, secondary_file_id];
 
     // Snapshot every initialized page's image before the rewrite.

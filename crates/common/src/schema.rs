@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ColumnId, IndexId, PgType, SequenceId, TableId, Value};
+use crate::{ColumnId, FileId, IndexId, PgType, SequenceId, TableId, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -277,6 +277,11 @@ impl ColumnInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub id: TableId,
+    /// Physical storage-generation id for this table's heap and primary index.
+    /// `0` means a legacy decoded schema is missing the field; catalog migration
+    /// replaces it with a non-zero id before installation.
+    #[serde(default)]
+    pub storage_id: FileId,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key: Vec<ColumnId>,
@@ -320,6 +325,7 @@ pub fn toast_relation_name(base_table: TableId) -> String {
 pub fn toast_schema(base: &TableSchema, toast_id: TableId) -> TableSchema {
     TableSchema {
         id: toast_id,
+        storage_id: toast_id,
         name: toast_relation_name(base.id),
         columns: vec![
             ColumnDef {
@@ -403,10 +409,30 @@ pub struct SequenceSchema {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub id: IndexId,
+    /// Physical storage-generation id for this secondary index. `0` means a
+    /// legacy decoded schema is missing the field; catalog migration replaces it
+    /// with a non-zero id before installation.
+    #[serde(default)]
+    pub storage_id: FileId,
     pub table: TableId,
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub unique: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncateTablePlan {
+    pub table_id: TableId,
+    pub new_table_storage_id: FileId,
+    pub new_toast_storage_id: Option<(TableId, FileId)>,
+    pub new_index_storage_ids: Vec<(IndexId, FileId)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncateCatalogUpdate {
+    pub table: TableSchema,
+    pub toast_table: Option<TableSchema>,
+    pub indexes: Vec<IndexSchema>,
 }
 
 #[cfg(test)]
@@ -465,6 +491,7 @@ mod tests {
         }"#;
         let schema: TableSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.compression, CompressionSetting::None);
+        assert_eq!(schema.storage_id, 0);
         assert_eq!(schema.active_dict_id, None);
         assert_eq!(schema.toast, ToastOptions::legacy_catalog_default());
         assert_eq!(schema.toast_table_id, None);

@@ -161,6 +161,13 @@ pub enum Statement {
     Vacuum {
         table: Option<String>,
     },
+    /// `TRUNCATE [TABLE] <table>` — immediate table truncation. A maintenance
+    /// command that does not bind/plan relationally; unsupported PostgreSQL
+    /// options such as multiple tables, ONLY, identity handling, and cascade are
+    /// rejected by the parser.
+    Truncate {
+        table: String,
+    },
     /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')` — the only
     /// supported ALTER form. Intercepted before sqlparser (like VACUUM) so the
     /// grammar does not depend on sqlparser's ALTER coverage; every other

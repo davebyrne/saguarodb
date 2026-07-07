@@ -160,6 +160,17 @@ pub trait BufferPool: Send + Sync {
     /// Allow eviction to flush+evict WAL-durable dirty pages (steal). Disabled until
     /// the server enables it during startup (before redo).
     fn enable_stealing(&self);
+
+    /// Discard every resident frame and allocation counter for `file_id` only if no
+    /// frame for that file is pinned or mid-eviction. Intended for removing retired
+    /// relation-generation files after all relation snapshots have dropped.
+    fn discard_file_if_unpinned(&self, file_id: FileId) -> Result<bool>;
+
+    /// Remove the durable file for `file_id`, if it exists.
+    fn remove_file(&self, file_id: FileId) -> Result<()>;
+
+    /// List durable file ids known to the backing store.
+    fn list_file_ids(&self) -> Result<Vec<FileId>>;
 }
 
 pub struct MemoryBufferPool {
@@ -614,39 +625,96 @@ impl BufferPool for MemoryBufferPool {
         self.stealing.store(true, Ordering::Release);
     }
 
+    fn discard_file_if_unpinned(&self, file_id: FileId) -> Result<bool> {
+        let mut state = self.state.lock();
+        let keys = state
+            .frames
+            .keys()
+            .filter(|(candidate_file, _)| *candidate_file == file_id)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in &keys {
+            let Some(frame) = state.frames.get(key) else {
+                continue;
+            };
+            if frame.pin_count.load(Ordering::Acquire) != 0
+                || frame.evicting.load(Ordering::Acquire)
+            {
+                return Ok(false);
+            }
+        }
+        for key in keys {
+            state.remove_frame(key);
+        }
+        state.next_page_num_by_file.remove(&file_id);
+        state.abandoned_pages_by_file.remove(&file_id);
+        state.extent_seeded.remove(&file_id);
+        Ok(true)
+    }
+
+    fn remove_file(&self, file_id: FileId) -> Result<()> {
+        self.store.remove_file(file_id)
+    }
+
+    fn list_file_ids(&self) -> Result<Vec<FileId>> {
+        self.store.list_file_ids()
+    }
+
     fn flush_dirty_pages(&self) -> Result<()> {
-        // Collect dirty frames under the lock, then do I/O without holding it.
+        // Reserve dirty frames under the lock, then do I/O without holding it.
+        // `evicting` is the pool's "in transition" bit: accessors, eviction, and
+        // file discard all treat it as unavailable, so a relation-generation cleanup
+        // cannot delete a file while checkpoint has cloned frames for that file and
+        // is about to write them.
         let dirty: Vec<Arc<Frame>> = {
             let state = self.state.lock();
-            state
-                .frames
-                .values()
-                .filter(|frame| frame.is_dirty())
-                .cloned()
-                .collect()
-        };
-        for frame in dirty {
-            let info = PageFlushInfo {
-                dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
-                page_lsn: None,
-            };
-            // Checkpoint runs under the exclusive write guard, after the WAL is
-            // flushed, so every dirty page is WAL-durable and the relaxed policy
-            // (`docs/specs/mvcc.md` §8, Milestone D1) admits it whether or not its
-            // dirtying transaction committed — committed, aborted, and in-flight
-            // pages all spill to the heap (the CLOG hides the non-committed ones).
-            // An unflushable dirty page would be silently dropped by the subsequent
-            // `mark_all_clean`, so fail loudly instead.
-            if !self.flush_policy.can_flush(&info) {
-                return Err(Self::storage_internal_error(
-                    "checkpoint encountered an unflushable dirty page",
-                ));
+            let mut dirty = Vec::new();
+            for frame in state.frames.values() {
+                if !frame.is_dirty() {
+                    continue;
+                }
+                if frame.pin_count.load(Ordering::Acquire) != 0
+                    || frame.evicting.swap(true, Ordering::AcqRel)
+                {
+                    dirty.iter().for_each(|reserved: &Arc<Frame>| {
+                        reserved.evicting.store(false, Ordering::Release);
+                    });
+                    return Err(Self::storage_internal_error(
+                        "checkpoint encountered a dirty page in transition",
+                    ));
+                }
+                dirty.push(frame.clone());
             }
-            let data = frame.data.read().clone();
-            self.store
-                .write_page(frame.file_id, frame.page_num, &data)?;
+            dirty
+        };
+        let flush_result = (|| {
+            for frame in &dirty {
+                let info = PageFlushInfo {
+                    dirty_txn_id: frame.dirty_txn_id.load(Ordering::Acquire),
+                    page_lsn: None,
+                };
+                // Checkpoint runs under the exclusive write guard, after the WAL is
+                // flushed, so every dirty page is WAL-durable and the relaxed policy
+                // (`docs/specs/mvcc.md` §8, Milestone D1) admits it whether or not its
+                // dirtying transaction committed — committed, aborted, and in-flight
+                // pages all spill to the heap (the CLOG hides the non-committed ones).
+                // An unflushable dirty page would be silently dropped by the subsequent
+                // `mark_all_clean`, so fail loudly instead.
+                if !self.flush_policy.can_flush(&info) {
+                    return Err(Self::storage_internal_error(
+                        "checkpoint encountered an unflushable dirty page",
+                    ));
+                }
+                let data = frame.data.read().clone();
+                self.store
+                    .write_page(frame.file_id, frame.page_num, &data)?;
+            }
+            Ok(())
+        })();
+        for frame in dirty {
+            frame.evicting.store(false, Ordering::Release);
         }
-        Ok(())
+        flush_result
     }
 
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard> {
@@ -1040,6 +1108,14 @@ impl PageStore for NoopPageStore {
 
     fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
         Ok(0)
+    }
+
+    fn remove_file(&self, _file_id: FileId) -> Result<()> {
+        Ok(())
+    }
+
+    fn list_file_ids(&self) -> Result<Vec<FileId>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1509,6 +1585,17 @@ mod tests {
                 .max()
                 .unwrap_or(0))
         }
+
+        fn remove_file(&self, _file_id: FileId) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_file_ids(&self) -> Result<Vec<FileId>> {
+            let mut files = self.pages.keys().map(|(file, _)| *file).collect::<Vec<_>>();
+            files.sort_unstable();
+            files.dedup();
+            Ok(files)
+        }
     }
 
     struct FlushAll;
@@ -1545,6 +1632,14 @@ mod tests {
 
         fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
             Ok(0)
+        }
+
+        fn remove_file(&self, _file_id: FileId) -> Result<()> {
+            Ok(())
+        }
+
+        fn list_file_ids(&self) -> Result<Vec<FileId>> {
+            Ok(Vec::new())
         }
     }
 
@@ -1613,6 +1708,96 @@ mod tests {
         assert!(store.writes.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn discard_file_waits_while_checkpoint_flush_has_reserved_frames() {
+        use std::sync::{Condvar, Mutex as StdMutex};
+
+        struct BlockingStore {
+            entered: Arc<(StdMutex<bool>, Condvar)>,
+            release: Arc<(StdMutex<bool>, Condvar)>,
+            writes: Mutex<Vec<(FileId, PageNum)>>,
+        }
+
+        impl PageLoader for BlockingStore {
+            fn load_page(&self, _file_id: FileId, _page_num: PageNum) -> Result<Option<PageData>> {
+                Ok(None)
+            }
+        }
+
+        impl PageStore for BlockingStore {
+            fn write_page(
+                &self,
+                file_id: FileId,
+                page_num: PageNum,
+                _data: &PageData,
+            ) -> Result<()> {
+                self.writes.lock().unwrap().push((file_id, page_num));
+                let (entered_lock, entered_cvar) = &*self.entered;
+                *entered_lock.lock().unwrap() = true;
+                entered_cvar.notify_one();
+
+                let (release_lock, release_cvar) = &*self.release;
+                let mut release = release_lock.lock().unwrap();
+                while !*release {
+                    release = release_cvar.wait(release).unwrap();
+                }
+                Ok(())
+            }
+
+            fn sync_all(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn page_count(&self, _file_id: FileId) -> Result<PageNum> {
+                Ok(0)
+            }
+
+            fn remove_file(&self, _file_id: FileId) -> Result<()> {
+                Ok(())
+            }
+
+            fn list_file_ids(&self) -> Result<Vec<FileId>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let entered = Arc::new((StdMutex::new(false), Condvar::new()));
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let store = Arc::new(BlockingStore {
+            entered: entered.clone(),
+            release: release.clone(),
+            writes: Mutex::new(Vec::new()),
+        });
+        let pool = Arc::new(MemoryBufferPool::new(8, Box::new(FlushAll), store.clone()));
+        {
+            let mut page = pool.new_page(7, 5).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(5).unwrap();
+
+        let flushing_pool = pool.clone();
+        let handle = std::thread::spawn(move || flushing_pool.flush_dirty_pages());
+        let (entered_lock, entered_cvar) = &*entered;
+        let mut has_entered = entered_lock.lock().unwrap();
+        while !*has_entered {
+            has_entered = entered_cvar.wait(has_entered).unwrap();
+        }
+        drop(has_entered);
+
+        assert!(
+            !pool.discard_file_if_unpinned(7).unwrap(),
+            "discard must not remove frames while checkpoint is writing them"
+        );
+
+        let (release_lock, release_cvar) = &*release;
+        *release_lock.lock().unwrap() = true;
+        release_cvar.notify_one();
+        handle.join().unwrap().unwrap();
+
+        assert!(pool.discard_file_if_unpinned(7).unwrap());
+        assert_eq!(store.writes.lock().unwrap().as_slice(), &[(7, 0)]);
+    }
+
     /// A `PageStore` that both records writes and serves them back, so eviction
     /// spills can be read back.
     #[derive(Default)]
@@ -1654,6 +1839,27 @@ mod tests {
                 .map(|(_, page)| page + 1)
                 .max()
                 .unwrap_or(0))
+        }
+
+        fn remove_file(&self, file_id: FileId) -> Result<()> {
+            self.pages
+                .lock()
+                .unwrap()
+                .retain(|(candidate, _), _| *candidate != file_id);
+            Ok(())
+        }
+
+        fn list_file_ids(&self) -> Result<Vec<FileId>> {
+            let mut files = self
+                .pages
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|(file, _)| *file)
+                .collect::<Vec<_>>();
+            files.sort_unstable();
+            files.dedup();
+            Ok(files)
         }
     }
 

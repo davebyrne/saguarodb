@@ -89,6 +89,7 @@ pub enum PhysicalPlan {
         table_name: String,
         index: IndexId,
         range: KeyRange,
+        full_filter: Option<BoundExpr>,
         filter: Option<BoundExpr>,
     },
     NestedLoopJoin {
@@ -530,12 +531,14 @@ fn plan_scan(
     };
 
     if let Some((index, candidate)) = best_index_scan(&schema, table, &filter_expr, catalog)? {
+        let full_filter = Some(filter_expr.clone());
         let residual = residual_filter(filter_expr, &candidate.consumed);
         return Ok(PhysicalPlan::IndexScan {
             table,
             table_name,
             index,
             range: candidate.range,
+            full_filter,
             filter: residual,
         });
     }

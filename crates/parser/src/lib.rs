@@ -927,6 +927,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_truncate_table_forms() {
+        for sql in ["truncate users", "TRUNCATE TABLE Users", "truncate users;"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Truncate {
+                    table: "users".to_string(),
+                },
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_truncate_forms() {
+        for sql in [
+            "truncate users, orders",
+            "truncate table only users",
+            "truncate users restart identity",
+            "truncate users continue identity",
+            "truncate users cascade",
+            "truncate users restrict",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::FeatureNotSupported, "for `{sql}`");
+        }
+
+        for sql in ["truncate public.users", "truncate \"Users\""] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
     fn parses_create_index_forms() {
         assert_eq!(
             parse("create index users_name on users (name)").unwrap(),

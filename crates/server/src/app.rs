@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use buffer::{BufferPool, PageStore};
 use catalog::CatalogManager;
@@ -49,6 +49,11 @@ pub struct ServerComponents {
     /// outcomes; this registry tracks which transactions are still running, for
     /// snapshot capture (B3/C3) and the GC horizon (Milestone F).
     pub active_txns: ActiveTxnRegistry,
+    /// Relation-swap DDL holds the write side from before its durable commit
+    /// point until catalog/storage generation publication finishes. Snapshot
+    /// capture takes the read side while pairing MVCC and relation snapshots, so
+    /// a reader cannot observe the post-commit/pre-publish gap.
+    pub relation_publish_gate: RwLock<()>,
     /// Row-lock wait coordination + deadlock detection (`docs/specs/deadlock.md`).
     /// A writer that conflicts with an in-progress holder blocks here via the
     /// [`common::ConflictWaiter`] installed on its `StatementContext`; commit/abort/

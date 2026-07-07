@@ -7,9 +7,10 @@ use parser::Statement;
 use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
 
 use super::{
-    BindSource, QueryService, QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome,
-    Transaction, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
-    mark_failed_on_error, run_plan, statement_class,
+    BindSource, CapturedSnapshots, ExecutionContextInput, QueryService, QuerySessionContext,
+    StatementClass, StatementRuntime, StreamOutcome, Transaction, TransactionSnapshots,
+    WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream, mark_failed_on_error,
+    run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
@@ -266,7 +267,17 @@ impl QueryService {
         // statement's pinned xmin); under Repeatable Read it is `None` because the
         // reusable snapshot's advertisement lives on `txn` for the whole
         // transaction (`docs/specs/mvcc.md` §9).
-        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        let TransactionSnapshots {
+            snapshot,
+            relations,
+            advertised,
+        } = match self.snapshots_for_transaction(&mut txn) {
+            Ok(snapshots) => snapshots,
+            Err(err) => {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
+        };
         // This statement has now captured the transaction's snapshot, so the
         // transaction has "run a query": a later `SET TRANSACTION ISOLATION LEVEL`
         // must be rejected (the before-first-query guard). Set here, before
@@ -284,29 +295,34 @@ impl QueryService {
         // The writing xid is the innermost open savepoint's subxid (or `txn_id`),
         // and the live (sub)xid set is threaded for own-write/own-conflict detection
         // (`docs/specs/savepoints.md` §4).
-        let ctx = self.execution_context(
-            txn.writing_xid(),
-            snapshot,
-            txn.isolation,
-            gc_horizon,
-            txn.live_txns(),
-            runtime,
-        );
+        let result = (|| {
+            let ctx = self.execution_context(ExecutionContextInput {
+                txn_id: txn.writing_xid(),
+                snapshot,
+                relations,
+                isolation: txn.isolation,
+                gc_horizon,
+                live_txns: txn.live_txns(),
+                runtime,
+            })?;
 
-        // Only a read (a plain `SELECT`) streams; a write is materialized, so the
-        // sink is withheld from `run_plan` for writes and the executor is never
-        // asked to stream a DML plan.
-        let read_sink = if is_write { None } else { sink };
-        let result = run_plan(
-            &self.engine,
-            &ctx,
-            bound,
-            self.components.catalog.as_ref(),
-            read_sink,
-        );
+            // Only a read (a plain `SELECT`) streams; a write is materialized, so the
+            // sink is withheld from `run_plan` for writes and the executor is never
+            // asked to stream a DML plan.
+            let read_sink = if is_write { None } else { sink };
+            let result = run_plan(
+                &self.engine,
+                &ctx,
+                bound,
+                self.components.catalog.as_ref(),
+                read_sink,
+            );
+            // The snapshot can no longer be used to read once `run_plan` has returned.
+            drop(ctx);
+            result
+        })();
         // The snapshot can no longer be used to read once `run_plan` has returned;
         // drop the per-statement advertisement now (a no-op under Repeatable Read).
-        drop(ctx);
         drop(advertised);
         match result {
             Ok(outcome) => {
@@ -426,17 +442,22 @@ impl QueryService {
         // could reclaim a version this long-lived read still sees live (data loss —
         // the worst path). `_advertised` lives until the end of this function, i.e.
         // exactly the snapshot's usable lifetime.
-        let (snapshot, _advertised) = self.capture_snapshot(0);
+        let CapturedSnapshots {
+            snapshot,
+            relations,
+            advertised: _advertised,
+        } = self.capture_consistent_snapshots(0)?;
         // A read never runs CREATE INDEX (the only horizon consumer), so the horizon
         // is unused on this path; pass `0`.
-        let ctx = self.execution_context(
-            0,
+        let ctx = self.execution_context(ExecutionContextInput {
+            txn_id: 0,
             snapshot,
-            IsolationLevel::default(),
-            0,
-            Arc::from([0]),
+            relations,
+            isolation: IsolationLevel::default(),
+            gc_horizon: 0,
+            live_txns: Arc::from([0]),
             runtime,
-        );
+        })?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, self.components.catalog.as_ref())?;
         // `_advertised` is held across the drive (including any producer block on a
@@ -512,7 +533,11 @@ impl QueryService {
         // commit/rollback that follow (`docs/specs/mvcc.md` §9): it lives until this
         // function returns on every path (success, statement error, panic), exactly
         // bracketing when the snapshot can still be used to read.
-        let (snapshot, _advertised) = self.capture_snapshot(txn_id);
+        let CapturedSnapshots {
+            snapshot,
+            relations,
+            advertised: _advertised,
+        } = self.capture_consistent_snapshots(txn_id)?;
         // Capture the GC horizon. CREATE INDEX needs it for its broken-chain check
         // (captured AFTER the exclusive guard, so no writer can advance it, exactly as
         // `run_vacuum` does); an UPDATE needs it for the H3 update-path prune
@@ -521,14 +546,15 @@ impl QueryService {
         // a stale/smaller horizon only prunes LESS — never unsafely — so capturing it
         // here (before execution) is sound. Other statements ignore it.
         let gc_horizon = self.components.gc_horizon();
-        let ctx = self.execution_context(
+        let ctx = self.execution_context(ExecutionContextInput {
             txn_id,
             snapshot,
-            IsolationLevel::default(),
+            relations,
+            isolation: IsolationLevel::default(),
             gc_horizon,
-            Arc::from([txn_id]),
+            live_txns: Arc::from([txn_id]),
             runtime,
-        );
+        })?;
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         let result = match result {

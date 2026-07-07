@@ -32,7 +32,7 @@ mod tests {
     use crate::ops::{join_rows, project_row};
     use crate::test_support::{ExecutorHarness, MemoryStorage};
     use crate::{ExecutionContext, ExecutionResult, QueryEngine, eval_expr};
-    use storage::SchemaOperations;
+    use storage::{SchemaOperations, StorageEngine};
 
     #[derive(Debug, Default)]
     struct TestSequenceManager {
@@ -642,6 +642,7 @@ mod tests {
     fn insert_row_does_not_evaluate_default_for_explicit_column() {
         let schema = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "t".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -687,6 +688,7 @@ mod tests {
             .with_session_sequences(session_sequences.clone());
         let schema = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "t".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -836,6 +838,7 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let ctx = ExecutionContext {
             statement: StatementContext::new(1),
+            relations: storage.capture_relation_snapshot().unwrap(),
             catalog: &catalog,
             storage: &storage,
             schema_ops: &storage,

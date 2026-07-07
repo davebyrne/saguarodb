@@ -11,7 +11,7 @@ use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 use super::PageBackedStorageEngine;
 use super::conflict_wait_test_support::{aborting_blocker, committing_blocker};
 use crate::HeapPageStore;
-use crate::traits::{SchemaOperations, StorageEngine};
+use crate::traits::SchemaOperations;
 
 struct AlwaysFlush;
 impl common::FlushPolicy for AlwaysFlush {
@@ -114,7 +114,7 @@ impl Fixture {
     /// deleted version's index entry is *retained* rather than removed.
     fn pk_index_tids(&self, key: &Key) -> Vec<super::RowLocation> {
         self.engine
-            .btree(crate::heap::index_file_id(TABLE_ID))
+            .btree(crate::heap::primary_index_file_id(TABLE_ID))
             .scan_key(key)
             .unwrap()
     }
@@ -124,8 +124,13 @@ impl Fixture {
     /// UPDATE test can assert that *both* the old and new versions hold a
     /// per-version entry (one entry per version) under the same value.
     fn secondary_index_tids(&self, index_id: u32, name: &str) -> Vec<super::RowLocation> {
+        let relations = self.engine.capture_pagebacked_relation_snapshot().unwrap();
+        let index = self
+            .engine
+            .index_handle(&relations, TABLE_ID, index_id)
+            .unwrap();
         self.engine
-            .secondary_btree(index_id)
+            .secondary_btree(&index)
             .scan_key(&Key(vec![Value::Text(name.to_string())]))
             .unwrap()
     }
@@ -222,7 +227,9 @@ impl Fixture {
         snapshot: Snapshot,
         current_txn: u64,
     ) -> Option<(super::RowLocation, u16)> {
-        let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
+        let btree = self
+            .engine
+            .btree(crate::heap::primary_index_file_id(TABLE_ID));
         self.engine
             .locate_visible_version(&btree, key, &snapshot, &[current_txn])
             .unwrap()
@@ -235,7 +242,9 @@ impl Fixture {
         snapshot: Snapshot,
         current_txn: u64,
     ) -> Option<(super::RowLocation, u16)> {
-        let btree = self.engine.btree(crate::heap::index_file_id(TABLE_ID));
+        let btree = self
+            .engine
+            .btree(crate::heap::primary_index_file_id(TABLE_ID));
         self.engine
             .locate_visible_version(&btree, key, &snapshot, &[current_txn])
             .unwrap()
@@ -287,6 +296,7 @@ fn snapshot(xmax: u64, xip: Vec<u64>) -> Snapshot {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -321,6 +331,7 @@ fn users_schema() -> TableSchema {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: 1,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),
         columns: vec![1],
@@ -660,6 +671,7 @@ fn unique_secondary_aborted_creator_does_not_conflict() {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
         columns: vec![1],
@@ -815,6 +827,7 @@ fn fixture_with_unique_name_index() -> Fixture {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
         columns: vec![1],
@@ -1125,6 +1138,7 @@ fn committed_update_is_visible_via_seq_and_both_secondary_scans() {
     let name_idx = name_index();
     let id_idx = IndexSchema {
         id: 2,
+        storage_id: 102,
         table: TABLE_ID,
         name: "users_id".to_string(),
         columns: vec![0],
@@ -1318,6 +1332,7 @@ fn update_unique_secondary_conflicts_only_with_other_live_rows() {
         .unwrap();
     let unique_name = IndexSchema {
         id: 1,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name_unique".to_string(),
         columns: vec![1],
@@ -2009,6 +2024,7 @@ fn non_hot_data_resolves_unchanged() {
 fn hot_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -3305,6 +3321,7 @@ fn create_index_over_a_broken_live_hot_chain_aborts_retryable() {
 
     let note_index = IndexSchema {
         id: 2,
+        storage_id: 102,
         table: TABLE_ID,
         name: "users_note".to_string(),
         columns: vec![2], // the `note` column
@@ -3379,6 +3396,7 @@ fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder()
 
     let note_index = IndexSchema {
         id: 2,
+        storage_id: 102,
         table: TABLE_ID,
         name: "users_note".to_string(),
         columns: vec![2],
@@ -3399,7 +3417,7 @@ fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder()
     // The entry exists and points at the chain ROOT.
     let tids: Vec<_> = fixture
         .engine
-        .secondary_btree(note_index.id)
+        .secondary_btree(&note_index)
         .scan_key(&Key(vec![Value::Text("v2".to_string())]))
         .unwrap();
     assert_eq!(tids, vec![root], "v2 is indexed at the chain root");

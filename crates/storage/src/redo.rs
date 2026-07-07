@@ -95,6 +95,7 @@ mod tests {
     fn header_schema() -> TableSchema {
         TableSchema {
             id: 1,
+            storage_id: 1,
             name: "t".to_string(),
             columns: vec![
                 ColumnDef {

@@ -11,8 +11,9 @@ pub use system::{
 };
 
 use common::{
-    CompressionSetting, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId, SequenceOptions,
-    SequenceSchema, TableId, TableSchema, ToastOptions,
+    CompressionSetting, FileId, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId,
+    SequenceOptions, SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan,
 };
 
 pub trait CatalogManager: Send + Sync {
@@ -71,6 +72,19 @@ pub trait CatalogManager: Send + Sync {
     /// Advances the dictionary id allocator's high-water mark past `id`
     /// (replay and orphan-dictionary-file recovery); never rewinds it.
     fn reserve_dictionary_id(&self, id: u32) -> Result<()>;
+    /// Allocates a physical storage-generation id. Storage ids are shared by
+    /// user-table heap/primary-index pairs, hidden TOAST heap/primary-index
+    /// pairs, and secondary indexes; they are never reused.
+    fn allocate_storage_id(&self) -> Result<FileId>;
+    /// Advances the storage-id allocator's high-water mark past `id` without
+    /// installing a schema.
+    fn reserve_storage_id(&self, id: FileId) -> Result<()>;
+    fn prepare_truncate_table(&self, table: TableId) -> Result<TruncateTablePlan>;
+    fn build_truncate_table_update(
+        &self,
+        plan: &TruncateTablePlan,
+    ) -> Result<TruncateCatalogUpdate>;
+    fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
@@ -130,6 +144,7 @@ mod tests {
     fn stored_id_table(id: u32, name: &str) -> TableSchema {
         TableSchema {
             id,
+            storage_id: id,
             name: name.to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -425,6 +440,234 @@ mod tests {
     }
 
     #[test]
+    fn table_toast_and_index_storage_ids_are_distinct() {
+        let catalog = MemoryCatalog::empty();
+        let table = catalog
+            .create_table_with_options(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "bio".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                ToastOptions::default_new_table(),
+                Vec::new(),
+            )
+            .unwrap();
+        let toast = catalog
+            .get_table(table.toast_table_id.unwrap())
+            .unwrap()
+            .unwrap();
+        let index = catalog
+            .create_index(
+                "users_bio".to_string(),
+                "users",
+                &["bio".to_string()],
+                false,
+            )
+            .unwrap();
+
+        assert_ne!(table.storage_id, toast.storage_id);
+        assert_ne!(table.storage_id, index.storage_id);
+        assert_ne!(toast.storage_id, index.storage_id);
+    }
+
+    #[test]
+    fn legacy_snapshot_missing_storage_ids_preserves_file_ids_by_kind() {
+        let json = r#"{
+            "tables_by_name": {"users": 1},
+            "tables_by_id": {"1": {
+                "id": 1,
+                "name": "users",
+                "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
+                "primary_key": [0]
+            }},
+            "next_table_id": 2,
+            "indexes_by_name": {"users_id": 1},
+            "indexes_by_id": {"1": {
+                "id": 1,
+                "table": 1,
+                "name": "users_id",
+                "columns": [0],
+                "unique": true
+            }},
+            "next_index_id": 2
+        }"#;
+
+        let catalog =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(json.as_bytes()).unwrap())
+                .unwrap();
+
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog.get_index_by_name("users_id").unwrap().unwrap();
+        assert_eq!(table.storage_id, 1);
+        assert_eq!(index.storage_id, 1);
+        assert_eq!(catalog.snapshot().unwrap().next_storage_id, 2);
+    }
+
+    #[test]
+    fn prepare_truncate_allocates_without_publishing_storage_ids() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        let plan = catalog.prepare_truncate_table(table.id).unwrap();
+
+        assert_eq!(plan.table_id, table.id);
+        assert_ne!(plan.new_table_storage_id, table.storage_id);
+        assert_eq!(plan.new_index_storage_ids.len(), 1);
+        assert_eq!(plan.new_index_storage_ids[0].0, index.id);
+        assert_ne!(plan.new_index_storage_ids[0].1, index.storage_id);
+        assert_eq!(
+            catalog.get_table(table.id).unwrap().unwrap().storage_id,
+            table.storage_id
+        );
+        assert_eq!(
+            catalog
+                .get_index_by_name("users_name")
+                .unwrap()
+                .unwrap()
+                .storage_id,
+            index.storage_id
+        );
+
+        let next = catalog.allocate_storage_id().unwrap();
+        assert!(next > plan.new_index_storage_ids[0].1);
+    }
+
+    #[test]
+    fn build_truncate_update_does_not_publish_storage_ids() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+        let plan = catalog.prepare_truncate_table(table.id).unwrap();
+
+        let update = catalog.build_truncate_table_update(&plan).unwrap();
+
+        assert_eq!(update.table.storage_id, plan.new_table_storage_id);
+        assert_eq!(
+            update.indexes,
+            vec![IndexSchema {
+                storage_id: plan.new_index_storage_ids[0].1,
+                ..index.clone()
+            }]
+        );
+        assert_eq!(
+            catalog.get_table(table.id).unwrap().unwrap().storage_id,
+            table.storage_id
+        );
+        assert_eq!(
+            catalog
+                .get_index_by_name("users_name")
+                .unwrap()
+                .unwrap()
+                .storage_id,
+            index.storage_id
+        );
+    }
+
+    #[test]
+    fn truncate_update_rejects_reusing_current_storage_ids() {
+        let catalog = catalog_with_users();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        let index = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        let mut plan = catalog.prepare_truncate_table(table.id).unwrap();
+        plan.new_table_storage_id = table.storage_id;
+        assert!(catalog.build_truncate_table_update(&plan).is_err());
+
+        let mut plan = catalog.prepare_truncate_table(table.id).unwrap();
+        plan.new_index_storage_ids = vec![(index.id, index.storage_id)];
+        assert!(catalog.build_truncate_table_update(&plan).is_err());
+    }
+
+    #[test]
+    fn apply_truncate_swaps_only_storage_ids() {
+        let catalog = MemoryCatalog::empty();
+        let table = catalog
+            .create_table_with_options(
+                "users".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "bio".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                ToastOptions::default_new_table(),
+                Vec::new(),
+            )
+            .unwrap();
+        let toast = catalog
+            .get_table(table.toast_table_id.unwrap())
+            .unwrap()
+            .unwrap();
+        let index = catalog
+            .create_index("users_bio".to_string(), "users", &["bio".to_string()], true)
+            .unwrap();
+        let plan = catalog.prepare_truncate_table(table.id).unwrap();
+
+        let update = catalog.apply_truncate_table(&plan).unwrap();
+
+        let mut expected_table = table.clone();
+        expected_table.storage_id = plan.new_table_storage_id;
+        assert_eq!(update.table, expected_table);
+        assert_eq!(catalog.get_table(table.id).unwrap(), Some(expected_table));
+
+        let (toast_id, new_toast_storage_id) = plan.new_toast_storage_id.unwrap();
+        assert_eq!(toast_id, toast.id);
+        let mut expected_toast = toast.clone();
+        expected_toast.storage_id = new_toast_storage_id;
+        assert_eq!(update.toast_table, Some(expected_toast.clone()));
+        assert_eq!(catalog.get_table(toast.id).unwrap(), Some(expected_toast));
+
+        let (index_id, new_index_storage_id) = plan.new_index_storage_ids[0];
+        assert_eq!(index_id, index.id);
+        let mut expected_index = index.clone();
+        expected_index.storage_id = new_index_storage_id;
+        assert_eq!(update.indexes, vec![expected_index.clone()]);
+        assert_eq!(
+            catalog.get_index_by_name("users_bio").unwrap(),
+            Some(expected_index)
+        );
+    }
+
+    #[test]
     fn create_sequence_assigns_defaults_and_drop_removes_it() {
         let catalog = MemoryCatalog::empty();
 
@@ -577,6 +820,7 @@ mod tests {
     fn try_from_snapshot_rejects_next_table_id_that_reuses_existing_id() {
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -626,6 +870,7 @@ mod tests {
         };
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -655,6 +900,7 @@ mod tests {
             sequences_by_id: HashMap::from([(1, sequence)]),
             next_sequence_id: 2,
             next_dictionary_id: 1,
+            next_storage_id: 4,
         };
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
@@ -669,6 +915,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -821,6 +1068,7 @@ mod tests {
     fn try_from_snapshot_accepts_composite_primary_key() {
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![
                 ColumnDef {
@@ -875,6 +1123,7 @@ mod tests {
     fn try_from_snapshot_rejects_nullable_primary_key_column() {
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -911,6 +1160,7 @@ mod tests {
     fn try_from_snapshot_rejects_non_contiguous_column_ids() {
         let schema = TableSchema {
             id: 3,
+            storage_id: 3,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 1,
@@ -1089,6 +1339,7 @@ mod tests {
         let catalog = MemoryCatalog::empty();
         let schema = TableSchema {
             id: 7,
+            storage_id: 7,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -1339,6 +1590,7 @@ mod tests {
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
         let schema = IndexSchema {
             id: 5,
+            storage_id: 5,
             table: users.id,
             name: "users_name".to_string(),
             columns: vec![1],
@@ -1402,6 +1654,7 @@ mod tests {
                 1,
                 IndexSchema {
                     id: 1,
+                    storage_id: 1,
                     table: 7,
                     name: "orphan".to_string(),
                     columns: vec![0],
@@ -1421,6 +1674,7 @@ mod tests {
     fn validate_rejects_reserved_primary_key_index_id() {
         let table = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -1448,6 +1702,7 @@ mod tests {
                 0,
                 IndexSchema {
                     id: 0,
+                    storage_id: 2,
                     table: 1,
                     name: "bad".to_string(),
                     columns: vec![0],
@@ -1466,6 +1721,7 @@ mod tests {
     fn validate_rejects_next_index_id_that_reuses_existing_id() {
         let table = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "users".to_string(),
             columns: vec![ColumnDef {
                 id: 0,
@@ -1493,6 +1749,7 @@ mod tests {
                 1,
                 IndexSchema {
                     id: 1,
+                    storage_id: 2,
                     table: 1,
                     name: "users_id".to_string(),
                     columns: vec![0],

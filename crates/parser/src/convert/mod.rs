@@ -234,6 +234,38 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             legacy_options,
             values,
         } => convert_copy(source, to, target, options, legacy_options, values),
+        sql::Statement::Truncate {
+            mut table_names,
+            partitions,
+            table: _,
+            only,
+            identity,
+            cascade,
+            on_cluster,
+        } => {
+            if table_names.len() != 1 {
+                return feature_not_supported("TRUNCATE supports one table only in v1");
+            }
+            if only {
+                return feature_not_supported("TRUNCATE ONLY is not supported in v1");
+            }
+            if partitions.is_some() {
+                return feature_not_supported("TRUNCATE PARTITION is not supported in v1");
+            }
+            if identity.is_some() {
+                return feature_not_supported("TRUNCATE identity options are not supported in v1");
+            }
+            if cascade.is_some() {
+                return feature_not_supported("TRUNCATE CASCADE/RESTRICT is not supported in v1");
+            }
+            if on_cluster.is_some() {
+                return feature_not_supported("TRUNCATE ON CLUSTER is not supported in v1");
+            }
+
+            Ok(Statement::Truncate {
+                table: object_name(&table_names.remove(0).name)?,
+            })
+        }
         _ => unsupported("unsupported SQL statement"),
     }
 }

@@ -267,12 +267,16 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "session control statements do not bind",
         )),
-        // VACUUM is a maintenance command dispatched to `run_vacuum` before binding
-        // (it is not relational and never binds/plans). This defensive arm keeps the
+        // VACUUM/TRUNCATE are maintenance commands dispatched before binding (they
+        // are not relational and never bind/plan). These defensive arms keep the
         // public `bind` API total if called directly.
         Statement::Vacuum { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
             "VACUUM is a maintenance command and does not bind",
+        )),
+        Statement::Truncate { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "TRUNCATE is a maintenance command and does not bind",
         )),
         // ALTER TABLE ... SET (compression) is a maintenance command dispatched
         // before binding (the VACUUM pattern); this arm keeps `bind` total.

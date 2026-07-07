@@ -32,6 +32,7 @@ pub(crate) const TYPE_FULL_PAGE_IMAGE_COMPRESSED: u8 = 18;
 pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
 pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
 pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
+pub(crate) const TYPE_TRUNCATE_TABLE: u8 = 22;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -171,6 +172,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::CreateDictionary { .. } => TYPE_CREATE_DICTIONARY,
         WalRecordKind::AlterTableCompression { .. } => TYPE_ALTER_TABLE_COMPRESSION,
         WalRecordKind::AlterTableToast { .. } => TYPE_ALTER_TABLE_TOAST,
+        WalRecordKind::TruncateTable { .. } => TYPE_TRUNCATE_TABLE,
     }
 }
 
@@ -476,6 +478,7 @@ mod tests {
             WalRecordKind::CreateIndex {
                 schema: common::IndexSchema {
                     id: 3,
+                    storage_id: 30,
                     table: 1,
                     name: "users_name".to_string(),
                     columns: vec![1],
@@ -570,6 +573,12 @@ mod tests {
                     active_dict_id: None,
                 },
                 toast_table_id: Some(6),
+            },
+            WalRecordKind::TruncateTable {
+                table_id: 5,
+                new_table_storage_id: 20,
+                new_toast_storage_id: Some((6, 21)),
+                new_index_storage_ids: vec![(7, 22), (8, 23)],
             },
         ];
         for kind in kinds {

@@ -168,6 +168,7 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
     components.wal.truncate_before(checkpoint_lsn)?;
 
     components.buffer_pool.mark_all_clean()?;
+    cleanup_relation_generation_files(components)?;
 
     components
         .checkpoint
@@ -181,6 +182,12 @@ pub fn run_checkpoint(components: &ServerComponents) -> Result<()> {
         .checkpoint
         .checkpoints
         .fetch_add(1, Ordering::AcqRel);
+    Ok(())
+}
+
+pub fn cleanup_relation_generation_files(components: &ServerComponents) -> Result<()> {
+    components.storage.try_cleanup_retired_generations()?;
+    components.storage.cleanup_orphan_files()?;
     Ok(())
 }
 

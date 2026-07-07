@@ -1,15 +1,17 @@
 use common::{
-    ColumnInfo, ExecRow, IndexId, KeyRange, PRIMARY_KEY_INDEX_ID, Result, RowIdentity,
+    ColumnInfo, ExecRow, IndexId, KeyRange, PRIMARY_KEY_INDEX_ID, Result, RowIdentity, SqlState,
     StatementContext, TableId,
 };
 use planner::BoundExpr;
-use storage::{RowIterator, StorageEngine};
+use std::sync::Arc;
+use storage::{RelationSnapshot, RowIterator, StorageEngine};
 
 use crate::ops::predicate_matches;
 use crate::query::PlanExecutor;
 
 pub struct SeqScanOp<'a> {
     ctx: StatementContext,
+    relations: Arc<dyn RelationSnapshot>,
     storage: &'a dyn StorageEngine,
     table: TableId,
     filter: Option<BoundExpr>,
@@ -20,6 +22,7 @@ pub struct SeqScanOp<'a> {
 impl<'a> SeqScanOp<'a> {
     pub fn new(
         ctx: StatementContext,
+        relations: Arc<dyn RelationSnapshot>,
         storage: &'a dyn StorageEngine,
         table: TableId,
         filter: Option<BoundExpr>,
@@ -27,6 +30,7 @@ impl<'a> SeqScanOp<'a> {
     ) -> Self {
         Self {
             ctx,
+            relations,
             storage,
             table,
             filter,
@@ -42,7 +46,10 @@ impl PlanExecutor for SeqScanOp<'_> {
     }
 
     fn open(&mut self) -> Result<()> {
-        self.iter = Some(self.storage.scan(&self.ctx, self.table)?);
+        self.iter = Some(
+            self.storage
+                .scan(&self.ctx, self.relations.as_ref(), self.table)?,
+        );
         Ok(())
     }
 
@@ -80,31 +87,51 @@ impl PlanExecutor for SeqScanOp<'_> {
 
 pub struct IndexScanOp<'a> {
     ctx: StatementContext,
+    relations: Arc<dyn RelationSnapshot>,
     storage: &'a dyn StorageEngine,
     table: TableId,
     index: IndexId,
     range: KeyRange,
+    full_filter: Option<BoundExpr>,
     filter: Option<BoundExpr>,
     output_schema: Vec<ColumnInfo>,
     iter: Option<Box<dyn RowIterator>>,
 }
 
+pub(crate) struct IndexScanInput<'a> {
+    pub(crate) ctx: StatementContext,
+    pub(crate) relations: Arc<dyn RelationSnapshot>,
+    pub(crate) storage: &'a dyn StorageEngine,
+    pub(crate) table: TableId,
+    pub(crate) index: IndexId,
+    pub(crate) range: KeyRange,
+    pub(crate) full_filter: Option<BoundExpr>,
+    pub(crate) filter: Option<BoundExpr>,
+    pub(crate) output_schema: Vec<ColumnInfo>,
+}
+
 impl<'a> IndexScanOp<'a> {
-    pub fn new(
-        ctx: StatementContext,
-        storage: &'a dyn StorageEngine,
-        table: TableId,
-        index: IndexId,
-        range: KeyRange,
-        filter: Option<BoundExpr>,
-        output_schema: Vec<ColumnInfo>,
-    ) -> Self {
-        Self {
+    pub(crate) fn new(input: IndexScanInput<'a>) -> Self {
+        let IndexScanInput {
             ctx,
+            relations,
             storage,
             table,
             index,
             range,
+            full_filter,
+            filter,
+            output_schema,
+        } = input;
+
+        Self {
+            ctx,
+            relations,
+            storage,
+            table,
+            index,
+            range,
+            full_filter,
             filter,
             output_schema,
             iter: None,
@@ -122,10 +149,23 @@ impl PlanExecutor for IndexScanOp<'_> {
         // index resolves each entry's primary key through the primary-key index.
         let iter = if self.index == PRIMARY_KEY_INDEX_ID {
             self.storage
-                .scan_range(&self.ctx, self.table, &self.range)?
+                .scan_range(&self.ctx, self.relations.as_ref(), self.table, &self.range)?
         } else {
-            self.storage
-                .index_scan(&self.ctx, self.table, self.index, &self.range)?
+            match self.storage.index_scan(
+                &self.ctx,
+                self.relations.as_ref(),
+                self.table,
+                self.index,
+                &self.range,
+            ) {
+                Ok(iter) => iter,
+                Err(err) if err.code == SqlState::UndefinedTable => {
+                    self.filter = self.full_filter.clone();
+                    self.storage
+                        .scan(&self.ctx, self.relations.as_ref(), self.table)?
+                }
+                Err(err) => return Err(err),
+            }
         };
         self.iter = Some(iter);
         Ok(())

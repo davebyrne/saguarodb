@@ -13,6 +13,7 @@ use planner::{
     BoundStatement, bind_parameterized, format_explain, logical_plan, mutates_sequences,
     physical_plan, substitute_params,
 };
+use storage::RelationSnapshot;
 
 use tokio::sync::mpsc;
 
@@ -25,6 +26,7 @@ mod copy;
 mod exec;
 mod gucs;
 mod stream;
+mod truncate;
 mod txn;
 mod vacuum;
 
@@ -32,7 +34,7 @@ pub use copy::CopyInChunk;
 pub use gucs::SessionGucs;
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
 pub use stream::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
-use txn::StatementRuntime;
+use txn::{CapturedSnapshots, ExecutionContextInput, StatementRuntime, TransactionSnapshots};
 pub(crate) use vacuum::full_vacuum_pass;
 
 pub struct QueryService {
@@ -178,9 +180,11 @@ pub struct Transaction {
     /// G). Set at BEGIN from an explicit `ISOLATION LEVEL` mode or the default
     /// (Read Committed), and adjustable by `SET TRANSACTION ISOLATION LEVEL`
     /// before the first query. Threaded into `StatementContext.isolation`, which
-    /// drives `snapshot_for_transaction`: Read Committed captures a fresh snapshot
+    /// drives `snapshots_for_transaction`: Read Committed captures a fresh snapshot
     /// per statement, Repeatable Read captures one at the first statement and
-    /// reuses it.
+    /// reuses it. The paired relation snapshot follows the same rule so
+    /// relation-swap DDL cannot move a stable transaction onto a newer physical
+    /// generation.
     isolation: IsolationLevel,
     /// Transactional changes to `default_transaction_isolation`. PostgreSQL makes a
     /// plain `SET` visible immediately but only persists it if the surrounding
@@ -203,6 +207,12 @@ pub struct Transaction {
     /// reused. `None` under Read Committed (a fresh snapshot is captured per
     /// statement).
     rr_snapshot: Option<Arc<Snapshot>>,
+    /// The relation-generation snapshot paired with `rr_snapshot`. Relation-swap
+    /// DDL such as truncate publishes new storage generations without changing
+    /// logical table ids, so Repeatable Read / Serializable must keep resolving
+    /// reads against the same relation generations for the whole transaction.
+    /// `None` under Read Committed.
+    rr_relations: Option<Arc<dyn RelationSnapshot>>,
     /// The advertisement pinning the GC horizon at the snapshot's `xmin` for the
     /// snapshot's usable lifetime (`docs/specs/mvcc.md` §9). Under Repeatable Read
     /// the one `rr_snapshot` is reusable for the whole transaction, so its
@@ -1221,7 +1231,7 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::ResetVariable { .. }
         | Statement::ShowVariable { .. }
         | Statement::DiscardAll => Ok(StatementClass::SessionConfig),
-        Statement::Vacuum { .. } => Ok(StatementClass::Maintenance),
+        Statement::Vacuum { .. } | Statement::Truncate { .. } => Ok(StatementClass::Maintenance),
         Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
             Ok(StatementClass::Maintenance)
         }
@@ -1265,7 +1275,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
@@ -1354,6 +1364,7 @@ mod tests {
             next_txn_id: AtomicU64::new(common::ids::FIRST_NORMAL_XID),
             dead_rows_since_vacuum: AtomicU64::new(0),
             active_txns,
+            relation_publish_gate: RwLock::new(()),
             lock_manager,
             ssi_manager,
             tls: None,
@@ -1657,6 +1668,32 @@ mod tests {
             self.inner.reserve_dictionary_id(id)
         }
 
+        fn allocate_storage_id(&self) -> Result<common::FileId> {
+            self.inner.allocate_storage_id()
+        }
+
+        fn reserve_storage_id(&self, id: common::FileId) -> Result<()> {
+            self.inner.reserve_storage_id(id)
+        }
+
+        fn prepare_truncate_table(&self, table: TableId) -> Result<common::TruncateTablePlan> {
+            self.inner.prepare_truncate_table(table)
+        }
+
+        fn build_truncate_table_update(
+            &self,
+            plan: &common::TruncateTablePlan,
+        ) -> Result<common::TruncateCatalogUpdate> {
+            self.inner.build_truncate_table_update(plan)
+        }
+
+        fn apply_truncate_table(
+            &self,
+            plan: &common::TruncateTablePlan,
+        ) -> Result<common::TruncateCatalogUpdate> {
+            self.inner.apply_truncate_table(plan)
+        }
+
         fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
             self.inner.get_index_by_name(name)
         }
@@ -1727,6 +1764,47 @@ mod tests {
         fn drop_sequence(&self, id: SequenceId) -> Result<()> {
             self.inner.drop_sequence(id)
         }
+    }
+
+    #[test]
+    fn relation_publish_gate_blocks_consistent_snapshot_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        let gate = app.components.relation_publish_gate.write().unwrap();
+        let service = app.query_service.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = service.capture_consistent_snapshots(0).is_ok();
+            done_tx.send(result).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot capture thread did not start");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "snapshot capture completed while relation publication was gated"
+        );
+
+        drop(gate);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot capture did not resume after relation gate released")
+            .then_some(())
+            .expect("snapshot capture failed after relation gate released");
+        handle.join().unwrap();
     }
 
     #[test]

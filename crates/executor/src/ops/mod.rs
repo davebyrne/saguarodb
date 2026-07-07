@@ -20,6 +20,7 @@ pub use join::join_rows;
 pub use limit::LimitOp;
 pub use projection::ProjectionOp;
 pub use projection::project_row;
+pub(crate) use scan::IndexScanInput;
 pub use scan::{IndexScanOp, SeqScanOp};
 pub use set_op::SetOpOp;
 pub use sort::SortOp;

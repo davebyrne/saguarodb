@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use common::{KeyRange, RelationKind, StatementContext, ToastCompression, ToastMode};
-use storage::StorageEngine;
 use support::{Connection, TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
@@ -948,6 +947,136 @@ async fn committed_data_survives_crash_without_checkpoint() {
             vec![Some("1".to_string()), Some("Ada".to_string())],
             vec![Some("2".to_string()), Some("Grace".to_string())],
         ]
+    );
+}
+
+#[tokio::test]
+async fn committed_truncate_survives_restart_and_accepts_new_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "truncate-recovery-toast-body-".repeat(260);
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (id integer primary key, name text, body text) \
+                 with (toast_min_value_size = 128, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("create index docs_name on docs (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query(&format!(
+                "insert into docs (id, name, body) values (1, 'Ada', '{body}')"
+            ))
+            .await
+            .unwrap();
+        server.simple_query("truncate table docs").await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert!(
+        server
+            .simple_query("select id from docs where name = 'Ada'")
+            .await
+            .unwrap()
+            .unwrap_rows()
+            .is_empty(),
+        "committed truncate must recover as an empty replacement generation"
+    );
+
+    server
+        .simple_query(&format!(
+            "insert into docs (id, name, body) values (1, 'Ada', '{body}')"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("select body from docs where name = 'Ada'")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some(body)]],
+        "secondary index and TOAST should remain usable after recovered truncate"
+    );
+}
+
+#[tokio::test]
+async fn precommit_truncate_prepare_is_skipped_and_storage_ids_are_burned() {
+    let dir = tempfile::tempdir().unwrap();
+    let planned_storage_ids;
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table users (id integer primary key, name text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index users_name on users (name)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into users (id, name) values (1, 'Ada')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+
+        let components = &server.app().components;
+        let table = components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .expect("users exists");
+        let plan = components.catalog.prepare_truncate_table(table.id).unwrap();
+        let update = components
+            .catalog
+            .build_truncate_table_update(&plan)
+            .unwrap();
+        planned_storage_ids = std::iter::once(plan.new_table_storage_id)
+            .chain(plan.new_toast_storage_id.map(|(_, storage_id)| storage_id))
+            .chain(
+                plan.new_index_storage_ids
+                    .iter()
+                    .map(|(_, storage_id)| *storage_id),
+            )
+            .collect::<Vec<_>>();
+
+        components
+            .storage
+            .prepare_truncate_table(&StatementContext::new(900), &plan, &update)
+            .unwrap();
+        components.wal.flush().unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select id, name from users order by id")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]],
+        "an uncommitted truncate prepare must not publish the empty generation"
+    );
+    let next_storage_id = server
+        .app()
+        .components
+        .catalog
+        .snapshot()
+        .unwrap()
+        .next_storage_id;
+    let max_planned = planned_storage_ids
+        .into_iter()
+        .max()
+        .expect("truncate allocated storage ids");
+    assert!(
+        next_storage_id > max_planned,
+        "recovery must reserve skipped truncate replacement storage ids"
     );
 }
 

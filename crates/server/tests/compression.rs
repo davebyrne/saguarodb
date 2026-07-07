@@ -5,7 +5,7 @@ use common::{
     TableSchema, ToastCompression, ToastMode, ToastOptions,
 };
 use saguarodb_server::config::Config;
-use storage::{RecoveryOperations, StorageEngine};
+use storage::SchemaOperations;
 use support::{Connection, TestServer};
 
 /// Independently probes whether this filesystem's `fallocate`
@@ -582,6 +582,7 @@ fn hidden_toast_chunk_count(server: &TestServer, table: &str) -> usize {
 fn legacy_schema_without_toast() -> TableSchema {
     TableSchema {
         id: 50,
+        storage_id: 50,
         name: "legacy_docs".to_string(),
         columns: vec![
             ColumnDef {
@@ -802,8 +803,19 @@ async fn alter_toast_options_create_hidden_relation_for_legacy_catalog_table() {
         .app()
         .components
         .storage
-        .apply_create_table(legacy)
+        .create_table(&StatementContext::new(0), &legacy)
         .unwrap();
+    server
+        .simple_query("create index legacy_docs_body on legacy_docs (body)")
+        .await
+        .unwrap();
+    let body_index = server
+        .app()
+        .components
+        .catalog
+        .get_index_by_name("legacy_docs_body")
+        .unwrap()
+        .expect("legacy_docs_body index exists");
 
     server
         .simple_query("alter table legacy_docs set (toast = off)")
@@ -834,6 +846,14 @@ async fn alter_toast_options_create_hidden_relation_for_legacy_catalog_table() {
         }
     );
     assert_eq!(hidden.compression, CompressionSetting::None);
+    assert_ne!(
+        hidden.storage_id, body_index.storage_id,
+        "late TOAST relation must allocate a fresh storage id, not reuse a secondary index generation"
+    );
+    assert!(
+        hidden.storage_id > body_index.storage_id,
+        "late TOAST relation should come after the pre-existing secondary index in storage allocation order"
+    );
 }
 
 #[tokio::test]

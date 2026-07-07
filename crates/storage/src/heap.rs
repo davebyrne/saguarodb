@@ -6,34 +6,40 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use buffer::{PAGE_SIZE, PageData, PageLoader, PageStore};
-use common::{DbError, FileId, IndexId, PageNum, Result, TableId};
+use common::{DbError, FileId, PageNum, Result};
 
-/// File-id high bit marking a table's primary-key index file. A table's heap file
-/// id is its table id; its index file id is the table id with this bit set, so a
-/// single page store serves both without collision (v1 table ids are small).
+/// File-id high bit marking a table generation's primary-key index file. A
+/// relation generation's heap file id is its `storage_id`; its primary-index file
+/// id is the `storage_id` with this bit set, so a single page store serves both
+/// without collision.
 pub(crate) const INDEX_FILE_BIT: FileId = 0x8000_0000;
 
 /// File-id high *two* bits marking a secondary-index file. Distinct from the
-/// primary-key index tag (top bit only): a secondary file id is `index_id` with
-/// both bits set, so heaps (no high bit), primary-key indexes (top bit), and
-/// secondary indexes (top two bits) never collide while table and index ids stay
-/// under `0x4000_0000` (always true in v1).
+/// primary-key index tag (top bit only): a secondary file id is the index
+/// generation's `storage_id` with both bits set, so heaps (no high bit),
+/// primary-key indexes (top bit), and secondary indexes (top two bits) never
+/// collide while storage ids stay under `0x4000_0000` (enforced by the catalog).
 pub(crate) const SECONDARY_INDEX_BITS: FileId = 0xC000_0000;
 
-/// The primary-key index file id for a table (distinct from its heap file id).
-pub(crate) fn index_file_id(table: TableId) -> FileId {
-    table | INDEX_FILE_BIT
+/// The heap file id for a relation generation.
+pub(crate) fn heap_file_id(storage_id: FileId) -> FileId {
+    storage_id
+}
+
+/// The primary-key index file id for a table generation.
+pub(crate) fn primary_index_file_id(storage_id: FileId) -> FileId {
+    storage_id | INDEX_FILE_BIT
 }
 
 /// The file id for a secondary index, tagged so it shares the page store with
 /// heaps and primary-key indexes without collision.
-pub(crate) fn secondary_index_file_id(index: IndexId) -> FileId {
+pub(crate) fn secondary_index_file_id(storage_id: FileId) -> FileId {
     debug_assert_eq!(
-        index & SECONDARY_INDEX_BITS,
+        storage_id & SECONDARY_INDEX_BITS,
         0,
-        "secondary index id {index} does not fit in 30 bits"
+        "secondary index storage id {storage_id} does not fit in 30 bits"
     );
-    index | SECONDARY_INDEX_BITS
+    storage_id | SECONDARY_INDEX_BITS
 }
 
 /// Filesystem allocation quantum assumed for hole punching. Punching is a
@@ -41,10 +47,11 @@ pub(crate) fn secondary_index_file_id(index: IndexId) -> FileId {
 /// reclaims nothing and correctness is unaffected.
 const FS_BLOCK_SIZE: usize = 4096;
 
-/// Mutable page home backed by one file per table: the heap at `<dir>/<id>.heap`
-/// and the primary-key index at `<dir>/<table>.idx`, with page `n` stored at byte
-/// offset `n * PAGE_SIZE`. Pages are loaded on a buffer miss and written back in
-/// place when flushed.
+/// Mutable page home backed by one file per relation generation: heaps at
+/// `<dir>/<storage_id>.heap`, primary-key indexes at `<dir>/<storage_id>.idx`,
+/// and secondary indexes at `<dir>/<storage_id>.sidx`, with page `n` stored at
+/// byte offset `n * PAGE_SIZE`. Pages are loaded on a buffer miss and written
+/// back in place when flushed.
 pub struct HeapPageStore {
     dir: PathBuf,
     files: Mutex<HashMap<FileId, Arc<File>>>,
@@ -86,6 +93,21 @@ impl HeapPageStore {
         } else {
             self.dir.join(format!("{file_id}.heap"))
         }
+    }
+
+    fn fsync_dir(&self) -> Result<()> {
+        let dir = File::open(&self.dir).map_err(|err| {
+            DbError::io(format!(
+                "failed to open heap directory {} for fsync: {err}",
+                self.dir.display()
+            ))
+        })?;
+        dir.sync_all().map_err(|err| {
+            DbError::io(format!(
+                "failed to fsync heap directory {}: {err}",
+                self.dir.display()
+            ))
+        })
     }
 
     /// Return a shared handle to a table's heap file, opening (and optionally
@@ -283,18 +305,55 @@ impl PageStore for HeapPageStore {
                 .map_err(|err| DbError::io(format!("failed to fsync heap file: {err}")))?;
         }
         // fsync the directory so newly created heap files are durable.
-        let dir = File::open(&self.dir).map_err(|err| {
+        self.fsync_dir()
+    }
+
+    fn remove_file(&self, file_id: FileId) -> Result<()> {
+        self.files
+            .lock()
+            .map_err(|_| DbError::internal("heap store lock poisoned"))?
+            .remove(&file_id);
+        let path = self.path(file_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => self.fsync_dir(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(DbError::io(format!(
+                "failed to remove heap file {}: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn list_file_ids(&self) -> Result<Vec<FileId>> {
+        let mut ids = Vec::new();
+        let entries = std::fs::read_dir(&self.dir).map_err(|err| {
             DbError::io(format!(
-                "failed to open heap directory {} for fsync: {err}",
+                "failed to read heap directory {}: {err}",
                 self.dir.display()
             ))
         })?;
-        dir.sync_all().map_err(|err| {
-            DbError::io(format!(
-                "failed to fsync heap directory {}: {err}",
-                self.dir.display()
-            ))
-        })
+        for entry in entries {
+            let entry = entry.map_err(|err| DbError::io(format!("heap dir entry: {err}")))?;
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(storage_id) = stem.parse::<FileId>() else {
+                continue;
+            };
+            match extension {
+                "heap" => ids.push(heap_file_id(storage_id)),
+                "idx" => ids.push(primary_index_file_id(storage_id)),
+                "sidx" => ids.push(secondary_index_file_id(storage_id)),
+                _ => {}
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 }
 
@@ -359,7 +418,7 @@ mod tests {
     fn index_and_heap_files_are_separate() {
         let dir = tempfile::tempdir().unwrap();
         let store = HeapPageStore::open(dir.path()).unwrap();
-        let index = super::index_file_id(5);
+        let index = super::primary_index_file_id(5);
 
         store.write_page(5, 0, &page(0x11)).unwrap();
         store.write_page(index, 0, &page(0x22)).unwrap();
@@ -377,7 +436,7 @@ mod tests {
         let store = HeapPageStore::open(dir.path()).unwrap();
         // Same numeric id, three namespaces: heap 5, primary-key index 5,
         // secondary index 5 must all be distinct files.
-        let primary = super::index_file_id(5);
+        let primary = super::primary_index_file_id(5);
         let secondary = super::secondary_index_file_id(5);
         assert_ne!(primary, secondary);
 

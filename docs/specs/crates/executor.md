@@ -100,7 +100,7 @@ impl QueryEngine {
 | Operator | Behavior |
 |---|---|
 | `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present |
-| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. Converts `StoredRow` to `ExecRow`, then applies `PhysicalPlan::IndexScan.filter` when present |
+| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a secondary index chosen from the current catalog is unavailable for the retained relation snapshot, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
 | `SystemScanOp` | Materializes rows for a virtual `pg_catalog`/`information_schema` system view from catalog metadata, the static registry, and `StatementContext.system_state`; applies scan filter if present; emits rows with no identity |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
@@ -269,7 +269,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 - Server query orchestration acquires the write guard before execution.
 - Use `CatalogManager::create_index` to validate the table/columns/name and assign the `IndexId`.
-- Call `SchemaOperations::create_index` to build and backfill the secondary tree; on failure, roll back the catalog with `CatalogManager::drop_index` before returning the error (mirroring `CREATE TABLE`).
+- Call `SchemaOperations::create_index` to build and backfill the secondary tree; storage does not publish the new index generation until that build succeeds. On failure, roll back the catalog with `CatalogManager::drop_index` before returning the error (mirroring `CREATE TABLE`).
 - `SchemaOperations::create_index` appends the `CreateIndex` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "CREATE INDEX", count: 0 }`.
 
@@ -306,7 +306,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

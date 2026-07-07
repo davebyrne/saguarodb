@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::CatalogManager;
@@ -9,19 +10,20 @@ use common::{
     SequenceSchema, SqlState, StatementContext, TableId, TableSchema, ToastOptions, Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
-use storage::{RowIterator, SchemaOperations, StorageEngine};
+use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
 use crate::copy::{CopyParser, format_header, format_row};
 use crate::eval_expr;
 use crate::ops::SystemScanOp;
 use crate::ops::{
-    AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanOp, LimitOp, NestedLoopJoinOp,
-    ProjectionOp, SeqScanOp, SetOpOp, SortOp, ValuesOp,
+    AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanInput, IndexScanOp, LimitOp,
+    NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
     pub statement: StatementContext,
+    pub relations: Arc<dyn RelationSnapshot>,
     pub catalog: &'a dyn CatalogManager,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
@@ -217,6 +219,7 @@ pub(crate) fn build_executor<'a>(
                 .record_relation_read(ctx.statement.txn_id, *table);
             Ok(Box::new(SeqScanOp::new(
                 ctx.statement.clone(),
+                ctx.relations.clone(),
                 ctx.storage,
                 *table,
                 filter.clone(),
@@ -237,32 +240,37 @@ pub(crate) fn build_executor<'a>(
             table,
             index,
             range,
+            full_filter,
             filter,
             ..
         } => {
             // SSI: an exact-key lookup reads one tuple (recorded even when no row
             // matches, so a later insert of that key is caught as a phantom); a range
-            // scan reads the whole relation (`docs/specs/ssi.md` §5).
-            match range {
-                KeyRange::Exact(key) => {
-                    ctx.statement
-                        .ssi_tracker
-                        .record_tuple_read(ctx.statement.txn_id, *table, key)
-                }
-                KeyRange::Range { .. } | KeyRange::All => ctx
+            // scan reads the whole relation (`docs/specs/ssi.md` §5). Secondary
+            // index scans are conservatively relation reads because an old
+            // relation snapshot may fall back to a full scan if the current-catalog
+            // index is unavailable for that generation.
+            match (index, range) {
+                (idx, KeyRange::Exact(key)) if *idx == common::PRIMARY_KEY_INDEX_ID => ctx
+                    .statement
+                    .ssi_tracker
+                    .record_tuple_read(ctx.statement.txn_id, *table, key),
+                _ => ctx
                     .statement
                     .ssi_tracker
                     .record_relation_read(ctx.statement.txn_id, *table),
             }
-            Ok(Box::new(IndexScanOp::new(
-                ctx.statement.clone(),
-                ctx.storage,
-                *table,
-                *index,
-                range.clone(),
-                filter.clone(),
-                table_output_schema(ctx.catalog, *table)?,
-            )))
+            Ok(Box::new(IndexScanOp::new(IndexScanInput {
+                ctx: ctx.statement.clone(),
+                relations: ctx.relations.clone(),
+                storage: ctx.storage,
+                table: *table,
+                index: *index,
+                range: range.clone(),
+                full_filter: full_filter.clone(),
+                filter: filter.clone(),
+                output_schema: table_output_schema(ctx.catalog, *table)?,
+            })))
         }
         PhysicalPlan::NestedLoopJoin {
             left,
@@ -529,7 +537,10 @@ fn execute_insert(
             ctx.statement
                 .ssi_tracker
                 .record_tuple_read(ctx.statement.txn_id, table, &key);
-            if let Some(existing) = ctx.storage.get(&ctx.statement, table, &key)? {
+            if let Some(existing) =
+                ctx.storage
+                    .get(&ctx.statement, ctx.relations.as_ref(), table, &key)?
+            {
                 if let BoundOnConflict::DoUpdate {
                     assignments,
                     filter,
@@ -557,7 +568,8 @@ fn execute_insert(
         }
 
         let returning_values = returning.map(|_| row.values.clone());
-        ctx.storage.insert(&ctx.statement, table, row)?;
+        ctx.storage
+            .insert(&ctx.statement, ctx.relations.as_ref(), table, row)?;
         if let (Some(returning), Some(values)) = (returning, returning_values) {
             returned.push(eval_returning(ctx, returning, &values)?);
         }
@@ -623,10 +635,13 @@ fn apply_conflict_update(
     validate_row_constraints(schema, &new_values)?;
     validate_check_constraints(&ctx.statement, schema, check_exprs, &new_values)?;
     let updated = new_values.clone();
-    if ctx
-        .storage
-        .update(&ctx.statement, table, key, Row { values: new_values })?
-    {
+    if ctx.storage.update(
+        &ctx.statement,
+        ctx.relations.as_ref(),
+        table,
+        key,
+        Row { values: new_values },
+    )? {
         Ok(Some(updated))
     } else {
         Ok(None)
@@ -712,7 +727,8 @@ pub(crate) fn map_and_insert_row(
 ) -> Result<()> {
     let row = build_insert_row(&ctx.statement, schema, columns, values, default_exprs)?;
     validate_check_constraints(&ctx.statement, schema, check_exprs, &row.values)?;
-    ctx.storage.insert(&ctx.statement, table, row)?;
+    ctx.storage
+        .insert(&ctx.statement, ctx.relations.as_ref(), table, row)?;
     Ok(())
 }
 
@@ -877,7 +893,9 @@ impl CopyOut {
         ctx.statement
             .ssi_tracker
             .record_relation_read(ctx.statement.txn_id, table);
-        let iter = ctx.storage.scan(&ctx.statement, table)?;
+        let iter = ctx
+            .storage
+            .scan(&ctx.statement, ctx.relations.as_ref(), table)?;
         Ok(Self {
             iter,
             slots,
@@ -944,10 +962,13 @@ fn execute_update(
             validate_row_constraints(&schema, &values)?;
             validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
             let returning_values = returning.map(|_| values.clone());
-            if ctx
-                .storage
-                .update(&ctx.statement, table, &identity.key, Row { values })?
-            {
+            if ctx.storage.update(
+                &ctx.statement,
+                ctx.relations.as_ref(),
+                table,
+                &identity.key,
+                Row { values },
+            )? {
                 if let (Some(returning), Some(values)) = (returning, returning_values) {
                     returned.push(eval_returning(ctx, returning, &values)?);
                 }
@@ -977,7 +998,10 @@ fn execute_delete(
             let identity = source_row.identity.ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
             })?;
-            if ctx.storage.delete(&ctx.statement, table, &identity.key)? {
+            if ctx
+                .storage
+                .delete(&ctx.statement, ctx.relations.as_ref(), table, &identity.key)?
+            {
                 if let (Some(returning), Some(values)) = (returning, returning_values) {
                     returned.push(eval_returning(ctx, returning, &values)?);
                 }

@@ -66,8 +66,7 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         horizon: u64,
     ) -> Result<(Vec<RowLocation>, usize)> {
-        // A table's heap file id is its table id (no high bit; see `heap::index_file_id`).
-        let file_id = schema.id;
+        let file_id = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(file_id)?;
         let latch = self.structural_latch(file_id);
 
@@ -593,7 +592,7 @@ impl PageBackedStorageEngine {
         }
 
         // Primary-key index, under its own structural latch (released before the next).
-        let pk_file_id = index_file_id(schema.id);
+        let pk_file_id = primary_index_file_id(schema.storage_id);
         {
             let latch = self.structural_latch(pk_file_id);
             let _pk_guard = latch.lock();
@@ -603,11 +602,11 @@ impl PageBackedStorageEngine {
 
         // Every live secondary index, each under its own structural latch (one at a
         // time — rule 1: never two structural latches simultaneously).
-        for index in self.table_indexes(schema.id)? {
-            let secondary_file_id = secondary_index_file_id(index.id);
+        for index in self.current_table_indexes(schema.id)? {
+            let secondary_file_id = secondary_index_file_id(index.storage_id);
             let latch = self.structural_latch(secondary_file_id);
             let _index_guard = latch.lock();
-            self.secondary_btree(index.id)
+            self.secondary_btree(&index)
                 .remove_values_in(VACUUM_TXN, dead_tids)?;
         }
 
@@ -655,8 +654,7 @@ impl PageBackedStorageEngine {
             return Ok(());
         }
 
-        // A table's heap file id is its table id (no high bit; see `heap::index_file_id`).
-        let file_id = schema.id;
+        let file_id = heap_file_id(schema.storage_id);
         let latch = self.structural_latch(file_id);
 
         // Group the dead slots by heap page so each page is rewritten once. A TID
@@ -707,7 +705,7 @@ impl PageBackedStorageEngine {
             return Ok(Vec::new());
         }
 
-        let file_id = schema.id;
+        let file_id = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(file_id)?;
         let mut value_ids = BTreeSet::new();
         for page_num in 0..page_count {
@@ -749,7 +747,8 @@ impl PageBackedStorageEngine {
                 base.name
             ))
         })?;
-        let (toast_schema, _) = self.table_handle(toast_table_id)?;
+        let relations = self.capture_pagebacked_relation_snapshot()?;
+        let (toast_schema, _) = self.table_handle(&relations, toast_table_id)?;
         crate::toast::ensure_toast_relation(&toast_schema)?;
 
         let mut deleted = 0usize;
@@ -763,7 +762,13 @@ impl PageBackedStorageEngine {
                 )));
             }
             let prefix = Key(vec![Value::Integer(value_id as i64)]);
-            let mut iter = self.scan_range(ctx, toast_table_id, &KeyRange::Exact(prefix))?;
+            let mut iter = <Self as StorageEngine>::scan_range(
+                self,
+                ctx,
+                &relations,
+                toast_table_id,
+                &KeyRange::Exact(prefix),
+            )?;
             let mut keys = Vec::new();
             while let Some(stored) = iter.next()? {
                 let (row_value_id, seq, _data) = toast_chunk_parts(&stored.row)?;
@@ -782,7 +787,7 @@ impl PageBackedStorageEngine {
                 keys.push(key);
             }
             for key in keys {
-                if self.delete(ctx, toast_table_id, &key)? {
+                if <Self as StorageEngine>::delete(self, ctx, &relations, toast_table_id, &key)? {
                     deleted += 1;
                 }
             }
@@ -795,7 +800,8 @@ impl PageBackedStorageEngine {
         let Some(toast_table_id) = base.toast_table_id else {
             return Ok(0);
         };
-        let (toast_schema, _) = self.table_handle(toast_table_id)?;
+        let relations = self.capture_pagebacked_relation_snapshot()?;
+        let (toast_schema, _) = self.table_handle(&relations, toast_table_id)?;
         crate::toast::ensure_toast_relation(&toast_schema)?;
         self.vacuum_relation(&toast_schema, horizon)
     }

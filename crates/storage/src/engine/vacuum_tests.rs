@@ -12,8 +12,8 @@ use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
 use super::{PageBackedStorageEngine, RowLocation, VACUUM_TXN};
 use crate::HeapPageStore;
-use crate::heap::index_file_id;
-use crate::traits::{SchemaOperations, StorageEngine};
+use crate::heap::primary_index_file_id;
+use crate::traits::SchemaOperations;
 
 const TABLE_ID: u32 = 1;
 const NAME_INDEX_ID: u32 = 7;
@@ -195,6 +195,7 @@ fn ctx(txn_id: u64) -> StatementContext {
 fn users_schema() -> TableSchema {
     TableSchema {
         id: TABLE_ID,
+        storage_id: TABLE_ID,
         name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -240,6 +241,7 @@ fn key(id: i64) -> common::Key {
 fn name_index() -> IndexSchema {
     IndexSchema {
         id: NAME_INDEX_ID,
+        storage_id: 101,
         table: TABLE_ID,
         name: "users_name".to_string(),
         columns: vec![1],
@@ -250,7 +252,7 @@ fn name_index() -> IndexSchema {
 /// Every TID stored in the primary-key index, in `(key, tid)` order.
 fn pk_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
     engine
-        .btree(index_file_id(TABLE_ID))
+        .btree(primary_index_file_id(TABLE_ID))
         .range(&KeyRange::All)
         .unwrap()
         .into_iter()
@@ -261,7 +263,7 @@ fn pk_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
 /// Every TID stored in the `name` secondary index, in `(key, tid)` order.
 fn name_index_tids(engine: &PageBackedStorageEngine) -> Vec<RowLocation> {
     engine
-        .secondary_btree(NAME_INDEX_ID)
+        .secondary_btree(&name_index())
         .range(&KeyRange::All)
         .unwrap()
         .into_iter()
@@ -437,7 +439,7 @@ fn vacuumed_index_page_survives_recovery_replay() {
     let dead: HashSet<RowLocation> = reclaimed.iter().copied().collect();
     assert_eq!(dead, HashSet::from([gone]));
 
-    let pk_file_id = index_file_id(TABLE_ID);
+    let pk_file_id = primary_index_file_id(TABLE_ID);
     fixture
         .engine
         .vacuum_indexes(&users_schema(), &dead)
@@ -510,7 +512,7 @@ fn vacuum_indexes_is_b_link_safe_against_a_concurrent_scanner() {
     let (reclaimed, _freed) = fixture.engine.vacuum_heap(&users_schema(), 9000).unwrap();
     assert_eq!(reclaimed.iter().copied().collect::<HashSet<_>>(), dead);
 
-    let pk_file_id = index_file_id(TABLE_ID);
+    let pk_file_id = primary_index_file_id(TABLE_ID);
     let live = Arc::new(live);
     let dead = Arc::new(dead);
     let barrier = Arc::new(Barrier::new(2));
@@ -1060,7 +1062,7 @@ fn no_stale_index_resolution_after_reclaim_and_reuse() {
     // the reused slot resolves only to the NEW row, never a stale one.
     let mut live: Vec<Row> = fixture
         .engine
-        .btree(index_file_id(TABLE_ID))
+        .btree(primary_index_file_id(TABLE_ID))
         .range(&KeyRange::All)
         .unwrap()
         .into_iter()

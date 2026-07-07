@@ -5,7 +5,10 @@ use common::{DbError, IsolationLevel, Result, SqlState};
 use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext};
 use tokio::sync::mpsc;
 
-use super::{QueryService, QuerySessionContext, Transaction, WriteUnitGuard};
+use super::{
+    CapturedSnapshots, ExecutionContextInput, QueryService, QuerySessionContext, Transaction,
+    TransactionSnapshots, WriteUnitGuard,
+};
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 
 /// One inbound COPY-from-stdin event, sent by the connection loop to the blocking
@@ -49,18 +52,24 @@ impl QueryService {
     ) -> Result<u64> {
         let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
         let txn_id = self.register_active_txn();
-        let (snapshot, _advertised) = self.capture_snapshot(txn_id);
+        let CapturedSnapshots {
+            snapshot,
+            relations,
+            advertised: _advertised,
+        } = self.capture_consistent_snapshots(txn_id)?;
         let gc_horizon = self.components.gc_horizon();
         // Autocommit COPY FROM: a fresh txn with no savepoints, so the live-set is
         // just `[txn_id]`.
-        let ctx = self.execution_context(
+        let ctx = self.execution_context(ExecutionContextInput {
             txn_id,
             snapshot,
-            IsolationLevel::default(),
+            relations,
+            isolation: IsolationLevel::default(),
             gc_horizon,
-            Arc::from([txn_id]),
-            session.statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
-        );
+            live_txns: Arc::from([txn_id]),
+            runtime: session
+                .statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
+        })?;
 
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
         let count = match outcome {
@@ -108,27 +117,38 @@ impl QueryService {
             txn.failed = true;
             return (Some(txn), Err(err));
         }
-        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        let TransactionSnapshots {
+            snapshot,
+            relations,
+            advertised,
+        } = match self.snapshots_for_transaction(&mut txn) {
+            Ok(snapshots) => snapshots,
+            Err(err) => {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
+        };
         txn.first_statement_ran = true;
         let gc_horizon = self.components.gc_horizon();
-        let result = {
+        let result = (|| {
             // COPY FROM may run inside a transaction with open savepoints: stamp
             // inserts with the innermost subxid and thread the live (sub)xid set.
-            let ctx = self.execution_context(
-                txn.writing_xid(),
+            let ctx = self.execution_context(ExecutionContextInput {
+                txn_id: txn.writing_xid(),
                 snapshot,
-                txn.isolation,
+                relations,
+                isolation: txn.isolation,
                 gc_horizon,
-                txn.live_txns(),
-                session.statement_runtime(
+                live_txns: txn.live_txns(),
+                runtime: session.statement_runtime(
                     txn.current_default_isolation(IsolationLevel::default()),
                     txn.isolation,
                 ),
-            );
+            })?;
             let result = drive_copy_in(&ctx, job, rx);
             drop(ctx);
             result
-        };
+        })();
         drop(advertised);
         match result {
             // COPY FROM inserts produce no committed dead versions (dead_versions += 0).
@@ -163,15 +183,21 @@ impl QueryService {
         session: QuerySessionContext,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<u64> {
-        let (snapshot, _advertised) = self.capture_snapshot(0);
-        let ctx = self.execution_context(
-            0,
+        let CapturedSnapshots {
             snapshot,
-            IsolationLevel::default(),
-            0,
-            Arc::from([0]),
-            session.statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
-        );
+            relations,
+            advertised: _advertised,
+        } = self.capture_consistent_snapshots(0)?;
+        let ctx = self.execution_context(ExecutionContextInput {
+            txn_id: 0,
+            snapshot,
+            relations,
+            isolation: IsolationLevel::default(),
+            gc_horizon: 0,
+            live_txns: Arc::from([0]),
+            runtime: session
+                .statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
+        })?;
         drive_copy_out(&ctx, job, frame_tx)
     }
 
@@ -184,26 +210,37 @@ impl QueryService {
         session: QuerySessionContext,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
-        let (snapshot, advertised) = self.snapshot_for_transaction(&mut txn);
+        let TransactionSnapshots {
+            snapshot,
+            relations,
+            advertised,
+        } = match self.snapshots_for_transaction(&mut txn) {
+            Ok(snapshots) => snapshots,
+            Err(err) => {
+                txn.failed = true;
+                return (Some(txn), Err(err));
+            }
+        };
         txn.first_statement_ran = true;
-        let result = {
+        let result = (|| {
             // A read inside a savepoint transaction must see its own subxids' writes,
             // so thread the live (sub)xid set.
-            let ctx = self.execution_context(
-                txn.writing_xid(),
+            let ctx = self.execution_context(ExecutionContextInput {
+                txn_id: txn.writing_xid(),
                 snapshot,
-                txn.isolation,
-                0,
-                txn.live_txns(),
-                session.statement_runtime(
+                relations,
+                isolation: txn.isolation,
+                gc_horizon: 0,
+                live_txns: txn.live_txns(),
+                runtime: session.statement_runtime(
                     txn.current_default_isolation(IsolationLevel::default()),
                     txn.isolation,
                 ),
-            );
+            })?;
             let result = drive_copy_out(&ctx, job, frame_tx);
             drop(ctx);
             result
-        };
+        })();
         drop(advertised);
         match result {
             Ok(count) => (Some(txn), Ok(count)),

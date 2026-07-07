@@ -14,7 +14,9 @@ pub use engine::{PageBackedStorageEngine, StorageMode};
 pub use heap::HeapPageStore;
 pub use page::is_valid as page_is_valid;
 pub use redo::apply_physical_redo;
-pub use traits::{RecoveryOperations, RowIterator, SchemaOperations, StorageEngine};
+pub use traits::{
+    RecoveryOperations, RelationSnapshot, RowIterator, SchemaOperations, StorageEngine,
+};
 
 #[cfg(test)]
 mod tests {
@@ -25,10 +27,10 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexId,
-        IndexSchema, Key, KeyRange, Lsn, RelationKind, Result, Row, SequenceManager,
-        SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression, ToastMode,
-        ToastOptions, TxnId, TxnStatus, TxnStatusView, Value, toast_schema,
+        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
+        KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
+        StatementContext, TableSchema, ToastCompression, ToastMode, ToastOptions, TxnId, TxnStatus,
+        TxnStatusView, Value, toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -43,7 +45,7 @@ mod tests {
         },
         decode_row, encode_row,
         engine::RowLocation,
-        heap::{index_file_id, secondary_index_file_id},
+        heap::{heap_file_id, primary_index_file_id, secondary_index_file_id},
         toast::{TOAST_CHUNK_PAYLOAD, build_external_stream},
     };
 
@@ -504,7 +506,7 @@ mod tests {
         crate::btree::BTree::new(
             harness.buffer.as_ref(),
             harness.wal.as_ref(),
-            crate::heap::index_file_id(1),
+            crate::heap::primary_index_file_id(1),
             &registry,
         )
         .insert(setup_ctx.txn_id, &Key(vec![Value::Integer(1)]), &location)
@@ -555,6 +557,94 @@ mod tests {
             .filter_map(|record| record.ok())
             .any(|record| matches!(record.kind, wal::WalRecordKind::CreateIndex { .. }));
         assert!(logged, "create_index should log a CreateIndex WAL record");
+    }
+
+    #[test]
+    fn storage_routes_files_by_storage_id_not_logical_id() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut schema = users_schema();
+        schema.id = 2;
+        schema.storage_id = 42;
+        schema.name = "accounts".to_string();
+        let index = IndexSchema {
+            id: 7,
+            storage_id: 43,
+            table: schema.id,
+            name: "accounts_name".to_string(),
+            columns: vec![1],
+            unique: false,
+        };
+
+        harness.storage.create_table(&ctx, &schema).unwrap();
+        harness.storage.create_index(&ctx, &index, 0).unwrap();
+        harness
+            .storage
+            .insert(&ctx, schema.id, user_row(1, "Ada", true))
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, schema.id, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Ada", true))
+        );
+        assert_eq!(
+            harness
+                .storage
+                .index_scan(
+                    &ctx,
+                    schema.id,
+                    index.id,
+                    &KeyRange::Exact(Key(vec![Value::Text("Ada".to_string())])),
+                )
+                .unwrap()
+                .next()
+                .unwrap()
+                .map(|stored| stored.row),
+            Some(user_row(1, "Ada", true))
+        );
+
+        assert!(
+            harness
+                .buffer
+                .page_count(heap_file_id(schema.storage_id))
+                .unwrap()
+                > 0
+        );
+        assert!(
+            harness
+                .buffer
+                .page_count(primary_index_file_id(schema.storage_id))
+                .unwrap()
+                > 0
+        );
+        assert!(
+            harness
+                .buffer
+                .page_count(secondary_index_file_id(index.storage_id))
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            harness.buffer.page_count(heap_file_id(schema.id)).unwrap(),
+            0
+        );
+        assert_eq!(
+            harness
+                .buffer
+                .page_count(primary_index_file_id(schema.id))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            harness
+                .buffer
+                .page_count(secondary_index_file_id(index.id))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1325,6 +1415,7 @@ mod tests {
         base.toast_table_id = Some(2);
         let mut toast = users_schema();
         toast.id = 2;
+        toast.storage_id = 2;
         toast.name = "\0toast_1".to_string();
         toast.relation_kind = RelationKind::Toast { base_table: 1 };
         harness.storage.install_schemas(vec![base, toast]).unwrap();
@@ -1345,6 +1436,7 @@ mod tests {
         let base = users_schema();
         let mut toast_relation = users_schema();
         toast_relation.id = 2;
+        toast_relation.storage_id = 2;
         toast_relation.name = "\0toast_1".to_string();
         toast_relation.relation_kind = RelationKind::Toast { base_table: 1 };
         harness
@@ -1527,13 +1619,24 @@ mod tests {
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let raw = vec![b'x'; TOAST_CHUNK_PAYLOAD * 2 + 37];
         let stream =
             build_external_stream(compress::CODEC_NONE, None, crc32fast::hash(&raw), &raw).unwrap();
 
         let pointer = harness
             .storage
-            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_NONE, &stream)
+            .write_toast_stream(
+                &ctx,
+                &relations,
+                &base,
+                raw.len() as u32,
+                compress::CODEC_NONE,
+                &stream,
+            )
             .unwrap();
 
         assert_eq!(pointer.value_id, 1);
@@ -1553,6 +1656,10 @@ mod tests {
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let raw = b"external logical bytes";
         let stream = build_external_stream(
             compress::CODEC_ZSTD,
@@ -1563,12 +1670,19 @@ mod tests {
         .unwrap();
         let pointer = harness
             .storage
-            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_ZSTD, &stream)
+            .write_toast_stream(
+                &ctx,
+                &relations,
+                &base,
+                raw.len() as u32,
+                compress::CODEC_ZSTD,
+                &stream,
+            )
             .unwrap();
 
         let read = harness
             .storage
-            .read_toast_stream(&ctx, &base, &pointer)
+            .read_toast_stream(&ctx, &relations, &base, &pointer)
             .unwrap();
 
         assert_eq!(read, stream);
@@ -1589,6 +1703,10 @@ mod tests {
             .storage
             .insert(&ctx, 2, toast_chunk_row(1, 2, b"efgh"))
             .unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let pointer = crate::codec::ToastPointer {
             value_id: 1,
             raw_len: 4,
@@ -1598,7 +1716,7 @@ mod tests {
 
         let err = harness
             .storage
-            .read_toast_stream(&ctx, &base, &pointer)
+            .read_toast_stream(&ctx, &relations, &base, &pointer)
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::InternalError);
@@ -1619,7 +1737,7 @@ mod tests {
         let btree = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            index_file_id(2),
+            primary_index_file_id(2),
             harness.storage.compression.as_ref(),
         );
         btree
@@ -1633,6 +1751,10 @@ mod tests {
                 },
             )
             .unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let pointer = crate::codec::ToastPointer {
             value_id: 1,
             raw_len: 4,
@@ -1642,7 +1764,7 @@ mod tests {
 
         let err = harness
             .storage
-            .read_toast_stream(&ctx, &base, &pointer)
+            .read_toast_stream(&ctx, &relations, &base, &pointer)
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::InternalError);
@@ -1656,18 +1778,29 @@ mod tests {
         let (base, toast) = base_and_toast_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
         harness.storage.create_table(&ctx, &toast).unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let raw = b"raw";
         let stream =
             build_external_stream(compress::CODEC_NONE, None, crc32fast::hash(raw), raw).unwrap();
         let mut pointer = harness
             .storage
-            .write_toast_stream(&ctx, &base, raw.len() as u32, compress::CODEC_NONE, &stream)
+            .write_toast_stream(
+                &ctx,
+                &relations,
+                &base,
+                raw.len() as u32,
+                compress::CODEC_NONE,
+                &stream,
+            )
             .unwrap();
         pointer.stored_len += 1;
 
         let err = harness
             .storage
-            .read_toast_stream(&ctx, &base, &pointer)
+            .read_toast_stream(&ctx, &relations, &base, &pointer)
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::InternalError);
@@ -1680,11 +1813,15 @@ mod tests {
         let ctx = StatementContext::new(1);
         let base = users_schema();
         harness.storage.create_table(&ctx, &base).unwrap();
+        let relations = harness
+            .storage
+            .capture_pagebacked_relation_snapshot()
+            .unwrap();
         let stream = build_external_stream(compress::CODEC_NONE, None, 0, b"raw").unwrap();
 
         let err = harness
             .storage
-            .write_toast_stream(&ctx, &base, 3, compress::CODEC_NONE, &stream)
+            .write_toast_stream(&ctx, &relations, &base, 3, compress::CODEC_NONE, &stream)
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::InternalError);
@@ -1872,7 +2009,15 @@ mod tests {
         assert_eq!(pointer.raw_len, raw.len() as u32);
         let stream = harness
             .storage
-            .read_toast_stream(&ctx, &base, pointer)
+            .read_toast_stream(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                pointer,
+            )
             .unwrap();
         let (dict_id, raw_crc32, payload) =
             crate::toast::parse_external_stream(pointer.codec, &stream).unwrap();
@@ -1947,7 +2092,15 @@ mod tests {
         assert_eq!(pointer.codec, compress::CODEC_ZSTD_DICT);
         let stream = harness
             .storage
-            .read_toast_stream(&ctx, &base, pointer)
+            .read_toast_stream(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                pointer,
+            )
             .unwrap();
         let (dict_id, raw_crc32, payload) =
             crate::toast::parse_external_stream(pointer.codec, &stream).unwrap();
@@ -2123,7 +2276,16 @@ mod tests {
 
         let err = harness
             .storage
-            .prepare_row_for_storage(&ctx, &schema, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &schema,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::ProgramLimitExceeded);
@@ -2143,7 +2305,16 @@ mod tests {
 
         let err = harness
             .storage
-            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::ProgramLimitExceeded);
@@ -2163,7 +2334,16 @@ mod tests {
 
         let err = harness
             .storage
-            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::ProgramLimitExceeded);
@@ -2194,7 +2374,16 @@ mod tests {
 
         let err = harness
             .storage
-            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::ProgramLimitExceeded);
@@ -2226,17 +2415,27 @@ mod tests {
         };
         let row_bytes = harness
             .storage
-            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap();
         assert!(matches!(
             decode_physical_row(&base, &row_bytes).unwrap().values[1],
             DecodedPhysicalValue::Compressed { .. }
         ));
         let location = seed_parent_tuple(&harness, &ctx, &base, &row_bytes, &pk(1));
+        let name_index_schema = name_index(false);
         seed_secondary_entry(
             &harness,
             &ctx,
-            name_index(false).id,
+            &name_index_schema,
             &Key(vec![Value::Text(name.clone())]),
             &location,
         );
@@ -2273,7 +2472,16 @@ mod tests {
         };
         let row_bytes = harness
             .storage
-            .prepare_row_for_storage(&ctx, &base, &MvccHeader::fresh(ctx.txn_id, 0), &row)
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
             .unwrap();
         assert!(matches!(
             decode_physical_row(&base, &row_bytes).unwrap().values[1],
@@ -2686,7 +2894,7 @@ mod tests {
         let pk_tids = pk_index_tids_for_key(&harness, &base, &pk(1));
         assert_eq!(pk_tids.len(), 1, "HOT update should not add a PK entry");
         assert_eq!(
-            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            secondary_index_tids_for_text(&harness, &name_index(false), "Ada").len(),
             1,
             "HOT update should not add a secondary index entry"
         );
@@ -2822,7 +3030,7 @@ mod tests {
             "external TOAST owner should use the normal indexed update path"
         );
         assert_eq!(
-            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            secondary_index_tids_for_text(&harness, &name_index(false), "Ada").len(),
             2,
             "normal update keeps one secondary entry per version"
         );
@@ -2887,7 +3095,7 @@ mod tests {
             "would-be external successor should use the normal indexed update path"
         );
         assert_eq!(
-            secondary_index_tids_for_text(&harness, name_index(false).id, "Ada").len(),
+            secondary_index_tids_for_text(&harness, &name_index(false), "Ada").len(),
             2,
             "normal update keeps one secondary entry per version"
         );
@@ -3092,6 +3300,7 @@ mod tests {
     fn name_index(unique: bool) -> IndexSchema {
         IndexSchema {
             id: 1,
+            storage_id: 101,
             table: 1,
             name: "users_name".to_string(),
             columns: vec![1],
@@ -3146,7 +3355,7 @@ mod tests {
         let btree: BTree<'_, RowLocation> = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            index_file_id(schema.id),
+            primary_index_file_id(schema.storage_id),
             harness.storage.compression.as_ref(),
         );
         let mut value_ids = Vec::new();
@@ -3196,7 +3405,7 @@ mod tests {
         let btree: BTree<'_, RowLocation> = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            index_file_id(schema.id),
+            primary_index_file_id(schema.storage_id),
             harness.storage.compression.as_ref(),
         );
         btree.scan_key(key).unwrap()
@@ -3204,13 +3413,13 @@ mod tests {
 
     fn secondary_index_tids_for_text(
         harness: &StorageHarness,
-        index: IndexId,
+        index: &IndexSchema,
         value: &str,
     ) -> Vec<RowLocation> {
         let btree: BTree<'_, RowLocation> = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            secondary_index_file_id(index),
+            secondary_index_file_id(index.storage_id),
             harness.storage.compression.as_ref(),
         );
         btree
@@ -3437,6 +3646,7 @@ mod tests {
     fn users_schema() -> TableSchema {
         TableSchema {
             id: 1,
+            storage_id: 1,
             name: "users".to_string(),
             columns: vec![
                 ColumnDef {
@@ -3543,6 +3753,7 @@ mod tests {
     fn big_text_schema() -> TableSchema {
         TableSchema {
             id: 2,
+            storage_id: 2,
             name: "big_text".to_string(),
             columns: vec![
                 ColumnDef {
@@ -3603,6 +3814,7 @@ mod tests {
     fn bytea_base_and_toast_schema() -> (TableSchema, TableSchema) {
         let mut base = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "bytea_base".to_string(),
             columns: vec![
                 ColumnDef {
@@ -3667,6 +3879,7 @@ mod tests {
         }
         TableSchema {
             id: 1,
+            storage_id: 1,
             name: "wide_fixed".to_string(),
             columns,
             primary_key: vec![0],
@@ -3703,6 +3916,7 @@ mod tests {
         });
         let mut base = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "wide_bytea".to_string(),
             columns,
             primary_key: vec![0],
@@ -3750,6 +3964,7 @@ mod tests {
         });
         let mut base = TableSchema {
             id: 1,
+            storage_id: 1,
             name: "dict_external".to_string(),
             columns,
             primary_key: vec![0],
@@ -3807,7 +4022,16 @@ mod tests {
     ) -> Vec<DecodedPhysicalValue> {
         let bytes = harness
             .storage
-            .prepare_row_for_storage(ctx, schema, &MvccHeader::fresh(ctx.txn_id, 0), row)
+            .prepare_row_for_storage(
+                ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                schema,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                row,
+            )
             .unwrap();
         decode_physical_row(schema, &bytes).unwrap().values
     }
@@ -3820,7 +4044,7 @@ mod tests {
         key: &Key,
     ) -> RowLocation {
         let location = RowLocation {
-            file_id: schema.id,
+            file_id: heap_file_id(schema.storage_id),
             page_num: 0,
             slot_num: 0,
         };
@@ -3828,13 +4052,13 @@ mod tests {
             let mut guard = harness
                 .storage
                 .buffer_pool
-                .fetch_for_redo(schema.id, 0)
+                .fetch_for_redo(heap_file_id(schema.storage_id), 0)
                 .unwrap();
             apply_physical_redo(
                 guard.data_mut(),
                 10,
                 &WalRecordKind::HeapInit {
-                    file_id: schema.id,
+                    file_id: heap_file_id(schema.storage_id),
                     page_num: 0,
                 },
             )
@@ -3844,13 +4068,13 @@ mod tests {
             let mut guard = harness
                 .storage
                 .buffer_pool
-                .fetch_for_redo(schema.id, 0)
+                .fetch_for_redo(heap_file_id(schema.storage_id), 0)
                 .unwrap();
             apply_physical_redo(
                 guard.data_mut(),
                 11,
                 &WalRecordKind::HeapInsert {
-                    file_id: schema.id,
+                    file_id: heap_file_id(schema.storage_id),
                     page_num: 0,
                     slot: 0,
                     row_bytes: row_bytes.to_vec(),
@@ -3861,7 +4085,7 @@ mod tests {
         let btree = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            index_file_id(schema.id),
+            primary_index_file_id(schema.storage_id),
             harness.storage.compression.as_ref(),
         );
         btree.insert(ctx.txn_id, key, &location).unwrap();
@@ -3871,14 +4095,14 @@ mod tests {
     fn seed_secondary_entry(
         harness: &StorageHarness,
         ctx: &StatementContext,
-        index: IndexId,
+        index: &IndexSchema,
         key: &Key,
         location: &RowLocation,
     ) {
         let btree = BTree::new(
             harness.storage.buffer_pool.as_ref(),
             harness.storage.wal.as_ref(),
-            secondary_index_file_id(index),
+            secondary_index_file_id(index.storage_id),
             harness.storage.compression.as_ref(),
         );
         btree.insert(ctx.txn_id, key, location).unwrap();

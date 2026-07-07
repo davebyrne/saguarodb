@@ -341,9 +341,11 @@ impl QueryService {
         let hidden_schema = if schema.toast_table_id.is_none() && needs_toast_relation(schema) {
             let toast_table_id = components.catalog.snapshot()?.next_table_id;
             components.catalog.reserve_table_id(toast_table_id)?;
+            let toast_storage_id = components.catalog.allocate_storage_id()?;
             let mut base = schema.clone();
             base.toast_table_id = Some(toast_table_id);
-            let hidden = toast_schema(&base, toast_table_id);
+            let mut hidden = toast_schema(&base, toast_table_id);
+            hidden.storage_id = toast_storage_id;
             components.storage.create_table(&ctx, &hidden)?;
             Some(hidden)
         } else {

@@ -183,6 +183,7 @@ mod tests {
     fn base_schema() -> TableSchema {
         TableSchema {
             id: 1,
+            storage_id: 1,
             name: "base".to_string(),
             columns: vec![
                 ColumnDef {

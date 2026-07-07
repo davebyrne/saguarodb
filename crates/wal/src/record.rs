@@ -135,6 +135,13 @@ pub enum WalRecordKind {
         toast: ToastOptions,
         toast_table_id: Option<TableId>,
     },
+    /// DDL: swaps a table and its dependent physical storage generations.
+    TruncateTable {
+        table_id: TableId,
+        new_table_storage_id: FileId,
+        new_toast_storage_id: Option<(TableId, FileId)>,
+        new_index_storage_ids: Vec<(IndexId, FileId)>,
+    },
 }
 
 /// Whether `kind` is a replayable page-mutation record (anything recovery
