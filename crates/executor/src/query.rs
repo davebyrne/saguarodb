@@ -546,20 +546,21 @@ fn execute_insert(
                         check_exprs,
                     )?
                 {
-                    count += 1;
                     if let Some(returning) = returning {
                         returned.push(eval_returning(ctx, returning, &updated)?);
                     }
+                    count += 1;
                 }
                 // DO NOTHING (or a DO UPDATE skipped by its WHERE) inserts no row.
                 continue;
             }
         }
 
-        if let Some(returning) = returning {
-            returned.push(eval_returning(ctx, returning, &row.values)?);
-        }
+        let returning_values = returning.map(|_| row.values.clone());
         ctx.storage.insert(&ctx.statement, table, row)?;
+        if let (Some(returning), Some(values)) = (returning, returning_values) {
+            returned.push(eval_returning(ctx, returning, &values)?);
+        }
         count += 1;
     }
 
@@ -942,19 +943,15 @@ fn execute_update(
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
             validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
-            // Evaluate RETURNING over the NEW row before it is moved into storage;
-            // only keep it if the update actually affected a row.
-            let returned_row = returning
-                .map(|returning| eval_returning(ctx, returning, &values))
-                .transpose()?;
+            let returning_values = returning.map(|_| values.clone());
             if ctx
                 .storage
                 .update(&ctx.statement, table, &identity.key, Row { values })?
             {
-                count += 1;
-                if let Some(row) = returned_row {
-                    returned.push(row);
+                if let (Some(returning), Some(values)) = (returning, returning_values) {
+                    returned.push(eval_returning(ctx, returning, &values)?);
                 }
+                count += 1;
             }
         }
 
@@ -976,19 +973,15 @@ fn execute_delete(
         let mut returned = Vec::new();
         while let Some(source_row) = executor.next()? {
             check_canceled(ctx)?;
-            // RETURNING on DELETE projects the OLD (deleted) row; evaluate it
-            // before consuming the row's identity for the delete.
-            let returned_row = returning
-                .map(|returning| eval_returning(ctx, returning, &source_row.row.values))
-                .transpose()?;
+            let returning_values = returning.map(|_| source_row.row.values.clone());
             let identity = source_row.identity.ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
             })?;
             if ctx.storage.delete(&ctx.statement, table, &identity.key)? {
-                count += 1;
-                if let Some(row) = returned_row {
-                    returned.push(row);
+                if let (Some(returning), Some(values)) = (returning, returning_values) {
+                    returned.push(eval_returning(ctx, returning, &values)?);
                 }
+                count += 1;
             }
         }
 

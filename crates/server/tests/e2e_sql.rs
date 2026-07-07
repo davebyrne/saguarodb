@@ -93,6 +93,65 @@ async fn e2e_returning_for_insert_update_delete() {
 }
 
 #[tokio::test]
+async fn e2e_returning_sequence_functions_run_only_after_successful_dml() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create sequence returning_seq")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table t (id integer primary key, email text unique)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, email) values (1, 'a@x'), (2, 'b@x')")
+        .await
+        .unwrap();
+
+    let duplicate_pk = match server
+        .simple_query(
+            "insert into t (id, email) values (1, 'c@x') returning nextval('returning_seq')",
+        )
+        .await
+    {
+        Ok(_) => panic!("duplicate insert should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        duplicate_pk.message.contains("23505") || duplicate_pk.message.contains("duplicate"),
+        "{}",
+        duplicate_pk.message
+    );
+
+    let rows = server
+        .simple_query("select nextval('returning_seq') from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    let duplicate_unique = match server
+        .simple_query("update t set email = 'b@x' where id = 1 returning nextval('returning_seq')")
+        .await
+    {
+        Ok(_) => panic!("duplicate update should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        duplicate_unique.message.contains("23505") || duplicate_unique.message.contains("unique"),
+        "{}",
+        duplicate_unique.message
+    );
+
+    let rows = server
+        .simple_query("select nextval('returning_seq') from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[tokio::test]
 async fn e2e_on_conflict_do_nothing_skips_duplicates() {
     let server = TestServer::start().await.unwrap();
     server

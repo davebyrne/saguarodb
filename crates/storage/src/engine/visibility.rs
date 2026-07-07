@@ -15,6 +15,40 @@ fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> 
     }
 }
 
+fn validate_toast_sample_column(schema: &TableSchema, column: usize) -> Result<DataType> {
+    let column = schema.columns.get(column).ok_or_else(|| {
+        crate::toast::toast_corruption("TOAST physical value references a missing column")
+    })?;
+    match column.data_type {
+        DataType::Text | DataType::Bytea => Ok(column.data_type.clone()),
+        _ => Err(crate::toast::toast_corruption(
+            "TOAST physical value references a non-varlena column",
+        )),
+    }
+}
+
+fn copy_bounded_sample(raw: &[u8], remaining: usize) -> Option<Vec<u8>> {
+    if raw.is_empty() || remaining == 0 {
+        return None;
+    }
+    Some(raw[..raw.len().min(remaining)].to_vec())
+}
+
+fn raw_len_within_remaining(raw_len: u32, remaining: usize) -> Option<usize> {
+    let raw_len = raw_len as usize;
+    (raw_len > 0 && raw_len <= remaining).then_some(raw_len)
+}
+
+fn external_stream_header_len(codec: u8) -> Result<usize> {
+    match codec {
+        compress::CODEC_NONE | compress::CODEC_ZSTD => Ok(4),
+        compress::CODEC_ZSTD_DICT => Ok(8),
+        other => Err(crate::toast::toast_corruption(format!(
+            "unknown external TOAST stream codec {other}"
+        ))),
+    }
+}
+
 impl PageBackedStorageEngine {
     /// Read the *current physical* row at `location`, ignoring snapshot visibility
     /// and without materializing TOAST values. Returns `None` when the line pointer is
@@ -72,6 +106,86 @@ impl PageBackedStorageEngine {
             }
         }
         Ok(Row { values })
+    }
+
+    pub(super) fn sample_toast_physical_value(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        column: usize,
+        physical_value: &crate::codec::DecodedPhysicalValue,
+        remaining: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        match physical_value {
+            DecodedPhysicalValue::Null => Ok(None),
+            DecodedPhysicalValue::Value(Value::Text(text)) => {
+                Ok(copy_bounded_sample(text.as_bytes(), remaining))
+            }
+            DecodedPhysicalValue::Value(Value::Bytes(bytes)) => {
+                Ok(copy_bounded_sample(bytes, remaining))
+            }
+            DecodedPhysicalValue::Value(_) => Ok(None),
+            DecodedPhysicalValue::Compressed {
+                column: physical_column,
+                codec,
+                dict_id,
+                raw_len,
+                raw_crc32,
+                payload,
+            } => {
+                if *physical_column != column {
+                    return Err(crate::toast::toast_corruption(
+                        "TOAST physical value column does not match decoded slot",
+                    ));
+                }
+                let data_type = validate_toast_sample_column(schema, column)?;
+                let declared_raw_len = *raw_len;
+                let Some(sample_len) = raw_len_within_remaining(declared_raw_len, remaining) else {
+                    return Ok(None);
+                };
+                let raw = self.materialize_toast_payload(
+                    *codec,
+                    *dict_id,
+                    declared_raw_len,
+                    *raw_crc32,
+                    payload,
+                )?;
+                debug_assert_eq!(raw.len(), sample_len);
+                validate_toast_sample_raw(data_type, &raw)?;
+                Ok(Some(raw))
+            }
+            DecodedPhysicalValue::External {
+                column: physical_column,
+                pointer,
+            } => {
+                if *physical_column != column {
+                    return Err(crate::toast::toast_corruption(
+                        "TOAST physical value column does not match decoded slot",
+                    ));
+                }
+                let data_type = validate_toast_sample_column(schema, column)?;
+                let Some(sample_len) = raw_len_within_remaining(pointer.raw_len, remaining) else {
+                    return Ok(None);
+                };
+                let header_len = external_stream_header_len(pointer.codec)?;
+                if (pointer.stored_len as usize) > remaining.saturating_add(header_len) {
+                    return Ok(None);
+                }
+                let stream = self.read_toast_stream(ctx, schema, pointer)?;
+                let (dict_id, raw_crc32, payload) =
+                    crate::toast::parse_external_stream(pointer.codec, &stream)?;
+                let raw = self.materialize_toast_payload(
+                    pointer.codec,
+                    dict_id,
+                    pointer.raw_len,
+                    raw_crc32,
+                    payload,
+                )?;
+                debug_assert_eq!(raw.len(), sample_len);
+                validate_toast_sample_raw(data_type, &raw)?;
+                Ok(Some(raw))
+            }
+        }
     }
 
     fn materialize_toast_payload(
@@ -395,5 +509,15 @@ impl PageBackedStorageEngine {
             .collect();
         pages.sort_unstable();
         Ok(pages)
+    }
+}
+
+fn validate_toast_sample_raw(data_type: DataType, raw: &[u8]) -> Result<()> {
+    match data_type {
+        DataType::Text => std::str::from_utf8(raw)
+            .map(|_| ())
+            .map_err(|_| crate::toast::toast_corruption("TOAST text value is not valid UTF-8")),
+        DataType::Bytea => Ok(()),
+        _ => unreachable!("validate_toast_sample_column returns only TEXT or BYTEA"),
     }
 }

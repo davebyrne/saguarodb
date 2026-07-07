@@ -2001,6 +2001,87 @@ mod tests {
     }
 
     #[test]
+    fn sample_toast_values_skips_oversized_inline_compressed_before_decompress() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let sample_ctx = StatementContext::new(2);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row_bytes = encode_row_v3_prepared(
+            &base,
+            &MvccHeader::fresh(ctx.txn_id, 0),
+            &[
+                PreparedColumnValue::Value(Value::Integer(1)),
+                PreparedColumnValue::Varlena(VarlenaPhysical::Compressed {
+                    codec: compress::CODEC_ZSTD,
+                    dict_id: None,
+                    raw_len: 2048,
+                    raw_crc32: 0,
+                    payload: b"not-a-zstd-payload".to_vec(),
+                }),
+                PreparedColumnValue::Value(Value::Boolean(true)),
+                PreparedColumnValue::Null,
+            ],
+        )
+        .unwrap();
+        seed_parent_tuple(
+            &harness,
+            &ctx,
+            &base,
+            &row_bytes,
+            &Key(vec![Value::Integer(1)]),
+        );
+
+        let samples = harness
+            .storage
+            .sample_toast_values(&sample_ctx, &base, 16, 1024)
+            .unwrap();
+
+        assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn sample_toast_values_skips_oversized_external_before_reading_chunks() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let sample_ctx = StatementContext::new(2);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let row_bytes = encode_row_v3_prepared(
+            &base,
+            &MvccHeader::fresh(ctx.txn_id, 0),
+            &[
+                PreparedColumnValue::Value(Value::Integer(1)),
+                PreparedColumnValue::Varlena(VarlenaPhysical::External(ToastPointer {
+                    value_id: 1,
+                    raw_len: 2048,
+                    stored_len: 4,
+                    codec: compress::CODEC_NONE,
+                })),
+                PreparedColumnValue::Value(Value::Boolean(true)),
+                PreparedColumnValue::Null,
+            ],
+        )
+        .unwrap();
+        seed_parent_tuple(
+            &harness,
+            &ctx,
+            &base,
+            &row_bytes,
+            &Key(vec![Value::Integer(1)]),
+        );
+
+        let samples = harness
+            .storage
+            .sample_toast_values(&sample_ctx, &base, 16, 1024)
+            .unwrap();
+
+        assert!(samples.is_empty());
+    }
+
+    #[test]
     fn prepare_externalizes_largest_value_first() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);

@@ -1109,12 +1109,14 @@ into `write_page`'s encode step and `load_page`'s decode step.
   It walks heap pages directly instead of calling the public scan iterator so
   `max_samples`/`max_bytes` bound memory on large tables. Each tuple's MVCC header
   is decoded first and filtered through the normal visibility predicate using `ctx`;
-  only visible rows are then decoded as full physical rows and routed through the same
-  materialization path as user reads, so inline raw, inline compressed, and external
-  TOAST values all contribute their logical bytes. Invisible rows are skipped without
-  decoding varlena bodies or reading hidden chunks. Empty values and non-toastable
-  columns are skipped. The server calls this under the exclusive maintenance guard for
-  `ALTER TABLE ... SET (toast_compression = zstd_dict)`.
+  only visible rows are then decoded as full physical rows. Inline raw values may be
+  truncated to the remaining byte budget. Inline compressed and external TOAST values
+  contribute their full logical bytes only when their declared logical size fits the
+  remaining byte budget; oversized compressed/external values are skipped before
+  decompression or hidden-chunk reads. Invisible rows are skipped without decoding
+  varlena bodies or reading hidden chunks. Empty values and non-toastable columns are
+  skipped. The server calls this under the exclusive maintenance guard for `ALTER
+  TABLE ... SET (toast_compression = zstd_dict)`.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check

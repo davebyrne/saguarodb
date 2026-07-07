@@ -747,9 +747,10 @@ impl PageBackedStorageEngine {
     /// Unlike `scan_range`, this walks heap pages directly so the caller's
     /// `max_samples`/`max_bytes` budget limits memory use on large tables. Rows
     /// are filtered with the normal MVCC visibility predicate and then routed
-    /// through the same detoast materialization path used by user reads, so the
-    /// samples represent logical column bytes regardless of their current inline,
-    /// compressed, or external physical form.
+    /// through the same detoast materialization path used by user reads only when
+    /// a compressed/external value's declared logical size fits the remaining byte
+    /// budget; oversized values are skipped before reading hidden chunks or
+    /// decompressing payloads.
     pub fn sample_toast_values(
         &self,
         ctx: &StatementContext,
@@ -805,25 +806,24 @@ impl PageBackedStorageEngine {
                     continue;
                 }
                 let physical = decode_physical_row(schema, &bytes)?;
-                let row = self.materialize_physical_row(ctx, schema, physical)?;
                 for &column_index in &toastable_columns {
                     if samples.len() >= max_samples || sampled_bytes >= max_bytes {
                         break 'pages;
                     }
-                    let Some(raw) = row.values.get(column_index).and_then(|value| match value {
-                        Value::Text(text) => Some(text.as_bytes()),
-                        Value::Bytes(bytes) => Some(bytes.as_slice()),
-                        _ => None,
-                    }) else {
-                        continue;
-                    };
-                    if raw.is_empty() {
-                        continue;
-                    }
                     let remaining = max_bytes - sampled_bytes;
-                    let sample_len = raw.len().min(remaining);
-                    samples.push(raw[..sample_len].to_vec());
-                    sampled_bytes += sample_len;
+                    let physical_value = physical.values.get(column_index).ok_or_else(|| {
+                        DbError::internal("decoded row is missing a toastable column")
+                    })?;
+                    if let Some(sample) = self.sample_toast_physical_value(
+                        ctx,
+                        schema,
+                        column_index,
+                        physical_value,
+                        remaining,
+                    )? {
+                        sampled_bytes += sample.len();
+                        samples.push(sample);
+                    }
                 }
             }
         }
