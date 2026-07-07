@@ -317,6 +317,7 @@ fn users_schema(storage_id: FileId) -> TableSchema {
         compression: CompressionSetting::None,
         active_dict_id: None,
         toast,
+        checks: Vec::new(),
         toast_table_id: Some(TOAST_TABLE_ID),
         relation_kind: RelationKind::User,
     }
