@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    DbError, IsolationLevel, Result, SequenceManager, SessionInfo, SessionSequenceState, Snapshot,
-    SqlState, StatementContext, SystemStateProvider, no_system_state,
+    CatalogIntrospectionProvider, DbError, IsolationLevel, Result, SequenceManager, SessionInfo,
+    SessionSequenceState, Snapshot, SqlState, StatementContext, SystemStateProvider,
+    no_catalog_introspection, no_system_state,
 };
 use executor::{ExecutionContext, ExecutionResult};
 use parser::Statement;
@@ -22,6 +23,7 @@ pub(super) struct StatementRuntime<'a> {
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     system_state: Arc<dyn SystemStateProvider>,
+    catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
 }
 
 pub(crate) struct CapturedSnapshots {
@@ -57,12 +59,22 @@ impl<'a> StatementRuntime<'a> {
             session_sequences,
             session_info,
             system_state: no_system_state(),
+            catalog_introspection: no_catalog_introspection(),
         }
     }
 
     #[must_use]
     pub(super) fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
         self.system_state = system_state;
+        self
+    }
+
+    #[must_use]
+    pub(super) fn with_catalog_introspection(
+        mut self,
+        catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    ) -> Self {
+        self.catalog_introspection = catalog_introspection;
         self
     }
 }
@@ -780,6 +792,7 @@ impl QueryService {
                 .with_session_sequences(runtime.session_sequences)
                 .with_session_info(runtime.session_info)
                 .with_system_state(runtime.system_state)
+                .with_catalog_introspection(runtime.catalog_introspection)
                 // Install the lock manager (so an in-progress row-lock conflict blocks
                 // instead of failing fast) and the connection's cancel flag (so a
                 // blocked writer is interruptible) — `docs/specs/deadlock.md`.

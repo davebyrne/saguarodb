@@ -48,6 +48,7 @@ impl QueryService {
         snapshots: CopySnapshots,
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
+        let session = self.with_catalog_introspection(session);
         match (slot, snapshots) {
             (
                 None,
@@ -208,6 +209,7 @@ impl QueryService {
         snapshots: CopySnapshots,
         frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> (Option<Transaction>, Result<u64>) {
+        let session = self.with_catalog_introspection(session);
         match (slot, snapshots) {
             (
                 None,

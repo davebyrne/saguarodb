@@ -3,17 +3,23 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use catalog::{
+    CatalogManager, check_constraint_oid, index_oid, primary_key_constraint_oid,
+    resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
+};
 use common::{
-    CheckpointGuard, ColumnInfo, CopyDirection, DataType, DbError, GucSetting, IsolationLevel,
-    PgType, Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState,
+    CatalogIntrospectionProvider, CheckpointGuard, ColumnDefault, ColumnInfo, CopyDirection,
+    DataType, DbError, GucSetting, IndexConstraintKind, IsolationLevel, PgType, RelationKind,
+    Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState,
     SystemStateProvider, TableId, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
 use planner::{
     BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery,
-    BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues, bind_parameterized,
-    format_explain, logical_plan, mutates_sequences, physical_plan, substitute_params,
+    BoundQueryBody, BoundReturning, BoundSelect, BoundStatement, BoundValues,
+    bind_parameterized_with_pg_types, collect_param_pg_types, format_explain, logical_plan,
+    mutates_sequences, physical_plan, substitute_params,
 };
 use storage::RelationSnapshot;
 
@@ -55,6 +61,7 @@ pub struct QuerySessionContext {
     gucs: Arc<SessionGucs>,
     session_registry: Option<Arc<SessionRegistry>>,
     system_state_override: Option<Arc<dyn SystemStateProvider>>,
+    catalog_introspection_override: Option<Arc<dyn CatalogIntrospectionProvider>>,
 }
 
 impl QuerySessionContext {
@@ -71,6 +78,7 @@ impl QuerySessionContext {
             gucs,
             session_registry: None,
             system_state_override: None,
+            catalog_introspection_override: None,
         }
     }
 
@@ -83,6 +91,15 @@ impl QuerySessionContext {
     #[must_use]
     pub fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
         self.system_state_override = Some(system_state);
+        self
+    }
+
+    #[must_use]
+    pub fn with_catalog_introspection(
+        mut self,
+        catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    ) -> Self {
+        self.catalog_introspection_override = Some(catalog_introspection);
         self
     }
 
@@ -117,6 +134,11 @@ impl QuerySessionContext {
             self.session_info.clone(),
         )
         .with_system_state(system_state)
+        .with_catalog_introspection(
+            self.catalog_introspection_override
+                .clone()
+                .unwrap_or_else(common::no_catalog_introspection),
+        )
     }
 }
 
@@ -140,6 +162,315 @@ impl SystemStateProvider for QuerySystemState {
             .map(|registry| registry.sessions())
             .unwrap_or_default()
     }
+}
+
+struct QueryCatalogIntrospection {
+    catalog: Arc<dyn CatalogManager>,
+    session_info: Arc<SessionInfo>,
+}
+
+impl std::fmt::Debug for QueryCatalogIntrospection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryCatalogIntrospection")
+            .field("session_info", &self.session_info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QueryCatalogIntrospection {
+    fn user_relation_oid(&self, name: &str) -> Result<Option<i64>> {
+        if let Some(table) = self.user_table_by_name(name)? {
+            return Ok(Some(table_oid(table.id)));
+        }
+        if let Some(index) = self.catalog.get_index_by_name(name)?
+            && self
+                .catalog
+                .get_table(index.table)?
+                .is_some_and(|table| table.relation_kind == RelationKind::User)
+        {
+            return Ok(Some(index_oid(index.id)));
+        }
+        for table in self.catalog.list_tables()? {
+            if table.relation_kind == RelationKind::User
+                && !table.primary_key.is_empty()
+                && primary_key_index_name(&table) == name
+            {
+                return Ok(Some(synthetic_primary_key_oid(table.id)));
+            }
+        }
+        if let Some(sequence) = self.catalog.get_sequence_by_name(name)? {
+            return Ok(Some(sequence_oid(sequence.id)));
+        }
+        Ok(None)
+    }
+
+    fn user_table_by_name(&self, name: &str) -> Result<Option<common::TableSchema>> {
+        let Some((schema, relation)) = split_relation_name(name) else {
+            return Ok(None);
+        };
+        if !matches!(schema.as_deref(), None | Some("public")) {
+            return Ok(None);
+        }
+        let Some(table) = self.catalog.get_table_by_name(&relation)? else {
+            return Ok(None);
+        };
+        if table.relation_kind == RelationKind::User {
+            Ok(Some(table))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn system_relation_oid(&self, schema: Option<&str>, name: &str) -> Option<i64> {
+        resolve_system_view(schema, name).map(|view| view.relation_oid())
+    }
+
+    fn relation_oid_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let Some((schema, relation)) = split_relation_name(name) else {
+            return Ok(None);
+        };
+        match schema.as_deref() {
+            Some("public") => self.user_relation_oid(&relation),
+            Some("pg_catalog") | Some("information_schema") => {
+                Ok(self.system_relation_oid(schema.as_deref(), &relation))
+            }
+            Some(_) => Ok(None),
+            None => self.user_relation_oid(&relation)?.map_or_else(
+                || Ok(self.system_relation_oid(None, &relation)),
+                |oid| Ok(Some(oid)),
+            ),
+        }
+    }
+
+    fn user_relation_is_visible(&self, relation_oid: i64) -> Result<bool> {
+        for table in self.catalog.list_tables()? {
+            if table.relation_kind != RelationKind::User {
+                continue;
+            }
+            if table_oid(table.id) == relation_oid {
+                return Ok(true);
+            }
+            let mut has_primary_key_index = false;
+            for index in self.catalog.list_indexes_for_table(table.id)? {
+                has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
+                if index_oid(index.id) == relation_oid {
+                    return Ok(true);
+                }
+            }
+            if !has_primary_key_index
+                && !table.primary_key.is_empty()
+                && synthetic_primary_key_oid(table.id) == relation_oid
+            {
+                return Ok(true);
+            }
+        }
+        for sequence in self.catalog.list_sequences()? {
+            if sequence_oid(sequence.id) == relation_oid {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn system_relation_is_visible(&self, relation_oid: i64) -> Result<bool> {
+        let Some(view) = catalog::SystemView::ALL.iter().copied().find(|view| {
+            view.schema() == catalog::SystemSchema::PgCatalog && view.relation_oid() == relation_oid
+        }) else {
+            return Ok(false);
+        };
+        Ok(self.user_relation_oid(view.name())?.is_none())
+    }
+
+    fn serial_sequence_name(&self, table: &str, column: &str) -> Result<Option<String>> {
+        let Some(table) = self.user_table_by_name(table)? else {
+            return Ok(None);
+        };
+        let column = column.trim().to_ascii_lowercase();
+        let Some(sequence_id) = table
+            .columns
+            .iter()
+            .find(|definition| definition.name == column)
+            .and_then(|definition| match definition.default {
+                Some(ColumnDefault::Nextval(sequence_id)) => Some(sequence_id),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(sequence) = self.catalog.get_sequence(sequence_id)? else {
+            return Ok(None);
+        };
+        Ok(sequence.owned.then_some(sequence.name))
+    }
+
+    fn index_definition(
+        &self,
+        index_oid_value: i64,
+        column: Option<i64>,
+    ) -> Result<Option<String>> {
+        for table in self.catalog.list_tables()? {
+            if table.relation_kind != RelationKind::User {
+                continue;
+            }
+            let mut has_primary_key_index = false;
+            for index in self.catalog.list_indexes_for_table(table.id)? {
+                has_primary_key_index |= index.constraint == IndexConstraintKind::PrimaryKey;
+                if index_oid(index.id) == index_oid_value {
+                    return Ok(render_index_definition(
+                        &index.name,
+                        &table,
+                        &index.columns,
+                        index.unique,
+                        column,
+                    ));
+                }
+            }
+            if !has_primary_key_index
+                && !table.primary_key.is_empty()
+                && synthetic_primary_key_oid(table.id) == index_oid_value
+            {
+                return Ok(render_index_definition(
+                    &primary_key_index_name(&table),
+                    &table,
+                    &table.primary_key,
+                    true,
+                    column,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    fn constraint_definition(&self, constraint_oid: i64) -> Result<Option<String>> {
+        for table in self.catalog.list_tables()? {
+            if table.relation_kind != RelationKind::User {
+                continue;
+            }
+            if !table.primary_key.is_empty()
+                && primary_key_constraint_oid(table.id) == constraint_oid
+            {
+                return Ok(Some(format!(
+                    "PRIMARY KEY ({})",
+                    column_names(&table, &table.primary_key).join(", ")
+                )));
+            }
+            for (index, check) in table.checks.iter().enumerate() {
+                let check_index: u16 = index.try_into().unwrap_or(u16::MAX);
+                if check_constraint_oid(table.id, check_index) == constraint_oid {
+                    return Ok(Some(format!("CHECK ({check})")));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl CatalogIntrospectionProvider for QueryCatalogIntrospection {
+    fn pg_get_indexdef(
+        &self,
+        index_oid: i64,
+        column: Option<i64>,
+        _pretty: bool,
+    ) -> Result<Option<String>> {
+        self.index_definition(index_oid, column)
+    }
+
+    fn pg_get_constraintdef(&self, constraint_oid: i64, _pretty: bool) -> Result<Option<String>> {
+        self.constraint_definition(constraint_oid)
+    }
+
+    fn pg_get_userbyid(&self, role_oid: i64) -> Result<Option<String>> {
+        Ok((role_oid == 10).then(|| self.session_info.user.clone()))
+    }
+
+    fn pg_table_is_visible(&self, relation_oid: i64) -> Result<bool> {
+        if self.user_relation_is_visible(relation_oid)?
+            || self.system_relation_is_visible(relation_oid)?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn to_regclass(&self, name: &str) -> Result<Option<i64>> {
+        self.relation_oid_by_name(name)
+    }
+
+    fn pg_get_serial_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
+        self.serial_sequence_name(table, column)
+    }
+}
+
+fn primary_key_index_name(table: &common::TableSchema) -> String {
+    format!("{}_pkey", table.name)
+}
+
+fn render_index_definition(
+    index_name: &str,
+    table: &common::TableSchema,
+    columns: &[u16],
+    unique: bool,
+    column: Option<i64>,
+) -> Option<String> {
+    let names = column_names(table, columns);
+    if let Some(column) = column {
+        return match column {
+            0 => Some(render_full_index_definition(
+                index_name, table, &names, unique,
+            )),
+            1.. => names.get((column - 1) as usize).cloned(),
+            _ => None,
+        };
+    }
+    Some(render_full_index_definition(
+        index_name, table, &names, unique,
+    ))
+}
+
+fn render_full_index_definition(
+    index_name: &str,
+    table: &common::TableSchema,
+    names: &[String],
+    unique: bool,
+) -> String {
+    let unique = if unique { "UNIQUE " } else { "" };
+    format!(
+        "CREATE {unique}INDEX {index_name} ON public.{} USING btree ({})",
+        table.name,
+        names.join(", ")
+    )
+}
+
+fn column_names(table: &common::TableSchema, columns: &[u16]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|column| {
+            table
+                .columns
+                .iter()
+                .find(|candidate| candidate.id == *column)
+                .map(|definition| definition.name.clone())
+        })
+        .collect()
+}
+
+fn split_relation_name(name: &str) -> Option<(Option<String>, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split('.');
+    let first = parts.next()?;
+    let Some(second) = parts.next() else {
+        return (!first.is_empty()).then_some((None, first.to_ascii_lowercase()));
+    };
+    if parts.next().is_some() || first.is_empty() || second.is_empty() {
+        return None;
+    }
+    Some((
+        Some(first.to_ascii_lowercase()),
+        second.to_ascii_lowercase(),
+    ))
 }
 
 /// The concurrency guard an autocommit write/DDL unit holds for its lifetime. DML
@@ -328,6 +659,24 @@ impl QueryService {
         }
     }
 
+    fn catalog_introspection_provider(
+        &self,
+        session_info: Arc<SessionInfo>,
+    ) -> Arc<dyn CatalogIntrospectionProvider> {
+        Arc::new(QueryCatalogIntrospection {
+            catalog: self.components.catalog.clone(),
+            session_info,
+        })
+    }
+
+    fn with_catalog_introspection(&self, session: QuerySessionContext) -> QuerySessionContext {
+        if session.catalog_introspection_override.is_some() {
+            return session;
+        }
+        let session_info = session.session_info.clone();
+        session.with_catalog_introspection(self.catalog_introspection_provider(session_info))
+    }
+
     /// Execute a simple-protocol SQL string against the session's transaction
     /// `slot`, returning the (possibly mutated) slot alongside the result. The
     /// slot carries the open explicit transaction across statements; autocommit
@@ -388,6 +737,7 @@ impl QueryService {
             Arc::new(SessionInfo::default()),
             gucs,
         );
+        let session = self.with_catalog_introspection(session);
         let (slot, default_isolation, result) =
             self.dispatch(parsed, slot, default_isolation, &session, None);
         let result = result.and_then(StreamOutcome::into_direct_result);
@@ -416,6 +766,7 @@ impl QueryService {
         session: QuerySessionContext,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+        let session = self.with_catalog_introspection(session);
         let parsed = match parser::parse(sql) {
             Err(err) => return (mark_failed_on_error(slot), default_isolation, Err(err)),
             Ok(parsed) => parsed,
@@ -520,31 +871,16 @@ impl QueryService {
                 result_columns,
             });
         }
-        // The binder resolves parameter types as `DataType` (declared or inferred).
-        let declared_data_types: Vec<Option<DataType>> = declared_param_types
-            .iter()
-            .map(|pg_type| pg_type.as_ref().map(PgType::data_type))
-            .collect();
         let _schema_guard = self.components.concurrency.begin_shared()?;
-        let (bound, param_types) = bind_parameterized(
+        let (bound, param_types) = bind_parameterized_with_pg_types(
             &statement,
             self.components.catalog.as_ref(),
-            &declared_data_types,
+            declared_param_types,
         )?;
         // Remember each parameter's wire type so `ParameterDescription` echoes the
-        // OID the client declared; an inferred parameter falls back to the collapsed
-        // default from its resolved `DataType`.
-        let param_pg_types = param_types
-            .iter()
-            .enumerate()
-            .map(|(index, data_type)| {
-                declared_param_types
-                    .get(index)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_else(|| PgType::from(data_type))
-            })
-            .collect();
+        // OID the client declared, or the more specific wire type inferred from
+        // catalog function arguments.
+        let param_pg_types = collect_param_pg_types(&bound, &param_types, declared_param_types)?;
         let schema_versions = prepared_schema_versions(&bound, self.components.catalog.as_ref())?;
         let result_columns = result_columns(&bound);
         Ok(PreparedStatement {
@@ -594,6 +930,7 @@ impl QueryService {
             Arc::new(SessionInfo::default()),
             Arc::new(SessionGucs::default()),
         );
+        let session = self.with_catalog_introspection(session);
         self.execute_prepared_cancelable_with_session_context(
             prepared,
             params,
@@ -613,6 +950,7 @@ impl QueryService {
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
+        let session = self.with_catalog_introspection(session.clone());
         // Maintenance does not bind/plan; run it before parameter substitution. The
         // connection routes maintenance through the in-session variant, so this
         // arm is reached only if a caller bypasses that routing — keep it total.
@@ -700,6 +1038,7 @@ impl QueryService {
         default_isolation: IsolationLevel,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> Result<StreamOutcome> {
+        let session = self.with_catalog_introspection(session);
         let mut sink = ChannelRowSink::new(row_tx);
         self.execute_prepared_cancelable_with_session_context(
             prepared,
@@ -734,6 +1073,7 @@ impl QueryService {
         // `Some` streams a SELECT's rows into the sink; `None` materializes.
         sink: Option<&mut dyn RowSink>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
+        let session = self.with_catalog_introspection(session.clone());
         if let StatementClass::TransactionControl(kind) = prepared.class {
             let (slot, default_isolation, result) =
                 self.handle_transaction_control(kind, slot, default_isolation, session.cancel());
@@ -1781,19 +2121,23 @@ mod tests {
     use std::time::Duration;
 
     use buffer::{BufferPool, MemoryBufferPool, PageStore};
-    use catalog::{CatalogManager, CatalogSnapshot, MemoryCatalog};
+    use catalog::{
+        CatalogManager, CatalogSnapshot, MemoryCatalog, check_constraint_oid, index_oid,
+        primary_key_constraint_oid, table_oid,
+    };
     use common::{
-        ConcurrencyController, DbError, FlushPolicy, IndexId, IndexSchema, IsolationLevel, Lsn,
-        PageFlushInfo, ParsedColumnDef, PgType, RelationKind, Result, RwLockConcurrencyController,
-        SequenceId, SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState,
-        TableId, TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
+        CatalogIntrospectionProvider, ConcurrencyController, DbError, FlushPolicy, IndexId,
+        IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, PgType, RelationKind,
+        Result, RwLockConcurrencyController, SequenceId, SequenceOptions, SequenceSchema,
+        SessionInfo, SessionSequenceState, SqlState, TableId, TableSchema, ToastCompression,
+        ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
     use storage::{HeapPageStore, PageBackedStorageEngine, StorageEngine, StorageMode};
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
-    use super::{SessionTxnStatus, slot_status};
+    use super::{CopyInChunk, SessionTxnStatus, slot_status};
     use crate::app::{AppState, ServerComponents};
     use crate::checkpoint::CheckpointState;
     use crate::config::Config;
@@ -3553,6 +3897,250 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_introspection_provider_is_wired_into_statement_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal: Arc<dyn WalManager> =
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap());
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            wal,
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create index users_id_lookup on users (id)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table constrained (\
+                 id integer primary key, \
+                 check (id > 0))",
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("create table pg_class (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create table serial_probe (id serial primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table toast_probe (id integer primary key, body text) \
+                 with (toast = aggressive)",
+            )
+            .unwrap();
+        let users = app
+            .components
+            .catalog
+            .get_table_by_name("users")
+            .unwrap()
+            .unwrap();
+        let users_pkey = app
+            .components
+            .catalog
+            .get_index_by_name("users_pkey")
+            .unwrap()
+            .unwrap();
+        let users_pkey_oid = index_oid(users_pkey.id);
+        let users_pkey_constraint_oid = primary_key_constraint_oid(users.id);
+        let users_id_lookup = app
+            .components
+            .catalog
+            .get_index_by_name("users_id_lookup")
+            .unwrap()
+            .unwrap();
+        let constrained = app
+            .components
+            .catalog
+            .get_table_by_name("constrained")
+            .unwrap()
+            .unwrap();
+        let constrained_check_oid = check_constraint_oid(constrained.id, 0);
+        let shadow_pg_class = app
+            .components
+            .catalog
+            .get_table_by_name("pg_class")
+            .unwrap()
+            .unwrap();
+        let toast_probe = app
+            .components
+            .catalog
+            .get_table_by_name("toast_probe")
+            .unwrap()
+            .unwrap();
+        let toast_oid = table_oid(toast_probe.toast_table_id.unwrap());
+        let rows = result_values(app.query_service.execute_sql(&format!(
+            "select \
+             to_regclass('users'), \
+             to_regclass('users_pkey'), \
+             to_regclass('pg_catalog.pg_class'), \
+             to_regclass('pg_class'), \
+             pg_table_is_visible(to_regclass('users')), \
+             pg_table_is_visible(to_regclass('users_pkey')), \
+             pg_table_is_visible({users_pkey_oid}), \
+             pg_table_is_visible(to_regclass('pg_catalog.pg_class')), \
+             pg_table_is_visible(to_regclass('information_schema.tables')), \
+             pg_table_is_visible({toast_oid}), \
+             pg_get_userbyid(10), \
+             pg_get_serial_sequence('serial_probe', 'id'), \
+             pg_get_serial_sequence('users', 'id'), \
+             pg_get_indexdef({users_pkey_oid}), \
+             pg_get_indexdef({}, 1, true), \
+             pg_get_indexdef({}, 99, true), \
+             pg_get_indexdef({}, -1, true), \
+             pg_get_constraintdef({users_pkey_constraint_oid}), \
+             pg_get_constraintdef({constrained_check_oid}), \
+             to_regtype('pg_catalog.int4'), \
+             to_regclass('missing')",
+            index_oid(users_id_lookup.id),
+            index_oid(users_id_lookup.id),
+            index_oid(users_id_lookup.id)
+        )));
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::Integer(table_oid(users.id)),
+                Value::Integer(users_pkey_oid),
+                Value::Integer(catalog::SystemView::PgClass.relation_oid()),
+                Value::Integer(table_oid(shadow_pg_class.id)),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Text("saguarodb".to_string()),
+                Value::Text("serial_probe_id_seq".to_string()),
+                Value::Null,
+                Value::Text(
+                    "CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)".to_string(),
+                ),
+                Value::Text("id".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::Text("PRIMARY KEY (id)".to_string()),
+                Value::Text("CHECK (id > 0)".to_string()),
+                Value::Integer(23),
+                Value::Null,
+            ]]
+        );
+    }
+
+    #[derive(Debug)]
+    struct OverrideIntrospection;
+
+    impl CatalogIntrospectionProvider for OverrideIntrospection {
+        fn to_regclass(&self, name: &str) -> Result<Option<i64>> {
+            Ok((name == "override_target").then_some(123))
+        }
+    }
+
+    #[test]
+    fn explicit_catalog_introspection_provider_override_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("select to_regclass('override_target')", &[])
+            .unwrap();
+        let session = super::QuerySessionContext::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+            Arc::new(super::SessionGucs::default()),
+        )
+        .with_catalog_introspection(Arc::new(OverrideIntrospection));
+        let result = app
+            .query_service
+            .execute_prepared_cancelable_with_session_context(
+                &prepared,
+                &[],
+                &session,
+                IsolationLevel::default(),
+                None,
+            )
+            .and_then(super::StreamOutcome::into_direct_result);
+
+        assert_eq!(result_values(result), vec![vec![Value::Integer(123)]]);
+    }
+
+    #[test]
+    fn copy_in_installs_catalog_introspection_for_expression_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table referenced (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create table copy_probe (\
+                 id integer primary key, \
+                 target_oid bigint not null default to_regclass('referenced'))",
+            )
+            .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (row_tx, _row_rx) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_CAPACITY);
+        let (slot, _, result) = app.query_service.execute_simple_streamed(
+            "copy copy_probe (id) from stdin",
+            None,
+            IsolationLevel::default(),
+            super::QuerySessionContext::new(
+                cancel.clone(),
+                Arc::new(SessionSequenceState::new()),
+                Arc::new(SessionInfo::default()),
+                Arc::new(super::SessionGucs::default()),
+            ),
+            row_tx,
+        );
+        assert!(slot.is_none());
+        let (job, snapshots) = match result.unwrap() {
+            super::StreamOutcome::BeginCopyIn { job, snapshots } => (job, snapshots),
+            other => panic!("expected COPY FROM request, got {other:?}"),
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.blocking_send(CopyInChunk::Chunk(b"1\n".to_vec()))
+            .unwrap();
+        tx.blocking_send(CopyInChunk::Done).unwrap();
+        drop(tx);
+        let session = super::QuerySessionContext::new(
+            cancel,
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+            Arc::new(super::SessionGucs::default()),
+        );
+        let (slot, result) = app
+            .query_service
+            .run_copy_in_stream(job, slot, session, snapshots, rx);
+        assert!(slot.is_none());
+        assert_eq!(result.unwrap(), 1);
+
+        let referenced = app
+            .components
+            .catalog
+            .get_table_by_name("referenced")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select target_oid from copy_probe where id = 1")
+            ),
+            vec![vec![Value::Integer(table_oid(referenced.id))]]
+        );
+    }
+
     #[tokio::test]
     async fn sequence_functions_use_session_state_and_write_routing() {
         let dir = tempfile::tempdir().unwrap();
@@ -4372,6 +4960,12 @@ mod tests {
             .execute_sql("create index i on users (ghost)")
             .unwrap_err();
         assert_eq!(missing_column.code, SqlState::UndefinedColumn);
+
+        let synthetic_primary_key_name = app
+            .query_service
+            .execute_sql("create index users_pkey on users (name)")
+            .unwrap_err();
+        assert_eq!(synthetic_primary_key_name.code, SqlState::DuplicateTable);
 
         app.query_service
             .execute_sql("create index dup on users (name)")

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::{
-    ColumnInfo, DbError, IsolationLevel, Result, Row, SessionInfo, SessionSequenceState,
+    ColumnInfo, DbError, IsolationLevel, PgType, Result, Row, SessionInfo, SessionSequenceState,
     SessionState, SqlState, Value,
 };
 use protocol::{
@@ -568,6 +568,33 @@ fn resolve_format(formats: &[i16], index: usize) -> i16 {
     }
 }
 
+fn resolve_result_formats(formats: &[i16], columns: &[ColumnInfo]) -> Vec<i16> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let wire_type = column.wire_type();
+            resolve_result_format_for_type(formats, index, &wire_type)
+        })
+        .collect()
+}
+
+fn resolve_result_format_for_type(formats: &[i16], index: usize, wire_type: &PgType) -> i16 {
+    let requested = resolve_format(formats, index);
+    if requested == 1 && binary_result_output_uses_text(wire_type) {
+        0
+    } else {
+        requested
+    }
+}
+
+fn binary_result_output_uses_text(wire_type: &PgType) -> bool {
+    matches!(
+        wire_type,
+        PgType::OidVector | PgType::Int2Vector | PgType::OidArray | PgType::Int2Array
+    )
+}
+
 fn protocol_error(message: impl Into<String>) -> DbError {
     DbError::protocol(SqlState::SyntaxError, message)
 }
@@ -622,14 +649,13 @@ fn encode_row(row: &Row, columns: &[ColumnInfo], formats: &[i16]) -> Result<Vec<
     row.values
         .iter()
         .enumerate()
-        .map(|(index, value)| {
-            let format = resolve_format(formats, index);
-            match columns.get(index) {
-                Some(column) => {
-                    protocol::encode_value_with_type(value, &column.wire_type(), format)
-                }
-                None => protocol::encode_value(value, format),
+        .map(|(index, value)| match columns.get(index) {
+            Some(column) => {
+                let wire_type = column.wire_type();
+                let format = resolve_result_format_for_type(formats, index, &wire_type);
+                protocol::encode_value_with_type(value, &wire_type, format)
             }
+            None => protocol::encode_value(value, resolve_format(formats, index)),
         })
         .collect()
 }

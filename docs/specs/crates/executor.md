@@ -130,9 +130,25 @@ files.
 
 `SystemScanOp` evaluates `PhysicalPlan::SystemScan` for the read-only virtual
 system catalog surface. `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
-`pg_index`, `information_schema.schemata`, `information_schema.tables`, and
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_depend`,
+`information_schema.schemata`, `information_schema.tables`, and
 `information_schema.columns` are computed from `CatalogManager` metadata and the
-static registry owned by the catalog crate. `pg_settings` combines
+static registry owned by the catalog crate. Hidden TOAST relations are
+storage-private and are omitted from PostgreSQL-facing relation rows (`pg_class`,
+`pg_attribute`, `pg_index`, `pg_constraint`, `pg_attrdef`, and `pg_depend`).
+User table rows report `reltoastrelid = 0` rather than exposing an OID for an
+omitted hidden relation.
+`pg_attribute` includes common
+PostgreSQL 16 metadata columns used by table-description probes, with harmless
+constants for unsupported features (no inheritance, missing values, ACLs, or
+per-column options). `pg_proc` exposes compatibility rows from
+`common::pg_proc_catalog_entries()` for SaguaroDB built-in/probe functions;
+`concat` sets `provariadic` for its variadic text signature.
+`pg_type` exposes rows for the scalar and catalog presentation types SaguaroDB
+reports; `typelem` is populated for `int2vector`, `oidvector`, `_int2`, and
+`_oid`, and `typarray` is nonzero only for array rows that are also present in
+the exposed `pg_type` set.
+`pg_database` and `pg_roles` expose the current session database/user. `pg_settings` combines
 `StatementContext.system_state.settings()` with synthesized transaction isolation
 rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`; the
 server wires this to its live `SessionRegistry`, while the no-op provider used by
@@ -140,8 +156,12 @@ library tests is empty.
 
 Rows are rebuilt for each execution, sorted deterministically, and filtered with
 the bound scan predicate using the same `predicate_matches` semantics as storage
-scans. System scans never record SSI reads and never carry `RowIdentity`, so they
-cannot be a DML source.
+scans. OID columns report PostgreSQL `oid` wire metadata; vector/array catalog
+fields keep text values but report PostgreSQL-compatible wire identities where
+there is no first-class SaguaroDB array/vector value. Extended-query result
+format selection keeps those vector/array fields in text even when a client asks
+for binary results. System scans never record
+SSI reads and never carry `RowIdentity`, so they cannot be a DML source.
 
 ## Expression Evaluation
 
@@ -162,7 +182,8 @@ The evaluator handles:
 - `CASE`.
 - `CAST`.
 - Sequence expressions: `nextval(sequence_id)` calls `StatementContext.sequence_manager.nextval`, records the returned value in the session sequence state, and returns it as `Value::Integer`; `currval(sequence_id)` first checks that the sequence still exists (`SqlState::UndefinedTable` if it was dropped), then reads the session sequence state and returns `SqlState::ObjectNotInPrerequisiteState` if the sequence has not been used on this connection; `setval(sequence_id, value[, is_called])` evaluates its arguments, returns `NULL` with no side effect when any argument is `NULL`, otherwise calls `SequenceManager::setval`, records the returned value in session state only when `is_called` is true, and returns it.
-- Scalar functions are dispatched through the scalar function registry in `common` (`docs/specs/crates/common.md`): scalar evaluation resolves the function by name via `common::lookup_scalar_function`, applies the entry's NULL policy, and calls its evaluator. The registered functions are `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), and `SUBSTRING(text, start[, length])`, the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, and `MOD`, and the string functions `REPLACE`, `POSITION`, `LEFT`, and `RIGHT`. These are NULL-propagating (any NULL argument yields NULL). `CONCAT` is the exception: it ignores NULL arguments and returns the empty string (never NULL) when every argument is NULL. `CURRENT_TIMESTAMP` and `now()` read `StatementContext.statement_timestamp_micros`, return `Value::TimestampTz`, and are stable within one statement. PostgreSQL-compatible system information functions read statement/session state: `VERSION()` returns `PostgreSQL 16.0 (SaguaroDB <crate-version>)`; `CURRENT_DATABASE()` and `CURRENT_CATALOG` return the startup database; `CURRENT_SCHEMA` returns `public`; `CURRENT_USER`, `SESSION_USER`, and `USER` return the startup user; `PG_BACKEND_PID()` returns the connection's `BackendKeyData` process id as `Value::Integer`; and `CURRENT_SETTING(text)` reads `StatementContext.system_state.setting(name)`, returns `Value::Text`, and returns `SqlState::UndefinedObject` (`42704`) when the parameter is unknown. `REPLACE` leaves the string unchanged for an empty `from` (unlike Rust's `str::replace`); `POSITION` is the 1-based character index (0 if absent, 1 for an empty substring); `LEFT`/`RIGHT` count characters and treat a negative count as removing characters from the far end (PostgreSQL semantics). `EXTRACT(field FROM source)` returns the `year`/`month`/`day`/`hour`/`minute`/`second` of a `DATE` or `TIMESTAMP` as `DOUBLE PRECISION` (a DATE has zero-valued time components; `second` includes the fractional part). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`. `FLOOR`/`CEIL`/`ROUND` leave an integer unchanged and round a double (`ROUND` is round-half-to-even, matching PostgreSQL's `round(double precision)`); `ABS` of `i64::MIN` returns `SqlState::NumericValueOutOfRange`; `SQRT` of a negative number and a non-finite `POWER` result return `NumericValueOutOfRange`; `MOD` by zero returns `SqlState::DivisionByZero`.
+- Scalar functions are dispatched through the scalar function registry in `common` (`docs/specs/crates/common.md`): scalar evaluation resolves the function by name via `common::lookup_scalar_function`, applies the entry's NULL policy, and calls its evaluator. The registered functions are `UPPER`, `LOWER`, `LENGTH`, `TRIM` (text), and `SUBSTRING(text, start[, length])`, the math functions `ABS`, `FLOOR`, `CEIL`/`CEILING`, `ROUND`, `SQRT`, `POWER`/`POW`, and `MOD`, and the string functions `REPLACE`, `POSITION`, `LEFT`, and `RIGHT`. These are NULL-propagating (any NULL argument yields NULL). `CONCAT` is the exception: it ignores NULL arguments and returns the empty string (never NULL) when every argument is NULL. `CURRENT_TIMESTAMP` and `now()` read `StatementContext.statement_timestamp_micros`, return `Value::TimestampTz`, and are stable within one statement. PostgreSQL-compatible system information functions read statement/session state: `VERSION()` returns `PostgreSQL 16.0 (SaguaroDB <crate-version>)`; `CURRENT_DATABASE()` and `CURRENT_CATALOG` return the startup database; `CURRENT_SCHEMA` returns `public`; `CURRENT_USER`, `SESSION_USER`, and `USER` return the startup user; `PG_BACKEND_PID()` returns the connection's `BackendKeyData` process id as `Value::Integer`; and `CURRENT_SETTING(text)` reads `StatementContext.system_state.setting(name)`, returns `Value::Text`, and returns `SqlState::UndefinedObject` (`42704`) when the parameter is unknown. PostgreSQL catalog introspection functions read `StatementContext.catalog_introspection`: `FORMAT_TYPE(oid, typmod)` formats supported type OIDs through `PgType`, treats `NULL` typmod as omitted (`-1`), returns `NULL` only for a `NULL` type OID, and returns `???` for unknown non-NULL types; `TO_REGTYPE(text)` resolves supported bare type names and `pg_catalog.`-qualified type names through `PgType`; `PG_GET_INDEXDEF`, `PG_GET_CONSTRAINTDEF`, `PG_GET_EXPR`, `PG_GET_USERBYID`, `PG_TABLE_IS_VISIBLE`, `TO_REGCLASS`, and `PG_GET_SERIAL_SEQUENCE` delegate to the provider and propagate provider errors; provider `None` becomes SQL `NULL` for nullable metadata lookups. `PG_GET_INDEXDEF(oid, column, pretty)` returns `NULL` when the OID is missing or a nonzero requested column number is outside the index key list; column `0` renders the full definition. The default no-op provider returns pass-through text for `PG_GET_EXPR(text, oid[, pretty])`; real providers may return `NULL` when an expression cannot be rendered. Privilege functions return `TRUE` for non-NULL probes because SaguaroDB has no grant model yet; relation-size and temp-schema probes return harmless compatibility constants; description and unsupported definition helpers return `NULL`. `REPLACE` leaves the string unchanged for an empty `from` (unlike Rust's `str::replace`); `POSITION` is the 1-based character index (0 if absent, 1 for an empty substring); `LEFT`/`RIGHT` count characters and treat a negative count as removing characters from the far end (PostgreSQL semantics). `EXTRACT(field FROM source)` returns the `year`/`month`/`day`/`hour`/`minute`/`second` of a `DATE` or `TIMESTAMP` as `DOUBLE PRECISION` (a DATE has zero-valued time components; `second` includes the fractional part). `LENGTH` and `SUBSTRING` count Unicode characters, not bytes; `SUBSTRING` uses 1-based start positions clamped to the string and rejects a negative length with `SqlState::DatatypeMismatch`. `FLOOR`/`CEIL`/`ROUND` leave an integer unchanged and round a double (`ROUND` is round-half-to-even, matching PostgreSQL's `round(double precision)`); `ABS` of `i64::MIN` returns `SqlState::NumericValueOutOfRange`; `SQRT` of a negative number and a non-finite `POWER` result return `NumericValueOutOfRange`; `MOD` by zero returns `SqlState::DivisionByZero`.
+- Function-listing helpers `PG_GET_FUNCTION_ARGUMENTS`, `PG_GET_FUNCTION_RESULT`, `PG_GET_FUNCTIONDEF`, `PG_FUNCTION_IS_VISIBLE`, and `OIDVECTORTYPES` render from the static built-in/probe `pg_proc` compatibility table and do not imply user-defined function support.
 - Aggregate functions are evaluated by `AggregateOp`, not by scalar evaluation.
 - `LocalRef` indexes into the current `ExecRow` values. `AggregateCall` must not reach scalar evaluation; logical planning rewrites it before physical execution.
 - `Parameter` (`$n`) references must be substituted to literals before execution. One reaching the evaluator is an internal error (`"unbound parameter $N reached the executor"`).

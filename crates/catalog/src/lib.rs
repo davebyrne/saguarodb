@@ -6,7 +6,8 @@ pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definitio
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
-    index_oid, is_system_schema, resolve_system_view, sequence_oid, table_oid,
+    attrdef_oid, check_constraint_oid, index_oid, is_system_schema, primary_key_constraint_oid,
+    resolve_system_view, sequence_oid, synthetic_primary_key_oid, table_oid,
 };
 
 use common::{
@@ -222,6 +223,7 @@ mod tests {
 
     use crate::{
         CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
+        system::{MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
         validate_create_table_definition,
     };
 
@@ -376,6 +378,176 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn relation_names_are_unique_across_tables_indexes_sequences_and_synthetic_pkeys() {
+        let catalog = catalog_with_users();
+        let index_err = catalog
+            .create_index("users".to_string(), "users", &["name".to_string()], false)
+            .unwrap_err();
+        assert_eq!(index_err.code, SqlState::DuplicateTable);
+        let sequence_err = catalog
+            .create_sequence("users".to_string(), SequenceOptions::default(), false)
+            .unwrap_err();
+        assert_eq!(sequence_err.code, SqlState::DuplicateTable);
+        let synthetic_err = catalog
+            .create_table(
+                "users_pkey".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap_err();
+        assert_eq!(synthetic_err.code, SqlState::DuplicateTable);
+
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_sequence("accounts".to_string(), SequenceOptions::default(), false)
+            .unwrap();
+        let table_err = catalog
+            .create_table(
+                "accounts".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap_err();
+        assert_eq!(table_err.code, SqlState::DuplicateTable);
+
+        let catalog = catalog_with_users();
+        catalog
+            .create_sequence("users_name".to_string(), SequenceOptions::default(), false)
+            .unwrap();
+        let index_err = catalog
+            .create_index(
+                "users_name".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(index_err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn hidden_toast_synthetic_primary_key_names_do_not_reserve_public_names() {
+        let catalog = MemoryCatalog::empty();
+        let base = catalog
+            .create_table_with_options(
+                "docs".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "body".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                ToastOptions::default_new_table(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(base.toast_table_id.is_some());
+
+        let public = catalog
+            .create_table(
+                "pg_toast_1_pkey".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        assert_eq!(public.name, "pg_toast_1_pkey");
+    }
+
+    #[test]
+    fn public_names_do_not_block_hidden_toast_synthetic_primary_key_names() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_sequence(
+                "pg_toast_1_pkey".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap();
+
+        let base = catalog
+            .create_table_with_options(
+                "docs".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "body".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+                ToastOptions::default_new_table(),
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(base.toast_table_id, Some(2));
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_public_relation_name_collisions() {
+        let users = stored_id_table(1, "users");
+        let duplicate_sequence = SequenceSchema {
+            id: 1,
+            name: "users".to_string(),
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start: 1,
+            cycle: false,
+            owned: false,
+            last_value: 1,
+            is_called: false,
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, users.clone())]),
+            next_table_id: 2,
+            sequences_by_name: HashMap::from([("users".to_string(), 1)]),
+            sequences_by_id: HashMap::from([(1, duplicate_sequence)]),
+            next_sequence_id: 2,
+            ..CatalogSnapshot::default()
+        };
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("public relation name users"));
+
+        let duplicate_index = IndexSchema {
+            id: 1,
+            storage_id: 1,
+            table: users.id,
+            name: "users".to_string(),
+            columns: vec![0],
+            unique: false,
+            constraint: IndexConstraintKind::None,
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 1)]),
+            tables_by_id: HashMap::from([(1, users)]),
+            next_table_id: 2,
+            indexes_by_name: HashMap::from([("users".to_string(), 1)]),
+            indexes_by_id: HashMap::from([(1, duplicate_index)]),
+            next_index_id: 2,
+            next_storage_id: 2,
+            ..CatalogSnapshot::default()
+        };
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert!(err.message.contains("public relation name users"));
     }
 
     #[test]
@@ -1472,6 +1644,66 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_table_ids_that_cannot_have_unique_virtual_oids() {
+        let bad_id = MAX_COMPOUND_OID_TABLE_ID + 1;
+        let schema = stored_id_table(bad_id, "too_many_tables");
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("too_many_tables".to_string(), bad_id)]),
+            tables_by_id: HashMap::from([(bad_id, schema)]),
+            next_table_id: bad_id + 1,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("virtual OID payload limit"));
+    }
+
+    #[test]
+    fn create_paths_reject_ids_that_cannot_have_unique_virtual_oids() {
+        let table_catalog = MemoryCatalog::empty();
+        table_catalog
+            .reserve_table_id(MAX_COMPOUND_OID_TABLE_ID)
+            .unwrap();
+        let err = table_catalog
+            .create_table(
+                "too_many_tables".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("virtual OID payload limit"));
+
+        let index_catalog = catalog_with_users();
+        index_catalog
+            .reserve_index_id(MAX_VIRTUAL_OID_PAYLOAD)
+            .unwrap();
+        let err = index_catalog
+            .create_index(
+                "too_many_indexes".to_string(),
+                "users",
+                &["id".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("virtual OID payload limit"));
+
+        let sequence_catalog = MemoryCatalog::empty();
+        sequence_catalog
+            .reserve_sequence_id(MAX_VIRTUAL_OID_PAYLOAD)
+            .unwrap();
+        let err = sequence_catalog
+            .create_sequence(
+                "too_many_sequences".to_string(),
+                SequenceOptions::default(),
+                false,
+            )
+            .unwrap_err();
+        assert!(err.message.contains("virtual OID payload limit"));
+    }
+
+    #[test]
     fn try_from_snapshot_accepts_valid_sequence_default() {
         let sequence = SequenceSchema {
             id: 1,
@@ -2241,6 +2473,80 @@ mod tests {
                 false,
             )
             .unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn synthetic_primary_key_index_name_is_reserved() {
+        let catalog = catalog_with_users();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+
+        let err = catalog
+            .create_index(
+                "users_pkey".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateTable);
+
+        let schema = IndexSchema {
+            id: 99,
+            storage_id: 99,
+            table: users.id,
+            name: "users_pkey".to_string(),
+            columns: vec![1],
+            unique: false,
+            constraint: IndexConstraintKind::None,
+        };
+        let err = catalog.apply_create_index(schema).unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn table_create_rejects_synthetic_primary_key_name_used_by_existing_index() {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "accounts".to_string(),
+                vec![
+                    id_column(false),
+                    ParsedColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    },
+                ],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+            .create_index(
+                "users_pkey".to_string(),
+                "accounts",
+                &["name".to_string()],
+                false,
+            )
+            .unwrap();
+
+        let err = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DuplicateTable);
+
+        let mut schema = stored_id_table(99, "users");
+        schema.primary_key = vec![0];
+        let err = catalog.apply_create_table(schema).unwrap_err();
         assert_eq!(err.code, SqlState::DuplicateTable);
     }
 

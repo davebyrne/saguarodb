@@ -621,11 +621,52 @@ pub fn encode_value_with_type(
                 .map_err(|_| integer_out_of_range(*int, "int4"))?
                 .to_be_bytes()
                 .to_vec(),
+            PgType::Oid => u32::try_from(*int)
+                .map_err(|_| integer_out_of_range(*int, "oid"))?
+                .to_be_bytes()
+                .to_vec(),
             _ => int.to_be_bytes().to_vec(),
         };
         return Ok(Some(bytes));
     }
     encode_value(value, format)
+}
+
+/// Decode a non-NULL parameter using its declared wire type. Most types decode
+/// through their collapsed storage [`DataType`]; `oid` is the exception because
+/// PostgreSQL encodes it as an unsigned 32-bit integer while SaguaroDB stores it
+/// in the shared signed integer value.
+pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Result<Value> {
+    let value_format = ValueFormat::from_code(format)?;
+    if matches!(
+        pg_type,
+        PgType::Int2Vector | PgType::OidVector | PgType::Int2Array | PgType::OidArray
+    ) && value_format == ValueFormat::Binary
+    {
+        return Err(protocol_error(
+            "binary catalog vector/array parameter is not supported",
+        ));
+    }
+    if matches!(pg_type, PgType::Oid) {
+        return match value_format {
+            ValueFormat::Binary => {
+                let array: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| protocol_error("binary oid parameter must be 4 bytes"))?;
+                Ok(Value::Integer(i64::from(u32::from_be_bytes(array))))
+            }
+            ValueFormat::Text => {
+                let value = decode_value(bytes, DataType::Integer, 0)?;
+                let Value::Integer(int) = value else {
+                    unreachable!("integer decoder returned non-integer value");
+                };
+                u32::try_from(int)
+                    .map(|_| value)
+                    .map_err(|_| integer_out_of_range(int, "oid"))
+            }
+        };
+    }
+    decode_value(bytes, pg_type.data_type(), format)
 }
 
 fn integer_out_of_range(value: i64, target: &str) -> DbError {
@@ -862,8 +903,8 @@ fn protocol_error(message: impl Into<String>) -> DbError {
 
 #[cfg(test)]
 mod integer_param_tests {
-    use super::decode_value;
-    use common::{DataType, Value};
+    use super::{decode_value, decode_value_with_type};
+    use common::{DataType, PgType, Value};
 
     #[test]
     fn binary_integer_parameter_accepts_2_4_8_byte_widths() {
@@ -885,6 +926,22 @@ mod integer_param_tests {
         }
         // Any other length is rejected.
         assert!(decode_value(&[0, 0, 0], DataType::Integer, 1).is_err());
+    }
+
+    #[test]
+    fn catalog_vector_and_array_parameters_accept_text_only() {
+        for pg_type in [
+            PgType::Int2Vector,
+            PgType::OidVector,
+            PgType::Int2Array,
+            PgType::OidArray,
+        ] {
+            assert_eq!(
+                decode_value_with_type(b"1 2", &pg_type, 0).unwrap(),
+                Value::Text("1 2".to_string())
+            );
+            assert!(decode_value_with_type(b"1 2", &pg_type, 1).is_err());
+        }
     }
 }
 

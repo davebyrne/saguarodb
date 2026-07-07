@@ -4,7 +4,7 @@ use sqlparser::ast as sql;
 use crate::{BinOp, Expr, FunctionArg, UnaryOp};
 
 use super::query::{convert_query, convert_set_expr_to_query};
-use super::{convert_pg_type, ident_name, object_name, parse_error, unsupported};
+use super::{convert_pg_type, function_name, ident_name, parse_error, unsupported};
 
 pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
     match expr {
@@ -419,7 +419,7 @@ fn convert_function(function: &sql::Function) -> Result<Expr> {
     };
 
     Ok(Expr::Function {
-        name: object_name(&function.name)?,
+        name: function_name(&function.name)?,
         args,
         distinct,
     })

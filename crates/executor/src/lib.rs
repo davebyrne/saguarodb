@@ -310,6 +310,307 @@ mod tests {
     }
 
     #[test]
+    fn system_scan_executes_extended_pg_catalog_views() {
+        let harness = ExecutorHarness::with_users();
+        harness.execute("create sequence explicit_seq").unwrap();
+        harness
+            .execute(
+                "create table constraint_probe (\
+                 id integer primary key default 7, \
+                 explicit_id integer default nextval('explicit_seq'), \
+                 serial_id serial, \
+                 name text, \
+                 check (id > 0))",
+            )
+            .unwrap();
+
+        let rows = harness
+            .select_rows(
+                "select proname, pronargs \
+                 from pg_catalog.pg_proc \
+                 where proname in ('format_type', 'pg_get_functiondef', 'pg_get_indexdef') \
+                 order by proname, pronargs",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Text("format_type".to_string()), Value::Integer(2)],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("pg_get_functiondef".to_string()),
+                        Value::Integer(1),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("pg_get_indexdef".to_string()),
+                        Value::Integer(1),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("pg_get_indexdef".to_string()),
+                        Value::Integer(3),
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select relchecks \
+                 from pg_catalog.pg_class \
+                 where relname = 'constraint_probe'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(1)],
+            }]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select attcollation, attstorage, attcompression, atthasmissing, attoptions \
+                 from pg_catalog.pg_attribute \
+                 join pg_catalog.pg_class c on attrelid = c.oid \
+                 where c.relname = 'constraint_probe' \
+                   and attname = 'name'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Integer(100),
+                    Value::Text("x".to_string()),
+                    Value::Text("".to_string()),
+                    Value::Boolean(false),
+                    Value::Null,
+                ],
+            }]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select k.conname, k.contype, k.conkey, k.conbin \
+                 from pg_catalog.pg_constraint k \
+                 join pg_catalog.pg_class c on k.conrelid = c.oid \
+                 where c.relname = 'constraint_probe' \
+                 order by conname",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("constraint_probe_check".to_string()),
+                        Value::Text("c".to_string()),
+                        Value::Null,
+                        Value::Text("id > 0".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("constraint_probe_pkey".to_string()),
+                        Value::Text("p".to_string()),
+                        Value::Text("{1}".to_string()),
+                        Value::Null,
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select d.adnum, d.adbin \
+                 from pg_catalog.pg_attrdef d \
+                 join pg_catalog.pg_class c on d.adrelid = c.oid \
+                 where c.relname = 'constraint_probe' \
+                 order by d.adnum",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1), Value::Text("7".to_string())],
+                },
+                Row {
+                    values: vec![
+                        Value::Integer(2),
+                        Value::Text("nextval('explicit_seq')".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Integer(3),
+                        Value::Text("nextval('constraint_probe_serial_id_seq')".to_string()),
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select count(*) \
+                 from pg_catalog.pg_depend d \
+                 join pg_catalog.pg_class c on d.refobjid = c.oid \
+                 where c.relname = 'constraint_probe'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(7)],
+            }]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select c.relname, d.deptype \
+                 from pg_catalog.pg_depend d \
+                 join pg_catalog.pg_class c on d.objid = c.oid \
+                 where c.relname in ('explicit_seq', 'constraint_probe_serial_id_seq') \
+                   and d.refobjsubid > 0 \
+                 order by c.relname",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("constraint_probe_serial_id_seq".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("explicit_seq".to_string()),
+                        Value::Text("n".to_string()),
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select count(*) \
+                 from pg_catalog.pg_proc \
+                 where proname in ('pg_get_viewdef', 'pg_get_functiondef')",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(3)],
+            }]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select pg_function_is_visible(oid), \
+                        pg_get_function_arguments(oid), \
+                        pg_get_function_result(oid), \
+                        oidvectortypes(proargtypes) \
+                 from pg_catalog.pg_proc \
+                 where proname = 'format_type'",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Boolean(true),
+                    Value::Text("oid, integer".to_string()),
+                    Value::Text("text".to_string()),
+                    Value::Text("oid, integer".to_string()),
+                ],
+            }]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select typname, typelem, typarray \
+                 from pg_catalog.pg_type \
+                 where typname in ('int2', 'oid', 'int2vector', 'oidvector', '_int2', '_oid') \
+                 order by typname",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![
+                        Value::Text("_int2".to_string()),
+                        Value::Integer(21),
+                        Value::Integer(0),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("_oid".to_string()),
+                        Value::Integer(26),
+                        Value::Integer(0),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("int2".to_string()),
+                        Value::Integer(0),
+                        Value::Integer(1005),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("int2vector".to_string()),
+                        Value::Integer(21),
+                        Value::Integer(0),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("oid".to_string()),
+                        Value::Integer(0),
+                        Value::Integer(1028),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        Value::Text("oidvector".to_string()),
+                        Value::Integer(26),
+                        Value::Integer(0),
+                    ],
+                },
+            ]
+        );
+
+        let rows = harness
+            .select_rows(
+                "select d.datname, r.rolname, r.rolcanlogin \
+                 from pg_catalog.pg_database d \
+                 join pg_catalog.pg_roles r on d.datdba = r.oid",
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![
+                    Value::Text("saguarodb".to_string()),
+                    Value::Text("saguarodb".to_string()),
+                    Value::Boolean(true),
+                ],
+            }]
+        );
+    }
+
+    #[test]
     fn division_by_zero_returns_sqlstate() {
         let row = ExecRow {
             row: Row { values: vec![] },
@@ -1721,6 +2022,21 @@ mod tests {
     }
 
     #[test]
+    fn format_type_evaluates_null_typmod() {
+        let harness = ExecutorHarness::with_users();
+        let rows = harness
+            .select_rows("select format_type(23, null), format_type(null, -1)")
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Text("integer".to_string()), Value::Null]
+            }]
+        );
+    }
+
+    #[test]
     fn substring_handles_bounds_and_optional_length() {
         let harness = ExecutorHarness::with_users();
         harness
@@ -1785,6 +2101,7 @@ mod tests {
                     name: name.to_string(),
                     args: Vec::new(),
                     data_type,
+                    pg_type: None,
                     nullable: false,
                 },
                 &row,
@@ -1853,6 +2170,7 @@ mod tests {
                 nullable,
             }],
             data_type: DataType::Text,
+            pg_type: None,
             nullable,
         };
 
@@ -1908,6 +2226,7 @@ mod tests {
                 nullable: false,
             }],
             data_type: DataType::Integer,
+            pg_type: None,
             nullable: false,
         };
 
@@ -1932,6 +2251,7 @@ mod tests {
             name: "mod".to_string(),
             args: vec![int(i64::MIN), int(-1)],
             data_type: DataType::Integer,
+            pg_type: None,
             nullable: false,
         };
 

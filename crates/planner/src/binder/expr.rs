@@ -1,4 +1,4 @@
-use common::{DataType, Result, SqlState, Value};
+use common::{DataType, PgType, Result, SqlState, Value};
 use parser::{Expr, FunctionArg, Query};
 
 use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, UnaryOp};
@@ -17,9 +17,18 @@ pub(super) fn bind_expr(
     expr: &Expr,
     expected: Option<DataType>,
 ) -> Result<BoundExpr> {
+    bind_expr_with_pg_type(ctx, expr, expected, None)
+}
+
+fn bind_expr_with_pg_type(
+    ctx: &mut BindContext,
+    expr: &Expr,
+    expected: Option<DataType>,
+    expected_pg_type: Option<PgType>,
+) -> Result<BoundExpr> {
     match expr {
         Expr::Literal(value) => bind_literal(value, expected),
-        Expr::Placeholder(index) => bind_placeholder(ctx, *index, expected),
+        Expr::Placeholder(index) => bind_placeholder(ctx, *index, expected, expected_pg_type),
         Expr::ColumnRef { table, column } => bind_column_ref(ctx, table.as_deref(), column),
         Expr::Subquery(select) => bind_scalar_subquery(ctx, select),
         Expr::BinaryOp { left, op, right } => bind_binary_op(ctx, left, op.clone(), right),
@@ -188,6 +197,7 @@ fn bind_placeholder(
     ctx: &BindContext,
     index: u32,
     expected: Option<DataType>,
+    expected_pg_type: Option<PgType>,
 ) -> Result<BoundExpr> {
     if index == 0 || index > MAX_PARAM_NUMBER {
         return Err(plan_error(
@@ -213,11 +223,16 @@ fn bind_placeholder(
             ));
         }
     };
+    let pg_type = ctx
+        .declared_param_pg_type(slot)
+        .or(expected_pg_type)
+        .filter(|pg_type| pg_type.data_type() == data_type);
     // A bound parameter value may be NULL; runtime NOT NULL checks (validate_not_null)
     // enforce column constraints, so the slot is treated as non-null for binding.
     Ok(BoundExpr::Parameter {
         index: slot,
         data_type,
+        pg_type,
         nullable: false,
     })
 }
@@ -604,6 +619,7 @@ fn bind_current_setting(ctx: &mut BindContext, args: &[FunctionArg]) -> Result<B
         nullable: name.nullable(),
         args: vec![name],
         data_type: DataType::Text,
+        pg_type: None,
     })
 }
 
@@ -877,10 +893,38 @@ fn bind_scalar_function(
     name: &str,
     args: &[FunctionArg],
 ) -> Result<BoundExpr> {
+    let Some(func) = common::lookup_scalar_function(name) else {
+        return Err(plan_error(
+            SqlState::SyntaxError,
+            format!("function {name} is not supported in v1"),
+        ));
+    };
+    let arity_probe: Vec<_> = (0..args.len())
+        .map(|_| common::ArgType {
+            data_type: DataType::Text,
+            literal: None,
+        })
+        .collect();
+    if let Err(err) = (func.signature)(func.name, &arity_probe)
+        && err.code == SqlState::SyntaxError
+    {
+        return Err(err);
+    }
     let mut bound_args = Vec::with_capacity(args.len());
-    for arg in args {
+    for (index, arg) in args.iter().enumerate() {
         match arg {
-            FunctionArg::Expr(expr) => bound_args.push(bind_expr(ctx, expr, None)?),
+            FunctionArg::Expr(expr) => {
+                let expected = common::scalar_function_arg_hint(func.name, args.len(), index);
+                let expected_pg_type =
+                    common::scalar_function_arg_pg_type(func.name, args.len(), index)
+                        .filter(|pg_type| Some(pg_type.data_type()) == expected);
+                bound_args.push(bind_expr_with_pg_type(
+                    ctx,
+                    expr,
+                    expected,
+                    expected_pg_type,
+                )?);
+            }
             FunctionArg::Wildcard => {
                 return Err(plan_error(
                     SqlState::SyntaxError,
@@ -890,29 +934,29 @@ fn bind_scalar_function(
         }
     }
 
-    bind_registered_function(name, bound_args)
+    bind_registered_function(func, name, bound_args)
 }
 
 /// Resolve a call against the scalar function registry: validate the (already
 /// bound) arguments through the function's signature and assign its result type
 /// and nullability. The registry is the sole authority for which scalar functions
 /// exist, so an unregistered name is rejected here.
-fn bind_registered_function(name: &str, bound_args: Vec<BoundExpr>) -> Result<BoundExpr> {
-    let Some(func) = common::lookup_scalar_function(name) else {
-        return Err(plan_error(
-            SqlState::SyntaxError,
-            format!("function {name} is not supported in v1"),
-        ));
-    };
+fn bind_registered_function(
+    func: &common::ScalarFunction,
+    name: &str,
+    bound_args: Vec<BoundExpr>,
+) -> Result<BoundExpr> {
     let data_type = {
         let arg_types: Vec<common::ArgType> = bound_args.iter().map(arg_type_of).collect();
         (func.signature)(func.name, &arg_types)?
     };
+    let pg_type = common::scalar_function_result_pg_type(func.name, bound_args.len(), &data_type);
     let nullable = func.result_nullable(bound_args.iter().map(BoundExpr::nullable));
     Ok(BoundExpr::Function {
         name: name.to_string(),
         args: bound_args,
         data_type,
+        pg_type,
         nullable,
     })
 }
@@ -1198,7 +1242,14 @@ fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Resu
     match matches.as_slice() {
         [(binding, column)] => Ok(input_ref(binding, column)),
         [] if table.is_none() && column.eq_ignore_ascii_case("current_schema") => {
-            bind_registered_function("current_schema", Vec::new())
+            common::lookup_scalar_function("current_schema")
+                .map(|func| bind_registered_function(func, "current_schema", Vec::new()))
+                .unwrap_or_else(|| {
+                    Err(plan_error(
+                        SqlState::SyntaxError,
+                        "function current_schema is not supported in v1",
+                    ))
+                })
         }
         [] => Err(plan_error(
             SqlState::UndefinedColumn,

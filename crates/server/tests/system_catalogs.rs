@@ -16,6 +16,9 @@ async fn system_catalogs_support_driver_query_shapes() {
     conn.ok("create unique index driver_items_code_idx on driver_items (code)")
         .await
         .rows();
+    conn.ok("create table toast_driver_items (id integer primary key, body text) with (toast = aggressive)")
+        .await
+        .rows();
 
     assert_eq!(
         conn.ok("select c.relname, n.nspname, a.attname \
@@ -104,6 +107,20 @@ async fn system_catalogs_support_driver_query_shapes() {
             vec![Some("r".to_string()), Some("1".to_string())],
             vec![Some("v".to_string()), Some("1".to_string())],
         ]
+    );
+    assert_eq!(
+        conn.ok("select relname from pg_catalog.pg_class where relname like 'pg_toast%'")
+            .await
+            .rows(),
+        Vec::<Vec<Option<String>>>::new()
+    );
+    assert_eq!(
+        conn.ok(
+            "select reltoastrelid from pg_catalog.pg_class where relname = 'toast_driver_items'"
+        )
+        .await
+        .rows(),
+        vec![vec![Some("0".to_string())]]
     );
 
     let explain_rows = conn
@@ -278,7 +295,7 @@ async fn system_catalog_describe_reports_expected_wire_types() {
             ))
             .collect::<Vec<_>>(),
         vec![
-            ("oid", 20, 8, -1, 0, 0, 0),
+            ("oid", 26, 4, -1, 0, 0, 0),
             ("relname", 25, -1, -1, 0, 0, 0),
             ("reltuples", 700, 4, -1, 0, 0, 0),
             ("relhasindex", 16, 1, -1, 0, 0, 0),

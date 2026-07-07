@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::{
-    DataType, DbError, POSTGRES_COMPAT_VERSION, Result, SqlState, StatementContext, Value,
+    DataType, DbError, POSTGRES_COMPAT_VERSION, PgType, Result, SqlState, StatementContext, Value,
 };
 
 /// A bound argument as seen by a function's signature checker: its resolved type
@@ -34,6 +34,14 @@ pub enum NullHandling {
     /// and the result type is nullable when any argument is. This is the rule for
     /// almost every function.
     Propagate,
+    /// A NULL argument still evaluates to NULL without invoking `eval`, but the
+    /// function may also return NULL for non-NULL inputs (for example, metadata
+    /// lookups for a missing OID). The result type is always nullable.
+    Nullable,
+    /// `eval` is always invoked and owns NULL semantics. The result type is
+    /// always nullable. Used for compatibility functions where only some NULL
+    /// arguments propagate, such as `format_type(oid, NULL)`.
+    EvaluateNullable,
     /// `eval` is always invoked (it decides how NULL is handled) and the result is
     /// never NULL, so the result type is non-nullable. Used by `CONCAT` (ignores
     /// NULL arguments) and the zero-argument system information functions.
@@ -63,6 +71,7 @@ impl ScalarFunction {
     pub fn result_nullable(&self, arg_nullable: impl IntoIterator<Item = bool>) -> bool {
         match self.null_handling {
             NullHandling::Propagate => arg_nullable.into_iter().any(|nullable| nullable),
+            NullHandling::Nullable | NullHandling::EvaluateNullable => true,
             NullHandling::NeverNull => false,
         }
     }
@@ -82,6 +91,816 @@ pub fn lookup_scalar_function(name: &str) -> Option<&'static ScalarFunction> {
         .get(name)
         .copied()
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PgProcCatalogEntry {
+    pub oid: i64,
+    pub name: &'static str,
+    pub ret_oid: i64,
+    pub arg_oids: &'static [i64],
+}
+
+impl PgProcCatalogEntry {
+    pub fn variadic_oid(self) -> i64 {
+        if self.name == "concat" {
+            PG_PROC_TEXT
+        } else {
+            0
+        }
+    }
+}
+
+pub fn pg_proc_catalog_entries() -> &'static [PgProcCatalogEntry] {
+    PG_PROC_CATALOG_ENTRIES
+}
+
+pub fn pg_proc_catalog_entry(oid: i64) -> Option<&'static PgProcCatalogEntry> {
+    PG_PROC_CATALOG_ENTRIES
+        .iter()
+        .find(|entry| entry.oid == oid)
+}
+
+pub fn format_type_oid(oid: i64) -> String {
+    PgType::from_oid_typmod(oid, -1)
+        .map(|pg_type| pg_type.format_type_name())
+        .unwrap_or_else(|| "???".to_string())
+}
+
+pub fn scalar_function_result_pg_type(
+    name: &str,
+    arity: usize,
+    data_type: &DataType,
+) -> Option<PgType> {
+    let mut candidates = PG_PROC_CATALOG_ENTRIES
+        .iter()
+        .filter(|entry| entry.name == name && entry.arg_oids.len() == arity)
+        .filter_map(|entry| PgType::from_oid_typmod(entry.ret_oid, -1))
+        .filter(|pg_type| pg_type.data_type() == *data_type);
+    let first = candidates.next()?;
+    if candidates.all(|candidate| candidate == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+pub fn scalar_function_arg_pg_type(name: &str, arity: usize, index: usize) -> Option<PgType> {
+    let mut candidates = PG_PROC_CATALOG_ENTRIES
+        .iter()
+        .filter(|entry| entry.name == name && entry.arg_oids.len() == arity)
+        .filter_map(|entry| entry.arg_oids.get(index))
+        .filter_map(|oid| PgType::from_oid_typmod(*oid, -1));
+    let first = candidates.next()?;
+    if candidates.all(|candidate| candidate == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Expected argument type for functions whose common tool probes often pass
+/// untyped NULLs or bind placeholders. The registered signature remains the
+/// source of truth: this returns a hint only when a bounded search over supported
+/// argument types finds exactly one type that can make the signature succeed at
+/// `index`. `None` means there is no single useful type hint and ordinary
+/// inference applies.
+pub fn scalar_function_arg_hint(name: &str, arity: usize, index: usize) -> Option<DataType> {
+    const MAX_HINT_ARITY: usize = 4;
+    if index >= arity {
+        return None;
+    }
+    let func = lookup_scalar_function(name)?;
+    if arity > MAX_HINT_ARITY {
+        return uniform_scalar_function_arg_hint(func, arity);
+    }
+    let mut accepted = hint_candidate_types()
+        .iter()
+        .filter(|candidate| signature_accepts_with_fixed_arg(func, arity, index, candidate))
+        .cloned();
+    let hint = accepted.next()?;
+    if accepted.next().is_none() {
+        Some(hint)
+    } else {
+        None
+    }
+}
+
+fn uniform_scalar_function_arg_hint(func: &ScalarFunction, arity: usize) -> Option<DataType> {
+    let mut accepted = hint_candidate_types()
+        .iter()
+        .filter(|candidate| signature_accepts_uniform_args(func, arity, candidate))
+        .cloned();
+    let hint = accepted.next()?;
+    if accepted.next().is_none() {
+        Some(hint)
+    } else {
+        None
+    }
+}
+
+const PG_PROC_TEXT: i64 = 25;
+const PG_PROC_OID: i64 = 26;
+const PG_PROC_OIDVECTOR: i64 = 30;
+const PG_PROC_INT4: i64 = 23;
+const PG_PROC_INT8: i64 = 20;
+const PG_PROC_BOOL: i64 = 16;
+const PG_PROC_FLOAT8: i64 = 701;
+const PG_PROC_DATE: i64 = 1082;
+const PG_PROC_TIMESTAMP: i64 = 1114;
+const PG_PROC_TIMESTAMPTZ: i64 = 1184;
+const PG_PROC_TEXT_ARGS_1: &[i64] = &[PG_PROC_TEXT];
+const PG_PROC_TEXT_ARGS_2: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_TEXT_ARGS_3: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_OIDVECTOR_ARGS_1: &[i64] = &[PG_PROC_OIDVECTOR];
+const PG_PROC_FLOAT8_ARGS_1: &[i64] = &[PG_PROC_FLOAT8];
+const PG_PROC_FLOAT8_ARGS_2: &[i64] = &[PG_PROC_FLOAT8, PG_PROC_FLOAT8];
+const PG_PROC_INT8_ARGS_1: &[i64] = &[PG_PROC_INT8];
+const PG_PROC_INT8_ARGS_2: &[i64] = &[PG_PROC_INT8, PG_PROC_INT8];
+const PG_PROC_INT8_FLOAT8_ARGS: &[i64] = &[PG_PROC_INT8, PG_PROC_FLOAT8];
+const PG_PROC_FLOAT8_INT8_ARGS: &[i64] = &[PG_PROC_FLOAT8, PG_PROC_INT8];
+const PG_PROC_OID_ARGS_1: &[i64] = &[PG_PROC_OID];
+const PG_PROC_OID_INT4_ARGS: &[i64] = &[PG_PROC_OID, PG_PROC_INT4];
+const PG_PROC_OID_INT4_BOOL_ARGS: &[i64] = &[PG_PROC_OID, PG_PROC_INT4, PG_PROC_BOOL];
+const PG_PROC_OID_BOOL_ARGS: &[i64] = &[PG_PROC_OID, PG_PROC_BOOL];
+const PG_PROC_EXPR_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_OID];
+const PG_PROC_EXPR_PRETTY_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_OID, PG_PROC_BOOL];
+const PG_PROC_EXTRACT_DATE_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_DATE];
+const PG_PROC_EXTRACT_TIMESTAMP_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_TIMESTAMP];
+const PG_PROC_OID_TEXT_ARGS: &[i64] = &[PG_PROC_OID, PG_PROC_TEXT];
+const PG_PROC_SERIAL_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_PRIV_ARGS_2: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_PRIV_ARGS_3: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_PRIV_OID_ARGS_2: &[i64] = &[PG_PROC_OID, PG_PROC_TEXT];
+const PG_PROC_PRIV_OID_ARGS_3: &[i64] = &[PG_PROC_OID, PG_PROC_OID, PG_PROC_TEXT];
+const PG_PROC_COLUMN_PRIV_ARGS_3: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_COLUMN_PRIV_ARGS: &[i64] = &[PG_PROC_TEXT, PG_PROC_TEXT, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_COLUMN_PRIV_OID_ARGS_3: &[i64] = &[PG_PROC_OID, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_COLUMN_PRIV_OID_ARGS: &[i64] =
+    &[PG_PROC_OID, PG_PROC_OID, PG_PROC_TEXT, PG_PROC_TEXT];
+const PG_PROC_NO_ARGS: &[i64] = &[];
+
+static PG_PROC_CATALOG_ENTRIES: &[PgProcCatalogEntry] = &[
+    PgProcCatalogEntry {
+        oid: 14_000,
+        name: "upper",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_001,
+        name: "lower",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_002,
+        name: "trim",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_003,
+        name: "length",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_071,
+        name: "abs",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_072,
+        name: "floor",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_073,
+        name: "ceil",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_074,
+        name: "ceiling",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_075,
+        name: "round",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_076,
+        name: "sqrt",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_077,
+        name: "power",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_078,
+        name: "pow",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_079,
+        name: "mod",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_080,
+        name: "extract",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_EXTRACT_DATE_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_081,
+        name: "extract",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_EXTRACT_TIMESTAMP_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_004,
+        name: "concat",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_005,
+        name: "substring",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: &[PG_PROC_TEXT, PG_PROC_INT8],
+    },
+    PgProcCatalogEntry {
+        oid: 14_006,
+        name: "substring",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: &[PG_PROC_TEXT, PG_PROC_INT8, PG_PROC_INT8],
+    },
+    PgProcCatalogEntry {
+        oid: 14_007,
+        name: "replace",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_008,
+        name: "position",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_TEXT_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_009,
+        name: "left",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: &[PG_PROC_TEXT, PG_PROC_INT8],
+    },
+    PgProcCatalogEntry {
+        oid: 14_010,
+        name: "right",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: &[PG_PROC_TEXT, PG_PROC_INT8],
+    },
+    PgProcCatalogEntry {
+        oid: 14_011,
+        name: "now",
+        ret_oid: PG_PROC_TIMESTAMPTZ,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_012,
+        name: "current_timestamp",
+        ret_oid: PG_PROC_TIMESTAMPTZ,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_013,
+        name: "version",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_014,
+        name: "current_database",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_015,
+        name: "current_catalog",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_016,
+        name: "current_schema",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_017,
+        name: "current_user",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_018,
+        name: "session_user",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_019,
+        name: "user",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_020,
+        name: "pg_backend_pid",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_021,
+        name: "current_setting",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_022,
+        name: "format_type",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_INT4_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_023,
+        name: "pg_get_indexdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_024,
+        name: "pg_get_indexdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_INT4_BOOL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_025,
+        name: "pg_table_is_visible",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_026,
+        name: "pg_get_expr",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_EXPR_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_027,
+        name: "pg_get_expr",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_EXPR_PRETTY_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_028,
+        name: "pg_get_constraintdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_029,
+        name: "pg_get_constraintdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_BOOL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_030,
+        name: "pg_get_userbyid",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_031,
+        name: "pg_get_serial_sequence",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_SERIAL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_032,
+        name: "to_regclass",
+        ret_oid: PG_PROC_OID,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_033,
+        name: "to_regtype",
+        ret_oid: PG_PROC_OID,
+        arg_oids: PG_PROC_TEXT_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_034,
+        name: "has_table_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_035,
+        name: "has_table_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_036,
+        name: "has_schema_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_037,
+        name: "has_schema_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_038,
+        name: "has_database_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_039,
+        name: "has_database_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_040,
+        name: "has_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_COLUMN_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_041,
+        name: "has_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_COLUMN_PRIV_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_042,
+        name: "has_sequence_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_043,
+        name: "has_sequence_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_044,
+        name: "has_function_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_045,
+        name: "has_function_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_046,
+        name: "has_any_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_047,
+        name: "has_any_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_048,
+        name: "pg_has_role",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_049,
+        name: "pg_has_role",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_050,
+        name: "obj_description",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_051,
+        name: "obj_description",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_TEXT_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_052,
+        name: "col_description",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_INT4_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_053,
+        name: "pg_relation_size",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_054,
+        name: "pg_table_size",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_055,
+        name: "pg_indexes_size",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_056,
+        name: "pg_total_relation_size",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_057,
+        name: "pg_my_temp_schema",
+        ret_oid: PG_PROC_OID,
+        arg_oids: PG_PROC_NO_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_058,
+        name: "pg_is_other_temp_schema",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_059,
+        name: "pg_get_viewdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_060,
+        name: "pg_get_viewdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_BOOL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_061,
+        name: "pg_get_functiondef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_062,
+        name: "pg_get_function_arguments",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_063,
+        name: "pg_get_function_result",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_064,
+        name: "pg_get_triggerdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_065,
+        name: "pg_get_triggerdef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_BOOL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_066,
+        name: "pg_get_ruledef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_067,
+        name: "pg_get_ruledef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_BOOL_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_068,
+        name: "pg_get_partkeydef",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_069,
+        name: "pg_function_is_visible",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_OID_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_070,
+        name: "oidvectortypes",
+        ret_oid: PG_PROC_TEXT,
+        arg_oids: PG_PROC_OIDVECTOR_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_082,
+        name: "has_table_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_083,
+        name: "has_table_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_084,
+        name: "has_schema_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_085,
+        name: "has_schema_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_086,
+        name: "has_database_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_087,
+        name: "has_database_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_088,
+        name: "has_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_COLUMN_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_089,
+        name: "has_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_COLUMN_PRIV_OID_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_090,
+        name: "has_sequence_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_091,
+        name: "has_sequence_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_092,
+        name: "has_function_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_093,
+        name: "has_function_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_094,
+        name: "has_any_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_095,
+        name: "has_any_column_privilege",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_096,
+        name: "pg_has_role",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_097,
+        name: "pg_has_role",
+        ret_oid: PG_PROC_BOOL,
+        arg_oids: PG_PROC_PRIV_OID_ARGS_3,
+    },
+    PgProcCatalogEntry {
+        oid: 14_098,
+        name: "abs",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_099,
+        name: "floor",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_100,
+        name: "ceil",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_101,
+        name: "ceiling",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_102,
+        name: "round",
+        ret_oid: PG_PROC_INT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_103,
+        name: "sqrt",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_INT8_ARGS_1,
+    },
+    PgProcCatalogEntry {
+        oid: 14_104,
+        name: "power",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_INT8_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_105,
+        name: "power",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_INT8_FLOAT8_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_106,
+        name: "power",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_INT8_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_107,
+        name: "pow",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_INT8_ARGS_2,
+    },
+    PgProcCatalogEntry {
+        oid: 14_108,
+        name: "pow",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_INT8_FLOAT8_ARGS,
+    },
+    PgProcCatalogEntry {
+        oid: 14_109,
+        name: "pow",
+        ret_oid: PG_PROC_FLOAT8,
+        arg_oids: PG_PROC_FLOAT8_INT8_ARGS,
+    },
+];
 
 /// The complete built-in scalar function table. Ordered by category for reading;
 /// lookups go through [`lookup_scalar_function`]'s name index.
@@ -277,6 +1096,211 @@ static SCALAR_FUNCTIONS: &[ScalarFunction] = &[
         signature: sig_text_to_text,
         eval: eval_current_setting,
     },
+    // --- PostgreSQL catalog introspection compatibility ---
+    ScalarFunction {
+        name: "format_type",
+        null_handling: NullHandling::EvaluateNullable,
+        signature: sig_format_type,
+        eval: eval_format_type,
+    },
+    ScalarFunction {
+        name: "pg_get_indexdef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_pg_get_indexdef,
+        eval: eval_pg_get_indexdef,
+    },
+    ScalarFunction {
+        name: "pg_table_is_visible",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_boolean,
+        eval: eval_pg_table_is_visible,
+    },
+    ScalarFunction {
+        name: "pg_get_expr",
+        null_handling: NullHandling::Nullable,
+        signature: sig_pg_get_expr,
+        eval: eval_pg_get_expr,
+    },
+    ScalarFunction {
+        name: "pg_get_constraintdef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_pg_get_constraintdef,
+        eval: eval_pg_get_constraintdef,
+    },
+    ScalarFunction {
+        name: "pg_get_userbyid",
+        null_handling: NullHandling::Nullable,
+        signature: sig_integer_to_text,
+        eval: eval_pg_get_userbyid,
+    },
+    ScalarFunction {
+        name: "has_table_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_schema_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_database_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_column_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_3_or_4,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_sequence_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_function_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "has_any_column_privilege",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "pg_has_role",
+        null_handling: NullHandling::Propagate,
+        signature: sig_privilege_2_or_3,
+        eval: eval_true,
+    },
+    ScalarFunction {
+        name: "obj_description",
+        null_handling: NullHandling::Nullable,
+        signature: sig_obj_description,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "col_description",
+        null_handling: NullHandling::Nullable,
+        signature: sig_two_integers_to_text,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "pg_get_serial_sequence",
+        null_handling: NullHandling::Nullable,
+        signature: sig_two_text_to_text,
+        eval: eval_pg_get_serial_sequence,
+    },
+    ScalarFunction {
+        name: "pg_relation_size",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_integer,
+        eval: eval_zero,
+    },
+    ScalarFunction {
+        name: "pg_table_size",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_integer,
+        eval: eval_zero,
+    },
+    ScalarFunction {
+        name: "pg_indexes_size",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_integer,
+        eval: eval_zero,
+    },
+    ScalarFunction {
+        name: "pg_total_relation_size",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_integer,
+        eval: eval_zero,
+    },
+    ScalarFunction {
+        name: "pg_my_temp_schema",
+        null_handling: NullHandling::NeverNull,
+        signature: sig_no_args_integer,
+        eval: eval_zero,
+    },
+    ScalarFunction {
+        name: "pg_is_other_temp_schema",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_boolean,
+        eval: eval_false,
+    },
+    ScalarFunction {
+        name: "to_regclass",
+        null_handling: NullHandling::Nullable,
+        signature: sig_text_to_integer,
+        eval: eval_to_regclass,
+    },
+    ScalarFunction {
+        name: "to_regtype",
+        null_handling: NullHandling::Nullable,
+        signature: sig_text_to_integer,
+        eval: eval_to_regtype,
+    },
+    ScalarFunction {
+        name: "pg_get_viewdef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_oid_optional_bool_to_text,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "pg_get_functiondef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_integer_to_text,
+        eval: eval_pg_get_functiondef,
+    },
+    ScalarFunction {
+        name: "pg_get_function_arguments",
+        null_handling: NullHandling::Nullable,
+        signature: sig_integer_to_text,
+        eval: eval_pg_get_function_arguments,
+    },
+    ScalarFunction {
+        name: "pg_get_function_result",
+        null_handling: NullHandling::Nullable,
+        signature: sig_integer_to_text,
+        eval: eval_pg_get_function_result,
+    },
+    ScalarFunction {
+        name: "pg_get_triggerdef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_oid_optional_bool_to_text,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "pg_get_ruledef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_oid_optional_bool_to_text,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "pg_get_partkeydef",
+        null_handling: NullHandling::Nullable,
+        signature: sig_integer_to_text,
+        eval: eval_null,
+    },
+    ScalarFunction {
+        name: "pg_function_is_visible",
+        null_handling: NullHandling::Propagate,
+        signature: sig_integer_to_boolean,
+        eval: eval_pg_function_is_visible,
+    },
+    ScalarFunction {
+        name: "oidvectortypes",
+        null_handling: NullHandling::Propagate,
+        signature: sig_text_to_text,
+        eval: eval_oidvectortypes,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -416,6 +1440,149 @@ fn sig_no_args_integer(name: &str, args: &[ArgType]) -> Result<DataType> {
 fn sig_no_args_timestamptz(name: &str, args: &[ArgType]) -> Result<DataType> {
     expect_arity(name, args, 0)?;
     Ok(DataType::TimestampTz)
+}
+
+fn sig_integer_to_text(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 1)?;
+    require_arg_type(&args[0], DataType::Integer)?;
+    Ok(DataType::Text)
+}
+
+fn sig_integer_to_integer(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 1)?;
+    require_arg_type(&args[0], DataType::Integer)?;
+    Ok(DataType::Integer)
+}
+
+fn sig_integer_to_boolean(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 1)?;
+    require_arg_type(&args[0], DataType::Integer)?;
+    Ok(DataType::Boolean)
+}
+
+fn sig_text_to_integer(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 1)?;
+    require_arg_type(&args[0], DataType::Text)?;
+    Ok(DataType::Integer)
+}
+
+fn sig_two_text_to_text(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 2)?;
+    require_arg_type(&args[0], DataType::Text)?;
+    require_arg_type(&args[1], DataType::Text)?;
+    Ok(DataType::Text)
+}
+
+fn sig_two_integers_to_text(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 2)?;
+    require_arg_type(&args[0], DataType::Integer)?;
+    require_arg_type(&args[1], DataType::Integer)?;
+    Ok(DataType::Text)
+}
+
+fn sig_format_type(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 2)?;
+    require_arg_type(&args[0], DataType::Integer)?;
+    require_arg_type(&args[1], DataType::Integer)?;
+    Ok(DataType::Text)
+}
+
+fn sig_pg_get_indexdef(name: &str, args: &[ArgType]) -> Result<DataType> {
+    if args.len() != 1 && args.len() != 3 {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects 1 or 3 arguments"),
+        ));
+    }
+    require_arg_type(&args[0], DataType::Integer)?;
+    if args.len() == 3 {
+        require_arg_type(&args[1], DataType::Integer)?;
+        require_arg_type(&args[2], DataType::Boolean)?;
+    }
+    Ok(DataType::Text)
+}
+
+fn sig_pg_get_expr(name: &str, args: &[ArgType]) -> Result<DataType> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects 2 or 3 arguments"),
+        ));
+    }
+    require_arg_type(&args[0], DataType::Text)?;
+    require_arg_type(&args[1], DataType::Integer)?;
+    if args.len() == 3 {
+        require_arg_type(&args[2], DataType::Boolean)?;
+    }
+    Ok(DataType::Text)
+}
+
+fn sig_pg_get_constraintdef(name: &str, args: &[ArgType]) -> Result<DataType> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects 1 or 2 arguments"),
+        ));
+    }
+    require_arg_type(&args[0], DataType::Integer)?;
+    if args.len() == 2 {
+        require_arg_type(&args[1], DataType::Boolean)?;
+    }
+    Ok(DataType::Text)
+}
+
+fn sig_privilege_2_or_3(name: &str, args: &[ArgType]) -> Result<DataType> {
+    sig_privilege_range(name, args, 2, 3)
+}
+
+fn sig_privilege_3_or_4(name: &str, args: &[ArgType]) -> Result<DataType> {
+    sig_privilege_range(name, args, 3, 4)
+}
+
+fn sig_privilege_range(
+    name: &str,
+    args: &[ArgType],
+    min_arity: usize,
+    max_arity: usize,
+) -> Result<DataType> {
+    if !(min_arity..=max_arity).contains(&args.len()) {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects {min_arity} to {max_arity} arguments"),
+        ));
+    }
+    for arg in args {
+        require_text_or_integer_arg(name, arg)?;
+    }
+    Ok(DataType::Boolean)
+}
+
+fn sig_obj_description(name: &str, args: &[ArgType]) -> Result<DataType> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects 1 or 2 arguments"),
+        ));
+    }
+    require_arg_type(&args[0], DataType::Integer)?;
+    if args.len() == 2 {
+        require_arg_type(&args[1], DataType::Text)?;
+    }
+    Ok(DataType::Text)
+}
+
+fn sig_oid_optional_bool_to_text(name: &str, args: &[ArgType]) -> Result<DataType> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(plan_err(
+            SqlState::SyntaxError,
+            format!("function {name} expects 1 or 2 arguments"),
+        ));
+    }
+    require_arg_type(&args[0], DataType::Integer)?;
+    if args.len() == 2 {
+        require_arg_type(&args[1], DataType::Boolean)?;
+    }
+    Ok(DataType::Text)
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +1878,148 @@ fn eval_current_setting(ctx: &StatementContext, values: &[Value]) -> Result<Valu
     Ok(Value::Text(setting))
 }
 
+fn eval_format_type(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let oid = match &values[0] {
+        Value::Null => return Ok(Value::Null),
+        value => integer_arg(value)?,
+    };
+    let typmod = match &values[1] {
+        Value::Null => -1,
+        value => integer_arg(value)?,
+    };
+    Ok(Value::Text(
+        PgType::from_oid_typmod(oid, typmod)
+            .map(|pg_type| pg_type.format_type_name())
+            .unwrap_or_else(|| "???".to_string()),
+    ))
+}
+
+fn eval_pg_get_indexdef(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let index_oid = integer_arg(&values[0])?;
+    let (column, pretty) = match values {
+        [_] => (None, false),
+        [_, column, pretty] => (Some(integer_arg(column)?), boolean_arg(pretty)?),
+        _ => return type_mismatch("pg_get_indexdef expects 1 or 3 arguments"),
+    };
+    Ok(nullable_text(
+        ctx.catalog_introspection
+            .pg_get_indexdef(index_oid, column, pretty)?,
+    ))
+}
+
+fn eval_pg_table_is_visible(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(Value::Boolean(
+        ctx.catalog_introspection
+            .pg_table_is_visible(integer_arg(&values[0])?)?,
+    ))
+}
+
+fn eval_pg_get_expr(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let expr = text_arg(&values[0])?;
+    let relation_oid = integer_arg(&values[1])?;
+    let pretty = values.get(2).map(boolean_arg).transpose()?.unwrap_or(false);
+    Ok(nullable_text(ctx.catalog_introspection.pg_get_expr(
+        expr,
+        relation_oid,
+        pretty,
+    )?))
+}
+
+fn eval_pg_get_constraintdef(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let constraint_oid = integer_arg(&values[0])?;
+    let pretty = values.get(1).map(boolean_arg).transpose()?.unwrap_or(false);
+    Ok(nullable_text(
+        ctx.catalog_introspection
+            .pg_get_constraintdef(constraint_oid, pretty)?,
+    ))
+}
+
+fn eval_pg_get_userbyid(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(nullable_text(
+        ctx.catalog_introspection
+            .pg_get_userbyid(integer_arg(&values[0])?)?,
+    ))
+}
+
+fn eval_pg_get_serial_sequence(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(nullable_text(
+        ctx.catalog_introspection
+            .pg_get_serial_sequence(text_arg(&values[0])?, text_arg(&values[1])?)?,
+    ))
+}
+
+fn eval_to_regclass(ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(nullable_int(
+        ctx.catalog_introspection
+            .to_regclass(text_arg(&values[0])?)?,
+    ))
+}
+
+fn eval_to_regtype(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(nullable_int(PgType::oid_for_name(text_arg(&values[0])?)))
+}
+
+fn eval_pg_get_functiondef(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let Some(entry) = pg_proc_catalog_entry(integer_arg(&values[0])?) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format!(
+        "CREATE FUNCTION pg_catalog.{}({}) RETURNS {} LANGUAGE sql",
+        entry.name,
+        format_function_arguments(entry),
+        format_type_oid(entry.ret_oid)
+    )))
+}
+
+fn eval_pg_get_function_arguments(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let Some(entry) = pg_proc_catalog_entry(integer_arg(&values[0])?) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format_function_arguments(entry)))
+}
+
+fn eval_pg_get_function_result(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let Some(entry) = pg_proc_catalog_entry(integer_arg(&values[0])?) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format_type_oid(entry.ret_oid)))
+}
+
+fn eval_pg_function_is_visible(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    Ok(Value::Boolean(
+        pg_proc_catalog_entry(integer_arg(&values[0])?).is_some(),
+    ))
+}
+
+fn eval_oidvectortypes(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
+    let rendered = text_arg(&values[0])?
+        .split_whitespace()
+        .map(|part| {
+            part.parse::<i64>()
+                .map(format_type_oid)
+                .unwrap_or_else(|_| "???".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Value::Text(rendered))
+}
+
+fn eval_true(_ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
+    Ok(Value::Boolean(true))
+}
+
+fn eval_false(_ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
+    Ok(Value::Boolean(false))
+}
+
+fn eval_zero(_ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
+    Ok(Value::Integer(0))
+}
+
+fn eval_null(_ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
+    Ok(Value::Null)
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers.
 // ---------------------------------------------------------------------------
@@ -745,6 +2054,90 @@ impl ExtractField {
 
 fn is_supported_extract_field(field: &str) -> bool {
     ExtractField::parse(field).is_some()
+}
+
+fn hint_candidate_types() -> &'static [DataType] {
+    static CANDIDATES: OnceLock<Vec<DataType>> = OnceLock::new();
+    CANDIDATES
+        .get_or_init(|| {
+            vec![
+                DataType::Integer,
+                DataType::Text,
+                DataType::Boolean,
+                DataType::Date,
+                DataType::Timestamp,
+                DataType::Time,
+                DataType::TimestampTz,
+                DataType::Interval,
+                DataType::Bytea,
+                DataType::Uuid,
+                DataType::Double,
+                DataType::Real,
+                DataType::Numeric {
+                    precision: None,
+                    scale: 0,
+                },
+            ]
+        })
+        .as_slice()
+}
+
+fn signature_accepts_with_fixed_arg(
+    func: &ScalarFunction,
+    arity: usize,
+    fixed_index: usize,
+    fixed_type: &DataType,
+) -> bool {
+    fn search(
+        func: &ScalarFunction,
+        arity: usize,
+        fixed_index: usize,
+        fixed_type: &DataType,
+        chosen: &mut Vec<DataType>,
+    ) -> bool {
+        if chosen.len() == arity {
+            let args: Vec<ArgType> = chosen
+                .iter()
+                .cloned()
+                .map(|data_type| ArgType {
+                    data_type,
+                    literal: None,
+                })
+                .collect();
+            return (func.signature)(func.name, &args).is_ok();
+        }
+        if chosen.len() == fixed_index {
+            chosen.push(fixed_type.clone());
+            let accepted = search(func, arity, fixed_index, fixed_type, chosen);
+            chosen.pop();
+            return accepted;
+        }
+        for candidate in hint_candidate_types() {
+            chosen.push(candidate.clone());
+            if search(func, arity, fixed_index, fixed_type, chosen) {
+                chosen.pop();
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+
+    search(func, arity, fixed_index, fixed_type, &mut Vec::new())
+}
+
+fn signature_accepts_uniform_args(
+    func: &ScalarFunction,
+    arity: usize,
+    data_type: &DataType,
+) -> bool {
+    let args: Vec<_> = (0..arity)
+        .map(|_| ArgType {
+            data_type: data_type.clone(),
+            literal: None,
+        })
+        .collect();
+    (func.signature)(func.name, &args).is_ok()
 }
 
 fn plan_err(code: SqlState, message: impl Into<String>) -> DbError {
@@ -789,6 +2182,19 @@ fn require_arg_type(arg: &ArgType, expected: DataType) -> Result<()> {
     Ok(())
 }
 
+fn require_text_or_integer_arg(name: &str, arg: &ArgType) -> Result<()> {
+    if matches!(arg.data_type, DataType::Text | DataType::Integer) {
+        return Ok(());
+    }
+    Err(plan_err(
+        SqlState::DatatypeMismatch,
+        format!(
+            "function {name} requires text or integer arguments, got {:?}",
+            arg.data_type
+        ),
+    ))
+}
+
 /// The numeric type (`Integer` or `Double`) of an argument for functions that
 /// accept either. Used both to validate (`SQRT`, `POWER`) and to carry the type
 /// through (`ABS`, `FLOOR`, `CEIL`, `ROUND`).
@@ -817,6 +2223,35 @@ fn integer_arg(value: &Value) -> Result<i64> {
     }
 }
 
+fn boolean_arg(value: &Value) -> Result<bool> {
+    match value {
+        Value::Boolean(value) => Ok(*value),
+        _ => type_mismatch("function expected a boolean argument"),
+    }
+}
+
+fn nullable_text(value: Option<String>) -> Value {
+    value.map(Value::Text).unwrap_or(Value::Null)
+}
+
+fn nullable_int(value: Option<i64>) -> Value {
+    value.map(Value::Integer).unwrap_or(Value::Null)
+}
+
+fn format_function_arguments(entry: &PgProcCatalogEntry) -> String {
+    let mut args = entry
+        .arg_oids
+        .iter()
+        .map(|oid| format_type_oid(*oid))
+        .collect::<Vec<_>>();
+    if entry.variadic_oid() != 0
+        && let Some(last) = args.last_mut()
+    {
+        *last = format!("VARIADIC {last}");
+    }
+    args.join(", ")
+}
+
 /// Read a numeric (`Integer` or `Double`) argument as `f64`.
 fn double_arg(value: &Value) -> Result<f64> {
     match value {
@@ -838,6 +2273,10 @@ fn numeric_round(value: &Value, round: fn(f64) -> f64) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::Arc};
+
+    use crate::CatalogIntrospectionProvider;
+
     use super::*;
 
     fn arg(data_type: DataType) -> ArgType<'static> {
@@ -858,6 +2297,10 @@ mod tests {
         (func.eval)(&ctx, values)
     }
 
+    fn text_value(value: &str) -> Value {
+        Value::Text(value.to_string())
+    }
+
     #[test]
     fn lookup_misses_unregistered_names() {
         assert!(lookup_scalar_function("nextval").is_none());
@@ -868,7 +2311,7 @@ mod tests {
 
     #[test]
     fn every_entry_has_a_lowercase_unique_name() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for func in SCALAR_FUNCTIONS {
             assert_eq!(
                 func.name,
@@ -878,6 +2321,129 @@ mod tests {
             );
             assert!(seen.insert(func.name), "duplicate name {}", func.name);
         }
+    }
+
+    #[test]
+    fn pg_proc_catalog_entries_stay_in_sync_with_scalar_registry() {
+        let proc_names = PG_PROC_CATALOG_ENTRIES
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<HashSet<_>>();
+        for func in SCALAR_FUNCTIONS {
+            assert!(
+                proc_names.contains(func.name),
+                "registered scalar function {} is missing from pg_proc metadata",
+                func.name
+            );
+        }
+
+        let mut oids = HashSet::new();
+        for entry in PG_PROC_CATALOG_ENTRIES {
+            assert!(
+                oids.insert(entry.oid),
+                "duplicate pg_proc oid {}",
+                entry.oid
+            );
+            assert!(
+                lookup_scalar_function(entry.name).is_some(),
+                "pg_proc metadata advertises unregistered function {}",
+                entry.name
+            );
+            assert!(
+                PgType::from_oid_typmod(entry.ret_oid, -1).is_some(),
+                "pg_proc metadata for {} has unknown return type oid {}",
+                entry.name,
+                entry.ret_oid
+            );
+            for arg_oid in entry.arg_oids {
+                assert!(
+                    PgType::from_oid_typmod(*arg_oid, -1).is_some(),
+                    "pg_proc metadata for {} has unknown arg type oid {}",
+                    entry.name,
+                    arg_oid
+                );
+            }
+            if entry.variadic_oid() != 0 {
+                assert!(
+                    entry.arg_oids.contains(&entry.variadic_oid()),
+                    "variadic pg_proc metadata for {} must include its variadic element type",
+                    entry.name
+                );
+            }
+        }
+
+        let concat = PG_PROC_CATALOG_ENTRIES
+            .iter()
+            .find(|entry| entry.name == "concat")
+            .expect("concat metadata");
+        assert_eq!(concat.variadic_oid(), PG_PROC_TEXT);
+        assert_eq!(format_function_arguments(concat), "VARIADIC text");
+        let oidvectortypes = PG_PROC_CATALOG_ENTRIES
+            .iter()
+            .find(|entry| entry.name == "oidvectortypes")
+            .expect("oidvectortypes metadata");
+        assert_eq!(oidvectortypes.arg_oids, PG_PROC_OIDVECTOR_ARGS_1);
+        assert_eq!(format_function_arguments(oidvectortypes), "oidvector");
+
+        let has_signature = |name: &str, ret_oid: i64, arg_oids: &'static [i64]| {
+            PG_PROC_CATALOG_ENTRIES.iter().any(|entry| {
+                entry.name == name && entry.ret_oid == ret_oid && entry.arg_oids == arg_oids
+            })
+        };
+        for (name, ret_oid, arg_oids) in [
+            ("abs", PG_PROC_FLOAT8, PG_PROC_FLOAT8_ARGS_1),
+            ("floor", PG_PROC_INT8, PG_PROC_INT8_ARGS_1),
+            ("ceil", PG_PROC_INT8, PG_PROC_INT8_ARGS_1),
+            ("ceiling", PG_PROC_INT8, PG_PROC_INT8_ARGS_1),
+            ("round", PG_PROC_INT8, PG_PROC_INT8_ARGS_1),
+            ("sqrt", PG_PROC_FLOAT8, PG_PROC_INT8_ARGS_1),
+            ("power", PG_PROC_FLOAT8, PG_PROC_INT8_ARGS_2),
+            ("power", PG_PROC_FLOAT8, PG_PROC_INT8_FLOAT8_ARGS),
+            ("power", PG_PROC_FLOAT8, PG_PROC_FLOAT8_INT8_ARGS),
+            ("pow", PG_PROC_FLOAT8, PG_PROC_INT8_ARGS_2),
+            ("pow", PG_PROC_FLOAT8, PG_PROC_INT8_FLOAT8_ARGS),
+            ("pow", PG_PROC_FLOAT8, PG_PROC_FLOAT8_INT8_ARGS),
+        ] {
+            assert!(
+                has_signature(name, ret_oid, arg_oids),
+                "{name} metadata should advertise {}({})",
+                format_type_oid(ret_oid),
+                arg_oids
+                    .iter()
+                    .map(|oid| format_type_oid(*oid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        for name in [
+            "has_table_privilege",
+            "has_schema_privilege",
+            "has_database_privilege",
+            "has_sequence_privilege",
+            "has_function_privilege",
+            "has_any_column_privilege",
+            "pg_has_role",
+        ] {
+            assert!(
+                PG_PROC_CATALOG_ENTRIES.iter().any(|entry| {
+                    entry.name == name && entry.arg_oids == PG_PROC_PRIV_OID_ARGS_2
+                }),
+                "{name} metadata should advertise the two-argument OID overload"
+            );
+            assert!(
+                PG_PROC_CATALOG_ENTRIES.iter().any(|entry| {
+                    entry.name == name && entry.arg_oids == PG_PROC_PRIV_OID_ARGS_3
+                }),
+                "{name} metadata should advertise the three-argument OID overload"
+            );
+        }
+        assert!(PG_PROC_CATALOG_ENTRIES.iter().any(|entry| {
+            entry.name == "has_column_privilege" && entry.arg_oids == PG_PROC_COLUMN_PRIV_OID_ARGS_3
+        }));
+        assert!(PG_PROC_CATALOG_ENTRIES.iter().any(|entry| {
+            entry.name == "has_column_privilege" && entry.arg_oids == PG_PROC_COLUMN_PRIV_OID_ARGS
+        }));
     }
 
     #[test]
@@ -893,6 +2459,11 @@ mod tests {
         assert!(!concat.result_nullable([true, true]));
         let version = lookup_scalar_function("version").unwrap();
         assert!(!version.result_nullable([]));
+
+        let to_regclass = lookup_scalar_function("to_regclass").unwrap();
+        assert!(to_regclass.result_nullable([false]));
+        let format_type = lookup_scalar_function("format_type").unwrap();
+        assert!(format_type.result_nullable([false, true]));
     }
 
     #[test]
@@ -1007,6 +2578,247 @@ mod tests {
                 .unwrap_err()
                 .code,
             SqlState::SyntaxError
+        );
+    }
+
+    #[test]
+    fn introspection_function_signatures_and_hints() {
+        assert_eq!(
+            result_type(
+                "format_type",
+                &[arg(DataType::Integer), arg(DataType::Integer)]
+            )
+            .unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            result_type(
+                "pg_get_indexdef",
+                &[
+                    arg(DataType::Integer),
+                    arg(DataType::Integer),
+                    arg(DataType::Boolean),
+                ]
+            )
+            .unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            result_type(
+                "has_table_privilege",
+                &[
+                    arg(DataType::Text),
+                    arg(DataType::Integer),
+                    arg(DataType::Text),
+                ]
+            )
+            .unwrap(),
+            DataType::Boolean
+        );
+        assert_eq!(
+            result_type(
+                "has_table_privilege",
+                &[
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                ]
+            )
+            .unwrap_err()
+            .code,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            result_type(
+                "has_column_privilege",
+                &[
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                    arg(DataType::Text),
+                ]
+            )
+            .unwrap(),
+            DataType::Boolean
+        );
+        assert_eq!(
+            result_type(
+                "has_column_privilege",
+                &[arg(DataType::Text), arg(DataType::Text)]
+            )
+            .unwrap_err()
+            .code,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            result_type("pg_function_is_visible", &[arg(DataType::Integer)]).unwrap(),
+            DataType::Boolean
+        );
+        assert_eq!(
+            result_type("oidvectortypes", &[arg(DataType::Text)]).unwrap(),
+            DataType::Text
+        );
+        assert_eq!(
+            result_type("format_type", &[arg(DataType::Integer)])
+                .unwrap_err()
+                .code,
+            SqlState::SyntaxError
+        );
+        assert_eq!(
+            scalar_function_arg_hint("format_type", 2, 1),
+            Some(DataType::Integer)
+        );
+        assert_eq!(
+            scalar_function_arg_hint("pg_get_expr", 3, 2),
+            Some(DataType::Boolean)
+        );
+        assert_eq!(
+            scalar_function_arg_hint("current_setting", 1, 0),
+            Some(DataType::Text)
+        );
+        assert_eq!(
+            scalar_function_arg_hint("concat", 5, 4),
+            Some(DataType::Text)
+        );
+        assert_eq!(scalar_function_arg_hint("pg_get_functiondef", 2, 1), None);
+        assert_eq!(scalar_function_arg_hint("abs", 1, 0), None);
+        assert_eq!(scalar_function_arg_hint("extract", 2, 1), None);
+        assert_eq!(scalar_function_arg_hint("format_type", 1, 0), None);
+    }
+
+    #[derive(Debug)]
+    struct TestIntrospection;
+
+    impl CatalogIntrospectionProvider for TestIntrospection {
+        fn pg_get_indexdef(
+            &self,
+            index_oid: i64,
+            column: Option<i64>,
+            pretty: bool,
+        ) -> Result<Option<String>> {
+            Ok(Some(format!(
+                "index={index_oid} column={column:?} pretty={pretty}"
+            )))
+        }
+
+        fn pg_get_constraintdef(
+            &self,
+            constraint_oid: i64,
+            pretty: bool,
+        ) -> Result<Option<String>> {
+            Ok(Some(format!("constraint={constraint_oid} pretty={pretty}")))
+        }
+
+        fn pg_get_userbyid(&self, role_oid: i64) -> Result<Option<String>> {
+            Ok((role_oid == 10).then(|| "alice".to_string()))
+        }
+
+        fn pg_table_is_visible(&self, relation_oid: i64) -> Result<bool> {
+            Ok(relation_oid == 42)
+        }
+
+        fn to_regclass(&self, name: &str) -> Result<Option<i64>> {
+            Ok((name == "users").then_some(42))
+        }
+
+        fn pg_get_serial_sequence(&self, table: &str, column: &str) -> Result<Option<String>> {
+            Ok((table == "users" && column == "id").then(|| "users_id_seq".to_string()))
+        }
+    }
+
+    #[test]
+    fn introspection_evaluators_use_context_provider() {
+        let ctx = StatementContext::new(0).with_catalog_introspection(Arc::new(TestIntrospection));
+        let func = |name: &str, values: &[Value]| {
+            let func = lookup_scalar_function(name).expect("registered function");
+            (func.eval)(&ctx, values).unwrap()
+        };
+
+        assert_eq!(
+            func("format_type", &[Value::Integer(23), Value::Integer(-1)]),
+            Value::Text("integer".to_string())
+        );
+        assert_eq!(
+            func("format_type", &[Value::Integer(23), Value::Null]),
+            Value::Text("integer".to_string())
+        );
+        assert_eq!(
+            func("format_type", &[Value::Null, Value::Integer(-1)]),
+            Value::Null
+        );
+        assert_eq!(
+            func(
+                "pg_get_indexdef",
+                &[Value::Integer(7), Value::Integer(1), Value::Boolean(true)]
+            ),
+            Value::Text("index=7 column=Some(1) pretty=true".to_string())
+        );
+        assert_eq!(
+            func("pg_table_is_visible", &[Value::Integer(42)]),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            func("pg_get_constraintdef", &[Value::Integer(9)]),
+            Value::Text("constraint=9 pretty=false".to_string())
+        );
+        assert_eq!(
+            func("pg_get_userbyid", &[Value::Integer(10)]),
+            Value::Text("alice".to_string())
+        );
+        assert_eq!(
+            func(
+                "pg_get_serial_sequence",
+                &[text_value("users"), text_value("id")]
+            ),
+            Value::Text("users_id_seq".to_string())
+        );
+        assert_eq!(
+            func("to_regclass", &[text_value("users")]),
+            Value::Integer(42)
+        );
+        assert_eq!(
+            func("to_regtype", &[text_value("integer")]),
+            Value::Integer(23)
+        );
+        assert_eq!(
+            func("to_regtype", &[text_value("_oid")]),
+            Value::Integer(1028)
+        );
+        assert_eq!(
+            func("pg_get_function_arguments", &[Value::Integer(14_022)]),
+            Value::Text("oid, integer".to_string())
+        );
+        assert_eq!(
+            func("pg_get_function_result", &[Value::Integer(14_022)]),
+            Value::Text("text".to_string())
+        );
+        assert_eq!(
+            func("pg_get_functiondef", &[Value::Integer(14_022)]),
+            Value::Text(
+                "CREATE FUNCTION pg_catalog.format_type(oid, integer) RETURNS text LANGUAGE sql"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            func("pg_function_is_visible", &[Value::Integer(14_022)]),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            func("pg_function_is_visible", &[Value::Integer(999_999)]),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            func("oidvectortypes", &[text_value("20 25")]),
+            Value::Text("bigint, text".to_string())
+        );
+        assert_eq!(func("obj_description", &[Value::Integer(1)]), Value::Null);
+        assert_eq!(
+            func(
+                "has_table_privilege",
+                &[Value::Integer(42), text_value("select")]
+            ),
+            Value::Boolean(true)
         );
     }
 

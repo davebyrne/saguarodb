@@ -816,6 +816,7 @@ fn rewrite_aggregate_expr(
             name,
             args,
             data_type,
+            pg_type,
             nullable,
         } => Ok(BoundExpr::Function {
             name: name.clone(),
@@ -824,6 +825,7 @@ fn rewrite_aggregate_expr(
                 .map(|arg| rewrite_aggregate_expr(arg, group_by, aggregates))
                 .collect::<Result<Vec<_>>>()?,
             data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
             nullable: *nullable,
         }),
         BoundExpr::Setval {

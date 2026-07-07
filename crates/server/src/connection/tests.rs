@@ -5,10 +5,13 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use common::{ErrorKind, IsolationLevel, Result, SqlState};
+use common::{
+    ColumnInfo, DataType, ErrorKind, IsolationLevel, PgType, Result, Row, SqlState, Value,
+};
 
 use super::{
-    StreamOutcome, TransactionState, handle_connection, sqlstate_code, streamed_task_result,
+    StreamOutcome, TransactionState, encode_row, handle_connection, resolve_result_formats,
+    sqlstate_code, streamed_task_result,
 };
 use crate::app::AppState;
 
@@ -22,6 +25,46 @@ fn transaction_state_maps_to_postgres_status_byte() {
 #[test]
 fn program_limit_exceeded_maps_to_sqlstate_54000() {
     assert_eq!(sqlstate_code(SqlState::ProgramLimitExceeded), "54000");
+}
+
+#[test]
+fn catalog_vector_and_array_results_stay_text_when_binary_is_requested() {
+    let columns = vec![
+        ColumnInfo {
+            name: "indkey".to_string(),
+            data_type: DataType::Text,
+            table_id: None,
+            column_id: None,
+            pg_type: Some(PgType::Int2Vector),
+        },
+        ColumnInfo {
+            name: "conkey".to_string(),
+            data_type: DataType::Text,
+            table_id: None,
+            column_id: None,
+            pg_type: Some(PgType::Int2Array),
+        },
+        ColumnInfo {
+            name: "n".to_string(),
+            data_type: DataType::Integer,
+            table_id: None,
+            column_id: None,
+            pg_type: Some(PgType::Int4),
+        },
+    ];
+    assert_eq!(resolve_result_formats(&[1], &columns), vec![0, 0, 1]);
+
+    let row = Row {
+        values: vec![
+            Value::Text("1 2".to_string()),
+            Value::Text("{1,2}".to_string()),
+            Value::Integer(7),
+        ],
+    };
+    let encoded = encode_row(&row, &columns, &[1]).unwrap();
+    assert_eq!(encoded[0], Some(b"1 2".to_vec()));
+    assert_eq!(encoded[1], Some(b"{1,2}".to_vec()));
+    assert_eq!(encoded[2], Some(7i32.to_be_bytes().to_vec()));
 }
 
 #[tokio::test]
@@ -678,6 +721,127 @@ async fn extended_protocol_accepts_int4_parameter_oid_and_echoes_it() {
     client.write_all(&seq).await.unwrap();
     let response = read_until_ready(&mut client).await;
     assert!(response.windows(3).any(|w| w == b"Ada"), "row value");
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+/// Catalog probes commonly declare parameters as `oid` (OID 26). The binder
+/// treats it as SaguaroDB's integer storage type, but the protocol must still
+/// accept and echo the OID wire identity and decode binary OIDs as unsigned
+/// 32-bit values.
+#[tokio::test]
+async fn extended_protocol_accepts_oid_parameter_oid_and_binary_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut seq = parse_bytes("", "select $1", &[26]);
+    seq.extend(describe_statement_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b'1', 0, 0, 0, 4]),
+        "ParseComplete (oid OID accepted)"
+    );
+    assert!(
+        response.windows(6).any(|w| w == [0, 1, 0, 0, 0, 26]),
+        "ParameterDescription echoes oid OID 26"
+    );
+    assert!(
+        response
+            .windows(12)
+            .any(|w| w == [0, 0, 0, 26, 0, 4, 255, 255, 255, 255, 0, 0]),
+        "RowDescription reports selected oid parameter as oid"
+    );
+
+    let oid = 4_000_000_000u32.to_be_bytes();
+    let mut seq = bind_bytes("", "", &[1], &[Some(&oid[..])], &[1]);
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response
+            .windows(8)
+            .any(|w| w == [0, 0, 0, 4, 0xee, 0x6b, 0x28, 0x00]),
+        "binary oid result encodes as unsigned 32-bit value"
+    );
+
+    let mut seq = parse_bytes("", "select pg_table_is_visible($1)", &[0]);
+    seq.extend(describe_statement_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(6).any(|w| w == [0, 1, 0, 0, 0, 26]),
+        "ParameterDescription infers oid OID 26 for catalog function argument"
+    );
+
+    let oid = 4_000_000_000u32.to_be_bytes();
+    let mut seq = bind_bytes("", "", &[1], &[Some(&oid[..])], &[0]);
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(7).any(|w| w == [0, 1, 0, 0, 0, 1, b'f']),
+        "inferred oid parameter decodes binary unsigned value and returns false"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_accepts_catalog_vector_parameter_oids_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut seq = parse_bytes("", "select oidvectortypes($1)", &[30]);
+    seq.extend(describe_statement_bytes(""));
+    seq.extend(bind_bytes("", "", &[0], &[Some(b"23 26")], &[0]));
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(6).any(|w| w == [0, 1, 0, 0, 0, 30]),
+        "ParameterDescription echoes oidvector OID 30"
+    );
+    assert!(
+        response.windows(12).any(|w| w == b"integer, oid"),
+        "oidvector parameter is decoded as text-backed catalog value"
+    );
+
+    let mut seq = bind_bytes("", "", &[1], &[Some(b"23 26")], &[0]);
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(21).any(|w| w == b"binary catalog vector"),
+        "binary catalog vector parameter is rejected"
+    );
 
     client.write_all(&terminate_bytes()).await.unwrap();
     server.await.unwrap();

@@ -28,7 +28,7 @@ use super::{
 pub(super) fn bind_query(
     catalog: &dyn CatalogManager,
     query: &Query,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
 ) -> Result<BoundQuery> {
@@ -110,7 +110,7 @@ fn bind_set_op_arms(
     catalog: &dyn CatalogManager,
     left: &Query,
     right: &Query,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
 ) -> Result<(BoundQuery, BoundQuery)> {
@@ -155,7 +155,7 @@ fn bind_ctes(
     catalog: &dyn CatalogManager,
     with: &[Cte],
     enclosing: &CteScope,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<CteScope> {
     let mut scope = enclosing.clone();
     let base = scope.ctes.len();
@@ -180,7 +180,7 @@ fn bind_cte(
     catalog: &dyn CatalogManager,
     cte: &Cte,
     scope: &CteScope,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<CteBinding> {
     let query = bind_query(catalog, &cte.query, declared, scope, None)?;
     let columns = derive_alias_columns(&query.output_columns(), &cte.column_aliases, || {
@@ -346,7 +346,7 @@ fn bind_output_order_by(
 fn bind_values(
     catalog: &dyn CatalogManager,
     rows: &[Vec<Expr>],
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
 ) -> Result<BoundValues> {
@@ -430,7 +430,7 @@ fn bind_select(
     catalog: &dyn CatalogManager,
     select: &Select,
     order_by: &[OrderByItem],
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
@@ -1333,6 +1333,14 @@ fn output_pg_type(ctx: &BindContext, expr: &BoundExpr) -> PgType {
             .map(ColumnDef::wire_type)
             .unwrap_or_else(|| PgType::from(data_type)),
         BoundExpr::Cast { pg_type, .. } => pg_type.clone(),
+        BoundExpr::Parameter {
+            pg_type: Some(pg_type),
+            ..
+        }
+        | BoundExpr::Function {
+            pg_type: Some(pg_type),
+            ..
+        } => pg_type.clone(),
         other => PgType::from(&other.data_type()),
     }
 }

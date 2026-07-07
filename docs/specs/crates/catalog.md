@@ -88,6 +88,12 @@ pub enum SystemView {
     PgAttribute,
     PgType,
     PgIndex,
+    PgProc,
+    PgConstraint,
+    PgAttrdef,
+    PgDepend,
+    PgDatabase,
+    PgRoles,
     PgSettings,
     PgStatActivity,
     InformationSchemaSchemata,
@@ -105,20 +111,33 @@ bare-name fallback rule. Qualified `pg_catalog.<view>` and
 `public` is not a system schema.
 
 Virtual OIDs are deterministic and derived rather than persisted. User-object
-OIDs use tagged `i64` spaces (`tag << 40 | durable_id`) so the full `u32`
-durable ID domains remain disjoint:
+OIDs use tagged 32-bit-compatible spaces (`tag << 28 | payload`) so catalog OID
+columns can report PostgreSQL `oid` (OID 26) and still encode in binary protocol
+as unsigned 32-bit values:
 
 - schemas: `pg_catalog = 11`, `public = 2200`, `information_schema = 13000`;
 - user tables: tag `1`;
 - user indexes, including primary-key and unique constraint indexes: tag `2`;
 - user sequences: tag `3`;
+- fallback synthetic primary-key indexes: tag `4`;
+- derived constraints and column defaults use separate deterministic tagged
+  spaces over `(table_id, local_object_id)`;
 - core system views use stable PostgreSQL OIDs where practical, otherwise
   project-reserved constants.
 
-OID-like catalog columns use existing integer semantic types with `int8` wire
-presentation so tagged virtual OIDs stay representable. `name`/`char`/`int2vector`-
-like columns use text presentation types. These are wire-shape approximations only;
-they do not introduce new storage or semantic types.
+The tag scheme reserves 28 payload bits. Table, index, sequence, and synthetic
+primary-key-index virtual OIDs reject installed object IDs above that payload
+range instead of truncating them. Derived constraint/default OIDs split the
+payload into a table-id portion and a local-object-id portion; catalog validation
+rejects objects outside that deterministic injective range rather than hashing
+or masking IDs into colliding OIDs.
+
+OID-like catalog columns use existing integer semantic types with PostgreSQL
+`oid` wire presentation. `name`/`char` values still use text semantics; vector
+and array catalog fields such as `pg_index.indkey`, `pg_proc.proargtypes`, and
+`pg_constraint.conkey` use text storage with PostgreSQL-compatible wire identities
+(`int2vector`, `oidvector`, `int2[]`, `oid[]`) where SaguaroDB has no first-class
+array/vector value type yet.
 
 ## Public API
 
@@ -286,39 +305,58 @@ Methods return owned schema copies. The catalog is stored behind an `RwLock`. `s
 
 The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
 
-User views share the table-id relation namespace and user relation-name
-namespace with tables, but they are stored in separate `views_by_*` maps so
-storage startup installs only physical relations. `create_view` assigns dense
-output column IDs, stores canonical SQL text plus dependency metadata, and starts
-`schema_version` at `1`; `replace_view` increments the view schema version and
-revalidates dependencies. View dependencies may target user tables only. A
-dependency with `all_columns = true` blocks column-level schema evolution for
-that relation; named dependencies block only those columns.
+User tables, user views, user-visible indexes (secondary, unique constraint, and
+primary-key constraint indexes), public sequences, and primary-key auto-names
+(`<relation>_pkey`) share the public relation-name namespace exposed through
+`pg_class` and `to_regclass`. Creating or applying any one of those objects
+rejects names already held by any other public relation kind with
+`SqlState::DuplicateTable`. User views share the table-id relation namespace
+with tables but are stored in separate `views_by_*` maps so storage startup
+installs only physical relations. Hidden TOAST relations are installed by ID only
+and are outside that user-visible namespace.
 
-`apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical `TableSchema`, rejects conflicting IDs, rejects conflicting names for user tables, rejects duplicate live table/TOAST `storage_id`s, adds only user tables to the name map, and advances `next_table_id` to at least `schema.id + 1` and `next_storage_id` past `schema.storage_id`. Hidden TOAST relations are installed by ID only and never inserted into `tables_by_name`. `reserve_table_id(id)` advances `next_table_id` to at least `id + 1` without installing a schema. Neither method reassigns table or column IDs. `apply_drop_table` removes an existing schema by ID without assigning IDs; dropping a user table also removes its linked hidden TOAST relation metadata and that relation's indexes, while directly dropping a linked hidden TOAST relation is rejected as catalog corruption. A missing ID returns `SqlState::UndefinedTable`.
+`apply_create_table` and `apply_drop_table` are recovery-only APIs.
+`apply_create_table` inserts a fully assigned historical `TableSchema`, rejects
+conflicting IDs and public relation names for user tables, rejects duplicate
+live table/TOAST `storage_id`s, adds only user tables to the name map, and
+advances `next_table_id` to at least `schema.id + 1` and `next_storage_id` past
+`schema.storage_id`. Hidden TOAST relations are installed by ID only and never
+inserted into `tables_by_name`. `reserve_table_id(id)` advances `next_table_id`
+to at least `id + 1` without installing a schema. Neither method reassigns table
+or column IDs. `apply_drop_table` removes an existing schema by ID without
+assigning IDs; dropping a user table also removes its linked hidden TOAST
+relation metadata and that relation's indexes, while directly dropping a linked
+hidden TOAST relation is rejected as catalog corruption. A missing ID returns
+`SqlState::UndefinedTable`.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them under the DDL guard before scanning rows. The server treats ADD/DROP COLUMN as potentially rewriting when taking its snapshot-exclusion fence because a conditional no-op decision can race with another DDL before the exclusive guard is acquired. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `rename_table` and `rename_table_column` reject dependent views and stored CHECK expressions so stored SQL text cannot become stale. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
 
 `create_view`, `replace_view`, `apply_create_view`, `apply_replace_view`, `drop_view`, and `apply_drop_view` manage durable user-view metadata. Creating a view allocates from `next_table_id`, rejects relation-name/id collisions with tables or views, stores dense output columns from `ViewColumn` (including result nullability and wire type), stores canonical SQL text, validates dependencies, and starts `schema_version = 1`. View dependencies may target user tables only; dependencies on views or hidden TOAST relations are rejected to avoid dependency cycles while view expansion remains single-level for stored view definitions. `replace_view` keeps the existing id/name and increments `schema_version`. Dropping a view is rejected while another view depends on it. `list_views` returns views ordered by id.
 
 `create_index` resolves the table and column names, assigns an `IndexId` plus a
-fresh `storage_id`, and returns the stored `IndexSchema`; `drop_index` removes
-an index by ID, returning `SqlState::UndefinedTable` for a missing ID (indexes
-share the relation namespace, so there is no dedicated SQLSTATE).
+fresh `storage_id`, and returns the stored `IndexSchema`; duplicate names
+include names already used by any public relation kind and names reserved for
+primary-key auto-names exposed through PostgreSQL-compatible catalogs. Creating
+or applying a table with a primary key is likewise rejected when its
+`<relation>_pkey` auto-name would collide with any public relation. `drop_index`
+removes an index by ID, returning `SqlState::UndefinedTable` for a missing ID
+(indexes share the relation namespace, so there is no dedicated SQLSTATE).
 `apply_create_index` and `apply_drop_index` are the matching recovery-only APIs:
 `apply_create_index` inserts a fully assigned historical `IndexSchema`, rejects
-conflicting names, IDs, or live secondary-index `storage_id`s, and advances `next_index_id` to at
-least `schema.id + 1` and `next_storage_id` past `schema.storage_id`;
+conflicting public relation names, IDs, or live secondary-index `storage_id`s,
+and advances `next_index_id` to at least `schema.id + 1` and `next_storage_id`
+past `schema.storage_id`;
 `reserve_index_id(id)` advances `next_index_id` to at least `id + 1` without
 installing a schema; `apply_drop_index` removes an existing index by ID.
 `list_indexes_for_table` returns a table's indexes ordered by ID and is how
 storage learns which indexes to maintain on DML.
 
 `create_sequence` validates and normalizes sequence options, assigns a
-`SequenceId`, stores a `SequenceSchema`, and returns it. A duplicate sequence
-name or ID returns `SqlState::DuplicateTable`; a missing sequence on drop returns
-`SqlState::UndefinedTable`; dropping a sequence still referenced by a column
-`ColumnDefault::Nextval` returns `SqlState::DependentObjectsStillExist` (`2BP01`).
+`SequenceId`, stores a `SequenceSchema`, and returns it. A duplicate public
+relation name or duplicate sequence ID returns `SqlState::DuplicateTable`; a
+missing sequence on drop returns `SqlState::UndefinedTable`; dropping a sequence
+still referenced by a column `ColumnDefault::Nextval` returns
+`SqlState::DependentObjectsStillExist` (`2BP01`).
 `apply_create_sequence` / `apply_drop_sequence` are the recovery-only APIs for
 historical sequence schemas, and
 `reserve_sequence_id(id)` advances `next_sequence_id` to at least `id + 1`
@@ -380,7 +418,9 @@ owned-sequence-default columns.
 
 ## Create Table Rules
 
-- Table name must be unique; a duplicate name returns `SqlState::DuplicateTable`.
+- Table name must be unique across the public relation namespace (user tables,
+  secondary indexes, sequences, and synthetic primary-key index rows); a duplicate
+  name returns `SqlState::DuplicateTable`.
 - Column names must be unique within table; duplicate column definitions return `SqlState::SyntaxError`.
 - A primary key is optional. If present, primary-key column names must exist.
 - Duplicate primary-key column names return `SqlState::SyntaxError`.
@@ -414,8 +454,8 @@ owned-sequence-default columns.
 
 ## Create Sequence Rules
 
-- Sequence name must be unique among sequences; a duplicate returns
-  `SqlState::DuplicateTable`.
+- Sequence name must be unique across the public relation namespace; a duplicate
+  returns `SqlState::DuplicateTable`.
 - `increment` must be nonzero.
 - For ascending sequences (`increment > 0`), omitted `MINVALUE` defaults to `1`,
   omitted `MAXVALUE` defaults to `i64::MAX`, and omitted `START` defaults to the
@@ -434,7 +474,9 @@ owned-sequence-default columns.
 
 ## Create Index Rules
 
-- Index name must be unique among indexes (indexes have their own name space, separate from tables); a duplicate index name returns `SqlState::DuplicateTable`, the same code reused for the shared relation namespace.
+- Index name must be unique across the public relation namespace; a duplicate
+  index name returns `SqlState::DuplicateTable`, the same code reused for the
+  shared relation namespace.
 - The target table must exist; otherwise `SqlState::UndefinedTable`.
 - Index column names must exist on the target table; otherwise `SqlState::UndefinedColumn`.
 - Duplicate index column names and an empty column list return `SqlState::SyntaxError`.
@@ -461,7 +503,7 @@ On startup:
 
 Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
 
-`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every table name index entry to point at an existing user-table schema with the same name and ID, every user-table schema to have a reverse name index entry, every hidden TOAST relation to be stored by ID only (not in the name index), every view name index entry to point at an existing view schema with the same name and ID, no table and view to share a relation name or relation id, nonzero table/view schema versions, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, every primary-key column ID to exist, every primary-key column to be non-null, no duplicate primary-key column, and `next_table_id >= max(table_or_view_id) + 1`. View validation additionally requires at least one output column, dense output column IDs, unique output column names, no column defaults on view output columns, non-empty SQL definition text, no self-dependency, no duplicate dependency entries, every dependency relation to exist, no dependency on a view or hidden TOAST relation, no dependency with both `all_columns = true` and named columns, and every named dependency column to exist. TOAST policy validation requires every table's `toast.tuple_target` to be in `ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET`, `toast.min_value_size >= ToastOptions::MIN_TOAST_MIN_VALUE_SIZE`, every user table with TOAST enabled to name an existing hidden TOAST relation, every hidden TOAST relation to point back to the owning user table without recursively naming another TOAST relation, and every hidden TOAST relation to match `common::toast_schema(base, toast_id)` exactly except for its storage id (name, columns, primary key, compression disabled, no nested TOAST metadata). Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, primary-key constraint indexes to be unique and to match the table's primary-key column list, every user table with a non-empty primary key to have exactly one primary-key constraint index, and `next_index_id >= max(index_id) + 1`. Storage-id validation requires every live table and secondary index to have a nonzero storage id, no storage id to contain file-kind high bits, no duplicate storage ids among live table/TOAST relations, no duplicate storage ids among live secondary indexes, and `next_storage_id` to be greater than every live storage id (or equal to the one-past-end sentinel after exhaustion). Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)` or `toast.active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id` and `next_storage_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
+`restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every table name index entry to point at an existing user-table schema with the same name and ID, every user-table schema to have a reverse name index entry, every hidden TOAST relation to be stored by ID only (not in the name index), every view name index entry to point at an existing view schema with the same name and ID, no table and view to share a relation name or relation id, nonzero table/view schema versions, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, every primary-key column ID to exist, every primary-key column to be non-null, no duplicate primary-key column, table IDs/default-column IDs/CHECK counts to fit the virtual catalog OID encoding limits, and `next_table_id >= max(table_or_view_id) + 1`. View validation additionally requires at least one output column, dense output column IDs, unique output column names, no column defaults on view output columns, non-empty SQL definition text, no self-dependency, no duplicate dependency entries, every dependency relation to exist, no dependency on a view or hidden TOAST relation, no dependency with both `all_columns = true` and named columns, and every named dependency column to exist. TOAST policy validation requires every table's `toast.tuple_target` to be in `ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET`, `toast.min_value_size >= ToastOptions::MIN_TOAST_MIN_VALUE_SIZE`, every user table with TOAST enabled to name an existing hidden TOAST relation, every hidden TOAST relation to point back to the owning user table without recursively naming another TOAST relation, and every hidden TOAST relation to match `common::toast_schema(base, toast_id)` exactly except for its storage id (name, columns, primary key, compression disabled, no nested TOAST metadata). Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, primary-key constraint indexes to be unique and to match the table's primary-key column list, every user table with a non-empty primary key to have exactly one primary-key constraint index, and `next_index_id >= max(index_id) + 1`. Storage-id validation requires every live table and secondary index to have a nonzero storage id, no storage id to contain file-kind high bits, no duplicate storage ids among live table/TOAST relations, no duplicate storage ids among live secondary indexes, and `next_storage_id` to be greater than every live storage id (or equal to the one-past-end sentinel after exhaustion). Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. After per-kind validation succeeds, the same public relation namespace rule used by runtime DDL is enforced across user table names, user view names, user-visible index names, public sequence names, and primary-key auto-names; hidden TOAST names and their helper names remain outside that namespace. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)` or `toast.active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id` and `next_storage_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
 
 ## WAL Interaction
 

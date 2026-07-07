@@ -491,10 +491,12 @@ fn eval_function(
         )));
     };
     // Apply the function's NULL policy before evaluating. NeverNull functions
-    // (CONCAT, the system information functions) are evaluated even when an
-    // argument is NULL — CONCAT ignores NULLs, the system functions take none.
-    if matches!(func.null_handling, common::NullHandling::Propagate)
-        && values.iter().any(|value| matches!(value, Value::Null))
+    // (CONCAT, the system information functions) and EvaluateNullable functions
+    // (for example `format_type`) are evaluated even when an argument is NULL.
+    if matches!(
+        func.null_handling,
+        common::NullHandling::Propagate | common::NullHandling::Nullable
+    ) && values.iter().any(|value| matches!(value, Value::Null))
     {
         return Ok(Value::Null);
     }

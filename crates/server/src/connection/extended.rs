@@ -9,7 +9,7 @@ use crate::query::{PreparedStatement, STREAM_CHANNEL_CAPACITY, StreamMessage, St
 
 use super::{
     Portal, Session, TransactionState, command_complete_tag, encode_row, error_response,
-    protocol_error, resolve_format, streamed_task_result, write_messages,
+    protocol_error, resolve_format, resolve_result_formats, streamed_task_result, write_messages,
 };
 
 impl Session {
@@ -287,10 +287,12 @@ impl Session {
 }
 
 /// Map a client-declared parameter type OID to its wire type. Accepts the
-/// distinct integer widths (int2/int4/int8) and character kinds
-/// (text/varchar/bpchar); `0` is the unspecified marker (the server infers the
-/// type). The wire type is remembered so `ParameterDescription` can echo the
-/// exact OID the client declared, and its `DataType` drives binding/decoding.
+/// exposed PostgreSQL wire identities; `0` is the unspecified marker (the server
+/// infers the type). Text-backed catalog vector/array identities are accepted so
+/// catalog-driven probes can feed `pg_proc.proargtypes` back into Parse, though
+/// they still decode through the collapsed text storage type. The wire type is
+/// remembered so `ParameterDescription` can echo the exact OID the client
+/// declared, and its `DataType` drives binding/decoding.
 fn oid_to_pg_type(oid: i32) -> Result<Option<PgType>> {
     let pg_type = match oid {
         0 => return Ok(None),
@@ -298,10 +300,15 @@ fn oid_to_pg_type(oid: i32) -> Result<Option<PgType>> {
         17 => PgType::Bytea,
         20 => PgType::Int8,
         21 => PgType::Int2,
+        22 => PgType::Int2Vector,
         23 => PgType::Int4,
         25 => PgType::Text,
+        26 => PgType::Oid,
+        30 => PgType::OidVector,
         700 => PgType::Float4,
         701 => PgType::Float8,
+        1005 => PgType::Int2Array,
+        1028 => PgType::OidArray,
         1042 => PgType::Bpchar(None),
         1043 => PgType::Varchar(None),
         1082 => PgType::Date,
@@ -341,9 +348,9 @@ fn decode_bind_params(
         .enumerate()
         .map(|(index, raw)| match raw {
             None => Ok(Value::Null),
-            Some(bytes) => protocol::decode_value(
+            Some(bytes) => protocol::decode_value_with_type(
                 bytes,
-                types[index].data_type(),
+                &types[index],
                 resolve_format(param_formats, index),
             ),
         })
@@ -353,17 +360,11 @@ fn decode_bind_params(
 fn row_description_or_no_data(columns: Option<&[ColumnInfo]>, formats: &[i16]) -> ServerMessage {
     match columns {
         Some(columns) => ServerMessage::RowDescription {
-            formats: resolve_formats(formats, columns.len()),
+            formats: resolve_result_formats(formats, columns),
             columns: columns.to_vec(),
         },
         None => ServerMessage::NoData,
     }
-}
-
-fn resolve_formats(formats: &[i16], count: usize) -> Vec<i16> {
-    (0..count)
-        .map(|index| resolve_format(formats, index))
-        .collect()
 }
 
 /// Encode a batch of streamed result rows as `DataRow` messages in the portal's

@@ -28,23 +28,40 @@ pub fn bind_parameterized(
     catalog: &dyn CatalogManager,
     declared_param_types: &[Option<DataType>],
 ) -> Result<(BoundStatement, Vec<DataType>)>;
+pub fn bind_parameterized_with_pg_types(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared_param_types: &[Option<PgType>],
+) -> Result<(BoundStatement, Vec<DataType>)>;
 pub fn collect_param_types(
     statement: &BoundStatement,
     declared: &[Option<DataType>],
 ) -> Result<Vec<DataType>>;
+pub fn collect_param_pg_types(
+    statement: &BoundStatement,
+    resolved_data_types: &[DataType],
+    declared: &[Option<PgType>],
+) -> Result<Vec<PgType>>;
 pub fn substitute_params(statement: &BoundStatement, params: &[Value]) -> Result<BoundStatement>;
 pub fn logical_plan(bound: &BoundStatement) -> Result<LogicalPlan>;
 pub fn physical_plan(logical: &LogicalPlan, catalog: &dyn CatalogManager) -> Result<PhysicalPlan>;
 ```
 
 `bind` is the simple-query entry point and rejects `$n` parameters with `SqlState::SyntaxError`. `bind_parameterized`
-binds an extended-protocol statement, resolving each parameter's type from the
-`Parse`-declared OID when given, otherwise inferring it from context (like a `NULL`
-literal); it returns the bound statement and the resolved parameter types by position.
+binds an extended-protocol statement from collapsed declared `DataType`s.
+`bind_parameterized_with_pg_types` is the server-facing variant: it resolves each
+parameter's semantic type from the `Parse`-declared `PgType` when given,
+otherwise inferring it from context (like a `NULL` literal), while preserving the
+declared `PgType` for result metadata when a parameter is selected. It also keeps
+unambiguous `pg_proc` argument wire hints on placeholders, so
+`collect_param_pg_types` can report inferred catalog OID parameters as PostgreSQL
+`oid` rather than collapsed `int8`. Both variants return the bound statement and
+the resolved parameter data types by position.
 `substitute_params` replaces each `BoundExpr::Parameter` with a type-checked literal of
-the bound value before planning and execution. `collect_param_types` and
-`substitute_params` live in the crate's `params` module and are re-exported from the
-crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
+the bound value before planning and execution. `collect_param_types`,
+`collect_param_pg_types`, and `substitute_params` live in the crate's `params`
+module and are re-exported from the crate root; `bind`/`bind_parameterized` call
+`collect_param_types` internally.
 
 ## Binder Contract
 
@@ -323,6 +340,7 @@ pub enum BoundExpr {
     Parameter {
         index: usize, // 0-based; replaced with a Literal by substitute_params
         data_type: DataType,
+        pg_type: Option<PgType>, // Parse-declared wire identity for output metadata
         nullable: bool,
     },
     InputRef {
@@ -349,6 +367,7 @@ pub enum BoundExpr {
         name: String,
         args: Vec<BoundExpr>,
         data_type: DataType,
+        pg_type: Option<PgType>, // pg_proc-derived wire identity when unambiguous
         nullable: bool,
     },
     AggregateCall {
@@ -513,7 +532,7 @@ Aggregate calls use a two-stage representation. Binder converts `COUNT`, `SUM`, 
 
 Aggregate `DISTINCT` (e.g. `COUNT(DISTINCT x)`) is supported: the binder carries the flag into `AggregateExpr.distinct`, and the executor de-duplicates the argument values before aggregating. `DISTINCT` combined with a wildcard argument (`COUNT(DISTINCT *)`) is rejected with `ErrorKind::Plan` / `SqlState::SyntaxError`. Aggregate return types are fixed: `COUNT` returns non-null `INTEGER`; `SUM` and `AVG` accept either numeric type and return that same type (`AVG(integer)` uses integer division truncated toward zero; `AVG(double precision)` is true floating-point division), rejecting non-numeric arguments with `SqlState::DatatypeMismatch`; `MIN` and `MAX` return the argument type and are nullable. `STDDEV`/`STDDEV_SAMP`/`STDDEV_POP` and `VARIANCE`/`VAR_SAMP`/`VAR_POP` accept a numeric argument and return nullable `DOUBLE PRECISION`; `BOOL_AND`/`BOOL_OR` require a boolean argument and return nullable `BOOLEAN`. Empty aggregate inputs return `0` for `COUNT` and `NULL` for the rest (the sample variance/stddev forms also return `NULL` for a single value).
 
-Scalar functions remain `BoundExpr::Function`. The set of scalar functions and their signatures live in the scalar function registry in `common` (`docs/specs/crates/common.md`); the binder resolves each ordinary call through `common::lookup_scalar_function` and runs the entry's signature check, so an unregistered scalar-function name is rejected there (`function <name> is not supported in v1`). Binder validates each call's arity and argument types and assigns its result type: `UPPER(text)`, `LOWER(text)`, `TRIM(text)` return `TEXT`; `LENGTH(text)` returns `INTEGER`; `SUBSTRING(text, integer[, integer])` returns `TEXT`. The math functions accept either numeric type (`INTEGER` or `DOUBLE PRECISION`): `ABS`, `FLOOR`, `CEIL`/`CEILING`, and `ROUND` return their argument's type (`FLOOR`/`CEIL`/`ROUND` of an `INTEGER` is the integer itself; of a `DOUBLE` they round and stay `DOUBLE`); `SQRT` and `POWER`/`POW` always return `DOUBLE` (an `INTEGER` argument is widened, matching PostgreSQL's `sqrt(int)`); `MOD(integer, integer)` returns `INTEGER` (integer-only, like the `%` operator). The string functions `REPLACE(text, text, text)`, `LEFT(text, integer)`, and `RIGHT(text, integer)` return `TEXT`; `POSITION(text, text)` returns `INTEGER`. `CURRENT_TIMESTAMP` and `now()` are zero-argument, non-nullable statement clock functions returning `TIMESTAMP WITH TIME ZONE`. PostgreSQL-compatible system information functions include zero-argument, non-nullable functions: `VERSION()`, `CURRENT_DATABASE()`, `CURRENT_CATALOG`, `CURRENT_SCHEMA`, `CURRENT_USER`, `SESSION_USER`, and `USER` return `TEXT`; `PG_BACKEND_PID()` returns `INTEGER` (SaguaroDB's single integer storage type, exposed like other integer results). `CURRENT_SETTING(text)` returns `TEXT`, pushes a `TEXT` type expectation into its single argument (so `current_setting($1)` infers `$1` as text), and is nullable only when the argument is nullable. A bare `CURRENT_SCHEMA` first resolves like an ordinary unqualified column name, so a real column named `current_schema` wins; only unresolved references bind as the system information function. All ordinary scalar functions above are NULL-propagating, so the result is nullable when any argument is; `CONCAT`, the statement clock functions, and the zero-argument system information functions are always non-nullable. `CONCAT(text, ...)` is variadic (one or more `TEXT` arguments), ignores NULL arguments, and always returns a non-nullable `TEXT` (the empty string when every argument is NULL); non-text arguments must be cast explicitly. `EXTRACT(field FROM source)` binds as `extract('field', source)`: the field literal must name a supported field (`year`/`month`/`day`/`hour`/`minute`/`second`), the source must be `DATE` or `TIMESTAMP`, and the result is `DOUBLE PRECISION` (nullable when the source is). Unknown function names, wrong arity, and argument-type mismatches are rejected with `ErrorKind::Plan` (`SyntaxError` for unknown names and arity, `DatatypeMismatch` for argument types). Aggregates may appear as scalar-function arguments (e.g. `ABS(SUM(id))`); logical planning rewrites the nested aggregate as usual.
+Scalar functions remain `BoundExpr::Function`. The set of scalar functions and their signatures live in the scalar function registry in `common` (`docs/specs/crates/common.md`); the binder resolves each ordinary call through `common::lookup_scalar_function` and runs the entry's signature check, so an unregistered scalar-function name is rejected there (`function <name> is not supported in v1`). For untyped `NULL` literals and placeholders, the binder asks the registry for an argument hint; hints are derived from the registered signature and are returned only when the argument has one unambiguous type for that arity. For high-arity calls the registry avoids exhaustive search and only returns hints for uniform-argument signatures such as variadic `CONCAT(text, ...)`. When `pg_proc` metadata gives one unambiguous result wire type for the function name/arity/result `DataType`, the binder stores that `PgType` on `BoundExpr::Function` so output schemas describe OID-returning helpers as PostgreSQL `oid` rather than collapsed `int8`. Binder validates each call's arity and argument types and assigns its result type: `UPPER(text)`, `LOWER(text)`, `TRIM(text)` return `TEXT`; `LENGTH(text)` returns `INTEGER`; `SUBSTRING(text, integer[, integer])` returns `TEXT`. The math functions accept either numeric type (`INTEGER` or `DOUBLE PRECISION`): `ABS`, `FLOOR`, `CEIL`/`CEILING`, and `ROUND` return their argument's type (`FLOOR`/`CEIL`/`ROUND` of an `INTEGER` is the integer itself; of a `DOUBLE` they round and stay `DOUBLE`); `SQRT` and `POWER`/`POW` always return `DOUBLE` (an `INTEGER` argument is widened, matching PostgreSQL's `sqrt(int)`); `MOD(integer, integer)` returns `INTEGER` (integer-only, like the `%` operator). The string functions `REPLACE(text, text, text)`, `LEFT(text, integer)`, and `RIGHT(text, integer)` return `TEXT`; `POSITION(text, text)` returns `INTEGER`. `CURRENT_TIMESTAMP` and `now()` are zero-argument, non-nullable statement clock functions returning `TIMESTAMP WITH TIME ZONE`. PostgreSQL-compatible system information functions include zero-argument, non-nullable functions: `VERSION()`, `CURRENT_DATABASE()`, `CURRENT_CATALOG`, `CURRENT_SCHEMA`, `CURRENT_USER`, `SESSION_USER`, and `USER` return `TEXT`; `PG_BACKEND_PID()` returns `INTEGER` (SaguaroDB's single integer storage type, exposed like other integer results). `CURRENT_SETTING(text)` returns `TEXT`, pushes a `TEXT` type expectation into its single argument (so `current_setting($1)` infers `$1` as text), and is nullable only when the argument is nullable. PostgreSQL catalog introspection compatibility functions are registry entries too: `FORMAT_TYPE(oid, typmod)` returns nullable `TEXT`; `PG_GET_INDEXDEF(oid[, column_no, pretty])`, `PG_GET_EXPR(text, oid[, pretty])`, `PG_GET_CONSTRAINTDEF(oid[, pretty])`, `PG_GET_USERBYID(oid)`, `PG_GET_SERIAL_SEQUENCE(text, text)`, `TO_REGCLASS(text)`, `TO_REGTYPE(text)`, and description/definition stubs return nullable `TEXT` or nullable integer OIDs as appropriate; visibility, temp-schema, relation-size, and privilege probes return `BOOLEAN`/`INTEGER`. Privilege probes accept PostgreSQL-compatible arity families: table/schema/database/sequence/function/any-column/role probes accept 2 or 3 text/OID-shaped arguments, while column probes accept 3 or 4. A bare `CURRENT_SCHEMA` first resolves like an ordinary unqualified column name, so a real column named `current_schema` wins; only unresolved references bind as the system information function. All ordinary scalar functions above are NULL-propagating, so the result is nullable when any argument is; metadata lookup functions whose object can be missing are always nullable; `CONCAT`, the statement clock functions, and the zero-argument system information functions are always non-nullable. `CONCAT(text, ...)` is variadic (one or more `TEXT` arguments), ignores NULL arguments, and always returns a non-nullable `TEXT` (the empty string when every argument is NULL); non-text arguments must be cast explicitly. `EXTRACT(field FROM source)` binds as `extract('field', source)`: the field literal must name a supported field (`year`/`month`/`day`/`hour`/`minute`/`second`), the source must be `DATE` or `TIMESTAMP`, and the result is `DOUBLE PRECISION` (nullable when the source is). Unknown function names, wrong arity, and argument-type mismatches are rejected with `ErrorKind::Plan` (`SyntaxError` for unknown names and arity, `DatatypeMismatch` for argument types). Aggregates may appear as scalar-function arguments (e.g. `ABS(SUM(id))`); logical planning rewrites the nested aggregate as usual.
 
 `COALESCE` and `NULLIF` are not NULL-propagating, so the binder desugars them to `BoundExpr::Case` rather than leaving them as `Function`s. `COALESCE(v1, ..., vn)` becomes `CASE WHEN v1 IS NOT NULL THEN v1 ... ELSE vn END`; all arguments must share one type (no implicit cast, with a bare untyped NULL taking its type from a sibling — all-NULL is `DatatypeMismatch`), and the result is non-nullable exactly when at least one argument is. `NULLIF(a, b)` becomes `CASE WHEN a = b THEN NULL ELSE a END`; the operands must be comparable (same type) and the result type is `a`'s type, always nullable. `BinOp::IsDistinctFrom` / `IsNotDistinctFrom` bind like a comparison (same-type operands, with one untyped NULL taking the sibling's type) but always yield a non-nullable `Boolean`: two NULLs are not distinct, a NULL and a non-NULL are distinct, otherwise ordinary equality applies.
 

@@ -218,6 +218,7 @@ pub struct ParsedColumnDef {
     pub nullable: bool,
     pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
     pub default: Option<ParsedDefault>,
+    pub pg_type: Option<PgType>,  // declared PostgreSQL wire identity
 }
 
 pub struct ColumnDef {
@@ -227,6 +228,7 @@ pub struct ColumnDef {
     pub nullable: bool,
     pub max_length: Option<u32>,  // VARCHAR(n)/CHAR(n) length; None = unbounded
     pub default: Option<ColumnDefault>,
+    pub pg_type: Option<PgType>,  // persisted declared PostgreSQL wire identity
 }
 
 pub struct ColumnInfo {
@@ -234,14 +236,7 @@ pub struct ColumnInfo {
     pub data_type: DataType,
     pub table_id: Option<TableId>,
     pub column_id: Option<ColumnId>,
-    pub pg_type: Option<PgType>,
-}
-
-pub struct ViewColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub pg_type: Option<PgType>,
+    pub pg_type: Option<PgType>,  // result-column wire identity
 }
 
 pub struct TableSchema {
@@ -340,7 +335,12 @@ by the catalog instead of treating `ColumnId` as a cross-version identity.
 `ColumnInfo` describes result columns and may be derived from expressions, so
 table/column IDs are optional. `TableSchema.schema_version` and
 `ViewSchema.schema_version` start at `1` and increment on public schema metadata
-changes.
+changes. The optional `pg_type` fields are presentation metadata for PostgreSQL
+protocol OIDs/typmods only; semantic type checking still uses `DataType`.
+Supported presentation-only identities include width/kind refinements
+(`int2`/`int4`/`int8`, `varchar`/`bpchar`), catalog `oid`, and catalog
+vector/array identities (`int2vector`, `oidvector`, `int2[]`/`_int2`,
+`oid[]`/`_oid`) that collapse to existing `Integer` or `Text` semantics.
 
 `TableSchema.id` and `IndexSchema.id` are stable logical catalog identities.
 `storage_id` is the current physical relation-generation id used by storage to
@@ -581,6 +581,7 @@ pub struct StatementContext {
     pub session_sequences: Arc<SessionSequenceState>,
     pub session_info: Arc<SessionInfo>,
     pub system_state: Arc<dyn SystemStateProvider>,
+    pub catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
 }
 ```
 
@@ -621,7 +622,14 @@ values. `session_info` carries connection identity (`user`, `database`,
 real per-connection value when system information functions are wired into query
 execution. `system_state` is the runtime provider for virtual system catalog
 session data (`pg_settings`, `pg_stat_activity`, and `current_setting`); default
-contexts install an empty no-op provider. Default contexts install loud/no-op test
+contexts install an empty no-op provider. `catalog_introspection` is the runtime
+provider for PostgreSQL-compatible metadata functions such as `pg_get_indexdef`,
+`pg_get_constraintdef`, `pg_table_is_visible`, `to_regclass`, and
+`pg_get_serial_sequence`; it accepts only primitive OID/name inputs so `common`
+remains a leaf crate. Default contexts install a no-op provider that returns
+`Ok(NULL)`/`Ok(FALSE)`/`Ok(pass-through expression text)` as appropriate, and
+real providers return `Result` so catalog-read failures propagate instead of
+being flattened into "object not found". Default contexts install loud/no-op test
 implementations where appropriate. `StatementContext` is `Clone` but not `Copy`.
 
 ```rust
@@ -660,6 +668,21 @@ pub trait SystemStateProvider: Send + Sync + Debug {
     fn setting(&self, name: &str) -> Option<String>;
     fn sessions(&self) -> Vec<SessionActivityRow>;
 }
+
+pub trait CatalogIntrospectionProvider: Send + Sync + Debug {
+    fn pg_get_indexdef(
+        &self,
+        index_oid: i64,
+        column: Option<i64>,
+        pretty: bool,
+    ) -> Result<Option<String>>;
+    fn pg_get_constraintdef(&self, constraint_oid: i64, pretty: bool) -> Result<Option<String>>;
+    fn pg_get_expr(&self, expr: &str, relation_oid: i64, pretty: bool) -> Result<Option<String>>;
+    fn pg_get_userbyid(&self, role_oid: i64) -> Result<Option<String>>;
+    fn pg_table_is_visible(&self, relation_oid: i64) -> Result<bool>;
+    fn to_regclass(&self, name: &str) -> Result<Option<i64>>;
+    fn pg_get_serial_sequence(&self, table: &str, column: &str) -> Result<Option<String>>;
+}
 ```
 
 `SystemStateProvider` lives in `common` so `executor` can read virtual-catalog
@@ -680,7 +703,7 @@ defined in one place instead of split across `planner` (binding) and `executor`
 ```rust
 pub struct ScalarFunction {
     pub name: &'static str,
-    pub null_handling: NullHandling,                       // Propagate | NeverNull
+    pub null_handling: NullHandling,
     pub signature: fn(name: &str, args: &[ArgType]) -> Result<DataType>,
     pub eval: fn(ctx: &StatementContext, values: &[Value]) -> Result<Value>,
 }
@@ -694,20 +717,56 @@ exist). The binder builds an `ArgType { data_type, literal }` per bound argument
 and argument types and returns the result `DataType`; signature failures are
 `ErrorKind::Plan`. Result nullability is not returned by `signature` — it is
 derived centrally by `ScalarFunction::result_nullable`: a `Propagate` function's
-result is nullable when any argument is, and a `NeverNull` function's result is
-never nullable. The executor evaluates the arguments, applies the same NULL
-policy (`Propagate` short-circuits to `NULL` when any argument is `NULL`;
-`NeverNull` is always evaluated), and calls `eval`; evaluation domain failures
-are `ErrorKind::Execute`. `NeverNull` covers `CONCAT` (which ignores `NULL`
-arguments) and the zero-argument system information functions.
+result is nullable when any argument is, `Nullable` and `EvaluateNullable`
+functions are always nullable, and a `NeverNull` function's result is never
+nullable. `Nullable` functions short-circuit to `NULL` on `NULL` arguments but
+may also return `NULL` for non-`NULL` metadata misses. `EvaluateNullable`
+functions are always evaluated and own their NULL semantics (for example,
+`format_type(oid, NULL)` treats the typmod as omitted, while
+`format_type(NULL, typmod)` returns `NULL`). The executor evaluates the arguments,
+applies the same NULL policy (`Propagate`/`Nullable` short-circuit to `NULL` when
+any argument is `NULL`; `EvaluateNullable`/`NeverNull` are always evaluated), and
+calls `eval`; evaluation domain failures are `ErrorKind::Execute`. `NeverNull`
+covers `CONCAT` (which ignores `NULL` arguments) and the zero-argument system
+information functions. The registry also exposes
+`scalar_function_arg_hint(name, arity, index)` for functions whose registered
+signature admits exactly one possible argument type at `index` for that arity
+(used by the binder to type untyped `NULL` literals and placeholders). Hints are
+inferred from the registered signature instead of maintained as a parallel
+name/arity table; ambiguous arguments, such as numeric functions accepting both
+`INTEGER` and `DOUBLE`, return `None`. The inference uses exhaustive search only
+for small arities and a cheap uniform-argument fallback for higher-arity
+signatures such as variadic `CONCAT`.
 
 The registry holds the ordinary scalar functions (text, math, string,
-`SUBSTRING`, `EXTRACT`), statement clock functions, and system information
-functions; their per-function signatures and semantics are specified in
+`SUBSTRING`, `EXTRACT`), statement clock functions, system information functions,
+and PostgreSQL-compatible catalog introspection/probe functions; their
+per-function signatures and semantics are specified in
 `docs/specs/crates/planner.md` (binding) and `docs/specs/crates/executor.md`
 (evaluation). Aggregate functions, sequence functions (`nextval`/`currval`/`setval`),
 and the NULL-folding forms `COALESCE`/`NULLIF` are intentionally not registry
 entries: they have their own bound representations and binding rules.
+
+`common` also owns the static `pg_proc` compatibility metadata for registered
+built-ins/probe helpers (`PgProcCatalogEntry` plus
+`pg_proc_catalog_entries()`/`pg_proc_catalog_entry()`), so executor system scans,
+planner output metadata, and function-definition helpers use one
+OID/name/signature source. `scalar_function_result_pg_type(name, arity,
+data_type)` derives an unambiguous result wire identity from that table when one
+exists, and `scalar_function_arg_pg_type(name, arity, index)` does the same for
+argument positions so the planner can preserve inferred OID parameter wire
+metadata. Definition helpers such as `pg_get_function_arguments`,
+`pg_get_function_result`, `pg_get_functiondef`, `pg_function_is_visible`, and
+`oidvectortypes` are
+compatibility helpers over this static table; they do not imply user-defined
+function support. The metadata must cover every registered scalar-function name,
+and entries must use decodable PostgreSQL type OIDs; `concat` is advertised as a
+variadic text helper via `provariadic`, and `oidvectortypes` advertises an
+`oidvector` argument even though SaguaroDB stores the catalog value as text. Math
+function metadata includes the integer/double overload rows accepted by the
+runtime signatures. Privilege-probe metadata includes text-shaped rows plus
+common OID-shaped overloads so client reflection can discover the object-OID
+forms that the runtime signature checker already accepts.
 
 ## MVCC Types
 

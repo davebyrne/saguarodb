@@ -221,6 +221,54 @@ pub fn no_system_state() -> Arc<dyn SystemStateProvider> {
     Arc::new(NoSystemStateProvider)
 }
 
+/// Rendered catalog facts consumed by PostgreSQL-compatible introspection
+/// functions. The `common` crate owns scalar-function dispatch but must remain a
+/// leaf crate, so the real server adapter implements this trait with primitive
+/// OID/name inputs rather than exposing catalog crate types here.
+pub trait CatalogIntrospectionProvider: Send + Sync + std::fmt::Debug {
+    fn pg_get_indexdef(
+        &self,
+        _index_oid: i64,
+        _column: Option<i64>,
+        _pretty: bool,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn pg_get_constraintdef(&self, _constraint_oid: i64, _pretty: bool) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn pg_get_expr(&self, expr: &str, _relation_oid: i64, _pretty: bool) -> Result<Option<String>> {
+        Ok(Some(expr.to_string()))
+    }
+
+    fn pg_get_userbyid(&self, _role_oid: i64) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn pg_table_is_visible(&self, _relation_oid: i64) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn to_regclass(&self, _name: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    fn pg_get_serial_sequence(&self, _table: &str, _column: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+struct NoCatalogIntrospectionProvider;
+
+impl CatalogIntrospectionProvider for NoCatalogIntrospectionProvider {}
+
+pub fn no_catalog_introspection() -> Arc<dyn CatalogIntrospectionProvider> {
+    Arc::new(NoCatalogIntrospectionProvider)
+}
+
 /// Records what a `SERIALIZABLE` transaction reads (SIREAD locks) and forms
 /// rw-antidependency edges when a write overwrites a concurrent read, so the server's
 /// serializable-conflict manager can detect dangerous structures and abort to preserve
@@ -329,6 +377,8 @@ pub struct StatementContext {
     /// Server/session state visible through virtual system catalogs and
     /// `current_setting`.
     pub system_state: Arc<dyn SystemStateProvider>,
+    /// Rendered catalog facts for PostgreSQL-compatible introspection functions.
+    pub catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
 }
 
 impl StatementContext {
@@ -352,6 +402,7 @@ impl StatementContext {
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
+            catalog_introspection: no_catalog_introspection(),
         }
     }
 
@@ -374,6 +425,7 @@ impl StatementContext {
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
+            catalog_introspection: no_catalog_introspection(),
         }
     }
 
@@ -398,6 +450,7 @@ impl StatementContext {
             session_sequences: Arc::new(SessionSequenceState::new()),
             session_info: Arc::new(SessionInfo::default()),
             system_state: no_system_state(),
+            catalog_introspection: no_catalog_introspection(),
         }
     }
 
@@ -473,6 +526,17 @@ impl StatementContext {
     #[must_use]
     pub fn with_system_state(mut self, system_state: Arc<dyn SystemStateProvider>) -> Self {
         self.system_state = system_state;
+        self
+    }
+
+    /// Install the provider used by PostgreSQL-compatible catalog introspection
+    /// functions.
+    #[must_use]
+    pub fn with_catalog_introspection(
+        mut self,
+        catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
+    ) -> Self {
+        self.catalog_introspection = catalog_introspection;
         self
     }
 

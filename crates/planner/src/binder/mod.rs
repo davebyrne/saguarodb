@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use catalog::{CatalogManager, resolve_system_view};
 use common::{
-    BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault,
+    BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault, PgType,
     RelationKind, Result, SqlState, TableId, TableSchema, Value, ViewDependency,
 };
 use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statement};
@@ -68,16 +68,18 @@ struct BindContext<'a> {
     bindings: Vec<Binding>,
     next_binding: BindingId,
     next_slot: usize,
-    /// Parameter type OIDs declared by an extended-protocol `Parse` (mapped to
-    /// `DataType`), 0-based and `None` when unspecified. Empty for simple queries.
-    declared_params: Vec<Option<DataType>>,
+    /// Parameter type OIDs declared by an extended-protocol `Parse`, 0-based and
+    /// `None` when unspecified. Empty for simple queries. Binding uses the
+    /// collapsed `DataType`, but output metadata for a selected parameter can
+    /// preserve the declared `PgType` (for example PostgreSQL `oid`).
+    declared_params: Vec<Option<PgType>>,
     /// The CTEs (`WITH`) in scope for `FROM` resolution. Empty unless the query or
     /// an enclosing query has a `WITH` clause.
     cte_scope: CteScope,
 }
 
 impl<'a> BindContext<'a> {
-    fn new(catalog: &'a dyn CatalogManager, declared_params: &[Option<DataType>]) -> Self {
+    fn new(catalog: &'a dyn CatalogManager, declared_params: &[Option<PgType>]) -> Self {
         Self {
             catalog,
             bindings: Vec::new(),
@@ -89,6 +91,11 @@ impl<'a> BindContext<'a> {
     }
 
     fn declared_param(&self, index: usize) -> Option<DataType> {
+        self.declared_param_pg_type(index)
+            .map(|pg_type| pg_type.data_type())
+    }
+
+    fn declared_param_pg_type(&self, index: usize) -> Option<PgType> {
         self.declared_params.get(index).cloned().flatten()
     }
 }
@@ -114,15 +121,31 @@ pub fn bind_parameterized(
     catalog: &dyn CatalogManager,
     declared_param_types: &[Option<DataType>],
 ) -> Result<(BoundStatement, Vec<DataType>)> {
+    let declared_pg_types: Vec<_> = declared_param_types
+        .iter()
+        .map(|data_type| data_type.as_ref().map(PgType::from))
+        .collect();
+    bind_parameterized_with_pg_types(statement, catalog, &declared_pg_types)
+}
+
+pub fn bind_parameterized_with_pg_types(
+    statement: &Statement,
+    catalog: &dyn CatalogManager,
+    declared_param_types: &[Option<PgType>],
+) -> Result<(BoundStatement, Vec<DataType>)> {
     let bound = bind_inner(statement, catalog, declared_param_types)?;
-    let params = crate::params::collect_param_types(&bound, declared_param_types)?;
+    let declared_data_types: Vec<_> = declared_param_types
+        .iter()
+        .map(|pg_type| pg_type.as_ref().map(PgType::data_type))
+        .collect();
+    let params = crate::params::collect_param_types(&bound, &declared_data_types)?;
     Ok((bound, params))
 }
 
 fn bind_inner(
     statement: &Statement,
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
     match statement {
         Statement::CreateTable {
@@ -916,7 +939,7 @@ impl ViewDependencyBuilder {
 
 fn collect_view_dependencies(
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     ast: &Query,
     bound: &BoundQuery,
 ) -> Result<Vec<ViewDependency>> {
@@ -1024,7 +1047,7 @@ fn collect_values_dependencies(values: &BoundValues, builder: &mut ViewDependenc
 
 fn collect_bound_but_unretained_cte_dependencies(
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     enclosing: &CteScope,
     query: &Query,
     builder: &mut ViewDependencyBuilder,
@@ -1054,7 +1077,7 @@ fn collect_bound_but_unretained_cte_dependencies(
 
 fn collect_nested_query_cte_dependencies(
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     scope: &CteScope,
     body: &QueryBody,
     builder: &mut ViewDependencyBuilder,
@@ -1101,7 +1124,7 @@ fn collect_nested_query_cte_dependencies(
 
 fn collect_from_item_cte_dependencies(
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     scope: &CteScope,
     from: &FromItem,
     builder: &mut ViewDependencyBuilder,
@@ -1131,7 +1154,7 @@ fn collect_from_item_cte_dependencies(
 
 fn collect_expr_cte_dependencies(
     catalog: &dyn CatalogManager,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
     scope: &CteScope,
     expr: &Expr,
     builder: &mut ViewDependencyBuilder,

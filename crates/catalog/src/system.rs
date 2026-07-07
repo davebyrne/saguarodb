@@ -4,10 +4,18 @@ pub const PG_CATALOG_SCHEMA_OID: i64 = 11;
 pub const PUBLIC_SCHEMA_OID: i64 = 2200;
 pub const INFORMATION_SCHEMA_OID: i64 = 13_000;
 
-const VIRTUAL_OID_TAG_SHIFT: u32 = 40;
+const VIRTUAL_OID_TAG_SHIFT: u32 = 28;
+pub const MAX_VIRTUAL_OID_PAYLOAD: u32 = (1 << VIRTUAL_OID_TAG_SHIFT) - 1;
+const COMPOUND_OID_SUB_ID_BITS: u32 = 12;
+pub const MAX_COMPOUND_OID_TABLE_ID: u32 =
+    (1 << (VIRTUAL_OID_TAG_SHIFT - COMPOUND_OID_SUB_ID_BITS)) - 1;
+pub const MAX_COMPOUND_OID_SUB_ID: u16 = ((1 << COMPOUND_OID_SUB_ID_BITS) - 1) as u16;
 const USER_TABLE_OID_TAG: i64 = 1_i64 << VIRTUAL_OID_TAG_SHIFT;
 const USER_INDEX_OID_TAG: i64 = 2_i64 << VIRTUAL_OID_TAG_SHIFT;
 const USER_SEQUENCE_OID_TAG: i64 = 3_i64 << VIRTUAL_OID_TAG_SHIFT;
+const SYNTHETIC_PRIMARY_KEY_OID_TAG: i64 = 4_i64 << VIRTUAL_OID_TAG_SHIFT;
+const CONSTRAINT_OID_TAG: i64 = 5_i64 << VIRTUAL_OID_TAG_SHIFT;
+const ATTRDEF_OID_TAG: i64 = 6_i64 << VIRTUAL_OID_TAG_SHIFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SystemSchema {
@@ -48,6 +56,12 @@ pub enum SystemView {
     PgAttribute,
     PgType,
     PgIndex,
+    PgProc,
+    PgConstraint,
+    PgAttrdef,
+    PgDepend,
+    PgDatabase,
+    PgRoles,
     PgSettings,
     PgStatActivity,
     InformationSchemaSchemata,
@@ -62,6 +76,12 @@ impl SystemView {
         SystemView::PgAttribute,
         SystemView::PgType,
         SystemView::PgIndex,
+        SystemView::PgProc,
+        SystemView::PgConstraint,
+        SystemView::PgAttrdef,
+        SystemView::PgDepend,
+        SystemView::PgDatabase,
+        SystemView::PgRoles,
         SystemView::PgSettings,
         SystemView::PgStatActivity,
         SystemView::InformationSchemaSchemata,
@@ -76,6 +96,12 @@ impl SystemView {
             | SystemView::PgAttribute
             | SystemView::PgType
             | SystemView::PgIndex
+            | SystemView::PgProc
+            | SystemView::PgConstraint
+            | SystemView::PgAttrdef
+            | SystemView::PgDepend
+            | SystemView::PgDatabase
+            | SystemView::PgRoles
             | SystemView::PgSettings
             | SystemView::PgStatActivity => SystemSchema::PgCatalog,
             SystemView::InformationSchemaSchemata
@@ -91,6 +117,12 @@ impl SystemView {
             SystemView::PgAttribute => "pg_attribute",
             SystemView::PgType => "pg_type",
             SystemView::PgIndex => "pg_index",
+            SystemView::PgProc => "pg_proc",
+            SystemView::PgConstraint => "pg_constraint",
+            SystemView::PgAttrdef => "pg_attrdef",
+            SystemView::PgDepend => "pg_depend",
+            SystemView::PgDatabase => "pg_database",
+            SystemView::PgRoles => "pg_roles",
             SystemView::PgSettings => "pg_settings",
             SystemView::PgStatActivity => "pg_stat_activity",
             SystemView::InformationSchemaSchemata => "schemata",
@@ -108,10 +140,16 @@ impl SystemView {
             SystemView::PgClass => 1259,
             SystemView::PgAttribute => 1249,
             SystemView::PgType => 1247,
+            SystemView::PgProc => 1255,
+            SystemView::PgDatabase => 1262,
             SystemView::PgNamespace => 2615,
             SystemView::PgIndex => 2610,
+            SystemView::PgConstraint => 2606,
+            SystemView::PgAttrdef => 2604,
+            SystemView::PgDepend => 2608,
             SystemView::PgSettings => 13_100,
             SystemView::PgStatActivity => 13_101,
+            SystemView::PgRoles => 13_102,
             SystemView::InformationSchemaSchemata => 13_200,
             SystemView::InformationSchemaTables => 13_201,
             SystemView::InformationSchemaColumns => 13_202,
@@ -158,14 +196,28 @@ impl SystemView {
                 name_col(1, "attname"),
                 oid_col(2, "atttypid"),
                 int4_col(3, "attstattarget"),
-                int4_col(4, "attlen"),
-                int4_col(5, "attnum"),
-                int4_col(6, "atttypmod"),
-                bool_col(7, "attnotnull"),
-                bool_col(8, "atthasdef"),
-                text_col(9, "attidentity"),
-                text_col(10, "attgenerated"),
-                bool_col(11, "attisdropped"),
+                int2_col(4, "attlen"),
+                int2_col(5, "attnum"),
+                int4_col(6, "attndims"),
+                int4_col(7, "attcacheoff"),
+                int4_col(8, "atttypmod"),
+                bool_col(9, "attbyval"),
+                text_col(10, "attalign"),
+                text_col(11, "attstorage"),
+                text_col(12, "attcompression"),
+                bool_col(13, "attnotnull"),
+                bool_col(14, "atthasdef"),
+                bool_col(15, "atthasmissing"),
+                text_col(16, "attidentity"),
+                text_col(17, "attgenerated"),
+                bool_col(18, "attisdropped"),
+                bool_col(19, "attislocal"),
+                int2_col(20, "attinhcount"),
+                oid_col(21, "attcollation"),
+                nullable_text_col(22, "attacl"),
+                nullable_text_col(23, "attoptions"),
+                nullable_text_col(24, "attfdwoptions"),
+                nullable_text_col(25, "attmissingval"),
             ],
             SystemView::PgType => vec![
                 oid_col(0, "oid"),
@@ -198,7 +250,113 @@ impl SystemView {
                 bool_col(10, "indisready"),
                 bool_col(11, "indislive"),
                 bool_col(12, "indisreplident"),
-                text_col(13, "indkey"),
+                int2vector_col(13, "indkey"),
+            ],
+            SystemView::PgProc => vec![
+                oid_col(0, "oid"),
+                name_col(1, "proname"),
+                oid_col(2, "pronamespace"),
+                oid_col(3, "proowner"),
+                oid_col(4, "prolang"),
+                real_col(5, "procost"),
+                real_col(6, "prorows"),
+                oid_col(7, "provariadic"),
+                oid_col(8, "prosupport"),
+                text_col(9, "prokind"),
+                bool_col(10, "prosecdef"),
+                bool_col(11, "proleakproof"),
+                bool_col(12, "proisstrict"),
+                bool_col(13, "proretset"),
+                text_col(14, "provolatile"),
+                text_col(15, "proparallel"),
+                int2_col(16, "pronargs"),
+                int2_col(17, "pronargdefaults"),
+                oid_col(18, "prorettype"),
+                oidvector_col(19, "proargtypes"),
+                nullable_oid_array_col(20, "proallargtypes"),
+                nullable_text_col(21, "proargmodes"),
+                nullable_text_col(22, "proargnames"),
+                nullable_text_col(23, "proargdefaults"),
+                nullable_text_col(24, "protrftypes"),
+                text_col(25, "prosrc"),
+                nullable_text_col(26, "probin"),
+                nullable_text_col(27, "proconfig"),
+                nullable_text_col(28, "proacl"),
+            ],
+            SystemView::PgConstraint => vec![
+                oid_col(0, "oid"),
+                name_col(1, "conname"),
+                oid_col(2, "connamespace"),
+                text_col(3, "contype"),
+                bool_col(4, "condeferrable"),
+                bool_col(5, "condeferred"),
+                bool_col(6, "convalidated"),
+                oid_col(7, "conrelid"),
+                oid_col(8, "contypid"),
+                oid_col(9, "conindid"),
+                oid_col(10, "conparentid"),
+                oid_col(11, "confrelid"),
+                text_col(12, "confupdtype"),
+                text_col(13, "confdeltype"),
+                text_col(14, "confmatchtype"),
+                bool_col(15, "conislocal"),
+                int4_col(16, "coninhcount"),
+                bool_col(17, "connoinherit"),
+                nullable_int2_array_col(18, "conkey"),
+                nullable_int2_array_col(19, "confkey"),
+                nullable_oid_array_col(20, "conpfeqop"),
+                nullable_oid_array_col(21, "conppeqop"),
+                nullable_oid_array_col(22, "conffeqop"),
+                nullable_oid_array_col(23, "conexclop"),
+                nullable_text_col(24, "conbin"),
+            ],
+            SystemView::PgAttrdef => vec![
+                oid_col(0, "oid"),
+                oid_col(1, "adrelid"),
+                int2_col(2, "adnum"),
+                text_col(3, "adbin"),
+            ],
+            SystemView::PgDepend => vec![
+                oid_col(0, "classid"),
+                oid_col(1, "objid"),
+                int4_col(2, "objsubid"),
+                oid_col(3, "refclassid"),
+                oid_col(4, "refobjid"),
+                int4_col(5, "refobjsubid"),
+                text_col(6, "deptype"),
+            ],
+            SystemView::PgDatabase => vec![
+                oid_col(0, "oid"),
+                name_col(1, "datname"),
+                oid_col(2, "datdba"),
+                int4_col(3, "encoding"),
+                text_col(4, "datlocprovider"),
+                bool_col(5, "datistemplate"),
+                bool_col(6, "datallowconn"),
+                int4_col(7, "datconnlimit"),
+                int4_col(8, "datfrozenxid"),
+                int4_col(9, "datminmxid"),
+                oid_col(10, "dattablespace"),
+                text_col(11, "datcollate"),
+                text_col(12, "datctype"),
+                nullable_text_col(13, "daticulocale"),
+                nullable_text_col(14, "datcollversion"),
+                nullable_text_col(15, "datacl"),
+            ],
+            SystemView::PgRoles => vec![
+                name_col(0, "rolname"),
+                bool_col(1, "rolsuper"),
+                bool_col(2, "rolinherit"),
+                bool_col(3, "rolcreaterole"),
+                bool_col(4, "rolcreatedb"),
+                bool_col(5, "rolcanlogin"),
+                bool_col(6, "rolreplication"),
+                int4_col(7, "rolconnlimit"),
+                nullable_text_col(8, "rolpassword"),
+                timestamptz_col(9, "rolvaliduntil", true),
+                bool_col(10, "rolbypassrls"),
+                nullable_text_col(11, "rolconfig"),
+                oid_col(12, "oid"),
             ],
             SystemView::PgSettings => vec![
                 name_col(0, "name"),
@@ -296,15 +454,51 @@ pub fn is_system_schema(name: &str) -> bool {
 }
 
 pub fn table_oid(table_id: u32) -> i64 {
-    USER_TABLE_OID_TAG | i64::from(table_id)
+    USER_TABLE_OID_TAG | oid_payload(table_id)
 }
 
 pub fn index_oid(index_id: u32) -> i64 {
-    USER_INDEX_OID_TAG | i64::from(index_id)
+    USER_INDEX_OID_TAG | oid_payload(index_id)
 }
 
 pub fn sequence_oid(sequence_id: u32) -> i64 {
-    USER_SEQUENCE_OID_TAG | i64::from(sequence_id)
+    USER_SEQUENCE_OID_TAG | oid_payload(sequence_id)
+}
+
+pub fn synthetic_primary_key_oid(table_id: u32) -> i64 {
+    SYNTHETIC_PRIMARY_KEY_OID_TAG | oid_payload(table_id)
+}
+
+pub fn primary_key_constraint_oid(table_id: u32) -> i64 {
+    CONSTRAINT_OID_TAG | compound_oid_payload(table_id, 0)
+}
+
+pub fn check_constraint_oid(table_id: u32, check_index: u16) -> i64 {
+    CONSTRAINT_OID_TAG | compound_oid_payload(table_id, check_index.saturating_add(1))
+}
+
+pub fn attrdef_oid(table_id: u32, column_id: u16) -> i64 {
+    ATTRDEF_OID_TAG | compound_oid_payload(table_id, column_id)
+}
+
+fn compound_oid_payload(id: u32, sub_id: u16) -> i64 {
+    assert!(
+        id <= MAX_COMPOUND_OID_TABLE_ID,
+        "catalog table id {id} exceeds compound virtual OID table-id limit"
+    );
+    assert!(
+        sub_id <= MAX_COMPOUND_OID_SUB_ID,
+        "catalog object sub-id {sub_id} exceeds compound virtual OID sub-id limit"
+    );
+    i64::from((id << COMPOUND_OID_SUB_ID_BITS) | u32::from(sub_id))
+}
+
+fn oid_payload(id: u32) -> i64 {
+    assert!(
+        id <= MAX_VIRTUAL_OID_PAYLOAD,
+        "catalog id {id} exceeds virtual OID payload limit"
+    );
+    i64::from(id)
 }
 
 fn col(id: u16, name: &str, data_type: DataType, pg_type: PgType, nullable: bool) -> ColumnDef {
@@ -323,12 +517,16 @@ fn int4_col(id: u16, name: &str) -> ColumnDef {
     col(id, name, DataType::Integer, PgType::Int4, false)
 }
 
+fn int2_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Integer, PgType::Int2, false)
+}
+
 fn nullable_int4_col(id: u16, name: &str) -> ColumnDef {
     col(id, name, DataType::Integer, PgType::Int4, true)
 }
 
 fn oid_col(id: u16, name: &str) -> ColumnDef {
-    col(id, name, DataType::Integer, PgType::Int8, false)
+    col(id, name, DataType::Integer, PgType::Oid, false)
 }
 
 fn name_col(id: u16, name: &str) -> ColumnDef {
@@ -343,8 +541,28 @@ fn nullable_text_col(id: u16, name: &str) -> ColumnDef {
     col(id, name, DataType::Text, PgType::Text, true)
 }
 
+fn oidvector_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Text, PgType::OidVector, false)
+}
+
+fn int2vector_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Text, PgType::Int2Vector, false)
+}
+
+fn nullable_oid_array_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Text, PgType::OidArray, true)
+}
+
+fn nullable_int2_array_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Text, PgType::Int2Array, true)
+}
+
 fn bool_col(id: u16, name: &str) -> ColumnDef {
     col(id, name, DataType::Boolean, PgType::Bool, false)
+}
+
+fn real_col(id: u16, name: &str) -> ColumnDef {
+    col(id, name, DataType::Real, PgType::Float4, false)
 }
 
 fn timestamptz_col(id: u16, name: &str, nullable: bool) -> ColumnDef {
@@ -422,12 +640,35 @@ mod tests {
 
     #[test]
     fn oid_spaces_are_disjoint_for_same_raw_id() {
-        for id in [0, 7, u32::MAX] {
-            let oids = [table_oid(id), index_oid(id), sequence_oid(id)];
+        for id in [0, 7, MAX_COMPOUND_OID_TABLE_ID] {
+            let oids = [
+                table_oid(id),
+                index_oid(id),
+                sequence_oid(id),
+                synthetic_primary_key_oid(id),
+                primary_key_constraint_oid(id),
+                attrdef_oid(id, 7),
+            ];
             assert_eq!(
                 oids.iter().copied().collect::<HashSet<_>>().len(),
                 oids.len()
             );
+            for oid in oids {
+                assert!(
+                    u32::try_from(oid).is_ok(),
+                    "virtual oid {oid} must fit PostgreSQL oid"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn virtual_oid_helpers_reject_ids_outside_supported_payloads() {
+        assert!(std::panic::catch_unwind(|| table_oid(MAX_VIRTUAL_OID_PAYLOAD + 1)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| primary_key_constraint_oid(MAX_COMPOUND_OID_TABLE_ID + 1))
+                .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| attrdef_oid(1, MAX_COMPOUND_OID_SUB_ID + 1)).is_err());
     }
 }

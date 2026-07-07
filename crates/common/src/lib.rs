@@ -25,15 +25,19 @@ pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };
 pub use context::{
-    ConflictWaiter, GucSetting, SequenceManager, SessionActivityRow, SessionInfo,
-    SessionSequenceState, SessionState, SsiTracker, StatementContext, SystemStateProvider,
-    no_system_state,
+    CatalogIntrospectionProvider, ConflictWaiter, GucSetting, SequenceManager, SessionActivityRow,
+    SessionInfo, SessionSequenceState, SessionState, SsiTracker, StatementContext,
+    SystemStateProvider, no_catalog_introspection, no_system_state,
 };
 pub use copy::{CopyDirection, CopyFormat, CopyOptions};
 pub use error::{DbError, ErrorKind, Result, SqlState};
 pub use float::{OrderedF32, OrderedF64};
 pub use flush::{FlushPolicy, PageFlushInfo};
-pub use functions::{ArgType, NullHandling, ScalarFunction, lookup_scalar_function};
+pub use functions::{
+    ArgType, NullHandling, PgProcCatalogEntry, ScalarFunction, format_type_oid,
+    lookup_scalar_function, pg_proc_catalog_entries, pg_proc_catalog_entry,
+    scalar_function_arg_hint, scalar_function_arg_pg_type, scalar_function_result_pg_type,
+};
 pub use ids::{
     BindingId, ColumnId, FIRST_NORMAL_XID, FROZEN_XID, FileId, INVALID_XID, IndexId, Lsn,
     PRIMARY_KEY_INDEX_ID, PageNum, RowId, SequenceId, TableId, TxnId,

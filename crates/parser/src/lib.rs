@@ -581,6 +581,34 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_pg_catalog_qualified_functions() {
+        let stmt = parse("select pg_catalog.format_type(23, -1)").unwrap();
+
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
+            panic!("expected select");
+        };
+
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, distinct: false },
+                ..
+            } if name == "format_type" && args.len() == 2
+        ));
+    }
+
+    #[test]
+    fn rejects_non_catalog_qualified_functions() {
+        let err = parse("select public.format_type(23, -1)").unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("qualified function names"));
+    }
+
+    #[test]
     fn normalizes_trim_and_substring_into_function_calls() {
         let stmt = parse("select trim(name), substring(name, 2, 3) from users").unwrap();
         let Statement::Query(Query {
@@ -1437,6 +1465,25 @@ mod tests {
             );
             assert_eq!(column.pg_type, Some(pg_type), "column {}", column.name);
         }
+    }
+
+    #[test]
+    fn oid_type_maps_to_integer_with_oid_wire_type() {
+        let Statement::CreateTable { columns, .. } =
+            parse("create table oids (a oid, b pg_catalog.oid)").unwrap()
+        else {
+            panic!("expected create table");
+        };
+
+        assert_eq!(columns.len(), 2);
+        for column in &columns {
+            assert_eq!(column.data_type, DataType::Integer);
+            assert_eq!(column.pg_type, Some(common::PgType::Oid));
+        }
+
+        let Statement::Query(_) = parse("select cast(1 as pg_catalog.oid)").unwrap() else {
+            panic!("expected select");
+        };
     }
 
     #[test]

@@ -389,11 +389,13 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             name,
             args,
             data_type,
+            pg_type,
             nullable,
         } => BoundExpr::Function {
             name,
             args: args.into_iter().map(fold_expr).collect(),
             data_type,
+            pg_type,
             nullable,
         },
         BoundExpr::Setval {

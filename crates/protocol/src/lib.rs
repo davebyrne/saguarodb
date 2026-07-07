@@ -2,7 +2,10 @@ mod codec;
 mod messages;
 mod state;
 
-pub use codec::{PostgresCodec, ProtocolCodec, decode_value, encode_value, encode_value_with_type};
+pub use codec::{
+    PostgresCodec, ProtocolCodec, decode_value, decode_value_with_type, encode_value,
+    encode_value_with_type,
+};
 pub use messages::{ClientMessage, ServerMessage, StatementKind};
 pub use state::{ConnectionState, PostgresConnectionState};
 
@@ -12,7 +15,8 @@ mod tests {
 
     use super::{
         ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
-        ServerMessage, StatementKind, decode_value, encode_value, encode_value_with_type,
+        ServerMessage, StatementKind, decode_value, decode_value_with_type, encode_value,
+        encode_value_with_type,
     };
 
     fn ssl_request_bytes() -> Vec<u8> {
@@ -644,6 +648,7 @@ mod tests {
             columns: vec![
                 labeled("small", DataType::Integer, PgType::Int2),
                 labeled("n", DataType::Integer, PgType::Int4),
+                labeled("obj", DataType::Integer, PgType::Oid),
                 labeled("code", DataType::Text, PgType::Varchar(Some(10))),
                 labeled(
                     "amt",
@@ -661,12 +666,13 @@ mod tests {
         });
 
         let mut offset = 5;
-        assert_eq!(read_i16(&bytes, &mut offset), 4);
+        assert_eq!(read_i16(&bytes, &mut offset), 5);
         // The declared width/kind/length is reported: int2/int4 OIDs, varchar with
         // its length typmod (n + 4), and numeric with its packed precision/scale.
         for (name, oid, typlen, typmod) in [
             ("small", 21, 2, -1),
             ("n", 23, 4, -1),
+            ("obj", 26, 4, -1),
             ("code", 1043, -1, 14),
             ("amt", 1700, -1, ((10 << 16) | 2) + 4),
         ] {
@@ -704,6 +710,12 @@ mod tests {
             1000i32.to_be_bytes()
         );
         assert_eq!(
+            encode_value_with_type(&Value::Integer(4_000_000_000), &PgType::Oid, 1)
+                .unwrap()
+                .unwrap(),
+            4_000_000_000u32.to_be_bytes()
+        );
+        assert_eq!(
             encode_value_with_type(&Value::Integer(1000), &PgType::Int8, 1)
                 .unwrap()
                 .unwrap(),
@@ -711,6 +723,18 @@ mod tests {
         );
         // A value that does not fit its declared width is rejected, not truncated.
         assert!(encode_value_with_type(&Value::Integer(40000), &PgType::Int2, 1).is_err());
+        assert!(encode_value_with_type(&Value::Integer(-1), &PgType::Oid, 1).is_err());
+        assert!(encode_value_with_type(&Value::Integer(4_294_967_296), &PgType::Oid, 1).is_err());
+        assert_eq!(
+            decode_value_with_type(&4_000_000_000u32.to_be_bytes(), &PgType::Oid, 1).unwrap(),
+            Value::Integer(4_000_000_000)
+        );
+        assert_eq!(
+            decode_value_with_type(b"4294967295", &PgType::Oid, 0).unwrap(),
+            Value::Integer(4_294_967_295)
+        );
+        assert!(decode_value_with_type(b"-1", &PgType::Oid, 0).is_err());
+        assert!(decode_value_with_type(b"4294967296", &PgType::Oid, 0).is_err());
         // A non-integer ignores the wire type for width and delegates to encode_value.
         assert_eq!(
             encode_value_with_type(&Value::Text("hi".to_string()), &PgType::Text, 1)

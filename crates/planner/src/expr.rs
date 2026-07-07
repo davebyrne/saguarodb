@@ -14,6 +14,7 @@ pub enum BoundExpr {
     Parameter {
         index: usize,
         data_type: DataType,
+        pg_type: Option<PgType>,
         nullable: bool,
     },
     InputRef {
@@ -40,6 +41,7 @@ pub enum BoundExpr {
         name: String,
         args: Vec<BoundExpr>,
         data_type: DataType,
+        pg_type: Option<PgType>,
         nullable: bool,
     },
     Nextval {
@@ -231,11 +233,9 @@ impl BoundExpr {
     pub(crate) fn data_type(&self) -> DataType {
         match self {
             BoundExpr::Literal { data_type, .. }
-            | BoundExpr::Parameter { data_type, .. }
             | BoundExpr::InputRef { data_type, .. }
             | BoundExpr::BinaryOp { data_type, .. }
             | BoundExpr::UnaryOp { data_type, .. }
-            | BoundExpr::Function { data_type, .. }
             | BoundExpr::Nextval { data_type, .. }
             | BoundExpr::Currval { data_type, .. }
             | BoundExpr::Setval { data_type, .. }
@@ -250,7 +250,9 @@ impl BoundExpr {
             | BoundExpr::Cast { data_type, .. }
             | BoundExpr::ScalarSubquery { data_type, .. }
             | BoundExpr::Exists { data_type, .. }
-            | BoundExpr::InSubquery { data_type, .. } => data_type.clone(),
+            | BoundExpr::InSubquery { data_type, .. }
+            | BoundExpr::Parameter { data_type, .. }
+            | BoundExpr::Function { data_type, .. } => data_type.clone(),
         }
     }
 

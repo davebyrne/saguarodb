@@ -2,7 +2,7 @@
 //! statement uses, and substituting bound values into a statement before
 //! planning and execution.
 
-use common::{DataType, DbError, Result, SqlState, Value};
+use common::{DataType, DbError, PgType, Result, SqlState, Value};
 
 use crate::bound::{BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning};
 use crate::{BoundExpr, BoundQuery, BoundQueryBody, BoundSelect, BoundStatement};
@@ -15,13 +15,15 @@ pub fn collect_param_types(
     statement: &BoundStatement,
     declared: &[Option<DataType>],
 ) -> Result<Vec<DataType>> {
-    let mut used: Vec<Option<DataType>> = Vec::new();
-    collect_statement(statement, &mut used)?;
+    let used = collect_param_uses(statement)?;
 
     let count = used.len().max(declared.len());
     let mut resolved = Vec::with_capacity(count);
     for index in 0..count {
-        let from_use = used.get(index).cloned().flatten();
+        let from_use = used
+            .get(index)
+            .and_then(|param_use| param_use.as_ref())
+            .map(|param_use| param_use.data_type.clone());
         let from_decl = declared.get(index).cloned().flatten();
         let data_type = from_use.or(from_decl).ok_or_else(|| {
             plan_error(
@@ -30,6 +32,41 @@ pub fn collect_param_types(
             )
         })?;
         resolved.push(data_type);
+    }
+    Ok(resolved)
+}
+
+pub fn collect_param_pg_types(
+    statement: &BoundStatement,
+    resolved_data_types: &[DataType],
+    declared: &[Option<PgType>],
+) -> Result<Vec<PgType>> {
+    let used = collect_param_uses(statement)?;
+
+    let count = used
+        .len()
+        .max(declared.len())
+        .max(resolved_data_types.len());
+    let mut resolved = Vec::with_capacity(count);
+    for index in 0..count {
+        let data_type = resolved_data_types.get(index).ok_or_else(|| {
+            plan_error(
+                SqlState::DatatypeMismatch,
+                format!("could not determine data type of parameter ${}", index + 1),
+            )
+        })?;
+        let pg_type = declared
+            .get(index)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                used.get(index)
+                    .and_then(|param_use| param_use.as_ref())
+                    .and_then(|param_use| param_use.pg_type.clone())
+            })
+            .filter(|pg_type| pg_type.data_type() == *data_type)
+            .unwrap_or_else(|| PgType::from(data_type));
+        resolved.push(pg_type);
     }
     Ok(resolved)
 }
@@ -45,7 +82,20 @@ pub fn substitute_params(statement: &BoundStatement, params: &[Value]) -> Result
 
 // --- collection (read-only) ---
 
-fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<DataType>>) -> Result<()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParamUse {
+    data_type: DataType,
+    pg_type: Option<PgType>,
+    pg_type_conflict: bool,
+}
+
+fn collect_param_uses(statement: &BoundStatement) -> Result<Vec<Option<ParamUse>>> {
+    let mut used = Vec::new();
+    collect_statement(statement, &mut used)?;
+    Ok(used)
+}
+
+fn collect_statement(statement: &BoundStatement, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     match statement {
         // COPY carries no expressions/parameters.
         BoundStatement::CreateTable { .. }
@@ -117,7 +167,7 @@ fn reject_create_view_parameters(query: &BoundQuery) -> Result<()> {
 
 fn collect_on_conflict(
     on_conflict: &Option<BoundOnConflict>,
-    used: &mut Vec<Option<DataType>>,
+    used: &mut Vec<Option<ParamUse>>,
 ) -> Result<()> {
     if let Some(BoundOnConflict::DoUpdate {
         assignments,
@@ -137,7 +187,7 @@ fn collect_on_conflict(
 
 fn collect_returning(
     returning: &Option<BoundReturning>,
-    used: &mut Vec<Option<DataType>>,
+    used: &mut Vec<Option<ParamUse>>,
 ) -> Result<()> {
     if let Some(returning) = returning {
         for expr in &returning.exprs {
@@ -149,7 +199,7 @@ fn collect_returning(
 
 /// Collect parameter types from a bound query: its body plus the query-level
 /// `ORDER BY` (which lives on the wrapper, not the `SELECT` body).
-fn collect_query(query: &BoundQuery, used: &mut Vec<Option<DataType>>) -> Result<()> {
+fn collect_query(query: &BoundQuery, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     match &query.body {
         BoundQueryBody::Select(select) => collect_select(select, used)?,
         BoundQueryBody::Values(values) => {
@@ -168,7 +218,7 @@ fn collect_query(query: &BoundQuery, used: &mut Vec<Option<DataType>>) -> Result
     Ok(())
 }
 
-fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Result<()> {
+fn collect_select(select: &BoundSelect, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     for item in &select.columns {
         collect_expr(&item.expr, used)?;
     }
@@ -187,7 +237,7 @@ fn collect_select(select: &BoundSelect, used: &mut Vec<Option<DataType>>) -> Res
     Ok(())
 }
 
-fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()> {
+fn collect_from(from: &BoundFrom, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => Ok(()),
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
@@ -209,16 +259,30 @@ fn collect_from(from: &BoundFrom, used: &mut Vec<Option<DataType>>) -> Result<()
     }
 }
 
-fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<DataType>>) -> Result<()> {
+fn collect_expr(expr: &BoundExpr, used: &mut Vec<Option<ParamUse>>) -> Result<()> {
     for_each_child(expr, &mut |child| collect_expr(child, used))?;
     if let Some(query) = subquery_query(expr) {
         collect_query(query, used)?;
     }
     if let BoundExpr::Parameter {
-        index, data_type, ..
+        index,
+        data_type,
+        pg_type,
+        ..
     } = expr
     {
-        record_param(used, *index, data_type)?;
+        let pg_type = pg_type
+            .clone()
+            .filter(|pg_type| pg_type.data_type() == *data_type);
+        record_param_use(
+            used,
+            *index,
+            ParamUse {
+                data_type: data_type.clone(),
+                pg_type,
+                pg_type_conflict: false,
+            },
+        )?;
     }
     Ok(())
 }
@@ -243,24 +307,36 @@ fn subquery_query_mut(expr: &mut BoundExpr) -> Option<&mut BoundQuery> {
     }
 }
 
-fn record_param(
-    used: &mut Vec<Option<DataType>>,
+fn record_param_use(
+    used: &mut Vec<Option<ParamUse>>,
     index: usize,
-    data_type: &DataType,
+    incoming: ParamUse,
 ) -> Result<()> {
     if used.len() <= index {
         used.resize(index + 1, None);
     }
-    match &used[index] {
-        Some(existing) if existing != data_type => Err(plan_error(
+    let Some(existing) = &mut used[index] else {
+        used[index] = Some(incoming);
+        return Ok(());
+    };
+    if existing.data_type != incoming.data_type {
+        return Err(plan_error(
             SqlState::DatatypeMismatch,
             format!("parameter ${} is used with conflicting types", index + 1),
-        )),
-        _ => {
-            used[index] = Some(data_type.clone());
-            Ok(())
-        }
+        ));
     }
+    if existing.pg_type_conflict {
+        return Ok(());
+    }
+    match (&existing.pg_type, incoming.pg_type) {
+        (Some(current), Some(next)) if current != &next => {
+            existing.pg_type = None;
+            existing.pg_type_conflict = true;
+        }
+        (None, Some(next)) => existing.pg_type = Some(next),
+        _ => {}
+    }
+    Ok(())
 }
 
 // --- substitution (in place) ---
@@ -421,6 +497,7 @@ fn substitute_expr(expr: &mut BoundExpr, params: &[Value]) -> Result<()> {
         index,
         data_type,
         nullable,
+        ..
     } = expr
     else {
         return Ok(());

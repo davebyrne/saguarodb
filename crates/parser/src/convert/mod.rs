@@ -492,6 +492,18 @@ fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
             Ok(PgType::Int4)
         }
         sql::DataType::BigInt(None) | sql::DataType::Int8(None) => Ok(PgType::Int8),
+        sql::DataType::Custom(name, modifiers) => {
+            let name = custom_type_name(name)?;
+            match name.as_str() {
+                "oid" | "pg_catalog.oid" => {
+                    if !modifiers.is_empty() {
+                        return unsupported("OID type modifiers are not supported");
+                    }
+                    Ok(PgType::Oid)
+                }
+                _ => unsupported("unsupported data type"),
+            }
+        }
         // Character types share the single `TEXT` storage type but report distinct
         // OIDs (text / varchar / bpchar). The declared length is applied by the
         // column path, not here.
@@ -540,6 +552,35 @@ fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
     }
 }
 
+fn custom_type_name(name: &sql::ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [name] => {
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported type name part"))?;
+            ident_name(name)
+        }
+        [schema, name] => {
+            let schema = schema
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported type schema part"))?;
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported type name part"))?;
+            let schema = ident_name(schema)?;
+            if schema != "pg_catalog" {
+                return feature_not_supported(
+                    "qualified type names are supported only in pg_catalog",
+                );
+            }
+            Ok(format!("{schema}.{}", ident_name(name)?))
+        }
+        _ => feature_not_supported(
+            "qualified type names with more than one schema are not supported",
+        ),
+    }
+}
+
 /// The wire type of a `SERIAL`-family column, or `None` for any other type. The
 /// column stores a 64-bit integer with a sequence-backed default, but reports the
 /// PostgreSQL width of its serial kind (`smallserial` => int2, `serial` => int4,
@@ -548,7 +589,7 @@ pub(super) fn serial_pg_type(data_type: &sql::DataType) -> Result<Option<PgType>
     let sql::DataType::Custom(name, modifiers) = data_type else {
         return Ok(None);
     };
-    let name = object_name(name)?;
+    let name = custom_type_name(name)?;
     let pg_type = match name.as_str() {
         "serial2" | "smallserial" => PgType::Int2,
         "serial" | "serial4" => PgType::Int4,
@@ -615,9 +656,9 @@ fn column_char_length(data_type: &sql::DataType) -> Result<Option<u32>> {
 }
 
 fn object_name(name: &sql::ObjectName) -> Result<String> {
-    // V1 has no schemas, so table, function, and column names are a single
-    // identifier. Reject `schema.table` (and longer) here with a clear error
-    // rather than letting a dotted name fail later as an unknown table.
+    // Paths that still call this helper accept only a single unqualified name.
+    // Relation and function names have their own helpers because they support
+    // limited schema-qualified compatibility forms.
     let [part] = name.0.as_slice() else {
         return unsupported("qualified names are not supported in v1");
     };
@@ -625,6 +666,35 @@ fn object_name(name: &sql::ObjectName) -> Result<String> {
         .as_ident()
         .ok_or_else(|| parse_error("unsupported object name part"))?;
     ident_name(ident)
+}
+
+fn function_name(name: &sql::ObjectName) -> Result<String> {
+    match name.0.as_slice() {
+        [name] => {
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported function name part"))?;
+            ident_name(name)
+        }
+        [schema, name] => {
+            let schema = schema
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported function schema part"))?;
+            let name = name
+                .as_ident()
+                .ok_or_else(|| parse_error("unsupported function name part"))?;
+            let schema = ident_name(schema)?;
+            if schema != "pg_catalog" {
+                return feature_not_supported(
+                    "qualified function names are supported only in pg_catalog",
+                );
+            }
+            ident_name(name)
+        }
+        _ => feature_not_supported(
+            "qualified function names with more than one schema are not supported",
+        ),
+    }
 }
 
 fn relation_name(name: &sql::ObjectName) -> Result<(Option<String>, String)> {

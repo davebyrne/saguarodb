@@ -7,7 +7,7 @@ mod params;
 mod physical;
 mod simplify;
 
-pub use binder::{bind, bind_default_expr, bind_parameterized};
+pub use binder::{bind, bind_default_expr, bind_parameterized, bind_parameterized_with_pg_types};
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
     BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
@@ -18,7 +18,7 @@ pub use expr::{
     AggregateExpr, AggregateFunc, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
 };
 pub use logical::{LogicalPlan, logical_plan};
-pub use params::{collect_param_types, substitute_params};
+pub use params::{collect_param_pg_types, collect_param_types, substitute_params};
 pub use parser::SetOp;
 pub use physical::{PhysicalPlan, physical_plan};
 
@@ -505,6 +505,55 @@ mod tests {
         // A computed expression falls back to the natural type collapsed from its
         // result DataType (Integer => int8).
         assert_eq!(select.output_schema[2].wire_type(), PgType::Int8);
+    }
+
+    #[test]
+    fn output_schema_preserves_oid_parameter_and_function_wire_types() {
+        let catalog = catalog_with_users();
+        let stmt =
+            parse("select $1, to_regclass('users'), to_regtype('integer'), pg_my_temp_schema()")
+                .unwrap();
+        let (bound, params) =
+            bind_parameterized_with_pg_types(&stmt, &catalog, &[Some(PgType::Oid)]).unwrap();
+        assert_eq!(params, vec![DataType::Integer]);
+
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].wire_type(), PgType::Oid);
+        assert_eq!(select.output_schema[1].wire_type(), PgType::Oid);
+        assert_eq!(select.output_schema[2].wire_type(), PgType::Oid);
+        assert_eq!(select.output_schema[3].wire_type(), PgType::Oid);
+    }
+
+    #[test]
+    fn catalog_function_placeholders_infer_oid_wire_types() {
+        let catalog = catalog_with_users();
+        let stmt =
+            parse("select pg_get_indexdef($1), pg_table_is_visible($2), format_type($3, $4)")
+                .unwrap();
+        let (bound, params) =
+            bind_parameterized_with_pg_types(&stmt, &catalog, &[None, None, None, None]).unwrap();
+        assert_eq!(
+            params,
+            vec![
+                DataType::Integer,
+                DataType::Integer,
+                DataType::Integer,
+                DataType::Integer,
+            ]
+        );
+
+        let param_pg_types =
+            collect_param_pg_types(&bound, &params, &[None, None, None, None]).unwrap();
+        assert_eq!(
+            param_pg_types,
+            vec![PgType::Oid, PgType::Oid, PgType::Oid, PgType::Int4]
+        );
     }
 
     #[test]
@@ -1388,6 +1437,31 @@ mod tests {
     }
 
     #[test]
+    fn binder_uses_registry_type_hints_for_introspection_functions() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select pg_catalog.format_type(null, $1)").unwrap();
+        let (bound, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+
+        assert_eq!(params, vec![DataType::Integer]);
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.output_schema[0].data_type, DataType::Text);
+        assert!(matches!(
+            &select.columns[0].expr,
+            BoundExpr::Function {
+                name,
+                nullable: true,
+                ..
+            } if name == "format_type"
+        ));
+    }
+
+    #[test]
     fn binder_types_system_information_functions() {
         let catalog = catalog_with_users();
         let stmt = parse(
@@ -1656,7 +1730,14 @@ mod tests {
         let catalog = catalog_with_users();
         let stmt = parse("select upper(name, name) from users").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
 
+        let stmt = parse("select format_type(NULL)").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+
+        let stmt = parse("select pg_get_indexdef($1, $2)").unwrap();
+        let err = bind_parameterized(&stmt, &catalog, &[]).unwrap_err();
         assert_eq!(err.code, SqlState::SyntaxError);
     }
 
@@ -2658,6 +2739,21 @@ mod tests {
         // CONCAT never returns NULL, even over a nullable argument.
         let bound = bind(
             &parse("select concat(name, '!') from users").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        assert_eq!(select.columns[0].expr.data_type(), DataType::Text);
+        assert!(!select.columns[0].expr.nullable());
+
+        let bound = bind(
+            &parse("select concat(null, null, null, null, null) from users").unwrap(),
             &catalog,
         )
         .unwrap();

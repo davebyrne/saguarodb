@@ -66,7 +66,7 @@ pub(super) fn bind_insert(
     source: &InsertSource,
     on_conflict: Option<&OnConflict>,
     returning: Option<&[SelectItem]>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let columns = insert_columns(&table, column_names)?;
@@ -127,7 +127,7 @@ fn bind_on_conflict(
     catalog: &dyn CatalogManager,
     table: &TableSchema,
     on_conflict: Option<&OnConflict>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<Option<BoundOnConflict>> {
     let Some(on_conflict) = on_conflict else {
         return Ok(None);
@@ -211,7 +211,7 @@ fn bind_do_update(
     target: Vec<ColumnId>,
     assignments: &[Assignment],
     filter: Option<&Expr>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundOnConflict> {
     let mut ctx = BindContext::new(catalog, declared);
     // Target row first (slots 0..n; bare columns resolve here), then the
@@ -259,7 +259,7 @@ fn bind_returning(
     catalog: &dyn CatalogManager,
     table: &TableSchema,
     items: Option<&[SelectItem]>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<Option<BoundReturning>> {
     let Some(items) = items else {
         return Ok(None);
@@ -286,7 +286,7 @@ fn bind_insert_values(
     table: &TableSchema,
     columns: &[ColumnId],
     rows: &[Vec<Expr>],
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundInsertSource> {
     let mut bound_rows = Vec::with_capacity(rows.len());
     for row in rows {
@@ -332,7 +332,7 @@ fn bind_insert_query(
     table: &TableSchema,
     columns: &[ColumnId],
     subquery: &Query,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundInsertSource> {
     // The INSERT source is a top-level query; it carries its own `WITH` (if any),
     // has no enclosing CTE scope, and gets no external `expected` types.
@@ -357,7 +357,7 @@ pub(super) fn bind_update(
     assignments: &[Assignment],
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let returning = bind_returning(catalog, &table, returning, declared)?;
@@ -411,7 +411,7 @@ pub(super) fn bind_delete(
     table_name: &str,
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
-    declared: &[Option<DataType>],
+    declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
     let returning = bind_returning(catalog, &table, returning, declared)?;

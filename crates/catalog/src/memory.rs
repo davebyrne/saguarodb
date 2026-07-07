@@ -9,7 +9,10 @@ use common::{
     ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
 };
 
-use crate::{CatalogManager, TableColumnAlteration};
+use crate::{
+    CatalogManager, TableColumnAlteration,
+    system::{MAX_COMPOUND_OID_SUB_ID, MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
+};
 
 const STORAGE_ID_KIND_BITS: FileId = 0xC000_0000;
 const MAX_STORAGE_ID: FileId = !STORAGE_ID_KIND_BITS;
@@ -209,8 +212,9 @@ impl CatalogManager for MemoryCatalog {
         normalize_table_storage_id(&mut schema, &snapshot)?;
         validate_schema(&schema, &snapshot.sequences_by_id)?;
         if schema.relation_kind == RelationKind::User {
-            reject_duplicate_relation_name(&snapshot, &schema.name)?;
+            reject_duplicate_relation_name(&snapshot, "table", &schema.name)?;
         }
+        reject_index_name_matching_synthetic_primary_key(&snapshot, &schema)?;
         reject_duplicate_relation_id(&snapshot, schema.id)?;
         validate_storage_id("table", schema.storage_id)?;
         reject_duplicate_table_storage_id(&snapshot, schema.storage_id, "table storage id")?;
@@ -319,7 +323,7 @@ impl CatalogManager for MemoryCatalog {
         checks: Vec<String>,
     ) -> Result<TableSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_relation_name(&snapshot, &name)?;
+        reject_duplicate_relation_name(&snapshot, "table", &name)?;
 
         let table_id = snapshot.next_table_id;
         reject_duplicate_relation_id(&snapshot, table_id)?;
@@ -342,6 +346,7 @@ impl CatalogManager for MemoryCatalog {
                 checks,
             },
         )?;
+        validate_schema(&schema, &snapshot.sequences_by_id)?;
         validate_toast_options(&schema)?;
         let hidden_toast = if needs_toast_relation(&schema) {
             let toast_id = next_table_id;
@@ -355,10 +360,12 @@ impl CatalogManager for MemoryCatalog {
             schema.toast_table_id = Some(toast_id);
             let mut hidden_toast = toast_schema(&schema, toast_id);
             hidden_toast.storage_id = toast_storage_id;
+            validate_schema(&hidden_toast, &snapshot.sequences_by_id)?;
             Some(hidden_toast)
         } else {
             None
         };
+        reject_index_name_matching_synthetic_primary_key(&snapshot, &schema)?;
 
         snapshot
             .tables_by_name
@@ -387,7 +394,7 @@ impl CatalogManager for MemoryCatalog {
         if schema.name == new_name {
             return Ok(schema);
         }
-        reject_duplicate_relation_name(&snapshot, &new_name)?;
+        reject_duplicate_relation_name(&snapshot, "table", &new_name)?;
         reject_dependent_views(&snapshot, id, None)?;
         schema.name = new_name;
         bump_schema_version(&mut schema.schema_version)?;
@@ -867,11 +874,11 @@ impl CatalogManager for MemoryCatalog {
     fn apply_create_index(&self, mut schema: IndexSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
         normalize_index_storage_id(&mut schema, &snapshot)?;
-        reject_duplicate_index_name(&snapshot, &schema.name)?;
         reject_duplicate_index_id(&snapshot, schema.id)?;
         validate_storage_id("index", schema.storage_id)?;
         reject_duplicate_index_storage_id(&snapshot, schema.storage_id, "index storage id")?;
         validate_index_schema(&schema, &snapshot.tables_by_id)?;
+        reject_duplicate_index_name_for_schema(&snapshot, &schema)?;
         reject_duplicate_primary_key_constraint_index(&snapshot, &schema)?;
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
@@ -926,7 +933,6 @@ impl CatalogManager for MemoryCatalog {
         constraint: IndexConstraintKind,
     ) -> Result<IndexSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_index_name(&snapshot, &name)?;
 
         let index_id = snapshot.next_index_id;
         let next_index_id = index_id
@@ -951,6 +957,8 @@ impl CatalogManager for MemoryCatalog {
                 constraint,
             )?
         };
+        validate_index_schema(&schema, &snapshot.tables_by_id)?;
+        reject_duplicate_index_name_for_schema(&snapshot, &schema)?;
         reject_duplicate_primary_key_constraint_index(&snapshot, &schema)?;
 
         snapshot
@@ -1044,6 +1052,7 @@ impl CatalogManager for MemoryCatalog {
             .checked_add(1)
             .ok_or_else(|| DbError::internal("catalog sequence id overflow"))?;
         let schema = build_sequence_schema(id, name, options, owned)?;
+        validate_sequence_schema(&schema)?;
         snapshot
             .sequences_by_name
             .insert(schema.name.clone(), schema.id);
@@ -1076,7 +1085,7 @@ impl CatalogManager for MemoryCatalog {
     fn apply_create_view(&self, schema: ViewSchema) -> Result<()> {
         let mut snapshot = self.write_snapshot()?;
         validate_view_schema(&schema, &snapshot)?;
-        reject_duplicate_relation_name(&snapshot, &schema.name)?;
+        reject_duplicate_relation_name(&snapshot, "view", &schema.name)?;
         reject_duplicate_relation_id(&snapshot, schema.id)?;
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog view id overflow while applying create view")
@@ -1098,7 +1107,7 @@ impl CatalogManager for MemoryCatalog {
             .cloned()
             .ok_or_else(|| undefined_view(format!("view id {} does not exist", schema.id)))?;
         if old.name != schema.name {
-            reject_duplicate_relation_name(&snapshot, &schema.name)?;
+            reject_duplicate_relation_name(&snapshot, "view", &schema.name)?;
             snapshot.views_by_name.remove(&old.name);
             snapshot
                 .views_by_name
@@ -1127,7 +1136,7 @@ impl CatalogManager for MemoryCatalog {
         dependencies: Vec<ViewDependency>,
     ) -> Result<ViewSchema> {
         let mut snapshot = self.write_snapshot()?;
-        reject_duplicate_relation_name(&snapshot, &name)?;
+        reject_duplicate_relation_name(&snapshot, "view", &name)?;
         let id = snapshot.next_table_id;
         reject_duplicate_relation_id(&snapshot, id)?;
         let next_table_id = id
@@ -2160,9 +2169,50 @@ fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     }
 
     validate_indexes(snapshot)?;
+    validate_public_relation_namespace(snapshot)?;
     validate_dictionary_ids(snapshot)?;
     validate_storage_ids(snapshot)?;
     validate_toast_relations(snapshot)?;
+    Ok(())
+}
+
+fn validate_public_relation_namespace(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut seen = HashMap::new();
+    for table in snapshot.tables_by_id.values() {
+        if table.relation_kind != RelationKind::User {
+            continue;
+        }
+        record_public_relation_name(&mut seen, "table", &table.name)?;
+        let has_matching_primary_key_index = snapshot.indexes_by_id.values().any(|index| {
+            index.table == table.id && is_matching_primary_key_constraint_index(snapshot, index)
+        });
+        if !has_matching_primary_key_index && !table.primary_key.is_empty() {
+            record_public_relation_name(
+                &mut seen,
+                "synthetic primary-key index",
+                &synthetic_primary_key_index_name(table),
+            )?;
+        }
+    }
+    for index in snapshot.indexes_by_id.values() {
+        record_public_relation_name(&mut seen, "index", &index.name)?;
+    }
+    for sequence in snapshot.sequences_by_id.values() {
+        record_public_relation_name(&mut seen, "sequence", &sequence.name)?;
+    }
+    Ok(())
+}
+
+fn record_public_relation_name(
+    seen: &mut HashMap<String, &'static str>,
+    kind: &'static str,
+    name: &str,
+) -> Result<()> {
+    if let Some(existing_kind) = seen.insert(name.to_string(), kind) {
+        return Err(DbError::internal(format!(
+            "catalog snapshot public relation name {name} is used by both {existing_kind} and {kind}"
+        )));
+    }
     Ok(())
 }
 
@@ -2331,6 +2381,9 @@ fn validate_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
         validate_index_schema(schema, &snapshot.tables_by_id)?;
         max_index_id = max_index_id.max(*id);
     }
+    for table in snapshot.tables_by_id.values() {
+        validate_no_index_name_matching_synthetic_primary_key(snapshot, table)?;
+    }
 
     let required_next = max_index_id
         .checked_add(1)
@@ -2355,6 +2408,7 @@ fn validate_index_schema(
             "catalog snapshot uses the reserved storage identity index id for a catalog index",
         ));
     }
+    validate_virtual_oid_id("index", &schema.name, schema.id, MAX_VIRTUAL_OID_PAYLOAD)?;
     let table = tables_by_id.get(&schema.table).ok_or_else(|| {
         DbError::internal(format!(
             "catalog snapshot index {} references missing table {}",
@@ -2487,6 +2541,8 @@ fn validate_sequences(snapshot: &CatalogSnapshot) -> Result<()> {
 }
 
 fn validate_sequence_schema(schema: &SequenceSchema) -> Result<()> {
+    validate_virtual_oid_id("sequence", &schema.name, schema.id, MAX_VIRTUAL_OID_PAYLOAD)?;
+
     if schema.increment == 0 {
         return Err(DbError::internal(format!(
             "catalog snapshot sequence {} has zero increment",
@@ -2525,6 +2581,7 @@ fn validate_schema(
         )));
     }
     validate_toast_options(schema)?;
+    validate_table_virtual_oids(schema)?;
 
     let mut column_ids = HashSet::new();
     let mut column_names = HashSet::new();
@@ -2667,6 +2724,36 @@ fn validate_view_columns(schema: &ViewSchema) -> Result<()> {
                 schema.name, column.name
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_table_virtual_oids(schema: &TableSchema) -> Result<()> {
+    validate_virtual_oid_id("table", &schema.name, schema.id, MAX_VIRTUAL_OID_PAYLOAD)?;
+    validate_virtual_oid_id("table", &schema.name, schema.id, MAX_COMPOUND_OID_TABLE_ID)?;
+
+    let max_default_column_id = schema
+        .columns
+        .iter()
+        .filter(|column| column.default.is_some())
+        .map(|column| column.id)
+        .max();
+    if let Some(column_id) = max_default_column_id
+        && column_id > MAX_COMPOUND_OID_SUB_ID
+    {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} column id {column_id} exceeds compound virtual OID sub-id limit {}",
+            schema.name, MAX_COMPOUND_OID_SUB_ID
+        )));
+    }
+
+    if schema.checks.len() > usize::from(MAX_COMPOUND_OID_SUB_ID) {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} has {} CHECK constraints, exceeding compound virtual OID sub-id limit {}",
+            schema.name,
+            schema.checks.len(),
+            MAX_COMPOUND_OID_SUB_ID
+        )));
     }
     Ok(())
 }
@@ -2815,6 +2902,15 @@ fn validate_view_dependencies(schema: &ViewSchema, snapshot: &CatalogSnapshot) -
     Ok(())
 }
 
+fn validate_virtual_oid_id(kind: &str, name: &str, id: u32, max: u32) -> Result<()> {
+    if id > max {
+        return Err(DbError::internal(format!(
+            "catalog snapshot {kind} {name} id {id} exceeds virtual OID payload limit {max}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_toast_options(schema: &TableSchema) -> Result<()> {
     if !(ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET)
         .contains(&schema.toast.tuple_target)
@@ -2909,7 +3005,7 @@ fn replace_table_and_index_schemas(
     carry_view_dependencies_for_table_update(&old, &schema, &mut candidate.views_by_id)?;
     if old.relation_kind == RelationKind::User {
         if old.name != schema.name {
-            reject_duplicate_relation_name(snapshot, &schema.name)?;
+            reject_duplicate_relation_name(snapshot, "table", &schema.name)?;
             candidate.tables_by_name.remove(&old.name);
             candidate
                 .tables_by_name
@@ -3201,16 +3297,6 @@ fn remap_indexes_after_drop(snapshot: &mut CatalogSnapshot, table: TableId, drop
     }
 }
 
-fn reject_duplicate_relation_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
-    if snapshot.tables_by_name.contains_key(name) || snapshot.views_by_name.contains_key(name) {
-        return Err(DbError::plan(
-            SqlState::DuplicateTable,
-            format!("relation {name} already exists"),
-        ));
-    }
-    Ok(())
-}
-
 fn reject_duplicate_relation_id(snapshot: &CatalogSnapshot, id: TableId) -> Result<()> {
     if snapshot.tables_by_id.contains_key(&id) || snapshot.views_by_id.contains_key(&id) {
         return Err(DbError::plan(
@@ -3222,13 +3308,7 @@ fn reject_duplicate_relation_id(snapshot: &CatalogSnapshot, id: TableId) -> Resu
 }
 
 fn reject_duplicate_sequence_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
-    if snapshot.sequences_by_name.contains_key(name) {
-        return Err(DbError::plan(
-            SqlState::DuplicateTable,
-            format!("sequence {name} already exists"),
-        ));
-    }
-    Ok(())
+    reject_duplicate_relation_name(snapshot, "sequence", name)
 }
 
 fn reject_duplicate_sequence_id(snapshot: &CatalogSnapshot, id: SequenceId) -> Result<()> {
@@ -3328,13 +3408,122 @@ fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {
 }
 
 fn reject_duplicate_index_name(snapshot: &CatalogSnapshot, name: &str) -> Result<()> {
-    if snapshot.indexes_by_name.contains_key(name) {
+    reject_duplicate_relation_name(snapshot, "index", name)
+}
+
+fn reject_duplicate_index_name_for_schema(
+    snapshot: &CatalogSnapshot,
+    schema: &IndexSchema,
+) -> Result<()> {
+    if snapshot.tables_by_name.contains_key(&schema.name)
+        || snapshot.sequences_by_name.contains_key(&schema.name)
+        || snapshot.indexes_by_name.contains_key(&schema.name)
+        || (synthetic_primary_key_index_name_conflict_by_name(snapshot, &schema.name)
+            && !is_matching_primary_key_constraint_index(snapshot, schema))
+    {
         return Err(DbError::plan(
             SqlState::DuplicateTable,
-            format!("index {name} already exists"),
+            format!("index {} already exists", schema.name),
         ));
     }
     Ok(())
+}
+
+fn is_matching_primary_key_constraint_index(
+    snapshot: &CatalogSnapshot,
+    schema: &IndexSchema,
+) -> bool {
+    if schema.constraint != IndexConstraintKind::PrimaryKey || !schema.unique {
+        return false;
+    }
+    snapshot
+        .tables_by_id
+        .get(&schema.table)
+        .is_some_and(|table| {
+            table.relation_kind == RelationKind::User
+                && !table.primary_key.is_empty()
+                && schema.columns == table.primary_key
+                && schema.name == synthetic_primary_key_index_name(table)
+        })
+}
+
+fn reject_duplicate_relation_name(
+    snapshot: &CatalogSnapshot,
+    kind: &str,
+    name: &str,
+) -> Result<()> {
+    if snapshot.tables_by_name.contains_key(name)
+        || snapshot.views_by_name.contains_key(name)
+        || snapshot.sequences_by_name.contains_key(name)
+        || snapshot.indexes_by_name.contains_key(name)
+        || synthetic_primary_key_index_name_conflict_by_name(snapshot, name)
+    {
+        return Err(DbError::plan(
+            SqlState::DuplicateTable,
+            format!("{kind} {name} already exists"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_index_name_matching_synthetic_primary_key(
+    snapshot: &CatalogSnapshot,
+    table: &TableSchema,
+) -> Result<()> {
+    if table.relation_kind == RelationKind::User && !table.primary_key.is_empty() {
+        reject_duplicate_relation_name(
+            snapshot,
+            "index",
+            &synthetic_primary_key_index_name(table),
+        )?;
+    }
+    Ok(())
+}
+
+fn synthetic_primary_key_index_name_conflict_by_name(
+    snapshot: &CatalogSnapshot,
+    name: &str,
+) -> bool {
+    snapshot.tables_by_id.values().any(|table| {
+        matches!(table.relation_kind, RelationKind::User)
+            && !table.primary_key.is_empty()
+            && synthetic_primary_key_index_name(table) == name
+    })
+}
+
+fn validate_no_index_name_matching_synthetic_primary_key(
+    snapshot: &CatalogSnapshot,
+    table: &TableSchema,
+) -> Result<()> {
+    if let Some(name) = synthetic_primary_key_index_name_conflict(snapshot, table) {
+        return Err(DbError::internal(format!(
+            "catalog snapshot table {} synthetic primary-key index name {name} conflicts with a secondary index",
+            table.name
+        )));
+    }
+    Ok(())
+}
+
+fn synthetic_primary_key_index_name_conflict(
+    snapshot: &CatalogSnapshot,
+    table: &TableSchema,
+) -> Option<String> {
+    if table.relation_kind != RelationKind::User || table.primary_key.is_empty() {
+        return None;
+    }
+    let name = synthetic_primary_key_index_name(table);
+    let index = snapshot
+        .indexes_by_name
+        .get(&name)
+        .and_then(|id| snapshot.indexes_by_id.get(id))?;
+    (!is_matching_primary_key_constraint_index(snapshot, index)).then_some(name)
+}
+
+fn synthetic_primary_key_index_name(table: &TableSchema) -> String {
+    match table.relation_kind {
+        RelationKind::User => format!("{}_pkey", table.name),
+        RelationKind::Toast { base_table } => format!("pg_toast_{base_table}_pkey"),
+    }
 }
 
 fn reject_duplicate_index_id(snapshot: &CatalogSnapshot, id: IndexId) -> Result<()> {

@@ -158,7 +158,10 @@ resolves to the collapsed default from its `DataType`: `Integer` -> `int8`,
 that `DataType` intentionally collapses:
 
 - integers: `Int2` (`21`, size `2`), `Int4` (`23`, size `4`), `Int8` (`20`, size `8`)
+- catalog integers: `Oid` (`26`, size `4`, unsigned on the PostgreSQL binary wire)
 - character: `Text` (`25`), `Varchar` (`1043`), `Bpchar` (`1042`), all size `-1`
+- catalog vectors/arrays used by virtual system views: `Int2Vector` (`22`),
+  `OidVector` (`30`), `Int2Array` (`1005`), `OidArray` (`1028`), all size `-1`
 - `Bool` (`16`, `1`), `Bytea` (`17`, `-1`), `Uuid` (`2950`, `16`)
 - `Float4` (`700`, `4`), `Float8` (`701`, `8`), `Numeric` (`1700`, `-1`)
 - temporal: `Date` (`1082`, `4`), `Time` (`1083`, `8`), `Timestamp` (`1114`, `8`),
@@ -170,22 +173,37 @@ that `DataType` intentionally collapses:
 On input, an extended-protocol `Parse` may declare each parameter's type OID.
 The accepted OIDs are the wire types above plus `0` (unspecified — the server
 infers the type): the distinct integer widths `int2` (`21`), `int4` (`23`),
-`int8` (`20`) all resolve to the single integer type, and `varchar` (`1043`) /
-`bpchar` (`1042`) / `text` (`25`) all resolve to text; any other OID is rejected
-with an "unsupported parameter type OID" error. The server remembers each
-declared wire type so `ParameterDescription` echoes the exact OID the client
-declared (an inferred parameter falls back to the collapsed default). A binary
-integer parameter may be bound as 2, 4, or 8 bytes (`int2`/`int4`/`int8`); each
-is sign-extended to the internal 64-bit integer.
+`int8` (`20`) and `oid` (`26`) all resolve to the single integer type, and
+`varchar` (`1043`) / `bpchar` (`1042`) / `text` (`25`) all resolve to text.
+Catalog vector/array parameter OIDs (`int2vector` `22`, `oidvector` `30`,
+`int2[]` `1005`, `oid[]` `1028`) are accepted for catalog-driven probes and
+decode through the same text-backed storage representation; binary input for
+those text-backed identities is unsupported until SaguaroDB has real vector/array
+values. Any other OID is rejected with an "unsupported parameter type OID" error.
+The server remembers each declared wire type so `ParameterDescription` echoes the
+exact OID the client declared. For unspecified parameters, the planner may still infer a
+more specific PostgreSQL wire identity from unambiguous catalog-function
+arguments, such as `oid` for `pg_table_is_visible($1)`; otherwise the inferred
+parameter falls back to the collapsed default for its semantic `DataType`.
+A binary integer parameter may be bound as 2, 4, or 8 bytes
+(`int2`/`int4`/`int8`); each is sign-extended to the internal 64-bit integer. A
+binary `oid` parameter is exactly 4 bytes and is decoded as an unsigned 32-bit
+value into the same internal integer type. A text `oid` parameter is parsed as a
+decimal integer and range-checked to the same `0..=u32::MAX` domain.
 
 The simple query path sends text format for all columns. The extended protocol
 lets a client request binary format (code `1`) per column via `Bind`;
 `RowDescription` then reports the chosen format code per field. Binary integer
 output honors the column's declared width: an `int2`/`int4` value is encoded to 2
-or 4 big-endian bytes (not the 8-byte `int8` form), via
-`encode_value_with_type`. A value that does not fit its declared width — only
-reachable for data that predates or bypasses the write-time range check — is
-rejected rather than silently truncated.
+or 4 big-endian bytes (not the 8-byte `int8` form), and an `oid` value is encoded
+as 4 unsigned big-endian bytes, via `encode_value_with_type`. A value that does
+not fit its declared width/range — only reachable for data that predates or
+bypasses the write-time range check, or for a virtual OID bug — is rejected
+rather than silently truncated. Virtual-catalog vector/array identities
+(`int2vector`, `oidvector`, `int2[]`, `oid[]`) use text storage; if an extended
+client requests binary results for such a column, the server reports and sends
+that column in text format so clients do not receive invalid binary
+array/vector bytes.
 
 ## PostgreSQL Wire Encoding Details
 

@@ -22,6 +22,7 @@ pub enum PgType {
     Int2,
     Int4,
     Int8,
+    Oid,
     Bool,
     Float4,
     Float8,
@@ -41,15 +42,126 @@ pub enum PgType {
     Timestamp,
     Timestamptz,
     Interval,
+    OidVector,
+    Int2Vector,
+    OidArray,
+    Int2Array,
 }
 
 impl PgType {
+    /// Decode a PostgreSQL type OID plus type modifier into the presentational
+    /// wire type SaguaroDB exposes. Unsupported OIDs return `None`.
+    pub fn from_oid_typmod(oid: i64, typmod: i64) -> Option<Self> {
+        let typmod = i32::try_from(typmod).ok()?;
+        Some(match oid {
+            16 => PgType::Bool,
+            17 => PgType::Bytea,
+            20 => PgType::Int8,
+            21 => PgType::Int2,
+            22 => PgType::Int2Vector,
+            23 => PgType::Int4,
+            25 => PgType::Text,
+            26 => PgType::Oid,
+            30 => PgType::OidVector,
+            700 => PgType::Float4,
+            701 => PgType::Float8,
+            1005 => PgType::Int2Array,
+            1028 => PgType::OidArray,
+            1042 => PgType::Bpchar(decode_length_typmod(typmod)),
+            1043 => PgType::Varchar(decode_length_typmod(typmod)),
+            1082 => PgType::Date,
+            1083 => PgType::Time,
+            1114 => PgType::Timestamp,
+            1184 => PgType::Timestamptz,
+            1186 => PgType::Interval,
+            1700 => {
+                let (precision, scale) = decode_numeric_typmod(typmod);
+                PgType::Numeric { precision, scale }
+            }
+            2950 => PgType::Uuid,
+            _ => return None,
+        })
+    }
+
+    /// Resolve a PostgreSQL type spelling commonly used in catalog probes to its
+    /// type OID. This is intentionally limited to SaguaroDB's exposed type set.
+    pub fn oid_for_name(name: &str) -> Option<i64> {
+        let name = name.trim().to_ascii_lowercase();
+        let name = name.strip_prefix("pg_catalog.").unwrap_or(&name);
+        Some(match name {
+            "bool" | "boolean" => 16,
+            "bytea" => 17,
+            "int8" | "bigint" => 20,
+            "int2" | "smallint" => 21,
+            "int4" | "integer" | "int" => 23,
+            "text" => 25,
+            "oid" => 26,
+            "oidvector" => 30,
+            "int2vector" => 22,
+            "int2[]" | "smallint[]" | "_int2" => 1005,
+            "oid[]" | "_oid" => 1028,
+            "float4" | "real" => 700,
+            "float8" | "double precision" | "float" => 701,
+            "bpchar" | "char" | "character" => 1042,
+            "varchar" | "character varying" => 1043,
+            "date" => 1082,
+            "time" | "time without time zone" => 1083,
+            "timestamp" | "timestamp without time zone" => 1114,
+            "timestamptz" | "timestamp with time zone" => 1184,
+            "interval" => 1186,
+            "numeric" | "decimal" => 1700,
+            "uuid" => 2950,
+            _ => return None,
+        })
+    }
+
+    /// PostgreSQL-style SQL display name used by `format_type`.
+    pub fn format_type_name(&self) -> String {
+        match self {
+            PgType::Int2 => "smallint".to_string(),
+            PgType::Int4 => "integer".to_string(),
+            PgType::Int8 => "bigint".to_string(),
+            PgType::Oid => "oid".to_string(),
+            PgType::Bool => "boolean".to_string(),
+            PgType::Float4 => "real".to_string(),
+            PgType::Float8 => "double precision".to_string(),
+            PgType::Numeric {
+                precision: Some(precision),
+                scale,
+            } if *scale == 0 => format!("numeric({precision})"),
+            PgType::Numeric {
+                precision: Some(precision),
+                scale,
+            } => format!("numeric({precision},{scale})"),
+            PgType::Numeric {
+                precision: None, ..
+            } => "numeric".to_string(),
+            PgType::Text => "text".to_string(),
+            PgType::Varchar(Some(length)) => format!("character varying({length})"),
+            PgType::Varchar(None) => "character varying".to_string(),
+            PgType::Bpchar(Some(length)) => format!("character({length})"),
+            PgType::Bpchar(None) => "character".to_string(),
+            PgType::Bytea => "bytea".to_string(),
+            PgType::Uuid => "uuid".to_string(),
+            PgType::Date => "date".to_string(),
+            PgType::Time => "time without time zone".to_string(),
+            PgType::Timestamp => "timestamp without time zone".to_string(),
+            PgType::Timestamptz => "timestamp with time zone".to_string(),
+            PgType::Interval => "interval".to_string(),
+            PgType::OidVector => "oidvector".to_string(),
+            PgType::Int2Vector => "int2vector".to_string(),
+            PgType::OidArray => "oid[]".to_string(),
+            PgType::Int2Array => "smallint[]".to_string(),
+        }
+    }
+
     /// The PostgreSQL type OID reported on the wire.
     pub fn oid(&self) -> i32 {
         match self {
             PgType::Int2 => 21,
             PgType::Int4 => 23,
             PgType::Int8 => 20,
+            PgType::Oid => 26,
             PgType::Bool => 16,
             PgType::Float4 => 700,
             PgType::Float8 => 701,
@@ -64,6 +176,10 @@ impl PgType {
             PgType::Timestamp => 1114,
             PgType::Timestamptz => 1184,
             PgType::Interval => 1186,
+            PgType::OidVector => 30,
+            PgType::Int2Vector => 22,
+            PgType::OidArray => 1028,
+            PgType::Int2Array => 1005,
         }
     }
 
@@ -72,7 +188,7 @@ impl PgType {
         match self {
             PgType::Bool => 1,
             PgType::Int2 => 2,
-            PgType::Int4 | PgType::Float4 | PgType::Date => 4,
+            PgType::Int4 | PgType::Oid | PgType::Float4 | PgType::Date => 4,
             PgType::Int8
             | PgType::Float8
             | PgType::Time
@@ -83,7 +199,11 @@ impl PgType {
             | PgType::Text
             | PgType::Varchar(_)
             | PgType::Bpchar(_)
-            | PgType::Bytea => -1,
+            | PgType::Bytea
+            | PgType::OidVector
+            | PgType::Int2Vector
+            | PgType::OidArray
+            | PgType::Int2Array => -1,
         }
     }
 
@@ -125,7 +245,7 @@ impl PgType {
     /// `PgType::from(&dt).data_type() == dt` for every `DataType`.
     pub fn data_type(&self) -> DataType {
         match self {
-            PgType::Int2 | PgType::Int4 | PgType::Int8 => DataType::Integer,
+            PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Oid => DataType::Integer,
             PgType::Bool => DataType::Boolean,
             PgType::Float4 => DataType::Real,
             PgType::Float8 => DataType::Double,
@@ -133,7 +253,13 @@ impl PgType {
                 precision: *precision,
                 scale: *scale,
             },
-            PgType::Text | PgType::Varchar(_) | PgType::Bpchar(_) => DataType::Text,
+            PgType::Text
+            | PgType::Varchar(_)
+            | PgType::Bpchar(_)
+            | PgType::OidVector
+            | PgType::Int2Vector
+            | PgType::OidArray
+            | PgType::Int2Array => DataType::Text,
             PgType::Bytea => DataType::Bytea,
             PgType::Uuid => DataType::Uuid,
             PgType::Date => DataType::Date,
@@ -153,9 +279,30 @@ impl PgType {
         match self {
             PgType::Int2 if i16::try_from(value).is_err() => Some("smallint"),
             PgType::Int4 if i32::try_from(value).is_err() => Some("integer"),
+            PgType::Oid if u32::try_from(value).is_err() => Some("oid"),
             _ => None,
         }
     }
+}
+
+fn decode_length_typmod(typmod: i32) -> Option<u32> {
+    let length = typmod.checked_sub(VARHDRSZ)?;
+    u32::try_from(length).ok()
+}
+
+fn decode_numeric_typmod(typmod: i32) -> (Option<u32>, u32) {
+    let Some(packed) = typmod.checked_sub(VARHDRSZ) else {
+        return (None, 0);
+    };
+    let Ok(packed) = u32::try_from(packed) else {
+        return (None, 0);
+    };
+    let precision = (packed >> 16) & 0xffff;
+    if precision == 0 {
+        return (None, 0);
+    }
+    let scale = packed & 0xffff;
+    (Some(precision), scale)
 }
 
 /// The fallback wire type for a `DataType` with no declared label: the collapsed
@@ -195,11 +342,16 @@ mod tests {
     fn oid_and_typlen_match_postgres() {
         let cases: &[(PgType, i32, i16)] = &[
             (PgType::Int2, 21, 2),
+            (PgType::Int2Vector, 22, -1),
             (PgType::Int4, 23, 4),
             (PgType::Int8, 20, 8),
+            (PgType::Oid, 26, 4),
+            (PgType::OidVector, 30, -1),
             (PgType::Bool, 16, 1),
             (PgType::Float4, 700, 4),
             (PgType::Float8, 701, 8),
+            (PgType::Int2Array, 1005, -1),
+            (PgType::OidArray, 1028, -1),
             (
                 PgType::Numeric {
                     precision: None,
@@ -225,6 +377,18 @@ mod tests {
             assert_eq!(pg_type.oid(), *oid, "oid for {pg_type:?}");
             assert_eq!(pg_type.typlen(), *typlen, "typlen for {pg_type:?}");
         }
+    }
+
+    #[test]
+    fn oid_for_name_accepts_catalog_qualified_type_names() {
+        assert_eq!(PgType::oid_for_name("int4"), Some(23));
+        assert_eq!(PgType::oid_for_name("pg_catalog.int4"), Some(23));
+        assert_eq!(PgType::oid_for_name("pg_catalog.oid"), Some(26));
+        assert_eq!(PgType::oid_for_name("oidvector"), Some(30));
+        assert_eq!(PgType::oid_for_name("_int2"), Some(1005));
+        assert_eq!(PgType::oid_for_name("pg_catalog._oid"), Some(1028));
+        assert_eq!(PgType::oid_for_name("PG_CATALOG.INTEGER"), Some(23));
+        assert_eq!(PgType::oid_for_name("public.int4"), None);
     }
 
     #[test]
@@ -280,6 +444,43 @@ mod tests {
         assert_eq!((typmod - 4) & 0xFFFF, 2);
     }
 
+    #[test]
+    fn decodes_oid_typmod_for_catalog_functions() {
+        assert_eq!(PgType::from_oid_typmod(23, -1), Some(PgType::Int4));
+        assert_eq!(PgType::from_oid_typmod(26, -1), Some(PgType::Oid));
+        assert_eq!(
+            PgType::from_oid_typmod(1043, 14),
+            Some(PgType::Varchar(Some(10)))
+        );
+        assert_eq!(
+            PgType::from_oid_typmod(1700, ((12 << 16) | 2) + 4),
+            Some(PgType::Numeric {
+                precision: Some(12),
+                scale: 2
+            })
+        );
+        assert_eq!(PgType::from_oid_typmod(999_999, -1), None);
+    }
+
+    #[test]
+    fn formats_type_names_for_catalog_functions() {
+        assert_eq!(PgType::Int4.format_type_name(), "integer");
+        assert_eq!(PgType::Oid.format_type_name(), "oid");
+        assert_eq!(
+            PgType::Varchar(Some(10)).format_type_name(),
+            "character varying(10)"
+        );
+        assert_eq!(
+            PgType::Numeric {
+                precision: Some(12),
+                scale: 2,
+            }
+            .format_type_name(),
+            "numeric(12,2)"
+        );
+        assert_eq!(PgType::oid_for_name("double precision"), Some(701));
+    }
+
     /// The label-free fallback reproduces the historical collapsed OIDs:
     /// integers as int8, character types as text.
     #[test]
@@ -313,19 +514,26 @@ mod tests {
             Some("integer")
         );
         assert_eq!(PgType::Int8.narrow_int_overflow(i64::MAX), None);
+        assert_eq!(PgType::Oid.narrow_int_overflow(4_294_967_295), None);
+        assert_eq!(PgType::Oid.narrow_int_overflow(-1), Some("oid"));
+        assert_eq!(PgType::Oid.narrow_int_overflow(4_294_967_296), Some("oid"));
         assert_eq!(PgType::Text.narrow_int_overflow(i64::MAX), None);
     }
 
     #[test]
     fn data_type_collapses_widths_and_char_kinds() {
         // The refined wire types collapse back to the storage type.
-        for pg_type in [PgType::Int2, PgType::Int4, PgType::Int8] {
+        for pg_type in [PgType::Int2, PgType::Int4, PgType::Int8, PgType::Oid] {
             assert_eq!(pg_type.data_type(), DataType::Integer);
         }
         for pg_type in [
             PgType::Text,
             PgType::Varchar(Some(10)),
             PgType::Bpchar(None),
+            PgType::OidVector,
+            PgType::Int2Vector,
+            PgType::OidArray,
+            PgType::Int2Array,
         ] {
             assert_eq!(pg_type.data_type(), DataType::Text);
         }

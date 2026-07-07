@@ -331,11 +331,13 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
             name,
             args,
             data_type,
+            pg_type,
             nullable,
         } => Ok(BoundExpr::Function {
             name: name.clone(),
             args: resolve_vec(ctx, args)?,
             data_type: data_type.clone(),
+            pg_type: pg_type.clone(),
             nullable: *nullable,
         }),
         BoundExpr::Setval {
