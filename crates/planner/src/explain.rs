@@ -15,8 +15,11 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
         PhysicalPlan::CreateTable { name, .. } => {
             output.push_str(&format!("{padding}CreateTable {name}\n"));
         }
-        PhysicalPlan::DropTable { table } => {
-            output.push_str(&format!("{padding}DropTable table={table}\n"));
+        PhysicalPlan::DropTable {
+            name, if_exists, ..
+        } => {
+            let conditional = if *if_exists { " if_exists=true" } else { "" };
+            output.push_str(&format!("{padding}DropTable {name}{conditional}\n"));
         }
         PhysicalPlan::CreateIndex {
             name,

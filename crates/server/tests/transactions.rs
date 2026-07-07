@@ -147,6 +147,35 @@ async fn ddl_inside_transaction_is_rejected() {
         err.message
     );
     conn.ok("rollback").await;
+
+    conn.ok("begin").await;
+    let ddl = conn
+        .query("create table if not exists users (id integer primary key)")
+        .await
+        .unwrap();
+    let err = ddl
+        .result
+        .err()
+        .expect("conditional CREATE TABLE in a txn is rejected");
+    assert!(
+        err.message.to_lowercase().contains("ddl"),
+        "message was: {}",
+        err.message
+    );
+    conn.ok("rollback").await;
+
+    conn.ok("begin").await;
+    let ddl = conn.query("drop table if exists users").await.unwrap();
+    let err = ddl
+        .result
+        .err()
+        .expect("conditional DROP TABLE in a txn is rejected");
+    assert!(
+        err.message.to_lowercase().contains("ddl"),
+        "message was: {}",
+        err.message
+    );
+    conn.ok("rollback").await;
 }
 
 /// COMMIT/ROLLBACK with no open transaction are no-ops that stay 'I'.

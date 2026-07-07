@@ -15,6 +15,7 @@ use crate::{
 pub enum PhysicalPlan {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
@@ -25,7 +26,9 @@ pub enum PhysicalPlan {
         checks: Vec<String>,
     },
     DropTable {
-        table: TableId,
+        name: String,
+        if_exists: bool,
+        table: Option<TableId>,
     },
     CreateIndex {
         name: String,
@@ -152,6 +155,7 @@ pub fn physical_plan(
     match logical {
         LogicalPlan::CreateTable {
             name,
+            if_not_exists,
             columns,
             primary_key,
             unique,
@@ -160,6 +164,7 @@ pub fn physical_plan(
             checks,
         } => Ok(PhysicalPlan::CreateTable {
             name: name.clone(),
+            if_not_exists: *if_not_exists,
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
@@ -167,7 +172,15 @@ pub fn physical_plan(
             toast: toast.clone(),
             checks: checks.clone(),
         }),
-        LogicalPlan::DropTable { table } => Ok(PhysicalPlan::DropTable { table: *table }),
+        LogicalPlan::DropTable {
+            name,
+            if_exists,
+            table,
+        } => Ok(PhysicalPlan::DropTable {
+            name: name.clone(),
+            if_exists: *if_exists,
+            table: *table,
+        }),
         LogicalPlan::CreateIndex {
             name,
             table,

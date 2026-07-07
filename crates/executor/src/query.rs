@@ -103,6 +103,7 @@ impl QueryEngine {
         match plan {
             PhysicalPlan::CreateTable {
                 name,
+                if_not_exists,
                 columns,
                 primary_key,
                 unique,
@@ -112,6 +113,7 @@ impl QueryEngine {
             } => execute_create_table(
                 ctx,
                 name,
+                *if_not_exists,
                 columns,
                 primary_key,
                 unique,
@@ -119,7 +121,11 @@ impl QueryEngine {
                 toast.clone(),
                 checks,
             ),
-            PhysicalPlan::DropTable { table } => execute_drop_table(ctx, *table),
+            PhysicalPlan::DropTable {
+                name,
+                if_exists,
+                table,
+            } => execute_drop_table(ctx, name, *if_exists, *table),
             PhysicalPlan::CreateIndex {
                 name,
                 table,
@@ -995,6 +1001,7 @@ fn execute_delete(
 fn execute_create_table(
     ctx: &ExecutionContext<'_>,
     name: &str,
+    if_not_exists: bool,
     columns: &[ParsedColumnDef],
     primary_key: &[String],
     unique: &[Vec<String>],
@@ -1002,6 +1009,16 @@ fn execute_create_table(
     toast: ToastOptions,
     checks: &[String],
 ) -> Result<ExecutionResult> {
+    if if_not_exists {
+        catalog::validate_create_table_definition(name, columns, primary_key, unique)?;
+        if ctx.catalog.get_table_by_name(name)?.is_some() {
+            return Ok(ExecutionResult::Modified {
+                command: "CREATE TABLE".to_string(),
+                count: 0,
+            });
+        }
+    }
+
     let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
     let mut created_sequences = Vec::new();
     for serial_column in &serial {
@@ -1024,6 +1041,13 @@ fn execute_create_table(
         checks.to_vec(),
     ) {
         Ok(schema) => schema,
+        Err(err) if if_not_exists && err.code == SqlState::DuplicateTable => {
+            cleanup_serial_sequences(ctx, &created_sequences);
+            return Ok(ExecutionResult::Modified {
+                command: "CREATE TABLE".to_string(),
+                count: 0,
+            });
+        }
         Err(err) => {
             cleanup_serial_sequences(ctx, &created_sequences);
             return Err(err);
@@ -1181,7 +1205,30 @@ fn create_unique_constraint_index(
     Ok(())
 }
 
-fn execute_drop_table(ctx: &ExecutionContext<'_>, table: TableId) -> Result<ExecutionResult> {
+fn execute_drop_table(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    if_exists: bool,
+    table: Option<TableId>,
+) -> Result<ExecutionResult> {
+    let table = match table {
+        Some(table) => table,
+        None if if_exists => match ctx.catalog.get_table_by_name(name)? {
+            Some(table) => table.id,
+            None => {
+                return Ok(ExecutionResult::Modified {
+                    command: "DROP TABLE".to_string(),
+                    count: 0,
+                });
+            }
+        },
+        None => {
+            return Err(DbError::plan(
+                SqlState::UndefinedTable,
+                format!("table {name} does not exist"),
+            ));
+        }
+    };
     let owned_sequences = owned_sequences_for_table(ctx, table)?;
     ctx.schema_ops.drop_table(&ctx.statement, table)?;
     for sequence in &owned_sequences {

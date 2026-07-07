@@ -2,7 +2,7 @@ mod memory;
 mod serialize;
 pub mod system;
 
-pub use memory::{CatalogSnapshot, MemoryCatalog};
+pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
@@ -113,6 +113,7 @@ mod tests {
 
     use crate::{
         CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
+        validate_create_table_definition,
     };
 
     fn id_column(nullable: bool) -> ParsedColumnDef {
@@ -230,6 +231,47 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::DuplicateTable);
+    }
+
+    #[test]
+    fn validate_create_table_definition_rejects_catalog_owned_shape_errors() {
+        let duplicate_column = validate_create_table_definition(
+            "t",
+            &[
+                id_column(false),
+                ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+            ],
+            &["id".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(duplicate_column.code, SqlState::SyntaxError);
+
+        let missing_unique_column = validate_create_table_definition(
+            "t",
+            &[
+                id_column(false),
+                ParsedColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+            ],
+            &["id".to_string()],
+            &[vec!["missing".to_string()]],
+        )
+        .unwrap_err();
+        assert_eq!(missing_unique_column.code, SqlState::UndefinedColumn);
     }
 
     #[test]

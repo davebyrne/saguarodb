@@ -230,7 +230,11 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 `CREATE TABLE`:
 
-- Server query orchestration acquires the write guard before execution.
+- Server query orchestration acquires the exclusive DDL guard before execution.
+- For `IF NOT EXISTS`, validate the table definition shape first (columns,
+  primary key, and unique-constraint column references). If the table already
+  exists, return the normal command tag without creating serial sequences,
+  mutating catalog/storage, or appending logical DDL WAL records.
 - For `SERIAL` family columns, choose owned sequence names at execution time
   (`<table>_<column>_seq`, with the smallest free numeric suffix if needed),
   create each owned sequence first (`owned: true`, default sequence options),
@@ -238,14 +242,19 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   owned `nextval` default before creating the table. If any later table or
   unique-index step fails, drop the created serial sequences as part of
   statement cleanup.
-- Use `CatalogManager::create_table` to assign IDs.
+- Use `CatalogManager::create_table_with_options` to assign IDs, store
+  compression/TOAST/CHECK metadata, and create any hidden TOAST relation
+  metadata.
 - Call `SchemaOperations::create_table`.
 - `SchemaOperations::create_table` appends the `CreateTable` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "CREATE TABLE", count: 0 }`.
 
 `DROP TABLE`:
 
-- Resolve table in binder.
+- Resolve table in binder for plain `DROP TABLE`; for `DROP TABLE IF EXISTS`,
+  carry the table name through planning and resolve it at execution time under
+  the exclusive DDL guard. If the table is absent, return the normal command tag
+  without catalog/storage mutation or logical DDL WAL records.
 - Call `SchemaOperations::drop_table`.
 - For each column default that references an owned sequence, call
   `SchemaOperations::drop_sequence` in the same statement.
@@ -297,7 +306,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE, DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, checkpoint, and `VACUUM` take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

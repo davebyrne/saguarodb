@@ -48,7 +48,7 @@ crate root; `bind`/`bind_parameterized` call `collect_param_types` internally.
 
 ## Binder Contract
 
-Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP SEQUENCE` is a deliberate exception: it carries the normalized sequence name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
+Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. `DROP TABLE IF EXISTS` and `DROP SEQUENCE` are deliberate exceptions: they carry the normalized object name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE IF NOT EXISTS` also carries the table name through execution so the duplicate-table no-op decision uses the current catalog. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
 
 Binder responsibilities:
 
@@ -71,6 +71,11 @@ Binder responsibilities:
 - Bind `ON CONFLICT` (`bind_on_conflict`): the arbiter is **always the primary key**. An explicit conflict target must name exactly the primary-key column(s) — any other column list (a secondary unique index) is rejected with `FeatureNotSupported`; a missing target is allowed for `DO NOTHING` but rejected for `DO UPDATE`. `DO NOTHING` binds to `BoundOnConflict::DoNothing`. `DO UPDATE SET ... [WHERE ...]` binds over **two** bindings — the target table (slots `0..n`, bare columns resolve here) and a `qualified_only` `excluded` pseudo-table (slots `n..2n`, only `excluded.<col>` resolves) — so a bare column means the existing row and `excluded.<col>` the proposed row (matching PostgreSQL, no ambiguity). The primary key cannot be assigned and duplicate assignments are rejected, as in `UPDATE`.
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId` and the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). For `COPY FROM` the binder also attaches the omitted columns' bound expression `DEFAULT`s (`bind_omitted_expr_defaults`) and the table's bound `CHECK` constraints (`bind_table_checks`) to `BoundStatement::Copy`, so the executor applies defaults and enforces checks per row exactly as INSERT does; `COPY TO` binds neither. COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
+- Bind `DROP TABLE` by resolving the table to `TableId` when `IF EXISTS` is
+  absent. Bind `DROP TABLE IF EXISTS` as a pass-through carrying the normalized
+  table name and `IF EXISTS`; the executor resolves the table at statement
+  execution time so a prepared conditional drop does not remain a no-op if the
+  table is created after `Parse` and before `Execute`.
 - Bind `CREATE SEQUENCE` as a pass-through carrying the normalized
   `SequenceOptions`. Bind `DROP SEQUENCE` as a pass-through carrying the
   normalized sequence name and `IF EXISTS`; the executor resolves the sequence
@@ -84,13 +89,15 @@ Binder responsibilities:
 pub enum BoundStatement {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     },
-    DropTable { table: TableId },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -463,8 +470,8 @@ Scalar functions remain `BoundExpr::Function`. The set of scalar functions and t
 
 ```rust
 pub enum LogicalPlan {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions },
-    DropTable { table: TableId },
+    CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -549,8 +556,8 @@ usable (e.g. `id = 3 + 4` folds to `id = 7`).
 
 ```rust
 pub enum PhysicalPlan {
-    CreateTable { name: String, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions },
-    DropTable { table: TableId },
+    CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -619,7 +626,7 @@ pub enum PhysicalPlan {
 
 The executor crate is not called for `EXPLAIN`.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=…`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 

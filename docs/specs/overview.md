@@ -14,7 +14,7 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 - Page-oriented storage engine with a durable on-disk non-clustered primary-key B-tree (abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`/`INT2`, `INTEGER`/`INT`/`INT4`, and `BIGINT`/`INT8` all share one 64-bit integer storage but report their distinct PostgreSQL width OIDs (`int2`/`int4`/`int8`; bare `INTEGER` is `int4`), and `int2`/`int4` values are range-checked at write and cast time (`SqlState::NumericValueOutOfRange` when out of range); `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')` and report their serial kind's width), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time, and reported on the wire as `varchar`/`bpchar`/`text` with the declared length; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
-- SQL subset: `CREATE TABLE` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, non-constant expression `DEFAULT` (bound against an empty scope, evaluated per row), `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, `CHECK (...)` constraints (column-level and table-level, unnamed; enforced per row on `INSERT`/`UPDATE`/`COPY FROM` with `SqlState::CheckViolation`), and optional trailing `WITH (...)` storage options: `compression = 'none' | 'zstd'`, `toast = 'off' | 'auto' | 'aggressive'`, `toast_tuple_target = <integer>`, `toast_min_value_size = <integer>`, and `toast_compression = 'none' | 'zstd' | 'zstd_dict'`; see `docs/specs/compression.md` and TOAST metadata below), `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, sequence functions `nextval`/`currval`/`setval`, statement clock functions `current_timestamp` and `now()`, and PostgreSQL-compatible system information functions `version()`, `current_database()`, `current_catalog`, `current_schema`, `current_user`, `session_user`, `user`, `pg_backend_pid()`, and `current_setting(text)`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; `SET`/`SHOW`/`RESET` of session configuration parameters including PostgreSQL-compatible `transaction_isolation` and `default_transaction_isolation`; `DISCARD ALL`; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]`, `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (full heap/index rewrite), and `ALTER TABLE <table> SET (toast = ..., toast_tuple_target = ..., toast_min_value_size = ..., toast_compression = ...)` (future-write-only TOAST policy update; mixed page-compression/TOAST SET lists are rejected), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
+- SQL subset: `CREATE TABLE [IF NOT EXISTS]` (with column `NULL`/`NOT NULL`, constant `DEFAULT`, `DEFAULT nextval('<sequence>')`, non-constant expression `DEFAULT` (bound against an empty scope, evaluated per row), `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family constraints, `CHECK (...)` constraints (column-level and table-level, unnamed; enforced per row on `INSERT`/`UPDATE`/`COPY FROM` with `SqlState::CheckViolation`), and optional trailing `WITH (...)` storage options: `compression = 'none' | 'zstd'`, `toast = 'off' | 'auto' | 'aggressive'`, `toast_tuple_target = <integer>`, `toast_min_value_size = <integer>`, and `toast_compression = 'none' | 'zstd' | 'zstd_dict'`; see `docs/specs/compression.md` and TOAST metadata below), `DROP TABLE [IF EXISTS]`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE [IF EXISTS]`, `INSERT ... VALUES`, `INSERT ... SELECT`, standalone `VALUES (...), (...)` (as a query — top-level, in `FROM`, or as a subquery body), set operations `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]` (arms must have the same column count and identical types, except a bare `NULL` column adopts the sibling arm's type when at least one arm types all its own columns (otherwise an explicit cast is required); `ORDER BY`/`LIMIT` apply to the combined result; the `ALL` forms use multiset semantics), non-recursive CTEs `WITH name [(cols)] AS (query), ...` (inlined as named derived tables; a CTE name shadows a catalog table; `WITH RECURSIVE` is not supported), `SELECT` (with an optional `FROM` — a FROM-less scalar projection such as `SELECT 1` or `SELECT count(*)` is supported — `DISTINCT`, `WHERE`, inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, sequence functions `nextval`/`currval`/`setval`, statement clock functions `current_timestamp` and `now()`, and PostgreSQL-compatible system information functions `version()`, `current_database()`, `current_catalog`, `current_schema`, `current_user`, `session_user`, `user`, `pg_backend_pid()`, and `current_setting(text)`), `UPDATE`, `DELETE`, `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (the statement produces a result set evaluated over each affected row — the new row for `INSERT`/`UPDATE`, the deleted row for `DELETE`), `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]` (upsert; the conflict arbiter is the primary key only — `excluded.<col>` references the proposed row), `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, `SET TRANSACTION ISOLATION LEVEL <level>`, `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` — Read Committed / Repeatable Read / Serializable, setting the per-connection default for future transactions; `SET`/`SHOW`/`RESET` of session configuration parameters including PostgreSQL-compatible `transaction_isolation` and `default_transaction_isolation`; `DISCARD ALL`; SERIALIZABLE is Serializable Snapshot Isolation (SSI), see `docs/specs/ssi.md`; and savepoints `SAVEPOINT`/`RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` — nested subtransactions, see `docs/specs/savepoints.md`), the maintenance commands `VACUUM [table]`, `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (full heap/index rewrite), and `ALTER TABLE <table> SET (toast = ..., toast_tuple_target = ..., toast_min_value_size = ..., toast_compression = ...)` (future-write-only TOAST policy update; mixed page-compression/TOAST SET lists are rejected), and the bulk-transfer command `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]` (text/CSV, simple-query only; see `docs/specs/copy.md`); binder rejects unsupported parsed forms.
 - Rule-based query planner (no cost-based optimization)
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
@@ -389,9 +389,9 @@ pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
 ```
 
-**Design rationale — owned guards over GATs:** All major traits in this system are used as trait objects (`Box<dyn BufferPool>`, `Box<dyn ConcurrencyController>`, etc.). GATs (`type ReadGuard<'a> where Self: 'a`) would make these traits non-object-safe, forcing generics throughout the crate dependency graph. Owned guards with Arc internals add negligible overhead (one Arc clone per statement) and keep the trait boundaries clean. This is the standard pattern in Rust database projects.
+**Design rationale — owned guards over GATs:** All major traits in this system are used as trait objects (`Box<dyn BufferPool>`, `Box<dyn ConcurrencyController>`, etc.). GATs (`type WriteGuard<'a> where Self: 'a`) would make these traits non-object-safe, forcing generics throughout the crate dependency graph. Owned guards with Arc internals add negligible overhead (one Arc clone per guarded statement) and keep the trait boundaries clean. This is the standard pattern in Rust database projects.
 
-All layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves names to IDs and assigns physical slot positions via the catalog. The logical planner, physical planner, executor, and storage engine never do name lookups — they work exclusively with stable IDs and slot indices.
+Most layers below the parser use `TableId`/`ColumnId`/`BindingId` instead of strings. The binder (phase 1 of the planner crate) resolves ordinary DML names to IDs and assigns physical slot positions via the catalog. Selected DDL plans intentionally carry names into execution when current catalog state must be consulted there, such as `CREATE TABLE IF NOT EXISTS`, `DROP TABLE IF EXISTS`, `DROP SEQUENCE IF EXISTS`, and `CREATE TABLE ... SERIAL` owned-sequence naming.
 
 `FlushPolicy` lives in `common` so the buffer pool can decide whether a dirty page is flushable without depending on the `wal` crate. `WalFlushPolicy` admits any WAL-durable dirty page (with MVCC the committedness gate is dropped — uncommitted/aborted pages may be flushed and are hidden by the CLOG); checkpoint uses it via `flush_dirty_pages` to flush dirty pages in place to the heap, and eviction-flush-on-steal uses it (plus `ensure_durable`, which forces the WAL first) to steal dirty pages during eviction, removing the in-RAM working-set ceiling during normal operation.
 
@@ -618,13 +618,15 @@ The AST uses strings for identifiers — name resolution to IDs happens in the p
 pub enum Statement {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,  // UNIQUE constraints; each becomes a unique index
         compression: Option<CompressionSetting>,
         toast: ToastOptionPatch,
+        checks: Vec<String>,
     },
-    DropTable { name: String },
+    DropTable { name: String, if_exists: bool },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
     CreateSequence { name: String, options: SequenceOptions },
@@ -864,7 +866,7 @@ All three phases are separate modules within the `planner` crate. All three are 
 
 ### Phase 1: Binder
 
-The binder performs semantic analysis and name resolution. Its output is a `BoundStatement` — a validated, ID-resolved, slot-assigned representation of the query. No downstream phase does table, column, or index name lookups for ordinary DML. Two DDL cases intentionally defer name work to execution: `DROP SEQUENCE` carries the normalized sequence name plus `IF EXISTS` through planning so prepared statements resolve existence at execution time, and `CREATE TABLE` with `SERIAL` chooses owned sequence names at execution time so prepared DDL observes current sequence-name collisions. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
+The binder performs semantic analysis and name resolution. Its output is a `BoundStatement` — a validated, ID-resolved, slot-assigned representation of the query. No downstream phase does table, column, or index name lookups for ordinary DML. Selected DDL cases intentionally defer name work to execution: `DROP TABLE IF EXISTS` and `DROP SEQUENCE` carry the normalized object name plus `IF EXISTS` through planning so prepared statements resolve existence at execution time, `CREATE TABLE IF NOT EXISTS` carries the table name so the duplicate-table no-op decision uses the current catalog, and `CREATE TABLE` with `SERIAL` chooses owned sequence names at execution time so prepared DDL observes current sequence-name collisions. The binder is the primary SQL type checker; the executor may still defensively validate runtime DML values before storage writes.
 
 The binder:
 - Resolves table names to `TableId` via the catalog
@@ -881,13 +883,15 @@ The binder:
 pub enum BoundStatement {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     },
-    DropTable { table: TableId },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -1142,13 +1146,15 @@ pub enum LogicalPlan {
     // DDL — passes through to physical plan unchanged
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     },
-    DropTable { table: TableId },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -1237,13 +1243,15 @@ pub enum PhysicalPlan {
     // DDL
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
         compression: CompressionSetting,
         toast: ToastOptions,
+        checks: Vec<String>,
     },
-    DropTable { table: TableId },
+    DropTable { name: String, if_exists: bool, table: Option<TableId> },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -1439,7 +1447,7 @@ Expression semantics:
 
 ### DDL and DML
 
-`INSERT`, `UPDATE`, and `DELETE` are handled directly by the executor (not through the iterator model), call into storage, and return the affected row count. `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` also return `ExecutionResult::Modified`, using the matching command names with `count = 0`.
+`INSERT`, `UPDATE`, and `DELETE` are handled directly by the executor (not through the iterator model), call into storage, and return the affected row count. `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` also return `ExecutionResult::Modified`, using the matching command names with `count = 0`. Conditional table DDL no-ops (`CREATE TABLE IF NOT EXISTS` when the table already exists, `DROP TABLE IF EXISTS` when it does not) return the same command tags without mutating catalog/storage or appending logical DDL WAL records; `CREATE TABLE IF NOT EXISTS` still validates the requested table definition shape before suppressing a duplicate-table conflict.
 
 ## 7. Storage Engine
 
@@ -2032,7 +2040,7 @@ pub struct TableSchema {
 
 `ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored schemas. The parser uses `ParsedColumnDef` (no IDs). The catalog's SQL DDL API `create_table_with_options` accepts `ParsedColumnDef`, assigns `ColumnId`s, stores the binder-resolved `ToastOptions`, and creates a hidden TOAST relation for user tables with at least one `TEXT` or `BYTEA` column. The hidden relation is stored by ID only, named `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`, and uses `compression = none`. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, and validates hidden TOAST relation cross-links when `toast_table_id` is present. Hidden TOAST relations must not be present in the user table name index.
 
-The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP SEQUENCE` resolves by name at execution time to preserve extended-protocol prepared-statement semantics, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
+The catalog is the authority for name-to-ID resolution. Table IDs, secondary-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for primary-key indexes). Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
 The catalog crate also owns a static virtual system-view registry for the
 driver-oriented `pg_catalog` and `information_schema` surface. The registry
@@ -2146,7 +2154,7 @@ The catalog is stored in the control record (`data/manifest.dat`) at each checkp
 
 ### WAL Integration
 
-`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` are logged to the WAL. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence` records. Aborted/in-flight create records are not installed, but their IDs are reserved so later objects do not reuse file names or catalog IDs whose orphan records may have been replayed.
+`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, and `DROP SEQUENCE` are logged to the WAL. Conditional table DDL no-ops do not emit logical DDL records. On crash recovery, the catalog is loaded from the control record and updated by replaying committed `CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`CreateSequence`/`DropSequence` records. Aborted/in-flight create records are not installed, but their IDs are reserved so later objects do not reuse file names or catalog IDs whose orphan records may have been replayed.
 
 ### Concurrency
 
@@ -2202,7 +2210,7 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
-- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` also gets a stable physical chain view for backfill.
+- **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` also gets a stable physical chain view for backfill.
 - **Maintenance statements** (`VACUUM [table]`): not relational — they do not bind or plan. Like checkpoint, `VACUUM` takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free), and it is rejected inside an explicit transaction block. For TOAST-enabled tables it commits hidden chunk deletes before pruning the parent tuples that own those chunks, then vacuums the hidden relation. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the orchestration, TOAST cleanup, and the GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 

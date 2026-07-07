@@ -1766,10 +1766,28 @@ mod tests {
             parse("create table teams (id integer, org integer, primary key (id, org))").unwrap();
         let bound = bind(&stmt, &catalog).unwrap();
 
-        let BoundStatement::CreateTable { primary_key, .. } = bound else {
+        let BoundStatement::CreateTable {
+            if_not_exists,
+            primary_key,
+            ..
+        } = bound
+        else {
             panic!("expected CreateTable");
         };
+        assert!(!if_not_exists);
         assert_eq!(primary_key, vec!["id".to_string(), "org".to_string()]);
+    }
+
+    #[test]
+    fn binder_preserves_create_table_if_not_exists() {
+        let catalog = catalog_with_users();
+        let stmt = parse("create table if not exists teams (id integer primary key)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        let BoundStatement::CreateTable { if_not_exists, .. } = bound else {
+            panic!("expected CreateTable");
+        };
+        assert!(if_not_exists);
     }
 
     #[test]
@@ -2323,6 +2341,38 @@ mod tests {
         let stmt = parse("drop table missing").unwrap();
         let err = bind(&stmt, &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn binder_resolves_plain_drop_table_to_table_id() {
+        let catalog = catalog_with_users();
+        let stmt = parse("drop table users").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        assert!(matches!(
+            bound,
+            BoundStatement::DropTable {
+                ref name,
+                if_exists: false,
+                table: Some(1)
+            } if name == "users"
+        ));
+    }
+
+    #[test]
+    fn binder_accepts_drop_if_exists_of_unknown_table_as_noop() {
+        let catalog = catalog_with_users();
+        let stmt = parse("drop table if exists missing").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+
+        assert!(matches!(
+            bound,
+            BoundStatement::DropTable {
+                ref name,
+                if_exists: true,
+                table: None
+            } if name == "missing"
+        ));
     }
 
     #[test]

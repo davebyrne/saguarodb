@@ -3392,6 +3392,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_drop_table_if_exists_resolves_at_execute_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("drop table if exists users", &[])
+            .unwrap();
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        app.query_service.execute_prepared(&prepared, &[]).unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("select id from users")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+    }
+
+    #[tokio::test]
+    async fn prepared_plain_drop_table_uses_bound_table_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+        let prepared = app
+            .query_service
+            .prepare_sql("drop table users", &[])
+            .unwrap();
+
+        app.query_service.execute_sql("drop table users").unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+        assert!(matches!(
+            app.query_service.execute_sql("select id from users"),
+            Ok(ExecutionResult::Query { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn execute_prepared_rejects_wrong_parameter_count() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();

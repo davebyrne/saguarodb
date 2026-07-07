@@ -522,11 +522,31 @@ mod tests {
     fn parses_statement_variants() {
         assert!(matches!(
             parse("create table users (id integer primary key, name text not null)").unwrap(),
-            Statement::CreateTable { .. }
+            Statement::CreateTable {
+                if_not_exists: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("create table if not exists users (id integer primary key)").unwrap(),
+            Statement::CreateTable {
+                if_not_exists: true,
+                ..
+            }
         ));
         assert!(matches!(
             parse("drop table users").unwrap(),
-            Statement::DropTable { .. }
+            Statement::DropTable {
+                if_exists: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("drop table if exists users").unwrap(),
+            Statement::DropTable {
+                if_exists: true,
+                ..
+            }
         ));
         assert!(matches!(
             parse("insert into users (id, name) values (1, 'ann')").unwrap(),
@@ -1974,6 +1994,17 @@ mod tests {
         assert_eq!(err.code, SqlState::InvalidParameterValue);
         // Malformed (no option list) is a plain syntax error.
         let err = parse("alter table users set compression").unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn rejects_conditional_index_ddl() {
+        let err = parse("create index if not exists users_name on users (name)").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
+        assert_eq!(err.code, SqlState::SyntaxError);
+
+        let err = parse("drop index if exists users_name").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Parse);
         assert_eq!(err.code, SqlState::SyntaxError);
     }
 

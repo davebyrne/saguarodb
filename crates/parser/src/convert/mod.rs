@@ -100,12 +100,10 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             }
             let name = object_name(&names.remove(0))?;
             match object_type {
-                sql::ObjectType::Table if !if_exists => Ok(Statement::DropTable { name }),
+                sql::ObjectType::Table => Ok(Statement::DropTable { name, if_exists }),
                 sql::ObjectType::Index if !if_exists => Ok(Statement::DropIndex { name }),
                 sql::ObjectType::Sequence => Ok(Statement::DropSequence { name, if_exists }),
-                sql::ObjectType::Table | sql::ObjectType::Index => {
-                    unsupported("unsupported DROP form")
-                }
+                sql::ObjectType::Index => unsupported("unsupported DROP form"),
                 _ => unsupported("unsupported DROP object type"),
             }
         }

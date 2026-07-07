@@ -14,6 +14,7 @@ use crate::{
 pub enum LogicalPlan {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         unique: Vec<Vec<String>>,
@@ -24,7 +25,9 @@ pub enum LogicalPlan {
         checks: Vec<String>,
     },
     DropTable {
-        table: TableId,
+        name: String,
+        if_exists: bool,
+        table: Option<TableId>,
     },
     CreateIndex {
         name: String,
@@ -139,6 +142,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
     match bound {
         BoundStatement::CreateTable {
             name,
+            if_not_exists,
             columns,
             primary_key,
             unique,
@@ -147,6 +151,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             checks,
         } => Ok(LogicalPlan::CreateTable {
             name: name.clone(),
+            if_not_exists: *if_not_exists,
             columns: columns.clone(),
             primary_key: primary_key.clone(),
             unique: unique.clone(),
@@ -154,7 +159,15 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             toast: toast.clone(),
             checks: checks.clone(),
         }),
-        BoundStatement::DropTable { table } => Ok(LogicalPlan::DropTable { table: *table }),
+        BoundStatement::DropTable {
+            name,
+            if_exists,
+            table,
+        } => Ok(LogicalPlan::DropTable {
+            name: name.clone(),
+            if_exists: *if_exists,
+            table: *table,
+        }),
         BoundStatement::CreateIndex {
             name,
             table,

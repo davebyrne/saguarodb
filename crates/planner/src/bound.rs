@@ -121,6 +121,7 @@ impl BoundQuery {
 pub enum BoundStatement {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         /// Column name lists for `UNIQUE` constraints; each becomes a unique
@@ -137,7 +138,9 @@ pub enum BoundStatement {
         checks: Vec<String>,
     },
     DropTable {
-        table: TableId,
+        name: String,
+        if_exists: bool,
+        table: Option<TableId>,
     },
     CreateIndex {
         name: String,

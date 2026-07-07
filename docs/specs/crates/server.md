@@ -229,12 +229,13 @@ Statement guard policy:
 
 - No guard: SELECT and EXPLAIN that do not mutate sequences (lock-free readers), and a read-only explicit transaction.
 - Shared writer guard (`begin_writer`, held for the whole write-transaction, many concurrent): INSERT, UPDATE, DELETE, `SELECT` statements whose bound expressions contain `nextval` or `setval`, and an explicit transaction once its first write runs. Acquired lazily.
-- Exclusive checkpoint guard (`begin_checkpoint`, per statement): CREATE TABLE,
-  DROP TABLE, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE (DDL is
-  non-transactional and rejected inside a block).
+- Exclusive checkpoint guard (`begin_checkpoint`, per statement): CREATE TABLE
+  (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX,
+  DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE (DDL is non-transactional and
+  rejected inside a block).
 - Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): checkpoint, `VACUUM`, and `ALTER TABLE ... SET (compression = ...)` (both maintenance commands run with no concurrent writer; readers stay lock-free).
 
-Bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution.
+Simple-query bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution. Extended-protocol `Parse` binds before a later `Execute`; prepared `DROP TABLE IF EXISTS` therefore carries the normalized table name and resolves it under the exclusive guard at execution time, while prepared `CREATE TABLE IF NOT EXISTS` performs the duplicate-table no-op check under that same guard.
 
 Write statement protocol (autocommit; an explicit write transaction is the same but the guard spans all its statements and the commit/abort happens at COMMIT/ROLLBACK):
 
@@ -250,7 +251,7 @@ Write statement protocol (autocommit; an explicit write transaction is the same 
 10. Call best-effort `record_commit_and_maybe_checkpoint(&components)`. A failure here is logged after the commit is already durable and cleaned up; it is not returned as a normal SQL error and is not a rollback signal.
 11. Return success.
 
-DDL follows the same allocate/execute/commit-or-abort sequence as an autocommit write, but it acquires the exclusive checkpoint guard instead of the shared writer guard. Catalog and storage mutations are part of the same statement-level commit. `CREATE TABLE` with `SERIAL` creates the owned sequences before the table and stores ordinary `ColumnDefault::Nextval` defaults. `CREATE TABLE` with a `TEXT` or `BYTEA` column creates a hidden TOAST relation in the catalog and installs both the base and hidden schemas in storage under the same statement context; the hidden relation is not resolvable by user table name. `DROP TABLE` emits sibling `DropSequence` records for owned sequences and cascades catalog/storage metadata to the linked hidden TOAST relation. `CreateTable`, `DropTable`, `CreateSequence`, and `DropSequence` WAL replay update both catalog and storage; `CreateIndex` and `DropIndex` update catalog, storage metadata, and index pages through their normal recovery paths. Normal DDL execution must restore the previous catalog state if storage mutation, WAL append, or WAL flush fails before the commit record is durable; DML rollback does not restore a catalog snapshot.
+DDL follows the same allocate/execute/commit-or-abort sequence as an autocommit write, but it acquires the exclusive checkpoint guard instead of the shared writer guard. Catalog and storage mutations are part of the same statement-level commit. `CREATE TABLE IF NOT EXISTS` still validates the requested table definition shape, then returns the normal command tag without catalog/storage/WAL mutation when the table already exists. `DROP TABLE IF EXISTS` returns the normal command tag without catalog/storage/WAL mutation when the table is absent. `CREATE TABLE` with `SERIAL` creates the owned sequences before the table and stores ordinary `ColumnDefault::Nextval` defaults. `CREATE TABLE` with a `TEXT` or `BYTEA` column creates a hidden TOAST relation in the catalog and installs both the base and hidden schemas in storage under the same statement context; the hidden relation is not resolvable by user table name. `DROP TABLE` emits sibling `DropSequence` records for owned sequences and cascades catalog/storage metadata to the linked hidden TOAST relation. `CreateTable`, `DropTable`, `CreateSequence`, and `DropSequence` WAL replay update both catalog and storage; `CreateIndex` and `DropIndex` update catalog, storage metadata, and index pages through their normal recovery paths. Normal DDL execution must restore the previous catalog state if storage mutation, WAL append, or WAL flush fails before the commit record is durable; DML rollback does not restore a catalog snapshot.
 
 If `storage.rollback_txn`, `buffer_pool.rollback`, or catalog `restore` fails before the commit record is durable, the server treats that as fatal. It logs the rollback failure, attempts to flush WAL, and exits instead of returning to service with possibly visible partial statement state.
 

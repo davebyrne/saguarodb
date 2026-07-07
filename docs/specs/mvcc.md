@@ -30,8 +30,9 @@ the same change (per `AGENTS.md`).
 
 ### Non-goals (initial)
 
-- **Transactional DDL** — DDL stays non-transactional (takes the exclusive lock,
-  commits immediately, is rejected inside an explicit transaction block).
+- **Transactional DDL** — DDL stays non-transactional, commits immediately, and
+  is rejected inside an explicit transaction block. Statement-level guard choice
+  is owned by the server and is statement-specific.
 - **Time-travel / as-of queries.**
 - **Savepoints / sub-transactions** — implemented via sub-transaction xids
   without undo (`docs/specs/savepoints.md`); subxids share the xid space, CLOG,
@@ -181,11 +182,12 @@ concurrent writers, which maximizes simultaneous unknowns. Rework is near-zero
 additive) and Stage 1 is a correct, useful, shippable waypoint.
 
 **Decision 6 — DDL: non-transactional initially.**
-DDL takes the exclusive lock, commits immediately, and is rejected inside an
-explicit transaction block. *Chosen over* transactional DDL, which requires making
-the catalog itself MVCC (versioned, abort-undoable) plus transactional file
-lifecycle — a second large subsystem orthogonal to data MVCC. Defers cleanly and
-additively.
+DDL commits immediately and is rejected inside an explicit transaction block.
+DDL uses the exclusive checkpoint/DDL guard so catalog rollback cannot overwrite
+another committed DDL change and index builds see a stable physical view. *Chosen
+over* transactional DDL, which requires making the catalog itself MVCC
+(versioned, abort-undoable) plus transactional file lifecycle — a second large
+subsystem orthogonal to data MVCC. Defers cleanly and additively.
 
 ---
 
@@ -994,10 +996,11 @@ reference current files.
     whole write-transaction, releasing it at `COMMIT`/`ROLLBACK`/disconnect. A
     read-only explicit transaction never takes the write guard, so it stays
     concurrent. Autocommit write = acquire for the one statement, release at the
-    implicit commit. DDL takes the exclusive guard and commits immediately
-    (non-transactional, §4 Decision 6) and is **rejected inside an explicit
-    transaction block**. This is Stage 1: many readers concurrent with at most one
-    writer; concurrent writers and write-write conflict detection are Milestone E.
+    implicit commit. DDL commits immediately (non-transactional, §4 Decision 6)
+    and is **rejected inside an explicit transaction block**; the current server
+    spec owns the statement-specific guard policy. This is Stage 1: many readers
+    concurrent with at most one writer; concurrent writers and write-write
+    conflict detection are Milestone E.
   - **Snapshot per isolation.** Default Read Committed captures a fresh snapshot at
     the start of each statement; Repeatable Read captures one snapshot at the first
     statement and reuses it. The snapshot is shared via `Arc` so the executor does

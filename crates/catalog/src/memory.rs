@@ -781,6 +781,44 @@ fn build_sequence_schema(
     })
 }
 
+pub fn validate_create_table_definition(
+    name: &str,
+    columns: &[ParsedColumnDef],
+    primary_key: &[String],
+    unique: &[Vec<String>],
+) -> Result<()> {
+    let columns_for_shape = columns
+        .iter()
+        .cloned()
+        .map(|mut column| {
+            column.default = None;
+            column
+        })
+        .collect();
+    let schema = build_schema(
+        &CatalogSnapshot::default(),
+        0,
+        name.to_string(),
+        columns_for_shape,
+        primary_key.to_vec(),
+        CompressionSetting::None,
+        ToastOptions::legacy_catalog_default(),
+        Vec::new(),
+    )?;
+    let mut generated_unique_names = HashSet::new();
+    for columns in unique {
+        let index_name = format!("{}_{}_key", name, columns.join("_"));
+        if !generated_unique_names.insert(index_name.clone()) {
+            return Err(DbError::plan(
+                SqlState::DuplicateTable,
+                format!("index {index_name} already exists"),
+            ));
+        }
+        build_index_schema(0, index_name, &schema, columns, true)?;
+    }
+    Ok(())
+}
+
 fn validate_snapshot(snapshot: &CatalogSnapshot) -> Result<()> {
     let mut max_table_id = 0;
     validate_sequences(snapshot)?;

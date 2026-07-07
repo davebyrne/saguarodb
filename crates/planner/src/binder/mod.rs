@@ -124,6 +124,7 @@ fn bind_inner(
     match statement {
         Statement::CreateTable {
             name,
+            if_not_exists,
             columns,
             primary_key,
             unique,
@@ -159,6 +160,7 @@ fn bind_inner(
             }
             Ok(BoundStatement::CreateTable {
                 name: name.clone(),
+                if_not_exists: *if_not_exists,
                 columns: columns.clone(),
                 primary_key: primary_key.clone(),
                 unique: unique.clone(),
@@ -167,9 +169,17 @@ fn bind_inner(
                 checks: checks.clone(),
             })
         }
-        Statement::DropTable { name } => {
-            let table = require_table(catalog, name)?;
-            Ok(BoundStatement::DropTable { table: table.id })
+        Statement::DropTable { name, if_exists } => {
+            let table = if *if_exists {
+                None
+            } else {
+                Some(require_table(catalog, name)?.id)
+            };
+            Ok(BoundStatement::DropTable {
+                name: name.clone(),
+                if_exists: *if_exists,
+                table,
+            })
         }
         Statement::CreateIndex {
             name,

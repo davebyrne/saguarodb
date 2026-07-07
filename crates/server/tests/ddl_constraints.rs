@@ -3,6 +3,7 @@ mod support;
 use std::path::Path;
 
 use support::{Connection, TestServer};
+use wal::{FileWalManager, WalManager, WalRecordKind};
 
 /// A column `DEFAULT` is applied when an `INSERT` omits the column, including for
 /// a `NOT NULL` column with a non-NULL default.
@@ -88,6 +89,142 @@ async fn default_type_mismatch_is_rejected() {
         "expected DatatypeMismatch: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn conditional_table_ddl_is_noop_only_for_existence_conflicts() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, note text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, note) values (1, 'kept')")
+        .await
+        .unwrap();
+
+    let duplicate = server
+        .simple_query("create table t (id integer primary key)")
+        .await
+        .err()
+        .expect("duplicate create without IF NOT EXISTS should fail");
+    assert!(
+        duplicate.message.contains("42P07"),
+        "expected DuplicateTable: {}",
+        duplicate.message
+    );
+
+    server
+        .simple_query("create table if not exists t (id integer primary key, other text)")
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, note from t")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("kept".to_string())]]
+    );
+
+    let invalid = server
+        .simple_query("create table if not exists t (id integer)")
+        .await
+        .err()
+        .expect("IF NOT EXISTS still validates the table definition");
+    assert!(
+        invalid.message.contains("42804"),
+        "expected DatatypeMismatch for missing primary key: {}",
+        invalid.message
+    );
+
+    let invalid = server
+        .simple_query("create table if not exists t (id integer primary key, id text)")
+        .await
+        .err()
+        .expect("IF NOT EXISTS still validates duplicate columns");
+    assert!(
+        invalid.message.contains("42601"),
+        "expected SyntaxError for duplicate column: {}",
+        invalid.message
+    );
+
+    let invalid = server
+        .simple_query(
+            "create table if not exists t (id integer primary key, email text, unique (missing))",
+        )
+        .await
+        .err()
+        .expect("IF NOT EXISTS still validates UNIQUE columns");
+    assert!(
+        invalid.message.contains("42703"),
+        "expected UndefinedColumn for missing UNIQUE column: {}",
+        invalid.message
+    );
+
+    server
+        .simple_query("drop table if exists missing")
+        .await
+        .unwrap();
+    server.simple_query("drop table if exists t").await.unwrap();
+
+    let missing = server
+        .simple_query("select id from t")
+        .await
+        .err()
+        .expect("table should have been dropped");
+    assert!(
+        missing.message.contains("42P01"),
+        "expected UndefinedTable: {}",
+        missing.message
+    );
+}
+
+#[tokio::test]
+async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create table t (id integer primary key, code integer unique)")
+            .await
+            .unwrap();
+        server
+            .simple_query(
+                "create table if not exists t (id integer primary key, code integer unique)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("drop table if exists missing")
+            .await
+            .unwrap();
+    }
+
+    let wal = FileWalManager::open(path.join("wal.dat")).unwrap();
+    let records = wal
+        .replay_from(0)
+        .unwrap()
+        .collect::<common::Result<Vec<_>>>()
+        .unwrap();
+    let create_table_records = records
+        .iter()
+        .filter(|record| matches!(record.kind, WalRecordKind::CreateTable { .. }))
+        .count();
+    let drop_table_records = records
+        .iter()
+        .filter(|record| matches!(record.kind, WalRecordKind::DropTable { .. }))
+        .count();
+    let create_index_records = records
+        .iter()
+        .filter(|record| matches!(record.kind, WalRecordKind::CreateIndex { .. }))
+        .count();
+
+    assert_eq!(create_table_records, 1);
+    assert_eq!(drop_table_records, 0);
+    assert_eq!(create_index_records, 1);
 }
 
 /// Column defaults persist across a restart (replayed from the durable catalog /

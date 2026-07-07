@@ -13,6 +13,7 @@ pub enum SetScope {
 pub enum Statement {
     CreateTable {
         name: String,
+        if_not_exists: bool,
         columns: Vec<ParsedColumnDef>,
         primary_key: Vec<String>,
         /// Column name lists for `UNIQUE` constraints (column-level `UNIQUE` and
@@ -34,6 +35,7 @@ pub enum Statement {
     },
     DropTable {
         name: String,
+        if_exists: bool,
     },
     CreateIndex {
         name: String,

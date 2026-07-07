@@ -135,7 +135,6 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
         || temporary
         || external
         || global.is_some()
-        || if_not_exists
         || transient
         || volatile
         || iceberg
@@ -252,6 +251,7 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
 
     Ok(Statement::CreateTable {
         name: object_name(&name)?,
+        if_not_exists,
         columns,
         primary_key,
         unique,
