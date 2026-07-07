@@ -112,6 +112,7 @@ impl PageBackedStorageEngine {
     pub(super) fn sample_toast_physical_value(
         &self,
         ctx: &StatementContext,
+        relations: &PageBackedRelationSnapshot,
         schema: &TableSchema,
         column: usize,
         physical_value: &crate::codec::DecodedPhysicalValue,
@@ -172,7 +173,7 @@ impl PageBackedStorageEngine {
                 if (pointer.stored_len as usize) > remaining.saturating_add(header_len) {
                     return Ok(None);
                 }
-                let stream = self.read_toast_stream(ctx, schema, pointer)?;
+                let stream = self.read_toast_stream(ctx, relations, schema, pointer)?;
                 let (dict_id, raw_crc32, payload) =
                     crate::toast::parse_external_stream(pointer.codec, &stream)?;
                 let raw = self.materialize_toast_payload(

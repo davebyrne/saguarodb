@@ -1056,6 +1056,7 @@ impl PageBackedStorageEngine {
         let mut sampled_bytes = 0usize;
         let file_id = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(file_id)?;
+        let relations = self.capture_pagebacked_relation_snapshot()?;
         'pages: for page_num in 0..page_count {
             if self.buffer_pool.is_page_abandoned(file_id, page_num) {
                 continue;
@@ -1099,6 +1100,7 @@ impl PageBackedStorageEngine {
                     })?;
                     if let Some(sample) = self.sample_toast_physical_value(
                         ctx,
+                        &relations,
                         schema,
                         column_index,
                         physical_value,
