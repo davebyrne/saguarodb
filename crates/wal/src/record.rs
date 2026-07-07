@@ -1,6 +1,6 @@
 use common::{
-    CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId, SequenceSchema,
-    TableId, TableSchema, ToastOptions,
+    ColumnId, CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId,
+    SequenceSchema, TableId, TableSchema, ToastOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +141,13 @@ pub enum WalRecordKind {
         new_table_storage_id: FileId,
         new_toast_storage_id: Option<(TableId, FileId)>,
         new_index_storage_ids: Vec<(IndexId, FileId)>,
+    },
+    /// DDL: updates a user table's primary-key column list. The derived storage
+    /// identity B-tree is rebuilt from heap rows when this committed logical
+    /// record is applied.
+    AlterTablePrimaryKey {
+        table_id: TableId,
+        primary_key: Vec<ColumnId>,
     },
 }
 

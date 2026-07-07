@@ -2,8 +2,9 @@ use std::ops::Bound;
 
 use catalog::SystemView;
 use common::{
-    ColumnId, ColumnInfo, CompressionSetting, DataType, IndexId, Key, KeyRange,
-    PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId, ToastOptions, Value,
+    ColumnId, ColumnInfo, CompressionSetting, DataType, IndexConstraintKind, IndexId, Key,
+    KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId,
+    ToastOptions, Value,
 };
 
 use crate::{
@@ -551,38 +552,47 @@ fn plan_scan(
 }
 
 /// Pick the index whose leading column the filter constrains best: an equality
-/// match beats a range, the primary key beats a secondary index (it is the
-/// canonical access path and reads no separate secondary file), and a lower index
-/// id breaks remaining ties. Returns the chosen index id and its key candidate, or
-/// `None` to fall back to a sequential scan.
+/// match beats a range, a declared primary-key constraint index wins remaining
+/// semantic ties, and a lower index id breaks final ties. Returns the chosen index
+/// id and its key candidate, or `None` to fall back to a sequential scan.
 fn best_index_scan(
     schema: &common::TableSchema,
     table: TableId,
     filter: &BoundExpr,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<Option<(IndexId, KeyCandidate)>> {
-    let mut candidates: Vec<(IndexId, KeyCandidate)> = Vec::new();
+    let mut candidates: Vec<(IndexId, IndexConstraintKind, KeyCandidate)> = Vec::new();
 
-    if let Some(primary_key) = schema.primary_key.first().copied()
-        && let Some(candidate) = best_key_candidate(filter, primary_key)
+    if let Some(leading) = schema.primary_key.first().copied()
+        && let Some(candidate) = best_key_candidate(filter, leading)
     {
-        candidates.push((PRIMARY_KEY_INDEX_ID, candidate));
+        candidates.push((
+            PRIMARY_KEY_INDEX_ID,
+            IndexConstraintKind::PrimaryKey,
+            candidate,
+        ));
     }
 
     for index in catalog.list_indexes_for_table(table)? {
         if let Some(leading) = index.columns.first().copied()
             && let Some(candidate) = best_key_candidate(filter, leading)
         {
-            candidates.push((index.id, candidate));
+            candidates.push((index.id, index.constraint, candidate));
         }
     }
 
-    Ok(candidates.into_iter().max_by(|(a_id, a), (b_id, b)| {
-        a.exact
-            .cmp(&b.exact)
-            .then_with(|| (*a_id == PRIMARY_KEY_INDEX_ID).cmp(&(*b_id == PRIMARY_KEY_INDEX_ID)))
-            .then_with(|| b_id.cmp(a_id))
-    }))
+    Ok(candidates
+        .into_iter()
+        .max_by(|(a_id, a_constraint, a), (b_id, b_constraint, b)| {
+            a.exact
+                .cmp(&b.exact)
+                .then_with(|| {
+                    (*a_constraint == IndexConstraintKind::PrimaryKey)
+                        .cmp(&(*b_constraint == IndexConstraintKind::PrimaryKey))
+                })
+                .then_with(|| b_id.cmp(a_id))
+        })
+        .map(|(id, _constraint, candidate)| (id, candidate)))
 }
 
 #[derive(Clone)]

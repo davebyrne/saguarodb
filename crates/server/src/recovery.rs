@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageStore};
 use catalog::{CatalogManager, MemoryCatalog, deserialize_catalog};
 use common::{
-    DbError, FlushPolicy, PageFlushInfo, Result, RwLockConcurrencyController, TruncateTablePlan,
+    DbError, FlushPolicy, PageFlushInfo, RelationKind, Result, RwLockConcurrencyController,
+    TableId, TruncateTablePlan,
 };
 use control::{ControlStore, FileControlStore};
 use storage::{HeapPageStore, PageBackedStorageEngine, RecoveryOperations, StorageMode};
@@ -119,6 +120,8 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // disk. They are resolved to Aborted below so VACUUM reclaims them before the floor
     // crosses them (`docs/specs/mvcc.md` §8; the FATAL-B resurrection fix).
     let mut writer_xids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut pending_identity_rebuilds: std::collections::BTreeSet<TableId> =
+        std::collections::BTreeSet::new();
     for record in wal.replay_from(checkpoint_lsn)? {
         let record = record?;
         if !is_redo_operation(&record.kind) {
@@ -140,6 +143,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
             }
             continue;
         }
+        let primary_key_rebuild = match &record.kind {
+            WalRecordKind::AlterTablePrimaryKey { table_id, .. } => Some(*table_id),
+            _ => None,
+        };
         apply_redo(
             catalog.as_ref(),
             storage.as_ref(),
@@ -149,6 +156,9 @@ pub fn open_app(config: Config) -> Result<AppState> {
             record.lsn,
             record.kind,
         )?;
+        if let Some(table_id) = primary_key_rebuild {
+            pending_identity_rebuilds.insert(table_id);
+        }
         replay_applied = true;
     }
     if replay_applied {
@@ -177,6 +187,15 @@ pub fn open_app(config: Config) -> Result<AppState> {
     // never-committed data as committed (`docs/specs/mvcc.md` §8). Persisted by the
     // recovery checkpoint below via `clog.dat`.
     wal.resolve_in_flight_as_aborted(&writer_xids)?;
+    for table_id in pending_identity_rebuilds {
+        let Some(schema) = catalog.get_table(table_id)? else {
+            continue;
+        };
+        if schema.relation_kind == RelationKind::User {
+            storage.apply_rebuild_table_identity(schema)?;
+            replay_applied = true;
+        }
+    }
     let tls = match config.tls_files().map_err(DbError::io)? {
         Some((cert, key)) => Some(crate::tls::build_acceptor(cert, key)?),
         None => None,
@@ -291,6 +310,7 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
             | WalRecordKind::TruncateTable { .. }
+            | WalRecordKind::AlterTablePrimaryKey { .. }
     )
 }
 
@@ -336,7 +356,8 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         | WalRecordKind::DropIndex { .. }
         | WalRecordKind::DropSequence { .. }
         | WalRecordKind::AlterTableCompression { .. }
-        | WalRecordKind::AlterTableToast { .. } => Ok(false),
+        | WalRecordKind::AlterTableToast { .. }
+        | WalRecordKind::AlterTablePrimaryKey { .. } => Ok(false),
         _ => Ok(false),
     }
 }
@@ -503,6 +524,13 @@ fn apply_redo(
             };
             let update = catalog.apply_truncate_table(&plan)?;
             storage.apply_truncate_table(update)
+        }
+        WalRecordKind::AlterTablePrimaryKey {
+            table_id,
+            primary_key,
+        } => {
+            let schema = catalog.set_table_primary_key(*table_id, primary_key.clone())?;
+            storage.apply_set_table_primary_key(schema)
         }
         // Normalized away above: `FullPageImageCompressed` never reaches this match
         // (it is rewritten to `FullPageImage` before the match runs).
@@ -695,6 +723,14 @@ mod tests {
             Ok(())
         }
 
+        fn apply_set_table_primary_key(&self, _schema: common::TableSchema) -> common::Result<()> {
+            Ok(())
+        }
+
+        fn apply_rebuild_table_identity(&self, _schema: common::TableSchema) -> common::Result<()> {
+            Ok(())
+        }
+
         fn apply_truncate_table(
             &self,
             update: common::TruncateCatalogUpdate,
@@ -748,6 +784,7 @@ mod tests {
             name: "legacy_table_id_idx".to_string(),
             columns: vec![0],
             unique: false,
+            constraint: common::IndexConstraintKind::None,
         };
         super::apply_redo(
             &catalog,
@@ -1265,7 +1302,7 @@ mod tests {
                 .snapshot()
                 .unwrap()
                 .next_index_id,
-            common::PRIMARY_KEY_INDEX_ID + 2,
+            common::PRIMARY_KEY_INDEX_ID + 3,
             "recovery must burn the aborted index id even though the index catalog record is skipped"
         );
         assert_eq!(
@@ -1275,7 +1312,7 @@ mod tests {
                 .snapshot()
                 .unwrap()
                 .next_storage_id,
-            4,
+            5,
             "recovery must burn the aborted index storage id even though the index catalog record is skipped"
         );
 
@@ -1289,8 +1326,8 @@ mod tests {
             .get_index_by_name("users_id")
             .unwrap()
             .unwrap();
-        assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 2);
-        assert_eq!(index.storage_id, 4);
+        assert_eq!(index.id, common::PRIMARY_KEY_INDEX_ID + 3);
+        assert_eq!(index.storage_id, 5);
     }
 
     #[test]

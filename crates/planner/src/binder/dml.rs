@@ -132,14 +132,31 @@ fn bind_on_conflict(
         return Ok(None);
     };
     let requires_target = matches!(on_conflict.action, ConflictAction::DoUpdate { .. });
-    validate_conflict_target(table, on_conflict.target.as_ref(), requires_target)?;
+    let target = validate_conflict_target(table, on_conflict.target.as_ref(), requires_target)?;
+    let target = match target {
+        Some(target) => Some(target),
+        None if !table.primary_key.is_empty() => Some(table.primary_key.clone()),
+        None => None,
+    };
 
     let action = match &on_conflict.action {
-        ConflictAction::DoNothing => BoundOnConflict::DoNothing,
+        ConflictAction::DoNothing => BoundOnConflict::DoNothing { target },
         ConflictAction::DoUpdate {
             assignments,
             filter,
-        } => bind_do_update(catalog, table, assignments, filter.as_ref(), declared)?,
+        } => bind_do_update(
+            catalog,
+            table,
+            target.clone().ok_or_else(|| {
+                plan_error(
+                    SqlState::FeatureNotSupported,
+                    "ON CONFLICT DO UPDATE requires a conflict target (the primary key)",
+                )
+            })?,
+            assignments,
+            filter.as_ref(),
+            declared,
+        )?,
     };
     Ok(Some(action))
 }
@@ -153,7 +170,7 @@ fn validate_conflict_target(
     table: &TableSchema,
     target: Option<&ConflictTarget>,
     requires_target: bool,
-) -> Result<()> {
+) -> Result<Option<Vec<ColumnId>>> {
     let Some(ConflictTarget::Columns(columns)) = target else {
         if requires_target {
             return Err(plan_error(
@@ -161,7 +178,7 @@ fn validate_conflict_target(
                 "ON CONFLICT DO UPDATE requires a conflict target (the primary key)",
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
 
     // Each named column must exist; then the set must equal the primary key.
@@ -178,17 +195,19 @@ fn validate_conflict_target(
             "ON CONFLICT arbiter must be the primary key; only the primary key is supported",
         ));
     }
-    Ok(())
+    Ok(Some(named))
 }
 
 /// Bind an `ON CONFLICT ... DO UPDATE SET ... [WHERE ...]` action. Assignment
 /// value expressions and the optional `WHERE` are bound over two bindings: the
 /// existing target row (bare columns) and the proposed `excluded` row
-/// (`excluded.<col>`). The primary key cannot be assigned, and duplicate
-/// assignments are rejected — same as `UPDATE`.
+/// (`excluded.<col>`). Duplicate assignments are rejected — same as `UPDATE`;
+/// primary-key assignments are allowed and enforced by the PK constraint index
+/// and storage rekeying.
 fn bind_do_update(
     catalog: &dyn CatalogManager,
     table: &TableSchema,
+    target: Vec<ColumnId>,
     assignments: &[Assignment],
     filter: Option<&Expr>,
     declared: &[Option<DataType>],
@@ -203,12 +222,6 @@ fn bind_do_update(
     let mut bound_assignments = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         let column = column_by_name(table, &assignment.column)?;
-        if table.primary_key.contains(&column.id) {
-            return Err(plan_error(
-                SqlState::DatatypeMismatch,
-                format!("cannot update primary key column {}", column.name),
-            ));
-        }
         if !seen.insert(column.id) {
             return Err(plan_error(
                 SqlState::DatatypeMismatch,
@@ -230,6 +243,7 @@ fn bind_do_update(
     }
 
     Ok(BoundOnConflict::DoUpdate {
+        target,
         assignments: bound_assignments,
         filter,
     })
@@ -359,12 +373,6 @@ pub(super) fn bind_update(
     let mut bound_assignments = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         let column = column_by_name(&table, &assignment.column)?;
-        if table.primary_key.contains(&column.id) {
-            return Err(plan_error(
-                SqlState::DatatypeMismatch,
-                format!("cannot update primary key column {}", column.name),
-            ));
-        }
         if !seen.insert(column.id) {
             return Err(plan_error(
                 SqlState::DatatypeMismatch,

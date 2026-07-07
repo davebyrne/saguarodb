@@ -8,7 +8,6 @@ const VIRTUAL_OID_TAG_SHIFT: u32 = 40;
 const USER_TABLE_OID_TAG: i64 = 1_i64 << VIRTUAL_OID_TAG_SHIFT;
 const USER_INDEX_OID_TAG: i64 = 2_i64 << VIRTUAL_OID_TAG_SHIFT;
 const USER_SEQUENCE_OID_TAG: i64 = 3_i64 << VIRTUAL_OID_TAG_SHIFT;
-const SYNTHETIC_PRIMARY_KEY_OID_TAG: i64 = 4_i64 << VIRTUAL_OID_TAG_SHIFT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SystemSchema {
@@ -308,10 +307,6 @@ pub fn sequence_oid(sequence_id: u32) -> i64 {
     USER_SEQUENCE_OID_TAG | i64::from(sequence_id)
 }
 
-pub fn synthetic_primary_key_oid(table_id: u32) -> i64 {
-    SYNTHETIC_PRIMARY_KEY_OID_TAG | i64::from(table_id)
-}
-
 fn col(id: u16, name: &str, data_type: DataType, pg_type: PgType, nullable: bool) -> ColumnDef {
     ColumnDef {
         id,
@@ -428,12 +423,7 @@ mod tests {
     #[test]
     fn oid_spaces_are_disjoint_for_same_raw_id() {
         for id in [0, 7, u32::MAX] {
-            let oids = [
-                table_oid(id),
-                index_oid(id),
-                sequence_oid(id),
-                synthetic_primary_key_oid(id),
-            ];
+            let oids = [table_oid(id), index_oid(id), sequence_oid(id)];
             assert_eq!(
                 oids.iter().copied().collect::<HashSet<_>>().len(),
                 oids.len()

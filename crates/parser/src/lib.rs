@@ -2011,6 +2011,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_alter_table_primary_key_forms() {
+        assert_eq!(
+            parse("alter table users add primary key (id)").unwrap(),
+            Statement::AlterTableAddPrimaryKey {
+                table: "users".to_string(),
+                columns: vec!["id".to_string()],
+                constraint_name: None,
+            }
+        );
+        assert_eq!(
+            parse("ALTER TABLE ONLY Users ADD CONSTRAINT users_pkey PRIMARY KEY (Id, Tenant);")
+                .unwrap(),
+            Statement::AlterTableAddPrimaryKey {
+                table: "users".to_string(),
+                columns: vec!["id".to_string(), "tenant".to_string()],
+                constraint_name: Some("users_pkey".to_string()),
+            }
+        );
+        assert_eq!(
+            parse("alter table users drop primary key").unwrap(),
+            Statement::AlterTableDropPrimaryKey {
+                table: "users".to_string(),
+                constraint_name: None,
+            }
+        );
+        assert_eq!(
+            parse("alter table only users drop constraint users_pkey").unwrap(),
+            Statement::AlterTableDropPrimaryKey {
+                table: "users".to_string(),
+                constraint_name: Some("users_pkey".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_alter_forms() {
         for sql in [
             "alter table users add column x integer",

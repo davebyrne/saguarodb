@@ -101,6 +101,81 @@ pub enum SqlState {
     InternalError,
 }
 
+impl SqlState {
+    pub fn code(self) -> &'static str {
+        match self {
+            SqlState::SuccessfulCompletion => "00000",
+            SqlState::SyntaxError => "42601",
+            SqlState::UndefinedTable => "42P01",
+            SqlState::InvalidSchemaName => "3F000",
+            SqlState::UndefinedColumn => "42703",
+            SqlState::UndefinedObject => "42704",
+            SqlState::InvalidColumnReference => "42P10",
+            SqlState::DuplicateTable => "42P07",
+            SqlState::DatatypeMismatch => "42804",
+            SqlState::DivisionByZero => "22012",
+            SqlState::InvalidParameterValue => "22023",
+            SqlState::NumericValueOutOfRange => "22003",
+            SqlState::StringDataRightTruncation => "22001",
+            SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::BadCopyFileFormat => "22P04",
+            SqlState::NotNullViolation => "23502",
+            SqlState::UniqueViolation => "23505",
+            SqlState::CheckViolation => "23514",
+            SqlState::CardinalityViolation => "21000",
+            SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::ObjectNotInPrerequisiteState => "55000",
+            SqlState::QueryCanceled => "57014",
+            SqlState::FeatureNotSupported => "0A000",
+            SqlState::InFailedSqlTransaction => "25P02",
+            SqlState::NoActiveSqlTransaction => "25P01",
+            SqlState::InvalidSavepointSpecification => "3B001",
+            SqlState::ProgramLimitExceeded => "54000",
+            SqlState::SerializationFailure => "40001",
+            SqlState::DeadlockDetected => "40P01",
+            SqlState::IoError => "58030",
+            SqlState::InternalError => "XX000",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "00000" => SqlState::SuccessfulCompletion,
+            "42601" => SqlState::SyntaxError,
+            "42P01" => SqlState::UndefinedTable,
+            "3F000" => SqlState::InvalidSchemaName,
+            "42703" => SqlState::UndefinedColumn,
+            "42704" => SqlState::UndefinedObject,
+            "42P10" => SqlState::InvalidColumnReference,
+            "42P07" => SqlState::DuplicateTable,
+            "42804" => SqlState::DatatypeMismatch,
+            "22012" => SqlState::DivisionByZero,
+            "22023" => SqlState::InvalidParameterValue,
+            "22003" => SqlState::NumericValueOutOfRange,
+            "22001" => SqlState::StringDataRightTruncation,
+            "22P02" => SqlState::InvalidTextRepresentation,
+            "22P04" => SqlState::BadCopyFileFormat,
+            "23502" => SqlState::NotNullViolation,
+            "23505" => SqlState::UniqueViolation,
+            "23514" => SqlState::CheckViolation,
+            "21000" => SqlState::CardinalityViolation,
+            "2BP01" => SqlState::DependentObjectsStillExist,
+            "55000" => SqlState::ObjectNotInPrerequisiteState,
+            "57014" => SqlState::QueryCanceled,
+            "0A000" => SqlState::FeatureNotSupported,
+            "25P02" => SqlState::InFailedSqlTransaction,
+            "25P01" => SqlState::NoActiveSqlTransaction,
+            "3B001" => SqlState::InvalidSavepointSpecification,
+            "54000" => SqlState::ProgramLimitExceeded,
+            "40001" => SqlState::SerializationFailure,
+            "40P01" => SqlState::DeadlockDetected,
+            "58030" => SqlState::IoError,
+            "XX000" => SqlState::InternalError,
+            _ => return None,
+        })
+    }
+}
+
 pub type Result<T> = std::result::Result<T, DbError>;
 
 impl DbError {
@@ -144,5 +219,50 @@ impl DbError {
             detail: None,
             hint: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SqlState;
+
+    #[test]
+    fn sqlstate_code_round_trips_known_codes() {
+        for state in [
+            SqlState::SuccessfulCompletion,
+            SqlState::SyntaxError,
+            SqlState::UndefinedTable,
+            SqlState::InvalidSchemaName,
+            SqlState::UndefinedColumn,
+            SqlState::UndefinedObject,
+            SqlState::InvalidColumnReference,
+            SqlState::DuplicateTable,
+            SqlState::DatatypeMismatch,
+            SqlState::DivisionByZero,
+            SqlState::InvalidParameterValue,
+            SqlState::NumericValueOutOfRange,
+            SqlState::StringDataRightTruncation,
+            SqlState::InvalidTextRepresentation,
+            SqlState::BadCopyFileFormat,
+            SqlState::NotNullViolation,
+            SqlState::UniqueViolation,
+            SqlState::CheckViolation,
+            SqlState::CardinalityViolation,
+            SqlState::DependentObjectsStillExist,
+            SqlState::ObjectNotInPrerequisiteState,
+            SqlState::QueryCanceled,
+            SqlState::FeatureNotSupported,
+            SqlState::InFailedSqlTransaction,
+            SqlState::NoActiveSqlTransaction,
+            SqlState::InvalidSavepointSpecification,
+            SqlState::ProgramLimitExceeded,
+            SqlState::SerializationFailure,
+            SqlState::DeadlockDetected,
+            SqlState::IoError,
+            SqlState::InternalError,
+        ] {
+            assert_eq!(SqlState::from_code(state.code()), Some(state));
+        }
+        assert_eq!(SqlState::from_code("99999"), None);
     }
 }

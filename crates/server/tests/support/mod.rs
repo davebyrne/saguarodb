@@ -847,10 +847,7 @@ fn decode_simple_query_response(bytes: &[u8]) -> Result<SimpleQueryResult> {
         match tag {
             b'D' => rows.push(decode_data_row(body)?),
             b'E' => {
-                return Err(common::DbError::protocol(
-                    common::SqlState::InternalError,
-                    decode_error_message(body),
-                ));
+                return Err(decode_error_response(body));
             }
             // Simple-query framing tags plus the extended-protocol acknowledgements
             // (`1` ParseComplete, `2` BindComplete, `n` NoData, `t`
@@ -936,6 +933,29 @@ fn decode_error_message(body: &[u8]) -> String {
         offset = end + 1;
     }
     fields.join(", ")
+}
+
+fn decode_error_response(body: &[u8]) -> common::DbError {
+    let mut sqlstate = common::SqlState::InternalError;
+    let mut offset = 0;
+    while offset < body.len() {
+        let field = body[offset];
+        if field == 0 {
+            break;
+        }
+        offset += 1;
+        let Some(relative_nul) = body[offset..].iter().position(|byte| *byte == 0) else {
+            break;
+        };
+        let end = offset + relative_nul;
+        if field == b'C'
+            && let Ok(code) = std::str::from_utf8(&body[offset..end])
+        {
+            sqlstate = common::SqlState::from_code(code).unwrap_or(common::SqlState::InternalError);
+        }
+        offset = end + 1;
+    }
+    common::DbError::protocol(sqlstate, decode_error_message(body))
 }
 
 fn startup_bytes() -> Vec<u8> {

@@ -4,13 +4,13 @@ use std::sync::{
 };
 
 use common::{
-    CompressionSetting, DbError, RelationKind, Result, SqlState, StatementContext, TableId,
-    TableOptionPatch, TableSchema, ToastCompression, ToastOptions, needs_toast_relation,
-    toast_schema,
+    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema, RelationKind,
+    Result, SqlState, StatementContext, TableId, TableOptionPatch, TableSchema, ToastCompression,
+    ToastOptions, needs_toast_relation, toast_schema,
 };
 use executor::ExecutionResult;
 use parser::Statement;
-use storage::SchemaOperations;
+use storage::{RecoveryOperations, SchemaOperations};
 use wal::{WalRecord, WalRecordKind};
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
@@ -31,6 +31,21 @@ struct ToastAlterPostCommit {
     toast: ToastOptions,
     toast_table_id: Option<TableId>,
     hidden_schema: Option<TableSchema>,
+}
+
+enum PrimaryKeyAlterPostCommit {
+    Add {
+        txn_id: u64,
+        schema: TableSchema,
+        index: IndexSchema,
+        gc_horizon: u64,
+    },
+    Drop {
+        txn_id: u64,
+        schema: TableSchema,
+        index_id: IndexId,
+        gc_horizon: u64,
+    },
 }
 
 impl QueryService {
@@ -376,4 +391,351 @@ impl QueryService {
         )?;
         components.storage.set_table_toast_metadata(&schema)
     }
+
+    /// `ALTER TABLE <t> ADD [CONSTRAINT name] PRIMARY KEY (cols...)`: immediate
+    /// commit DDL under the exclusive guard. The normal secondary constraint index
+    /// is created before commit (new index files are safe to orphan on abort);
+    /// the existing table identity tree is rebuilt only after the DDL commit is
+    /// durable, and recovery derives that rebuild from the logical WAL record.
+    pub(super) fn run_alter_table_add_primary_key(
+        &self,
+        statement: Statement,
+    ) -> Result<ExecutionResult> {
+        let Statement::AlterTableAddPrimaryKey {
+            table,
+            columns,
+            constraint_name,
+        } = statement
+        else {
+            return Err(DbError::internal(
+                "expected ALTER TABLE ADD PRIMARY KEY statement",
+            ));
+        };
+
+        let components = &self.components;
+        {
+            let _guard = components.concurrency.begin_checkpoint()?;
+            let schema = self.require_user_table(&table)?;
+            if !schema.primary_key.is_empty() {
+                return Err(DbError::plan(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    format!("table {table} already has a primary key"),
+                ));
+            }
+            let primary_key = primary_key_column_ids(&schema, &columns)?;
+            let new_schema = schema_with_primary_key(schema.clone(), primary_key.clone())?;
+            let gc_horizon = components.gc_horizon();
+            let catalog_snapshot = components.catalog.snapshot()?;
+            let index_name = constraint_name.unwrap_or_else(|| format!("{}_pkey", schema.name));
+            if components.catalog.get_index_by_name(&index_name)?.is_some() {
+                return Err(DbError::plan(
+                    SqlState::DuplicateTable,
+                    format!("index {index_name} already exists"),
+                ));
+            }
+            let index = IndexSchema {
+                id: catalog_snapshot.next_index_id,
+                storage_id: catalog_snapshot.next_storage_id,
+                table: schema.id,
+                name: index_name,
+                columns: primary_key.clone(),
+                unique: true,
+                constraint: IndexConstraintKind::PrimaryKey,
+            };
+            let catalog_before = Some(catalog_snapshot);
+            let txn_id = components
+                .active_txns
+                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+
+            let pre_commit = (|| {
+                let ctx = maintenance_statement_context(txn_id, self, gc_horizon);
+                components.storage.validate_table_primary_key_change(
+                    &ctx,
+                    &new_schema,
+                    gc_horizon,
+                )?;
+                components.catalog.reserve_index_id(index.id)?;
+                components.catalog.reserve_storage_id(index.storage_id)?;
+                components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::AlterTablePrimaryKey {
+                        table_id: schema.id,
+                        primary_key,
+                    },
+                })?;
+                components.storage.create_index(&ctx, &index, gc_horizon)?;
+                Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Add {
+                    txn_id,
+                    schema: new_schema,
+                    index,
+                    gc_horizon,
+                })
+            })();
+
+            let post_commit = match pre_commit {
+                Ok(post_commit) => post_commit,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
+            if let Err(err) = self.finish_alter_table_primary_key_after_commit(post_commit) {
+                self.fatal_after_durable_commit(err);
+            }
+            if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+                self.fatal_after_durable_commit(err);
+            }
+            components.active_txns.deregister(txn_id);
+            components.lock_manager.on_txn_finished();
+        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
+
+        Ok(ExecutionResult::Modified {
+            command: "ALTER TABLE".to_string(),
+            count: 0,
+        })
+    }
+
+    /// `ALTER TABLE <t> DROP PRIMARY KEY` or `DROP CONSTRAINT <pkey>`.
+    pub(super) fn run_alter_table_drop_primary_key(
+        &self,
+        statement: Statement,
+    ) -> Result<ExecutionResult> {
+        let Statement::AlterTableDropPrimaryKey {
+            table,
+            constraint_name,
+        } = statement
+        else {
+            return Err(DbError::internal(
+                "expected ALTER TABLE DROP PRIMARY KEY statement",
+            ));
+        };
+
+        let components = &self.components;
+        {
+            let _guard = components.concurrency.begin_checkpoint()?;
+            let schema = self.require_user_table(&table)?;
+            if schema.primary_key.is_empty() {
+                return Err(DbError::plan(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    format!("table {table} does not have a primary key"),
+                ));
+            }
+            let index = primary_key_constraint_index(components.catalog.as_ref(), &schema)?;
+            if let Some(name) = &constraint_name
+                && *name != index.name
+            {
+                return Err(DbError::plan(
+                    SqlState::UndefinedObject,
+                    format!("constraint {name} does not exist"),
+                ));
+            }
+
+            let mut new_schema = schema.clone();
+            new_schema.primary_key.clear();
+            let gc_horizon = components.gc_horizon();
+            let catalog_before = Some(components.catalog.snapshot()?);
+            let txn_id = components
+                .active_txns
+                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+
+            let pre_commit = (|| {
+                let ctx = maintenance_statement_context(txn_id, self, gc_horizon);
+                components.storage.validate_table_primary_key_change(
+                    &ctx,
+                    &new_schema,
+                    gc_horizon,
+                )?;
+                components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::AlterTablePrimaryKey {
+                        table_id: schema.id,
+                        primary_key: Vec::new(),
+                    },
+                })?;
+                components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::DropIndex { index: index.id },
+                })?;
+                Ok::<_, DbError>(PrimaryKeyAlterPostCommit::Drop {
+                    txn_id,
+                    schema: new_schema,
+                    index_id: index.id,
+                    gc_horizon,
+                })
+            })();
+
+            let post_commit = match pre_commit {
+                Ok(post_commit) => post_commit,
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
+            if let Err(err) = self.finish_alter_table_primary_key_after_commit(post_commit) {
+                self.fatal_after_durable_commit(err);
+            }
+            if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+                self.fatal_after_durable_commit(err);
+            }
+            components.active_txns.deregister(txn_id);
+            components.lock_manager.on_txn_finished();
+        }
+        record_commit_and_maybe_checkpoint_after_durable_commit(&self.components);
+
+        Ok(ExecutionResult::Modified {
+            command: "ALTER TABLE".to_string(),
+            count: 0,
+        })
+    }
+
+    fn require_user_table(&self, table: &str) -> Result<TableSchema> {
+        let schema = self
+            .components
+            .catalog
+            .get_table_by_name(table)?
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedTable,
+                    format!("table {table} does not exist"),
+                )
+            })?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "cannot ALTER PRIMARY KEY on a hidden relation",
+            ));
+        }
+        Ok(schema)
+    }
+
+    fn finish_alter_table_primary_key_after_commit(
+        &self,
+        post: PrimaryKeyAlterPostCommit,
+    ) -> Result<()> {
+        match post {
+            PrimaryKeyAlterPostCommit::Add {
+                txn_id,
+                schema,
+                index,
+                gc_horizon,
+            } => {
+                self.components
+                    .ssi_manager
+                    .promote_table_identity_locks_to_relation(schema.id);
+                self.components
+                    .storage
+                    .set_table_primary_key_logged(&schema, gc_horizon, txn_id)?;
+                self.components.wal.flush()?;
+                self.components
+                    .catalog
+                    .add_table_primary_key_index(schema.id, schema.primary_key.clone(), index)
+                    .map(|_| ())
+            }
+            PrimaryKeyAlterPostCommit::Drop {
+                txn_id,
+                schema,
+                index_id,
+                gc_horizon,
+            } => {
+                self.components
+                    .catalog
+                    .drop_table_primary_key_index(schema.id, index_id)?;
+                self.components
+                    .ssi_manager
+                    .promote_table_identity_locks_to_relation(schema.id);
+                self.components
+                    .storage
+                    .set_table_primary_key_logged(&schema, gc_horizon, txn_id)?;
+                self.components.wal.flush()?;
+                self.components.storage.apply_drop_index(index_id)
+            }
+        }
+    }
+}
+
+fn maintenance_statement_context(
+    txn_id: u64,
+    service: &QueryService,
+    gc_horizon: u64,
+) -> StatementContext {
+    StatementContext::new(txn_id)
+        .with_gc_horizon(gc_horizon)
+        .with_conflict_waiter(
+            service.components.lock_manager.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+}
+
+fn primary_key_column_ids(schema: &TableSchema, columns: &[String]) -> Result<Vec<ColumnId>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(columns.len());
+    for column_name in columns {
+        if !seen.insert(column_name.as_str()) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!("duplicate primary key column {column_name}"),
+            ));
+        }
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.name == *column_name)
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!("primary key column {column_name} does not exist"),
+                )
+            })?;
+        ids.push(column.id);
+    }
+    Ok(ids)
+}
+
+fn schema_with_primary_key(
+    mut schema: TableSchema,
+    primary_key: Vec<ColumnId>,
+) -> Result<TableSchema> {
+    for column_id in &primary_key {
+        let column = schema
+            .columns
+            .iter_mut()
+            .find(|column| column.id == *column_id)
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "primary key column id {column_id} is missing from table {}",
+                    schema.name
+                ))
+            })?;
+        column.nullable = false;
+    }
+    schema.primary_key = primary_key;
+    Ok(schema)
+}
+
+fn primary_key_constraint_index(
+    catalog: &dyn catalog::CatalogManager,
+    schema: &TableSchema,
+) -> Result<IndexSchema> {
+    catalog
+        .list_indexes_for_table(schema.id)?
+        .into_iter()
+        .find(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+        .ok_or_else(|| {
+            DbError::internal(format!(
+                "table {} has primary-key metadata but no primary-key constraint index",
+                schema.name
+            ))
+        })
 }

@@ -168,10 +168,10 @@ pub enum Statement {
     Truncate {
         table: String,
     },
-    /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')` — the only
-    /// supported ALTER form. Intercepted before sqlparser (like VACUUM) so the
-    /// grammar does not depend on sqlparser's ALTER coverage; every other
-    /// `ALTER ...` input is rejected at parse time.
+    /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')`. Intercepted
+    /// before sqlparser (like VACUUM) so the grammar does not depend on
+    /// sqlparser's ALTER coverage; unsupported `ALTER ...` inputs are rejected at
+    /// parse time.
     AlterTableSetCompression {
         table: String,
         compression: CompressionSetting,
@@ -181,6 +181,18 @@ pub enum Statement {
     AlterTableSetOptions {
         table: String,
         options: TableOptionPatch,
+    },
+    /// `ALTER TABLE [ONLY] <name> ADD [CONSTRAINT <name>] PRIMARY KEY (cols...)`.
+    AlterTableAddPrimaryKey {
+        table: String,
+        columns: Vec<String>,
+        constraint_name: Option<String>,
+    },
+    /// `ALTER TABLE [ONLY] <name> DROP PRIMARY KEY` or
+    /// `ALTER TABLE [ONLY] <name> DROP CONSTRAINT <name>`.
+    AlterTableDropPrimaryKey {
+        table: String,
+        constraint_name: Option<String>,
     },
     /// `COPY <table> [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`. A
     /// non-relational bulk-transfer command (text/CSV, simple-query only). The

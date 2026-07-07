@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use catalog::CatalogManager;
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
-    ExecRow, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result, Row, SequenceOptions,
-    SequenceSchema, SqlState, StatementContext, TableId, TableSchema, ToastOptions, Value,
+    ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result,
+    Row, SequenceOptions, SequenceSchema, SqlState, StatementContext, TableId, TableSchema,
+    ToastOptions, Value,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
@@ -244,21 +245,31 @@ pub(crate) fn build_executor<'a>(
             filter,
             ..
         } => {
-            // SSI: an exact-key lookup reads one tuple (recorded even when no row
-            // matches, so a later insert of that key is caught as a phantom); a range
-            // scan reads the whole relation (`docs/specs/ssi.md` §5). Secondary
-            // index scans are conservatively relation reads because an old
-            // relation snapshot may fall back to a full scan if the current-catalog
-            // index is unavailable for that generation.
-            match (index, range) {
-                (idx, KeyRange::Exact(key)) if *idx == common::PRIMARY_KEY_INDEX_ID => ctx
-                    .statement
+            // SSI: a full declared-primary-key point lookup reads one tuple
+            // (recorded even when no row matches, so a later insert of that key
+            // is caught as a phantom). A composite-key prefix scan, a range scan,
+            // or any catalog-index scan reads the relation conservatively
+            // (`docs/specs/ssi.md` §5). Catalog index scans stay relation reads
+            // because an old relation snapshot may fall back to a full scan if the
+            // current-catalog index is unavailable for that generation.
+            let full_primary_key_exact_read = if *index == common::PRIMARY_KEY_INDEX_ID
+                && let KeyRange::Exact(key) = range
+            {
+                key.0.len() == require_table(ctx.catalog, *table)?.primary_key.len()
+            } else {
+                false
+            };
+            if full_primary_key_exact_read {
+                let KeyRange::Exact(key) = range else {
+                    unreachable!("full_primary_key_exact_read requires an exact range");
+                };
+                ctx.statement
                     .ssi_tracker
-                    .record_tuple_read(ctx.statement.txn_id, *table, key),
-                _ => ctx
-                    .statement
+                    .record_tuple_read(ctx.statement.txn_id, *table, key);
+            } else {
+                ctx.statement
                     .ssi_tracker
-                    .record_relation_read(ctx.statement.txn_id, *table),
+                    .record_relation_read(ctx.statement.txn_id, *table);
             }
             Ok(Box::new(IndexScanOp::new(IndexScanInput {
                 ctx: ctx.statement.clone(),
@@ -493,6 +504,11 @@ fn execute_insert(
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
     let schema = require_table(ctx.catalog, table)?;
+    let has_conflict_arbiter = if let Some(on_conflict) = on_conflict {
+        validate_on_conflict_arbiter(on_conflict, &schema)?
+    } else {
+        false
+    };
     let mut executor = build_executor(ctx, source)?;
     // Materialize the source fully before inserting. For `INSERT ... SELECT`
     // that reads the target table, this makes the query observe only the
@@ -522,18 +538,19 @@ fn execute_insert(
         // raises a check violation on the proposed row).
         validate_check_constraints(&ctx.statement, &schema, check_exprs, &row.values)?;
 
-        // ON CONFLICT: the arbiter is the primary key. Probe the visible row at the
-        // proposed primary key; on a conflict, take the action (skip for DO NOTHING,
-        // update the existing row for DO UPDATE) instead of inserting. The probe uses
-        // snapshot visibility (including this statement's own earlier inserts), so a
-        // duplicate key within the same statement is also caught.
-        if let Some(on_conflict) = on_conflict {
+        // ON CONFLICT: the bound arbiter is the declared primary-key constraint, if
+        // one existed at bind/prepare time. Probe that primary-key index; on a
+        // conflict, take the action (skip for DO NOTHING, update the existing row for
+        // DO UPDATE) instead of inserting. The probe uses snapshot visibility
+        // (including this statement's own earlier inserts), so a duplicate key within
+        // the same statement is also caught. A targetless statement bound with no
+        // primary key has no arbiter, so there is simply nothing to probe.
+        if let Some(on_conflict) = on_conflict
+            && has_conflict_arbiter
+        {
             let key = primary_key_for_row(&schema, &row.values)?;
-            // SSI: the ON CONFLICT arbiter probe is a tuple read of `key` — record a
-            // SIREAD lock (even when no row matches, so a later insert of `key` is
-            // caught as a phantom, `docs/specs/ssi.md` §5.1). The IndexScan exact-key
-            // arm records this for ordinary point reads; this probe bypasses
-            // `build_executor`, so it must record here. No-op for non-SERIALIZABLE.
+            // SSI: this probe bypasses `build_executor`, but it is still a point read
+            // of the proposed primary-key value.
             ctx.statement
                 .ssi_tracker
                 .record_tuple_read(ctx.statement.txn_id, table, &key);
@@ -544,6 +561,7 @@ fn execute_insert(
                 if let BoundOnConflict::DoUpdate {
                     assignments,
                     filter,
+                    ..
                 } = on_conflict
                     && let Some(updated) = apply_conflict_update(
                         ctx,
@@ -577,6 +595,33 @@ fn execute_insert(
     }
 
     Ok(modified_result("INSERT", count, returning, returned))
+}
+
+fn validate_on_conflict_arbiter(
+    on_conflict: &BoundOnConflict,
+    schema: &TableSchema,
+) -> Result<bool> {
+    let Some(target) = on_conflict_target(on_conflict) else {
+        return Ok(false);
+    };
+    let mut target = target.to_vec();
+    target.sort_unstable();
+    let mut primary_key = schema.primary_key.clone();
+    primary_key.sort_unstable();
+    if target == primary_key && !primary_key.is_empty() {
+        return Ok(true);
+    }
+    Err(DbError::execute(
+        SqlState::FeatureNotSupported,
+        "ON CONFLICT arbiter must be the primary key; only the primary key is supported",
+    ))
+}
+
+fn on_conflict_target(on_conflict: &BoundOnConflict) -> Option<&[ColumnId]> {
+    match on_conflict {
+        BoundOnConflict::DoNothing { target } => target.as_deref(),
+        BoundOnConflict::DoUpdate { target, .. } => Some(target),
+    }
 }
 
 /// Build the primary-key [`Key`] for a full table row (catalog slot order),
@@ -1088,6 +1133,12 @@ fn execute_create_table(
         cleanup_created_table(ctx, schema.id, &created_sequences);
         return Err(err);
     }
+    if !primary_key.is_empty()
+        && let Err(err) = create_primary_key_constraint_index(ctx, &schema, primary_key)
+    {
+        cleanup_created_table(ctx, schema.id, &created_sequences);
+        return Err(err);
+    }
     // Each UNIQUE constraint becomes a unique index built on the just-created
     // (empty) table, in declared order. On any failure, drop the table — which
     // cascades to every index created so far in the catalog — and return; the
@@ -1209,14 +1260,41 @@ fn create_unique_constraint_index(
     columns: &[String],
 ) -> Result<()> {
     let name = format!("{}_{}_key", schema.name, columns.join("_"));
-    let index = ctx
-        .catalog
-        .create_index(name, &schema.name, columns, true)?;
+    let index = ctx.catalog.create_index_with_constraint(
+        name,
+        &schema.name,
+        columns,
+        true,
+        IndexConstraintKind::Unique,
+    )?;
     if let Err(err) = ctx
         .schema_ops
         .create_index(&ctx.statement, &index, ctx.gc_horizon)
     {
         let _ = ctx.catalog.drop_index(index.id);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn create_primary_key_constraint_index(
+    ctx: &ExecutionContext<'_>,
+    schema: &TableSchema,
+    columns: &[String],
+) -> Result<()> {
+    let name = format!("{}_pkey", schema.name);
+    let index = ctx.catalog.create_index_with_constraint(
+        name,
+        &schema.name,
+        columns,
+        true,
+        IndexConstraintKind::PrimaryKey,
+    )?;
+    if let Err(err) = ctx
+        .schema_ops
+        .create_index(&ctx.statement, &index, ctx.gc_horizon)
+    {
+        let _ = ctx.catalog.apply_drop_index(index.id);
         return Err(err);
     }
     Ok(())
@@ -1307,6 +1385,16 @@ fn execute_create_index(
 }
 
 fn execute_drop_index(ctx: &ExecutionContext<'_>, index: IndexId) -> Result<ExecutionResult> {
+    if ctx
+        .catalog
+        .get_index(index)?
+        .is_some_and(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+    {
+        return Err(DbError::plan(
+            common::SqlState::DependentObjectsStillExist,
+            "cannot drop index backing a primary key constraint",
+        ));
+    }
     ctx.schema_ops.drop_index(&ctx.statement, index)?;
     ctx.catalog.drop_index(index)?;
     Ok(ExecutionResult::Modified {

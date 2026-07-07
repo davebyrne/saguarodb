@@ -48,7 +48,7 @@ overview spec states "the redo WAL is the prerequisite" for MVCC; it is done.
 | Capability | Where | Relevance to MVCC |
 |---|---|---|
 | Redo WAL with **PageLSN** gating + **full-page writes** | `crates/wal`, `crates/server/src/recovery.rs` | Idempotent, torn-page-safe physiological redo — the substrate for redo-all recovery |
-| **On-disk** non-clustered primary-key B-tree + secondary indexes | `crates/storage/src/btree.rs`, `engine.rs` | Recovery rebuilds nothing in memory; indexes are durable |
+| **On-disk** non-clustered storage-identity B-tree + catalog indexes | `crates/storage/src/btree.rs`, `engine.rs` | Recovery rebuilds nothing in memory; indexes are durable |
 | **Eviction-flush-on-steal** + incremental checkpoint + control record | `crates/buffer`, `crates/server/src/checkpoint.rs` | Working set not bounded by the buffer pool |
 | Row format **v1 with a reserved version byte** | `crates/storage/src/codec.rs` (`ROW_FORMAT_VERSION = 1`) | Single chokepoint for adding `xmin`/`xmax` |
 | Page format **v2 with PageLSN** | `crates/storage/src/page.rs` (`HEADER_LEN = 22`) | Per-page redo gating |
@@ -805,8 +805,8 @@ design, because index entries accumulate per version as well as heap tuples.
     half-mutated page with a stale checksum (a durability defense-in-depth backing the
     "process each chain once" invariant above).
 - **Index vacuum** (`storage::vacuum_indexes(schema, dead_tids)`, F3a): remove the
-  dangling index entries `vacuum_heap` left behind — for the table's primary-key
-  index **and every live secondary index**, delete every entry whose value (the heap
+  dangling index entries `vacuum_heap` left behind — for the table's identity
+  index **and every live catalog index**, delete every entry whose value (the heap
   TID) is in `dead_tids`. `dead_tids` are exactly the **DEAD-root TIDs** `vacuum_heap`
   returns; a **REDIRECT root keeps a LIVE index entry** and is therefore NEVER in
   `dead_tids`, so F3a removes only fully-dead roots and a collapsed (redirected) root's
@@ -1240,7 +1240,7 @@ savepoints via sub-transaction xids (optional, deferred).
     page mutation): pruning lives on the UPDATE/VACUUM path (H3), never the
     lock-free reader path.
   - **Sequential-scan rule.** A `HEAP_ONLY` tuple has **no index entry of its
-    own**, so a PK/secondary index range scan never yields it directly; it is
+    own**, so an identity/catalog index range scan never yields it directly; it is
     reached only by walking `t_ctid` from its (indexed) root. The visible version
     of each chain is therefore yielded **once**, via the root's index entry — a
     heap-only chain member is never independently returned. The scan yields the
@@ -1254,9 +1254,9 @@ savepoints via sub-transaction xids (optional, deferred).
   - **HOT-update fast path** (`storage/src/engine.rs` `update` → `try_hot_update`).
     Before the normal "fresh fully-indexed version + all-index inserts" path, `update`
     attempts a HOT update, eligible iff BOTH:
-    1. **No indexed column changed.** The new row's key equals the predecessor's for
-       the primary key (already required — a PK change is rejected) AND for every
-       secondary index (`secondary_index_key`). If all index keys match, only
+    1. **No indexed column changed.** The new row's identity key equals the
+       predecessor's and every catalog index key (`secondary_index_key`) is
+       unchanged. If all index keys match, only
        non-indexed columns differ.
     2. **Inline physical storage.** For TOAST-enabled tables, neither the predecessor
        nor the prepared successor may contain an external TOAST pointer. Inline raw and
@@ -1592,8 +1592,8 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
      target a dead version), write the new version (`xmin = txn`, `xmax = invalid`,
      `t_ctid = self`), stamp the old version's `xmax = txn` + `t_ctid→new` (the
      forward chain, invariant 5), insert a per-version entry into **all** indexes
-     (PK and every secondary), and retain every old entry; drop
-     relocate-tombstone-repoint; keep rejecting PK changes.
+     (identity and every catalog index), and retain every old entry; drop
+     relocate-tombstone-repoint.
    - *All indexes, not only changed ones:* because reads do not walk `t_ctid` (every
      version is independently indexed, §3.2 invariant 3 — one entry per version), the
      new heap TID needs its own entry in **every** index, including secondaries whose
@@ -1614,7 +1614,8 @@ becomes MVCC). The durability, rollback, and concurrency models are untouched
      column, and a scan on an *unchanged* secondary column — the all-indexes check);
      both versions present internally (old: `xmax=txn`, `t_ctid→new`); a secondary
      scan by the *old* value resolves the old version via a hand-built old snapshot;
-     unique-secondary conflict vs. other live rows but not self; PK change rejected;
+     unique-secondary conflict vs. other live rows but not self; PK changes insert a
+     replacement identity entry and enforce uniqueness;
      update after delete-then-reinsert targets the visible version.
 
 ### Optional / follow-on (land in B or defer to G)

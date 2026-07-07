@@ -55,4 +55,12 @@ impl RecoveryOperations for PageBackedStorageEngine {
     fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()> {
         self.apply_truncate_table_without_wal(update)
     }
+
+    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()> {
+        self.set_table_primary_key_metadata(&schema)
+    }
+
+    fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()> {
+        self.set_table_primary_key(&schema, u64::MAX)
+    }
 }

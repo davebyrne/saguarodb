@@ -545,6 +545,98 @@ async fn e2e_create_insert_select_update_delete_explain() {
 }
 
 #[tokio::test]
+async fn e2e_table_without_primary_key_supports_dml_and_secondary_index_scan() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table events (kind text, value integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create index events_kind on events (kind)")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into events (kind, value) values ('click', 10), ('view', 20), ('click', 30)",
+        )
+        .await
+        .unwrap();
+    server
+        .simple_query("update events set value = value + 1 where kind = 'click'")
+        .await
+        .unwrap();
+    server
+        .simple_query("delete from events where value = 20")
+        .await
+        .unwrap();
+
+    let explain = server
+        .simple_query("explain select value from events where kind = 'click'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(explain[0][0].as_ref().unwrap().contains("IndexScan"));
+
+    let rows = server
+        .simple_query("select kind, value from events where kind = 'click' order by value")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("click".to_string()), Some("11".to_string())],
+            vec![Some("click".to_string()), Some("31".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn e2e_primary_key_value_update_rekeys_row() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada'), (2, 'Bea')")
+        .await
+        .unwrap();
+    server
+        .simple_query("update users set id = 3 where id = 1")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select id, name from users where id = 3")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".to_string()), Some("Ada".to_string())]]
+    );
+
+    let rows = server
+        .simple_query("select id, name from users where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+
+    let err = match server
+        .simple_query("update users set id = 2 where name = 'Ada'")
+        .await
+    {
+        Ok(_) => panic!("expected duplicate primary key update to fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, common::SqlState::UniqueViolation);
+}
+
+#[tokio::test]
 async fn e2e_delete_then_reinsert_same_key_succeeds() {
     // MVCC DELETE stamps xmax in place (no tombstone) and retains index entries, so
     // re-inserting the deleted primary key now succeeds: the committed-deleted

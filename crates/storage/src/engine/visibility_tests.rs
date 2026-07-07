@@ -336,6 +336,7 @@ fn name_index() -> IndexSchema {
         name: "users_name".to_string(),
         columns: vec![1],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     }
 }
 
@@ -676,6 +677,7 @@ fn unique_secondary_aborted_creator_does_not_conflict() {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
+        constraint: common::IndexConstraintKind::None,
     };
     fixture
         .engine
@@ -832,6 +834,7 @@ fn fixture_with_unique_name_index() -> Fixture {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
+        constraint: common::IndexConstraintKind::None,
     };
     fixture
         .engine
@@ -1143,6 +1146,7 @@ fn committed_update_is_visible_via_seq_and_both_secondary_scans() {
         name: "users_id".to_string(),
         columns: vec![0],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     };
     fixture.engine.create_index(&setup, &name_idx, 0).unwrap();
     fixture.engine.create_index(&setup, &id_idx, 0).unwrap();
@@ -1337,6 +1341,7 @@ fn update_unique_secondary_conflicts_only_with_other_live_rows() {
         name: "users_name_unique".to_string(),
         columns: vec![1],
         unique: true,
+        constraint: common::IndexConstraintKind::None,
     };
     fixture
         .engine
@@ -1411,30 +1416,38 @@ fn update_unique_secondary_conflicts_only_with_other_live_rows() {
     );
 }
 
-/// Changing the primary key is rejected (existing behavior preserved); the row
-/// is unchanged.
+/// Changing the primary key rewrites the identity entry: the old key no longer
+/// sees a live row and the new key resolves to the replacement.
 #[test]
-fn update_rejects_primary_key_change() {
+fn update_allows_primary_key_change() {
     let (fixture, _rid) = fixture_with_one_row_and_index();
 
-    let err = fixture
-        .engine
-        .update(
-            &ctx(20, snapshot(21, vec![])),
-            TABLE_ID,
-            &key(1),
-            row(2, "alive"),
-        )
-        .unwrap_err();
-    assert_eq!(err.code, common::SqlState::DatatypeMismatch);
+    assert!(
+        fixture
+            .engine
+            .update(
+                &ctx(20, snapshot(21, vec![])),
+                TABLE_ID,
+                &key(1),
+                row(2, "alive"),
+            )
+            .unwrap()
+    );
+    fixture.commit(20);
 
-    // The original row is untouched.
     assert_eq!(
         fixture
             .engine
             .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(1))
             .unwrap(),
-        Some(row(1, "alive"))
+        None
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .get(&ctx(0, snapshot(30, vec![])), TABLE_ID, &key(2))
+            .unwrap(),
+        Some(row(2, "alive"))
     );
 }
 
@@ -3326,6 +3339,7 @@ fn create_index_over_a_broken_live_hot_chain_aborts_retryable() {
         name: "users_note".to_string(),
         columns: vec![2], // the `note` column
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     };
 
     // Horizon 15 (below the deleter xmax = 20): the root version (note "v1") is
@@ -3401,6 +3415,7 @@ fn create_index_indexes_a_chain_live_to_an_older_reader_but_not_to_the_builder()
         name: "users_note".to_string(),
         columns: vec![2],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     };
 
     // Horizon 50: the root (xmax=20 < 50, committed) is dead_to_all, but the

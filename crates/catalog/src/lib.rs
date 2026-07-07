@@ -6,14 +6,13 @@ pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definitio
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
     INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemSchema, SystemView,
-    index_oid, is_system_schema, resolve_system_view, sequence_oid, synthetic_primary_key_oid,
-    table_oid,
+    index_oid, is_system_schema, resolve_system_view, sequence_oid, table_oid,
 };
 
 use common::{
-    CompressionSetting, FileId, IndexId, IndexSchema, ParsedColumnDef, Result, SequenceId,
-    SequenceOptions, SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate,
-    TruncateTablePlan,
+    ColumnId, CompressionSetting, FileId, IndexConstraintKind, IndexId, IndexSchema,
+    ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
+    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
 };
 
 pub trait CatalogManager: Send + Sync {
@@ -66,6 +65,28 @@ pub trait CatalogManager: Send + Sync {
         toast: ToastOptions,
         toast_table_id: Option<TableId>,
     ) -> Result<TableSchema>;
+    /// Applies an ALTER (or replays one during recovery): locates the live user
+    /// table by id and replaces its primary-key column list. Adding a primary key
+    /// marks those columns not-null in catalog metadata; dropping one does not
+    /// restore prior nullability.
+    fn set_table_primary_key(
+        &self,
+        table: TableId,
+        primary_key: Vec<ColumnId>,
+    ) -> Result<TableSchema>;
+    /// Atomically installs a live user table's primary-key metadata and the
+    /// backing primary-key constraint index. Adding a primary key marks those
+    /// columns not-null.
+    fn add_table_primary_key_index(
+        &self,
+        table: TableId,
+        primary_key: Vec<ColumnId>,
+        index: IndexSchema,
+    ) -> Result<TableSchema>;
+    /// Atomically clears a live user table's primary-key metadata and removes the
+    /// backing primary-key constraint index. Dropping a primary key does not restore
+    /// prior nullability on the former key columns.
+    fn drop_table_primary_key_index(&self, table: TableId, index: IndexId) -> Result<TableSchema>;
     /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
     /// "no dictionary").
     fn allocate_dictionary_id(&self) -> Result<u32>;
@@ -87,6 +108,7 @@ pub trait CatalogManager: Send + Sync {
     fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
+    fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>>;
     fn reserve_index_id(&self, id: IndexId) -> Result<()>;
     fn apply_create_index(&self, schema: IndexSchema) -> Result<()>;
@@ -97,6 +119,16 @@ pub trait CatalogManager: Send + Sync {
         table: &str,
         columns: &[String],
         unique: bool,
+    ) -> Result<IndexSchema> {
+        self.create_index_with_constraint(name, table, columns, unique, IndexConstraintKind::None)
+    }
+    fn create_index_with_constraint(
+        &self,
+        name: String,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+        constraint: IndexConstraintKind,
     ) -> Result<IndexSchema>;
     fn drop_index(&self, id: IndexId) -> Result<()>;
 
@@ -120,9 +152,9 @@ mod tests {
     use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexSchema,
-        ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema, SqlState,
-        TableSchema, ToastCompression, ToastMode, ToastOptions, toast_schema,
+        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexConstraintKind,
+        IndexSchema, ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema,
+        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, toast_schema,
     };
 
     use crate::{
@@ -155,7 +187,7 @@ mod tests {
                 default: None,
                 pg_type: None,
             }],
-            primary_key: vec![0],
+            primary_key: Vec::new(),
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -231,7 +263,7 @@ mod tests {
             .create_table(
                 "users".to_string(),
                 vec![id_column(false)],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -306,7 +338,7 @@ mod tests {
                         pg_type: None,
                     },
                 ],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -358,6 +390,15 @@ mod tests {
     #[test]
     fn restore_does_not_rewind_allocators() {
         let catalog = catalog_with_users();
+        catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
         let before_failed_ddl = catalog.snapshot().unwrap();
 
         let failed_table = catalog
@@ -488,7 +529,7 @@ mod tests {
                 "id": 1,
                 "name": "users",
                 "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
-                "primary_key": [0]
+                "primary_key": []
             }},
             "next_table_id": 2,
             "indexes_by_name": {"users_id": 1},
@@ -831,7 +872,7 @@ mod tests {
                 default: None,
                 pg_type: None,
             }],
-            primary_key: vec![0],
+            primary_key: Vec::new(),
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -881,7 +922,7 @@ mod tests {
                 default: Some(ColumnDefault::Nextval(1)),
                 pg_type: None,
             }],
-            primary_key: vec![0],
+            primary_key: Vec::new(),
             compression: CompressionSetting::None,
             active_dict_id: None,
             toast: ToastOptions::legacy_catalog_default(),
@@ -963,7 +1004,7 @@ mod tests {
                     default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
                     pg_type: None,
                 }],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -995,7 +1036,7 @@ mod tests {
                     default: Some(common::ParsedDefault::Nextval("users_id_seq".to_string())),
                     pg_type: None,
                 }],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -1102,9 +1143,20 @@ mod tests {
             tables_by_name: HashMap::from([("users".to_string(), 3)]),
             tables_by_id: HashMap::from([(3, schema)]),
             next_table_id: 4,
-            indexes_by_name: HashMap::new(),
-            indexes_by_id: HashMap::new(),
-            next_index_id: 1,
+            indexes_by_name: HashMap::from([("users_pkey".to_string(), 1)]),
+            indexes_by_id: HashMap::from([(
+                1,
+                IndexSchema {
+                    id: 1,
+                    storage_id: 4,
+                    table: 3,
+                    name: "users_pkey".to_string(),
+                    columns: vec![0, 1],
+                    unique: true,
+                    constraint: common::IndexConstraintKind::PrimaryKey,
+                },
+            )]),
+            next_index_id: 2,
             ..CatalogSnapshot::default()
         };
 
@@ -1117,6 +1169,41 @@ mod tests {
                 .primary_key,
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn try_from_snapshot_rejects_user_primary_key_without_constraint_index() {
+        let schema = TableSchema {
+            id: 3,
+            storage_id: 3,
+            name: "users".to_string(),
+            columns: vec![ColumnDef {
+                id: 0,
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                max_length: None,
+                default: None,
+                pg_type: None,
+            }],
+            primary_key: vec![0],
+            compression: CompressionSetting::None,
+            active_dict_id: None,
+            toast: ToastOptions::legacy_catalog_default(),
+            toast_table_id: None,
+            relation_kind: RelationKind::User,
+            checks: Vec::new(),
+        };
+        let snapshot = CatalogSnapshot {
+            tables_by_name: HashMap::from([("users".to_string(), 3)]),
+            tables_by_id: HashMap::from([(3, schema)]),
+            next_table_id: 4,
+            ..CatalogSnapshot::default()
+        };
+
+        let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(err.message.contains("no primary-key constraint index"));
     }
 
     #[test]
@@ -1211,20 +1298,161 @@ mod tests {
     }
 
     #[test]
-    fn create_table_rejects_empty_primary_key() {
+    fn create_table_accepts_empty_primary_key() {
         let catalog = MemoryCatalog::empty();
 
-        let err = catalog
+        let schema = catalog
             .create_table(
                 "users".to_string(),
                 vec![id_column(false)],
                 vec![],
                 CompressionSetting::None,
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(err.kind, ErrorKind::Plan);
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        assert!(schema.primary_key.is_empty());
+    }
+
+    #[test]
+    fn set_table_primary_key_updates_columns_and_can_clear_key() {
+        let catalog = MemoryCatalog::empty();
+
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(true)],
+                vec![],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        assert!(schema.columns[0].nullable);
+
+        let updated = catalog.set_table_primary_key(schema.id, vec![0]).unwrap();
+        assert_eq!(updated.primary_key, vec![0]);
+        assert!(!updated.columns[0].nullable);
+
+        let cleared = catalog
+            .set_table_primary_key(schema.id, Vec::new())
+            .unwrap();
+        assert!(cleared.primary_key.is_empty());
+        assert!(
+            !cleared.columns[0].nullable,
+            "dropping a primary key does not restore prior nullability"
+        );
+    }
+
+    #[test]
+    fn add_table_primary_key_index_sets_key_and_installs_constraint_index() {
+        let catalog = MemoryCatalog::empty();
+
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(true)],
+                vec![],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let index = IndexSchema {
+            id: 7,
+            storage_id: 7,
+            table: schema.id,
+            name: "users_pkey".to_string(),
+            columns: vec![0],
+            unique: true,
+            constraint: IndexConstraintKind::PrimaryKey,
+        };
+
+        let updated = catalog
+            .add_table_primary_key_index(schema.id, vec![0], index.clone())
+            .unwrap();
+
+        assert_eq!(updated.primary_key, vec![0]);
+        assert!(!updated.columns[0].nullable);
+        assert_eq!(catalog.get_index(index.id).unwrap(), Some(index));
+        assert_eq!(
+            catalog.get_table(schema.id).unwrap().unwrap().primary_key,
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn add_table_primary_key_index_rejects_plain_index_metadata() {
+        let catalog = MemoryCatalog::empty();
+
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(true)],
+                vec![],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let index = IndexSchema {
+            id: 7,
+            storage_id: 7,
+            table: schema.id,
+            name: "users_pkey".to_string(),
+            columns: vec![0],
+            unique: true,
+            constraint: IndexConstraintKind::None,
+        };
+
+        let err = catalog
+            .add_table_primary_key_index(schema.id, vec![0], index)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert!(
+            catalog
+                .get_table(schema.id)
+                .unwrap()
+                .unwrap()
+                .primary_key
+                .is_empty()
+        );
+        assert!(catalog.get_index_by_name("users_pkey").unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_table_primary_key_index_clears_key_and_removes_constraint_index() {
+        let catalog = MemoryCatalog::empty();
+
+        let schema = catalog
+            .create_table(
+                "users".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let index = catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+
+        let updated = catalog
+            .drop_table_primary_key_index(schema.id, index.id)
+            .unwrap();
+
+        assert!(updated.primary_key.is_empty());
+        assert!(
+            !updated.columns[0].nullable,
+            "dropping a primary key does not restore prior nullability"
+        );
+        assert!(catalog.get_index(index.id).unwrap().is_none());
+        assert!(
+            catalog
+                .get_table(schema.id)
+                .unwrap()
+                .unwrap()
+                .primary_key
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1309,7 +1537,7 @@ mod tests {
             .create_table(
                 "users".to_string(),
                 vec![id_column(false)],
-                vec!["id".to_string()],
+                Vec::new(),
                 common::CompressionSetting::None,
             )
             .unwrap();
@@ -1562,6 +1790,95 @@ mod tests {
     }
 
     #[test]
+    fn drop_index_rejects_primary_key_constraint_index() {
+        let catalog = catalog_with_users();
+        let index = catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+
+        let err = catalog.drop_index(index.id).unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+        assert!(catalog.get_index(index.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn create_index_with_constraint_rejects_invalid_constraint_metadata() {
+        let catalog = catalog_with_users();
+
+        let not_unique = catalog
+            .create_index_with_constraint(
+                "bad_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                false,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap_err();
+        assert_eq!(not_unique.code, SqlState::InternalError);
+        assert_eq!(catalog.get_index_by_name("bad_pkey").unwrap(), None);
+
+        let wrong_columns = catalog
+            .create_index_with_constraint(
+                "wrong_pkey".to_string(),
+                "users",
+                &["name".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap_err();
+        assert_eq!(wrong_columns.code, SqlState::InternalError);
+        assert_eq!(catalog.get_index_by_name("wrong_pkey").unwrap(), None);
+
+        let unique_constraint_not_unique = catalog
+            .create_index_with_constraint(
+                "bad_unique".to_string(),
+                "users",
+                &["name".to_string()],
+                false,
+                IndexConstraintKind::Unique,
+            )
+            .unwrap_err();
+        assert_eq!(unique_constraint_not_unique.code, SqlState::InternalError);
+        assert_eq!(catalog.get_index_by_name("bad_unique").unwrap(), None);
+    }
+
+    #[test]
+    fn create_index_with_constraint_rejects_duplicate_primary_key_constraint() {
+        let catalog = catalog_with_users();
+        catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+
+        let err = catalog
+            .create_index_with_constraint(
+                "users_second_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(
+            catalog.get_index_by_name("users_second_pkey").unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn drop_table_cascades_to_its_indexes() {
         let catalog = catalog_with_users();
         let users = catalog.get_table_by_name("users").unwrap().unwrap();
@@ -1595,6 +1912,7 @@ mod tests {
             name: "users_name".to_string(),
             columns: vec![1],
             unique: false,
+            constraint: common::IndexConstraintKind::None,
         };
 
         catalog.apply_create_index(schema.clone()).unwrap();
@@ -1617,8 +1935,68 @@ mod tests {
     }
 
     #[test]
+    fn apply_create_index_rejects_invalid_constraint_metadata() {
+        let catalog = catalog_with_users();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        let schema = IndexSchema {
+            id: 5,
+            storage_id: 5,
+            table: users.id,
+            name: "bad_pkey".to_string(),
+            columns: vec![1],
+            unique: true,
+            constraint: common::IndexConstraintKind::PrimaryKey,
+        };
+
+        let err = catalog.apply_create_index(schema).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(catalog.get_index_by_name("bad_pkey").unwrap(), None);
+    }
+
+    #[test]
+    fn apply_create_index_rejects_duplicate_primary_key_constraint() {
+        let catalog = catalog_with_users();
+        let users = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+
+        let schema = IndexSchema {
+            id: 5,
+            storage_id: 5,
+            table: users.id,
+            name: "users_second_pkey".to_string(),
+            columns: vec![0],
+            unique: true,
+            constraint: common::IndexConstraintKind::PrimaryKey,
+        };
+
+        let err = catalog.apply_create_index(schema).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(
+            catalog.get_index_by_name("users_second_pkey").unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn serialize_round_trip_preserves_indexes() {
         let catalog = catalog_with_users();
+        catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
         catalog
             .create_index(
                 "users_name".to_string(),
@@ -1640,7 +2018,7 @@ mod tests {
         let next = restored
             .create_index("users_id".to_string(), "users", &["id".to_string()], false)
             .unwrap();
-        assert_eq!(next.id, 2);
+        assert_eq!(next.id, 3);
     }
 
     #[test]
@@ -1659,6 +2037,7 @@ mod tests {
                     name: "orphan".to_string(),
                     columns: vec![0],
                     unique: false,
+                    constraint: common::IndexConstraintKind::None,
                 },
             )]),
             next_index_id: 2,
@@ -1707,6 +2086,7 @@ mod tests {
                     name: "bad".to_string(),
                     columns: vec![0],
                     unique: false,
+                    constraint: common::IndexConstraintKind::None,
                 },
             )]),
             next_index_id: 1,
@@ -1714,7 +2094,7 @@ mod tests {
         };
 
         let err = MemoryCatalog::try_from_snapshot(snapshot).unwrap_err();
-        assert!(err.message.contains("reserved primary-key index id"));
+        assert!(err.message.contains("reserved storage identity index id"));
     }
 
     #[test]
@@ -1754,6 +2134,7 @@ mod tests {
                     name: "users_id".to_string(),
                     columns: vec![0],
                     unique: false,
+                    constraint: common::IndexConstraintKind::None,
                 },
             )]),
             next_index_id: 1,
@@ -1773,7 +2154,7 @@ mod tests {
                 "id": 1,
                 "name": "users",
                 "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
-                "primary_key": [0]
+                "primary_key": []
             }},
             "next_table_id": 2
         }"#;
@@ -1830,7 +2211,7 @@ mod tests {
                         pg_type: None,
                     },
                 ],
-                vec!["id".to_string()],
+                Vec::new(),
                 CompressionSetting::None,
                 toast.clone(),
                 Vec::new(),
@@ -1899,7 +2280,7 @@ mod tests {
             .create_table(
                 "users".to_string(),
                 vec![id_column(false)],
-                vec!["id".to_string()],
+                Vec::new(),
                 CompressionSetting::None,
             )
             .unwrap();
@@ -2105,7 +2486,7 @@ mod tests {
                 "id": 1,
                 "name": "users",
                 "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
-                "primary_key": [0]
+                "primary_key": []
             }},
             "next_table_id": 2
         }"#;

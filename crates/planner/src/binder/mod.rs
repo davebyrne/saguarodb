@@ -141,12 +141,6 @@ fn bind_inner(
                     ));
                 }
             }
-            if primary_key.is_empty() {
-                return Err(plan_error(
-                    SqlState::DatatypeMismatch,
-                    "a table requires a primary key",
-                ));
-            }
             for column in columns {
                 validate_default_value(catalog, column)?;
             }
@@ -278,14 +272,15 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "TRUNCATE is a maintenance command and does not bind",
         )),
-        // ALTER TABLE ... SET (compression) is a maintenance command dispatched
-        // before binding (the VACUUM pattern); this arm keeps `bind` total.
-        Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
-            Err(plan_error(
-                SqlState::FeatureNotSupported,
-                "ALTER TABLE is a maintenance command and does not bind",
-            ))
-        }
+        // ALTER TABLE maintenance commands are dispatched before binding (the
+        // VACUUM pattern); this arm keeps `bind` total.
+        Statement::AlterTableSetCompression { .. }
+        | Statement::AlterTableSetOptions { .. }
+        | Statement::AlterTableAddPrimaryKey { .. }
+        | Statement::AlterTableDropPrimaryKey { .. } => Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "ALTER TABLE is a maintenance command and does not bind",
+        )),
         Statement::Copy {
             table,
             columns,

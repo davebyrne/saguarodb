@@ -238,8 +238,15 @@ pub enum BoundInsertSource {
 /// slots `n..2n` — so the executor evaluates them over `existing ++ excluded`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundOnConflict {
-    DoNothing,
+    DoNothing {
+        /// Explicit conflict target column ids, when present. The binder validates
+        /// this as the primary key; execution rechecks it after prepared statements
+        /// in case DDL changed the table shape. `None` is targetless DO NOTHING.
+        target: Option<Vec<ColumnId>>,
+    },
     DoUpdate {
+        /// Explicit conflict target column ids. DO UPDATE requires a target.
+        target: Vec<ColumnId>,
         assignments: Vec<(ColumnId, BoundExpr)>,
         filter: Option<BoundExpr>,
     },

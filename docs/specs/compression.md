@@ -106,7 +106,7 @@ and `parser`/binder can reference it without depending on `compress`.
   binder never sees `AlterTableSetCompression`. The compression value
   (`'none'`/`'zstd'`) is validated at parse time; table existence is
   checked by `run_alter_table_compression` itself once it holds the guard.
-- A table's secondary indexes and primary-key index inherit the table's
+- A table's catalog indexes and storage identity index inherit the table's
   setting for their files, but compress **dict-less** (a heap-trained
   dictionary does not fit B-tree node content; per-index dictionaries are
   future work).
@@ -341,8 +341,8 @@ instead of waiting on an unrelated later commit to notice it.
 5. Update the in-memory catalog and the store's file configs (heap + all
    index files of the table).
 6. **Rewrite pass (an FPI per page — torn-page repair, exactly like
-   VACUUM):** for each page `0..page_count` of the heap file, the PK index
-   file, and every secondary index file (skipping buffer-reported abandoned
+   VACUUM):** for each page `0..page_count` of the heap file, the identity-index
+   file, and every catalog-index file (skipping buffer-reported abandoned
    holes and pages that are not yet initialized): take its write guard,
    capture the current image, log it as a single unconditional
    `FullPageImage`/`FullPageImageCompressed` under the maintenance txn id

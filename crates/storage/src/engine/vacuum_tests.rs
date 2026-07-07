@@ -246,6 +246,7 @@ fn name_index() -> IndexSchema {
         name: "users_name".to_string(),
         columns: vec![1],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     }
 }
 

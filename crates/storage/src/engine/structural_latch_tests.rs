@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::Duration;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
@@ -101,6 +102,7 @@ fn name_index() -> IndexSchema {
         name: "users_name".to_string(),
         columns: vec![1],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     }
 }
 
@@ -145,6 +147,45 @@ fn structural_latch_does_not_serialize_globally() {
     let gb = b.lock(); // would block forever if the registry mutex were held here
     drop(gb);
     drop(ga);
+}
+
+#[test]
+fn identity_rewrite_gate_blocks_identity_scans() {
+    let (engine, wal, _dir) = engine();
+    let setup = ctx(100);
+    engine.create_table(&setup, &users_schema()).unwrap();
+    engine.insert(&ctx(10), TABLE_ID, row(1, "amy")).unwrap();
+    commit(&wal, 10);
+
+    let engine = Arc::new(engine);
+    let rewrite_latch = engine.identity_rewrite_latch(TABLE_ID);
+    let rewrite_guard = rewrite_latch.write();
+    let barrier = Arc::new(Barrier::new(2));
+    let (tx, rx) = mpsc::channel();
+
+    let scan_engine = Arc::clone(&engine);
+    let scan_barrier = Arc::clone(&barrier);
+    let handle = std::thread::spawn(move || {
+        scan_barrier.wait();
+        let result = scan_engine.scan(&ctx(20), TABLE_ID).and_then(|mut rows| {
+            let mut count = 0;
+            while rows.next()?.is_some() {
+                count += 1;
+            }
+            Ok(count)
+        });
+        tx.send(result).unwrap();
+    });
+
+    barrier.wait();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "scan completed while the identity rewrite gate was held"
+    );
+
+    drop(rewrite_guard);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), 1);
+    handle.join().unwrap();
 }
 
 #[test]

@@ -84,7 +84,10 @@ fn validate_logical_index_keys_fit(
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
-    crate::btree::validate_index_key_fits(&key_for_row(schema, row)?)?;
+    if !schema.primary_key.is_empty() {
+        let key = primary_key_for_row(schema, row)?;
+        crate::btree::validate_index_key_fits(&key)?;
+    }
     for index in storage.table_indexes(relations, schema.id)? {
         let (key, _has_null) = secondary_index_key(schema, &index, row)?;
         crate::btree::validate_index_key_fits(&key)?;
@@ -1012,9 +1015,9 @@ impl PageBackedStorageEngine {
 
         // Eligibility (1): no indexed column changed. Read the predecessor's CURRENT
         // physical row (not a snapshot read — we need its actual indexed values) and
-        // compare every secondary index's key against the new row's. The primary key
-        // is already known unchanged (the caller rejects a PK change). A missing
-        // predecessor here means it was reclaimed under us — not eligible.
+        // compare the storage identity and every secondary index key against the new
+        // row. If any indexed key changes, the new version needs its own index
+        // entries, so the caller falls back to the fully indexed path.
         let Some(previous_physical) = self.read_location_physical(schema, previous_location)?
         else {
             return Ok(None);
@@ -1024,6 +1027,13 @@ impl PageBackedStorageEngine {
         }
         let previous_row =
             self.materialize_physical_row(ctx, relations, schema, previous_physical)?;
+        if !schema.primary_key.is_empty() {
+            let (old_key, _) = row_key_for_columns(schema, &schema.primary_key, &previous_row)?;
+            let (new_key, _) = row_key_for_columns(schema, &schema.primary_key, row)?;
+            if old_key != new_key {
+                return Ok(None);
+            }
+        }
         for index in self.table_indexes(relations, table)? {
             let (old_key, _) = secondary_index_key(schema, &index, &previous_row)?;
             let (new_key, _) = secondary_index_key(schema, &index, row)?;

@@ -48,6 +48,11 @@ struct SsiState {
     relation_writers: HashMap<TableId, HashSet<TxnId>>,
     /// `(table, key) → serializable writers` of that row — the dual of `tuple_readers`.
     tuple_writers: HashMap<(TableId, Key), HashSet<TxnId>>,
+    /// `table → writers` whose tuple-write keys were invalidated by a primary-key
+    /// DDL identity rewrite. Later exact reads on that table must conservatively
+    /// check these writers at relation granularity until the writer's SSI state is
+    /// released.
+    promoted_tuple_writers: HashMap<TableId, HashSet<TxnId>>,
     /// Per top-level serializable transaction.
     txns: HashMap<TxnId, TxnSsi>,
     /// Monotonic commit-sequence counter assigned to a serializable transaction when
@@ -207,6 +212,48 @@ impl SerializableConflictManager {
         (st.txns.len(), relation, tuple)
     }
 
+    /// Promote tuple-granularity SSI state on `table` to relation granularity.
+    ///
+    /// `ALTER TABLE ... ADD/DROP PRIMARY KEY` changes the table's storage identity
+    /// keyspace. Existing tuple locks and tuple-write records are keyed by the old
+    /// identity, so future writes/reads under the new identity would miss them.
+    /// Relation-granularity tracking is keyspace-neutral and strictly more
+    /// conservative.
+    pub fn promote_table_identity_locks_to_relation(&self, table: TableId) {
+        let mut st = self.lock();
+        let readers: Vec<TxnId> = st
+            .txns
+            .iter()
+            .filter(|(_, txn)| txn.tuple_locks.contains_key(&table))
+            .map(|(&txn_id, _)| txn_id)
+            .collect();
+        let writers: Vec<TxnId> = st
+            .relation_writers
+            .get(&table)
+            .map_or_else(Vec::new, |writers| writers.iter().copied().collect());
+        if !writers.is_empty() {
+            st.promoted_tuple_writers
+                .entry(table)
+                .or_default()
+                .extend(writers.iter().copied());
+        }
+
+        for reader in readers {
+            let keys = st
+                .txns
+                .get_mut(&reader)
+                .and_then(|txn| txn.tuple_locks.remove(&table))
+                .unwrap_or_default();
+            for key in keys {
+                remove_reader(&mut st.tuple_readers, &(table, key), reader);
+            }
+            for writer in &writers {
+                form_rw_edge(&mut st, reader, *writer);
+            }
+            Self::add_relation_lock(&mut st, reader, table);
+        }
+    }
+
     /// Record `top`'s relation SIREAD lock on `table` (under the manager lock).
     fn add_relation_lock(st: &mut SsiState, top: TxnId, table: TableId) {
         let Some(txn) = st.txns.get_mut(&top) else {
@@ -250,6 +297,16 @@ fn purge(st: &mut SsiState, top: TxnId, txn: TxnSsi) {
         for key in keys {
             remove_reader(&mut st.tuple_writers, &(table, key), top);
         }
+    }
+    let mut empty_promoted = Vec::new();
+    for (table, writers) in &mut st.promoted_tuple_writers {
+        writers.remove(&top);
+        if writers.is_empty() {
+            empty_promoted.push(*table);
+        }
+    }
+    for table in empty_promoted {
+        st.promoted_tuple_writers.remove(&table);
     }
     // `top →rw w` ⟹ `w.in_edges` holds `top`; `v →rw top` ⟹ `v.out_edges` holds `top`.
     for w in txn.out_edges {
@@ -334,10 +391,13 @@ impl SsiTracker for SerializableConflictManager {
         }
         // Conflict-out (§6): a concurrent writer may have already written this exact
         // row, so form `reader →rw writer` for each recorded writer of (table, key).
-        let writers: Vec<TxnId> = st
+        let mut writers: HashSet<TxnId> = st
             .tuple_writers
             .get(&(table, key.clone()))
-            .map_or_else(Vec::new, |s| s.iter().copied().collect());
+            .map_or_else(HashSet::new, |s| s.iter().copied().collect());
+        if let Some(promoted) = st.promoted_tuple_writers.get(&table) {
+            writers.extend(promoted.iter().copied());
+        }
         for w in writers {
             form_rw_edge(&mut st, top, w);
         }
@@ -523,6 +583,46 @@ mod tests {
         assert!(st.relation_readers.get(&7).is_some_and(|s| s.contains(&10)));
         // The earlier tuple-reader entries for table 7 were cleared.
         assert!(!st.tuple_readers.contains_key(&(7, key(0))));
+    }
+
+    #[test]
+    fn primary_key_ddl_promotion_keeps_future_writes_conservative() {
+        let mgr = manager();
+        mgr.register(10, snapshot(20));
+        mgr.record_tuple_read(10, 7, &key(1));
+
+        mgr.promote_table_identity_locks_to_relation(7);
+        assert!(!tuple_has(&mgr, 7, &key(1), 10));
+        assert!(relation_has(&mgr, 7, 10));
+
+        mgr.register(25, snapshot(30));
+        mgr.note_write(25, 7, &key(999)).unwrap();
+        let st = mgr.lock();
+        assert!(
+            st.txns[&10].out_edges.contains(&25),
+            "promoted relation lock catches writes under a different identity key"
+        );
+        assert!(st.txns[&25].in_edges.contains(&10));
+    }
+
+    #[test]
+    fn primary_key_ddl_promotion_keeps_prior_writes_conservative() {
+        let mgr = manager();
+        mgr.register(25, snapshot_excluding(40, &[10]));
+        mgr.note_write(25, 7, &key(1)).unwrap();
+        mgr.commit_check(25).unwrap();
+        mgr.finished(25);
+
+        mgr.promote_table_identity_locks_to_relation(7);
+
+        mgr.register(10, snapshot_excluding(40, &[25]));
+        mgr.record_tuple_read(10, 7, &key(999));
+        let st = mgr.lock();
+        assert!(
+            st.txns[&10].out_edges.contains(&25),
+            "exact reads under a new identity key must see writers retained from the old keyspace"
+        );
+        assert!(st.txns[&25].in_edges.contains(&10));
     }
 
     /// A snapshot that excludes `others` (lists them in `xip`), so a writer among them

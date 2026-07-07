@@ -72,10 +72,11 @@ fn returning_mutates_sequences(returning: &BoundReturning) -> bool {
 
 fn on_conflict_mutates_sequences(on_conflict: &BoundOnConflict) -> bool {
     match on_conflict {
-        BoundOnConflict::DoNothing => false,
+        BoundOnConflict::DoNothing { .. } => false,
         BoundOnConflict::DoUpdate {
             assignments,
             filter,
+            ..
         } => {
             assignments
                 .iter()
@@ -200,7 +201,7 @@ mod tests {
     use catalog::{CatalogManager, MemoryCatalog, SystemView};
     use common::{
         CompressionSetting, CopyDirection, CopyFormat, CopyOptions, DataType, ErrorKind,
-        PRIMARY_KEY_INDEX_ID, ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression,
+        IndexConstraintKind, ParsedColumnDef, PgType, SequenceOptions, SqlState, ToastCompression,
         ToastMode, ToastOptions, Value,
     };
     use parser::parse;
@@ -234,7 +235,23 @@ mod tests {
                 common::CompressionSetting::None,
             )
             .unwrap();
+        create_primary_key_index(&catalog, "users", &["id"]);
         catalog
+    }
+
+    fn create_primary_key_index(catalog: &MemoryCatalog, table: &str, columns: &[&str]) {
+        catalog
+            .create_index_with_constraint(
+                format!("{table}_pkey"),
+                table,
+                &columns
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect::<Vec<_>>(),
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
     }
 
     fn catalog_with_users_and_sequence() -> MemoryCatalog {
@@ -250,7 +267,7 @@ mod tests {
     }
 
     /// `users` plus a non-unique secondary index `users_name` on `name`
-    /// (index id 1, since the primary-key index is the reserved id 0).
+    /// (index id 2, since the primary-key constraint index is catalog id 1).
     fn catalog_with_users_and_name_index() -> MemoryCatalog {
         let catalog = catalog_with_users();
         catalog
@@ -291,6 +308,7 @@ mod tests {
                 common::CompressionSetting::None,
             )
             .unwrap();
+        create_primary_key_index(&catalog, "accounts", &["id"]);
         catalog
     }
 
@@ -321,6 +339,7 @@ mod tests {
                 common::CompressionSetting::None,
             )
             .unwrap();
+        create_primary_key_index(&catalog, "codes", &["code"]);
         catalog
     }
 
@@ -1128,16 +1147,20 @@ mod tests {
     fn binder_binds_on_conflict() {
         let catalog = catalog_with_users();
 
-        // ON CONFLICT DO NOTHING binds to BoundOnConflict::DoNothing.
+        // ON CONFLICT DO NOTHING binds the current primary-key arbiter when present.
         let stmt =
             parse("insert into users (id, name) values (1, 'Ada') on conflict do nothing").unwrap();
         let BoundStatement::Insert {
-            on_conflict: Some(BoundOnConflict::DoNothing),
+            on_conflict:
+                Some(BoundOnConflict::DoNothing {
+                    target: Some(target),
+                }),
             ..
         } = bind(&stmt, &catalog).unwrap()
         else {
             panic!("expected insert with DO NOTHING");
         };
+        assert_eq!(target, vec![0]);
 
         // ON CONFLICT (id) DO UPDATE SET name = excluded.name binds an assignment
         // whose value references the excluded (proposed) row at slot n+1.
@@ -1197,14 +1220,24 @@ mod tests {
         let err = bind(&stmt, &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
 
-        // The primary key cannot be assigned in DO UPDATE.
+        // Primary-key columns can be assigned because storage identity is hidden;
+        // the primary-key constraint index enforces uniqueness.
         let stmt = parse(
             "insert into users (id, name) values (1, 'Ada') \
              on conflict (id) do update set id = excluded.id",
         )
         .unwrap();
-        let err = bind(&stmt, &catalog).unwrap_err();
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        let BoundStatement::Insert {
+            on_conflict: Some(BoundOnConflict::DoUpdate { assignments, .. }),
+            ..
+        } = bind(&stmt, &catalog).unwrap()
+        else {
+            panic!("expected DO UPDATE");
+        };
+        assert!(matches!(
+            assignments[0],
+            (0, BoundExpr::InputRef { slot: 2, .. })
+        ));
     }
 
     #[test]
@@ -1875,7 +1908,7 @@ mod tests {
         let physical = physical_plan(&logical, &catalog).unwrap();
 
         assert!(format!("{physical:?}").contains("IndexScan"));
-        assert!(format!("{physical:?}").contains(&format!("index: {PRIMARY_KEY_INDEX_ID}")));
+        assert!(format!("{physical:?}").contains("index: 0"));
     }
 
     #[test]
@@ -1952,9 +1985,9 @@ mod tests {
                 text.contains("IndexScan"),
                 "expected IndexScan for {predicate}"
             );
-            // The secondary index is id 1 (the primary-key index is id 0).
+            // The secondary index is id 2 (the primary-key constraint index is id 1).
             assert!(
-                text.contains("index: 1"),
+                text.contains("index: 2"),
                 "expected secondary index for {predicate}"
             );
         }
@@ -1972,7 +2005,7 @@ mod tests {
 
         let text = format!("{physical:?}");
         assert!(text.contains("IndexScan"));
-        assert!(text.contains(&format!("index: {PRIMARY_KEY_INDEX_ID}")));
+        assert!(text.contains("index: 0"));
         assert!(text.contains("filter: Some"));
     }
 
@@ -2384,11 +2417,13 @@ mod tests {
     }
 
     #[test]
-    fn binder_rejects_table_without_primary_key() {
+    fn binder_accepts_table_without_primary_key() {
         let catalog = MemoryCatalog::empty();
         let stmt = parse("create table t (a integer not null)").unwrap();
-        let err = bind(&stmt, &catalog).unwrap_err();
-        assert_eq!(err.code, SqlState::DatatypeMismatch);
+        let BoundStatement::CreateTable { primary_key, .. } = bind(&stmt, &catalog).unwrap() else {
+            panic!("expected CREATE TABLE");
+        };
+        assert!(primary_key.is_empty());
     }
 
     #[test]

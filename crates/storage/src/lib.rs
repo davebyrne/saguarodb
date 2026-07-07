@@ -574,6 +574,7 @@ mod tests {
             name: "accounts_name".to_string(),
             columns: vec![1],
             unique: false,
+            constraint: common::IndexConstraintKind::None,
         };
 
         harness.storage.create_table(&ctx, &schema).unwrap();
@@ -673,6 +674,56 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_null_is_rejected_by_storage_insert() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness
+            .storage
+            .create_table(&ctx, &nullable_primary_key_users_schema())
+            .unwrap();
+
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row_null_id("Ada", true))
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::NotNullViolation);
+    }
+
+    #[test]
+    fn primary_key_null_is_rejected_by_storage_update() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        harness
+            .storage
+            .create_table(&ctx, &nullable_primary_key_users_schema())
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        let err = harness
+            .storage
+            .update(
+                &ctx,
+                1,
+                &Key(vec![Value::Integer(1)]),
+                user_row_null_id("Ada", true),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::NotNullViolation);
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, 1, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Ada", true))
+        );
+    }
+
+    #[test]
     fn scan_range_walks_primary_key_directory_in_key_order() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
@@ -704,6 +755,153 @@ mod tests {
                 Key(vec![Value::Integer(3)]),
             ]
         );
+    }
+
+    #[test]
+    fn set_table_primary_key_rebuilds_storage_identity() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut heap_schema = users_schema();
+        heap_schema.primary_key.clear();
+        harness.storage.create_table(&ctx, &heap_schema).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Grace", true))
+            .unwrap();
+
+        let mut pk_schema = heap_schema;
+        pk_schema.primary_key = vec![0];
+        harness
+            .storage
+            .validate_table_primary_key_change(&ctx, &pk_schema, u64::MAX)
+            .unwrap();
+        harness
+            .storage
+            .set_table_primary_key(&pk_schema, u64::MAX)
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .storage
+                .get(&ctx, 1, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Ada", true))
+        );
+        let err = harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Duplicate", true))
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
+    }
+
+    #[test]
+    fn logged_set_table_primary_key_emits_identity_index_fpis() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let mut heap_schema = users_schema();
+        heap_schema.primary_key.clear();
+        harness.storage.create_table(&ctx, &heap_schema).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(2, "Grace", true))
+            .unwrap();
+
+        let before = harness
+            .wal
+            .full_page_image_count(primary_index_file_id(heap_schema.storage_id));
+        let mut pk_schema = heap_schema;
+        pk_schema.primary_key = vec![0];
+        harness
+            .storage
+            .set_table_primary_key_logged(&pk_schema, u64::MAX, 9)
+            .unwrap();
+        let after = harness
+            .wal
+            .full_page_image_count(primary_index_file_id(pk_schema.storage_id));
+
+        assert!(
+            after >= before + 2,
+            "logged identity rebuild must emit at least root and metapage FPIs"
+        );
+    }
+
+    #[test]
+    fn set_table_primary_key_allows_same_key_across_non_hot_versions() {
+        let harness = StorageHarness::new();
+        let mut heap_schema = users_schema();
+        heap_schema.primary_key.clear();
+        let setup = StatementContext::new(1);
+        harness.storage.create_table(&setup, &heap_schema).unwrap();
+        harness
+            .storage
+            .create_index(&setup, &name_index(false), 0)
+            .unwrap();
+        harness
+            .storage
+            .insert(&setup, 1, user_row(1, "Ada", true))
+            .unwrap();
+
+        let mut scan = harness.storage.scan(&setup, 1).unwrap();
+        let hidden_key = scan.next().unwrap().unwrap().key;
+        assert!(scan.next().unwrap().is_none());
+
+        let update = StatementContext::new(2);
+        harness
+            .storage
+            .update(&update, 1, &hidden_key, user_row(1, "Lovelace", true))
+            .unwrap();
+
+        let mut pk_schema = heap_schema;
+        pk_schema.primary_key = vec![0];
+        harness
+            .storage
+            .validate_table_primary_key_change(&StatementContext::new(3), &pk_schema, 1)
+            .unwrap();
+        harness
+            .storage
+            .set_table_primary_key(&pk_schema, 1)
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .storage
+                .get(&StatementContext::new(4), 1, &Key(vec![Value::Integer(1)]))
+                .unwrap(),
+            Some(user_row(1, "Lovelace", true))
+        );
+    }
+
+    #[test]
+    fn set_table_primary_key_rejects_duplicate_live_rows() {
+        let harness = StorageHarness::new();
+        let mut heap_schema = users_schema();
+        heap_schema.primary_key.clear();
+        let ctx = StatementContext::new(1);
+        harness.storage.create_table(&ctx, &heap_schema).unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Ada", true))
+            .unwrap();
+        harness
+            .storage
+            .insert(&ctx, 1, user_row(1, "Grace", false))
+            .unwrap();
+
+        let mut pk_schema = heap_schema;
+        pk_schema.primary_key = vec![0];
+        let err = harness
+            .storage
+            .validate_table_primary_key_change(&ctx, &pk_schema, u64::MAX)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
     }
 
     #[test]
@@ -1329,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_index_is_not_maintained_or_scannable() {
+    fn dropped_index_is_not_maintained_but_existing_entries_remain_scannable() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
         harness.create_users_table(&ctx).unwrap();
@@ -1349,13 +1547,23 @@ mod tests {
             .storage
             .insert(&ctx, 1, user_row(2, "Ada", false))
             .unwrap();
-        // ...and can no longer be scanned.
-        let err = harness
-            .storage
-            .index_scan(&ctx, 1, 1, &name_eq("Ada"))
-            .err()
-            .expect("dropped index should not be scannable");
-        assert_eq!(err.code, SqlState::UndefinedTable);
+        // ...and is no longer maintained, but the retained physical entries remain
+        // scan-readable for statements planned before the catalog drop.
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(&ctx, 1, 1, &name_eq("Ada"))
+                .unwrap(),
+        );
+        assert_eq!(rows, vec![user_row(1, "Ada", true)]);
+
+        let rows = collect(
+            harness
+                .storage
+                .index_scan(&ctx, 1, 1, &name_eq("Missing"))
+                .unwrap(),
+        );
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -1768,7 +1976,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, SqlState::InternalError);
-        assert!(err.message.contains("missing, duplicate, or out of order"));
+        assert!(err.message.contains("duplicate seq"));
     }
 
     #[test]
@@ -3305,6 +3513,7 @@ mod tests {
             name: "users_name".to_string(),
             columns: vec![1],
             unique,
+            constraint: common::IndexConstraintKind::None,
         }
     }
 
@@ -3696,6 +3905,12 @@ mod tests {
         }
     }
 
+    fn nullable_primary_key_users_schema() -> TableSchema {
+        let mut schema = users_schema();
+        schema.columns[0].nullable = true;
+        schema
+    }
+
     fn sequence_schema(
         id: u32,
         name: &str,
@@ -3736,6 +3951,17 @@ mod tests {
                 Value::Integer(id),
                 Value::Null,
                 Value::Boolean(true),
+                Value::Null,
+            ],
+        }
+    }
+
+    fn user_row_null_id(name: &str, active: bool) -> Row {
+        Row {
+            values: vec![
+                Value::Null,
+                Value::Text(name.to_string()),
+                Value::Boolean(active),
                 Value::Null,
             ],
         }

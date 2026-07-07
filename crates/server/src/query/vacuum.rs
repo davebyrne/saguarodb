@@ -35,6 +35,12 @@ impl QueryService {
                 self.run_alter_table_compression(statement)
             }
             Statement::AlterTableSetOptions { .. } => self.run_alter_table_toast_options(statement),
+            Statement::AlterTableAddPrimaryKey { .. } => {
+                self.run_alter_table_add_primary_key(statement)
+            }
+            Statement::AlterTableDropPrimaryKey { .. } => {
+                self.run_alter_table_drop_primary_key(statement)
+            }
             _ => Err(DbError::internal(
                 "run_maintenance called with a non-maintenance statement",
             )),

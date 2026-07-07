@@ -10,11 +10,13 @@ use crate::{
 /// the optional `WHERE`); `DO NOTHING` carries no expressions.
 fn simplify_on_conflict(on_conflict: BoundOnConflict) -> BoundOnConflict {
     match on_conflict {
-        BoundOnConflict::DoNothing => BoundOnConflict::DoNothing,
+        BoundOnConflict::DoNothing { target } => BoundOnConflict::DoNothing { target },
         BoundOnConflict::DoUpdate {
+            target,
             assignments,
             filter,
         } => BoundOnConflict::DoUpdate {
+            target,
             assignments: assignments
                 .into_iter()
                 .map(|(column, expr)| (column, fold_expr(expr)))

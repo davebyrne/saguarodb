@@ -126,4 +126,12 @@ pub trait RecoveryOperations: Send + Sync {
     /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
     /// table/index generations produced by catalog replay. Must not append WAL.
     fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
+    /// Recovery apply for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: installs the
+    /// updated schema metadata while WAL is replayed. The derived identity tree is
+    /// rebuilt after the replay pass, once all heap records are applied and
+    /// crashed writers are resolved. Must not append WAL.
+    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()>;
+    /// Rebuild the derived storage identity tree from heap rows after recovery
+    /// replay has reached a stable final heap state. Must not append WAL.
+    fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;
 }

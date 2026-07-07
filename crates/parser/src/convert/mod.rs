@@ -822,11 +822,11 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
 }
 
 /// Intercept `ALTER ...` before sqlparser (the VACUUM pattern above). Owns the
-/// whole ALTER namespace: supported storage-option forms parse here; every
-/// other `ALTER ...` input, however well-formed, is `FeatureNotSupported`
-/// rather than falling through to sqlparser (whose ALTER TABLE coverage does
-/// not match our supported subset). A malformed option list (missing `(...)`,
-/// missing `=`, …) is a plain syntax error.
+/// whole ALTER namespace: supported table forms parse here; every other
+/// `ALTER ...` input, however well-formed, is `FeatureNotSupported` rather than
+/// falling through to sqlparser (whose ALTER TABLE coverage does not match our
+/// supported subset). A malformed option list (missing `(...)`, missing `=`, …)
+/// is a plain syntax error.
 fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     let trimmed = sql.trim();
     let Some(first) = trimmed.split_whitespace().next() else {
@@ -849,7 +849,7 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     let unsupported_form = || {
         Err(DbError::parse(
             SqlState::FeatureNotSupported,
-            "only ALTER TABLE <name> SET (...) storage options are supported",
+            "only ALTER TABLE <name> SET (...), ADD PRIMARY KEY, and DROP PRIMARY KEY are supported",
         ))
     };
 
@@ -860,13 +860,16 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
     if !expect_word(&tokens, &mut i, "table") {
         return unsupported_form();
     }
+    let _only = expect_word(&tokens, &mut i, "only");
     // Table identifier: unquoted word, lowercased (the `ident_name` rule).
-    let table = match tokens.get(i) {
-        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
-        _ => return Err(parse_error("expected table name after ALTER TABLE")),
-    };
-    i += 1;
+    let table = parse_alter_identifier(&tokens, &mut i, "expected table name after ALTER TABLE")?;
     if !expect_word(&tokens, &mut i, "set") {
+        if expect_word(&tokens, &mut i, "add") {
+            return parse_alter_table_add_primary_key(&tokens, i, table);
+        }
+        if expect_word(&tokens, &mut i, "drop") {
+            return parse_alter_table_drop_primary_key(&tokens, i, table);
+        }
         return unsupported_form();
     }
     if !matches!(tokens.get(i), Some(Token::LParen)) {
@@ -894,6 +897,113 @@ fn try_parse_alter_table(sql: &str) -> Result<Option<Statement>> {
         }));
     }
     Err(parse_error("ALTER TABLE SET requires at least one option"))
+}
+
+fn parse_alter_table_add_primary_key(
+    tokens: &[Token],
+    mut i: usize,
+    table: String,
+) -> Result<Option<Statement>> {
+    let constraint_name = if expect_word(tokens, &mut i, "constraint") {
+        Some(parse_alter_identifier(
+            tokens,
+            &mut i,
+            "expected constraint name after ALTER TABLE ... ADD CONSTRAINT",
+        )?)
+    } else {
+        None
+    };
+    if !expect_word(tokens, &mut i, "primary") || !expect_word(tokens, &mut i, "key") {
+        return Err(DbError::parse(
+            SqlState::FeatureNotSupported,
+            "only ALTER TABLE ... ADD PRIMARY KEY is supported",
+        ));
+    }
+    if !matches!(tokens.get(i), Some(Token::LParen)) {
+        return Err(parse_error(
+            "expected ( after ALTER TABLE ... ADD PRIMARY KEY",
+        ));
+    }
+    i += 1;
+    let columns = parse_identifier_list(tokens, &mut i, "primary key")?;
+    if !matches!(tokens.get(i), Some(Token::RParen)) {
+        return Err(parse_error("expected ) after primary key column list"));
+    }
+    i += 1;
+    finish_alter_statement(tokens, i)?;
+    Ok(Some(Statement::AlterTableAddPrimaryKey {
+        table,
+        columns,
+        constraint_name,
+    }))
+}
+
+fn parse_alter_table_drop_primary_key(
+    tokens: &[Token],
+    mut i: usize,
+    table: String,
+) -> Result<Option<Statement>> {
+    let constraint_name = if expect_word(tokens, &mut i, "primary") {
+        if !expect_word(tokens, &mut i, "key") {
+            return Err(parse_error(
+                "expected KEY after ALTER TABLE ... DROP PRIMARY",
+            ));
+        }
+        None
+    } else if expect_word(tokens, &mut i, "constraint") {
+        Some(parse_alter_identifier(
+            tokens,
+            &mut i,
+            "expected constraint name after ALTER TABLE ... DROP CONSTRAINT",
+        )?)
+    } else {
+        return Err(DbError::parse(
+            SqlState::FeatureNotSupported,
+            "only ALTER TABLE ... DROP PRIMARY KEY is supported",
+        ));
+    };
+    finish_alter_statement(tokens, i)?;
+    Ok(Some(Statement::AlterTableDropPrimaryKey {
+        table,
+        constraint_name,
+    }))
+}
+
+fn parse_alter_identifier(tokens: &[Token], i: &mut usize, message: &str) -> Result<String> {
+    let name = match tokens.get(*i) {
+        Some(Token::Word(w)) if w.quote_style.is_none() => w.value.to_ascii_lowercase(),
+        Some(Token::Word(_)) => return Err(parse_error("quoted identifiers are not supported")),
+        _ => return Err(parse_error(message)),
+    };
+    *i += 1;
+    Ok(name)
+}
+
+fn parse_identifier_list(tokens: &[Token], i: &mut usize, context: &str) -> Result<Vec<String>> {
+    let mut columns = Vec::new();
+    loop {
+        columns.push(parse_alter_identifier(
+            tokens,
+            i,
+            &format!("expected column name in {context} column list"),
+        )?);
+        if matches!(tokens.get(*i), Some(Token::Comma)) {
+            *i += 1;
+            continue;
+        }
+        break;
+    }
+    Ok(columns)
+}
+
+fn finish_alter_statement(tokens: &[Token], mut i: usize) -> Result<()> {
+    if matches!(tokens.get(i), Some(Token::SemiColon)) {
+        i += 1;
+    }
+    if i != tokens.len() {
+        return Err(parse_error("unexpected trailing input after ALTER TABLE"));
+    }
+    Ok(())
 }
 
 fn parse_alter_table_options(tokens: &[Token], i: &mut usize) -> Result<TableOptionPatch> {

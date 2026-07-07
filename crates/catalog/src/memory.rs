@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use common::{
-    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, IndexId,
-    IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, ParsedDefault, RelationKind, Result,
-    SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema, ToastMode,
-    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, needs_toast_relation, toast_schema,
+    ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId,
+    IndexConstraintKind, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
+    ParsedDefault, RelationKind, Result, SequenceId, SequenceOptions, SequenceSchema, SqlState,
+    TableId, TableSchema, ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    needs_toast_relation, toast_schema,
 };
 
 use crate::CatalogManager;
@@ -388,6 +389,120 @@ impl CatalogManager for MemoryCatalog {
         Ok(schema)
     }
 
+    fn set_table_primary_key(
+        &self,
+        table: TableId,
+        primary_key: Vec<ColumnId>,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "cannot set primary key metadata on hidden relation {}",
+                schema.name
+            )));
+        }
+
+        set_primary_key_columns(&mut schema, primary_key)?;
+        validate_schema(&schema, &snapshot.sequences_by_id)?;
+        snapshot.tables_by_id.insert(table, schema.clone());
+        Ok(schema)
+    }
+
+    fn add_table_primary_key_index(
+        &self,
+        table: TableId,
+        primary_key: Vec<ColumnId>,
+        index: IndexSchema,
+    ) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "cannot add primary key metadata on hidden relation {}",
+                schema.name
+            )));
+        }
+        if !schema.primary_key.is_empty() {
+            return Err(DbError::internal(format!(
+                "table {} already has primary key metadata",
+                schema.name
+            )));
+        }
+
+        set_primary_key_columns(&mut schema, primary_key)?;
+        validate_schema(&schema, &snapshot.sequences_by_id)?;
+        if index.table != table {
+            return Err(DbError::internal(format!(
+                "primary-key index {} references table {}, expected {table}",
+                index.name, index.table
+            )));
+        }
+        if index.constraint != IndexConstraintKind::PrimaryKey || !index.unique {
+            return Err(DbError::internal(format!(
+                "primary-key index {} must be a unique primary-key constraint index",
+                index.name
+            )));
+        }
+        reject_duplicate_index_name(&snapshot, &index.name)?;
+        reject_duplicate_index_id(&snapshot, index.id)?;
+        validate_index_schema_for_table(&index, &schema)?;
+        reject_duplicate_primary_key_constraint_index(&snapshot, &index)?;
+
+        let next_after_index = index.id.checked_add(1).ok_or_else(|| {
+            DbError::internal("catalog index id overflow while applying primary key index")
+        })?;
+        snapshot.tables_by_id.insert(table, schema.clone());
+        snapshot
+            .indexes_by_name
+            .insert(index.name.clone(), index.id);
+        snapshot.next_index_id = snapshot.next_index_id.max(next_after_index);
+        snapshot.indexes_by_id.insert(index.id, index);
+        Ok(schema)
+    }
+
+    fn drop_table_primary_key_index(&self, table: TableId, index: IndexId) -> Result<TableSchema> {
+        let mut snapshot = self.write_snapshot()?;
+        let mut schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .cloned()
+            .ok_or_else(|| DbError::internal(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "cannot drop primary key metadata on hidden relation {}",
+                schema.name
+            )));
+        }
+        let index_schema = snapshot
+            .indexes_by_id
+            .get(&index)
+            .cloned()
+            .ok_or_else(|| undefined_index(format!("index id {index} does not exist")))?;
+        if index_schema.table != table || index_schema.constraint != IndexConstraintKind::PrimaryKey
+        {
+            return Err(DbError::internal(format!(
+                "index {} is not the primary-key constraint index for table {}",
+                index_schema.name, schema.name
+            )));
+        }
+
+        schema.primary_key.clear();
+        validate_schema(&schema, &snapshot.sequences_by_id)?;
+        snapshot.indexes_by_id.remove(&index);
+        snapshot.indexes_by_name.remove(&index_schema.name);
+        snapshot.tables_by_id.insert(table, schema.clone());
+        Ok(schema)
+    }
+
     fn allocate_dictionary_id(&self) -> Result<u32> {
         let mut snapshot = self.write_snapshot()?;
         let id = snapshot.next_dictionary_id;
@@ -512,6 +627,10 @@ impl CatalogManager for MemoryCatalog {
             .cloned())
     }
 
+    fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>> {
+        Ok(self.read_snapshot()?.indexes_by_id.get(&id).cloned())
+    }
+
     fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>> {
         let mut indexes: Vec<_> = self
             .read_snapshot()?
@@ -536,6 +655,8 @@ impl CatalogManager for MemoryCatalog {
         reject_duplicate_index_id(&snapshot, schema.id)?;
         validate_storage_id("index", schema.storage_id)?;
         reject_duplicate_index_storage_id(&snapshot, schema.storage_id, "index storage id")?;
+        validate_index_schema(&schema, &snapshot.tables_by_id)?;
+        reject_duplicate_primary_key_constraint_index(&snapshot, &schema)?;
 
         let next_after_schema = schema.id.checked_add(1).ok_or_else(|| {
             DbError::internal("catalog index id overflow while applying create index")
@@ -560,12 +681,13 @@ impl CatalogManager for MemoryCatalog {
         Ok(())
     }
 
-    fn create_index(
+    fn create_index_with_constraint(
         &self,
         name: String,
         table: &str,
         columns: &[String],
         unique: bool,
+        constraint: IndexConstraintKind,
     ) -> Result<IndexSchema> {
         let mut snapshot = self.write_snapshot()?;
         reject_duplicate_index_name(&snapshot, &name)?;
@@ -583,8 +705,17 @@ impl CatalogManager for MemoryCatalog {
                 .get(table)
                 .and_then(|id| snapshot.tables_by_id.get(id))
                 .ok_or_else(|| undefined_table(format!("table {table} does not exist")))?;
-            build_index_schema(index_id, storage_id, name, table_schema, columns, unique)?
+            build_index_schema(
+                index_id,
+                storage_id,
+                name,
+                table_schema,
+                columns,
+                unique,
+                constraint,
+            )?
         };
+        reject_duplicate_primary_key_constraint_index(&snapshot, &schema)?;
 
         snapshot
             .indexes_by_name
@@ -596,6 +727,15 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn drop_index(&self, id: IndexId) -> Result<()> {
+        if self
+            .get_index(id)?
+            .is_some_and(|index| index.constraint == IndexConstraintKind::PrimaryKey)
+        {
+            return Err(DbError::plan(
+                SqlState::DependentObjectsStillExist,
+                "cannot drop index backing a primary key constraint",
+            ));
+        }
         self.apply_drop_index(id)
     }
 
@@ -1232,13 +1372,6 @@ fn build_schema(snapshot: &CatalogSnapshot, input: BuildSchemaInput) -> Result<T
         primary_key_ids.push(column_id);
     }
 
-    if primary_key_ids.is_empty() {
-        return Err(DbError::plan(
-            SqlState::DatatypeMismatch,
-            "a table requires a primary key",
-        ));
-    }
-
     Ok(TableSchema {
         id: table_id,
         storage_id,
@@ -1406,7 +1539,15 @@ pub fn validate_create_table_definition(
                 format!("index {index_name} already exists"),
             ));
         }
-        build_index_schema(0, 2, index_name, &schema, columns, true)?;
+        build_index_schema(
+            0,
+            2,
+            index_name,
+            &schema,
+            columns,
+            true,
+            IndexConstraintKind::None,
+        )?;
     }
     Ok(())
 }
@@ -1635,11 +1776,6 @@ fn validate_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
                 schema.id
             )));
         }
-        if *id == PRIMARY_KEY_INDEX_ID {
-            return Err(DbError::internal(
-                "catalog snapshot uses the reserved primary-key index id for a secondary index",
-            ));
-        }
         if snapshot.indexes_by_name.get(&schema.name) != Some(id) {
             return Err(DbError::internal(format!(
                 "catalog snapshot index {} is missing from name index",
@@ -1659,6 +1795,7 @@ fn validate_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
             snapshot.next_index_id
         )));
     }
+    validate_user_primary_key_indexes(snapshot)?;
 
     Ok(())
 }
@@ -1667,6 +1804,11 @@ fn validate_index_schema(
     schema: &IndexSchema,
     tables_by_id: &HashMap<TableId, TableSchema>,
 ) -> Result<()> {
+    if schema.id == PRIMARY_KEY_INDEX_ID {
+        return Err(DbError::internal(
+            "catalog snapshot uses the reserved storage identity index id for a catalog index",
+        ));
+    }
     let table = tables_by_id.get(&schema.table).ok_or_else(|| {
         DbError::internal(format!(
             "catalog snapshot index {} references missing table {}",
@@ -1674,10 +1816,30 @@ fn validate_index_schema(
         ))
     })?;
 
+    validate_index_schema_for_table(schema, table)
+}
+
+fn validate_index_schema_for_table(schema: &IndexSchema, table: &TableSchema) -> Result<()> {
     if schema.columns.is_empty() {
         return Err(DbError::internal(format!(
-            "catalog snapshot index {} has no columns",
+            "catalog index {} has no columns",
             schema.name
+        )));
+    }
+    if matches!(
+        schema.constraint,
+        IndexConstraintKind::Unique | IndexConstraintKind::PrimaryKey
+    ) && !schema.unique
+    {
+        return Err(DbError::internal(format!(
+            "catalog constraint index {} is not unique",
+            schema.name
+        )));
+    }
+    if schema.constraint == IndexConstraintKind::PrimaryKey && schema.columns != table.primary_key {
+        return Err(DbError::internal(format!(
+            "catalog primary-key index {} does not match table {} primary key",
+            schema.name, table.name
         )));
     }
 
@@ -1685,15 +1847,47 @@ fn validate_index_schema(
     for column_id in &schema.columns {
         if !table.columns.iter().any(|column| column.id == *column_id) {
             return Err(DbError::internal(format!(
-                "catalog snapshot index {} references missing column {} on table {}",
+                "catalog index {} references missing column {} on table {}",
                 schema.name, column_id, schema.table
             )));
         }
         if !seen.insert(*column_id) {
             return Err(DbError::internal(format!(
-                "catalog snapshot index {} has duplicate column {}",
+                "catalog index {} has duplicate column {}",
                 schema.name, column_id
             )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_user_primary_key_indexes(snapshot: &CatalogSnapshot) -> Result<()> {
+    let mut counts_by_table: HashMap<TableId, usize> = HashMap::new();
+    for index in snapshot.indexes_by_id.values() {
+        if index.constraint == IndexConstraintKind::PrimaryKey {
+            *counts_by_table.entry(index.table).or_default() += 1;
+        }
+    }
+
+    for table in snapshot.tables_by_id.values() {
+        if table.relation_kind != RelationKind::User || table.primary_key.is_empty() {
+            continue;
+        }
+        match counts_by_table.get(&table.id).copied().unwrap_or(0) {
+            0 => {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot table {} has a primary key but no primary-key constraint index",
+                    table.name
+                )));
+            }
+            1 => {}
+            count => {
+                return Err(DbError::internal(format!(
+                    "catalog snapshot table {} has {count} primary-key constraint indexes",
+                    table.name
+                )));
+            }
         }
     }
 
@@ -1810,12 +2004,6 @@ fn validate_schema(
         validate_column_default(&schema.name, column, sequences_by_id)?;
     }
 
-    if schema.primary_key.is_empty() {
-        return Err(DbError::internal(format!(
-            "catalog snapshot table {} must have a primary key",
-            schema.name
-        )));
-    }
     let mut primary_key_ids = HashSet::new();
     for column_id in &schema.primary_key {
         let Some(column) = schema.columns.iter().find(|column| column.id == *column_id) else {
@@ -1838,6 +2026,31 @@ fn validate_schema(
         }
     }
 
+    Ok(())
+}
+
+fn set_primary_key_columns(schema: &mut TableSchema, primary_key: Vec<ColumnId>) -> Result<()> {
+    let mut seen = HashSet::new();
+    for column_id in &primary_key {
+        if !seen.insert(*column_id) {
+            return Err(DbError::plan(
+                SqlState::SyntaxError,
+                format!("duplicate primary key column id {column_id}"),
+            ));
+        }
+        let column = schema
+            .columns
+            .iter_mut()
+            .find(|column| column.id == *column_id)
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedColumn,
+                    format!("primary key column id {column_id} does not exist"),
+                )
+            })?;
+        column.nullable = false;
+    }
+    schema.primary_key = primary_key;
     Ok(())
 }
 
@@ -1949,6 +2162,7 @@ fn build_index_schema(
     table: &TableSchema,
     columns: &[String],
     unique: bool,
+    constraint: IndexConstraintKind,
 ) -> Result<IndexSchema> {
     if columns.is_empty() {
         return Err(DbError::plan(
@@ -1980,14 +2194,17 @@ fn build_index_schema(
         column_ids.push(column.id);
     }
 
-    Ok(IndexSchema {
+    let schema = IndexSchema {
         id: index_id,
         storage_id,
         table: table.id,
         name,
         columns: column_ids,
         unique,
-    })
+        constraint,
+    };
+    validate_index_schema_for_table(&schema, table)?;
+    Ok(schema)
 }
 
 fn drop_indexes_for_table(snapshot: &mut CatalogSnapshot, table: TableId) {
@@ -2020,6 +2237,31 @@ fn reject_duplicate_index_id(snapshot: &CatalogSnapshot, id: IndexId) -> Result<
             SqlState::DuplicateTable,
             format!("index id {id} already exists"),
         ));
+    }
+    Ok(())
+}
+
+fn reject_duplicate_primary_key_constraint_index(
+    snapshot: &CatalogSnapshot,
+    schema: &IndexSchema,
+) -> Result<()> {
+    if schema.constraint != IndexConstraintKind::PrimaryKey {
+        return Ok(());
+    }
+    if let Some(existing) = snapshot.indexes_by_id.values().find(|index| {
+        index.id != schema.id
+            && index.table == schema.table
+            && index.constraint == IndexConstraintKind::PrimaryKey
+    }) {
+        let table = snapshot
+            .tables_by_id
+            .get(&schema.table)
+            .map(|table| table.name.as_str())
+            .unwrap_or("<missing>");
+        return Err(DbError::internal(format!(
+            "catalog table {table} already has primary-key constraint index {}",
+            existing.name
+        )));
     }
     Ok(())
 }

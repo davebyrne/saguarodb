@@ -44,6 +44,122 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
 }
 
 #[tokio::test]
+async fn no_primary_key_table_survives_restart_with_dml_and_secondary_index() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table events (kind text, value integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index events_kind on events (kind)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into events (kind, value) values ('click', 10), ('view', 20)")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("insert into events (kind, value) values ('click', 30)")
+            .await
+            .unwrap();
+        server
+            .simple_query("update events set value = value + 1 where kind = 'click'")
+            .await
+            .unwrap();
+        server
+            .simple_query("delete from events where kind = 'view'")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let explain = server
+        .simple_query("explain select value from events where kind = 'click'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(explain[0][0].as_ref().unwrap().contains("IndexScan"));
+
+    let rows = server
+        .simple_query("select kind, value from events where kind = 'click' order by value")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("click".to_string()), Some("11".to_string())],
+            vec![Some("click".to_string()), Some("31".to_string())],
+        ]
+    );
+    let rows = server
+        .simple_query("select kind, value from events where kind = 'view'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn no_primary_key_toasted_table_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "no-primary-key-toast-body-".repeat(260);
+    let updated = "no-primary-key-toast-updated-".repeat(260);
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query(
+                "create table docs (slug text, body text) \
+                 with (toast = aggressive, toast_tuple_target = 512, \
+                       toast_min_value_size = 128, toast_compression = none)",
+            )
+            .await
+            .unwrap();
+        server
+            .simple_query("create index docs_slug on docs (slug)")
+            .await
+            .unwrap();
+        server
+            .simple_query(&format!(
+                "insert into docs (slug, body) values ('a', '{body}')"
+            ))
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query(&format!(
+                "update docs set body = '{updated}' where slug = 'a'"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            visible_toast_chunk_count(&server, "docs") > 0,
+            "large no-PK values should be externalized before restart"
+        );
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let explain = server
+        .simple_query("explain select body from docs where slug = 'a'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert!(explain[0][0].as_ref().unwrap().contains("IndexScan"));
+
+    let rows = server
+        .simple_query("select body from docs where slug = 'a'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some(updated)]]);
+}
+
+#[tokio::test]
 async fn create_table_toast_metadata_survives_replay_and_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
 

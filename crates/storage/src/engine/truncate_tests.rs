@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, CompressionSetting, DataType, FileId, IndexSchema, Key, KeyRange, Lsn,
-    PageFlushInfo, RelationKind, Row, Snapshot, StatementContext, TableSchema, ToastCompression,
-    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId, TxnStatus, TxnStatusView, Value,
-    toast_schema,
+    ColumnDef, CompressionSetting, DataType, FileId, IndexConstraintKind, IndexSchema, Key,
+    KeyRange, Lsn, PageFlushInfo, RelationKind, Row, Snapshot, StatementContext, TableSchema,
+    ToastCompression, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, TxnId, TxnStatus,
+    TxnStatusView, Value, toast_schema,
 };
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
 
@@ -337,6 +337,7 @@ fn name_index(storage_id: FileId) -> IndexSchema {
         name: "users_name_key".to_string(),
         columns: vec![1],
         unique: true,
+        constraint: IndexConstraintKind::Unique,
     }
 }
 
@@ -348,6 +349,7 @@ fn note_index(storage_id: FileId) -> IndexSchema {
         name: "users_note_idx".to_string(),
         columns: vec![2],
         unique: false,
+        constraint: IndexConstraintKind::None,
     }
 }
 

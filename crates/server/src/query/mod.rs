@@ -1114,9 +1114,9 @@ pub struct PreparedStatement {
     sql: String,
     class: StatementClass,
     bound: Option<BoundStatement>,
-    /// The parsed maintenance statement (`VACUUM`, `ALTER TABLE ... SET
-    /// (compression = ...)`), carried unbound for the `StatementClass::Maintenance`
-    /// case so an extended-protocol `Execute` can run it through `run_maintenance`.
+    /// The parsed maintenance statement (`VACUUM` or supported `ALTER TABLE`),
+    /// carried unbound for the `StatementClass::Maintenance` case so an
+    /// extended-protocol `Execute` can run it through `run_maintenance`.
     /// `None` for every other class.
     maintenance: Option<Statement>,
     /// The parsed session-configuration statement (`SET`/`RESET`/`SHOW`/
@@ -1149,8 +1149,8 @@ impl PreparedStatement {
         matches!(self.class, StatementClass::TransactionControl(_))
     }
 
-    /// Whether this is a maintenance command (`VACUUM`, `ALTER TABLE ... SET
-    /// (compression = ...)`). The connection routes such an `Execute` through the
+    /// Whether this is a maintenance command (`VACUUM` or supported `ALTER TABLE`).
+    /// The connection routes such an `Execute` through the
     /// session path so it is rejected inside an open transaction block and
     /// otherwise runs as a standalone maintenance unit.
     pub fn is_maintenance(&self) -> bool {
@@ -1232,9 +1232,10 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::ShowVariable { .. }
         | Statement::DiscardAll => Ok(StatementClass::SessionConfig),
         Statement::Vacuum { .. } | Statement::Truncate { .. } => Ok(StatementClass::Maintenance),
-        Statement::AlterTableSetCompression { .. } | Statement::AlterTableSetOptions { .. } => {
-            Ok(StatementClass::Maintenance)
-        }
+        Statement::AlterTableSetCompression { .. }
+        | Statement::AlterTableSetOptions { .. }
+        | Statement::AlterTableAddPrimaryKey { .. }
+        | Statement::AlterTableDropPrimaryKey { .. } => Ok(StatementClass::Maintenance),
         Statement::Copy { direction, .. } => Ok(StatementClass::Copy(*direction)),
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
@@ -1660,6 +1661,32 @@ mod tests {
                 .set_table_toast_metadata(table, toast, toast_table_id)
         }
 
+        fn set_table_primary_key(
+            &self,
+            table: TableId,
+            primary_key: Vec<common::ColumnId>,
+        ) -> Result<TableSchema> {
+            self.inner.set_table_primary_key(table, primary_key)
+        }
+
+        fn add_table_primary_key_index(
+            &self,
+            table: TableId,
+            primary_key: Vec<common::ColumnId>,
+            index: IndexSchema,
+        ) -> Result<TableSchema> {
+            self.inner
+                .add_table_primary_key_index(table, primary_key, index)
+        }
+
+        fn drop_table_primary_key_index(
+            &self,
+            table: TableId,
+            index: IndexId,
+        ) -> Result<TableSchema> {
+            self.inner.drop_table_primary_key_index(table, index)
+        }
+
         fn allocate_dictionary_id(&self) -> Result<u32> {
             self.inner.allocate_dictionary_id()
         }
@@ -1698,6 +1725,10 @@ mod tests {
             self.inner.get_index_by_name(name)
         }
 
+        fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>> {
+            self.inner.get_index(id)
+        }
+
         fn list_indexes_for_table(&self, table: TableId) -> Result<Vec<IndexSchema>> {
             self.inner.list_indexes_for_table(table)
         }
@@ -1722,6 +1753,18 @@ mod tests {
             unique: bool,
         ) -> Result<IndexSchema> {
             self.inner.create_index(name, table, columns, unique)
+        }
+
+        fn create_index_with_constraint(
+            &self,
+            name: String,
+            table: &str,
+            columns: &[String],
+            unique: bool,
+            constraint: common::IndexConstraintKind,
+        ) -> Result<IndexSchema> {
+            self.inner
+                .create_index_with_constraint(name, table, columns, unique, constraint)
         }
 
         fn drop_index(&self, id: IndexId) -> Result<()> {
@@ -3148,6 +3191,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drop_index_rejects_primary_key_constraint_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_sql("drop index users_pkey")
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::DependentObjectsStillExist);
+
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        let duplicate = app
+            .query_service
+            .execute_sql("insert into users (id, name) values (1, 'Dup')")
+            .unwrap_err();
+        assert_eq!(duplicate.code, SqlState::UniqueViolation);
+    }
+
+    #[tokio::test]
     async fn create_index_rejects_bad_table_column_and_duplicate_name() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -3191,7 +3258,7 @@ mod tests {
             app.query_service.execute_sql(sql).unwrap();
         }
 
-        // EXPLAIN shows the secondary index (id 1) is chosen, not a seq scan.
+        // EXPLAIN shows the secondary index (id 2) is chosen, not a seq scan.
         let executor::ExecutionResult::Explanation { text } = app
             .query_service
             .execute_sql("explain select id from users where name = 'Bob'")
@@ -3200,7 +3267,7 @@ mod tests {
             panic!("expected explanation");
         };
         assert!(text.contains("IndexScan"), "plan was: {text}");
-        assert!(text.contains("index=1"), "plan was: {text}");
+        assert!(text.contains("index=2"), "plan was: {text}");
 
         // Equality through the secondary index returns exactly the matching row.
         let executor::ExecutionResult::Query { rows, .. } = app
@@ -3516,6 +3583,120 @@ mod tests {
             app.query_service.execute_sql("select id from users"),
             Ok(ExecutionResult::Query { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_explicit_on_conflict_rechecks_primary_key_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "insert into users (id, name) values (1, 'Ada') on conflict (id) do nothing",
+                &[],
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users drop primary key")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[tokio::test]
+    async fn prepared_on_conflict_rejects_changed_primary_key_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "insert into users (id, name) values (1, 'Ada') \
+                 on conflict (id) do update set name = excluded.name",
+                &[],
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users drop primary key")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users add primary key (name)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[tokio::test]
+    async fn prepared_targetless_on_conflict_rejects_changed_primary_key_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "insert into users (id, name) values (1, 'Ada') on conflict do nothing",
+                &[],
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users drop primary key")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users add primary key (name)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+    }
+
+    #[tokio::test]
+    async fn prepared_targetless_on_conflict_without_pk_keeps_no_arbiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+
+        let prepared = app
+            .query_service
+            .prepare_sql(
+                "insert into users (id, name) values (1, 'Ada again') on conflict do nothing",
+                &[],
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users add primary key (id)")
+            .unwrap();
+
+        let err = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UniqueViolation);
     }
 
     #[tokio::test]

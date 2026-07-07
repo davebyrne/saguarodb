@@ -195,6 +195,54 @@ async fn phantom_insert_into_scanned_table_aborts_one() {
     assert_eq!(server.active_txn_count(), 0);
 }
 
+/// A composite primary-key prefix scan can use the PK index but is not a single
+/// tuple read. It must therefore take a relation SIREAD lock; otherwise an insert
+/// of another `(tenant, id)` value under that prefix would miss the phantom edge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_pk_prefix_index_scan_tracks_relation_siread() {
+    let server = TestServer::start().await.unwrap();
+    let mut setup = Connection::connect(&server).await.unwrap();
+    setup
+        .ok("create table t (tenant integer, id integer, v integer, primary key (tenant, id))")
+        .await;
+    setup
+        .ok("insert into t (tenant, id, v) values (1, 1, 10)")
+        .await;
+
+    let explain = setup
+        .ok("explain select v from t where tenant = 1")
+        .await
+        .rows();
+    assert!(
+        explain[0][0].as_ref().unwrap().contains("IndexScan"),
+        "composite PK prefix lookup should use an IndexScan, got: {explain:?}"
+    );
+
+    let mut t1 = Connection::connect(&server).await.unwrap();
+    let mut t2 = Connection::connect(&server).await.unwrap();
+    t1.ok("begin isolation level serializable").await;
+    t2.ok("begin isolation level serializable").await;
+    t1.ok("select v from t where tenant = 1").await;
+    t2.ok("select v from t where tenant = 1").await;
+    t1.ok("update t set v = 11 where tenant = 1 and id = 1")
+        .await;
+    t2.ok("insert into t (tenant, id, v) values (1, 2, 20)")
+        .await;
+
+    let r1 = t1.query("commit").await.unwrap().result;
+    let r2 = t2.query("commit").await.unwrap().result;
+    let failures = [&r1, &r2].into_iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        failures,
+        1,
+        "exactly one aborts (t1_err={}, t2_err={})",
+        r1.is_err(),
+        r2.is_err()
+    );
+    assert!(r1.err().or(r2.err()).unwrap().message.contains("C=40001"));
+    assert_eq!(server.active_txn_count(), 0);
+}
+
 /// A read-only SERIALIZABLE transaction is never a pivot (no writes ⇒ no incoming
 /// rw-edge), so it commits cleanly even when a concurrent SERIALIZABLE writer modifies
 /// a row it read. A single rw-edge is not a cycle — no false abort.

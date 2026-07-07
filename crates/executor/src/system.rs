@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use catalog::{
     CatalogManager, INFORMATION_SCHEMA_OID, PG_CATALOG_SCHEMA_OID, PUBLIC_SCHEMA_OID, SystemView,
-    index_oid, sequence_oid, synthetic_primary_key_oid, table_oid,
+    index_oid, sequence_oid, table_oid,
 };
 use common::{
-    ColumnDef, ColumnDefault, GucSetting, IsolationLevel, OrderedF32, PgType, RelationKind, Result,
-    Row, SequenceSchema, SessionActivityRow, StatementContext, TableId, TableSchema, Value, bytea,
-    datetime, float, interval, numeric, uuid,
+    ColumnDef, ColumnDefault, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32, PgType,
+    RelationKind, Result, Row, SequenceSchema, SessionActivityRow, StatementContext, TableId,
+    TableSchema, Value, bytea, datetime, float, interval, numeric, uuid,
 };
 
 const OWNER_OID: i64 = 10;
@@ -54,17 +54,7 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
 
     for table in &tables {
         let indexes = catalog.list_indexes_for_table(table.id)?;
-        rows.push(pg_class_table_row(
-            table,
-            !table.primary_key.is_empty() || !indexes.is_empty(),
-        ));
-        if !table.primary_key.is_empty() {
-            rows.push(pg_class_index_row(
-                synthetic_primary_key_oid(table.id),
-                &primary_key_index_name(table),
-                table.primary_key.len(),
-            ));
-        }
+        rows.push(pg_class_table_row(table, !indexes.is_empty()));
         for index in indexes {
             rows.push(pg_class_index_row(
                 index_oid(index.id),
@@ -284,15 +274,6 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for table in &tables {
-        if !table.primary_key.is_empty() {
-            rows.push(pg_index_row(
-                synthetic_primary_key_oid(table.id),
-                table_oid(table.id),
-                &table.primary_key,
-                true,
-                true,
-            ));
-        }
         for index in catalog.list_indexes_for_table(table.id)? {
             if let Some(table) = table_by_id.get(&index.table) {
                 rows.push(pg_index_row(
@@ -300,7 +281,7 @@ fn pg_index_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
                     table_oid(index.table),
                     &index.columns,
                     index.unique,
-                    false,
+                    index.constraint == IndexConstraintKind::PrimaryKey,
                 ));
                 debug_assert!(index.columns.iter().all(|column| {
                     table
@@ -619,10 +600,6 @@ fn relation_name(table: &TableSchema) -> String {
         RelationKind::User => table.name.clone(),
         RelationKind::Toast { base_table } => format!("pg_toast_{base_table}"),
     }
-}
-
-fn primary_key_index_name(table: &TableSchema) -> String {
-    format!("{}_pkey", relation_name(table))
 }
 
 fn row(values: Vec<Value>) -> Row {

@@ -104,6 +104,7 @@ fn collect_on_conflict(
     if let Some(BoundOnConflict::DoUpdate {
         assignments,
         filter,
+        ..
     }) = on_conflict
     {
         for (_, expr) in assignments {
@@ -302,6 +303,7 @@ fn substitute_on_conflict(
     if let Some(BoundOnConflict::DoUpdate {
         assignments,
         filter,
+        ..
     }) = on_conflict
     {
         for (_, expr) in assignments {

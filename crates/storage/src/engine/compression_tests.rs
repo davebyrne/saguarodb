@@ -73,6 +73,7 @@ fn note_index() -> IndexSchema {
         name: "users_note".to_string(),
         columns: vec![1],
         unique: false,
+        constraint: common::IndexConstraintKind::None,
     }
 }
 

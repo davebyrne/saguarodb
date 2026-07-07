@@ -129,13 +129,15 @@ async fn conditional_table_ddl_is_noop_only_for_existence_conflicts() {
     );
 
     let invalid = server
-        .simple_query("create table if not exists t (id integer)")
+        .simple_query(
+            "create table if not exists t (id integer primary key, n integer default 'oops')",
+        )
         .await
         .err()
         .expect("IF NOT EXISTS still validates the table definition");
     assert!(
         invalid.message.contains("42804"),
-        "expected DatatypeMismatch for missing primary key: {}",
+        "expected DatatypeMismatch for invalid default: {}",
         invalid.message
     );
 
@@ -224,7 +226,7 @@ async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
 
     assert_eq!(create_table_records, 1);
     assert_eq!(drop_table_records, 0);
-    assert_eq!(create_index_records, 1);
+    assert_eq!(create_index_records, 2);
 }
 
 /// Column defaults persist across a restart (replayed from the durable catalog /
@@ -1291,6 +1293,169 @@ async fn unique_constraint_survives_restart() {
         "expected unique violation: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn alter_table_add_primary_key_enforces_existing_table() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table accounts (aid integer not null, bid integer, balance integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into accounts (aid, bid, balance) values (1, 10, 100), (2, 10, 200)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("alter table accounts add primary key (aid)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("insert into accounts (aid, bid, balance) values (1, 20, 300)")
+        .await
+        .err()
+        .expect("duplicate primary key should be rejected after ALTER");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("primary key"),
+        "expected primary key violation: {}",
+        err.message
+    );
+
+    let rows = server
+        .simple_query("select balance from accounts where aid = 2")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("200".to_string())]]);
+}
+
+#[tokio::test]
+async fn alter_table_add_primary_key_rejects_bad_existing_rows_without_mutating_table() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table dupes (id integer not null, v integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into dupes (id, v) values (1, 10), (1, 20)")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("alter table dupes add primary key (id)")
+        .await
+        .err()
+        .expect("existing duplicates should reject ADD PRIMARY KEY");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("primary key"),
+        "expected primary key violation: {}",
+        err.message
+    );
+    server
+        .simple_query("insert into dupes (id, v) values (1, 30)")
+        .await
+        .expect("failed ALTER must leave the table without a primary key");
+
+    server
+        .simple_query("create table nulls (id integer, v integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into nulls (id, v) values (null, 10)")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("alter table nulls add primary key (id)")
+        .await
+        .err()
+        .expect("existing NULL should reject ADD PRIMARY KEY");
+    assert!(
+        err.message.contains("23502") || err.message.to_lowercase().contains("null"),
+        "expected not-null violation: {}",
+        err.message
+    );
+    server
+        .simple_query("insert into nulls (id, v) values (null, 20)")
+        .await
+        .expect("failed ALTER must leave the column nullable");
+}
+
+#[tokio::test]
+async fn alter_table_drop_primary_key_allows_duplicate_keys() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, v integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, v) values (1, 10)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("alter table t drop primary key")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, v) values (1, 20)")
+        .await
+        .expect("duplicate key values should be allowed after DROP PRIMARY KEY");
+
+    let rows = server
+        .simple_query("select count(*) from t where id = 1")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[tokio::test]
+async fn alter_table_primary_key_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let server = TestServer::start_with_data_dir(&path).await.unwrap();
+        server
+            .simple_query("create table t (id integer not null, v integer)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into t (id, v) values (1, 10)")
+            .await
+            .unwrap();
+        server
+            .simple_query("alter table only t add constraint t_pkey primary key (id)")
+            .await
+            .unwrap();
+        // No checkpoint: recovery must replay AlterTablePrimaryKey and the
+        // primary-key constraint CreateIndex.
+    }
+
+    let server = restart(&path).await;
+    let err = server
+        .simple_query("insert into t (id, v) values (1, 20)")
+        .await
+        .err()
+        .expect("primary key should be enforced after restart");
+    assert!(
+        err.message.contains("23505") || err.message.to_lowercase().contains("primary key"),
+        "expected primary key violation: {}",
+        err.message
+    );
+
+    server
+        .simple_query("alter table t drop constraint t_pkey")
+        .await
+        .unwrap();
+    drop(server);
+
+    let server = restart(&path).await;
+    server
+        .simple_query("insert into t (id, v) values (1, 30)")
+        .await
+        .expect("DROP PRIMARY KEY should survive restart");
 }
 
 /// An explicit `NULL` for a `NOT NULL` column is rejected on both INSERT and

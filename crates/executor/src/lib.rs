@@ -484,6 +484,75 @@ mod tests {
     }
 
     #[test]
+    fn update_rekeys_primary_key_identity_in_test_storage() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("insert into users (id, name) values (1, 'Ada')")
+            .unwrap();
+        assert_eq!(
+            harness.storage_keys("users").unwrap(),
+            vec![Key(vec![Value::Integer(1)])]
+        );
+
+        harness
+            .execute("update users set id = 3 where id = 1")
+            .unwrap();
+
+        assert_eq!(
+            harness.storage_keys("users").unwrap(),
+            vec![Key(vec![Value::Integer(3)])]
+        );
+        let rows = harness
+            .select_rows("select id, name from users order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row {
+                values: vec![Value::Integer(3), Value::Text("Ada".to_string())]
+            }]
+        );
+    }
+
+    #[test]
+    fn composite_primary_key_prefix_index_scan_matches_test_storage() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute(
+                "create table m \
+                 (tenant integer, id integer, note text, primary key (tenant, id))",
+            )
+            .unwrap();
+        harness
+            .execute(
+                "insert into m (tenant, id, note) values \
+                 (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c')",
+            )
+            .unwrap();
+
+        let explain = harness
+            .explain_plan("select id, note from m where tenant = 1 order by id")
+            .unwrap();
+        assert!(
+            explain.contains("IndexScan"),
+            "expected IndexScan, got {explain}"
+        );
+        let rows = harness
+            .select_rows("select id, note from m where tenant = 1 order by id")
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    values: vec![Value::Integer(1), Value::Text("a".to_string())]
+                },
+                Row {
+                    values: vec![Value::Integer(2), Value::Text("b".to_string())]
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn delete_where_deletes_only_matching_rows() {
         let harness = ExecutorHarness::with_users();
         harness

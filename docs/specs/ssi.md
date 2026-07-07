@@ -42,8 +42,8 @@ only by `SERIALIZABLE` transactions.
 
 SIREAD locks (the record of what a transaction read) are taken at two granularities:
 
-- **Tuple** — a point read by primary key (`WHERE pk = k`) records a SIREAD on
-  `(table, key)`.
+- **Tuple** — a full-key point read through the storage identity index for a declared primary key (`WHERE pk = k`)
+  records a SIREAD on `(table, key)`.
 - **Relation** — a sequential scan, a range scan, or any non-point predicate
   records a SIREAD on the whole `(table)`.
 
@@ -132,9 +132,11 @@ SIREAD locks are recorded at the **executor's scan operators**, which know the a
 method (so they distinguish a point lookup from a scan) and run for `SELECT` and the
 `WHERE`-scan of `UPDATE`/`DELETE`:
 
-- **`IndexScan` with an exact key** → `record_tuple_read(table, key)`. Recorded **even
-  when no row matches**, so a later `INSERT` of that key is caught as a phantom.
-- **`SeqScan`, or `IndexScan` over a range** → `record_relation_read(table)`.
+- **`IndexScan` through the storage identity index for a declared primary key with a full exact key** →
+  `record_tuple_read(table, key)`. Recorded **even when no row matches**, so a
+  later `INSERT` of that key is caught as a phantom.
+- **`SeqScan`, non-primary-key `IndexScan`, composite-primary-key prefix `IndexScan`, or `IndexScan` over a range** →
+  `record_relation_read(table)`.
 
 Two reads do **not** flow through the scan operators and so record their SIREAD lock at
 their own site (a missed read here is a silent serializability hole):
@@ -143,7 +145,7 @@ their own site (a missed read here is a silent serializability hole):
   `CopyOut::new`.
 - **The `INSERT ... ON CONFLICT` primary-key arbiter probe** is a point read of the
   proposed key → `record_tuple_read(table, key)` (recorded even when the key is absent,
-  for phantom protection), right before the probe `get`.
+  for phantom protection), right before the storage identity lookup.
 
 Recording at the scan operator (rather than in the storage `is_visible` path) is both
 cleaner — one site per access method — and correct for the chosen granularity: the
@@ -177,6 +179,15 @@ accumulates more than a fixed threshold of tuple SIREAD locks on one table, its 
 locks for that table are collapsed into a single relation lock. This stays correct
 (coarser ⇒ more conservative) and caps per-transaction state. The threshold is a
 compile-time constant initially (no new startup flag).
+
+Primary-key DDL uses the same conservative direction. `ALTER TABLE ... ADD/DROP
+PRIMARY KEY` changes the table identity keyspace, so before the storage identity
+tree is rebuilt any retained tuple SIREAD locks for that table are promoted to a
+relation lock, and any retained tuple write records for that table are marked as
+relation-granularity conflict-out candidates. Future writes under hidden heap
+identity or a new primary-key tuple therefore still see readers that originally
+locked an old key, and future exact reads under the new keyspace still see
+writers retained from the old keyspace.
 
 ### 5.5 Savepoints
 
@@ -304,6 +315,9 @@ versions reclaimed by VACUUM.
 - **VACUUM / HOT.** SIREAD locks reference `(table, key)` and `(table)`, not physical
   TIDs, so HOT chain collapse and VACUUM are unaffected. The SIREAD-lifetime horizon
   (§5.3) is the existing GC horizon; SSI does not hold versions back beyond it.
+- **Primary-key DDL.** `ALTER TABLE ... ADD/DROP PRIMARY KEY` promotes retained tuple
+  SIREAD locks on the table to relation locks before changing the storage identity
+  keyspace. This is intentionally conservative and avoids stale tuple keys.
 - **Crash recovery.** No durable SSI state; nothing to replay. Recovery operations
   append no WAL and run no SSI tracking.
 

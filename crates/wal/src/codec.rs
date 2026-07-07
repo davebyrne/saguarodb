@@ -33,6 +33,7 @@ pub(crate) const TYPE_CREATE_DICTIONARY: u8 = 19;
 pub(crate) const TYPE_ALTER_TABLE_COMPRESSION: u8 = 20;
 pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
 pub(crate) const TYPE_TRUNCATE_TABLE: u8 = 22;
+pub(crate) const TYPE_ALTER_TABLE_PRIMARY_KEY: u8 = 23;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -173,6 +174,7 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::AlterTableCompression { .. } => TYPE_ALTER_TABLE_COMPRESSION,
         WalRecordKind::AlterTableToast { .. } => TYPE_ALTER_TABLE_TOAST,
         WalRecordKind::TruncateTable { .. } => TYPE_TRUNCATE_TABLE,
+        WalRecordKind::AlterTablePrimaryKey { .. } => TYPE_ALTER_TABLE_PRIMARY_KEY,
     }
 }
 
@@ -266,8 +268,9 @@ fn encode_payload(kind: &WalRecordKind) -> Result<Vec<u8>> {
             buf.extend_from_slice(bytes);
             Ok(buf)
         }
-        // AlterTableCompression/AlterTableToast: no arms — the `_ =>` serde_json
-        // fallback handles logical DDL records.
+        // AlterTableCompression/AlterTableToast/TruncateTable/AlterTablePrimaryKey:
+        // no arms —
+        // the `_ =>` serde_json fallback handles logical DDL records.
         _ => serde_json::to_vec(kind)
             .map_err(|err| wal_error(format!("failed to serialize WAL payload: {err}"))),
     }
@@ -483,6 +486,7 @@ mod tests {
                     name: "users_name".to_string(),
                     columns: vec![1],
                     unique: true,
+                    constraint: common::IndexConstraintKind::None,
                 },
             },
             WalRecordKind::DropIndex { index: 3 },
@@ -579,6 +583,10 @@ mod tests {
                 new_table_storage_id: 20,
                 new_toast_storage_id: Some((6, 21)),
                 new_index_storage_ids: vec![(7, 22), (8, 23)],
+            },
+            WalRecordKind::AlterTablePrimaryKey {
+                table_id: 5,
+                primary_key: vec![0, 2],
             },
         ];
         for kind in kinds {

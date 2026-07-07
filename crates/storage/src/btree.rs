@@ -104,6 +104,32 @@ struct PendingInsert<'a> {
     leaf: bool,
 }
 
+#[derive(Clone, Copy)]
+enum WriteMode {
+    Logged(u64),
+    Unlogged,
+}
+
+impl WriteMode {
+    fn txn_id(self) -> u64 {
+        match self {
+            Self::Logged(txn_id) => txn_id,
+            Self::Unlogged => 0,
+        }
+    }
+
+    fn wal_txn_id(self) -> Option<u64> {
+        match self {
+            Self::Logged(txn_id) => Some(txn_id),
+            Self::Unlogged => None,
+        }
+    }
+
+    fn is_unlogged(self) -> bool {
+        matches!(self, Self::Unlogged)
+    }
+}
+
 /// A search probe ordered against stored entries by `(key, value)`. The optional
 /// value is the tiebreaker among equal user-keys: `None` is a lower bound (sorts
 /// before every entry sharing the key), `Some(bytes)` targets one exact entry.
@@ -138,14 +164,36 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
         let mut root_image = *root.data();
         index_page::init(&mut root_image, root_num, true);
-        if let Err(err) = self.log_new_full_page(txn_id, root, root_image) {
+        if let Err(err) = self.log_new_full_page(WriteMode::Logged(txn_id), root, root_image) {
             self.abandon_unpublished_new_page(meta)?;
             return Err(err);
         }
 
         let mut meta_image = *meta.data();
         index_page::meta_init(&mut meta_image, meta_num, root_num);
-        self.log_new_full_page(txn_id, meta, meta_image)?;
+        self.log_new_full_page(WriteMode::Logged(txn_id), meta, meta_image)?;
+        Ok(())
+    }
+
+    /// Reset during a derived rebuild and log the new root/metapage images.
+    pub(crate) fn reset_to_empty(&self, txn_id: u64) -> Result<()> {
+        self.reset_to_empty_with_mode(WriteMode::Logged(txn_id))
+    }
+
+    /// Reset during recovery's derived rebuild, where WAL replay already reached
+    /// the final heap state and recovery must not append new WAL.
+    pub(crate) fn reset_to_empty_unlogged(&self) -> Result<()> {
+        self.reset_to_empty_with_mode(WriteMode::Unlogged)
+    }
+
+    fn reset_to_empty_with_mode(&self, mode: WriteMode) -> Result<()> {
+        let mut root_image = [0u8; buffer::PAGE_SIZE];
+        index_page::init(&mut root_image, 1, true);
+        self.write_root_page(mode, 1, root_image)?;
+
+        let mut meta_image = [0u8; buffer::PAGE_SIZE];
+        index_page::meta_init(&mut meta_image, 0, 1);
+        self.write_root_page(mode, 0, meta_image)?;
         Ok(())
     }
 
@@ -216,6 +264,16 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// is placed in `(key, value)` order. An exact `(key, value)` duplicate is also
     /// inserted (the engine prevents that for the primary-key index).
     pub(crate) fn insert(&self, txn_id: u64, key: &Key, value: &V) -> Result<()> {
+        self.insert_with_mode(WriteMode::Logged(txn_id), key, value)
+    }
+
+    /// Insert during a derived rebuild whose logical WAL record is already durable.
+    /// This updates pages without appending physical B-tree WAL.
+    pub(crate) fn insert_unlogged(&self, key: &Key, value: &V) -> Result<()> {
+        self.insert_with_mode(WriteMode::Unlogged, key, value)
+    }
+
+    fn insert_with_mode(&self, mode: WriteMode, key: &Key, value: &V) -> Result<()> {
         let key_bytes = encode_key(key)?;
         let value = value.encode()?;
         validate_index_entry_fits(key_bytes.len(), value.len())?;
@@ -227,11 +285,11 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         if let InsertOutcome::Split {
             sep_key,
             right_page,
-        } = self.insert_rec(txn_id, root, &probe, &key_bytes, &value)?
+        } = self.insert_rec(mode, root, &probe, &key_bytes, &value)?
         {
             // The root split: grow the tree by one level with a new internal
             // root whose leftmost child is the old root.
-            let new_root = self.buffer.new_page(self.file_id, txn_id)?;
+            let new_root = self.buffer.new_page(self.file_id, mode.txn_id())?;
             let new_root_num = new_root.page_num();
             let mut image = *new_root.data();
             index_page::init(&mut image, new_root_num, false);
@@ -242,8 +300,8 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 self.abandon_unpublished_new_page(new_root)?;
                 return Err(err);
             }
-            self.log_new_full_page(txn_id, new_root, image)?;
-            self.set_root(txn_id, new_root_num)?;
+            self.log_new_full_page(mode, new_root, image)?;
+            self.set_root(mode, new_root_num)?;
         }
         Ok(())
     }
@@ -275,7 +333,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 if &entry_key == key && entry_value == value.as_slice() {
                     let mut image = *guard.data();
                     index_page::remove_entry(&mut image, pos)?;
-                    self.log_full_page(txn_id, &mut guard, image)?;
+                    self.log_full_page(WriteMode::Logged(txn_id), &mut guard, image)?;
                     return Ok(true);
                 }
                 // The lower bound landed before the target but it is not a match,
@@ -346,7 +404,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
     fn insert_rec(
         &self,
-        txn_id: u64,
+        mode: WriteMode,
         page_num: PageNum,
         probe: &Probe<'_>,
         key_bytes: &[u8],
@@ -355,7 +413,9 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         if self.node_is_leaf(page_num)? {
             let mut page_num = page_num;
             loop {
-                let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+                let mut guard = self
+                    .buffer
+                    .write_page(self.file_id, page_num, mode.txn_id())?;
                 let mut pos = self.lower_bound(guard.data(), true, probe)?;
                 if pos == index_page::entry_count(guard.data()) {
                     let right = index_page::link(guard.data());
@@ -365,7 +425,9 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                             page_num = next;
                             continue;
                         }
-                        guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+                        guard = self
+                            .buffer
+                            .write_page(self.file_id, page_num, mode.txn_id())?;
                         pos = self.lower_bound(guard.data(), true, probe)?;
                     }
                 }
@@ -373,11 +435,11 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 if index_page::has_space(guard.data(), key_bytes.len(), value.len()) {
                     let mut image = *guard.data();
                     index_page::insert_entry(&mut image, pos, key_bytes, value)?;
-                    self.log_full_page(txn_id, &mut guard, image)?;
+                    self.log_full_page(mode, &mut guard, image)?;
                     return Ok(InsertOutcome::Inserted);
                 }
                 return self.split_node(
-                    txn_id,
+                    mode,
                     &mut guard,
                     PendingInsert {
                         pos,
@@ -393,12 +455,14 @@ impl<'a, V: IndexValue> BTree<'a, V> {
             let guard = self.buffer.read_page(self.file_id, page_num)?;
             self.child_for(guard.data(), probe)?
         };
-        match self.insert_rec(txn_id, child, probe, key_bytes, value)? {
+        match self.insert_rec(mode, child, probe, key_bytes, value)? {
             InsertOutcome::Split {
                 sep_key,
                 right_page,
             } => {
-                let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
+                let mut guard = self
+                    .buffer
+                    .write_page(self.file_id, page_num, mode.txn_id())?;
                 // Route the separator by its own `(key, value)`: split the
                 // composite into its user key and the value tiebreaker.
                 let (sep_decoded, consumed) = decode_key_prefix(&sep_key)?;
@@ -411,11 +475,11 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 if index_page::has_space(guard.data(), sep_key.len(), child_bytes.len()) {
                     let mut image = *guard.data();
                     index_page::insert_entry(&mut image, pos, &sep_key, &child_bytes)?;
-                    self.log_full_page(txn_id, &mut guard, image)?;
+                    self.log_full_page(mode, &mut guard, image)?;
                     Ok(InsertOutcome::Inserted)
                 } else {
                     self.split_node(
-                        txn_id,
+                        mode,
                         &mut guard,
                         PendingInsert {
                             pos,
@@ -437,7 +501,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// its child becomes the right node's leftmost.
     fn split_node(
         &self,
-        txn_id: u64,
+        mode: WriteMode,
         guard: &mut PageWriteGuard,
         insert: PendingInsert<'_>,
     ) -> Result<InsertOutcome> {
@@ -450,7 +514,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         let mid = split_point(&entries);
 
         if insert.leaf {
-            let right = self.buffer.new_page(self.file_id, txn_id)?;
+            let right = self.buffer.new_page(self.file_id, mode.txn_id())?;
             let right_num = right.page_num();
             let mut right_image = *right.data();
             index_page::init(&mut right_image, right_num, true);
@@ -459,13 +523,13 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 return Err(err);
             }
             index_page::set_link(&mut right_image, old_right_link);
-            self.log_new_full_page(txn_id, right, right_image)?;
+            self.log_new_full_page(mode, right, right_image)?;
 
             let mut left_image = *guard.data();
             index_page::init(&mut left_image, page_num, true);
             append_entries(&mut left_image, &entries[..mid])?;
             index_page::set_link(&mut left_image, right_num);
-            self.log_full_page(txn_id, guard, left_image)?;
+            self.log_full_page(mode, guard, left_image)?;
 
             // The separator is the composite `(key ++ value)` of the right half's
             // first leaf entry, so the parent can route equal user-keys that
@@ -485,7 +549,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
             let push_key = entries[mid].0.clone();
             let right_leftmost = decode_child(&entries[mid].1)?;
 
-            let right = self.buffer.new_page(self.file_id, txn_id)?;
+            let right = self.buffer.new_page(self.file_id, mode.txn_id())?;
             let right_num = right.page_num();
             let mut right_image = *right.data();
             index_page::init(&mut right_image, right_num, false);
@@ -494,7 +558,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 self.abandon_unpublished_new_page(right)?;
                 return Err(err);
             }
-            self.log_new_full_page(txn_id, right, right_image)?;
+            self.log_new_full_page(mode, right, right_image)?;
 
             let mut left_image = *guard.data();
             index_page::init(&mut left_image, page_num, false);
@@ -506,7 +570,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
                 &push_key,
                 &encode_child(right_num),
             )?;
-            self.log_full_page(txn_id, guard, left_image)?;
+            self.log_full_page(mode, guard, left_image)?;
 
             Ok(InsertOutcome::Split {
                 sep_key: push_key,
@@ -520,11 +584,13 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         Ok(index_page::meta_root(guard.data()))
     }
 
-    fn set_root(&self, txn_id: u64, root: PageNum) -> Result<()> {
-        let mut guard = self.buffer.write_page(self.file_id, META_PAGE, txn_id)?;
+    fn set_root(&self, mode: WriteMode, root: PageNum) -> Result<()> {
+        let mut guard = self
+            .buffer
+            .write_page(self.file_id, META_PAGE, mode.txn_id())?;
         let mut image = *guard.data();
         index_page::meta_set_root(&mut image, root);
-        self.log_full_page(txn_id, &mut guard, image)
+        self.log_full_page(mode, &mut guard, image)
     }
 
     fn node_is_leaf(&self, page_num: PageNum) -> Result<bool> {
@@ -683,10 +749,14 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
     fn log_full_page(
         &self,
-        txn_id: u64,
+        mode: WriteMode,
         guard: &mut PageWriteGuard,
         mut image: PageImage,
     ) -> Result<()> {
+        let Some(txn_id) = mode.wal_txn_id() else {
+            *guard.data_mut() = image;
+            return Ok(());
+        };
         let lsn = self.wal.append(WalRecord {
             lsn: 0,
             txn_id,
@@ -699,11 +769,11 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
     fn log_new_full_page(
         &self,
-        txn_id: u64,
+        mode: WriteMode,
         mut guard: PageWriteGuard,
         image: PageImage,
     ) -> Result<()> {
-        match self.log_full_page(txn_id, &mut guard, image) {
+        match self.log_full_page(mode, &mut guard, image) {
             Ok(()) => {
                 // The FullPageImage now durably references this freshly allocated
                 // page: it can no longer be abandoned, only reclaimed by VACUUM.
@@ -719,6 +789,16 @@ impl<'a, V: IndexValue> BTree<'a, V> {
 
     fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()> {
         self.buffer.abandon_unpublished_new_page(guard)
+    }
+
+    fn write_root_page(&self, mode: WriteMode, page_num: PageNum, image: PageImage) -> Result<()> {
+        let mut guard = if mode.is_unlogged() {
+            self.buffer.fetch_for_redo(self.file_id, page_num)?
+        } else {
+            self.buffer
+                .write_page(self.file_id, page_num, mode.txn_id())?
+        };
+        self.log_full_page(mode, &mut guard, image)
     }
 }
 
@@ -781,7 +861,7 @@ impl<'a> BTree<'a, RowLocation> {
             }
             let next = index_page::link(&image);
             if changed {
-                self.log_full_page(txn_id, &mut guard, image)?;
+                self.log_full_page(WriteMode::Logged(txn_id), &mut guard, image)?;
             }
             drop(guard);
             if next == 0 {

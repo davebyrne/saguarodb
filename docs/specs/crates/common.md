@@ -257,6 +257,13 @@ pub struct IndexSchema {
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub unique: bool,
+    pub constraint: IndexConstraintKind,
+}
+
+pub enum IndexConstraintKind {
+    None,
+    Unique,
+    PrimaryKey,
 }
 
 pub struct SequenceOptions {
@@ -347,6 +354,8 @@ non-unique index admits duplicates. On disk every index entry is disambiguated b
 the heap TID it points at (see `storage` Secondary Indexes), so no metadata
 distinguishes the two beyond the `unique` flag. Secondary indexes have their own
 `storage_id`; it is independent of the index's logical `id`.
+`constraint` records whether the index backs no SQL constraint, a `UNIQUE`
+constraint, or a `PRIMARY KEY` constraint.
 
 `TruncateTablePlan` is the catalog-produced allocation plan for a future
 relation-generation swap: it names the logical table plus the fresh physical
@@ -413,6 +422,7 @@ pub enum SqlState {
     NotNullViolation,
     UniqueViolation,
     CheckViolation,
+    CardinalityViolation,
     DependentObjectsStillExist,
     ObjectNotInPrerequisiteState,
     QueryCanceled,
@@ -427,10 +437,17 @@ pub enum SqlState {
     InternalError,
 }
 
+impl SqlState {
+    pub fn code(self) -> &'static str;
+    pub fn from_code(code: &str) -> Option<Self>;
+}
+
 pub type Result<T> = std::result::Result<T, DbError>;
 ```
 
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
+`SqlState::code` is the single source of truth for PostgreSQL wire SQLSTATE
+strings, and `SqlState::from_code` is the reverse parser for known codes.
 
 `SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
 table's `CHECK` constraint — the constraint expression evaluated to `false` for

@@ -403,9 +403,18 @@ pub struct SequenceSchema {
     pub is_called: bool,
 }
 
+/// Catalog-visible constraint semantics carried by an index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexConstraintKind {
+    #[default]
+    None,
+    Unique,
+    PrimaryKey,
+}
+
 /// A secondary index over one or more columns of a table. `unique` rejects
-/// duplicate indexed values; a non-unique index appends the primary key to make
-/// each entry distinct on disk.
+/// duplicate indexed values; the B-tree stores the heap TID as a value tiebreaker
+/// so duplicate non-unique keys can coexist.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSchema {
     pub id: IndexId,
@@ -418,6 +427,8 @@ pub struct IndexSchema {
     pub name: String,
     pub columns: Vec<ColumnId>,
     pub unique: bool,
+    #[serde(default)]
+    pub constraint: IndexConstraintKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,7 +5,7 @@
 
 ## Purpose
 
-`storage` owns table files, row serialization, page-backed row storage, the durable on-disk primary-key and secondary B-tree indexes, normal data operations, sequence runtime state, schema file operations, and recovery apply operations.
+`storage` owns table files, row serialization, page-backed row storage, the durable on-disk storage-identity and catalog B-tree indexes, normal data operations, sequence runtime state, schema file operations, and recovery apply operations.
 
 ## Depends On
 
@@ -74,6 +74,13 @@ pub trait RecoveryOperations: Send + Sync {
     /// Recovery apply for committed relation-swap `TRUNCATE`: publishes the new
     /// table/index generations produced by catalog replay. Must not append WAL.
     fn apply_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()>;
+    /// Recovery apply for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: installs the
+    /// updated schema metadata during WAL replay. The derived identity tree is
+    /// rebuilt after replay reaches the final heap state. Must not append WAL.
+    fn apply_set_table_primary_key(&self, schema: TableSchema) -> Result<()>;
+    /// Rebuild the derived table identity tree from heap rows after recovery
+    /// replay. Must not append WAL.
+    fn apply_rebuild_table_identity(&self, schema: TableSchema) -> Result<()>;
 }
 ```
 
@@ -93,12 +100,12 @@ when the table generation itself is unchanged.
 
 ## Table Storage
 
-Each table is page-backed. Full rows live in heap pages; a durable, non-clustered B-tree maps each primary key to its `RowLocation`, stored in a separate index file per table (see Primary-Key Index). The clustered on-disk B-tree (rows in the leaves, no separate heap) remains future work behind the existing storage traits.
+Each table is page-backed. Full rows live in heap pages; a durable, non-clustered identity B-tree maps each row's storage identity to its `RowLocation`, stored in a separate reserved index file per table (see Storage Identity Index). For tables with a primary key, the storage identity is the logical primary-key tuple. For tables without a primary key, it is a hidden heap identity derived from the row's root TID. The clustered on-disk B-tree (rows in the leaves, no separate heap) remains future work behind the existing storage traits.
 
-- `insert` inserts by primary key (heap row plus B-tree entry) and adds an entry to every secondary index on the table.
-- `get` does a primary-key lookup through the B-tree.
-- `scan` / `scan_range` walk the primary-key B-tree leaves in key order and read rows from their heap locations.
-- `index_scan` walks a secondary index, which points directly at heap TIDs, and reads each row from its heap location (no primary-key indirection; see Secondary Indexes).
+- `insert` inserts a heap row plus storage identity B-tree entry and adds an entry to every catalog index on the table.
+- `get` does a storage-identity lookup through the reserved B-tree.
+- `scan` / `scan_range` walk the reserved identity B-tree leaves in key order and read rows from their heap locations.
+- `index_scan` walks a catalog index, which points directly at heap TIDs, and reads each row from its heap location (no identity-index indirection; see Catalog Indexes).
 - `delete` marks the visible version deleted in place (MVCC delete; see below) and
   retains its index entries. `update` writes a new heap version, chains the old
   version forward to it (`xmax` + `t_ctid`), and inserts a per-version entry into
@@ -218,7 +225,7 @@ Checksum:    4 bytes
 
 Development builds do not migrate older page formats. Existing page files without `PageVersion = 2` are rejected as corrupt during load/recovery.
 
-`PageType` is `1` for a heap data page and `2` for a B-tree index node. `validate`/`is_valid` accept both (the data-page slot-layout check runs only for type `1`); the index node body layout is described under Primary-Key Index.
+`PageType` is `1` for a heap data page and `2` for a B-tree index node. `validate`/`is_valid` accept both (the data-page slot-layout check runs only for type `1`); the index node body layout is described under Storage Identity Index.
 
 Page body (data page):
 
@@ -465,7 +472,7 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
 index entries that `vacuum_heap` left behind (`mvcc.md` §9 / Milestone F3a). After
 the heap prune marks a dead tuple's line pointer `DEAD`, every index entry pointing
 at that TID still lingers (it would resolve to a DEAD slot); this pass deletes those
-entries from the table's **primary-key index and every live secondary index**, so no
+entries from the table's **reserved identity index and every live catalog index**, so no
 index entry resolves to a dead slot before the line pointers are reclaimed
 `DEAD → UNUSED` (F3b). `dead_tids` are exactly `vacuum_heap`'s returned DEAD-root
 TIDs, so a **`REDIRECT` root is never in the set** (it keeps a LIVE index entry that
@@ -543,7 +550,7 @@ mandatory order on one dead-TID set**:
 
 1. `vacuum_heap(schema, horizon)` (F2b) — prune dead-to-all tuples to `DEAD`,
    collecting their TIDs.
-2. `vacuum_indexes(schema, &dead)` (F3a) — strip every PK + secondary index entry for
+2. `vacuum_indexes(schema, &dead)` (F3a) — strip every identity + catalog index entry for
    those TIDs.
 3. `reclaim_line_pointers(schema, &dead)` (F3b) — flip the now entry-free line
    pointers `DEAD → UNUSED`.
@@ -601,9 +608,9 @@ chunks by their MVCC headers.
 `delete(ctx, table, key)` marks the **visible** version of `key` deleted in place
 rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
 
-1. **Locate the visible version.** The primary-key index may carry an entry per
-   version, so `delete` collects the candidate TIDs (`scan_key(key)`), decodes each
-   tuple's physical header, and selects the one visible to the statement's snapshot
+1. **Locate the visible version.** The reserved identity index may carry an entry
+   per version, so `delete` collects the candidate TIDs (`scan_key(key)`), decodes
+   each tuple's physical header, and selects the one visible to the statement's snapshot
    (`ctx.snapshot`/`ctx.txn_id`) via `common::is_visible` — the row the executor
    matched (under snapshot isolation at most one version of a key is visible). If
    none is visible (already deleted, aborted, or absent), the delete affects no row
@@ -630,7 +637,7 @@ rather than tombstoning it (`mvcc.md` §3.2 invariant 1):
    carried through unchanged (no hint bits set here — that is the optional commit
    10). The line pointer **stays `NORMAL`**: the tuple is physically present and is
    hidden purely by visibility once the deleter commits.
-3. **Retain index entries.** No primary-key or secondary index entry is removed.
+3. **Retain index entries.** No identity-index or catalog-index entry is removed.
    The dead version and its entries linger until VACUUM (Milestone F) reclaims them.
 
 This is the first point internal state diverges from a single-version heap: a
@@ -648,9 +655,11 @@ stays hidden and an aborted one (no durable `Commit`) leaves the row visible.
 ### MVCC Update
 
 `update(ctx, table, key, row)` writes a **new heap version** and chains the old
-one to it (Postgres-style, non-HOT; `mvcc.md` §3.2 invariants 1, 3, 5). The
-primary key may not change (a changed PK is a `DatatypeMismatch` error), so the new
-version carries the same PK as the old. The flow is ordered for correct uniqueness:
+one to it (Postgres-style, non-HOT; `mvcc.md` §3.2 invariants 1, 3, 5). A
+primary-key change is allowed and is treated as an indexed-column change: it is
+not HOT-eligible, the replacement storage identity is inserted, and primary-key
+uniqueness is checked before the update succeeds. The flow is ordered for correct
+uniqueness:
 
 1. **Locate the visible old version.** Like `delete`, `update` locates the version
    the statement's snapshot sees via `locate_visible_version(key)` (the candidate
@@ -680,9 +689,9 @@ version carries the same PK as the old. The flow is ordered for correct uniquene
    aborting txn) becomes invisible via CLOG = Aborted and is reclaimed by VACUUM
    (Milestone F). (An early pre-write conflict check to avoid the transient orphan is
    a deferred optimization; the authoritative check stays atomic at stamp time.)
-4. **Insert per-version entries into all indexes.** A new `(key, new_tid)` entry is
-   inserted into the primary-key index and a new `(secondary_key, new_tid)` entry
-   into **every** secondary index — changed-column or not. Because reads do not walk
+4. **Insert per-version entries into all indexes.** A new `(identity_key, new_tid)`
+   entry is inserted into the reserved identity index and a new `(index_key, new_tid)`
+   entry into **every** catalog index — changed-column or not. Because reads do not walk
    `t_ctid` (every version is independently indexed; one entry per version), the new
    TID needs its own entry in every index, or a scan on an unchanged secondary value
    would find only the superseded old version's entry. Skipping unchanged-column
@@ -801,27 +810,49 @@ value.
 
 Serialization uses catalog `TableSchema` column order.
 
-## Primary-Key Index
+## Storage Identity Index
 
 Each table has a durable, non-clustered B+-tree mapping `Key -> RowLocation`, in
 its own file. The heap file id is the table schema's current `storage_id`; the
-primary-key index file id is that same generation id with the high bit set, so it
-never collides with the heap file. `HeapPageStore` writes it to
-`<data>/heap/<storage_id>.idx`. Rows stay in the heap; the tree replaces the
-former in-memory directory.
+primary-key/identity index file id is that same generation id with the high bit
+set, so it never collides with the heap file. `HeapPageStore` writes it to
+`<data>/heap/<storage_id>.idx`. For tables with a primary key, the key is the
+logical primary-key tuple. For tables without a primary key, the key is a hidden
+heap identity derived from the row's root TID. Rows stay in the heap; the tree
+replaces the former in-memory directory.
+
+`ALTER TABLE ... ADD/DROP PRIMARY KEY` changes which key the identity tree uses.
+Before commit, storage validates the existing heap under the exclusive
+maintenance guard: primary-key adds reject NULL key values, duplicate live keys,
+and live HOT chains whose versions would produce different new identity keys
+(`SerializationFailure`, retry after the chain becomes dead-to-all or is vacuumed).
+Committed-deleted predecessor versions that are still retained for older readers
+may share the future primary-key value with their successor; they are indexed for
+visibility but do not count as duplicate live keys.
+After the DDL commit is durable, the identity tree is reset and rebuilt from heap
+rows under the table's identity rewrite gate, so concurrent identity scans cannot
+observe the transient empty or partially rebuilt tree. In normal execution the
+reset and inserts log full-page-image redo for the identity B-tree and the server
+flushes that WAL before checkpoint truncation can run. The committed logical
+`AlterTablePrimaryKey` record is still the recovery source of truth when the
+crash happens before a checkpoint containing the rebuild completes: recovery
+installs primary-key metadata while replaying WAL, defers the derived identity
+rebuild until after all retained WAL records have replayed and crashed writers
+have been marked aborted, and performs that recovery-only rebuild without
+appending WAL.
 
 ### Multi-entry ordering
 
 The B-tree is a **multi-entry** structure ordered by the composite `(key, value)`
-where `value` is the leaf value (the `RowLocation` for the primary-key index).
-**Duplicate user-keys are allowed**, disambiguated and ordered by their value
+where `value` is the leaf value (the `RowLocation` for the identity index).
+**Duplicate logical keys are allowed**, disambiguated and ordered by their value
 bytes (the `IndexValue::encode` form, compared as raw little-endian bytes — a
 stable total order, not necessarily numeric). The tree no longer rejects duplicate
-keys structurally; **primary-key uniqueness is now an engine-level check** (see
-Error Handling and the note below). This is the index-per-version substrate
-(`mvcc.md` §3.2 invariant 3): the primary-key index stores one `RowLocation` per
-physical tuple version, so old versions keep their entries until VACUUM removes
-the dangling TIDs.
+keys structurally; **primary-key uniqueness is an engine-level check** for tables
+that declare one (see Error Handling and the note below). This is the
+index-per-version substrate (`mvcc.md` §3.2 invariant 3): the identity index stores
+one `RowLocation` per physical tuple version, so old versions keep their entries
+until VACUUM removes the dangling TIDs.
 
 - **API.** `insert(txn_id, key, value)` inserts one `(key, value)` entry (duplicate
   keys allowed). `remove(txn_id, key, value)` removes the single matching
@@ -867,9 +898,9 @@ the dangling TIDs.
 - **Update.** MVCC row updates retain old index entries and insert a new
   per-version entry for the new heap TID in every relevant index. The B-tree
   `remove(key, value)` primitive remains available for maintenance/VACUUM-style
-  exact-entry removal, but normal DML does not call it. A row update that would
-  change the primary key itself is rejected by the engine with
-  `SqlState::DatatypeMismatch` (primary-key updates are not supported).
+  exact-entry removal, but normal DML does not call it. A row update that changes
+  the primary key falls back to the non-HOT path and is rejected only if the
+  replacement key violates uniqueness.
 - **Crash safety.** Every node mutation logs a `FullPageImage` and stamps the
   page-LSN, so the index is recovered by the same redo path as the heap and needs
   no rebuild. Mutations are staged in scratch page images and copied into the
@@ -894,10 +925,11 @@ the dangling TIDs.
   value bytes.
 
 **Primary-key uniqueness (visibility/CLOG-aware liveness check).** Because the tree
-no longer rejects duplicate keys, the engine `insert` enforces uniqueness with a
-shared visibility-aware check (`unique_conflict_kind`): it `scan_key(pk)`s the
-primary-key index and, for each candidate TID, reads the *physical* tuple header
-and classifies that version (`common::classify_unique_conflict` →
+no longer rejects duplicate keys, the engine `insert` enforces uniqueness for
+tables with a primary key using a shared visibility-aware check
+(`unique_conflict_kind`): it `scan_key(pk)`s the identity index and, for each
+candidate TID, reads the *physical* tuple header and classifies that version
+(`common::classify_unique_conflict` →
 `UniqueConflict`). The decision is a **liveness ("dirty") check, not a snapshot
 read**: it consults the CLOG (`TxnStatusView`) plus the tuple's `infomask` hint
 bits — never a `Snapshot` — so it sees concurrently in-flight and already-committed
@@ -922,31 +954,32 @@ definite `23505` even if another candidate is only in-flight. A DEAD/UNUSED line
 pointer contributes no conflict. Once versioning stamps `xmax`/writes aborted
 versions, a dead version with the same key no longer blocks a re-insert.
 
-The B-tree is generic over its leaf value type, but every index — primary-key and
-secondary — now stores a fixed-width `RowLocation` (heap TID), so all indexes are
-uniform (see Secondary Indexes). Internally the tree treats values as opaque bytes
+The B-tree is generic over its leaf value type, but every index — identity and
+catalog — stores a fixed-width `RowLocation` (heap TID), so all indexes are
+uniform (see Catalog Indexes). Internally the tree treats values as opaque bytes
 and uses them as the equal-key tiebreaker.
 
-## Secondary Indexes
+## Catalog Indexes
 
-A table may have any number of secondary indexes. Each is its own durable B-tree
+A table may have any number of catalog indexes, including the primary-key
+constraint index when the table declares a primary key. Each is its own durable B-tree
 in its own file, tagged with the top two file-id bits (distinct from the heap and
-the primary-key index) and written to `<data>/heap/<storage_id>.sidx`, where
+the identity index) and written to `<data>/heap/<storage_id>.sidx`, where
 `storage_id` is the secondary index schema's current physical generation. Index
 ids are stable logical catalog identities; storage ids name the current physical
 files and may change on relation-swap truncate.
 
-- **Entry layout.** A secondary index stores `indexed_columns -> RowLocation`
-  (heap TID), uniform with the primary-key index — every index is now
-  `(key → heap TID)`. Reads go secondary index → `RowLocation` → heap, with no
-  primary-key indirection. (Previously secondary indexes stored the primary key
-  and reads chained through the primary-key index; that indirection is removed.)
-- **Key shape.** The secondary key is the encoded indexed column(s) alone; the
+- **Entry layout.** A catalog index stores `indexed_columns -> RowLocation`
+  (heap TID), uniform with the identity index — every index is `(key → heap TID)`.
+  Reads go catalog index → `RowLocation` → heap, with no identity-index
+  indirection. (Previously secondary indexes stored the primary key and reads
+  chained through the storage identity index; that indirection is removed.)
+- **Key shape.** The catalog-index key is the encoded indexed column(s) alone; the
   primary key is no longer embedded. Duplicate indexed values (including multiple
   rows whose indexed value is NULL) coexist as ordinary multi-entry rows,
   disambiguated by the trailing heap TID in the tree's `(key, tid)` ordering. A
-  unique secondary index enforces uniqueness through the **same shared
-  visibility/CLOG-aware liveness check** the primary-key index uses
+  unique catalog index enforces uniqueness through the **same shared
+  visibility/CLOG-aware liveness check** the identity index uses
   (`unique_conflict_kind` / `common::classify_unique_conflict`): it conflicts only
   with an alive-or-potentially-alive version of the key, ignoring dead
   (creator-aborted) and committed-deleted versions. For a non-NULL indexed value it
@@ -962,8 +995,12 @@ files and may change on relation-swap truncate.
   ignores each stored key's trailing TID tiebreaker (the leaf value). An equality
   bound thus matches every row sharing the indexed value, and an inclusive upper
   bound includes all of its rows. Results are returned in index order, each read
-  directly from the heap at its TID. The `StoredRow.key` is recovered from the heap
-  row's primary key.
+  directly from the heap at its TID. The `StoredRow.key` is recovered as the
+  logical primary key for tables with one, or as the hidden heap identity for
+  tables without one. A committed dropped index remains physically scan-readable
+  for statements that planned before the drop; it is excluded from `table_indexes`
+  and therefore no longer maintained by later writes. A rolled-back index create
+  removes storage metadata entirely and remains unscannable.
 - **Entry size.** Before descending or mutating pages, B-tree insertion rejects
   an encoded `(key, value)` that cannot fit in a fresh leaf node or whose future
   internal separator could not fit in a fresh internal node. The error is
@@ -986,13 +1023,13 @@ files and may change on relation-swap truncate.
   not contain it.
   `drop_index` marks the index dropped and leaves its pages in place (accepted
   bloat, like `drop_table`). `drop_table` (and its recovery replay) cascades to
-  mark the table's secondary indexes dropped too; when the table has a hidden
-  TOAST relation, the hidden relation and its secondary indexes are marked
+  mark the table's catalog indexes dropped too; when the table has a hidden
+  TOAST relation, the hidden relation and its catalog indexes are marked
   dropped as metadata as well. This keeps storage's table/index set consistent
   with the catalog's drop-table cascade. The engine learns a table's live
   indexes from the installed index schemas (`install_index_schemas`) plus
   in-session creates.
-- **Crash safety.** Like the primary-key index, every secondary node mutation
+- **Crash safety.** Like the identity index, every catalog-index node mutation
   logs a `FullPageImage` and stamps the page-LSN, so index pages recover through
   the same redo path as the heap. Index *metadata* (which indexes exist) is made
   durable by the `CreateIndex` / `DropIndex` WAL records — replayed into both
@@ -1091,8 +1128,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
   startup/recovery (`install_schemas`, `install_index_schemas`), on `CREATE
   TABLE`, on `CREATE INDEX`, and on `ALTER TABLE ... SET (compression)`: the
   heap file gets `(codec, active_dict_id)` from the table's `compression`
-  setting, and every index file for that table (the primary-key index and
-  every secondary index) gets the SAME codec but **never** the heap's trained
+  setting, and every index file for that table (the identity index and every
+  catalog index) gets the SAME codec but **never** the heap's trained
   dictionary — a heap-trained dictionary does not fit B-tree node content, so
   index files always compress dict-less (or not at all). A file with no
   registered config always writes/reads raw.
@@ -1114,8 +1151,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
   when it shrinks the image, `WalRecordKind::FullPageImage` (raw) otherwise —
   self-describing per record, so the WAL never expands. The five steady-state
   DML/VACUUM sites are:
-  `BTree::log_full_page` (every B-tree node mutation — the primary-key index,
-  every secondary index, and index vacuum's leaf rewrite all share this one
+  `BTree::log_full_page` (every B-tree node mutation — the identity index,
+  every catalog index, and index vacuum's leaf rewrite all share this one
   function), `log_insert` (a heap row's first-touch-since-checkpoint FPI),
   `stamp_xmax_logged` (the `UPDATE`/`DELETE` in-place `xmax`/`t_ctid` stamp's
   first-touch FPI), `apply_prune_plan` (the heap-prune VACUUM pass, F2b/H3),
@@ -1152,8 +1189,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
-  `sample_heap_pages` uses) — of the table's heap file, primary-key index
-  file, and every live secondary-index file, across each file's full current
+  `sample_heap_pages` uses) — of the table's heap file, identity-index file,
+  and every live catalog-index file, across each file's full current
   extent, skipping abandoned fresh-page holes. For each such page, under that
   file's structural latch and the page's buffer-pool write guard, it captures
   the current image, logs it as a single unconditional
@@ -1190,7 +1227,7 @@ Normal data operations append physiological redo records as they mutate pages, s
 
 - A row insert logs `HeapInsert { file_id, page_num, slot, row_bytes }`, or a `FullPageImage` if this is the first modification of the page since the last checkpoint (torn-page protection). A fresh page first logs `HeapInit`.
 - An MVCC row delete logs `HeapUpdateHeader { file_id, page_num, slot, xmax, t_ctid, infomask }` to stamp `xmax` in place on the still-`NORMAL` line pointer (or a `FullPageImage` on first touch); it does not tombstone (see MVCC Delete). An MVCC row update writes a new tuple version through the normal insert/heap-write WAL path, stamps the old version's `xmax`/`t_ctid` with `HeapUpdateHeader` or `FullPageImage`, and inserts new per-version index entries without removing old ones.
-- Each primary-key or secondary index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the primary-key index, and `create_index` initializes and backfills a secondary index, logged the same way.
+- Each identity or catalog index node mutated during the operation logs a `FullPageImage` of that node (the indexes use full-page-image redo throughout). `create_table` initializes the identity index, and `create_index` initializes and backfills a catalog index, logged the same way.
 - `SchemaOperations::create_table` / `drop_table` / `create_index` / `drop_index` log `CreateTable` / `DropTable` / `CreateIndex` / `DropIndex`. Recovery replays each into both the catalog and storage metadata; the index pages come back through the full-page-image redo above.
 - `SchemaOperations::create_sequence` / `drop_sequence` log `CreateSequence` /
   `DropSequence`. Recovery applies them to both catalog and storage sequence
@@ -1216,7 +1253,7 @@ The storage engine can be initialized in recovery mode. In recovery mode:
 - Sequence value records replay via `RecoveryOperations` regardless of CLOG
   status because sequence advancement is non-transactional.
 - No WAL append occurs.
-- The primary-key and secondary indexes are durable on disk, so their pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild. Which indexes exist is reinstalled from the catalog at startup (`install_index_schemas`).
+- The identity and catalog indexes are durable on disk, so their pages are recovered by the same redo (full-page-image records) as the heap; there is no in-memory directory to rebuild. Which catalog indexes exist is reinstalled from the catalog at startup (`install_index_schemas`).
 
 Concrete page-backed storage exports:
 
@@ -1284,7 +1321,7 @@ impl PageBackedStorageEngine {
 }
 ```
 
-`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table, TOAST value-id allocator, and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables and hidden TOAST relations), `install_index_schemas` (secondary indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. In normal mode, `install_schemas` seeds every hidden TOAST relation's in-memory value-id allocator by physically scanning its heap rows (including aborted and in-flight tuples) and setting `next_value_id = 1 + max(value_id)`, or `1` when the relation has no chunks. In recovery mode, `install_schemas` intentionally leaves TOAST allocator entries absent: post-checkpoint physical redo may install additional chunk rows after schema metadata is loaded, so the recovery-to-normal transition reseeds every live hidden TOAST relation after redo has finished and before maintenance or DML can prune rows. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
+`open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table, TOAST value-id allocator, and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables and hidden TOAST relations), `install_index_schemas` (catalog indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. In normal mode, `install_schemas` seeds every hidden TOAST relation's in-memory value-id allocator by physically scanning its heap rows (including aborted and in-flight tuples) and setting `next_value_id = 1 + max(value_id)`, or `1` when the relation has no chunks. In recovery mode, `install_schemas` intentionally leaves TOAST allocator entries absent: post-checkpoint physical redo may install additional chunk rows after schema metadata is loaded, so the recovery-to-normal transition reseeds every live hidden TOAST relation after redo has finished and before maintenance or DML can prune rows. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
 
@@ -1322,7 +1359,7 @@ rows.
 Storage owns a storage-private row preparation helper that converts a logical
 `Row` into row-format v3 bytes for INSERT and the normal non-HOT UPDATE path.
 Index keys are computed from the caller's logical row before physical TOAST
-encoding, so primary and secondary indexes store logical keys rather than TOAST
+encoding, so identity and catalog indexes store logical keys rather than TOAST
 pointers.
 
 Preparation first validates the logical primary-key and live secondary-index
@@ -1406,6 +1443,12 @@ structural writers (a fully-concurrent B-link tree and a free-space map are defe
 `mvcc.md` §12). A per-index / per-heap structural latch held across the *whole*
 operation closes both windows.
 
+`ALTER TABLE ... ADD/DROP PRIMARY KEY` additionally takes a per-table identity
+rewrite gate exclusively while resetting and rebuilding the reserved identity
+B-tree. Normal identity-index reads and inserts take the shared side of that gate,
+so they keep ordinary B-link concurrency with each other but cannot overlap the
+destructive rebuild.
+
 - **Registry.** `PageBackedStorageEngine` holds a registry mapping `FileId →
   Arc<parking_lot::Mutex<()>>` (a `Mutex<HashMap<…>>`, lazily populated).
   `structural_latch(file_id)` locks the registry mutex only **briefly** — to look up
@@ -1461,7 +1504,7 @@ different files can proceed concurrently.
   the shared writer guard, so two writers touching the same heap or index file
   serialize on that file's structural latch while writers on different files
   proceed in parallel.
-- The primary-key index is durable on disk, so nothing is rebuilt after recovery.
+- The identity index is durable on disk, so nothing is rebuilt after recovery.
 - Compaction may be skipped unless a page runs out of free space (and B-tree nodes are never merged).
 - Before any page mutation, storage must obtain a write page guard with `ctx.txn_id`.
 - New pages allocated during a statement are not reclaimed on rollback; their page numbers remain consumed so runtime state matches redo-all recovery.
@@ -1471,10 +1514,11 @@ different files can proceed concurrently.
 ## Error Handling
 
 - Duplicate primary key (committed-live duplicate): `SqlState::UniqueViolation`.
-- Duplicate value in a unique secondary index (insert, update, or backfill, committed-live duplicate): `SqlState::UniqueViolation`.
-- Unique key (primary or secondary) held only by another in-progress inserter — undecidable until that transaction finishes; wait and recheck, surfacing `UniqueViolation` only if the holder commits.
-- Update that changes the primary key: `SqlState::DatatypeMismatch` (primary-key updates are not supported).
-- `index_scan` on a dropped or unknown index: `SqlState::UndefinedTable`.
+- Duplicate value in a unique catalog index (insert, update, or backfill, committed-live duplicate): `SqlState::UniqueViolation`.
+- Unique key (primary or catalog index) held only by another in-progress inserter — undecidable until that transaction finishes; wait and recheck, surfacing `UniqueViolation` only if the holder commits.
+- `index_scan` on an unknown, rolled-back, wrong-table, or dropped-table index:
+  `SqlState::UndefinedTable`. A committed dropped index for a live table remains
+  scan-readable over its retained physical entries but is no longer maintained.
 - Missing update/delete key: return `Ok(false)`.
 - Corrupt page checksum: `ErrorKind::Storage`.
 - Page layout or index invariant violation: `ErrorKind::Storage` or `Internal` depending on source.
@@ -1483,8 +1527,8 @@ different files can proceed concurrently.
 
 - Insert then get returns the row.
 - Duplicate insert fails without changing existing row.
-- Update replaces a row by primary key.
-- Delete removes a row by primary key.
+- Update replaces a row by storage identity key.
+- Delete removes a row by storage identity key.
 - Scan returns all rows with `StoredRow` identity.
 - Range scan returns expected ordered keys.
 - Recovery DDL apply mutates metadata without WAL append.
@@ -1492,12 +1536,13 @@ different files can proceed concurrently.
 - A B-tree splits correctly under variable-length keys (byte-balanced) and stays searchable.
 - After a restart, inserting a row or growing the index never reuses an on-disk page.
 - Failed insert that allocated a new page rolls back newly allocated pages through buffer rollback.
-- Heap, primary-key index, and secondary index files for the same storage id stay distinct.
-- A secondary B-tree stores heap TIDs and a prefix range matches the indexed columns regardless of the trailing TID tiebreaker; an index scan resolves to heap TIDs directly.
+- Heap, identity-index, and catalog-index files for the same numeric id stay distinct.
+- A catalog-index B-tree stores heap TIDs and a prefix range matches the indexed columns regardless of the trailing TID tiebreaker; an index scan resolves to heap TIDs directly.
 - `create_index` backfills existing rows; `index_scan` returns them, and a non-unique index returns every row for a value.
-- Insert, update, and delete keep a secondary index in sync.
+- Insert, update, and delete keep a catalog index in sync.
 - A unique index rejects a duplicate value on insert and on backfill, but allows multiple NULLs.
-- A dropped index is no longer maintained or scannable; a rolled-back create removes it.
+- A dropped index is no longer maintained but retained entries remain scannable for
+  already-planned readers; a rolled-back create removes it.
 - A secondary index is not visible to relation snapshots captured while its physical tree/backfill is still in progress.
 - `create_index` logs a `CreateIndex` record; recovery-apply index methods append no WAL.
-- After a restart, a secondary index created post-checkpoint is replayed (catalog + storage metadata and its rebuilt tree) and remains scannable.
+- After a restart, a catalog index created post-checkpoint is replayed (catalog + storage metadata and its rebuilt tree) and remains scannable.

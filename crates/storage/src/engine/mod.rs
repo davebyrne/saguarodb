@@ -6,6 +6,9 @@
 //! substrate is a per-[`FileId`] registry of `Arc<parking_lot::Mutex<()>>` latches
 //! ([`PageBackedStorageEngine::structural_latch`]); the engine is shared via `Arc`,
 //! so two transactions mutating the same index/heap contend on the same latch.
+//! A separate per-table identity rewrite gate protects the destructive reset/rebuild
+//! used by `ALTER TABLE ... ADD/DROP PRIMARY KEY`: ordinary identity reads and
+//! writes take its shared side, while the rebuild takes its exclusive side.
 //!
 //! The on-disk B-tree splits without latch coupling (it releases the latch between
 //! levels and re-acquires the parent to propagate a split), and heap free-space
@@ -48,7 +51,7 @@ use common::{
     TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TxnStatusView, UniqueConflict, Value,
     WriteConflict, classify_unique_conflict, is_visible, write_conflict,
 };
-use parking_lot::Mutex as PlMutex;
+use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 use crate::btree::BTree;
@@ -71,6 +74,12 @@ use dml::{HotUpdateRequest, StampOutcome};
 pub enum StorageMode {
     Recovery,
     Normal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebuildWalMode {
+    Logged(u64),
+    Unlogged,
 }
 
 /// The transaction id VACUUM stamps on the pages it prunes (`docs/specs/mvcc.md`
@@ -255,6 +264,10 @@ pub struct PageBackedStorageEngine {
     /// globally). Shared across all transactions because the engine is shared via
     /// `Arc`, so two txns mutating the same index/heap contend on the same latch.
     structural_latches: Mutex<HashMap<FileId, Arc<PlMutex<()>>>>,
+    /// Per-table gate for storage-identity tree rewrites. Normal B-link scans and
+    /// inserts take the shared side; ALTER PRIMARY KEY takes the exclusive side
+    /// before resetting and rebuilding the identity tree.
+    identity_rewrite_latches: Mutex<HashMap<TableId, Arc<PlRwLock<()>>>>,
 }
 
 impl std::fmt::Debug for PageBackedStorageEngine {
@@ -305,6 +318,7 @@ impl PageBackedStorageEngine {
                 relation_epoch: 0,
             }),
             structural_latches: Mutex::new(HashMap::new()),
+            identity_rewrite_latches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -325,6 +339,14 @@ impl PageBackedStorageEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(latches.entry(file_id).or_default())
+    }
+
+    fn identity_rewrite_latch(&self, table: TableId) -> Arc<PlRwLock<()>> {
+        let mut latches = self
+            .identity_rewrite_latches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(latches.entry(table).or_default())
     }
 
     pub fn install_schemas(&self, schemas: Vec<TableSchema>) -> Result<()> {
@@ -667,28 +689,27 @@ impl PageBackedStorageEngine {
             ctx,
             relations,
             toast_table_id,
-            &KeyRange::Exact(Key(vec![Value::Integer(pointer.value_id as i64)])),
+            &KeyRange::Exact(toast_value_key_prefix(pointer.value_id)?),
         )?;
-        let mut stream = Vec::with_capacity(pointer.stored_len as usize);
-        let mut expected_seq = 0i64;
+        let mut chunks = BTreeMap::new();
         while let Some(stored) = iter.next()? {
             let (value_id, seq, data) = toast_chunk_parts(&stored.row)?;
-            if value_id != pointer.value_id {
+            if value_id != pointer.value_id || stored.key != toast_chunk_key(value_id, seq)? {
                 return Err(crate::toast::toast_corruption(format!(
-                    "TOAST chunk value_id {value_id} does not match pointer value_id {}",
+                    "TOAST chunk key does not match row for value_id {} seq {seq}",
                     pointer.value_id
                 )));
             }
-            if stored.key
-                != Key(vec![
-                    Value::Integer(pointer.value_id as i64),
-                    Value::Integer(seq),
-                ])
-            {
-                return Err(crate::toast::toast_corruption(
-                    "TOAST chunk primary key does not match row contents",
-                ));
+            if chunks.insert(seq, data).is_some() {
+                return Err(crate::toast::toast_corruption(format!(
+                    "TOAST chunks for value_id {} contain duplicate seq {seq}",
+                    pointer.value_id
+                )));
             }
+        }
+        let mut stream = Vec::with_capacity(pointer.stored_len as usize);
+        let mut expected_seq = 0i64;
+        for (seq, data) in chunks {
             if seq != expected_seq {
                 return Err(crate::toast::toast_corruption(format!(
                     "TOAST chunks for value_id {} are missing, duplicate, or out of order at seq {seq}",
@@ -796,8 +817,10 @@ impl PageBackedStorageEngine {
             .collect())
     }
 
-    /// Check that an index is live and belongs to `table`, erroring otherwise (a
-    /// dropped index keeps its pages as bloat and must not be scanned).
+    /// Check that an index belongs to `table`, erroring if it was never installed
+    /// or belongs elsewhere. Dropped indexes are still physically scan-readable so
+    /// an already-planned statement can finish against retained entries; DML
+    /// maintenance uses `table_indexes`, which filters dropped indexes out.
     fn index_handle(
         &self,
         relations: &PageBackedRelationSnapshot,
@@ -806,7 +829,7 @@ impl PageBackedStorageEngine {
     ) -> Result<IndexHandle> {
         if relations.tables.contains_key(&table) {
             match relations.indexes.get(&index) {
-                Some(index_state) if !index_state.dropped && index_state.schema.table == table => {
+                Some(index_state) if index_state.schema.table == table => {
                     Ok(IndexHandle::new(index_state.clone()))
                 }
                 _ => {
@@ -827,9 +850,7 @@ impl PageBackedStorageEngine {
                     state
                         .indexes
                         .get(&index)
-                        .filter(|index_state| {
-                            !index_state.dropped && index_state.schema.table == table
-                        })
+                        .filter(|index_state| index_state.schema.table == table)
                         .cloned()
                         .map(IndexHandle::new)
                         .ok_or_else(|| undefined_index(index))
@@ -840,7 +861,7 @@ impl PageBackedStorageEngine {
             state
                 .indexes
                 .get(&index)
-                .filter(|index_state| !index_state.dropped && index_state.schema.table == table)
+                .filter(|index_state| index_state.schema.table == table)
                 .cloned()
                 .map(IndexHandle::new)
                 .ok_or_else(|| undefined_index(index))
@@ -913,6 +934,36 @@ impl PageBackedStorageEngine {
             secondary_index_file_id(index.storage_id),
             self.compression.as_ref(),
         )
+    }
+
+    fn insert_storage_identity_entry(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        index_file_id: FileId,
+        key: &Key,
+        location: &RowLocation,
+    ) -> Result<()> {
+        let btree = self.btree(index_file_id);
+        let latch = self.structural_latch(index_file_id);
+        loop {
+            let rewrite_latch = self.identity_rewrite_latch(schema.id);
+            let rewrite_guard = rewrite_latch.read();
+            let guard = latch.lock();
+            if !schema.primary_key.is_empty() {
+                match self.unique_conflict_kind(&btree, key, schema, &ctx.live_txns)? {
+                    UniqueConflict::Violation => return Err(duplicate_primary_key()),
+                    UniqueConflict::WouldBlock(blocker) => {
+                        drop(guard);
+                        drop(rewrite_guard);
+                        self.wait_for_conflict(ctx, blocker)?;
+                        continue;
+                    }
+                    UniqueConflict::None => {}
+                }
+            }
+            return btree.insert(ctx.txn_id, key, location);
+        }
     }
 
     /// Install `schema`'s at-rest file configs into the shared registry: the
@@ -998,6 +1049,265 @@ impl PageBackedStorageEngine {
             }),
         );
         bump_relation_epoch(&mut state);
+        Ok(())
+    }
+
+    /// Validate that the existing heap can be addressed by `schema`'s storage
+    /// identity (logical primary key, or hidden heap identity when empty). This
+    /// performs no page or metadata mutation and is used before the DDL commit.
+    pub fn validate_table_primary_key_change(
+        &self,
+        ctx: &StatementContext,
+        schema: &TableSchema,
+        gc_horizon: u64,
+    ) -> Result<()> {
+        self.storage_identity_entries_for_schema(ctx, schema, gc_horizon)
+            .map(|_| ())
+    }
+
+    /// Install a primary-key ALTER during recovery and rebuild the table identity
+    /// B-tree from heap rows without appending WAL. The rebuild is derived from
+    /// the committed logical DDL record after the WAL replay pass has reached the
+    /// final heap state.
+    pub fn set_table_primary_key(&self, schema: &TableSchema, gc_horizon: u64) -> Result<()> {
+        self.set_table_primary_key_with_rebuild(schema, gc_horizon, RebuildWalMode::Unlogged)
+    }
+
+    /// Install a primary-key ALTER during normal execution and rebuild the table
+    /// identity B-tree with physical full-page-image redo. The caller must flush
+    /// WAL before any checkpoint may truncate the logical ALTER record.
+    pub fn set_table_primary_key_logged(
+        &self,
+        schema: &TableSchema,
+        gc_horizon: u64,
+        txn_id: u64,
+    ) -> Result<()> {
+        self.set_table_primary_key_with_rebuild(schema, gc_horizon, RebuildWalMode::Logged(txn_id))
+    }
+
+    fn set_table_primary_key_with_rebuild(
+        &self,
+        schema: &TableSchema,
+        gc_horizon: u64,
+        wal_mode: RebuildWalMode,
+    ) -> Result<()> {
+        let ctx = StatementContext::new(0);
+        let entries = self.storage_identity_entries_for_schema(&ctx, schema, gc_horizon)?;
+        self.rebuild_storage_identity(schema, &entries, wal_mode)?;
+        self.set_table_primary_key_metadata(schema)
+    }
+
+    pub(crate) fn set_table_primary_key_metadata(&self, schema: &TableSchema) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("state lock poisoned"))?;
+        let dropped = state
+            .tables
+            .get(&schema.id)
+            .filter(|t| !t.dropped)
+            .ok_or_else(|| DbError::internal(format!("table {} is not installed", schema.id)))?
+            .dropped;
+        state.tables.insert(
+            schema.id,
+            Arc::new(TableGeneration {
+                schema: schema.clone(),
+                dropped,
+            }),
+        );
+        bump_relation_epoch(&mut state);
+        Ok(())
+    }
+
+    fn storage_identity_entries_for_schema(
+        &self,
+        ctx: &StatementContext,
+        new_schema: &TableSchema,
+        gc_horizon: u64,
+    ) -> Result<Vec<(Key, RowLocation)>> {
+        let old_schema = {
+            let state = self.lock_state()?;
+            live_table(&state.tables, new_schema.id)?.schema.clone()
+        };
+        let relations = self.capture_pagebacked_relation_snapshot()?;
+        if old_schema.columns.len() != new_schema.columns.len()
+            || old_schema
+                .columns
+                .iter()
+                .zip(&new_schema.columns)
+                .any(|(old, new)| old.id != new.id || old.data_type != new.data_type)
+        {
+            return Err(storage_internal(format!(
+                "table {} primary-key ALTER changed the row layout",
+                new_schema.name
+            )));
+        }
+
+        let mut entries = Vec::new();
+        let mut live_primary_key_rows = HashSet::new();
+        for root in self.heap_identity_roots(&old_schema)? {
+            let versions = self.collect_chain_versions(&old_schema, root)?;
+            let mut live_entries = Vec::new();
+            for (_loc, decoded) in &versions {
+                if common::is_dead_to_all(
+                    decoded.header.xmin,
+                    decoded.header.xmax,
+                    decoded.header.infomask,
+                    gc_horizon,
+                    self.txn_status_view(),
+                ) {
+                    continue;
+                }
+                let row =
+                    self.materialize_physical_row(ctx, &relations, &old_schema, decoded.clone())?;
+                let key = storage_identity_key_for_row(new_schema, &row, root)?;
+                let conflict = classify_unique_conflict(
+                    decoded.header.xmin,
+                    decoded.header.xmax,
+                    decoded.header.infomask,
+                    &ctx.live_txns,
+                    self.txn_status_view(),
+                );
+                if let Some((_existing_key, existing_conflict)) = live_entries
+                    .iter_mut()
+                    .find(|(existing_key, _)| *existing_key == key)
+                {
+                    *existing_conflict = strongest_unique_conflict(*existing_conflict, conflict);
+                } else {
+                    live_entries.push((key, conflict));
+                }
+            }
+
+            if live_entries.len() >= 2 {
+                return Err(DbError::execute(
+                    SqlState::SerializationFailure,
+                    "cannot alter primary key over a live HOT chain with differing key values; \
+                     retry after the transaction ends or after VACUUM",
+                ));
+            }
+            let Some((key, conflict)) = live_entries.into_iter().next() else {
+                continue;
+            };
+            if !new_schema.primary_key.is_empty() {
+                record_primary_key_candidate(&mut live_primary_key_rows, &key, conflict)?;
+            }
+            entries.push((key, root));
+        }
+        Ok(entries)
+    }
+
+    fn heap_identity_roots(&self, schema: &TableSchema) -> Result<Vec<RowLocation>> {
+        let page_count = self.buffer_pool.page_count(schema.id)?;
+        let mut roots = Vec::new();
+        for page_num in 0..page_count {
+            if self.buffer_pool.is_page_abandoned(schema.id, page_num) {
+                continue;
+            }
+            let page_roots = {
+                let guard = self.buffer_pool.read_page(schema.id, page_num)?;
+                if !page::is_initialized(guard.data()) {
+                    Vec::new()
+                } else {
+                    Self::heap_identity_roots_on_page(schema.id, page_num, guard.data())?
+                }
+            };
+            roots.extend(page_roots);
+        }
+        Ok(roots)
+    }
+
+    fn heap_identity_roots_on_page(
+        file_id: FileId,
+        page_num: PageNum,
+        data: &[u8; buffer::PAGE_SIZE],
+    ) -> Result<Vec<RowLocation>> {
+        let slot_count = page::next_slot(data)?;
+        let mut is_member = HashSet::with_capacity(slot_count as usize);
+
+        for slot in 0..slot_count {
+            match page::slot_state(data, slot)? {
+                page::LinePointer::Redirect(target) => {
+                    is_member.insert(target);
+                }
+                page::LinePointer::Normal => {
+                    let Some(bytes) = page::read_row(data, slot)? else {
+                        return Err(storage_internal("normal line pointer has no tuple"));
+                    };
+                    let (_xmin, _xmax, t_ctid, infomask) = decode_mvcc_header(&bytes)?;
+                    if infomask & crate::codec::HOT_UPDATED == 0 {
+                        continue;
+                    }
+                    let (succ_page, succ_slot) = t_ctid;
+                    if succ_page != page_num {
+                        continue;
+                    }
+                    if let page::LinePointer::Normal = page::slot_state(data, succ_slot)? {
+                        let Some(succ_bytes) = page::read_row(data, succ_slot)? else {
+                            return Err(storage_internal("HOT successor is not a live tuple"));
+                        };
+                        let (_x, _xm, _t, succ_infomask) = decode_mvcc_header(&succ_bytes)?;
+                        if succ_infomask & crate::codec::HEAP_ONLY != 0 {
+                            is_member.insert(succ_slot);
+                        }
+                    }
+                }
+                page::LinePointer::Dead | page::LinePointer::Unused => {}
+            }
+        }
+
+        let mut roots = Vec::new();
+        for slot in 0..slot_count {
+            match page::slot_state(data, slot)? {
+                page::LinePointer::Normal => {
+                    if is_member.contains(&slot) {
+                        continue;
+                    }
+                    let Some(bytes) = page::read_row(data, slot)? else {
+                        return Err(storage_internal("normal line pointer has no tuple"));
+                    };
+                    let (_xmin, _xmax, _t_ctid, infomask) = decode_mvcc_header(&bytes)?;
+                    if infomask & crate::codec::HEAP_ONLY != 0 {
+                        continue;
+                    }
+                    roots.push(RowLocation {
+                        file_id,
+                        page_num,
+                        slot_num: slot,
+                    });
+                }
+                page::LinePointer::Redirect(_) => roots.push(RowLocation {
+                    file_id,
+                    page_num,
+                    slot_num: slot,
+                }),
+                page::LinePointer::Dead | page::LinePointer::Unused => {}
+            }
+        }
+        Ok(roots)
+    }
+
+    fn rebuild_storage_identity(
+        &self,
+        schema: &TableSchema,
+        entries: &[(Key, RowLocation)],
+        wal_mode: RebuildWalMode,
+    ) -> Result<()> {
+        let rewrite_latch = self.identity_rewrite_latch(schema.id);
+        let _rewrite_guard = rewrite_latch.write();
+        let index_fid = primary_index_file_id(schema.storage_id);
+        let latch = self.structural_latch(index_fid);
+        let _guard = latch.lock();
+        let btree = self.btree(index_fid);
+        match wal_mode {
+            RebuildWalMode::Logged(txn_id) => btree.reset_to_empty(txn_id)?,
+            RebuildWalMode::Unlogged => btree.reset_to_empty_unlogged()?,
+        }
+        for (key, location) in entries {
+            match wal_mode {
+                RebuildWalMode::Logged(txn_id) => btree.insert(txn_id, key, location)?,
+                RebuildWalMode::Unlogged => btree.insert_unlogged(key, location)?,
+            }
+        }
         Ok(())
     }
 
@@ -1544,16 +1854,14 @@ impl StorageEngine for PageBackedStorageEngine {
         let table_handle = self.table_handle(relations, table)?;
         let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
-        let key = key_for_row(&schema, &row)?;
-        let btree = self.btree(index_fid);
 
         // Write the new heap tuple first (under its own per-heap latch inside
-        // `write_new_row`, released on return), THEN do the primary-key uniqueness
-        // check + index insert atomically under the PK index latch. Writing the heap
-        // row before taking the PK latch keeps the two structural latches disjoint
-        // (rule 1: never two at once). A transiently orphaned heap tuple (if the PK
-        // check below fails) is invisible via CLOG once the txn aborts and reclaimed
-        // by VACUUM — the same orphan-on-conflict handling `update` relies on.
+        // `write_new_row`, released on return), THEN insert the table identity entry
+        // atomically under its index latch. Writing the heap row before taking that
+        // latch keeps the two structural latches disjoint (rule 1: never two at
+        // once). A transiently orphaned heap tuple (if the uniqueness check below
+        // fails) is invisible via CLOG once the txn aborts and reclaimed by VACUUM —
+        // the same orphan-on-conflict handling `update` relies on.
         let row_bytes = self.prepare_row_for_storage(
             ctx,
             relations,
@@ -1562,38 +1870,9 @@ impl StorageEngine for PageBackedStorageEngine {
             &row,
         )?;
         let location = self.write_new_row_bytes(&schema, &row_bytes, ctx.txn_id)?;
+        let key = storage_identity_key_for_row(&schema, &row, location)?;
 
-        // Visibility-aware primary-key uniqueness AND the index insert under ONE hold
-        // of the PK index structural latch (Milestone E2a, the critical atomic
-        // check-and-insert): the multi-entry tree no longer rejects duplicate keys
-        // structurally, so reject only when an alive-or-potentially-alive version
-        // already holds the key (dead/aborted versions do not block a re-insert). A
-        // committed-live duplicate is a definite `UniqueViolation`; a key held only by
-        // another in-progress inserter is undecidable, so we drop the latch, wait, and
-        // re-check. Holding the latch across BOTH the scan and the insert (incl. any
-        // leaf/parent/root split + `set_root`) is what stops two concurrent inserts of
-        // the same key from both passing the check and both inserting.
-        {
-            let latch = self.structural_latch(index_fid);
-            loop {
-                let guard = latch.lock();
-                match self.unique_conflict_kind(&btree, &key, &schema, &ctx.live_txns)? {
-                    UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                    UniqueConflict::None => {
-                        btree.insert(ctx.txn_id, &key, &location)?;
-                        break;
-                    }
-                    // A key held only by an in-progress inserter is undecidable: drop
-                    // the structural latch BEFORE blocking (the holder may itself be
-                    // waiting on this latch, which would deadlock — `docs/specs/deadlock.md`),
-                    // then re-check under a fresh latch (committed ⇒ 23505; aborted ⇒ free).
-                    UniqueConflict::WouldBlock(blocker) => {
-                        drop(guard);
-                        self.wait_for_conflict(ctx, blocker)?;
-                    }
-                }
-            }
-        }
+        self.insert_storage_identity_entry(ctx, &schema, index_fid, &key, &location)?;
 
         for index in self.table_indexes(relations, table)? {
             let (entry_key, has_null) = secondary_index_key(&schema, &index, &row)?;
@@ -1604,7 +1883,8 @@ impl StorageEngine for PageBackedStorageEngine {
         // serializable reader of the table (or a point reader of this key) — the
         // phantom case (`docs/specs/ssi.md` §6). No-op for non-SERIALIZABLE writers; an
         // `Err` is the SSI `40001` victim, aborting this statement.
-        ctx.ssi_tracker.note_write(ctx.txn_id, table, &key)?;
+        let ssi_key = ssi_write_key_for_row(&schema, &row, &key)?;
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, &ssi_key)?;
 
         Ok(RowId {
             page_num: location.page_num,
@@ -1623,10 +1903,15 @@ impl StorageEngine for PageBackedStorageEngine {
         let table_handle = self.table_handle(relations, table)?;
         let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
+        let locations = {
+            let rewrite_latch = self.identity_rewrite_latch(table);
+            let _rewrite_guard = rewrite_latch.read();
+            self.btree(index_fid).scan_key(key)?
+        };
         // The primary-key index may carry entries for several versions of this key
         // once versioning lands (B4); collect every candidate TID and return the
         // single one visible to this snapshot. Today there is one entry per key.
-        for location in self.btree(index_fid).scan_key(key)? {
+        for location in locations {
             if let Some((_resolved, row)) =
                 self.read_visible_row(ctx, relations, &schema, location)?
             {
@@ -1648,16 +1933,25 @@ impl StorageEngine for PageBackedStorageEngine {
         let Some(table_handle) = self.table_handle_opt(relations, table)? else {
             return Ok(false);
         };
+        let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
         let btree = self.btree(index_fid);
         // Locate the single version this statement's snapshot sees (the row the
         // executor matched). If none is visible the key was already deleted or is
         // absent, so the delete affects no row — preserve the no-op semantics.
-        let Some((location, infomask)) =
+        let visible = {
+            let rewrite_latch = self.identity_rewrite_latch(table);
+            let _rewrite_guard = rewrite_latch.read();
             self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
-        else {
+        };
+        let Some((location, infomask)) = visible else {
             return Ok(false);
         };
+        let previous_row = self
+            .read_visible_row(ctx, relations, &schema, location)?
+            .map(|(_resolved, row)| row)
+            .ok_or_else(|| storage_internal("visible row disappeared during delete"))?;
+        let ssi_key = ssi_write_key_for_row(&schema, &previous_row, key)?;
 
         // MVCC delete: stamp xmax on the still-NORMAL line pointer in place. The
         // tuple and *all* its index entries (PK and secondary) are retained — the
@@ -1676,7 +1970,7 @@ impl StorageEngine for PageBackedStorageEngine {
         }
         // SSI: this delete overwrote the row a concurrent serializable reader may have
         // read (`docs/specs/ssi.md` §6).
-        ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
+        ctx.ssi_tracker.note_write(ctx.txn_id, table, &ssi_key)?;
         Ok(true)
     }
 
@@ -1701,19 +1995,19 @@ impl StorageEngine for PageBackedStorageEngine {
         // the *visible* version is what makes the right row the one updated. If none
         // is visible the key was already deleted or is absent, so the update affects
         // no row — preserve the no-op semantics.
-        let Some((previous_location, infomask)) =
+        let visible = {
+            let rewrite_latch = self.identity_rewrite_latch(table);
+            let _rewrite_guard = rewrite_latch.read();
             self.locate_visible_version(&btree, key, &ctx.snapshot, &ctx.live_txns)?
-        else {
+        };
+        let Some((previous_location, infomask)) = visible else {
             return Ok(false);
         };
-        let replacement_key = key_for_row(&schema, &row)?;
-        if &replacement_key != key {
-            return Err(DbError::execute(
-                SqlState::DatatypeMismatch,
-                "primary key updates are not supported",
-            ));
-        }
-
+        let previous_row = self
+            .read_visible_row(ctx, relations, &schema, previous_location)?
+            .map(|(_resolved, row)| row)
+            .ok_or_else(|| storage_internal("visible row disappeared during update"))?;
+        let ssi_keys = ssi_write_keys_for_update(&schema, &previous_row, &row, key)?;
         // HOT-update fast path (`docs/specs/mvcc.md` §10 Milestone H2). When BOTH (a)
         // no indexed column changed and (b) the new tuple fits on the predecessor's
         // own page, write the new version as a heap-only tuple on that page, chain the
@@ -1737,7 +2031,9 @@ impl StorageEngine for PageBackedStorageEngine {
             // SSI: a successful HOT update overwrote the row a concurrent serializable
             // reader may have read (`docs/specs/ssi.md` §6).
             if result {
-                ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
+                for ssi_key in &ssi_keys {
+                    ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
+                }
             }
             return Ok(result);
         }
@@ -1791,37 +2087,18 @@ impl StorageEngine for PageBackedStorageEngine {
             self.wait_for_conflict(ctx, blocker)?;
         }
 
-        // Primary-key entry for the new version, under ONE hold of the PK index
-        // structural latch across the uniqueness check AND the insert (Milestone E2a,
-        // atomic check-and-insert). The key is unchanged (a PK change is rejected
-        // above), so this adds a second `(key, new_tid)` entry alongside the retained
-        // old one. The uniqueness check now sees the old version as own-deleted
-        // (`xmax == ctx.txn_id` ⇒ `UniqueConflict::None`), so the unchanged PK does not
-        // falsely self-conflict; a collision with a *different* committed-live row is a
-        // `UniqueViolation`, and one with another in-progress inserter waits and
-        // re-checks. The latch is taken AFTER the
-        // `stamp_xmax_logged` above (which holds only a frame latch, no structural
-        // latch) and wraps the whole `insert` incl. any split/root-split; it is
-        // released before the secondary inserts each take their own latch (rule 1).
-        {
-            let latch = self.structural_latch(index_fid);
-            loop {
-                let guard = latch.lock();
-                match self.unique_conflict_kind(&btree, key, &schema, &ctx.live_txns)? {
-                    UniqueConflict::Violation => return Err(duplicate_primary_key()),
-                    UniqueConflict::None => {
-                        btree.insert(ctx.txn_id, key, &new_location)?;
-                        break;
-                    }
-                    // Drop the structural latch before blocking on the in-progress
-                    // holder, then re-check (`docs/specs/deadlock.md`).
-                    UniqueConflict::WouldBlock(blocker) => {
-                        drop(guard);
-                        self.wait_for_conflict(ctx, blocker)?;
-                    }
-                }
-            }
-        }
+        // New non-HOT versions get their own identity entry. For PK tables that is
+        // the logical primary-key value; for no-PK tables it is the hidden heap key.
+        // Old identity entries are retained until VACUUM, like every other MVCC
+        // index entry.
+        let replacement_key = storage_identity_key_for_row(&schema, &row, new_location)?;
+        self.insert_storage_identity_entry(
+            ctx,
+            &schema,
+            index_fid,
+            &replacement_key,
+            &new_location,
+        )?;
 
         // A new per-version entry for the new tuple in *every* secondary index
         // (changed-column or not), pointing at `new_location`. Old entries are
@@ -1836,7 +2113,9 @@ impl StorageEngine for PageBackedStorageEngine {
 
         // SSI: the non-HOT update overwrote the row a concurrent serializable reader
         // may have read (`docs/specs/ssi.md` §6).
-        ctx.ssi_tracker.note_write(ctx.txn_id, table, key)?;
+        for ssi_key in &ssi_keys {
+            ctx.ssi_tracker.note_write(ctx.txn_id, table, ssi_key)?;
+        }
         Ok(true)
     }
 
@@ -1860,7 +2139,11 @@ impl StorageEngine for PageBackedStorageEngine {
         let table_handle = self.table_handle(relations, table)?;
         let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
-        let entries = self.btree(index_fid).range(range)?;
+        let entries = {
+            let rewrite_latch = self.identity_rewrite_latch(table);
+            let _rewrite_guard = rewrite_latch.read();
+            self.btree(index_fid).range(range)?
+        };
 
         let mut rows = Vec::with_capacity(entries.len());
         for (key, location) in entries {
@@ -1924,10 +2207,12 @@ impl StorageEngine for PageBackedStorageEngine {
             else {
                 continue;
             };
-            // The row's primary key is recovered from the heap row, preserving the
-            // `StoredRow.key` semantics callers relied on under secondary→PK. The
-            // `RowId` is the resolved live version, not the index TID.
-            let key = key_for_row(&schema, &row)?;
+            // Secondary entries point at the indexed root TID. For PK tables the
+            // executor identity remains the logical primary key; for no-PK tables it is
+            // the hidden heap key derived from that root TID. HOT chains preserve the
+            // root identity; non-HOT versions have their own secondary entry and own
+            // identity.
+            let key = storage_identity_key_for_row(&schema, &row, location)?;
             rows.push(StoredRow {
                 row_id: RowId {
                     page_num: resolved.page_num,
@@ -2637,19 +2922,10 @@ fn committed_change_retired_index(
     }
 }
 
-pub(crate) fn key_for_row(schema: &TableSchema, row: &Row) -> Result<Key> {
-    let mut values = Vec::with_capacity(schema.primary_key.len());
-    for primary_key in &schema.primary_key {
-        let value = column_value(schema, row, *primary_key)?;
-        if matches!(value, Value::Null) {
-            return Err(DbError::execute(
-                SqlState::NotNullViolation,
-                "primary key cannot be NULL",
-            ));
-        }
-        values.push(value);
-    }
-    Ok(Key(values))
+fn storage_key_for_location(location: RowLocation) -> Key {
+    let page = i64::from(location.page_num);
+    let slot = i64::from(location.slot_num);
+    Key(vec![Value::Integer((page << 16) | slot)])
 }
 
 /// The value of column `column_id` in `row`, located by the schema's column
@@ -2666,6 +2942,69 @@ fn column_value(schema: &TableSchema, row: &Row, column_id: ColumnId) -> Result<
         .ok_or_else(|| storage_internal("row is missing a column value"))
 }
 
+fn row_key_for_columns(
+    table: &TableSchema,
+    columns: &[ColumnId],
+    row: &Row,
+) -> Result<(Key, bool)> {
+    let mut values = Vec::with_capacity(columns.len());
+    let mut has_null = false;
+    for column_id in columns {
+        let value = column_value(table, row, *column_id)?;
+        has_null |= matches!(value, Value::Null);
+        values.push(value);
+    }
+    Ok((Key(values), has_null))
+}
+
+fn storage_identity_key_for_row(
+    schema: &TableSchema,
+    row: &Row,
+    location: RowLocation,
+) -> Result<Key> {
+    if schema.primary_key.is_empty() {
+        return Ok(storage_key_for_location(location));
+    }
+    primary_key_for_row(schema, row)
+}
+
+fn primary_key_for_row(schema: &TableSchema, row: &Row) -> Result<Key> {
+    let (key, has_null) = row_key_for_columns(schema, &schema.primary_key, row)?;
+    if has_null {
+        return Err(DbError::storage(
+            SqlState::NotNullViolation,
+            "primary key column cannot be NULL",
+        ));
+    }
+    Ok(key)
+}
+
+fn ssi_write_key_for_row(schema: &TableSchema, row: &Row, fallback: &Key) -> Result<Key> {
+    if schema.primary_key.is_empty() {
+        Ok(fallback.clone())
+    } else {
+        primary_key_for_row(schema, row)
+    }
+}
+
+fn ssi_write_keys_for_update(
+    schema: &TableSchema,
+    previous_row: &Row,
+    new_row: &Row,
+    fallback: &Key,
+) -> Result<Vec<Key>> {
+    if schema.primary_key.is_empty() {
+        return Ok(vec![fallback.clone()]);
+    }
+    let previous_key = ssi_write_key_for_row(schema, previous_row, fallback)?;
+    let new_key = ssi_write_key_for_row(schema, new_row, fallback)?;
+    if previous_key == new_key {
+        Ok(vec![previous_key])
+    } else {
+        Ok(vec![previous_key, new_key])
+    }
+}
+
 /// The secondary-index B-tree key for `row`: just the encoded indexed column(s).
 /// The primary key is no longer embedded — duplicate secondary keys are
 /// disambiguated by the heap TID in the tree's `(key, tid)` ordering. Returns the
@@ -2674,14 +3013,7 @@ fn column_value(schema: &TableSchema, row: &Row, column_id: ColumnId) -> Result<
 /// participates in a unique constraint; distinct NULL rows coexist via their
 /// differing TIDs).
 fn secondary_index_key(table: &TableSchema, index: &IndexSchema, row: &Row) -> Result<(Key, bool)> {
-    let mut values = Vec::with_capacity(index.columns.len());
-    let mut has_null = false;
-    for column_id in &index.columns {
-        let value = column_value(table, row, *column_id)?;
-        has_null |= matches!(value, Value::Null);
-        values.push(value);
-    }
-    Ok((Key(values), has_null))
+    row_key_for_columns(table, &index.columns, row)
 }
 
 fn pagebacked_relations(relations: &dyn RelationSnapshot) -> Result<&PageBackedRelationSnapshot> {
@@ -2818,6 +3150,24 @@ fn toast_chunk_parts(row: &Row) -> Result<(u64, i64, Vec<u8>)> {
     Ok((value_id, seq, data))
 }
 
+fn toast_value_key_prefix(value_id: u64) -> Result<Key> {
+    let value_id = i64::try_from(value_id).map_err(|_| {
+        crate::toast::toast_corruption(format!("TOAST value_id {value_id} is invalid"))
+    })?;
+    if value_id <= 0 {
+        return Err(crate::toast::toast_corruption(format!(
+            "TOAST value_id {value_id} is invalid"
+        )));
+    }
+    Ok(Key(vec![Value::Integer(value_id)]))
+}
+
+fn toast_chunk_key(value_id: u64, seq: i64) -> Result<Key> {
+    let mut values = toast_value_key_prefix(value_id)?.0;
+    values.push(Value::Integer(seq));
+    Ok(Key(values))
+}
+
 fn mark_table_dropped(state: &mut StorageState, txn_id: u64, table: TableId) {
     record_table_before(state, txn_id, table);
     let is_toast_relation = state.tables.get(&table).is_some_and(|table_state| {
@@ -2952,8 +3302,46 @@ fn duplicate_unique_index(name: &str) -> DbError {
     )
 }
 
+fn strongest_unique_conflict(left: UniqueConflict, right: UniqueConflict) -> UniqueConflict {
+    match (left, right) {
+        (UniqueConflict::Violation, _) | (_, UniqueConflict::Violation) => {
+            UniqueConflict::Violation
+        }
+        (UniqueConflict::WouldBlock(blocker), _) | (_, UniqueConflict::WouldBlock(blocker)) => {
+            UniqueConflict::WouldBlock(blocker)
+        }
+        (UniqueConflict::None, UniqueConflict::None) => UniqueConflict::None,
+    }
+}
+
+fn record_primary_key_candidate(
+    live_primary_key_rows: &mut HashSet<Key>,
+    key: &Key,
+    conflict: UniqueConflict,
+) -> Result<()> {
+    match conflict {
+        UniqueConflict::None => Ok(()),
+        UniqueConflict::Violation => {
+            if live_primary_key_rows.insert(key.clone()) {
+                Ok(())
+            } else {
+                Err(duplicate_primary_key())
+            }
+        }
+        UniqueConflict::WouldBlock(blocker) => Err(DbError::execute(
+            SqlState::SerializationFailure,
+            format!(
+                "cannot alter primary key while transaction {blocker} may hold a conflicting key; retry after it ends"
+            ),
+        )),
+    }
+}
+
 fn duplicate_primary_key() -> DbError {
-    DbError::storage(SqlState::UniqueViolation, "duplicate primary key")
+    DbError::storage(
+        SqlState::UniqueViolation,
+        "duplicate key value violates primary key",
+    )
 }
 
 fn relation_generation_write_conflict(table: TableId) -> DbError {

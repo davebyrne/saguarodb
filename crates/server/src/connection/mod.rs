@@ -645,45 +645,14 @@ fn command_complete_tag(command: &str, count: u64) -> String {
 fn error_response(err: &DbError) -> ServerMessage {
     ServerMessage::ErrorResponse {
         severity: "ERROR".to_string(),
-        code: sqlstate_code(err.code).to_string(),
+        code: err.code.code().to_string(),
         message: err.message.clone(),
     }
 }
 
+#[cfg(test)]
 fn sqlstate_code(code: SqlState) -> &'static str {
-    match code {
-        SqlState::SuccessfulCompletion => "00000",
-        SqlState::SyntaxError => "42601",
-        SqlState::UndefinedTable => "42P01",
-        SqlState::InvalidSchemaName => "3F000",
-        SqlState::UndefinedColumn => "42703",
-        SqlState::UndefinedObject => "42704",
-        SqlState::InvalidColumnReference => "42P10",
-        SqlState::DuplicateTable => "42P07",
-        SqlState::DatatypeMismatch => "42804",
-        SqlState::DivisionByZero => "22012",
-        SqlState::InvalidParameterValue => "22023",
-        SqlState::NumericValueOutOfRange => "22003",
-        SqlState::StringDataRightTruncation => "22001",
-        SqlState::InvalidTextRepresentation => "22P02",
-        SqlState::BadCopyFileFormat => "22P04",
-        SqlState::NotNullViolation => "23502",
-        SqlState::UniqueViolation => "23505",
-        SqlState::CheckViolation => "23514",
-        SqlState::CardinalityViolation => "21000",
-        SqlState::DependentObjectsStillExist => "2BP01",
-        SqlState::ObjectNotInPrerequisiteState => "55000",
-        SqlState::QueryCanceled => "57014",
-        SqlState::FeatureNotSupported => "0A000",
-        SqlState::InFailedSqlTransaction => "25P02",
-        SqlState::NoActiveSqlTransaction => "25P01",
-        SqlState::InvalidSavepointSpecification => "3B001",
-        SqlState::ProgramLimitExceeded => "54000",
-        SqlState::SerializationFailure => "40001",
-        SqlState::DeadlockDetected => "40P01",
-        SqlState::IoError => "58030",
-        SqlState::InternalError => "XX000",
-    }
+    code.code()
 }
 
 #[cfg(test)]

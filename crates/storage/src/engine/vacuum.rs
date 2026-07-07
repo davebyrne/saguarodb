@@ -762,30 +762,22 @@ impl PageBackedStorageEngine {
                     "TOAST value_id {value_id} is invalid"
                 )));
             }
-            let prefix = Key(vec![Value::Integer(value_id as i64)]);
             let mut iter = <Self as StorageEngine>::scan_range(
                 self,
                 ctx,
                 &relations,
                 toast_table_id,
-                &KeyRange::Exact(prefix),
+                &KeyRange::Exact(toast_value_key_prefix(value_id)?),
             )?;
             let mut keys = Vec::new();
             while let Some(stored) = iter.next()? {
                 let (row_value_id, seq, _data) = toast_chunk_parts(&stored.row)?;
-                if row_value_id != value_id {
+                if row_value_id != value_id || stored.key != toast_chunk_key(row_value_id, seq)? {
                     return Err(crate::toast::toast_corruption(format!(
-                        "TOAST chunk value_id {row_value_id} does not match requested value_id {value_id}"
+                        "TOAST chunk key does not match row for value_id {value_id} seq {seq}"
                     )));
                 }
-                let key = Key(vec![Value::Integer(value_id as i64), Value::Integer(seq)]);
-                if stored.key != key {
-                    return Err(crate::toast::toast_corruption(format!(
-                        "TOAST chunk key {:?} does not match row value_id {value_id} seq {seq}",
-                        stored.key
-                    )));
-                }
-                keys.push(key);
+                keys.push(stored.key);
             }
             for key in keys {
                 if <Self as StorageEngine>::delete(self, ctx, &relations, toast_table_id, &key)? {

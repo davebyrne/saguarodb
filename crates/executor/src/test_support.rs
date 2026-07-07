@@ -1,10 +1,10 @@
 use catalog::{CatalogManager, MemoryCatalog};
 use common::{
-    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexId, IndexSchema, Key, KeyRange,
-    ParsedColumnDef, Result, Row, RowId, SqlState, StatementContext, StoredRow, TableId,
-    TableSchema, Value,
+    ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexConstraintKind, IndexId,
+    IndexSchema, Key, KeyRange, ParsedColumnDef, Result, Row, RowId, SqlState, StatementContext,
+    StoredRow, TableId, TableSchema, Value,
 };
-use planner::{PhysicalPlan, bind, logical_plan, physical_plan};
+use planner::{PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
@@ -50,6 +50,18 @@ impl ExecutorHarness {
         let storage = MemoryStorage::empty();
         storage
             .create_table(&StatementContext::new(0), &schema)
+            .unwrap();
+        let primary_key = catalog
+            .create_index_with_constraint(
+                "users_pkey".to_string(),
+                "users",
+                &["id".to_string()],
+                true,
+                IndexConstraintKind::PrimaryKey,
+            )
+            .unwrap();
+        storage
+            .create_index(&StatementContext::new(0), &primary_key, 0)
             .unwrap();
         Self {
             catalog,
@@ -101,6 +113,14 @@ impl ExecutorHarness {
             ExecutionResult::Query { rows, .. } => Ok(rows),
             _ => Err(common::DbError::internal("expected query result")),
         }
+    }
+
+    pub fn explain_plan(&self, sql: &str) -> Result<String> {
+        let statement = parser::parse(sql)?;
+        let bound = bind(&statement, &self.catalog)?;
+        let logical = logical_plan(&bound)?;
+        let physical = physical_plan(&logical, &self.catalog)?;
+        Ok(format_explain(&physical))
     }
 
     /// Stream a read query through `execute_query_streamed`, driving the provided
@@ -208,6 +228,14 @@ impl ExecutorHarness {
         }
         Ok(bytes)
     }
+
+    pub fn storage_keys(&self, table: &str) -> Result<Vec<Key>> {
+        let schema = self
+            .catalog
+            .get_table_by_name(table)?
+            .ok_or_else(|| undefined_table_by_name(table))?;
+        self.storage.keys_for_table(schema.id)
+    }
 }
 
 fn is_read_plan(plan: &PhysicalPlan) -> bool {
@@ -235,6 +263,7 @@ struct MemoryStorageState {
     schemas: BTreeMap<TableId, TableSchema>,
     indexes: BTreeMap<IndexId, IndexSchema>,
     rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
+    next_key: i64,
     savepoints: BTreeMap<u64, MemoryStorageSnapshot>,
 }
 
@@ -243,11 +272,24 @@ struct MemoryStorageSnapshot {
     schemas: BTreeMap<TableId, TableSchema>,
     indexes: BTreeMap<IndexId, IndexSchema>,
     rows: BTreeMap<TableId, BTreeMap<Key, Row>>,
+    next_key: i64,
 }
 
 impl MemoryStorage {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    pub fn keys_for_table(&self, table: TableId) -> Result<Vec<Key>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("storage lock poisoned"))?;
+        Ok(state
+            .rows
+            .get(&table)
+            .map(|rows| rows.keys().cloned().collect())
+            .unwrap_or_default())
     }
 }
 
@@ -285,13 +327,11 @@ impl StorageEngine for MemoryStorage {
             .get(&table)
             .cloned()
             .ok_or_else(|| undefined_table(table))?;
-        let key = key_for_row(&schema, &row)?;
+        let key = storage_identity_key_for_insert(&mut state, &schema, &row)?;
+        validate_unique_indexes(&state, &schema, None, &row)?;
         let rows = state.rows.entry(table).or_default();
         if rows.contains_key(&key) {
-            return Err(DbError::storage(
-                SqlState::UniqueViolation,
-                "duplicate primary key",
-            ));
+            return Err(duplicate_storage_identity_error(&schema));
         }
         let row_id = row_id_for_len(rows.len())?;
         rows.insert(key, row);
@@ -353,20 +393,20 @@ impl StorageEngine for MemoryStorage {
             .get(&table)
             .cloned()
             .ok_or_else(|| undefined_table(table))?;
-        let replacement_key = key_for_row(&schema, &row)?;
-        if &replacement_key != key {
-            return Err(DbError::execute(
-                SqlState::DatatypeMismatch,
-                "primary key updates are not supported",
-            ));
-        }
+        let replacement_key = storage_identity_key_for_update(&schema, key, &row)?;
+        validate_unique_indexes(&state, &schema, Some(key), &row)?;
         let Some(rows) = state.rows.get_mut(&table) else {
             return Ok(false);
         };
         if !rows.contains_key(key) {
             return Ok(false);
         }
-        rows.insert(key.clone(), row);
+        if &replacement_key != key && rows.contains_key(&replacement_key) {
+            return Err(duplicate_storage_identity_error(&schema));
+        }
+        rows.remove(key)
+            .ok_or_else(|| DbError::internal("row disappeared during test update"))?;
+        rows.insert(replacement_key, row);
         Ok(true)
     }
 
@@ -492,6 +532,7 @@ impl StorageEngine for MemoryStorage {
             state.schemas = snapshot.schemas;
             state.indexes = snapshot.indexes;
             state.rows = snapshot.rows;
+            state.next_key = snapshot.next_key;
         }
         Ok(())
     }
@@ -578,6 +619,7 @@ fn begin_txn(state: &mut MemoryStorageState, txn_id: u64) {
             schemas: state.schemas.clone(),
             indexes: state.indexes.clone(),
             rows: state.rows.clone(),
+            next_key: state.next_key,
         },
     );
 }
@@ -602,35 +644,85 @@ impl RowIterator for MemoryRowIterator {
     }
 }
 
-fn key_for_row(schema: &TableSchema, row: &Row) -> Result<Key> {
-    let primary_key = schema
-        .primary_key
-        .first()
-        .ok_or_else(|| DbError::internal("table has no primary key"))?;
-    let slot = schema
-        .columns
-        .iter()
-        .position(|column| column.id == *primary_key)
-        .ok_or_else(|| DbError::internal("primary key column is missing"))?;
-    let value = row
-        .values
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| DbError::internal("row is missing primary key slot"))?;
-    if matches!(value, Value::Null) {
-        return Err(DbError::execute(
-            SqlState::NotNullViolation,
-            "primary key cannot be NULL",
-        ));
-    }
-    Ok(Key(vec![value]))
-}
-
 fn stored_rows(rows: &BTreeMap<Key, Row>) -> Vec<StoredRow> {
     rows.iter()
         .enumerate()
         .map(|(index, (key, row))| stored_row(index, key, row))
         .collect()
+}
+
+fn allocate_storage_key(state: &mut MemoryStorageState) -> Result<Key> {
+    state.next_key = state
+        .next_key
+        .checked_add(1)
+        .ok_or_else(|| DbError::internal("test storage key overflow"))?;
+    Ok(Key(vec![Value::Integer(state.next_key)]))
+}
+
+fn storage_identity_key_for_insert(
+    state: &mut MemoryStorageState,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<Key> {
+    if schema.primary_key.is_empty() {
+        return allocate_storage_key(state);
+    }
+    primary_key_for_row(schema, row)
+}
+
+fn storage_identity_key_for_update(schema: &TableSchema, current: &Key, row: &Row) -> Result<Key> {
+    if schema.primary_key.is_empty() {
+        return Ok(current.clone());
+    }
+    primary_key_for_row(schema, row)
+}
+
+fn primary_key_for_row(schema: &TableSchema, row: &Row) -> Result<Key> {
+    let (key, has_null) = row_key_for_columns(schema, &schema.primary_key, row)?;
+    if has_null {
+        return Err(DbError::storage(
+            SqlState::NotNullViolation,
+            "primary key column cannot be NULL",
+        ));
+    }
+    Ok(key)
+}
+
+fn validate_unique_indexes(
+    state: &MemoryStorageState,
+    schema: &TableSchema,
+    current_key: Option<&Key>,
+    candidate: &Row,
+) -> Result<()> {
+    for index in state
+        .indexes
+        .values()
+        .filter(|index| index.table == schema.id && index.unique)
+    {
+        let (candidate_key, has_null) = row_key_for_columns(schema, &index.columns, candidate)?;
+        if has_null {
+            continue;
+        }
+        let Some(rows) = state.rows.get(&schema.id) else {
+            continue;
+        };
+        for (key, row) in rows {
+            if current_key == Some(key) {
+                continue;
+            }
+            if index_key(schema, index, row)? == candidate_key {
+                return Err(DbError::storage(
+                    SqlState::UniqueViolation,
+                    if index.constraint == IndexConstraintKind::PrimaryKey {
+                        "duplicate primary key"
+                    } else {
+                        "duplicate key value violates unique index"
+                    },
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stored_row(index: usize, key: &Key, row: &Row) -> StoredRow {
@@ -667,6 +759,29 @@ fn column_info(schema: &TableSchema) -> Vec<ColumnInfo> {
 }
 
 fn key_in_range(key: &Key, range: &KeyRange) -> bool {
+    let prefix_len = comparison_prefix_len(range);
+    let prefix = prefix_of(key, prefix_len);
+    let compared = prefix.as_ref().unwrap_or(key);
+    key_prefix_in_range(compared, range)
+}
+
+fn comparison_prefix_len(range: &KeyRange) -> usize {
+    let bound_len = |bound: &Bound<Key>| match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key.0.len()),
+        Bound::Unbounded => None,
+    };
+    match range {
+        KeyRange::All => 0,
+        KeyRange::Exact(key) => key.0.len(),
+        KeyRange::Range { start, end } => bound_len(start).or_else(|| bound_len(end)).unwrap_or(0),
+    }
+}
+
+fn prefix_of(key: &Key, len: usize) -> Option<Key> {
+    (len < key.0.len()).then(|| Key(key.0[..len].to_vec()))
+}
+
+fn key_prefix_in_range(key: &Key, range: &KeyRange) -> bool {
     match range {
         KeyRange::All => true,
         KeyRange::Exact(exact) => key == exact,
@@ -699,6 +814,13 @@ fn undefined_table(table: TableId) -> DbError {
     )
 }
 
+fn undefined_table_by_name(table: &str) -> DbError {
+    DbError::storage(
+        SqlState::UndefinedTable,
+        format!("table {table} does not exist"),
+    )
+}
+
 fn undefined_index(index: IndexId) -> DbError {
     DbError::storage(
         SqlState::UndefinedTable,
@@ -707,8 +829,18 @@ fn undefined_index(index: IndexId) -> DbError {
 }
 
 fn index_key(schema: &TableSchema, index: &IndexSchema, row: &Row) -> Result<Key> {
-    let mut values = Vec::with_capacity(index.columns.len());
-    for column_id in &index.columns {
+    let (key, _has_null) = row_key_for_columns(schema, &index.columns, row)?;
+    Ok(key)
+}
+
+fn row_key_for_columns(
+    schema: &TableSchema,
+    columns: &[ColumnId],
+    row: &Row,
+) -> Result<(Key, bool)> {
+    let mut values = Vec::with_capacity(columns.len());
+    let mut has_null = false;
+    for column_id in columns {
         let slot = schema
             .columns
             .iter()
@@ -719,7 +851,19 @@ fn index_key(schema: &TableSchema, index: &IndexSchema, row: &Row) -> Result<Key
             .get(slot)
             .cloned()
             .ok_or_else(|| DbError::internal("row is missing an index column"))?;
+        has_null |= matches!(value, Value::Null);
         values.push(value);
     }
-    Ok(Key(values))
+    Ok((Key(values), has_null))
+}
+
+fn duplicate_storage_identity_error(schema: &TableSchema) -> DbError {
+    DbError::storage(
+        SqlState::UniqueViolation,
+        if schema.primary_key.is_empty() {
+            "duplicate storage identity"
+        } else {
+            "duplicate primary key"
+        },
+    )
 }
