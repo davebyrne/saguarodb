@@ -130,7 +130,7 @@ impl Fixture {
             .index_handle(&relations, TABLE_ID, index_id)
             .unwrap();
         self.engine
-            .secondary_btree(&index)
+            .secondary_btree(&index.schema)
             .scan_key(&Key(vec![Value::Text(name.to_string())]))
             .unwrap()
     }

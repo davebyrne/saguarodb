@@ -618,6 +618,46 @@ fn published_truncate_files_are_not_removed_by_later_rollback_cleanup() {
 }
 
 #[test]
+fn table_handle_fallback_pins_current_generation() {
+    let fixture = Fixture::new();
+    let mut old_relations = fixture
+        .engine
+        .capture_pagebacked_relation_snapshot()
+        .unwrap();
+    old_relations.tables.remove(&TABLE_ID);
+
+    let handle = fixture
+        .engine
+        .table_handle(&old_relations, TABLE_ID)
+        .unwrap();
+
+    assert!(
+        Arc::strong_count(&handle._generation) >= 2,
+        "fallback table handle must pin the current generation while files are used"
+    );
+}
+
+#[test]
+fn index_handle_fallback_pins_current_generation() {
+    let fixture = Fixture::new();
+    let mut old_relations = fixture
+        .engine
+        .capture_pagebacked_relation_snapshot()
+        .unwrap();
+    old_relations.indexes.remove(&NAME_INDEX_ID);
+
+    let handle = fixture
+        .engine
+        .index_handle(&old_relations, TABLE_ID, NAME_INDEX_ID)
+        .unwrap();
+
+    assert!(
+        Arc::strong_count(&handle._generation) >= 2,
+        "fallback index handle must pin the current generation while files are used"
+    );
+}
+
+#[test]
 fn rollback_of_published_create_index_retires_snapshot_held_file() {
     let fixture = Fixture::new();
     let row = user_row(1, "alice", "snapshot note");

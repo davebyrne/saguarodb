@@ -661,31 +661,40 @@ impl BufferPool for MemoryBufferPool {
     }
 
     fn flush_dirty_pages(&self) -> Result<()> {
-        // Reserve dirty frames under the lock, then do I/O without holding it.
-        // `evicting` is the pool's "in transition" bit: accessors, eviction, and
-        // file discard all treat it as unavailable, so a relation-generation cleanup
-        // cannot delete a file while checkpoint has cloned frames for that file and
-        // is about to write them.
-        let dirty: Vec<Arc<Frame>> = {
-            let state = self.state.lock();
-            let mut dirty = Vec::new();
-            for frame in state.frames.values() {
-                if !frame.is_dirty() {
-                    continue;
+        // Reserve every dirty frame under the pool lock, then do I/O without
+        // holding it. `evicting` is the pool's "in transition" bit: accessors,
+        // eviction, and file discard all treat it as unavailable, so a
+        // relation-generation cleanup cannot delete a file while checkpoint has
+        // cloned frames for that file and is about to write them.
+        //
+        // Reader pins are not a reason to fail checkpoint: a reader holds a shared
+        // data latch, and checkpoint can take another shared latch to clone a stable
+        // page image. A concurrent dirty eviction is transient; wait and retry so
+        // the caller never follows a partial flush with `mark_all_clean`.
+        let dirty: Vec<Arc<Frame>> = loop {
+            let mut retry = false;
+            let dirty = {
+                let state = self.state.lock();
+                let mut dirty = Vec::new();
+                for frame in state.frames.values() {
+                    if !frame.is_dirty() {
+                        continue;
+                    }
+                    if frame.evicting.swap(true, Ordering::AcqRel) {
+                        dirty.iter().for_each(|reserved: &Arc<Frame>| {
+                            reserved.evicting.store(false, Ordering::Release);
+                        });
+                        retry = true;
+                        break;
+                    }
+                    dirty.push(frame.clone());
                 }
-                if frame.pin_count.load(Ordering::Acquire) != 0
-                    || frame.evicting.swap(true, Ordering::AcqRel)
-                {
-                    dirty.iter().for_each(|reserved: &Arc<Frame>| {
-                        reserved.evicting.store(false, Ordering::Release);
-                    });
-                    return Err(Self::storage_internal_error(
-                        "checkpoint encountered a dirty page in transition",
-                    ));
-                }
-                dirty.push(frame.clone());
+                dirty
+            };
+            if !retry {
+                break dirty;
             }
-            dirty
+            std::thread::yield_now();
         };
         let flush_result = (|| {
             for frame in &dirty {
@@ -1655,6 +1664,27 @@ mod tests {
 
         pool.flush_dirty_pages().unwrap();
 
+        let writes = store.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, 1);
+        assert_eq!(writes[0].1, 0);
+        assert_eq!(writes[0].2.0[0], 42);
+    }
+
+    #[test]
+    fn flush_dirty_pages_writes_reader_pinned_dirty_page() {
+        let store = Arc::new(CapturingStore::default());
+        let pool = MemoryBufferPool::new(8, Box::new(FlushAll), store.clone());
+        {
+            let mut page = pool.new_page(1, 5).unwrap();
+            page.data_mut()[0] = 42;
+        }
+        pool.commit(5).unwrap();
+        let read = pool.read_page(1, 0).unwrap();
+
+        pool.flush_dirty_pages().unwrap();
+
+        assert_eq!(read.data()[0], 42);
         let writes = store.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, 1);

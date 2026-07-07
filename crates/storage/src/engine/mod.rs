@@ -144,6 +144,36 @@ struct IndexGeneration {
     dropped: bool,
 }
 
+struct TableHandle {
+    _generation: Arc<TableGeneration>,
+    schema: TableSchema,
+    primary_index_file_id: FileId,
+}
+
+impl TableHandle {
+    fn new(generation: Arc<TableGeneration>) -> Self {
+        Self {
+            schema: generation.schema.clone(),
+            primary_index_file_id: primary_index_file_id(generation.schema.storage_id),
+            _generation: generation,
+        }
+    }
+}
+
+struct IndexHandle {
+    _generation: Arc<IndexGeneration>,
+    schema: IndexSchema,
+}
+
+impl IndexHandle {
+    fn new(generation: Arc<IndexGeneration>) -> Self {
+        Self {
+            schema: generation.schema.clone(),
+            _generation: generation,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SequenceState {
     schema: Arc<Mutex<SequenceSchema>>,
@@ -488,12 +518,13 @@ impl PageBackedStorageEngine {
     }
 
     /// The schema and index file id of a live table, looked up under the lock so
-    /// the heap and B-tree work can run without holding it.
+    /// the heap and B-tree work can run without holding it. The returned handle
+    /// pins the generation files for as long as the caller may touch them.
     fn table_handle(
         &self,
         relations: &PageBackedRelationSnapshot,
         table: TableId,
-    ) -> Result<(TableSchema, FileId)> {
+    ) -> Result<TableHandle> {
         let table_state = match relations.tables.get(&table) {
             Some(table_state) if !table_state.dropped => table_state.clone(),
             Some(_) => return Err(undefined_table(table)),
@@ -507,10 +538,7 @@ impl PageBackedStorageEngine {
                     .ok_or_else(|| undefined_table(table))?
             }
         };
-        Ok((
-            table_state.schema.clone(),
-            primary_index_file_id(table_state.schema.storage_id),
-        ))
+        Ok(TableHandle::new(table_state))
     }
 
     /// Like `table_handle`, but a missing or dropped table yields `None` (callers
@@ -519,12 +547,11 @@ impl PageBackedStorageEngine {
         &self,
         relations: &PageBackedRelationSnapshot,
         table: TableId,
-    ) -> Result<Option<(TableSchema, FileId)>> {
+    ) -> Result<Option<TableHandle>> {
         match relations.tables.get(&table) {
-            Some(table_state) if !table_state.dropped => Ok(Some((
-                table_state.schema.clone(),
-                primary_index_file_id(table_state.schema.storage_id),
-            ))),
+            Some(table_state) if !table_state.dropped => {
+                Ok(Some(TableHandle::new(table_state.clone())))
+            }
             Some(_) => Ok(None),
             None => {
                 let state = self.lock_state()?;
@@ -532,12 +559,8 @@ impl PageBackedStorageEngine {
                     .tables
                     .get(&table)
                     .filter(|table_state| !table_state.dropped)
-                    .map(|table_state| {
-                        (
-                            table_state.schema.clone(),
-                            primary_index_file_id(table_state.schema.storage_id),
-                        )
-                    }))
+                    .cloned()
+                    .map(TableHandle::new))
             }
         }
     }
@@ -780,11 +803,11 @@ impl PageBackedStorageEngine {
         relations: &PageBackedRelationSnapshot,
         table: TableId,
         index: IndexId,
-    ) -> Result<IndexSchema> {
+    ) -> Result<IndexHandle> {
         if relations.tables.contains_key(&table) {
             match relations.indexes.get(&index) {
                 Some(index_state) if !index_state.dropped && index_state.schema.table == table => {
-                    Ok(index_state.schema.clone())
+                    Ok(IndexHandle::new(index_state.clone()))
                 }
                 _ => {
                     let snapshot_table = relations
@@ -807,7 +830,8 @@ impl PageBackedStorageEngine {
                         .filter(|index_state| {
                             !index_state.dropped && index_state.schema.table == table
                         })
-                        .map(|index_state| index_state.schema.clone())
+                        .cloned()
+                        .map(IndexHandle::new)
                         .ok_or_else(|| undefined_index(index))
                 }
             }
@@ -817,7 +841,8 @@ impl PageBackedStorageEngine {
                 .indexes
                 .get(&index)
                 .filter(|index_state| !index_state.dropped && index_state.schema.table == table)
-                .map(|index_state| index_state.schema.clone())
+                .cloned()
+                .map(IndexHandle::new)
                 .ok_or_else(|| undefined_index(index))
         }
     }
@@ -1514,7 +1539,9 @@ impl StorageEngine for PageBackedStorageEngine {
     ) -> Result<RowId> {
         let relations = pagebacked_relations(relations)?;
         self.ensure_current_generation_for_write(relations, table)?;
-        let (schema, index_fid) = self.table_handle(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_fid = table_handle.primary_index_file_id;
         let key = key_for_row(&schema, &row)?;
         let btree = self.btree(index_fid);
 
@@ -1591,7 +1618,9 @@ impl StorageEngine for PageBackedStorageEngine {
         key: &Key,
     ) -> Result<Option<Row>> {
         let relations = pagebacked_relations(relations)?;
-        let (schema, index_fid) = self.table_handle(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_fid = table_handle.primary_index_file_id;
         // The primary-key index may carry entries for several versions of this key
         // once versioning lands (B4); collect every candidate TID and return the
         // single one visible to this snapshot. Today there is one entry per key.
@@ -1614,9 +1643,10 @@ impl StorageEngine for PageBackedStorageEngine {
     ) -> Result<bool> {
         let relations = pagebacked_relations(relations)?;
         self.ensure_current_generation_for_write(relations, table)?;
-        let Some((_, index_fid)) = self.table_handle_opt(relations, table)? else {
+        let Some(table_handle) = self.table_handle_opt(relations, table)? else {
             return Ok(false);
         };
+        let index_fid = table_handle.primary_index_file_id;
         let btree = self.btree(index_fid);
         // Locate the single version this statement's snapshot sees (the row the
         // executor matched). If none is visible the key was already deleted or is
@@ -1658,7 +1688,9 @@ impl StorageEngine for PageBackedStorageEngine {
     ) -> Result<bool> {
         let relations = pagebacked_relations(relations)?;
         self.ensure_current_generation_for_write(relations, table)?;
-        let (schema, index_fid) = self.table_handle(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_fid = table_handle.primary_index_file_id;
         let btree = self.btree(index_fid);
         // Locate the version this statement's snapshot sees (the row the executor
         // matched), NOT an arbitrary `search(key)` entry. The primary-key index may
@@ -1823,7 +1855,9 @@ impl StorageEngine for PageBackedStorageEngine {
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
         let relations = pagebacked_relations(relations)?;
-        let (schema, index_fid) = self.table_handle(relations, table)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_fid = table_handle.primary_index_file_id;
         let entries = self.btree(index_fid).range(range)?;
 
         let mut rows = Vec::with_capacity(entries.len());
@@ -1866,8 +1900,10 @@ impl StorageEngine for PageBackedStorageEngine {
         range: &KeyRange,
     ) -> Result<Box<dyn RowIterator>> {
         let relations = pagebacked_relations(relations)?;
-        let (schema, _pk_file_id) = self.table_handle(relations, table)?;
-        let index_schema = self.index_handle(relations, table, index)?;
+        let table_handle = self.table_handle(relations, table)?;
+        let schema = table_handle.schema.clone();
+        let index_handle = self.index_handle(relations, table, index)?;
+        let index_schema = index_handle.schema.clone();
 
         // The secondary index points directly at heap TIDs (uniform with the
         // primary-key index), so a scan collects candidate TIDs from the index and
@@ -2073,7 +2109,9 @@ impl SchemaOperations for PageBackedStorageEngine {
         gc_horizon: u64,
     ) -> Result<()> {
         let relations = self.capture_pagebacked_relation_snapshot()?;
-        let (table_schema, pk_file_id) = self.table_handle(&relations, schema.table)?;
+        let table_handle = self.table_handle(&relations, schema.table)?;
+        let table_schema = table_handle.schema.clone();
+        let pk_file_id = table_handle.primary_index_file_id;
         {
             let mut state = self.lock_state()?;
             self.append_wal(

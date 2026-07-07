@@ -748,7 +748,8 @@ impl PageBackedStorageEngine {
             ))
         })?;
         let relations = self.capture_pagebacked_relation_snapshot()?;
-        let (toast_schema, _) = self.table_handle(&relations, toast_table_id)?;
+        let toast_handle = self.table_handle(&relations, toast_table_id)?;
+        let toast_schema = toast_handle.schema.clone();
         crate::toast::ensure_toast_relation(&toast_schema)?;
 
         let mut deleted = 0usize;
@@ -801,7 +802,8 @@ impl PageBackedStorageEngine {
             return Ok(0);
         };
         let relations = self.capture_pagebacked_relation_snapshot()?;
-        let (toast_schema, _) = self.table_handle(&relations, toast_table_id)?;
+        let toast_handle = self.table_handle(&relations, toast_table_id)?;
+        let toast_schema = toast_handle.schema.clone();
         crate::toast::ensure_toast_relation(&toast_schema)?;
         self.vacuum_relation(&toast_schema, horizon)
     }
