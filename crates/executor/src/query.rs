@@ -8,7 +8,7 @@ use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
     ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result,
     Row, SequenceOptions, SequenceSchema, SqlState, StatementContext, StoredRow, TableId,
-    TableSchema, ToastOptions, TruncateCatalogUpdate, Value,
+    TableSchema, ToastOptions, TruncateCatalogUpdate, Value, ViewColumn,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, bind_default_expr};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
@@ -152,12 +152,23 @@ impl QueryEngine {
                 table_name: _,
                 new_name,
             } => execute_alter_table_rename_table(ctx, *table, new_name),
-            PhysicalPlan::CreateView { .. } | PhysicalPlan::DropView { .. } => {
-                Err(DbError::execute(
-                    SqlState::FeatureNotSupported,
-                    "views are not implemented yet",
-                ))
-            }
+            PhysicalPlan::CreateView {
+                name,
+                or_replace,
+                columns,
+                query,
+                definition,
+                dependencies,
+            } => execute_create_view(
+                ctx,
+                name,
+                *or_replace,
+                columns,
+                query,
+                definition,
+                dependencies,
+            ),
+            PhysicalPlan::DropView { name, if_exists } => execute_drop_view(ctx, name, *if_exists),
             PhysicalPlan::CreateIndex {
                 name,
                 table,
@@ -1136,6 +1147,12 @@ fn execute_create_table(
                 count: 0,
             });
         }
+        if ctx.catalog.get_view_by_name(name)?.is_some() {
+            return Err(DbError::plan(
+                SqlState::DuplicateTable,
+                format!("relation {name} already exists"),
+            ));
+        }
     }
 
     let serial = resolve_serial_columns(ctx.catalog, name, columns)?;
@@ -1367,6 +1384,12 @@ fn execute_drop_table(
         Some(table) => table,
         None if if_exists => match ctx.catalog.get_table_by_name(name)? {
             Some(table) => table.id,
+            None if ctx.catalog.get_view_by_name(name)?.is_some() => {
+                return Err(DbError::plan(
+                    SqlState::WrongObjectType,
+                    format!("relation {name} is a view, not a table"),
+                ));
+            }
             None => {
                 return Ok(ExecutionResult::Modified {
                     command: "DROP TABLE".to_string(),
@@ -1569,6 +1592,109 @@ fn alter_table_result() -> ExecutionResult {
         command: "ALTER TABLE".to_string(),
         count: 0,
     }
+}
+
+fn execute_create_view(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    or_replace: bool,
+    columns: &[String],
+    query: &planner::BoundQuery,
+    definition: &str,
+    dependencies: &[common::ViewDependency],
+) -> Result<ExecutionResult> {
+    let output = create_view_output_columns(columns, query);
+    let schema = match ctx.catalog.get_view_by_name(name)? {
+        Some(existing) if or_replace => {
+            let replaced = ctx.catalog.replace_view(
+                existing.id,
+                output,
+                definition.to_string(),
+                dependencies.to_vec(),
+            )?;
+            if let Err(err) = ctx.schema_ops.replace_view(&ctx.statement, &replaced) {
+                let _ = ctx.catalog.apply_replace_view(existing);
+                return Err(err);
+            }
+            replaced
+        }
+        Some(_) => {
+            return Err(DbError::plan(
+                SqlState::DuplicateTable,
+                format!("relation {name} already exists"),
+            ));
+        }
+        None => {
+            let schema = ctx.catalog.create_view(
+                name.to_string(),
+                output,
+                definition.to_string(),
+                dependencies.to_vec(),
+            )?;
+            if let Err(err) = ctx.schema_ops.create_view(&ctx.statement, &schema) {
+                let _ = ctx.catalog.apply_drop_view(schema.id);
+                return Err(err);
+            }
+            schema
+        }
+    };
+    debug_assert_eq!(schema.name, name);
+    Ok(ExecutionResult::Modified {
+        command: "CREATE VIEW".to_string(),
+        count: 0,
+    })
+}
+
+fn create_view_output_columns(columns: &[String], query: &planner::BoundQuery) -> Vec<ViewColumn> {
+    query
+        .output_columns()
+        .into_iter()
+        .zip(query.output_schema())
+        .enumerate()
+        .map(|(index, (output, info))| ViewColumn {
+            name: columns
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| output.name.clone()),
+            data_type: output.data_type,
+            nullable: output.nullable,
+            pg_type: info.pg_type.clone(),
+        })
+        .collect()
+}
+
+fn execute_drop_view(
+    ctx: &ExecutionContext<'_>,
+    name: &str,
+    if_exists: bool,
+) -> Result<ExecutionResult> {
+    let view = match ctx.catalog.get_view_by_name(name)? {
+        Some(view) => view,
+        None if ctx.catalog.get_table_by_name(name)?.is_some() => {
+            return Err(DbError::plan(
+                SqlState::WrongObjectType,
+                format!("relation {name} is a table, not a view"),
+            ));
+        }
+        None if if_exists => {
+            return Ok(ExecutionResult::Modified {
+                command: "DROP VIEW".to_string(),
+                count: 0,
+            });
+        }
+        None => {
+            return Err(DbError::plan(
+                SqlState::UndefinedTable,
+                format!("view {name} does not exist"),
+            ));
+        }
+    };
+    ctx.schema_ops.drop_view(&ctx.statement, view.id)?;
+    ctx.catalog.drop_view(view.id)?;
+    Ok(ExecutionResult::Modified {
+        command: "DROP VIEW".to_string(),
+        count: 0,
+    })
 }
 
 fn expression_default_for_column(

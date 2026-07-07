@@ -569,6 +569,7 @@ fn table_select_items(table: &TableSchema, binding: &Binding) -> Vec<BoundSelect
         .map(|column| BoundSelectItem {
             expr: input_ref(binding, column),
             alias: column.name.clone(),
+            wildcard_source: None,
         })
         .collect()
 }

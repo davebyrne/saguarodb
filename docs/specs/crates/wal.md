@@ -29,6 +29,9 @@ pub enum WalRecordKind {
     DropIndex { index: IndexId },
     CreateSequence { schema: SequenceSchema },
     DropSequence { sequence: SequenceId },
+    CreateView { schema: ViewSchema },
+    ReplaceView { schema: ViewSchema },
+    DropView { view: TableId },
     SequenceAdvance { sequence: SequenceId, value: i64 },
     SetSequenceValue { sequence: SequenceId, value: i64, is_called: bool },
     Commit,
@@ -83,6 +86,12 @@ These record kinds support per-table page compression, WAL full-page-image compr
 - **`TruncateTable { table_id, new_table_storage_id, new_toast_storage_id, new_index_storage_ids }`** (type byte `22`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as the ALTER records). The logical DDL record for relation-generation `TRUNCATE`: it carries the stable logical table id and the fresh physical storage ids allocated for the table heap/primary-index pair, optional hidden TOAST heap/primary-index pair, and all secondary indexes. Skipped aborted/in-flight records reserve every carried storage id so future relation generations cannot reuse files that may have been created before abort. Committed replay builds/applies the catalog storage-id update and publishes the matching storage generation swap through `RecoveryOperations`; the replacement heap/index pages themselves are restored by the following physical redo records.
 - **`AlterTablePrimaryKey { table_id, primary_key }`** (type byte `23`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as `AlterTableCompression`). The DDL record for `ALTER TABLE ... ADD/DROP PRIMARY KEY`: updates a table's primary-key column-id list in catalog and storage metadata. Replay is committed-only via `server::is_logical_catalog_record`; aborted/in-flight records are skipped and reserve no ids of their own. Normal execution derives the storage identity B-tree rebuild from this committed logical record, logs the resulting identity B-tree pages as full-page-image redo, and flushes them before checkpoint truncation can make the logical record redundant. During recovery, the metadata is installed at the record's WAL position (so following `CreateIndex`/`DropIndex` records validate), the table id is recorded as needing a derived rebuild, and the identity tree is rebuilt without appending WAL only after the full replay pass and crashed-writer abort resolution.
 - **`UpdateTableSchema { schema, indexes }`** (type byte `24`; no dedicated binary arm, so it uses the same JSON logical-DDL fallback as the ALTER records). The DDL record for schema-evolution `ALTER TABLE`: metadata-only renames carry the updated table schema and current catalog-index schemas; ADD/DROP column rewrites carry the updated table schema plus any affected catalog indexes with fresh storage ids allocated by the catalog update helpers. Replay is committed-only; committed replay applies the table and carried index schemas atomically to the catalog, then applies the carried index schemas and table schema to storage metadata. Skipped aborted/in-flight records reserve the carried table and index storage ids so rewrite relation files are not reused even though the catalog schema is not installed.
+- **`CreateView { schema }`**, **`ReplaceView { schema }`**, and
+  **`DropView { view }`** (type bytes `25`, `26`, and `27`; JSON logical-DDL
+  fallback). The DDL records for user view metadata. Replay is committed-only
+  through the logical catalog replay class. Skipped aborted/in-flight
+  `CreateView` records still reserve the view id because view ids share the
+  table-id relation namespace; replace and drop records reserve no new ids.
 
 On disk:
 
@@ -95,7 +104,7 @@ Payload: variable
 CRC32: 4 bytes
 ```
 
-CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields (not JSON) despite one being physiological-adjacent and the other logical/DDL-adjacent — see above; `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, and `UpdateTableSchema` use the JSON fallback. The `Type` byte is authoritative for binary records.
+CRC covers header and payload except the CRC field. Logical records encode their payload as JSON; physiological redo records use compact little-endian binary fields (`FullPageImage` stores the raw page bytes). `FullPageImageCompressed` and `CreateDictionary` also use compact binary fields (not JSON) despite one being physiological-adjacent and the other logical/DDL-adjacent — see above; `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, and the view DDL records use the JSON fallback. The `Type` byte is authoritative for binary records.
 
 ## Public API
 

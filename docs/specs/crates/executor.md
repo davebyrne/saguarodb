@@ -241,6 +241,9 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   primary key, and unique-constraint column references). If the table already
   exists, return the normal command tag without creating serial sequences,
   mutating catalog/storage, or appending logical DDL WAL records.
+  If a view already exists with the requested name, return
+  `SqlState::DuplicateTable` because user tables and views share the relation
+  name namespace.
 - For `SERIAL` family columns, choose owned sequence names at execution time
   (`<table>_<column>_seq`, with the smallest free numeric suffix if needed),
   create each owned sequence first (`owned: true`, default sequence options),
@@ -257,10 +260,13 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 `DROP TABLE`:
 
-- Resolve table in binder for plain `DROP TABLE`; for `DROP TABLE IF EXISTS`,
-  carry the table name through planning and resolve it at execution time under
-  the exclusive DDL guard. If the table is absent, return the normal command tag
-  without catalog/storage mutation or logical DDL WAL records.
+- Resolve table in binder for plain `DROP TABLE`; if the name belongs to a
+  view, return `SqlState::WrongObjectType`. For `DROP TABLE IF EXISTS`, carry
+  the table name through planning and resolve it at execution time under the
+  exclusive DDL guard. If the table is absent, return the normal command tag
+  without catalog/storage mutation or logical DDL WAL records. If a view exists
+  with the requested name, return `SqlState::WrongObjectType` rather than
+  treating the statement as a no-op.
 - Call `SchemaOperations::drop_table`.
 - For each column default that references an owned sequence, call
   `SchemaOperations::drop_sequence` in the same statement.
@@ -287,32 +293,6 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - `SchemaOperations::drop_index` appends the `DropIndex` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "DROP INDEX", count: 0 }`.
 
-`ALTER TABLE` schema evolution:
-
-- `RENAME TO` and `RENAME COLUMN` are metadata-only. The executor calls the
-  catalog rename helper, fetches the table's secondary indexes, then calls
-  `SchemaOperations::update_table_schema`, which appends `UpdateTableSchema`.
-- `ADD COLUMN` and `DROP COLUMN` first run catalog preflight. No-op conditional
-  statements return the normal `ALTER TABLE` command tag without scanning rows
-  or mutating storage.
-- Real ADD/DROP rewrites apply the catalog schema change, allocate fresh storage
-  ids with the catalog update helpers, call `SchemaOperations::update_table_schema`
-  to log `UpdateTableSchema` before publishing empty replacement heap/index files,
-  then stream visible rows from the retained old relation snapshot through
-  `StorageEngine::for_each_visible_row` into the replacement relation. The
-  page-backed engine walks the old identity B-tree one leaf page at a time instead
-  of materializing the table in executor memory. ADD backfills the new column from
-  its default (`NULL`, constant, sequence `nextval`, or bound expression default);
-  DROP removes the dropped column position from every row.
-
-`CREATE VIEW` / `DROP VIEW`:
-
-- The parser, binder, and planner carry view DDL through bound/logical/physical
-  plan forms, but normal server execution rejects user view DDL with
-  `SqlState::FeatureNotSupported` before binding/planning until view execution
-  support lands. System catalog views are a separate virtual scan path and are
-  implemented.
-
 `CREATE SEQUENCE`:
 
 - Server query orchestration acquires the DDL guard before execution.
@@ -336,9 +316,65 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   return the normal command tag.
 - Return `Modified { command: "DROP SEQUENCE", count: 0 }`.
 
+`CREATE VIEW` / `CREATE OR REPLACE VIEW`:
+
+- Server query orchestration acquires the exclusive DDL guard before execution.
+- The binder has already bound the view query, validated the optional output
+  column list, rejected query parameters, and attached durable dependencies.
+- For a new view, call `CatalogManager::create_view` to allocate the relation id
+  and install metadata, then call `SchemaOperations::create_view`, which appends
+  the `CreateView` WAL operation record. If storage/WAL append fails, remove the
+  catalog view before returning the error.
+- For `OR REPLACE` with an existing view, call `CatalogManager::replace_view`
+  (same id/name, incremented schema version), then
+  `SchemaOperations::replace_view`, which appends `ReplaceView`; if storage/WAL
+  append fails, restore the previous view schema before returning the error.
+- A non-`OR REPLACE` duplicate relation name returns `SqlState::DuplicateTable`.
+- Return `Modified { command: "CREATE VIEW", count: 0 }`.
+
+`DROP VIEW`:
+
+- Resolve the view name at execution time. A missing view returns
+  `SqlState::UndefinedTable` unless `IF EXISTS` was present.
+- If the name belongs to an existing table, return `SqlState::WrongObjectType`
+  rather than treating the statement as missing or as an `IF EXISTS` no-op.
+- For an existing view, call `SchemaOperations::drop_view`, which appends the
+  `DropView` WAL operation record, then `CatalogManager::drop_view`.
+- For `IF EXISTS` and a missing view, perform no catalog or WAL mutation and
+  return the normal command tag.
+- Return `Modified { command: "DROP VIEW", count: 0 }`.
+
+`ALTER TABLE` schema evolution:
+
+- `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN`, and
+  `RENAME TO` execute through the DDL path under the server-owned exclusive
+  guard.
+- `RENAME COLUMN` and `RENAME TO` are metadata updates: mutate catalog schema,
+  then call `SchemaOperations::update_table_schema` with the updated table and
+  current secondary-index schemas. Catalog rejects these renames when dependent
+  views or stored CHECK expressions would leave SQL text stale.
+- `ADD COLUMN` and `DROP COLUMN` are logical rewrites. The server holds its
+  snapshot-exclusion guard before the executor runs these plans, so no new
+  statement can bind one storage generation and scan another. The executor first
+  calls the catalog preflight helper, returning no-op/error outcomes before
+  materializing rows. For a real rewrite it scans visible rows under the old
+  schema, applies the catalog schema change with fresh storage ids, calls
+  `SchemaOperations::update_table_schema` to install empty replacement storage,
+  transforms each old row, validates the new row shape, and reinserts it through
+  normal storage `insert` so heap, primary-key, secondary-index, and TOAST paths
+  stay shared with DML.
+- `ADD COLUMN` evaluates the column default per existing row (`NULL`, constant,
+  `nextval`, or bound expression default) and creates hidden TOAST storage first
+  when the catalog allocated a hidden TOAST relation for the new toastable
+  column. `DROP COLUMN` uses catalog-remapped secondary-index schemas so WAL and
+  recovery install matching table/index metadata.
+- Successful schema-evolution statements return
+  `Modified { command: "ALTER TABLE", count: 0 }`; no-op `IF [NOT] EXISTS`
+  forms return the same tag without catalog/storage mutation.
+
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, schema-evolution ALTER TABLE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE VIEW, DROP VIEW, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, schema-evolution ALTER TABLE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. `ALTER TABLE ... ADD/DROP COLUMN` also takes the server active-snapshot exclusion guard before the checkpoint guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
 
 ## Acceptance Tests
 

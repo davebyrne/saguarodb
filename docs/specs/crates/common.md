@@ -234,6 +234,14 @@ pub struct ColumnInfo {
     pub data_type: DataType,
     pub table_id: Option<TableId>,
     pub column_id: Option<ColumnId>,
+    pub pg_type: Option<PgType>,
+}
+
+pub struct ViewColumn {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub pg_type: Option<PgType>,
 }
 
 pub struct TableSchema {
@@ -277,7 +285,7 @@ pub struct ViewColumn {
 pub struct ViewDependency {
     pub relation: TableId,
     pub columns: Vec<ColumnId>,
-    pub all_columns: bool,
+    pub all_columns: bool,       // SELECT * / relation-wide column-set dependency
 }
 
 pub struct ViewSchema {
@@ -351,7 +359,10 @@ not intentionally create those cross-kind raw collisions.
 column IDs and no defaults. `ViewDependency.columns` lists referenced column IDs;
 `all_columns = true` represents relation-wide dependencies such as `SELECT *`;
 neither specific columns nor `all_columns` represents relation-existence-only
-dependencies such as `count(*)`.
+dependencies such as `count(*)`. For compatibility with snapshots written before
+`all_columns` existed, deserializing a dependency with the field absent and
+`columns = []` treats it as `all_columns = true`; newly serialized
+relation-existence dependencies always include `all_columns = false`.
 
 `ToastOptions` is durable per-table policy for storage-private TOAST handling.
 It does not change public SQL values: `Value::Text(String)` and
@@ -449,6 +460,7 @@ pub enum SqlState {
     UndefinedColumn,
     UndefinedObject,
     InvalidColumnReference,
+    WrongObjectType,
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,

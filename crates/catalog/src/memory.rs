@@ -2989,6 +2989,9 @@ fn carry_view_dependencies_for_table_update(
                 }
                 continue;
             }
+            if dependency.columns.is_empty() {
+                continue;
+            }
 
             let mut remapped = Vec::with_capacity(dependency.columns.len());
             let mut seen = HashSet::new();

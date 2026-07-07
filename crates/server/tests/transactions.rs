@@ -1003,7 +1003,7 @@ async fn schema_rewrite_waits_for_live_repeatable_read_snapshot() {
 }
 
 #[tokio::test]
-async fn conditional_noop_schema_alter_does_not_wait_for_live_snapshot() {
+async fn conditional_noop_schema_alter_waits_for_live_snapshot_before_noop() {
     let server = TestServer::start().await.unwrap();
     let mut setup = Connection::connect(&server).await.unwrap();
     setup
@@ -1026,26 +1026,27 @@ async fn conditional_noop_schema_alter_does_not_wait_for_live_snapshot() {
     );
 
     let mut ddl = Connection::connect(&server).await.unwrap();
-    let add = tokio::time::timeout(
-        Duration::from_secs(2),
-        ddl.query("alter table users add column if not exists name text"),
-    )
-    .await
-    .expect("conditional no-op ADD COLUMN must not wait for the live snapshot")
-    .expect("ADD COLUMN transport should succeed");
+    let add_task = tokio::spawn(async move {
+        ddl.query("alter table users add column if not exists name text")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !add_task.is_finished(),
+        "conditional no-op ADD COLUMN still takes the schema-rewrite fence"
+    );
+    reader.ok("rollback").await;
+    let add = tokio::time::timeout(Duration::from_secs(5), add_task)
+        .await
+        .expect("conditional ADD COLUMN should finish after the snapshot rolls back")
+        .expect("ADD COLUMN task should not panic")
+        .expect("ADD COLUMN transport should succeed");
     add.result
         .expect("conditional ADD COLUMN should be a no-op");
 
-    let drop = tokio::time::timeout(
-        Duration::from_secs(2),
-        ddl.query("alter table users drop column if exists missing"),
-    )
-    .await
-    .expect("conditional no-op DROP COLUMN must not wait for the live snapshot")
-    .expect("DROP COLUMN transport should succeed");
-    drop.result
-        .expect("conditional DROP COLUMN should be a no-op");
-
+    reader
+        .ok("start transaction isolation level repeatable read")
+        .await;
     assert_eq!(
         reader
             .ok("select id, name from users where id = 1")
@@ -1053,7 +1054,33 @@ async fn conditional_noop_schema_alter_does_not_wait_for_live_snapshot() {
             .rows(),
         vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
     );
+
+    let mut ddl = Connection::connect(&server).await.unwrap();
+    let drop_task = tokio::spawn(async move {
+        ddl.query("alter table users drop column if exists missing")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !drop_task.is_finished(),
+        "conditional no-op DROP COLUMN still takes the schema-rewrite fence"
+    );
     reader.ok("rollback").await;
+    let drop = tokio::time::timeout(Duration::from_secs(5), drop_task)
+        .await
+        .expect("conditional DROP COLUMN should finish after the snapshot rolls back")
+        .expect("DROP COLUMN task should not panic")
+        .expect("DROP COLUMN transport should succeed");
+    drop.result
+        .expect("conditional DROP COLUMN should be a no-op");
+
+    assert_eq!(
+        setup
+            .ok("select id, name from users where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("1".to_string()), Some("Ada".to_string())]]
+    );
 }
 
 #[tokio::test]

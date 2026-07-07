@@ -293,7 +293,7 @@ impl FlushPolicy for WalFlushPolicy {
 }
 
 /// Whether `kind` is a logical catalog mutation (`CreateTable`/`DropTable`/
-/// `CreateIndex`/`DropIndex`/sequence DDL). These directly mutate the durable catalog rather
+/// `CreateIndex`/`DropIndex`/sequence/view DDL). These directly mutate the durable catalog rather
 /// than being idempotent PageLSN-gated page writes, so redo-all gates them by
 /// transaction outcome (only a committed DDL replays); the physical heap/index
 /// page records are not gated.
@@ -308,6 +308,9 @@ fn is_logical_catalog_record(kind: &WalRecordKind) -> bool {
             | WalRecordKind::DropIndex { .. }
             | WalRecordKind::CreateSequence { .. }
             | WalRecordKind::DropSequence { .. }
+            | WalRecordKind::CreateView { .. }
+            | WalRecordKind::ReplaceView { .. }
+            | WalRecordKind::DropView { .. }
             | WalRecordKind::CreateDictionary { .. }
             | WalRecordKind::AlterTableCompression { .. }
             | WalRecordKind::AlterTableToast { .. }
@@ -332,6 +335,10 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         }
         WalRecordKind::CreateSequence { schema } => {
             catalog.reserve_sequence_id(schema.id)?;
+            Ok(true)
+        }
+        WalRecordKind::CreateView { schema } => {
+            catalog.reserve_table_id(schema.id)?;
             Ok(true)
         }
         WalRecordKind::CreateDictionary { dict_id, .. } => {
@@ -363,6 +370,8 @@ fn reserve_catalog_id(catalog: &dyn CatalogManager, kind: &WalRecordKind) -> Res
         WalRecordKind::DropTable { .. }
         | WalRecordKind::DropIndex { .. }
         | WalRecordKind::DropSequence { .. }
+        | WalRecordKind::ReplaceView { .. }
+        | WalRecordKind::DropView { .. }
         | WalRecordKind::AlterTableCompression { .. }
         | WalRecordKind::AlterTableToast { .. }
         | WalRecordKind::AlterTablePrimaryKey { .. } => Ok(false),
@@ -462,6 +471,9 @@ fn apply_redo(
             catalog.apply_drop_sequence(*sequence)?;
             storage.apply_drop_sequence(*sequence)
         }
+        WalRecordKind::CreateView { schema } => catalog.apply_create_view(schema.clone()),
+        WalRecordKind::ReplaceView { schema } => catalog.apply_replace_view(schema.clone()),
+        WalRecordKind::DropView { view } => catalog.apply_drop_view(*view),
         WalRecordKind::SequenceAdvance { sequence, value } => {
             storage.apply_sequence_advance(*sequence, *value)
         }

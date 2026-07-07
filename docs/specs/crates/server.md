@@ -163,11 +163,14 @@ schema while scanning another relation generation.
 
 For autocommit write and DDL statements, `bind(statement, catalog)` runs after
 the statement has acquired its statement guard: the shared writer guard for DML,
-or the exclusive checkpoint guard for DDL. Read statements still bind lock-free,
-then the server inspects the bound tree; if it contains `nextval` or `setval`,
-it is re-routed through the shared writer path so sequence advancement is WAL
-logged and committed like other writes. This keeps write-side catalog resolution
-inside the same exclusion window as planning and execution.
+or the exclusive checkpoint guard for DDL. Schema-rewrite ADD/DROP COLUMN takes
+the active-snapshot exclusion fence before waiting for the exclusive checkpoint
+guard because conditional no-op preflight can race with another DDL until that
+exclusive guard is held. Read statements still bind lock-free, then the server inspects the bound tree; if it
+contains `nextval` or `setval`, it is re-routed through the shared writer path so
+sequence advancement is WAL logged and committed like other writes. This keeps
+write-side catalog resolution inside the same exclusion window as planning and
+execution.
 
 ### Transaction lifecycle (Milestone C)
 
@@ -189,7 +192,7 @@ The query path is a real transaction lifecycle; autocommit is an implicit single
   - `Statement::AlterTableSetOptions { .. }` → `run_alter_table_toast_options` (below).
   - `Statement::AlterTableAddPrimaryKey { .. }` / `Statement::AlterTableDropPrimaryKey { .. }` → primary-key ALTER handlers (below).
 - **Schema-evolution DDL (`ALTER TABLE ... ADD/DROP/RENAME COLUMN`, `ALTER TABLE ... RENAME TO`)**: classified as `StatementClass::Ddl`, rejected inside explicit transaction blocks, and executed under the exclusive checkpoint guard in autocommit/prepared execution. Bound/prepared schema-evolution ALTER carries the target table id plus schema version; execution rejects the cached plan if the table is dropped, recreated, or otherwise schema-changed before execution instead of resolving the table name again. Metadata-only renames increment `schema_version`, update catalog/storage metadata, and append `UpdateTableSchema`. ADD/DROP column statements first run catalog preflight; no-op conditional forms and dependency errors return before snapshot fencing. Real rewrites acquire the active-transaction registry's snapshot-exclusion guard before waiting for the checkpoint guard, so new read snapshots cannot bind one schema generation and scan another while writer-guarded transactions can still finish. The executor captures the old relation snapshot, applies the catalog schema change, allocates fresh storage ids through the catalog update helpers, calls `SchemaOperations::update_table_schema` to append `UpdateTableSchema` before initializing empty replacement files, then streams visible old rows into the replacement relation. Command tag `ALTER TABLE`.
-- **User view DDL (`CREATE [OR REPLACE] VIEW`, `DROP VIEW`)**: parser, binder, planner, and catalog metadata APIs exist, but the server rejects user view DDL with `SqlState::FeatureNotSupported` before binding/planning until view execution support lands. System catalog views are unrelated virtual scans and are implemented.
+- **View DDL (`CREATE [OR REPLACE] VIEW`, `DROP VIEW`)**: classified as `StatementClass::Ddl`, rejected inside explicit transaction blocks through the normal DDL-in-block path, and executed under the exclusive checkpoint guard in autocommit or prepared-statement execution. `CREATE VIEW` binds the stored query before execution, persists the view definition, output columns, and table dependencies in the catalog, and appends `CreateView` or `ReplaceView` WAL through storage. `DROP VIEW [IF EXISTS]` resolves the view at execution time, appends `DropView`, and removes it from the catalog. View definitions expand during binding of later queries; cached prepared plans record schema versions for both referenced tables and views so changing a view or an underlying table forces a reprepare.
 - **`ALTER TABLE <t> SET (compression = 'none' | 'zstd')`** (`docs/specs/compression.md` §8): `run_alter_table_compression` runs the whole statement under the **exclusive** checkpoint guard (drains writers, like `VACUUM`/`CREATE INDEX` backfill), in this load-bearing order. Step 4's `wal.flush()` is the **durable commit point** (mirrors `autocommit_bound_write_with_guard`): steps 1-4 propagate an error normally as a statement error (nothing has committed yet — table resolution's `UndefinedTable` and a dict-training failure both land here). Steps 5-8 are **post-durable-commit cleanup**: any error there is routed to `fatal_after_durable_commit` (logs, best-effort WAL flush, `process::exit`) instead of being returned as a statement error, because the DDL already committed and misreporting it as failed would be worse than crashing. Step 9 (the checkpoint-account trigger) runs after the guard releases and is best-effort — `record_commit_and_maybe_checkpoint_after_durable_commit` logs any error rather than returning or crashing, exactly like every other commit path.
   1. Acquire the exclusive guard; resolve the table by name (`SqlState::UndefinedTable` if it does not exist) and allocate a fresh `txn_id`.
   2. **Train.** If the target setting is `Zstd`, sample the table's current heap pages (`storage.sample_heap_pages`, capped at 4096 pages) and attempt `compress::train_dictionary`; a `None` (too small a corpus) leaves `active_dict_id = None` — not an error, the table proceeds dict-less.
@@ -221,7 +224,7 @@ As of Milestone E2b the global writer lock is **inverted** into a shared-writer 
 
 - **Readers run lock-free.** A read-only statement/transaction takes **no** `ConcurrencyController` guard. It captures its snapshot under the active-transaction-registry latch and reads via the buffer pool's per-frame latches, so it runs concurrently with in-flight writers and skips their uncommitted versions by MVCC visibility. (Unchanged from Stage 1.)
 - **Writers run concurrently.** A write transaction acquires the **SHARED** writer guard (`begin_writer`) **lazily** on its first write statement and holds the owned guard on the `Session` for the whole write-transaction, releasing it at COMMIT/ROLLBACK/disconnect. Many writers hold it at once; write-write safety comes from per-row conflict detection (E1: first-updater-wins `40001`) and the per-index / per-heap structural latches in `storage` (E2a), not from this lock. Autocommit DML = acquire the shared guard for the one statement, release at the implicit commit.
-- **DDL runs alone.** DDL is non-transactional, rejected inside an explicit transaction block, and acquires the **EXCLUSIVE** checkpoint guard (`begin_checkpoint`) for the whole autocommit statement. This covers table, index, and sequence DDL. The guard prevents catalog rollback from restoring a stale whole-catalog snapshot over another committed DDL change, and gives `CREATE INDEX` the stable physical chain view its HOT broken-chain backfill check requires.
+- **DDL runs alone.** DDL is non-transactional, rejected inside an explicit transaction block, and acquires the **EXCLUSIVE** checkpoint guard (`begin_checkpoint`) for the whole autocommit statement. This covers table, index, sequence, view, and schema-evolution DDL. The guard prevents catalog rollback from restoring a stale whole-catalog snapshot over another committed DDL change, and gives `CREATE INDEX` the stable physical chain view its HOT broken-chain backfill check requires.
 - **Checkpoint excludes writers.** `run_checkpoint` takes the **EXCLUSIVE** checkpoint guard (`begin_checkpoint`), which drains all in-flight writers and then runs alone — preserving the "no in-flight writer at checkpoint" invariant verbatim (so every transaction below the truncation boundary is settled and captured by `persist_clog`'s snapshot, keeping recovery correct without a fuzzy checkpoint). The `acquire-at-most-one-writer-guard-per-transaction` reentrancy tripwire is now a cheap correctness assertion (the shared guard is re-entrant), not a deadlock guard.
 
 Deferred from Milestone E (`mvcc.md` §12): a fully-concurrent / B-link writer protocol (so E2a takes per-index latches instead), blocking + deadlock detection (instead of fail-fast `40001`), and a fuzzy checkpoint (checkpointing with writers in flight).
@@ -256,10 +259,11 @@ Statement guard policy:
 - Exclusive checkpoint guard (`begin_checkpoint`, per statement): CREATE TABLE
   (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE INDEX,
   DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE (DDL is non-transactional and
-  rejected inside a block).
+  rejected inside a block), CREATE VIEW, DROP VIEW, and schema-evolution
+  `ALTER TABLE` execution.
 - Exclusive checkpoint guard (`begin_checkpoint`, drains all writers, runs alone): checkpoint, implemented maintenance work (`VACUUM`, `TRUNCATE`, `ALTER TABLE ... SET (...)`, and `ALTER TABLE ... ADD/DROP PRIMARY KEY`), plus autocommit DDL. Readers stay lock-free.
 
-Simple-query bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution. Extended-protocol `Parse` binds before a later `Execute`; prepared `DROP TABLE IF EXISTS` therefore carries the normalized table name and resolves it under the exclusive guard at execution time, while prepared `CREATE TABLE IF NOT EXISTS` performs the duplicate-table no-op check under that same guard.
+Simple-query bind and plan run under the same statement guard as execution (for writers) so catalog state cannot change between name resolution and execution; read and DML statements advertise a snapshot before binding so schema rewrites cannot publish a new generation underneath a bound statement. Extended-protocol `Parse` binds before a later `Execute` while holding the shared concurrency guard across bind plus schema-version capture; prepared data plans record the schema version of every referenced user table and user view, and `Execute` rejects the cached plan with `FeatureNotSupported` ("cached plan must be reprepared after schema change") if any version changed or relation disappeared. Prepared schema-rewrite ADD/DROP COLUMN takes the same snapshot-exclusion fence as simple-query execution before waiting for the exclusive guard; execute-time catalog preflight then decides whether the statement is still a no-op or must rewrite. Prepared `DROP TABLE IF EXISTS`/`DROP VIEW IF EXISTS` therefore still carries the normalized relation name and resolves it under the exclusive guard at execution time, including `WrongObjectType` checks when the shared table/view namespace contains the wrong relation kind. Prepared `CREATE TABLE IF NOT EXISTS` performs the duplicate-table no-op check under that same guard but still returns `DuplicateTable` when the name belongs to a view.
 
 Write statement protocol (autocommit; an explicit write transaction is the same but the guard spans all its statements and the commit/abort happens at COMMIT/ROLLBACK):
 
@@ -422,7 +426,8 @@ For each accepted TCP connection:
 The connection also serves the extended query protocol, holding per-connection
 prepared-statement and portal maps (named and unnamed). `Parse` calls
 `QueryService::prepare_sql` (mapping the declared parameter type OIDs, `0` =
-unspecified) and replies `ParseComplete`. `Bind` decodes each parameter value
+unspecified), caches referenced table/view schema versions for bound data statements,
+and replies `ParseComplete`. `Bind` decodes each parameter value
 (text or binary, per the Bind format codes, via `decode_value`) into a portal
 and replies `BindComplete`. `Describe` replies `ParameterDescription` +
 `RowDescription`/`NoData` for a statement, or `RowDescription`/`NoData` in the
@@ -519,5 +524,8 @@ If checkpoint fails during shutdown, log the error and exit. WAL durability stil
 - `ALTER TABLE ... SET (compression = ...)` rewrites a table in both directions (`none → zstd`, `zstd → none`) with correctness preserved across a restart; a crash simulated mid-rewrite recovers with a self-describing mix of old/new-encoded pages still readable, and re-running the same `ALTER` completes the rewrite.
 - `ALTER TABLE ... ADD PRIMARY KEY` validates and enforces the key on an existing heap-identity table, rejects duplicate/NULL existing rows without mutating the table, and survives restart; `ALTER TABLE ... DROP PRIMARY KEY` removes the primary-key constraint index, rebuilds hidden heap identity, allows duplicate key values, and survives restart.
 - `ALTER TABLE` and `TRUNCATE` (like `VACUUM`) are rejected inside an explicit transaction block with the generalized maintenance-in-block message, and route through the extended query protocol's prepared-maintenance path the same way. Autocommit `TRUNCATE` performs a relation-generation swap and returns command tag `TRUNCATE TABLE`.
+- Schema-evolution `ALTER TABLE` is rejected inside explicit transaction blocks through the DDL-in-block path, executes in simple autocommit and extended prepared execution, rewrites rows for ADD/DROP, preserves secondary indexes, and survives restart.
+- View DDL is rejected inside explicit transaction blocks, executes in simple autocommit and extended prepared execution, invalidates stale prepared plans, appears in `pg_class`/`pg_attribute` and `information_schema`, and survives restart.
+- Autocommit `TRUNCATE` performs a relation-generation swap, clears heap, primary-key index, secondary-index, and hidden TOAST storage, permits reinserting prior keys, survives restart, and returns command tag `TRUNCATE TABLE`.
 - Recovery resolves a dictionary created (via `ALTER`) after the last checkpoint, both from the replayed `CreateDictionary` WAL record and from the durable dictionary file seeded before redo.
 - `VACUUM` still runs correctly on a compressed table.

@@ -1,20 +1,23 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use catalog::{CatalogManager, resolve_system_view};
 use common::{
     BindingId, ColumnDef, ColumnId, DataType, DbError, ParsedColumnDef, ParsedDefault,
-    RelationKind, Result, SqlState, TableId, TableSchema, Value,
+    RelationKind, Result, SqlState, TableId, TableSchema, Value, ViewDependency,
 };
 use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statement};
 
-use crate::{BoundExpr, BoundQuery, BoundStatement};
+use crate::{
+    BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
+    BoundStatement, BoundValues,
+};
 
 mod dml;
 mod expr;
 mod query;
 
 use dml::{bind_copy, bind_delete, bind_insert, bind_update};
-use query::bind_query;
+use query::{bind_query, derive_alias_columns};
 
 #[derive(Clone, Debug)]
 struct Binding {
@@ -166,6 +169,11 @@ fn bind_inner(
         Statement::DropTable { name, if_exists } => {
             let table = if *if_exists {
                 None
+            } else if catalog.get_view_by_name(name)?.is_some() {
+                return Err(plan_error(
+                    SqlState::WrongObjectType,
+                    format!("relation {name} is a view, not a table"),
+                ));
             } else {
                 Some(require_table(catalog, name)?.id)
             };
@@ -265,14 +273,22 @@ fn bind_inner(
                     "CREATE VIEW does not support query parameters",
                 ));
             }
-            let query = bind_query(catalog, query, declared, &CteScope::default(), None)?;
-            validate_create_view_columns(columns, &query)?;
+            if query_has_sequence_function(query) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "CREATE VIEW does not support sequence functions",
+                ));
+            }
+            let bound_query = bind_query(catalog, query, declared, &CteScope::default(), None)?;
+            validate_create_view_columns(columns, &bound_query)?;
+            let dependencies = collect_view_dependencies(catalog, declared, query, &bound_query)?;
             Ok(BoundStatement::CreateView {
                 name: name.clone(),
                 or_replace: *or_replace,
                 columns: columns.clone(),
-                query,
+                query: bound_query,
                 definition: definition.clone(),
+                dependencies,
             })
         }
         Statement::DropView { name, if_exists } => Ok(BoundStatement::DropView {
@@ -368,19 +384,27 @@ fn bind_inner(
 }
 
 fn require_table(catalog: &dyn CatalogManager, name: &str) -> Result<TableSchema> {
-    let table = catalog.get_table_by_name(name)?.ok_or_else(|| {
-        if resolve_system_view(None, name).is_some() {
-            plan_error(
+    let table = match catalog.get_table_by_name(name)? {
+        Some(table) => table,
+        None if catalog.get_view_by_name(name)?.is_some() => {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "cannot modify view",
+            ));
+        }
+        None if resolve_system_view(None, name).is_some() => {
+            return Err(plan_error(
                 SqlState::FeatureNotSupported,
                 "cannot modify system catalog",
-            )
-        } else {
-            plan_error(
+            ));
+        }
+        None => {
+            return Err(plan_error(
                 SqlState::UndefinedTable,
                 format!("table {name} does not exist"),
-            )
+            ));
         }
-    })?;
+    };
     if matches!(table.relation_kind, RelationKind::Toast { .. }) {
         return Err(plan_error(
             SqlState::FeatureNotSupported,
@@ -820,6 +844,604 @@ fn validate_create_view_columns(columns: &[String], query: &BoundQuery) -> Resul
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DependencyBinding {
+    binding: BindingId,
+    relation: TableId,
+}
+
+#[derive(Default)]
+struct ViewDependencyBuilder {
+    dependencies: BTreeMap<TableId, ViewDependencyColumns>,
+}
+
+enum ViewDependencyColumns {
+    Relation,
+    Columns(BTreeSet<ColumnId>),
+    AllColumns,
+}
+
+impl ViewDependencyBuilder {
+    fn add_relation(&mut self, relation: TableId) {
+        self.dependencies
+            .entry(relation)
+            .or_insert(ViewDependencyColumns::Relation);
+    }
+
+    fn add_column(&mut self, relation: TableId, column: ColumnId) {
+        match self.dependencies.entry(relation) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(ViewDependencyColumns::Columns(BTreeSet::from([column])));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                ViewDependencyColumns::Relation => {
+                    entry.insert(ViewDependencyColumns::Columns(BTreeSet::from([column])));
+                }
+                ViewDependencyColumns::Columns(columns) => {
+                    columns.insert(column);
+                }
+                ViewDependencyColumns::AllColumns => {}
+            },
+        }
+    }
+
+    fn add_all_columns(&mut self, relation: TableId) {
+        self.dependencies
+            .insert(relation, ViewDependencyColumns::AllColumns);
+    }
+
+    fn finish(self) -> Vec<ViewDependency> {
+        self.dependencies
+            .into_iter()
+            .map(|(relation, columns)| match columns {
+                ViewDependencyColumns::Relation => ViewDependency {
+                    relation,
+                    columns: Vec::new(),
+                    all_columns: false,
+                },
+                ViewDependencyColumns::Columns(columns) => ViewDependency {
+                    relation,
+                    columns: columns.into_iter().collect(),
+                    all_columns: false,
+                },
+                ViewDependencyColumns::AllColumns => ViewDependency {
+                    relation,
+                    columns: Vec::new(),
+                    all_columns: true,
+                },
+            })
+            .collect()
+    }
+}
+
+fn collect_view_dependencies(
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+    ast: &Query,
+    bound: &BoundQuery,
+) -> Result<Vec<ViewDependency>> {
+    let mut builder = ViewDependencyBuilder::default();
+    collect_query_dependencies(ast, bound, &mut builder);
+    collect_bound_but_unretained_cte_dependencies(
+        catalog,
+        declared,
+        &CteScope::default(),
+        ast,
+        &mut builder,
+    )?;
+    Ok(builder.finish())
+}
+
+fn collect_query_dependencies(
+    ast: &Query,
+    bound: &BoundQuery,
+    builder: &mut ViewDependencyBuilder,
+) {
+    match (&ast.body, &bound.body) {
+        (QueryBody::Select(ast_select), BoundQueryBody::Select(bound_select)) => {
+            collect_select_dependencies(ast_select, bound_select, &bound.order_by, builder);
+        }
+        (QueryBody::Values(_), BoundQueryBody::Values(values)) => {
+            collect_values_dependencies(values, builder);
+        }
+        (
+            QueryBody::SetOp {
+                left: ast_left,
+                right: ast_right,
+                ..
+            },
+            BoundQueryBody::SetOp(bound_set),
+        ) => {
+            collect_query_dependencies(ast_left, &bound_set.left, builder);
+            collect_query_dependencies(ast_right, &bound_set.right, builder);
+        }
+        _ => {}
+    }
+}
+
+fn collect_select_dependencies(
+    ast: &parser::Select,
+    select: &BoundSelect,
+    order_by: &[BoundOrderByItem],
+    builder: &mut ViewDependencyBuilder,
+) {
+    let relation_bindings = select
+        .from
+        .as_ref()
+        .map(|from| {
+            collect_from_dependencies(from, builder);
+            visible_relation_bindings(from)
+        })
+        .unwrap_or_default();
+    for item in &ast.columns {
+        match item {
+            SelectItem::Wildcard => {
+                for binding in &relation_bindings {
+                    builder.add_all_columns(binding.relation);
+                }
+            }
+            SelectItem::QualifiedWildcard(qualifier) => {
+                for binding in relation_bindings_with_name(select.from.as_ref(), qualifier.as_str())
+                {
+                    builder.add_all_columns(binding.relation);
+                }
+            }
+            SelectItem::Expression { .. } => {}
+        }
+    }
+    for item in &select.columns {
+        collect_expr_dependencies(&item.expr, &relation_bindings, builder);
+    }
+    if let Some(filter) = &select.filter {
+        collect_expr_dependencies(filter, &relation_bindings, builder);
+    }
+    for expr in &select.group_by {
+        collect_expr_dependencies(expr, &relation_bindings, builder);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_dependencies(having, &relation_bindings, builder);
+    }
+    if let Some(BoundDistinct::On(exprs)) = &select.distinct {
+        for expr in exprs {
+            collect_expr_dependencies(expr, &relation_bindings, builder);
+        }
+    }
+    for item in &select.columns {
+        if let Some(relation) = item.wildcard_source {
+            builder.add_all_columns(relation);
+        }
+    }
+    for order_by in order_by {
+        collect_expr_dependencies(&order_by.expr, &relation_bindings, builder);
+    }
+}
+
+fn collect_values_dependencies(values: &BoundValues, builder: &mut ViewDependencyBuilder) {
+    for expr in values.rows.iter().flatten() {
+        collect_expr_dependencies(expr, &[], builder);
+    }
+}
+
+fn collect_bound_but_unretained_cte_dependencies(
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+    enclosing: &CteScope,
+    query: &Query,
+    builder: &mut ViewDependencyBuilder,
+) -> Result<()> {
+    let mut scope = enclosing.clone();
+    for cte in &query.with {
+        let bound = bind_query(catalog, &cte.query, declared, &scope, None)?;
+        collect_query_dependencies(&cte.query, &bound, builder);
+        collect_bound_but_unretained_cte_dependencies(
+            catalog, declared, &scope, &cte.query, builder,
+        )?;
+        let columns = derive_alias_columns(&bound.output_columns(), &cte.column_aliases, || {
+            format!("CTE \"{}\"", cte.name)
+        })?;
+        scope.ctes.push(CteBinding {
+            name: cte.name.clone(),
+            query: bound,
+            columns,
+        });
+    }
+    collect_nested_query_cte_dependencies(catalog, declared, &scope, &query.body, builder)?;
+    for order_by in &query.order_by {
+        collect_expr_cte_dependencies(catalog, declared, &scope, &order_by.expr, builder)?;
+    }
+    Ok(())
+}
+
+fn collect_nested_query_cte_dependencies(
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+    scope: &CteScope,
+    body: &QueryBody,
+    builder: &mut ViewDependencyBuilder,
+) -> Result<()> {
+    match body {
+        QueryBody::Select(select) => {
+            for item in &select.columns {
+                if let SelectItem::Expression { expr, .. } = item {
+                    collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+                }
+            }
+            for from in &select.from {
+                collect_from_item_cte_dependencies(catalog, declared, scope, from, builder)?;
+            }
+            if let Some(filter) = &select.filter {
+                collect_expr_cte_dependencies(catalog, declared, scope, filter, builder)?;
+            }
+            for expr in &select.group_by {
+                collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            }
+            if let Some(having) = &select.having {
+                collect_expr_cte_dependencies(catalog, declared, scope, having, builder)?;
+            }
+            if let Some(parser::Distinct::On(exprs)) = &select.distinct {
+                for expr in exprs {
+                    collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+                }
+            }
+        }
+        QueryBody::Values(rows) => {
+            for expr in rows.iter().flatten() {
+                collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            }
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            collect_bound_but_unretained_cte_dependencies(catalog, declared, scope, left, builder)?;
+            collect_bound_but_unretained_cte_dependencies(
+                catalog, declared, scope, right, builder,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_from_item_cte_dependencies(
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+    scope: &CteScope,
+    from: &FromItem,
+    builder: &mut ViewDependencyBuilder,
+) -> Result<()> {
+    match from {
+        FromItem::Table { .. } => {}
+        FromItem::Derived { subquery, .. } => {
+            collect_bound_but_unretained_cte_dependencies(
+                catalog, declared, scope, subquery, builder,
+            )?;
+        }
+        FromItem::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            collect_from_item_cte_dependencies(catalog, declared, scope, left, builder)?;
+            collect_from_item_cte_dependencies(catalog, declared, scope, right, builder)?;
+            if let Some(condition) = condition {
+                collect_expr_cte_dependencies(catalog, declared, scope, condition, builder)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_expr_cte_dependencies(
+    catalog: &dyn CatalogManager,
+    declared: &[Option<DataType>],
+    scope: &CteScope,
+    expr: &Expr,
+    builder: &mut ViewDependencyBuilder,
+) -> Result<()> {
+    match expr {
+        Expr::Subquery(query) => {
+            collect_bound_but_unretained_cte_dependencies(
+                catalog, declared, scope, query, builder,
+            )?;
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            collect_bound_but_unretained_cte_dependencies(
+                catalog, declared, scope, subquery, builder,
+            )?;
+        }
+        Expr::Exists { subquery, .. } => {
+            collect_bound_but_unretained_cte_dependencies(
+                catalog, declared, scope, subquery, builder,
+            )?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, left, builder)?;
+            collect_expr_cte_dependencies(catalog, declared, scope, right, builder)?;
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                if let FunctionArg::Expr(expr) = arg {
+                    collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            for item in list {
+                collect_expr_cte_dependencies(catalog, declared, scope, item, builder)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            collect_expr_cte_dependencies(catalog, declared, scope, low, builder)?;
+            collect_expr_cte_dependencies(catalog, declared, scope, high, builder)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+            collect_expr_cte_dependencies(catalog, declared, scope, pattern, builder)?;
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_cte_dependencies(catalog, declared, scope, operand, builder)?;
+            }
+            for (when, then) in when_clauses {
+                collect_expr_cte_dependencies(catalog, declared, scope, when, builder)?;
+                collect_expr_cte_dependencies(catalog, declared, scope, then, builder)?;
+            }
+            if let Some(else_clause) = else_clause {
+                collect_expr_cte_dependencies(catalog, declared, scope, else_clause, builder)?;
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            collect_expr_cte_dependencies(catalog, declared, scope, expr, builder)?;
+        }
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => {}
+    }
+    Ok(())
+}
+
+fn collect_from_dependencies(from: &BoundFrom, builder: &mut ViewDependencyBuilder) {
+    match from {
+        BoundFrom::Table { table, .. } => builder.add_relation(*table),
+        BoundFrom::System { .. } => {}
+        BoundFrom::Derived { query, .. } => collect_bound_query_dependencies(query, builder),
+        BoundFrom::View { view, query, .. } => {
+            builder.add_relation(*view);
+            collect_bound_query_dependencies(query, builder);
+        }
+        BoundFrom::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            collect_from_dependencies(left, builder);
+            collect_from_dependencies(right, builder);
+            let relation_bindings = visible_relation_bindings(from);
+            if let Some(condition) = condition {
+                collect_expr_dependencies(condition, &relation_bindings, builder);
+            }
+        }
+    }
+}
+
+fn collect_bound_query_dependencies(query: &BoundQuery, builder: &mut ViewDependencyBuilder) {
+    match &query.body {
+        BoundQueryBody::Select(select) => {
+            collect_bound_select_dependencies(select, &query.order_by, builder);
+        }
+        BoundQueryBody::Values(values) => collect_values_dependencies(values, builder),
+        BoundQueryBody::SetOp(set_op) => {
+            collect_bound_query_dependencies(&set_op.left, builder);
+            collect_bound_query_dependencies(&set_op.right, builder);
+        }
+    }
+}
+
+fn collect_bound_select_dependencies(
+    select: &BoundSelect,
+    order_by: &[BoundOrderByItem],
+    builder: &mut ViewDependencyBuilder,
+) {
+    let relation_bindings = select
+        .from
+        .as_ref()
+        .map(|from| {
+            collect_from_dependencies(from, builder);
+            visible_relation_bindings(from)
+        })
+        .unwrap_or_default();
+    for item in &select.columns {
+        collect_expr_dependencies(&item.expr, &relation_bindings, builder);
+    }
+    if let Some(filter) = &select.filter {
+        collect_expr_dependencies(filter, &relation_bindings, builder);
+    }
+    for expr in &select.group_by {
+        collect_expr_dependencies(expr, &relation_bindings, builder);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_dependencies(having, &relation_bindings, builder);
+    }
+    if let Some(BoundDistinct::On(exprs)) = &select.distinct {
+        for expr in exprs {
+            collect_expr_dependencies(expr, &relation_bindings, builder);
+        }
+    }
+    for item in &select.columns {
+        if let Some(relation) = item.wildcard_source {
+            builder.add_all_columns(relation);
+        }
+    }
+    for order_by in order_by {
+        collect_expr_dependencies(&order_by.expr, &relation_bindings, builder);
+    }
+}
+
+fn visible_relation_bindings(from: &BoundFrom) -> Vec<DependencyBinding> {
+    match from {
+        BoundFrom::Table { table, binding, .. } => vec![DependencyBinding {
+            binding: *binding,
+            relation: *table,
+        }],
+        BoundFrom::View { view, binding, .. } => vec![DependencyBinding {
+            binding: *binding,
+            relation: *view,
+        }],
+        BoundFrom::System { .. } | BoundFrom::Derived { .. } => Vec::new(),
+        BoundFrom::Join { left, right, .. } => {
+            let mut bindings = visible_relation_bindings(left);
+            bindings.extend(visible_relation_bindings(right));
+            bindings
+        }
+    }
+}
+
+fn relation_bindings_with_name(
+    from: Option<&BoundFrom>,
+    qualifier: &str,
+) -> Vec<DependencyBinding> {
+    let mut output = Vec::new();
+    if let Some(from) = from {
+        collect_relation_bindings_with_name(from, qualifier, &mut output);
+    }
+    output
+}
+
+fn collect_relation_bindings_with_name(
+    from: &BoundFrom,
+    qualifier: &str,
+    output: &mut Vec<DependencyBinding>,
+) {
+    match from {
+        BoundFrom::Table {
+            table,
+            binding,
+            name,
+            alias,
+            ..
+        } => {
+            if alias.as_deref().unwrap_or(name) == qualifier {
+                output.push(DependencyBinding {
+                    binding: *binding,
+                    relation: *table,
+                });
+            }
+        }
+        BoundFrom::View {
+            view,
+            binding,
+            alias,
+            ..
+        } => {
+            if alias == qualifier {
+                output.push(DependencyBinding {
+                    binding: *binding,
+                    relation: *view,
+                });
+            }
+        }
+        BoundFrom::Join { left, right, .. } => {
+            collect_relation_bindings_with_name(left, qualifier, output);
+            collect_relation_bindings_with_name(right, qualifier, output);
+        }
+        BoundFrom::System { .. } | BoundFrom::Derived { .. } => {}
+    }
+}
+
+fn collect_expr_dependencies(
+    expr: &BoundExpr,
+    bindings: &[DependencyBinding],
+    builder: &mut ViewDependencyBuilder,
+) {
+    match expr {
+        BoundExpr::InputRef { input, column, .. } => {
+            if let Some(binding) = bindings.iter().find(|binding| binding.binding == *input) {
+                builder.add_column(binding.relation, *column);
+            }
+        }
+        BoundExpr::Literal { .. }
+        | BoundExpr::Parameter { .. }
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::Nextval { .. }
+        | BoundExpr::Currval { .. }
+        | BoundExpr::AggregateCall { arg: None, .. } => {}
+        BoundExpr::BinaryOp { left, right, .. } => {
+            collect_expr_dependencies(left, bindings, builder);
+            collect_expr_dependencies(right, bindings, builder);
+        }
+        BoundExpr::UnaryOp { expr, .. }
+        | BoundExpr::IsNull { expr, .. }
+        | BoundExpr::IsNotNull { expr, .. }
+        | BoundExpr::Cast { expr, .. } => collect_expr_dependencies(expr, bindings, builder),
+        BoundExpr::Function { args, .. } => {
+            for arg in args {
+                collect_expr_dependencies(arg, bindings, builder);
+            }
+        }
+        BoundExpr::Setval {
+            value, is_called, ..
+        } => {
+            collect_expr_dependencies(value, bindings, builder);
+            if let Some(is_called) = is_called {
+                collect_expr_dependencies(is_called, bindings, builder);
+            }
+        }
+        BoundExpr::AggregateCall { arg: Some(arg), .. } => {
+            collect_expr_dependencies(arg, bindings, builder);
+        }
+        BoundExpr::InList { expr, list, .. } => {
+            collect_expr_dependencies(expr, bindings, builder);
+            for item in list {
+                collect_expr_dependencies(item, bindings, builder);
+            }
+        }
+        BoundExpr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_dependencies(expr, bindings, builder);
+            collect_expr_dependencies(low, bindings, builder);
+            collect_expr_dependencies(high, bindings, builder);
+        }
+        BoundExpr::Like { expr, pattern, .. } => {
+            collect_expr_dependencies(expr, bindings, builder);
+            collect_expr_dependencies(pattern, bindings, builder);
+        }
+        BoundExpr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_dependencies(operand, bindings, builder);
+            }
+            for (when, then) in when_clauses {
+                collect_expr_dependencies(when, bindings, builder);
+                collect_expr_dependencies(then, bindings, builder);
+            }
+            if let Some(else_clause) = else_clause {
+                collect_expr_dependencies(else_clause, bindings, builder);
+            }
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            collect_bound_query_dependencies(query, builder);
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            collect_expr_dependencies(expr, bindings, builder);
+            collect_bound_query_dependencies(query, builder);
+        }
+    }
+}
+
 fn query_has_placeholder(query: &Query) -> bool {
     query
         .with
@@ -830,6 +1452,128 @@ fn query_has_placeholder(query: &Query) -> bool {
             .order_by
             .iter()
             .any(|order_by| expr_has_placeholder(&order_by.expr))
+}
+
+fn query_has_sequence_function(query: &Query) -> bool {
+    query
+        .with
+        .iter()
+        .any(|cte| query_has_sequence_function(&cte.query))
+        || query_body_has_sequence_function(&query.body)
+        || query
+            .order_by
+            .iter()
+            .any(|order_by| expr_has_sequence_function(&order_by.expr))
+}
+
+fn query_body_has_sequence_function(body: &QueryBody) -> bool {
+    match body {
+        QueryBody::Select(select) => {
+            select.columns.iter().any(select_item_has_sequence_function)
+                || select.from.iter().any(from_item_has_sequence_function)
+                || select
+                    .filter
+                    .as_ref()
+                    .is_some_and(expr_has_sequence_function)
+                || select.group_by.iter().any(expr_has_sequence_function)
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(expr_has_sequence_function)
+                || select
+                    .distinct
+                    .as_ref()
+                    .is_some_and(|distinct| match distinct {
+                        parser::Distinct::All => false,
+                        parser::Distinct::On(exprs) => exprs.iter().any(expr_has_sequence_function),
+                    })
+        }
+        QueryBody::Values(rows) => rows.iter().flatten().any(expr_has_sequence_function),
+        QueryBody::SetOp { left, right, .. } => {
+            query_has_sequence_function(left) || query_has_sequence_function(right)
+        }
+    }
+}
+
+fn select_item_has_sequence_function(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        SelectItem::Expression { expr, .. } => expr_has_sequence_function(expr),
+    }
+}
+
+fn from_item_has_sequence_function(item: &FromItem) -> bool {
+    match item {
+        FromItem::Table { .. } => false,
+        FromItem::Derived { subquery, .. } => query_has_sequence_function(subquery),
+        FromItem::Join {
+            left,
+            right,
+            condition,
+            ..
+        } => {
+            from_item_has_sequence_function(left)
+                || from_item_has_sequence_function(right)
+                || condition.as_ref().is_some_and(expr_has_sequence_function)
+        }
+    }
+}
+
+fn expr_has_sequence_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, args, .. } => {
+            name.eq_ignore_ascii_case("nextval")
+                || name.eq_ignore_ascii_case("currval")
+                || name.eq_ignore_ascii_case("setval")
+                || args.iter().any(function_arg_has_sequence_function)
+        }
+        Expr::Subquery(query) => query_has_sequence_function(query),
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_has_sequence_function(expr) || query_has_sequence_function(subquery)
+        }
+        Expr::Exists { subquery, .. } => query_has_sequence_function(subquery),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_sequence_function(left) || expr_has_sequence_function(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            expr_has_sequence_function(expr)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_has_sequence_function(expr) || list.iter().any(expr_has_sequence_function)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_sequence_function(expr)
+                || expr_has_sequence_function(low)
+                || expr_has_sequence_function(high)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_sequence_function(expr) || expr_has_sequence_function(pattern)
+        }
+        Expr::Case {
+            operand,
+            when_clauses,
+            else_clause,
+        } => {
+            operand.as_deref().is_some_and(expr_has_sequence_function)
+                || when_clauses.iter().any(|(when, then)| {
+                    expr_has_sequence_function(when) || expr_has_sequence_function(then)
+                })
+                || else_clause
+                    .as_deref()
+                    .is_some_and(expr_has_sequence_function)
+        }
+        Expr::Cast { expr, .. } => expr_has_sequence_function(expr),
+        Expr::Literal(_) | Expr::Placeholder(_) | Expr::ColumnRef { .. } => false,
+    }
+}
+
+fn function_arg_has_sequence_function(arg: &FunctionArg) -> bool {
+    match arg {
+        FunctionArg::Expr(expr) => expr_has_sequence_function(expr),
+        FunctionArg::Wildcard => false,
+    }
 }
 
 fn query_body_has_placeholder(body: &QueryBody) -> bool {

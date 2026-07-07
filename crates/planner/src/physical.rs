@@ -4,7 +4,7 @@ use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DataType, IndexConstraintKind, IndexId, Key,
     KeyRange, PRIMARY_KEY_INDEX_ID, ParsedColumnDef, Result, SequenceOptions, TableId,
-    ToastOptions, Value,
+    ToastOptions, Value, ViewDependency,
 };
 
 use crate::{
@@ -77,6 +77,7 @@ pub enum PhysicalPlan {
         columns: Vec<String>,
         query: crate::BoundQuery,
         definition: String,
+        dependencies: Vec<ViewDependency>,
     },
     DropView {
         name: String,
@@ -285,12 +286,14 @@ pub fn physical_plan(
             columns,
             query,
             definition,
+            dependencies,
         } => Ok(PhysicalPlan::CreateView {
             name: name.clone(),
             or_replace: *or_replace,
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
+            dependencies: dependencies.clone(),
         }),
         LogicalPlan::DropView { name, if_exists } => Ok(PhysicalPlan::DropView {
             name: name.clone(),

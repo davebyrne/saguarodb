@@ -61,6 +61,9 @@ pub trait SchemaOperations: Send + Sync {
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
     fn create_sequence(&self, ctx: &StatementContext, schema: &SequenceSchema) -> Result<()>;
     fn drop_sequence(&self, ctx: &StatementContext, sequence: SequenceId) -> Result<()>;
+    fn create_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
+    fn replace_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
+    fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
@@ -1256,6 +1259,9 @@ Normal data operations append physiological redo records as they mutate pages, s
 - `SchemaOperations::create_sequence` / `drop_sequence` log `CreateSequence` /
   `DropSequence`. Recovery applies them to both catalog and storage sequence
   metadata when the DDL transaction committed.
+- `SchemaOperations::create_view` / `replace_view` / `drop_view` log
+  `CreateView` / `ReplaceView` / `DropView`. Views have no physical storage
+  metadata, so recovery applies these records to the catalog only.
 - `SequenceManager::nextval` / `setval` log `SequenceAdvance` /
   `SetSequenceValue` and flush that WAL before the live value changes. Recovery
   replays these value records unconditionally against storage's installed

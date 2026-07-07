@@ -12,8 +12,7 @@ use super::{
     BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService,
     QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome, Transaction,
     TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
-    mark_failed_on_error, prepared_schema_versions, run_plan, staged_schema_ddl_error,
-    statement_class,
+    mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::SnapshotExclusionGuard;
@@ -538,9 +537,6 @@ impl QueryService {
         default_isolation: IsolationLevel,
         sink: Option<&mut dyn RowSink>,
     ) -> Result<StreamOutcome> {
-        if let Some(err) = staged_schema_ddl_error(&statement) {
-            return Err(err);
-        }
         match class {
             StatementClass::Read => {
                 let captured = self.capture_consistent_snapshots(0)?;
@@ -688,12 +684,11 @@ impl QueryService {
                 Some(captured),
             );
         }
-        let schema_snapshot_guard =
-            if statement_rewrites_table_storage(&statement, self.components.catalog.as_ref())? {
-                Some(self.components.active_txns.begin_snapshot_exclusion())
-            } else {
-                None
-            };
+        let schema_snapshot_guard = if statement_may_rewrite_table_storage(&statement) {
+            Some(self.components.active_txns.begin_snapshot_exclusion())
+        } else {
+            None
+        };
         let needs_exclusive = statement_needs_exclusive_guard(&statement);
         let guard = if needs_exclusive {
             WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
@@ -946,23 +941,11 @@ fn statement_is_syntactic_dml(statement: &Statement) -> bool {
     )
 }
 
-fn statement_rewrites_table_storage(
-    statement: &Statement,
-    catalog: &dyn CatalogManager,
-) -> Result<bool> {
-    match statement {
-        Statement::AlterTableAddColumn {
-            table,
-            if_not_exists,
-            column,
-        } => preflight_add_column_rewrite(catalog, table, *if_not_exists, column),
-        Statement::AlterTableDropColumn {
-            table,
-            if_exists,
-            column,
-        } => preflight_drop_column_rewrite(catalog, table, *if_exists, column),
-        _ => Ok(false),
-    }
+fn statement_may_rewrite_table_storage(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::AlterTableAddColumn { .. } | Statement::AlterTableDropColumn { .. }
+    )
 }
 
 fn bound_needs_exclusive_guard(bound: &BoundStatement) -> bool {
@@ -990,16 +973,6 @@ fn bound_rewrites_table_storage(
     }
 }
 
-fn preflight_add_column_rewrite(
-    catalog: &dyn CatalogManager,
-    table: &str,
-    if_not_exists: bool,
-    column: &common::ParsedColumnDef,
-) -> Result<bool> {
-    let table = require_table_for_rewrite_preflight(catalog, table)?;
-    preflight_add_column_rewrite_by_id(catalog, table.id, if_not_exists, column)
-}
-
 fn preflight_add_column_rewrite_by_id(
     catalog: &dyn CatalogManager,
     table: TableId,
@@ -1011,16 +984,6 @@ fn preflight_add_column_rewrite_by_id(
         .rewrites_storage())
 }
 
-fn preflight_drop_column_rewrite(
-    catalog: &dyn CatalogManager,
-    table: &str,
-    if_exists: bool,
-    column: &str,
-) -> Result<bool> {
-    let table = require_table_for_rewrite_preflight(catalog, table)?;
-    preflight_drop_column_rewrite_by_id(catalog, table.id, if_exists, column)
-}
-
 fn preflight_drop_column_rewrite_by_id(
     catalog: &dyn CatalogManager,
     table: TableId,
@@ -1030,18 +993,6 @@ fn preflight_drop_column_rewrite_by_id(
     Ok(catalog
         .preflight_drop_table_column(table, if_exists, column)?
         .rewrites_storage())
-}
-
-fn require_table_for_rewrite_preflight(
-    catalog: &dyn CatalogManager,
-    table: &str,
-) -> Result<common::TableSchema> {
-    catalog.get_table_by_name(table)?.ok_or_else(|| {
-        DbError::plan(
-            SqlState::UndefinedTable,
-            format!("table {table} does not exist"),
-        )
-    })
 }
 
 fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
@@ -1060,4 +1011,68 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
             | BoundStatement::CreateView { .. }
             | BoundStatement::DropView { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use catalog::MemoryCatalog;
+    use common::{DataType, ParsedColumnDef};
+
+    use super::*;
+
+    fn parsed_column(name: &str) -> ParsedColumnDef {
+        ParsedColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Integer,
+            nullable: true,
+            max_length: None,
+            default: None,
+            pg_type: None,
+        }
+    }
+
+    #[test]
+    fn conditional_add_drop_column_are_classified_as_potential_rewrites() {
+        let add = Statement::AlterTableAddColumn {
+            table: "t".to_string(),
+            if_not_exists: true,
+            column: parsed_column("c"),
+        };
+        assert!(statement_may_rewrite_table_storage(&add));
+
+        let drop = Statement::AlterTableDropColumn {
+            table: "t".to_string(),
+            if_exists: true,
+            column: "c".to_string(),
+        };
+        assert!(statement_may_rewrite_table_storage(&drop));
+    }
+
+    #[test]
+    fn bound_conditional_add_drop_column_detect_actual_rewrites() {
+        let catalog = MemoryCatalog::empty();
+        let schema = catalog
+            .create_table(
+                "t".to_string(),
+                vec![parsed_column("id")],
+                Vec::new(),
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        let add = BoundStatement::AlterTableAddColumn {
+            table: schema.id,
+            table_name: "t".to_string(),
+            if_not_exists: true,
+            column: parsed_column("c"),
+        };
+        assert!(bound_rewrites_table_storage(&add, &catalog).unwrap());
+
+        let drop = BoundStatement::AlterTableDropColumn {
+            table: schema.id,
+            table_name: "t".to_string(),
+            if_exists: true,
+            column: "c".to_string(),
+        };
+        assert!(!bound_rewrites_table_storage(&drop, &catalog).unwrap());
+    }
 }

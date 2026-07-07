@@ -35,6 +35,9 @@ pub(crate) const TYPE_ALTER_TABLE_TOAST: u8 = 21;
 pub(crate) const TYPE_TRUNCATE_TABLE: u8 = 22;
 pub(crate) const TYPE_ALTER_TABLE_PRIMARY_KEY: u8 = 23;
 pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
+pub(crate) const TYPE_CREATE_VIEW: u8 = 25;
+pub(crate) const TYPE_REPLACE_VIEW: u8 = 26;
+pub(crate) const TYPE_DROP_VIEW: u8 = 27;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
@@ -159,6 +162,9 @@ fn record_type(kind: &WalRecordKind) -> u8 {
         WalRecordKind::DropIndex { .. } => TYPE_DROP_INDEX,
         WalRecordKind::CreateSequence { .. } => TYPE_CREATE_SEQUENCE,
         WalRecordKind::DropSequence { .. } => TYPE_DROP_SEQUENCE,
+        WalRecordKind::CreateView { .. } => TYPE_CREATE_VIEW,
+        WalRecordKind::ReplaceView { .. } => TYPE_REPLACE_VIEW,
+        WalRecordKind::DropView { .. } => TYPE_DROP_VIEW,
         WalRecordKind::SequenceAdvance { .. } => TYPE_SEQUENCE_ADVANCE,
         WalRecordKind::SetSequenceValue { .. } => TYPE_SET_SEQUENCE_VALUE,
         WalRecordKind::Commit => TYPE_COMMIT,
@@ -551,6 +557,51 @@ mod tests {
                 },
             },
             WalRecordKind::DropSequence { sequence: 4 },
+            WalRecordKind::CreateView {
+                schema: common::ViewSchema {
+                    id: 5,
+                    name: "active_users".to_string(),
+                    columns: vec![common::ColumnDef {
+                        id: 0,
+                        name: "id".to_string(),
+                        data_type: common::DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    }],
+                    definition: "select id from users".to_string(),
+                    dependencies: vec![common::ViewDependency {
+                        relation: 1,
+                        columns: vec![0],
+                        all_columns: false,
+                    }],
+                    schema_version: 1,
+                },
+            },
+            WalRecordKind::ReplaceView {
+                schema: common::ViewSchema {
+                    id: 5,
+                    name: "active_users".to_string(),
+                    columns: vec![common::ColumnDef {
+                        id: 0,
+                        name: "id".to_string(),
+                        data_type: common::DataType::Integer,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: None,
+                    }],
+                    definition: "select id from users where id > 0".to_string(),
+                    dependencies: vec![common::ViewDependency {
+                        relation: 1,
+                        columns: vec![0],
+                        all_columns: false,
+                    }],
+                    schema_version: 2,
+                },
+            },
+            WalRecordKind::DropView { view: 5 },
             WalRecordKind::SequenceAdvance {
                 sequence: 4,
                 value: 11,

@@ -1,9 +1,11 @@
 use catalog::{CatalogManager, SystemView, is_system_schema, resolve_system_view};
 use common::{
-    ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId, TableSchema,
-    Value,
+    BindingId, ColumnDef, ColumnId, ColumnInfo, DataType, PgType, Result, SqlState, TableId,
+    TableSchema, Value, ViewSchema,
 };
-use parser::{Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem};
+use parser::{
+    Cte, Distinct, Expr, FromItem, OrderByItem, Query, QueryBody, Select, SelectItem, Statement,
+};
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
@@ -196,7 +198,7 @@ fn bind_cte(
 /// renamed left to right by the optional column-alias list. More aliases than
 /// columns is a `SyntaxError`; `describe` names the relation for that message
 /// (e.g. `table "d"`, `CTE "x"`) and is only evaluated on error.
-fn derive_alias_columns(
+pub(super) fn derive_alias_columns(
     output: &[OutputColumn],
     column_aliases: &[String],
     describe: impl FnOnce() -> String,
@@ -439,7 +441,9 @@ fn bind_select(
     let from = if select.from.is_empty() {
         None
     } else {
-        Some(bind_from_items(catalog, &mut ctx, &select.from)?)
+        let from = bind_from_items(catalog, &mut ctx, &select.from)?;
+        apply_outer_join_nullability(&mut ctx, &from);
+        Some(from)
     };
     let filter = select
         .filter
@@ -529,6 +533,58 @@ fn bind_from_items(
     Ok(bound)
 }
 
+fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
+    match from {
+        BoundFrom::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            apply_outer_join_nullability(ctx, left);
+            apply_outer_join_nullability(ctx, right);
+            match join_type {
+                JoinType::Left => mark_from_bindings_nullable(ctx, right),
+                JoinType::Right => mark_from_bindings_nullable(ctx, left),
+                JoinType::Full => {
+                    mark_from_bindings_nullable(ctx, left);
+                    mark_from_bindings_nullable(ctx, right);
+                }
+                JoinType::Inner | JoinType::Cross => {}
+            }
+        }
+        BoundFrom::Table { .. }
+        | BoundFrom::System { .. }
+        | BoundFrom::Derived { .. }
+        | BoundFrom::View { .. } => {}
+    }
+}
+
+fn mark_from_bindings_nullable(ctx: &mut BindContext, from: &BoundFrom) {
+    let mut bindings = Vec::new();
+    collect_from_binding_ids(from, &mut bindings);
+    for binding in &mut ctx.bindings {
+        if bindings.contains(&binding.id) {
+            for column in &mut binding.columns {
+                column.nullable = true;
+            }
+        }
+    }
+}
+
+fn collect_from_binding_ids(from: &BoundFrom, output: &mut Vec<BindingId>) {
+    match from {
+        BoundFrom::Table { binding, .. }
+        | BoundFrom::System { binding, .. }
+        | BoundFrom::Derived { binding, .. }
+        | BoundFrom::View { binding, .. } => output.push(*binding),
+        BoundFrom::Join { left, right, .. } => {
+            collect_from_binding_ids(left, output);
+            collect_from_binding_ids(right, output);
+        }
+    }
+}
+
 fn bind_from_item(
     catalog: &dyn CatalogManager,
     ctx: &mut BindContext,
@@ -600,6 +656,8 @@ fn bind_table_or_schema_qualified_name(
                 Ok(bind_cte_reference(ctx, cte, alias.clone()))
             } else if let Some(table) = catalog.get_table_by_name(name)? {
                 Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            } else if let Some(view) = catalog.get_view_by_name(name)? {
+                bind_view_from_schema(catalog, ctx, view, alias.clone())
             } else if let Some(view) = resolve_system_view(None, name) {
                 Ok(bind_system_view(ctx, view, alias.clone()))
             } else {
@@ -610,13 +668,16 @@ fn bind_table_or_schema_qualified_name(
             }
         }
         Some("public") => {
-            let table = catalog.get_table_by_name(name)?.ok_or_else(|| {
-                plan_error(
-                    SqlState::UndefinedTable,
-                    format!("table public.{name} does not exist"),
-                )
-            })?;
-            Ok(bind_table_from_schema(ctx, table, alias.clone()))
+            if let Some(table) = catalog.get_table_by_name(name)? {
+                return Ok(bind_table_from_schema(ctx, table, alias.clone()));
+            }
+            if let Some(view) = catalog.get_view_by_name(name)? {
+                return bind_view_from_schema(catalog, ctx, view, alias.clone());
+            }
+            Err(plan_error(
+                SqlState::UndefinedTable,
+                format!("table public.{name} does not exist"),
+            ))
         }
         Some(schema) if is_system_schema(schema) => match resolve_system_view(Some(schema), name) {
             Some(view) => Ok(bind_system_view(ctx, view, alias.clone())),
@@ -630,6 +691,67 @@ fn bind_table_or_schema_qualified_name(
             format!("schema \"{schema}\" does not exist"),
         )),
     }
+}
+
+fn parse_view_query(view: &ViewSchema) -> Result<Query> {
+    match parser::parse(&view.definition)? {
+        Statement::Query(query) => Ok(query),
+        _ => Err(plan_error(
+            SqlState::SyntaxError,
+            format!("view {} definition is not a SELECT query", view.name),
+        )),
+    }
+}
+
+fn bind_view_from_schema(
+    catalog: &dyn CatalogManager,
+    ctx: &mut BindContext,
+    view: ViewSchema,
+    alias: Option<String>,
+) -> Result<BoundFrom> {
+    let query_ast = parse_view_query(&view)?;
+    // A stored view definition binds in its own scope. Caller CTEs must not
+    // change what base relations the persisted SQL resolves to.
+    let query = bind_query(
+        catalog,
+        &query_ast,
+        &ctx.declared_params,
+        &CteScope::default(),
+        None,
+    )?;
+    let output_len = query.output_schema().len();
+    if output_len != view.columns.len() {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            format!(
+                "view {} definition returns {output_len} columns but catalog has {} columns",
+                view.name,
+                view.columns.len()
+            ),
+        ));
+    }
+    let visible_name = alias.unwrap_or_else(|| view.name.clone());
+    let binding = ctx.next_binding;
+    ctx.next_binding += 1;
+    let slot_start = ctx.next_slot;
+    ctx.next_slot += view.columns.len();
+    ctx.bindings.push(Binding {
+        id: binding,
+        table_id: None,
+        table_name: view.name.clone(),
+        visible_name: visible_name.clone(),
+        columns: view.columns.clone(),
+        slot_start,
+        qualified_only: false,
+    });
+    Ok(BoundFrom::View {
+        view: view.id,
+        schema_version: view.schema_version,
+        query: Box::new(query),
+        binding,
+        alias: visible_name,
+        schema: view.columns,
+    })
 }
 
 fn bind_system_view(ctx: &mut BindContext, view: SystemView, alias: Option<String>) -> BoundFrom {
@@ -676,6 +798,7 @@ pub(super) fn bind_table_from_schema(
     BoundFrom::Table {
         table: table.id,
         binding,
+        name: table.name,
         alias,
         schema: table.columns,
     }
@@ -826,6 +949,7 @@ pub(super) fn bind_select_item(
                     output.push(BoundSelectItem {
                         expr: input_ref(binding, column),
                         alias: column.name.clone(),
+                        wildcard_source: binding.table_id,
                     });
                 }
             }
@@ -836,13 +960,18 @@ pub(super) fn bind_select_item(
                 output.push(BoundSelectItem {
                     expr: input_ref(binding, column),
                     alias: column.name.clone(),
+                    wildcard_source: binding.table_id,
                 });
             }
         }
         SelectItem::Expression { expr, alias } => {
             let bound = bind_expr(ctx, expr, expected)?;
             let alias = alias.clone().unwrap_or_else(|| derive_alias(expr));
-            output.push(BoundSelectItem { expr: bound, alias });
+            output.push(BoundSelectItem {
+                expr: bound,
+                alias,
+                wildcard_source: None,
+            });
         }
     }
     Ok(())

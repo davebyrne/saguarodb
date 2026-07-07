@@ -1,6 +1,6 @@
 use common::{
     ColumnId, CompressionSetting, FileId, IndexId, IndexSchema, Lsn, PageNum, SequenceId,
-    SequenceSchema, TableId, TableSchema, ToastOptions,
+    SequenceSchema, TableId, TableSchema, ToastOptions, ViewSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,15 @@ pub enum WalRecordKind {
     },
     DropSequence {
         sequence: SequenceId,
+    },
+    CreateView {
+        schema: ViewSchema,
+    },
+    ReplaceView {
+        schema: ViewSchema,
+    },
+    DropView {
+        view: TableId,
     },
     /// Non-transactional sequence advance produced by `nextval`. Recovery replays
     /// it regardless of the writer transaction's eventual outcome so rolled-back

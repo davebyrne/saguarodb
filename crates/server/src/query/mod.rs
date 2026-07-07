@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -520,9 +520,6 @@ impl QueryService {
                 result_columns,
             });
         }
-        if let Some(err) = staged_schema_ddl_error(&statement) {
-            return Err(err);
-        }
         // The binder resolves parameter types as `DataType` (declared or inferred).
         let declared_data_types: Vec<Option<DataType>> = declared_param_types
             .iter()
@@ -947,13 +944,11 @@ impl QueryService {
         &self,
         schema_versions: &[(TableId, u64)],
     ) -> Result<()> {
-        for (table_id, prepared_version) in schema_versions {
-            let current = self
-                .components
-                .catalog
-                .get_table(*table_id)?
-                .ok_or_else(prepared_schema_changed_error)?;
-            if current.schema_version != *prepared_version {
+        for (relation, prepared_version) in schema_versions {
+            let current_version =
+                relation_schema_version(self.components.catalog.as_ref(), *relation)?
+                    .ok_or_else(prepared_schema_changed_error)?;
+            if current_version != *prepared_version {
                 return Err(prepared_schema_changed_error());
             }
         }
@@ -969,6 +964,11 @@ impl QueryService {
         for (table_id, bound_version) in schema_versions {
             match relations.table_schema_version(*table_id) {
                 Some(snapshot_version) if snapshot_version == *bound_version => {}
+                None if self
+                    .components
+                    .catalog
+                    .get_view(*table_id)?
+                    .is_some_and(|view| view.schema_version == *bound_version) => {}
                 None if allow_missing_tables && relations.missing_tables_are_empty() => {}
                 _ => return Err(relation_snapshot_schema_changed_error(*table_id)),
             }
@@ -981,12 +981,10 @@ impl QueryService {
         schema_versions: &[(TableId, u64)],
     ) -> Result<()> {
         for (table_id, bound_version) in schema_versions {
-            let current = self
-                .components
-                .catalog
-                .get_table(*table_id)?
-                .ok_or_else(|| relation_snapshot_schema_changed_error(*table_id))?;
-            if current.schema_version != *bound_version {
+            let current_version =
+                relation_schema_version(self.components.catalog.as_ref(), *table_id)?
+                    .ok_or_else(|| relation_snapshot_schema_changed_error(*table_id))?;
+            if current_version != *bound_version {
                 return Err(relation_snapshot_schema_changed_error(*table_id));
             }
         }
@@ -1026,22 +1024,66 @@ fn prepared_schema_versions(
     bound: &BoundStatement,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<Vec<(TableId, u64)>> {
-    let mut tables = BTreeSet::new();
-    collect_bound_statement_tables(bound, &mut tables);
-    tables
+    let mut relations = BTreeMap::new();
+    collect_bound_statement_tables(bound, &mut relations)?;
+    relations
         .into_iter()
-        .map(|table_id| {
-            let schema = catalog
-                .get_table(table_id)?
-                .ok_or_else(prepared_schema_changed_error)?;
-            Ok((table_id, schema.schema_version))
+        .map(|(relation, bound_version)| {
+            let schema_version = match bound_version {
+                Some(schema_version) => schema_version,
+                None => relation_schema_version(catalog, relation)?
+                    .ok_or_else(prepared_schema_changed_error)?,
+            };
+            Ok((relation, schema_version))
         })
         .collect()
 }
 
-fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<TableId>) {
+fn relation_schema_version(
+    catalog: &dyn catalog::CatalogManager,
+    relation: TableId,
+) -> Result<Option<u64>> {
+    if let Some(table) = catalog.get_table(relation)? {
+        return Ok(Some(table.schema_version));
+    }
+    if let Some(view) = catalog.get_view(relation)? {
+        return Ok(Some(view.schema_version));
+    }
+    Ok(None)
+}
+
+type BoundRelationVersions = BTreeMap<TableId, Option<u64>>;
+
+fn record_bound_relation_version(
+    relations: &mut BoundRelationVersions,
+    relation: TableId,
+    schema_version: Option<u64>,
+) -> Result<()> {
+    let Some(existing) = relations.get_mut(&relation) else {
+        relations.insert(relation, schema_version);
+        return Ok(());
+    };
+    match (*existing, schema_version) {
+        (Some(existing), Some(incoming)) if existing != incoming => {
+            Err(DbError::internal(format!(
+                "bound plan references relation id {relation} at conflicting schema versions \
+                 {existing} and {incoming}"
+            )))
+        }
+        (None, Some(incoming)) => {
+            *existing = Some(incoming);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_bound_statement_tables(
+    bound: &BoundStatement,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     match bound {
-        BoundStatement::Query(query) => collect_query_tables(query, tables),
+        BoundStatement::Query(query) => collect_query_tables(query, relations)?,
         BoundStatement::Insert {
             table,
             source,
@@ -1051,19 +1093,19 @@ fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<
             check_exprs,
             ..
         } => {
-            tables.insert(*table);
-            collect_insert_source_tables(source, tables);
+            record_bound_relation_version(relations, *table, None)?;
+            collect_insert_source_tables(source, relations)?;
             if let Some(on_conflict) = on_conflict {
-                collect_on_conflict_tables(on_conflict, tables);
+                collect_on_conflict_tables(on_conflict, relations)?;
             }
             if let Some(returning) = returning {
-                collect_returning_tables(returning, tables);
+                collect_returning_tables(returning, relations)?;
             }
             for (_, expr) in default_exprs {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
             for expr in check_exprs {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
         }
         BoundStatement::Update {
@@ -1073,16 +1115,16 @@ fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<
             returning,
             check_exprs,
         } => {
-            tables.insert(*table);
+            record_bound_relation_version(relations, *table, None)?;
             for (_, expr) in assignments {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
-            collect_select_tables(source, tables);
+            collect_select_tables(source, relations)?;
             if let Some(returning) = returning {
-                collect_returning_tables(returning, tables);
+                collect_returning_tables(returning, relations)?;
             }
             for expr in check_exprs {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
         }
         BoundStatement::Delete {
@@ -1090,18 +1132,18 @@ fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<
             source,
             returning,
         } => {
-            tables.insert(*table);
-            collect_select_tables(source, tables);
+            record_bound_relation_version(relations, *table, None)?;
+            collect_select_tables(source, relations)?;
             if let Some(returning) = returning {
-                collect_returning_tables(returning, tables);
+                collect_returning_tables(returning, relations)?;
             }
         }
-        BoundStatement::Explain(inner) => collect_bound_statement_tables(inner, tables),
+        BoundStatement::Explain(inner) => collect_bound_statement_tables(inner, relations)?,
         BoundStatement::AlterTableAddColumn { table, .. }
         | BoundStatement::AlterTableDropColumn { table, .. }
         | BoundStatement::AlterTableRenameColumn { table, .. }
         | BoundStatement::AlterTableRenameTable { table, .. } => {
-            tables.insert(*table);
+            record_bound_relation_version(relations, *table, None)?;
         }
         BoundStatement::CreateTable { .. }
         | BoundStatement::DropTable { .. }
@@ -1109,100 +1151,140 @@ fn collect_bound_statement_tables(bound: &BoundStatement, tables: &mut BTreeSet<
         | BoundStatement::DropIndex { .. }
         | BoundStatement::CreateSequence { .. }
         | BoundStatement::DropSequence { .. }
-        | BoundStatement::CreateView { .. }
         | BoundStatement::DropView { .. } => {}
         BoundStatement::Copy { table, .. } => {
-            tables.insert(*table);
+            record_bound_relation_version(relations, *table, None)?;
+        }
+        BoundStatement::CreateView {
+            query,
+            dependencies,
+            ..
+        } => {
+            collect_query_tables(query, relations)?;
+            for dependency in dependencies {
+                record_bound_relation_version(relations, dependency.relation, None)?;
+            }
         }
     }
+    Ok(())
 }
 
-fn collect_query_tables(query: &BoundQuery, tables: &mut BTreeSet<TableId>) {
+fn collect_query_tables(query: &BoundQuery, relations: &mut BoundRelationVersions) -> Result<()> {
     match &query.body {
-        BoundQueryBody::Select(select) => collect_select_tables(select, tables),
-        BoundQueryBody::Values(values) => collect_values_tables(values, tables),
+        BoundQueryBody::Select(select) => collect_select_tables(select, relations)?,
+        BoundQueryBody::Values(values) => collect_values_tables(values, relations)?,
         BoundQueryBody::SetOp(set_op) => {
-            collect_query_tables(&set_op.left, tables);
-            collect_query_tables(&set_op.right, tables);
+            collect_query_tables(&set_op.left, relations)?;
+            collect_query_tables(&set_op.right, relations)?;
         }
     }
     for order_by in &query.order_by {
-        collect_expr_tables(&order_by.expr, tables);
+        collect_expr_tables(&order_by.expr, relations)?;
     }
+    Ok(())
 }
 
-fn collect_values_tables(values: &BoundValues, tables: &mut BTreeSet<TableId>) {
+fn collect_values_tables(
+    values: &BoundValues,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     for expr in values.rows.iter().flatten() {
-        collect_expr_tables(expr, tables);
+        collect_expr_tables(expr, relations)?;
     }
+    Ok(())
 }
 
-fn collect_select_tables(select: &BoundSelect, tables: &mut BTreeSet<TableId>) {
+fn collect_select_tables(
+    select: &BoundSelect,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     if let Some(distinct) = &select.distinct {
-        collect_distinct_tables(distinct, tables);
+        collect_distinct_tables(distinct, relations)?;
     }
     for item in &select.columns {
-        collect_expr_tables(&item.expr, tables);
+        collect_expr_tables(&item.expr, relations)?;
     }
     if let Some(from) = &select.from {
-        collect_from_tables(from, tables);
+        collect_from_tables(from, relations)?;
     }
     if let Some(filter) = &select.filter {
-        collect_expr_tables(filter, tables);
+        collect_expr_tables(filter, relations)?;
     }
     for expr in &select.group_by {
-        collect_expr_tables(expr, tables);
+        collect_expr_tables(expr, relations)?;
     }
     if let Some(having) = &select.having {
-        collect_expr_tables(having, tables);
+        collect_expr_tables(having, relations)?;
     }
+    Ok(())
 }
 
-fn collect_distinct_tables(distinct: &BoundDistinct, tables: &mut BTreeSet<TableId>) {
+fn collect_distinct_tables(
+    distinct: &BoundDistinct,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     match distinct {
         BoundDistinct::All => {}
         BoundDistinct::On(exprs) => {
             for expr in exprs {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
         }
     }
+    Ok(())
 }
 
-fn collect_from_tables(from: &BoundFrom, tables: &mut BTreeSet<TableId>) {
+fn collect_from_tables(from: &BoundFrom, relations: &mut BoundRelationVersions) -> Result<()> {
     match from {
         BoundFrom::Table { table, .. } => {
-            tables.insert(*table);
+            record_bound_relation_version(relations, *table, None)?;
         }
         BoundFrom::System { .. } => {}
-        BoundFrom::Derived { query, .. } => collect_query_tables(query, tables),
+        BoundFrom::Derived { query, .. } => collect_query_tables(query, relations)?,
+        BoundFrom::View {
+            view,
+            schema_version,
+            query,
+            ..
+        } => {
+            record_bound_relation_version(relations, *view, Some(*schema_version))?;
+            collect_query_tables(query, relations)?;
+        }
         BoundFrom::Join {
             left,
             right,
             condition,
             ..
         } => {
-            collect_from_tables(left, tables);
-            collect_from_tables(right, tables);
+            collect_from_tables(left, relations)?;
+            collect_from_tables(right, relations)?;
             if let Some(condition) = condition {
-                collect_expr_tables(condition, tables);
+                collect_expr_tables(condition, relations)?;
             }
         }
     }
+    Ok(())
 }
 
-fn collect_insert_source_tables(source: &BoundInsertSource, tables: &mut BTreeSet<TableId>) {
+fn collect_insert_source_tables(
+    source: &BoundInsertSource,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     match source {
         BoundInsertSource::Values { rows, .. } => {
             for expr in rows.iter().flatten() {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
         }
-        BoundInsertSource::Query(query) => collect_query_tables(query, tables),
+        BoundInsertSource::Query(query) => collect_query_tables(query, relations)?,
     }
+    Ok(())
 }
 
-fn collect_on_conflict_tables(on_conflict: &BoundOnConflict, tables: &mut BTreeSet<TableId>) {
+fn collect_on_conflict_tables(
+    on_conflict: &BoundOnConflict,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     match on_conflict {
         BoundOnConflict::DoNothing { .. } => {}
         BoundOnConflict::DoUpdate {
@@ -1211,22 +1293,27 @@ fn collect_on_conflict_tables(on_conflict: &BoundOnConflict, tables: &mut BTreeS
             ..
         } => {
             for (_, expr) in assignments {
-                collect_expr_tables(expr, tables);
+                collect_expr_tables(expr, relations)?;
             }
             if let Some(filter) = filter {
-                collect_expr_tables(filter, tables);
+                collect_expr_tables(filter, relations)?;
             }
         }
     }
+    Ok(())
 }
 
-fn collect_returning_tables(returning: &BoundReturning, tables: &mut BTreeSet<TableId>) {
+fn collect_returning_tables(
+    returning: &BoundReturning,
+    relations: &mut BoundRelationVersions,
+) -> Result<()> {
     for expr in &returning.exprs {
-        collect_expr_tables(expr, tables);
+        collect_expr_tables(expr, relations)?;
     }
+    Ok(())
 }
 
-fn collect_expr_tables(expr: &BoundExpr, tables: &mut BTreeSet<TableId>) {
+fn collect_expr_tables(expr: &BoundExpr, relations: &mut BoundRelationVersions) -> Result<()> {
     match expr {
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
@@ -1236,43 +1323,43 @@ fn collect_expr_tables(expr: &BoundExpr, tables: &mut BTreeSet<TableId>) {
         | BoundExpr::AggregateCall { arg: None, .. }
         | BoundExpr::LocalRef { .. } => {}
         BoundExpr::BinaryOp { left, right, .. } => {
-            collect_expr_tables(left, tables);
-            collect_expr_tables(right, tables);
+            collect_expr_tables(left, relations)?;
+            collect_expr_tables(right, relations)?;
         }
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => collect_expr_tables(expr, tables),
+        | BoundExpr::Cast { expr, .. } => collect_expr_tables(expr, relations)?,
         BoundExpr::Function { args, .. } => {
             for arg in args {
-                collect_expr_tables(arg, tables);
+                collect_expr_tables(arg, relations)?;
             }
         }
         BoundExpr::Setval {
             value, is_called, ..
         } => {
-            collect_expr_tables(value, tables);
+            collect_expr_tables(value, relations)?;
             if let Some(is_called) = is_called {
-                collect_expr_tables(is_called, tables);
+                collect_expr_tables(is_called, relations)?;
             }
         }
-        BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_tables(arg, tables),
+        BoundExpr::AggregateCall { arg: Some(arg), .. } => collect_expr_tables(arg, relations)?,
         BoundExpr::InList { expr, list, .. } => {
-            collect_expr_tables(expr, tables);
+            collect_expr_tables(expr, relations)?;
             for item in list {
-                collect_expr_tables(item, tables);
+                collect_expr_tables(item, relations)?;
             }
         }
         BoundExpr::Between {
             expr, low, high, ..
         } => {
-            collect_expr_tables(expr, tables);
-            collect_expr_tables(low, tables);
-            collect_expr_tables(high, tables);
+            collect_expr_tables(expr, relations)?;
+            collect_expr_tables(low, relations)?;
+            collect_expr_tables(high, relations)?;
         }
         BoundExpr::Like { expr, pattern, .. } => {
-            collect_expr_tables(expr, tables);
-            collect_expr_tables(pattern, tables);
+            collect_expr_tables(expr, relations)?;
+            collect_expr_tables(pattern, relations)?;
         }
         BoundExpr::Case {
             operand,
@@ -1281,24 +1368,25 @@ fn collect_expr_tables(expr: &BoundExpr, tables: &mut BTreeSet<TableId>) {
             ..
         } => {
             if let Some(operand) = operand {
-                collect_expr_tables(operand, tables);
+                collect_expr_tables(operand, relations)?;
             }
             for (when, then) in when_clauses {
-                collect_expr_tables(when, tables);
-                collect_expr_tables(then, tables);
+                collect_expr_tables(when, relations)?;
+                collect_expr_tables(then, relations)?;
             }
             if let Some(else_clause) = else_clause {
-                collect_expr_tables(else_clause, tables);
+                collect_expr_tables(else_clause, relations)?;
             }
         }
         BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
-            collect_query_tables(query, tables);
+            collect_query_tables(query, relations)?;
         }
         BoundExpr::InSubquery { expr, query, .. } => {
-            collect_expr_tables(expr, tables);
-            collect_query_tables(query, tables);
+            collect_expr_tables(expr, relations)?;
+            collect_query_tables(query, relations)?;
         }
     }
+    Ok(())
 }
 
 /// Abort and discard a transaction held on the session, e.g. when a client
@@ -1518,9 +1606,9 @@ pub struct PreparedStatement {
     sql: String,
     class: StatementClass,
     bound: Option<BoundStatement>,
-    /// Table schema versions captured at prepare time for cached data plans.
-    /// Executing the plan after any referenced table changes shape is rejected so
-    /// stale row slots and RowDescription metadata are never reused silently.
+    /// Table/view schema versions captured at prepare time for cached data plans.
+    /// Executing the plan after any referenced relation changes shape is rejected
+    /// so stale row slots and RowDescription metadata are never reused silently.
     schema_versions: Vec<(TableId, u64)>,
     /// The parsed maintenance statement, carried unbound for the
     /// `StatementClass::Maintenance` case so an extended-protocol `Execute` can
@@ -1654,19 +1742,6 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::ReleaseSavepoint { .. }
         | Statement::RollbackToSavepoint { .. } => Ok(StatementClass::Savepoint),
     }
-}
-
-fn staged_schema_ddl_error(statement: &Statement) -> Option<DbError> {
-    matches!(
-        statement,
-        Statement::CreateView { .. } | Statement::DropView { .. }
-    )
-    .then(|| {
-        DbError::plan(
-            SqlState::FeatureNotSupported,
-            "views are not implemented yet",
-        )
-    })
 }
 
 fn classify_bound(class: StatementClass, bound: &BoundStatement) -> StatementClass {
@@ -2724,25 +2799,9 @@ mod tests {
     }
 
     #[test]
-    fn staged_schema_ddl_views_reject_and_truncate_executes() {
+    fn truncate_executes_in_simple_and_prepared_paths() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
-
-        let view_sql = "create view v as select * from missing_table";
-        let simple_err = app.query_service.execute_sql(view_sql).unwrap_err();
-        assert_eq!(simple_err.code, SqlState::FeatureNotSupported);
-        assert!(simple_err.message.contains("views are not implemented yet"));
-
-        let prepared_err = match app.query_service.prepare_sql(view_sql, &[]) {
-            Ok(_) => panic!("expected prepare to reject {view_sql}"),
-            Err(err) => err,
-        };
-        assert_eq!(prepared_err.code, SqlState::FeatureNotSupported);
-        assert!(
-            prepared_err
-                .message
-                .contains("views are not implemented yet")
-        );
 
         app.query_service
             .execute_sql("create table users (id integer primary key, name text)")
@@ -2816,6 +2875,309 @@ mod tests {
         assert_eq!(
             row_count(app.query_service.execute_sql("select id from users")),
             0
+        );
+    }
+
+    #[test]
+    fn views_create_select_replace_drop_and_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text, active boolean)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "insert into users (id, name, active) values \
+                 (1, 'Ada', true), (2, 'Grace', false)",
+            )
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create view active_users (uid, uname) as \
+                 select id, name from users where active = true",
+            )
+            .unwrap();
+        let create_table_over_view = app
+            .query_service
+            .execute_sql("create table if not exists active_users (id integer primary key)")
+            .unwrap_err();
+        assert_eq!(create_table_over_view.code, SqlState::DuplicateTable);
+        let drop_table_over_view = app
+            .query_service
+            .execute_sql("drop table if exists active_users")
+            .unwrap_err();
+        assert_eq!(drop_table_over_view.code, SqlState::WrongObjectType);
+        let plain_drop_table_over_view = app
+            .query_service
+            .execute_sql("drop table active_users")
+            .unwrap_err();
+        assert_eq!(plain_drop_table_over_view.code, SqlState::WrongObjectType);
+        let drop_view_over_table = app
+            .query_service
+            .execute_sql("drop view if exists users")
+            .unwrap_err();
+        assert_eq!(drop_view_over_table.code, SqlState::WrongObjectType);
+        let plain_drop_view_over_table = app
+            .query_service
+            .execute_sql("drop view users")
+            .unwrap_err();
+        assert_eq!(plain_drop_view_over_table.code, SqlState::WrongObjectType);
+
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select uid, uname from active_users order by uid")
+            ),
+            vec![vec![Value::Integer(1), Value::Text("Ada".to_string())]]
+        );
+        app.query_service
+            .execute_sql("create table copied_active_users (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into copied_active_users (id) select uid from active_users")
+            .unwrap();
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select id from copied_active_users")
+            ),
+            vec![vec![Value::Integer(1)]]
+        );
+        assert_eq!(
+            result_values(app.query_service.execute_sql(
+                "select table_type from information_schema.tables \
+                 where table_schema = 'public' and table_name = 'active_users'"
+            )),
+            vec![vec![Value::Text("VIEW".to_string())]]
+        );
+        assert_eq!(
+            result_values(app.query_service.execute_sql(
+                "select relkind from pg_catalog.pg_class where relname = 'active_users'"
+            )),
+            vec![vec![Value::Text("v".to_string())]]
+        );
+        assert_eq!(
+            result_values(app.query_service.execute_sql(
+                "select column_name from information_schema.columns \
+                 where table_schema = 'public' and table_name = 'active_users' \
+                 order by ordinal_position"
+            )),
+            vec![
+                vec![Value::Text("uid".to_string())],
+                vec![Value::Text("uname".to_string())],
+            ]
+        );
+
+        let prepared = app
+            .query_service
+            .prepare_sql("select uid from active_users order by uid", &[])
+            .unwrap();
+        assert_eq!(
+            result_values(app.query_service.execute_prepared(&prepared, &[])),
+            vec![vec![Value::Integer(1)]]
+        );
+
+        app.query_service
+            .execute_sql(
+                "create or replace view active_users (uid) as \
+                 select id from users where id > 1",
+            )
+            .unwrap();
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("with users (id) as (values (99)) select uid from active_users")
+            ),
+            vec![vec![Value::Integer(2)]]
+        );
+        let stale = app
+            .query_service
+            .execute_prepared(&prepared, &[])
+            .unwrap_err();
+        assert_eq!(stale.code, SqlState::FeatureNotSupported);
+        assert!(stale.message.contains("cached plan must be reprepared"));
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select uid from active_users order by uid")
+            ),
+            vec![vec![Value::Integer(2)]]
+        );
+
+        app.query_service
+            .execute_sql("drop view active_users")
+            .unwrap();
+        let missing = app
+            .query_service
+            .execute_sql("select uid from active_users")
+            .unwrap_err();
+        assert_eq!(missing.code, SqlState::UndefinedTable);
+    }
+
+    #[test]
+    fn view_dependencies_block_drop_and_only_wildcards_block_add_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql("create table users (id integer primary key, name text)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create view user_count as select count(*) from users")
+            .unwrap();
+        app.query_service
+            .execute_sql("alter table users add column active boolean")
+            .unwrap();
+        app.query_service
+            .execute_sql("create view ordered_users as select id from users order by name")
+            .unwrap();
+        let drop_ordered_column = app
+            .query_service
+            .execute_sql("alter table users drop column name")
+            .unwrap_err();
+        assert_eq!(
+            drop_ordered_column.code,
+            SqlState::DependentObjectsStillExist
+        );
+        app.query_service
+            .execute_sql("drop view ordered_users")
+            .unwrap();
+        let drop_table = app
+            .query_service
+            .execute_sql("drop table users")
+            .unwrap_err();
+        assert_eq!(drop_table.code, SqlState::DependentObjectsStillExist);
+
+        app.query_service
+            .execute_sql("drop view user_count")
+            .unwrap();
+        app.query_service
+            .execute_sql("create view all_users as select * from users")
+            .unwrap();
+        let add_column = app
+            .query_service
+            .execute_sql("alter table users add column email text")
+            .unwrap_err();
+        assert_eq!(add_column.code, SqlState::DependentObjectsStillExist);
+
+        app.query_service
+            .execute_sql("drop view all_users")
+            .unwrap();
+        app.query_service
+            .execute_sql("create view nested_all_users as select * from (select * from users) d")
+            .unwrap();
+        let add_nested_column = app
+            .query_service
+            .execute_sql("alter table users add column email text")
+            .unwrap_err();
+        assert_eq!(add_nested_column.code, SqlState::DependentObjectsStillExist);
+
+        app.query_service
+            .execute_sql("drop view nested_all_users")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create view cte_all_users as with d as (select * from users) select * from d",
+            )
+            .unwrap();
+        let add_cte_column = app
+            .query_service
+            .execute_sql("alter table users add column email text")
+            .unwrap_err();
+        assert_eq!(add_cte_column.code, SqlState::DependentObjectsStillExist);
+
+        app.query_service
+            .execute_sql("create table logs (id integer primary key, message text)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create view unused_cte_view as \
+                 with unused as (select * from logs) select 1 as one",
+            )
+            .unwrap();
+        let drop_unused_cte_table = app
+            .query_service
+            .execute_sql("drop table logs")
+            .unwrap_err();
+        assert_eq!(
+            drop_unused_cte_table.code,
+            SqlState::DependentObjectsStillExist
+        );
+
+        app.query_service
+            .execute_sql("create sequence seq1")
+            .unwrap();
+        let sequence_view = app
+            .query_service
+            .execute_sql("create view sequence_view as select nextval('seq1')")
+            .unwrap_err();
+        assert_eq!(sequence_view.code, SqlState::FeatureNotSupported);
+    }
+
+    #[test]
+    fn view_output_nullability_accounts_for_outer_join_null_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+
+        app.query_service
+            .execute_sql("create table left_rows (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create table right_rows (id integer primary key)")
+            .unwrap();
+        app.query_service
+            .execute_sql("insert into left_rows (id) values (1)")
+            .unwrap();
+        app.query_service
+            .execute_sql(
+                "create view nullable_right as \
+                 select right_rows.id as maybe_id \
+                 from left_rows left join right_rows on false",
+            )
+            .unwrap();
+
+        assert_eq!(
+            result_values(
+                app.query_service
+                    .execute_sql("select maybe_id from nullable_right")
+            ),
+            vec![vec![Value::Null]]
+        );
+        assert_eq!(
+            result_values(app.query_service.execute_sql(
+                "select is_nullable from information_schema.columns \
+                 where table_schema = 'public' and table_name = 'nullable_right' \
+                 and column_name = 'maybe_id'"
+            )),
+            vec![vec![Value::Text("YES".to_string())]]
+        );
+    }
+
+    #[test]
+    fn views_recover_from_wal_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let app = AppState::open_for_test(dir.path()).unwrap();
+            app.query_service
+                .execute_sql("create table users (id integer primary key, name text)")
+                .unwrap();
+            app.query_service
+                .execute_sql("insert into users (id, name) values (1, 'Ada')")
+                .unwrap();
+            app.query_service
+                .execute_sql("create view user_names as select name from users")
+                .unwrap();
+        }
+
+        let reopened = AppState::open_for_test(dir.path()).unwrap();
+        assert_eq!(
+            result_values(
+                reopened
+                    .query_service
+                    .execute_sql("select name from user_names")
+            ),
+            vec![vec![Value::Text("Ada".to_string())]]
         );
     }
 
@@ -4336,6 +4698,48 @@ mod tests {
             "message was: {}",
             insert_err.message
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_schema_versions_keep_bound_view_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        app.query_service
+            .execute_sql("create table users (id integer primary key, active boolean)")
+            .unwrap();
+        app.query_service
+            .execute_sql("create view active_users as select id from users where active = true")
+            .unwrap();
+
+        let statement = parser::parse("select id from active_users").unwrap();
+        let bound = planner::bind(&statement, app.components.catalog.as_ref()).unwrap();
+        let original_view = app
+            .components
+            .catalog
+            .get_view_by_name("active_users")
+            .unwrap()
+            .unwrap();
+
+        app.query_service
+            .execute_sql("create or replace view active_users as select id from users where id > 0")
+            .unwrap();
+        let replaced_view = app
+            .components
+            .catalog
+            .get_view_by_name("active_users")
+            .unwrap()
+            .unwrap();
+
+        let schema_versions =
+            super::prepared_schema_versions(&bound, app.components.catalog.as_ref()).unwrap();
+        assert!(schema_versions.contains(&(original_view.id, original_view.schema_version)));
+        assert!(!schema_versions.contains(&(replaced_view.id, replaced_view.schema_version)));
+
+        let stale = app
+            .query_service
+            .validate_prepared_schema_versions(&schema_versions)
+            .unwrap_err();
+        assert_eq!(stale.code, SqlState::FeatureNotSupported);
     }
 
     #[tokio::test]

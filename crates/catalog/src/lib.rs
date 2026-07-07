@@ -643,6 +643,8 @@ mod tests {
         // after the user table is already burned before the view is created.
         assert_eq!(view.id, users.id + 2);
         assert_eq!(view.schema_version, common::INITIAL_SCHEMA_VERSION);
+        assert!(!view.columns[0].nullable);
+        assert!(view.columns[1].nullable);
         assert_eq!(
             catalog
                 .get_view_by_name("active_users")

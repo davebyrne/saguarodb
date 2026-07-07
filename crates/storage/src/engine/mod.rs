@@ -2802,6 +2802,36 @@ impl SchemaOperations for PageBackedStorageEngine {
         state.sequences.remove(&sequence);
         Ok(())
     }
+
+    fn create_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(
+            &state,
+            ctx,
+            WalRecordKind::CreateView {
+                schema: schema.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn replace_view(&self, ctx: &StatementContext, schema: &common::ViewSchema) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(
+            &state,
+            ctx,
+            WalRecordKind::ReplaceView {
+                schema: schema.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()> {
+        let state = self.lock_state()?;
+        self.append_wal(&state, ctx, WalRecordKind::DropView { view })?;
+        Ok(())
+    }
 }
 
 impl SequenceManager for PageBackedStorageEngine {

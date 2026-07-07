@@ -7,7 +7,7 @@ use catalog::{
 use common::{
     ColumnDef, ColumnDefault, GucSetting, IndexConstraintKind, IsolationLevel, OrderedF32, PgType,
     RelationKind, Result, Row, SequenceSchema, SessionActivityRow, StatementContext, TableId,
-    TableSchema, Value, bytea, datetime, float, interval, numeric, uuid,
+    TableSchema, Value, ViewSchema, bytea, datetime, float, interval, numeric, uuid,
 };
 
 const OWNER_OID: i64 = 10;
@@ -66,6 +66,10 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
 
     for sequence in catalog.list_sequences()? {
         rows.push(pg_class_sequence_row(&sequence));
+    }
+
+    for view in catalog.list_views()? {
+        rows.push(pg_class_user_view_row(&view));
     }
 
     for view in SystemView::ALL {
@@ -174,6 +178,38 @@ fn pg_class_sequence_row(sequence: &SequenceSchema) -> Row {
     ])
 }
 
+fn pg_class_user_view_row(view: &ViewSchema) -> Row {
+    let oid = table_oid(view.id);
+    row(vec![
+        int(oid),
+        text(&view.name),
+        int(PUBLIC_SCHEMA_OID),
+        int(0),
+        int(OWNER_OID),
+        int(0),
+        int(oid),
+        int(0),
+        int(0),
+        real(-1.0),
+        int(0),
+        int(0),
+        bool_value(false),
+        bool_value(false),
+        text("p"),
+        text("v"),
+        int(view.columns.len() as i64),
+        int(0),
+        bool_value(false),
+        bool_value(false),
+        bool_value(false),
+        bool_value(false),
+        bool_value(false),
+        bool_value(true),
+        text("d"),
+        bool_value(false),
+    ])
+}
+
 fn pg_class_view_row(view: SystemView) -> Row {
     let oid = view.relation_oid();
     row(vec![
@@ -211,6 +247,11 @@ fn pg_attribute_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     for table in catalog.list_tables()? {
         for column in &table.columns {
             rows.push(pg_attribute_row(table_oid(table.id), column));
+        }
+    }
+    for view in catalog.list_views()? {
+        for column in &view.columns {
+            rows.push(pg_attribute_row(table_oid(view.id), column));
         }
     }
     for view in SystemView::ALL {
@@ -451,6 +492,11 @@ fn information_schema_tables_rows(
             "NO",
         ));
     }
+    for view in catalog.list_views()? {
+        rows.push(information_schema_table_row(
+            ctx, "public", &view.name, "VIEW", "NO",
+        ));
+    }
     rows.sort_by_key(|row| (text_at(row, 1).to_string(), text_at(row, 2).to_string()));
     Ok(rows)
 }
@@ -507,6 +553,13 @@ fn information_schema_columns_rows(
                 view.name(),
                 &column,
                 false,
+            )?);
+        }
+    }
+    for view in catalog.list_views()? {
+        for column in &view.columns {
+            rows.push(information_schema_column_row(
+                catalog, ctx, "public", &view.name, column, false,
             )?);
         }
     }

@@ -137,7 +137,9 @@ fn select_mutates_sequences(select: &BoundSelect) -> bool {
 fn from_mutates_sequences(from: &BoundFrom) -> bool {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => false,
-        BoundFrom::Derived { query, .. } => query_mutates_sequences(query),
+        BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
+            query_mutates_sequences(query)
+        }
         BoundFrom::Join {
             left,
             right,
@@ -1017,6 +1019,36 @@ mod tests {
         let err = bind(&stmt, &catalog).unwrap_err();
 
         assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn binder_marks_outer_join_null_supplying_side_nullable() {
+        let catalog = catalog_with_users_and_accounts();
+        for (sql, expected) in [
+            (
+                "select users.id, accounts.id from users left join accounts on users.id = accounts.id",
+                [false, true],
+            ),
+            (
+                "select users.id, accounts.id from users right join accounts on users.id = accounts.id",
+                [true, false],
+            ),
+            (
+                "select users.id, accounts.id from users full join accounts on users.id = accounts.id",
+                [true, true],
+            ),
+        ] {
+            let bound = bind(&parse(sql).unwrap(), &catalog).unwrap();
+            let BoundStatement::Query(query) = bound else {
+                panic!("expected query");
+            };
+            let nullability = query
+                .output_columns()
+                .into_iter()
+                .map(|column| column.nullable)
+                .collect::<Vec<_>>();
+            assert_eq!(nullability, expected, "{sql}");
+        }
     }
 
     #[test]

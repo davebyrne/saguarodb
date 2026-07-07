@@ -38,6 +38,9 @@ pub enum SqlState {
     /// not in the select list, or a `DISTINCT ON` whose expressions do not match
     /// the leading `ORDER BY` expressions.
     InvalidColumnReference,
+    /// `42809`: an existing object has the requested name but not the expected
+    /// relation kind, e.g. `DROP TABLE` names a view.
+    WrongObjectType,
     DuplicateTable,
     DatatypeMismatch,
     DivisionByZero,
@@ -111,6 +114,7 @@ impl SqlState {
             SqlState::UndefinedColumn => "42703",
             SqlState::UndefinedObject => "42704",
             SqlState::InvalidColumnReference => "42P10",
+            SqlState::WrongObjectType => "42809",
             SqlState::DuplicateTable => "42P07",
             SqlState::DatatypeMismatch => "42804",
             SqlState::DivisionByZero => "22012",
@@ -147,6 +151,7 @@ impl SqlState {
             "42703" => SqlState::UndefinedColumn,
             "42704" => SqlState::UndefinedObject,
             "42P10" => SqlState::InvalidColumnReference,
+            "42809" => SqlState::WrongObjectType,
             "42P07" => SqlState::DuplicateTable,
             "42804" => SqlState::DatatypeMismatch,
             "22012" => SqlState::DivisionByZero,
@@ -236,6 +241,7 @@ mod tests {
             SqlState::UndefinedColumn,
             SqlState::UndefinedObject,
             SqlState::InvalidColumnReference,
+            SqlState::WrongObjectType,
             SqlState::DuplicateTable,
             SqlState::DatatypeMismatch,
             SqlState::DivisionByZero,

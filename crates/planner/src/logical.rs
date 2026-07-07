@@ -1,7 +1,7 @@
 use catalog::SystemView;
 use common::{
     ColumnId, ColumnInfo, CompressionSetting, DbError, IndexId, ParsedColumnDef, Result,
-    SequenceOptions, TableId, ToastOptions,
+    SequenceOptions, TableId, ToastOptions, ViewDependency,
 };
 
 use crate::{
@@ -75,6 +75,7 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
+        dependencies: Vec<ViewDependency>,
     },
     DropView {
         name: String,
@@ -270,12 +271,14 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             columns,
             query,
             definition,
+            dependencies,
         } => Ok(LogicalPlan::CreateView {
             name: name.clone(),
             or_replace: *or_replace,
             columns: columns.clone(),
             query: query.clone(),
             definition: definition.clone(),
+            dependencies: dependencies.clone(),
         }),
         BoundStatement::DropView { name, if_exists } => Ok(LogicalPlan::DropView {
             name: name.clone(),
@@ -597,7 +600,7 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
         // sit at the derived binding's slots, so an outer WHERE (the standalone
         // case) is applied as a Filter above it — it cannot be pushed into the
         // inner scan.
-        BoundFrom::Derived { query, .. } => {
+        BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
             let plan = plan_query(query)?;
             Ok(match filter {
                 Some(predicate) => LogicalPlan::Filter {

@@ -1,7 +1,7 @@
 use catalog::SystemView;
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, CopyDirection, CopyOptions, DataType,
-    IndexId, ParsedColumnDef, SequenceOptions, TableId, TableSchema, ToastOptions,
+    IndexId, ParsedColumnDef, SequenceOptions, TableId, TableSchema, ToastOptions, ViewDependency,
 };
 use parser::SetOp;
 
@@ -188,6 +188,7 @@ pub enum BoundStatement {
         columns: Vec<String>,
         query: BoundQuery,
         definition: String,
+        dependencies: Vec<ViewDependency>,
     },
     DropView {
         name: String,
@@ -316,6 +317,10 @@ pub enum BoundDistinct {
 pub struct BoundSelectItem {
     pub expr: BoundExpr,
     pub alias: String,
+    /// Set when this output item was produced by expanding `*` from a physical
+    /// user table. View dependency collection uses this to preserve wildcard
+    /// intent through nested derived tables and CTEs.
+    pub wildcard_source: Option<TableId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,6 +328,7 @@ pub enum BoundFrom {
     Table {
         table: TableId,
         binding: common::BindingId,
+        name: String,
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
@@ -336,6 +342,17 @@ pub enum BoundFrom {
     /// in its own scope; `schema` is the derived columns (renamed by the optional
     /// column-alias list) projected into the outer scope at `binding`'s slots.
     Derived {
+        query: Box<BoundQuery>,
+        binding: common::BindingId,
+        alias: String,
+        schema: Vec<ColumnDef>,
+    },
+    /// A user-defined view inlined as a derived query. It is kept distinct from a
+    /// plain derived table so dependency tracking can invalidate prepared plans
+    /// when the view is replaced or dropped.
+    View {
+        view: TableId,
+        schema_version: u64,
         query: Box<BoundQuery>,
         binding: common::BindingId,
         alias: String,

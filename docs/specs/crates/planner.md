@@ -72,10 +72,30 @@ Binder responsibilities:
 - Bind `RETURNING` (`bind_returning`, shared by INSERT/UPDATE/DELETE): the projection items bind against a single binding of the target table in catalog (slot) order, so the expressions reference the affected full row by slot. `*`/`table.*` expand to all table columns; expressions, aliases, and `derive_alias` work as in the `SELECT` list; aggregate calls are rejected (`DatatypeMismatch`). The result is `Some(BoundReturning { exprs, output_schema })` (the `RowDescription`), or `None` with no clause. `RETURNING` expressions may carry `$n` parameters — `collect_param_types`/`substitute_params` traverse them.
 - Bind `COPY` (`bind_copy`): resolve the table to `TableId`, retain the bound `TableSchema`, and resolve the column list to `ColumnId`s (reusing the INSERT column resolver — empty list defaults to all columns in catalog order, duplicates are `DatatypeMismatch`, unknown columns `UndefinedColumn`), carrying `direction`/`options` through. Unlike INSERT it does not reject an omitted NOT NULL column up front; that surfaces per row at insert time (matching PostgreSQL). For `COPY FROM` the binder also attaches the omitted columns' bound expression `DEFAULT`s (`bind_omitted_expr_defaults`) and the table's bound `CHECK` constraints (`bind_table_checks`) to `BoundStatement::Copy`, so the executor applies defaults and enforces checks per row exactly as INSERT does; `COPY TO` binds neither. COPY is not lowered to a `LogicalPlan` — `logical_plan` rejects `BoundStatement::Copy` (internal error); the server drives COPY directly (`docs/specs/copy.md`).
 - Bind `DROP TABLE` by resolving the table to `TableId` when `IF EXISTS` is
-  absent. Bind `DROP TABLE IF EXISTS` as a pass-through carrying the normalized
-  table name and `IF EXISTS`; the executor resolves the table at statement
-  execution time so a prepared conditional drop does not remain a no-op if the
-  table is created after `Parse` and before `Execute`.
+  absent; if the name belongs to a view, return `SqlState::WrongObjectType`.
+  Bind `DROP TABLE IF EXISTS` as a pass-through carrying the normalized table
+  name and `IF EXISTS`; the executor resolves the table at statement execution
+  time so a prepared conditional drop does not remain a no-op if the table is
+  created after `Parse` and before `Execute`, and returns
+  `SqlState::WrongObjectType` if the name belongs to a view.
+- Bind `CREATE VIEW` by binding its query, validating any explicit view column
+  list against the query output width, rejecting query parameters, and deriving
+  durable `ViewDependency` metadata. Specific column references become named
+  column dependencies; `SELECT *` / `table.*` become `all_columns` dependencies,
+  including when the wildcard occurs inside a derived table or CTE used by the
+  view; relation references with no columns (for example `count(*)`) become
+  relation-existence dependencies. Dependencies also include bound CTE
+  definitions even when they are not referenced by the final query body, because
+  the stored SQL is rebound on later view use and those CTEs must remain
+  bindable. `CREATE VIEW` rejects `nextval`/`currval`/`setval` sequence
+  functions until durable sequence dependencies are represented. Bind
+  `DROP VIEW` as a pass-through carrying the normalized view name and `IF
+  EXISTS`.
+- Resolve user views in `FROM` by parsing their stored query definition and
+  inlining it as a `BoundFrom::View`, which lowers like a derived table but
+  retains the view id/schema version for dependency tracking and prepared-plan
+  invalidation. DML target resolution rejects view names with
+  `FeatureNotSupported`.
 - Bind `CREATE SEQUENCE` as a pass-through carrying the normalized
   `SequenceOptions`. Bind `DROP SEQUENCE` as a pass-through carrying the
   normalized sequence name and `IF EXISTS`; the executor resolves the sequence
@@ -106,7 +126,7 @@ pub enum BoundStatement {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: BoundInsertSource, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Query(BoundQuery),
@@ -202,12 +222,14 @@ pub enum BoundDistinct {
 pub struct BoundSelectItem {
     pub expr: BoundExpr,
     pub alias: String,
+    pub wildcard_source: Option<TableId>, // physical table whose `*` produced this item
 }
 
 pub enum BoundFrom {
     Table {
         table: TableId,
         binding: BindingId,
+        name: String,
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
@@ -222,6 +244,14 @@ pub enum BoundFrom {
         binding: BindingId,
         alias: String,
         schema: Vec<ColumnDef>,   // derived columns projected into the outer scope
+    },
+    View {                        // user view expanded from catalog definition
+        view: TableId,
+        schema_version: u64,
+        query: Box<BoundQuery>,
+        binding: BindingId,
+        alias: String,
+        schema: Vec<ColumnDef>,
     },
     Join {
         left: Box<BoundFrom>,
@@ -242,25 +272,30 @@ For `CREATE TABLE`, binder defaults an absent `compression` option to
 maintenance statements do not bind. Schema-evolution `ALTER TABLE` and
 `CREATE`/`DROP VIEW` statements have `BoundStatement` → `LogicalPlan` →
 `PhysicalPlan` variants so the parser/planner surface is explicit.
-Schema-evolution ALTER statements execute through the executor/server DDL path;
-view DDL remains staged and the server rejects those statements with
-`SqlState::FeatureNotSupported` before binding until view execution support
-lands. Direct planner API calls may still bind their defaults or view queries.
-`CREATE VIEW` binding rejects query parameters (`SqlState::FeatureNotSupported`)
-so stored view SQL is never coupled to execute-time parameter substitution. When
-a view supplies an explicit column list, its length must exactly match the bound
+Schema-evolution ALTER and view DDL statements execute through the
+executor/server DDL path.
+`CREATE VIEW` binding rejects query parameters and sequence functions
+(`SqlState::FeatureNotSupported`) so stored view SQL is never coupled to
+execute-time parameter substitution or untracked sequence dependencies. When a
+view supplies an explicit column list, its length must exactly match the bound
 query output width and names must be unique (`SqlState::SyntaxError`).
 
 A `BoundFrom::Derived` binds its inner query in a fresh (uncorrelated) scope and exposes its output columns under `alias`, renamed left to right by the optional column-alias list (more aliases than columns is `SqlState::SyntaxError`). The derived columns occupy a contiguous slot range at the derived binding, just like a base table, so logical planning lowers a derived table to its inner query's plan (no dedicated plan node or executor operator); an outer `WHERE` over a standalone derived table becomes a `Filter` above it. Derived-column references have no underlying table (their `ColumnInfo.table_id` is `None`).
 
+A `BoundFrom::View` represents a user view from the catalog. The binder parses
+the stored query text in the view's own scope (caller CTEs do not affect stored
+name resolution) and inlines the bound query like a derived table, while
+retaining the view relation id and schema version so prepared statements can be
+invalidated when the view changes or is dropped.
+
 A `BoundFrom::System` represents a virtual system view from `pg_catalog` or
 `information_schema`. Bare names resolve in this order: CTE, user table, then
-`pg_catalog` system view, so a user table named `pg_class` shadows the bare
-system view. Qualified `public.<name>` resolves only user tables; qualified
-system schemas resolve only the registry view named in that schema; unknown
-schemas fail with `SqlState::InvalidSchemaName`. System-view output columns have
-no underlying table id. DML and COPY targets cannot modify system catalog names
-and are rejected before planning.
+user view, then `pg_catalog` system view, so a user relation named `pg_class`
+shadows the bare system view. Qualified `public.<name>` resolves user tables or
+user views; qualified system schemas resolve only the registry view named in that
+schema; unknown schemas fail with `SqlState::InvalidSchemaName`. System-view
+output columns have no underlying table id. DML and COPY targets cannot modify
+system catalog names or user views and are rejected before planning.
 
 A top-level `SELECT` binds to `BoundStatement::Query(BoundQuery)`. Binding a `BoundQuery` binds its body (a `BoundSelect`) and, for a `SELECT` body, binds the query-level `ORDER BY` against that block's output columns (the `ORDER BY`/`DISTINCT` validation is coupled and stays together). Logical planning lowers the body, then applies the wrapper's `ORDER BY`/`LIMIT`/`OFFSET`; the aggregate-context `ORDER BY` rewrite stays with the body because it depends on the body's `group_by`/aggregates. `BoundSelect` (without the query-level modifiers) is also used directly as the source for `UPDATE` and `DELETE`, preserving filters and row identity through execution.
 
@@ -274,7 +309,7 @@ A **set operation** (`UNION`/`INTERSECT`/`EXCEPT`) binds both arms in their own 
 
 `CREATE INDEX` binds as a pass-through (name, table, columns, unique), like `CREATE TABLE`: the catalog validates that the table and columns exist and the index name is unused at execute time. `DROP INDEX` resolves the index name to its `IndexId` at bind time, rejecting an unknown index with `UndefinedTable` (mirroring `DROP TABLE`).
 
-`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins; the parser rejects `ON`/`USING`/`NATURAL` on a `CROSS JOIN` at parse time (`SqlState::SyntaxError`). The executor treats a cross join's `None` condition as `TRUE`. A comma-separated `FROM a, b, ...` list desugars into a left-deep chain of `JoinType::Cross` joins, each with `condition: None`.
+`BoundFrom::Join.condition` is `None` only for `JoinType::Cross`; all other join types have a boolean `Some(condition)`. The binder rejects missing `ON` predicates for non-cross joins; the parser rejects `ON`/`USING`/`NATURAL` on a `CROSS JOIN` at parse time (`SqlState::SyntaxError`). The executor treats a cross join's `None` condition as `TRUE`. A comma-separated `FROM a, b, ...` list desugars into a left-deep chain of `JoinType::Cross` joins, each with `condition: None`. For output expression nullability, the binder marks every binding on the null-supplying side of an outer join nullable (`RIGHT` side of `LEFT JOIN`, `LEFT` side of `RIGHT JOIN`, both sides of `FULL JOIN`) before binding `WHERE`, projection, `GROUP BY`, `HAVING`, `ORDER BY`, and `DISTINCT`; this nullability flows into `output_columns()`, derived tables, `INSERT ... SELECT` assignment checks, and view output metadata.
 
 ## Bound Expressions
 
@@ -496,7 +531,7 @@ pub enum LogicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<LogicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<LogicalPlan>, returning: Option<BoundReturning> },
@@ -588,7 +623,7 @@ pub enum PhysicalPlan {
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
-    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String },
+    CreateView { name: String, or_replace: bool, columns: Vec<String>, query: BoundQuery, definition: String, dependencies: Vec<ViewDependency> },
     DropView { name: String, if_exists: bool },
     Insert { table: TableId, columns: Vec<ColumnId>, source: Box<PhysicalPlan>, on_conflict: Option<BoundOnConflict>, returning: Option<BoundReturning> },
     Update { table: TableId, assignments: Vec<(ColumnId, BoundExpr)>, source: Box<PhysicalPlan>, returning: Option<BoundReturning> },

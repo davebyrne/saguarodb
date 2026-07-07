@@ -4,6 +4,7 @@ use std::sync::Arc;
 use common::{
     ColumnInfo, IndexId, IndexSchema, Key, KeyRange, Result, Row, RowId, SequenceId,
     SequenceSchema, StatementContext, StoredRow, TableId, TableSchema, TruncateCatalogUpdate,
+    ViewSchema,
 };
 
 pub trait RowIterator: Send {
@@ -130,6 +131,9 @@ pub trait SchemaOperations: Send + Sync {
     fn drop_index(&self, ctx: &StatementContext, index: IndexId) -> Result<()>;
     fn create_sequence(&self, ctx: &StatementContext, schema: &SequenceSchema) -> Result<()>;
     fn drop_sequence(&self, ctx: &StatementContext, sequence: SequenceId) -> Result<()>;
+    fn create_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
+    fn replace_view(&self, ctx: &StatementContext, schema: &ViewSchema) -> Result<()>;
+    fn drop_view(&self, ctx: &StatementContext, view: TableId) -> Result<()>;
 }
 
 pub trait RecoveryOperations: Send + Sync {
