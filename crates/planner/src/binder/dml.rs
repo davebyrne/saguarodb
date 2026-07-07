@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use catalog::CatalogManager;
 use common::{
     ColumnDef, ColumnDefault, ColumnId, ColumnInfo, CopyDirection, CopyOptions, DataType, DbError,
-    Result, SqlState, TableSchema,
+    PgType, Result, SqlState, TableSchema,
 };
 use parser::{
     Assignment, ConflictAction, ConflictTarget, Expr, InsertSource, OnConflict, Query, SelectItem,
@@ -178,6 +178,7 @@ fn bind_do_update(
             ));
         }
         let value = bind_expr(&mut ctx, &assignment.value, Some(column.data_type.clone()))?;
+        let value = coerce_assignment_expr(value, column);
         reject_aggregate(&value)?;
         validate_assignable(&value, column)?;
         bound_assignments.push((column.id, value));
@@ -251,6 +252,7 @@ fn bind_insert_values(
                 expr,
                 Some(column.data_type.clone()),
             )?;
+            let bound = coerce_assignment_expr(bound, column);
             reject_aggregate(&bound)?;
             validate_assignable(&bound, column)?;
             bound_row.push(bound);
@@ -332,6 +334,7 @@ pub(super) fn bind_update(
             ));
         }
         let value = bind_expr(&mut ctx, &assignment.value, Some(column.data_type.clone()))?;
+        let value = coerce_assignment_expr(value, column);
         reject_aggregate(&value)?;
         validate_assignable(&value, column)?;
         bound_assignments.push((column.id, value));
@@ -453,6 +456,23 @@ fn column_by_id(table: &TableSchema, id: ColumnId) -> Result<&ColumnDef> {
 
 fn validate_assignable(expr: &BoundExpr, column: &ColumnDef) -> Result<()> {
     validate_assignable_from(&expr.data_type(), expr.nullable(), column)
+}
+
+/// DML assignment expressions are otherwise strict, but PostgreSQL accepts
+/// assigning `TIMESTAMPTZ` expressions to `TIMESTAMP` columns. Keep the exception
+/// explicit and local to expression assignments; `INSERT ... SELECT` remains a
+/// strict output-column check.
+fn coerce_assignment_expr(expr: BoundExpr, column: &ColumnDef) -> BoundExpr {
+    if expr.data_type() == DataType::TimestampTz && column.data_type == DataType::Timestamp {
+        let nullable = expr.nullable();
+        return BoundExpr::Cast {
+            expr: Box::new(expr),
+            data_type: DataType::Timestamp,
+            pg_type: PgType::Timestamp,
+            nullable,
+        };
+    }
+    expr
 }
 
 /// Whether a source column of `(data_type, nullable)` may feed `column`: the types

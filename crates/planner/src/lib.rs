@@ -384,6 +384,60 @@ mod tests {
         catalog
     }
 
+    fn catalog_with_temporal_columns() -> MemoryCatalog {
+        let catalog = MemoryCatalog::empty();
+        catalog
+            .create_table(
+                "t".to_string(),
+                vec![
+                    ParsedColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Int4),
+                    },
+                    ParsedColumnDef {
+                        name: "ts".to_string(),
+                        data_type: DataType::Timestamp,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Timestamp),
+                    },
+                    ParsedColumnDef {
+                        name: "tstz".to_string(),
+                        data_type: DataType::TimestampTz,
+                        nullable: true,
+                        max_length: None,
+                        default: None,
+                        pg_type: Some(PgType::Timestamptz),
+                    },
+                ],
+                vec!["id".to_string()],
+                common::CompressionSetting::None,
+            )
+            .unwrap();
+        catalog
+    }
+
+    fn assert_timestamptz_to_timestamp_assignment_cast(expr: &BoundExpr) {
+        let BoundExpr::Cast {
+            expr: inner,
+            data_type,
+            pg_type,
+            nullable,
+        } = expr
+        else {
+            panic!("expected TIMESTAMPTZ -> TIMESTAMP assignment cast, got {expr:?}");
+        };
+        assert_eq!(data_type, &DataType::Timestamp);
+        assert_eq!(pg_type, &PgType::Timestamp);
+        assert_eq!(*nullable, inner.nullable());
+        assert_eq!(inner.data_type(), DataType::TimestampTz);
+    }
+
     #[test]
     fn output_schema_reports_column_reference_wire_types() {
         let catalog = catalog_with_typed_columns();
@@ -2542,6 +2596,76 @@ mod tests {
         // EXTRACT requires a date/timestamp source.
         let err = bind(
             &parse("select extract(year from id) from users").unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn binder_binds_statement_timestamp_functions_as_timestamptz() {
+        let catalog = catalog_with_users();
+        let bound = bind(&parse("select current_timestamp, now()").unwrap(), &catalog).unwrap();
+        let BoundStatement::Query(BoundQuery {
+            body: BoundQueryBody::Select(select),
+            ..
+        }) = bound
+        else {
+            panic!("expected bound select");
+        };
+        for item in &select.columns {
+            assert_eq!(item.expr.data_type(), DataType::TimestampTz);
+            assert!(!item.expr.nullable());
+        }
+
+        let err = bind(&parse("select current_date").unwrap(), &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::SyntaxError);
+    }
+
+    #[test]
+    fn binder_casts_timestamptz_expression_assignments_to_timestamp_columns() {
+        let catalog = catalog_with_temporal_columns();
+
+        let bound = bind(
+            &parse("insert into t (id, ts) values (1, current_timestamp)").unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Insert {
+            source: BoundInsertSource::Values { rows, .. },
+            ..
+        } = bound
+        else {
+            panic!("expected INSERT VALUES");
+        };
+        assert_timestamptz_to_timestamp_assignment_cast(&rows[0][1]);
+
+        let bound = bind(&parse("update t set ts = now()").unwrap(), &catalog).unwrap();
+        let BoundStatement::Update { assignments, .. } = bound else {
+            panic!("expected UPDATE");
+        };
+        assert_timestamptz_to_timestamp_assignment_cast(&assignments[0].1);
+
+        let bound = bind(
+            &parse(
+                "insert into t (id, tstz) values (1, current_timestamp) \
+                 on conflict (id) do update set ts = excluded.tstz",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap();
+        let BoundStatement::Insert {
+            on_conflict: Some(BoundOnConflict::DoUpdate { assignments, .. }),
+            ..
+        } = bound
+        else {
+            panic!("expected ON CONFLICT DO UPDATE");
+        };
+        assert_timestamptz_to_timestamp_assignment_cast(&assignments[0].1);
+
+        let err = bind(
+            &parse("insert into t (id, ts) select id, tstz from t").unwrap(),
             &catalog,
         )
         .unwrap_err();

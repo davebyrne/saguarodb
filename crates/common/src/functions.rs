@@ -210,6 +210,18 @@ static SCALAR_FUNCTIONS: &[ScalarFunction] = &[
         signature: sig_extract,
         eval: eval_extract,
     },
+    ScalarFunction {
+        name: "current_timestamp",
+        null_handling: NullHandling::NeverNull,
+        signature: sig_no_args_timestamptz,
+        eval: eval_statement_timestamp,
+    },
+    ScalarFunction {
+        name: "now",
+        null_handling: NullHandling::NeverNull,
+        signature: sig_no_args_timestamptz,
+        eval: eval_statement_timestamp,
+    },
     // --- System information ---
     ScalarFunction {
         name: "version",
@@ -399,6 +411,11 @@ fn sig_no_args_text(name: &str, args: &[ArgType]) -> Result<DataType> {
 fn sig_no_args_integer(name: &str, args: &[ArgType]) -> Result<DataType> {
     expect_arity(name, args, 0)?;
     Ok(DataType::Integer)
+}
+
+fn sig_no_args_timestamptz(name: &str, args: &[ArgType]) -> Result<DataType> {
+    expect_arity(name, args, 0)?;
+    Ok(DataType::TimestampTz)
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +670,10 @@ fn eval_extract(_ctx: &StatementContext, values: &[Value]) -> Result<Value> {
         ExtractField::Second => second,
     };
     Ok(Value::Float(value.into()))
+}
+
+fn eval_statement_timestamp(ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
+    Ok(Value::TimestampTz(ctx.statement_timestamp_micros))
 }
 
 fn eval_version(_ctx: &StatementContext, _values: &[Value]) -> Result<Value> {
@@ -987,6 +1008,25 @@ mod tests {
                 .code,
             SqlState::SyntaxError
         );
+    }
+
+    #[test]
+    fn statement_timestamp_functions_use_context_clock() {
+        let ctx = StatementContext::new(0).with_statement_timestamp_micros(1_234_567);
+        for name in ["current_timestamp", "now"] {
+            assert_eq!(result_type(name, &[]).unwrap(), DataType::TimestampTz);
+            assert_eq!(
+                result_type(name, &[arg(DataType::Text)]).unwrap_err().code,
+                SqlState::SyntaxError
+            );
+
+            let func = lookup_scalar_function(name).expect("registered function");
+            assert!(!func.result_nullable([]));
+            assert_eq!(
+                (func.eval)(&ctx, &[]).unwrap(),
+                Value::TimestampTz(1_234_567)
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
+use crate::datetime::now_micros;
 use crate::error::{DbError, Result};
 use crate::ids::{SequenceId, TableId, TxnId};
 use crate::mvcc::{IsolationLevel, Snapshot};
@@ -281,6 +282,10 @@ pub struct StatementContext {
     pub txn_id: u64,
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
+    /// Statement start timestamp as UTC microseconds since the Unix epoch. SQL
+    /// clock functions such as `CURRENT_TIMESTAMP` and `now()` read this value so
+    /// repeated calls within one statement are stable.
+    pub statement_timestamp_micros: i64,
     /// Blocks this statement when it hits an in-progress row-lock conflict, until
     /// the holder finishes (`docs/specs/deadlock.md`). The default
     /// (`NoConflictWaiter`) errors if ever asked to wait; the server installs the
@@ -337,6 +342,7 @@ impl StatementContext {
             txn_id,
             snapshot: Arc::new(Snapshot::sees_all_committed()),
             isolation: IsolationLevel::default(),
+            statement_timestamp_micros: now_micros(),
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
@@ -358,6 +364,7 @@ impl StatementContext {
             txn_id,
             snapshot,
             isolation: IsolationLevel::default(),
+            statement_timestamp_micros: now_micros(),
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
@@ -381,6 +388,7 @@ impl StatementContext {
             txn_id,
             snapshot,
             isolation,
+            statement_timestamp_micros: now_micros(),
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
@@ -406,6 +414,14 @@ impl StatementContext {
     #[must_use]
     pub fn with_live_txns(mut self, live_txns: Arc<[u64]>) -> Self {
         self.live_txns = live_txns;
+        self
+    }
+
+    /// Override this statement's timestamp. Used by deterministic tests; server
+    /// paths rely on the constructor default captured when the context is built.
+    #[must_use]
+    pub fn with_statement_timestamp_micros(mut self, statement_timestamp_micros: i64) -> Self {
+        self.statement_timestamp_micros = statement_timestamp_micros;
         self
     }
 
@@ -519,6 +535,16 @@ mod tests {
     fn contexts_with_same_txn_id_are_equal() {
         assert_eq!(StatementContext::new(7), StatementContext::new(7));
         assert_ne!(StatementContext::new(7), StatementContext::new(8));
+    }
+
+    #[test]
+    fn statement_timestamp_is_stable_and_not_part_of_context_identity() {
+        let ctx = StatementContext::new(7).with_statement_timestamp_micros(123);
+        assert_eq!(ctx.statement_timestamp_micros, 123);
+        assert_eq!(
+            ctx,
+            StatementContext::new(7).with_statement_timestamp_micros(456)
+        );
     }
 
     #[test]

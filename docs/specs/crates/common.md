@@ -475,11 +475,15 @@ visible, so pre-capture call sites — tests, recovery scaffolding — filter no
 and `isolation` with the default (`IsolationLevel::ReadCommitted`). `isolation`
 selects the server's snapshot-capture timing (Read Committed = fresh per statement,
 Repeatable Read = captured once per transaction); the storage engine does not
-consult it. `gc_horizon` carries the GC horizon (minimum advertised snapshot `xmin`)
-the server captured for the statement; it is consumed ONLY by the storage engine's
-HOT update-path prune (`docs/specs/mvcc.md` §10 Milestone H3) and defaults to `0`
-(prune nothing committed-dead) for read/pre-capture/test contexts, set on write paths
-via `StatementContext::with_gc_horizon(gc_horizon)`. A stale/smaller horizon only
+consult it. `statement_timestamp_micros` captures the statement start time as UTC
+microseconds since the Unix epoch; SQL clock functions (`CURRENT_TIMESTAMP` and
+`now()`) read this value so repeated calls within one statement are stable, and
+tests may override it with `with_statement_timestamp_micros(...)`. `gc_horizon`
+carries the GC horizon (minimum advertised snapshot `xmin`) the server captured
+for the statement; it is consumed ONLY by the storage engine's HOT update-path
+prune (`docs/specs/mvcc.md` §10 Milestone H3) and defaults to `0` (prune nothing
+committed-dead) for read/pre-capture/test contexts, set on write paths via
+`StatementContext::with_gc_horizon(gc_horizon)`. A stale/smaller horizon only
 prunes less, never unsafely. `conflict_waiter`, `cancel`, `live_txns`, and
 `ssi_tracker` carry the server-owned concurrency services documented in
 `docs/specs/deadlock.md`, `docs/specs/savepoints.md`, and `docs/specs/ssi.md`.
@@ -573,12 +577,12 @@ are `ErrorKind::Execute`. `NeverNull` covers `CONCAT` (which ignores `NULL`
 arguments) and the zero-argument system information functions.
 
 The registry holds the ordinary scalar functions (text, math, string,
-`SUBSTRING`, `EXTRACT`) and the system information functions; their per-function
-signatures and semantics are specified in `docs/specs/crates/planner.md` (binding)
-and `docs/specs/crates/executor.md` (evaluation). Aggregate functions, sequence
-functions (`nextval`/`currval`/`setval`), and the NULL-folding forms
-`COALESCE`/`NULLIF` are intentionally not registry entries: they have their own
-bound representations and binding rules.
+`SUBSTRING`, `EXTRACT`), statement clock functions, and system information
+functions; their per-function signatures and semantics are specified in
+`docs/specs/crates/planner.md` (binding) and `docs/specs/crates/executor.md`
+(evaluation). Aggregate functions, sequence functions (`nextval`/`currval`/`setval`),
+and the NULL-folding forms `COALESCE`/`NULLIF` are intentionally not registry
+entries: they have their own bound representations and binding rules.
 
 ## MVCC Types
 

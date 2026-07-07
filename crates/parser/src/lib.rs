@@ -416,6 +416,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_statement_timestamp_functions() {
+        let stmt = parse("select current_timestamp, now()").unwrap();
+
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = stmt
+        else {
+            panic!("expected select");
+        };
+
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, distinct: false },
+                ..
+            } if name == "current_timestamp" && args.is_empty()
+        ));
+        assert!(matches!(
+            select.columns[1],
+            SelectItem::Expression {
+                expr: Expr::Function { ref name, ref args, distinct: false },
+                ..
+            } if name == "now" && args.is_empty()
+        ));
+    }
+
+    #[test]
     fn normalizes_trim_and_substring_into_function_calls() {
         let stmt = parse("select trim(name), substring(name, 2, 3) from users").unwrap();
         let Statement::Query(Query {

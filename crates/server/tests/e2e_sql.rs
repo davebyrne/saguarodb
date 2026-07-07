@@ -1148,6 +1148,47 @@ async fn e2e_timestamp_type_round_trips_orders_and_casts() {
 }
 
 #[tokio::test]
+async fn e2e_statement_timestamp_functions_are_stable_and_assignable_to_timestamp() {
+    let server = TestServer::start().await.unwrap();
+
+    let rows = server
+        .simple_query("select cast(current_timestamp as text), cast(now() as text)")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    let current_timestamp = rows[0][0].as_ref().unwrap();
+    let now = rows[0][1].as_ref().unwrap();
+    assert_eq!(current_timestamp, now);
+    assert!(
+        current_timestamp.ends_with("+00"),
+        "expected timestamptz UTC text, got {current_timestamp}"
+    );
+
+    server
+        .simple_query("create table logs (id integer primary key, at timestamp)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into logs (id, at) values (1, current_timestamp), (2, now())")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select cast(at as text) from logs order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let at = row[0].as_ref().unwrap();
+        assert!(
+            !at.ends_with("+00"),
+            "timestamp column should render without timezone: {at}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn e2e_timestamp_primary_key_uses_index() {
     let server = TestServer::start().await.unwrap();
     server
