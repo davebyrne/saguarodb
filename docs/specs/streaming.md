@@ -119,19 +119,49 @@ impl QueryEngine {
         sink: &mut dyn RowSink,
         batch_size: usize,
     ) -> Result<u64>;
+
+    /// Open the same query drive without exhausting it immediately. The returned
+    /// handle owns the opened operator tree and can be fetched in bounded chunks
+    /// by cursors/portal suspension.
+    pub fn open_query<'a>(
+        &self,
+        ctx: &'a ExecutionContext<'_>,
+        plan: &PhysicalPlan,
+    ) -> Result<OpenQuery<'a>>;
+}
+
+pub enum FetchStatus {
+    Exhausted { count: u64 },
+    Suspended { count: u64 },
+}
+
+impl OpenQuery<'_> {
+    pub fn output_schema(&self) -> &[ColumnInfo];
+    pub fn fetch(
+        &mut self,
+        max_rows: Option<u64>,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<FetchStatus>;
+    pub fn close(&mut self) -> Result<()>;
 }
 ```
 
 Notes:
 
-- `execute_query_streamed` performs the same uncorrelated-subquery resolution
-  that `QueryEngine::execute` does before building the executor, and reuses the
+- `open_query` performs the same uncorrelated-subquery resolution that
+  `QueryEngine::execute` does before building the executor, and reuses the
   existing `open_executor` / `close_after` / per-row cancellation checks so open
   failure, cancellation granularity, and close-on-error behavior are identical to
   the materializing path (the drive pulls with `next`, not `next_batch`, so
-  cancellation stays per-row).
+  cancellation stays per-row). `execute_query_streamed` is `open_query` plus a
+  single unbounded fetch and close.
+- A bounded `OpenQuery::fetch(Some(n))` emits at most `n` rows. If exactly `n`
+  rows were emitted, it pulls one additional row as lookahead: `Suspended` means
+  that buffered row exists, while `Exhausted` means the query really ended at the
+  boundary. `fetch(Some(0))` emits no rows and uses the same lookahead rule.
 - The existing materializing `execute_query` is re-expressed as
-  `execute_query_streamed` driven by a `Vec`-collecting sink. This keeps every
+  `OpenQuery::fetch(None)` driven by a `Vec`-collecting sink. This keeps every
   current caller and test that matches `ExecutionResult::Query { rows, .. }`
   working with no change, and guarantees the streamed and materialized paths
   cannot diverge (they are the same drive loop).

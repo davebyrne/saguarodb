@@ -49,17 +49,46 @@ impl QueryEngine {
         &self, ctx: &ExecutionContext<'_>, plan: &PhysicalPlan,
         sink: &mut dyn RowSink, batch_size: usize,
     ) -> Result<u64>; // rows streamed
+
+    pub fn open_query<'a>(
+        &self, ctx: &'a ExecutionContext<'_>, plan: &PhysicalPlan,
+    ) -> Result<OpenQuery<'a>>;
+}
+
+pub enum FetchStatus {
+    Exhausted { count: u64 },
+    Suspended { count: u64 },
+}
+
+pub struct OpenQuery<'a> { /* owns an opened Box<dyn PlanExecutor + 'a> */ }
+
+impl OpenQuery<'_> {
+    pub fn output_schema(&self) -> &[ColumnInfo];
+    pub fn fetch(
+        &mut self,
+        max_rows: Option<u64>,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<FetchStatus>;
+    pub fn close(&mut self) -> Result<()>;
 }
 ```
 
 `start` is called once with the output schema (even for an empty result), then
 `push` receives row batches of at most `batch_size` until the plan is exhausted
 or the sink returns `ControlFlow::Break` (e.g. the consumer is gone), after which
-the executor is closed. Cancellation is polled between rows exactly as the
-materializing path does. The materializing `execute_query` is itself expressed as
-this same drive with an in-memory collecting sink, so streamed and materialized
-results cannot diverge. The caller must hold the snapshot's GC-horizon
-advertisement and any transaction guard for the whole call, as with `execute`.
+the one-shot streaming call closes the executor. `OpenQuery::fetch` calls
+`start` for each fetch call, emits at most `max_rows` rows when a bound is
+supplied, and returns `Suspended` only when a one-row lookahead confirms there
+are rows remaining. The lookahead row is buffered and delivered by the next
+fetch. `fetch(None)` drains until exhaustion unless the sink asks to stop early;
+on exhaustion, error, explicit `close`, or `Drop`, the executor is closed.
+Cancellation is polled between rows exactly as the materializing path does. The
+materializing `execute_query` and one-shot `execute_query_streamed` paths are
+expressed through `OpenQuery`, so streamed, materialized, and cursor-facing
+results share the same open/fetch/close behavior. The caller must hold the
+snapshot's GC-horizon advertisement and any transaction guard for the whole
+`OpenQuery` lifetime, as with `execute`.
 
 ## Query Engine Boundary
 

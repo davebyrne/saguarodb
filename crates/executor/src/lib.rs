@@ -12,7 +12,9 @@ pub mod test_support;
 
 pub use common::{ExecRow, RowIdentity};
 pub use expr::eval_expr;
-pub use query::{CopyIn, CopyOut, ExecutionContext, PlanExecutor, QueryEngine, RowSink};
+pub use query::{
+    CopyIn, CopyOut, ExecutionContext, FetchStatus, OpenQuery, PlanExecutor, QueryEngine, RowSink,
+};
 pub use result::{CopyJob, ExecutionResult};
 
 #[cfg(test)]

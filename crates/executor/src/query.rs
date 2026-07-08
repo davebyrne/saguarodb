@@ -91,6 +91,173 @@ pub trait RowSink {
     fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchStatus {
+    Exhausted { count: u64 },
+    Suspended { count: u64 },
+}
+
+impl FetchStatus {
+    pub fn count(self) -> u64 {
+        match self {
+            FetchStatus::Exhausted { count } | FetchStatus::Suspended { count } => count,
+        }
+    }
+}
+
+pub struct OpenQuery<'a> {
+    columns: Vec<ColumnInfo>,
+    executor: Option<Box<dyn PlanExecutor + 'a>>,
+    cancel: &'a AtomicBool,
+    pending: Option<ExecRow>,
+    exhausted: bool,
+    closed: bool,
+}
+
+impl<'a> OpenQuery<'a> {
+    fn from_executor(
+        cancel: &'a AtomicBool,
+        mut executor: Box<dyn PlanExecutor + 'a>,
+    ) -> Result<Self> {
+        let columns = executor.output_schema().to_vec();
+        open_executor(executor.as_mut())?;
+        Ok(Self {
+            columns,
+            executor: Some(executor),
+            cancel,
+            pending: None,
+            exhausted: false,
+            closed: false,
+        })
+    }
+
+    pub fn output_schema(&self) -> &[ColumnInfo] {
+        &self.columns
+    }
+
+    pub fn fetch(
+        &mut self,
+        max_rows: Option<u64>,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<FetchStatus> {
+        let result = self.fetch_inner(max_rows, sink, batch_size.max(1));
+        if result.is_err() {
+            let _ = self.close();
+        }
+        result
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        self.closed = true;
+        self.pending = None;
+        match self.executor.take() {
+            Some(mut executor) => executor.close(),
+            None => Ok(()),
+        }
+    }
+
+    fn fetch_inner(
+        &mut self,
+        max_rows: Option<u64>,
+        sink: &mut dyn RowSink,
+        batch_size: usize,
+    ) -> Result<FetchStatus> {
+        sink.start(&self.columns)?;
+        if self.exhausted {
+            return Ok(FetchStatus::Exhausted { count: 0 });
+        }
+        if self.closed {
+            return Err(DbError::internal("cannot fetch from a closed query"));
+        }
+
+        let mut count = 0;
+        let mut batch = Vec::with_capacity(batch_size);
+        loop {
+            if max_rows.is_some_and(|limit| count >= limit) {
+                return self.finish_limited_fetch(count, sink, batch);
+            }
+
+            let next = match self.pending.take() {
+                Some(row) => Some(row),
+                None => self.executor_mut()?.next()?,
+            };
+            let Some(row) = next else {
+                return self.finish_exhausted_fetch(count, sink, batch);
+            };
+
+            check_canceled_flag(self.cancel)?;
+            batch.push(row.row);
+            count += 1;
+
+            if batch.len() >= batch_size {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                if sink.push(full)?.is_break() {
+                    return self.lookahead_status(count);
+                }
+            }
+        }
+    }
+
+    fn finish_limited_fetch(
+        &mut self,
+        count: u64,
+        sink: &mut dyn RowSink,
+        batch: Vec<Row>,
+    ) -> Result<FetchStatus> {
+        if !batch.is_empty() && sink.push(batch)?.is_break() {
+            return self.lookahead_status(count);
+        }
+
+        self.lookahead_status(count)
+    }
+
+    fn lookahead_status(&mut self, count: u64) -> Result<FetchStatus> {
+        if self.pending.is_some() {
+            return Ok(FetchStatus::Suspended { count });
+        }
+        let next = self.executor_mut()?.next()?;
+        match next {
+            Some(row) => {
+                check_canceled_flag(self.cancel)?;
+                self.pending = Some(row);
+                Ok(FetchStatus::Suspended { count })
+            }
+            None => {
+                self.exhausted = true;
+                self.close()?;
+                Ok(FetchStatus::Exhausted { count })
+            }
+        }
+    }
+
+    fn finish_exhausted_fetch(
+        &mut self,
+        count: u64,
+        sink: &mut dyn RowSink,
+        batch: Vec<Row>,
+    ) -> Result<FetchStatus> {
+        if !batch.is_empty() {
+            let _ = sink.push(batch)?;
+        }
+        self.exhausted = true;
+        self.close()?;
+        Ok(FetchStatus::Exhausted { count })
+    }
+
+    fn executor_mut(&mut self) -> Result<&mut Box<dyn PlanExecutor + 'a>> {
+        self.executor
+            .as_mut()
+            .ok_or_else(|| DbError::internal("open query executor is closed"))
+    }
+}
+
+impl Drop for OpenQuery<'_> {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 pub struct QueryEngine;
 
 impl QueryEngine {
@@ -228,11 +395,11 @@ impl QueryEngine {
     /// [`ExecutionResult::Query`]. Returns the number of rows streamed.
     ///
     /// This is the streaming counterpart of the `SELECT` arm of [`Self::execute`]
-    /// and shares its build/open/drive/close path (via [`drive_query`]), so the
-    /// streamed and materialized results cannot diverge
-    /// (`docs/specs/streaming.md` §3). The caller must hold the snapshot's
-    /// GC-horizon advertisement and any transaction guard for the full duration
-    /// of the call, exactly as the materializing path does.
+    /// and shares the same [`OpenQuery`] fetch path as materialized results, so
+    /// streamed and materialized results cannot diverge (`docs/specs/streaming.md`
+    /// §3). The caller must hold the snapshot's GC-horizon advertisement and any
+    /// transaction guard for the full duration of the call, exactly as the
+    /// materializing path does.
     pub fn execute_query_streamed(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -240,10 +407,23 @@ impl QueryEngine {
         sink: &mut dyn RowSink,
         batch_size: usize,
     ) -> Result<u64> {
-        // Resolve uncorrelated subqueries up front, exactly as `execute` does
-        // before dispatching to `execute_query`.
+        let mut query = self.open_query(ctx, plan)?;
+        let result = query.fetch(None, sink, batch_size).map(FetchStatus::count);
+        let close_result = query.close();
+        match (result, close_result) {
+            (Err(err), _) => Err(err),
+            (Ok(count), Ok(())) => Ok(count),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    pub fn open_query<'a>(
+        &self,
+        ctx: &'a ExecutionContext<'_>,
+        plan: &PhysicalPlan,
+    ) -> Result<OpenQuery<'a>> {
         let resolved = crate::subquery::resolve_plan_subqueries(ctx, plan)?;
-        drive_query(ctx, &resolved, sink, batch_size)
+        open_resolved_query(ctx, &resolved)
     }
 }
 
@@ -446,76 +626,28 @@ const MATERIALIZE_BATCH_ROWS: usize = 1024;
 
 fn execute_query(ctx: &ExecutionContext<'_>, plan: &PhysicalPlan) -> Result<ExecutionResult> {
     // The plan reaching here has already had its subqueries resolved by
-    // `QueryEngine::execute`; drive it into a collecting sink so the materialized
-    // path is the very same loop as the streaming path, and the two cannot
-    // diverge (`docs/specs/streaming.md` §3).
+    // `QueryEngine::execute`; open it as an `OpenQuery` so the materialized,
+    // streamed, and cursor-facing paths share one fetch loop.
     let mut sink = VecRowSink::default();
-    drive_query(ctx, plan, &mut sink, MATERIALIZE_BATCH_ROWS)?;
+    let mut query = open_resolved_query(ctx, plan)?;
+    let result = query.fetch(None, &mut sink, MATERIALIZE_BATCH_ROWS);
+    let close_result = query.close();
+    match (result, close_result) {
+        (Err(err), _) => return Err(err),
+        (Ok(_), Ok(())) => {}
+        (Ok(_), Err(err)) => return Err(err),
+    }
     Ok(ExecutionResult::Query {
         columns: sink.columns,
         rows: sink.rows,
     })
 }
 
-/// Build a *resolved* query `plan`'s executor, then open, drive, and close it.
-/// Shared by the materializing [`execute_query`] and the streaming
-/// [`QueryEngine::execute_query_streamed`].
-fn drive_query(
-    ctx: &ExecutionContext<'_>,
+fn open_resolved_query<'a>(
+    ctx: &'a ExecutionContext<'_>,
     plan: &PhysicalPlan,
-    sink: &mut dyn RowSink,
-    batch_size: usize,
-) -> Result<u64> {
-    let mut executor = build_executor(ctx, plan)?;
-    drive_open_executor(ctx.cancel, executor.as_mut(), sink, batch_size)
-}
-
-/// Open, drive into `sink`, and close a built `executor`, guaranteeing `close`
-/// runs on every path: an open failure closes and returns via [`open_executor`],
-/// and a drive error, early [`ControlFlow::Break`], or success all flow through
-/// [`close_after`].
-fn drive_open_executor(
-    cancel: &AtomicBool,
-    executor: &mut dyn PlanExecutor,
-    sink: &mut dyn RowSink,
-    batch_size: usize,
-) -> Result<u64> {
-    open_executor(executor)?;
-    let result = drive_into_sink(cancel, executor, sink, batch_size);
-    close_after(executor, result)
-}
-
-/// Emit the schema, then pull rows one at a time — polling cancellation between
-/// rows, exactly as the materializing loop did — accumulating them into batches
-/// of at most `batch_size` before handing each to `sink`. Stops early when the
-/// sink returns [`ControlFlow::Break`]. Returns the number of rows produced.
-fn drive_into_sink(
-    cancel: &AtomicBool,
-    executor: &mut dyn PlanExecutor,
-    sink: &mut dyn RowSink,
-    batch_size: usize,
-) -> Result<u64> {
-    debug_assert!(batch_size >= 1, "batch_size must be at least 1");
-    sink.start(executor.output_schema())?;
-    let mut count: u64 = 0;
-    let mut batch: Vec<Row> = Vec::with_capacity(batch_size);
-    while let Some(row) = executor.next()? {
-        check_canceled_flag(cancel)?;
-        batch.push(row.row);
-        count += 1;
-        if batch.len() >= batch_size {
-            let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
-            if sink.push(full)?.is_break() {
-                return Ok(count);
-            }
-        }
-    }
-    if !batch.is_empty() {
-        // This is the last batch; the scan is finished either way, so a `Break`
-        // request here has no remaining rows to skip.
-        let _ = sink.push(batch)?;
-    }
-    Ok(count)
+) -> Result<OpenQuery<'a>> {
+    OpenQuery::from_executor(ctx.cancel, build_executor(ctx, plan)?)
 }
 
 /// A [`RowSink`] that materializes all rows into memory — the collecting sink
@@ -2043,7 +2175,16 @@ fn _type_name(data_type: &DataType) -> &'static str {
 mod drive_tests {
     use super::*;
     use common::{ColumnInfo, ExecRow, Row, Value};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::atomic::AtomicBool;
+
+    #[derive(Default)]
+    struct MockCounts {
+        opened: usize,
+        closed: usize,
+        yielded: usize,
+    }
 
     /// A `PlanExecutor` stub for exercising the drive/close plumbing directly:
     /// it yields a fixed row sequence (optionally failing on `open` or on the
@@ -2057,10 +2198,23 @@ mod drive_tests {
         opened: usize,
         closed: usize,
         yielded: usize,
+        shared: Option<Rc<RefCell<MockCounts>>>,
     }
 
     impl MockExecutor {
         fn with_rows(count: usize) -> Self {
+            Self::with_rows_and_shared(count, None)
+        }
+
+        fn with_shared_rows(count: usize) -> (Self, Rc<RefCell<MockCounts>>) {
+            let shared = Rc::new(RefCell::new(MockCounts::default()));
+            (
+                Self::with_rows_and_shared(count, Some(shared.clone())),
+                shared,
+            )
+        }
+
+        fn with_rows_and_shared(count: usize, shared: Option<Rc<RefCell<MockCounts>>>) -> Self {
             let rows: Vec<Row> = (0..count)
                 .map(|i| Row {
                     values: vec![Value::Integer(i as i64)],
@@ -2080,6 +2234,7 @@ mod drive_tests {
                 opened: 0,
                 closed: 0,
                 yielded: 0,
+                shared,
             }
         }
     }
@@ -2091,6 +2246,9 @@ mod drive_tests {
 
         fn open(&mut self) -> Result<()> {
             self.opened += 1;
+            if let Some(shared) = &self.shared {
+                shared.borrow_mut().opened += 1;
+            }
             if self.fail_open {
                 return Err(DbError::internal("open failed"));
             }
@@ -2104,6 +2262,9 @@ mod drive_tests {
             match self.rows.next() {
                 Some(row) => {
                     self.yielded += 1;
+                    if let Some(shared) = &self.shared {
+                        shared.borrow_mut().yielded += 1;
+                    }
                     Ok(Some(ExecRow {
                         row,
                         identity: None,
@@ -2115,6 +2276,9 @@ mod drive_tests {
 
         fn close(&mut self) -> Result<()> {
             self.closed += 1;
+            if let Some(shared) = &self.shared {
+                shared.borrow_mut().closed += 1;
+            }
             Ok(())
         }
     }
@@ -2156,60 +2320,249 @@ mod drive_tests {
         }
     }
 
-    #[test]
-    fn drive_closes_executor_after_normal_completion() {
-        let cancel = AtomicBool::new(false);
-        let mut executor = MockExecutor::with_rows(3);
-        let mut sink = TestSink::new();
-        let count = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(executor.opened, 1);
-        assert_eq!(executor.closed, 1);
+    struct FailingSink;
+
+    impl RowSink for FailingSink {
+        fn start(&mut self, _columns: &[ColumnInfo]) -> Result<()> {
+            Ok(())
+        }
+
+        fn push(&mut self, _rows: Vec<Row>) -> Result<ControlFlow<()>> {
+            Err(DbError::internal("sink failed"))
+        }
     }
 
     #[test]
-    fn drive_closes_executor_when_sink_breaks() {
+    fn open_query_closes_executor_after_normal_completion() {
         let cancel = AtomicBool::new(false);
-        let mut executor = MockExecutor::with_rows(5);
+        let (executor, counts) = MockExecutor::with_shared_rows(3);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut sink = TestSink::new();
+
+        let status = query.fetch(None, &mut sink, 2).unwrap();
+
+        assert_eq!(status, FetchStatus::Exhausted { count: 3 });
+        assert_eq!(counts.borrow().opened, 1);
+        assert_eq!(counts.borrow().closed, 1);
+    }
+
+    #[test]
+    fn open_query_sink_break_looks_ahead_before_suspending() {
+        let cancel = AtomicBool::new(false);
+        let (executor, counts) = MockExecutor::with_shared_rows(5);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         // One row per batch; break once two rows have been pushed.
         let mut sink = TestSink::breaking_at(2);
-        let count = drive_open_executor(&cancel, &mut executor, &mut sink, 1).unwrap();
-        assert_eq!(count, 2, "returns the rows streamed before the break");
-        assert_eq!(executor.yielded, 2, "scan stopped early, not drained");
-        assert_eq!(executor.closed, 1, "close still runs after an early break");
+
+        let status = query.fetch(None, &mut sink, 1).unwrap();
+
+        assert_eq!(status, FetchStatus::Suspended { count: 2 });
+        assert_eq!(
+            counts.borrow().yielded,
+            3,
+            "one extra row is buffered as lookahead"
+        );
+        assert_eq!(counts.borrow().closed, 0, "suspended query remains open");
+
+        let mut second = TestSink::new();
+        let status = query.fetch(None, &mut second, 2).unwrap();
+        assert_eq!(status, FetchStatus::Exhausted { count: 3 });
+        assert_eq!(second.rows, 3);
     }
 
     #[test]
-    fn drive_closes_executor_on_next_error() {
+    fn open_query_sink_break_at_end_reports_exhausted() {
         let cancel = AtomicBool::new(false);
-        let mut executor = MockExecutor::with_rows(5);
+        let (executor, counts) = MockExecutor::with_shared_rows(2);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut sink = TestSink::breaking_at(2);
+
+        let status = query.fetch(None, &mut sink, 1).unwrap();
+
+        assert_eq!(status, FetchStatus::Exhausted { count: 2 });
+        assert_eq!(counts.borrow().closed, 1);
+    }
+
+    #[test]
+    fn open_query_closes_executor_on_next_error() {
+        let cancel = AtomicBool::new(false);
+        let (mut executor, counts) = MockExecutor::with_shared_rows(5);
         executor.fail_next_after = Some(2);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
-        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+
+        let err = query.fetch(None, &mut sink, 2).unwrap_err();
+
         assert!(err.to_string().contains("next failed"));
-        assert_eq!(executor.closed, 1, "close runs after a mid-drive error");
+        assert_eq!(
+            counts.borrow().closed,
+            1,
+            "close runs after a mid-drive error"
+        );
     }
 
     #[test]
-    fn drive_closes_executor_on_open_failure() {
+    fn open_query_closes_executor_on_open_failure() {
         let cancel = AtomicBool::new(false);
-        let mut executor = MockExecutor::with_rows(3);
+        let (mut executor, counts) = MockExecutor::with_shared_rows(3);
         executor.fail_open = true;
-        let mut sink = TestSink::new();
-        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+
+        let err = match OpenQuery::from_executor(&cancel, Box::new(executor)) {
+            Ok(_) => panic!("open should fail"),
+            Err(err) => err,
+        };
+
         assert!(err.to_string().contains("open failed"));
-        assert_eq!(executor.opened, 1);
-        assert_eq!(executor.closed, 1, "open failure still closes the executor");
-        assert_eq!(executor.yielded, 0, "next is never called after open fails");
+        assert_eq!(counts.borrow().opened, 1);
+        assert_eq!(
+            counts.borrow().closed,
+            1,
+            "open failure still closes the executor"
+        );
+        assert_eq!(
+            counts.borrow().yielded,
+            0,
+            "next is never called after open fails"
+        );
     }
 
     #[test]
-    fn drive_cancellation_aborts_and_closes() {
+    fn open_query_cancellation_aborts_and_closes() {
         let cancel = AtomicBool::new(true);
-        let mut executor = MockExecutor::with_rows(3);
+        let (executor, counts) = MockExecutor::with_shared_rows(3);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
-        let err = drive_open_executor(&cancel, &mut executor, &mut sink, 2).unwrap_err();
+
+        let err = query.fetch(None, &mut sink, 2).unwrap_err();
+
         assert_eq!(err.code, SqlState::QueryCanceled);
-        assert_eq!(executor.closed, 1, "cancellation still closes the executor");
+        assert_eq!(
+            counts.borrow().closed,
+            1,
+            "cancellation still closes the executor"
+        );
+    }
+
+    #[test]
+    fn open_query_sink_error_closes_executor() {
+        let cancel = AtomicBool::new(false);
+        let (executor, counts) = MockExecutor::with_shared_rows(3);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut sink = FailingSink;
+
+        let err = query.fetch(None, &mut sink, 1).unwrap_err();
+
+        assert!(err.to_string().contains("sink failed"));
+        assert_eq!(
+            counts.borrow().closed,
+            1,
+            "sink errors still close the executor"
+        );
+    }
+
+    #[test]
+    fn open_query_fetch_suspends_and_resumes() {
+        let cancel = AtomicBool::new(false);
+        let executor = MockExecutor::with_rows(5);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+
+        let mut first = TestSink::new();
+        let status = query.fetch(Some(2), &mut first, 1).unwrap();
+        assert_eq!(status, FetchStatus::Suspended { count: 2 });
+        assert_eq!(first.rows, 2);
+
+        let mut second = TestSink::new();
+        let status = query.fetch(Some(10), &mut second, 2).unwrap();
+        assert_eq!(status, FetchStatus::Exhausted { count: 3 });
+        assert_eq!(second.rows, 3);
+    }
+
+    #[test]
+    fn open_query_exact_limit_reports_exhausted() {
+        let cancel = AtomicBool::new(false);
+        let executor = MockExecutor::with_rows(3);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut sink = TestSink::new();
+
+        let status = query.fetch(Some(3), &mut sink, 2).unwrap();
+
+        assert_eq!(status, FetchStatus::Exhausted { count: 3 });
+        assert_eq!(sink.rows, 3);
+    }
+
+    #[test]
+    fn open_query_zero_row_fetch_buffers_next_row() {
+        let cancel = AtomicBool::new(false);
+        let executor = MockExecutor::with_rows(2);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut first = TestSink::new();
+
+        let status = query.fetch(Some(0), &mut first, 2).unwrap();
+        assert_eq!(status, FetchStatus::Suspended { count: 0 });
+        assert_eq!(first.rows, 0);
+
+        let mut second = TestSink::new();
+        let status = query.fetch(Some(1), &mut second, 2).unwrap();
+        assert_eq!(status, FetchStatus::Suspended { count: 1 });
+        assert_eq!(second.rows, 1);
+    }
+
+    #[test]
+    fn open_query_zero_row_fetch_preserves_pending_row() {
+        let cancel = AtomicBool::new(false);
+        let executor = MockExecutor::with_rows(2);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+
+        let mut first = TestSink::new();
+        assert_eq!(
+            query.fetch(Some(1), &mut first, 2).unwrap(),
+            FetchStatus::Suspended { count: 1 }
+        );
+
+        let mut zero = TestSink::new();
+        assert_eq!(
+            query.fetch(Some(0), &mut zero, 2).unwrap(),
+            FetchStatus::Suspended { count: 0 }
+        );
+        assert_eq!(zero.rows, 0);
+
+        let mut second = TestSink::new();
+        assert_eq!(
+            query.fetch(Some(1), &mut second, 2).unwrap(),
+            FetchStatus::Exhausted { count: 1 }
+        );
+        assert_eq!(
+            second.rows, 1,
+            "the row buffered by the first fetch was not skipped"
+        );
+    }
+
+    #[test]
+    fn open_query_closes_on_exhaustion_and_close_is_idempotent() {
+        let cancel = AtomicBool::new(false);
+        let (executor, counts) = MockExecutor::with_shared_rows(1);
+        let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+        let mut sink = TestSink::new();
+
+        let status = query.fetch(None, &mut sink, 2).unwrap();
+        assert_eq!(status, FetchStatus::Exhausted { count: 1 });
+        assert_eq!(counts.borrow().closed, 1);
+
+        query.close().unwrap();
+        assert_eq!(counts.borrow().closed, 1);
+    }
+
+    #[test]
+    fn open_query_drop_closes_suspended_executor() {
+        let cancel = AtomicBool::new(false);
+        let (executor, counts) = MockExecutor::with_shared_rows(3);
+        {
+            let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
+            let mut sink = TestSink::new();
+            let status = query.fetch(Some(1), &mut sink, 1).unwrap();
+            assert_eq!(status, FetchStatus::Suspended { count: 1 });
+            assert_eq!(counts.borrow().closed, 0);
+        }
+        assert_eq!(counts.borrow().closed, 1);
     }
 }

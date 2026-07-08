@@ -91,8 +91,10 @@ Rules:
 
 - `open_query` performs the same uncorrelated-subquery resolution as
   `execute_query_streamed`.
-- `fetch(Some(n))` emits at most `n` rows. `n = 0` means no rows and immediate
-  suspension if the query is not already exhausted.
+- `fetch(Some(n))` emits at most `n` rows. If the fetch reaches the bound, it
+  performs a one-row lookahead: `Suspended` means a row remains buffered for the
+  next fetch, while `Exhausted` means the query ended at the boundary. `n = 0`
+  emits no rows and uses the same lookahead rule.
 - `fetch(None)` drains to exhaustion.
 - `close` is idempotent and is also called from `Drop` as a best-effort cleanup.
 - Existing `execute_query_streamed` can be reimplemented as `open_query` plus
@@ -313,7 +315,8 @@ Protocol unit tests:
 
 Executor tests:
 
-- `OpenQuery::fetch(Some(n))` returns exactly `n` rows then `Suspended`.
+- `OpenQuery::fetch(Some(n))` emits at most `n` rows and returns `Suspended`
+  only when a lookahead row remains buffered.
 - A second fetch resumes at the next row.
 - `fetch(None)` drains and returns `Exhausted`.
 - `close` runs on exhausted, suspended, error, and drop paths.
