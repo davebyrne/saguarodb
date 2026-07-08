@@ -458,6 +458,7 @@ pub enum ServerMessage {
     ParseComplete,
     BindComplete,
     CloseComplete,
+    PortalSuspended,
     ParameterDescription(Vec<i32>),
     NoData,
     ErrorResponse { severity: String, code: String, message: String },
@@ -539,9 +540,11 @@ portals, and binary parameter/result encoding:
    `RowDescription`/`NoData`; of a portal returns `RowDescription`/`NoData` in
    the portal's result formats.
 4. **Execute:** The server runs the portal and streams `DataRow`s in the
-   requested result formats, then `CommandComplete`. No `RowDescription` (that
-   comes from Describe) and no `ReadyForQuery` (that comes from Sync). Each
-   Execute is its own autocommit unit; `max_rows` is treated as "all rows".
+   requested result formats. No `RowDescription` (that comes from Describe) and
+   no `ReadyForQuery` (that comes from Sync). SELECT with `max_rows == 0` drains
+   to `CommandComplete`; read-only SELECT with `max_rows > 0` sends at most that
+   many rows and returns `PortalSuspended` when more rows remain, so a later
+   `Execute` can resume the same portal. Non-SELECT statements ignore `max_rows`.
 5. **Sync:** The server sends `ReadyForQuery`. An error earlier in the sequence
    sends `ErrorResponse` and then skips messages until `Sync`.
 6. **Close/Flush:** `Close` drops a statement or portal (`CloseComplete`);

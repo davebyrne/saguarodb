@@ -1,0 +1,386 @@
+use std::sync::Arc;
+
+use common::{ColumnInfo, DbError, IsolationLevel, Result, SqlState};
+use executor::FetchStatus;
+use planner::{logical_plan, physical_plan};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use super::{
+    ExecutionContextInput, PreparedStatement, QueryService, QuerySessionContext, STREAM_BATCH_ROWS,
+    StatementClass, StreamMessage, Transaction, TransactionSnapshots, classify_bound,
+    prepared_schema_versions,
+};
+
+pub(crate) enum CursorFetchStatus {
+    Exhausted { count: u64 },
+    Suspended { count: u64 },
+}
+
+pub(crate) struct StartedCursor {
+    pub(crate) handle: QueryCursorHandle,
+    pub(crate) columns: Vec<ColumnInfo>,
+}
+
+pub(crate) struct QueryCursorHandle {
+    tx: mpsc::Sender<CursorCommand>,
+    _task: JoinHandle<()>,
+}
+
+impl QueryCursorHandle {
+    pub(crate) async fn start_fetch(
+        &self,
+        max_rows: Option<u64>,
+        row_tx: mpsc::Sender<StreamMessage>,
+    ) -> Result<oneshot::Receiver<Result<CursorFetchStatus>>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(CursorCommand::Fetch {
+                max_rows,
+                row_tx,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| DbError::internal("cursor worker is no longer running"))?;
+        Ok(reply_rx)
+    }
+}
+
+enum CursorCommand {
+    Fetch {
+        max_rows: Option<u64>,
+        row_tx: mpsc::Sender<StreamMessage>,
+        reply_tx: oneshot::Sender<Result<CursorFetchStatus>>,
+    },
+}
+
+struct CursorSetup {
+    txn: Option<Transaction>,
+    default_isolation: IsolationLevel,
+    result: Result<StartedCursorSetup>,
+}
+
+struct StartedCursorSetup {
+    columns: Vec<ColumnInfo>,
+}
+
+struct CursorWorkerInput {
+    service: Arc<QueryService>,
+    prepared: Arc<PreparedStatement>,
+    params: Vec<common::Value>,
+    txn: Option<Transaction>,
+    default_isolation: IsolationLevel,
+    session: QuerySessionContext,
+    setup_tx: oneshot::Sender<CursorSetup>,
+    cmd_rx: mpsc::Receiver<CursorCommand>,
+}
+
+impl QueryService {
+    pub(crate) async fn start_prepared_cursor(
+        service: Arc<Self>,
+        prepared: Arc<PreparedStatement>,
+        params: Vec<common::Value>,
+        txn: Option<Transaction>,
+        default_isolation: IsolationLevel,
+        session: QuerySessionContext,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StartedCursor>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (setup_tx, setup_rx) = oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            run_cursor_worker(CursorWorkerInput {
+                service,
+                prepared,
+                params,
+                txn,
+                default_isolation,
+                session,
+                setup_tx,
+                cmd_rx,
+            });
+        });
+
+        let setup = match setup_rx.await {
+            Ok(setup) => setup,
+            Err(_) => {
+                return (
+                    None,
+                    default_isolation,
+                    Err(DbError::internal("cursor worker stopped before setup")),
+                );
+            }
+        };
+        let CursorSetup {
+            txn,
+            default_isolation,
+            result,
+        } = setup;
+        match result {
+            Ok(setup) => (
+                txn,
+                default_isolation,
+                Ok(StartedCursor {
+                    handle: QueryCursorHandle {
+                        tx: cmd_tx,
+                        _task: task,
+                    },
+                    columns: setup.columns,
+                }),
+            ),
+            Err(err) => (txn, default_isolation, Err(err)),
+        }
+    }
+}
+
+fn run_cursor_worker(input: CursorWorkerInput) {
+    let CursorWorkerInput {
+        service,
+        prepared,
+        params,
+        txn,
+        default_isolation,
+        session,
+        setup_tx,
+        cmd_rx,
+    } = input;
+    let session = service.with_catalog_introspection(session);
+    let input = CursorWorkerInput {
+        service,
+        prepared,
+        params,
+        txn: None,
+        default_isolation,
+        session,
+        setup_tx,
+        cmd_rx,
+    };
+    match txn {
+        Some(txn) => run_transaction_cursor_worker(input, txn),
+        None => run_autocommit_cursor_worker(input),
+    }
+}
+
+fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
+    let CursorWorkerInput {
+        service,
+        prepared,
+        params,
+        txn: _,
+        default_isolation,
+        session,
+        setup_tx,
+        mut cmd_rx,
+    } = input;
+    let bound = match service.substitute_prepared_params(&prepared, &params) {
+        Ok(bound) => bound,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    if !matches!(classify_bound(prepared.class, &bound), StatementClass::Read) {
+        return send_setup_error(setup_tx, None, default_isolation, read_only_cursor_error());
+    }
+    if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
+        return send_setup_error(setup_tx, None, default_isolation, err);
+    }
+    let captured = match service.capture_consistent_snapshots(0) {
+        Ok(captured) => captured,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    let schema_versions =
+        match prepared_schema_versions(&bound, service.components.catalog.as_ref()) {
+            Ok(schema_versions) => schema_versions,
+            Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+        };
+    if let Err(err) = service.validate_relation_snapshot_schema_versions(
+        captured.relations.as_ref(),
+        &schema_versions,
+        true,
+    ) {
+        return send_setup_error(setup_tx, None, default_isolation, err);
+    }
+    let runtime = session.statement_runtime(default_isolation, default_isolation);
+    let ctx = match service.execution_context(ExecutionContextInput {
+        txn_id: 0,
+        snapshot: captured.snapshot,
+        relations: captured.relations,
+        isolation: IsolationLevel::default(),
+        gc_horizon: 0,
+        live_txns: Arc::from([0]),
+        runtime,
+    }) {
+        Ok(ctx) => ctx,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    let logical = match logical_plan(&bound) {
+        Ok(logical) => logical,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    let physical = match physical_plan(&logical, service.components.catalog.as_ref()) {
+        Ok(physical) => physical,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    let mut query = match service.engine.open_query(&ctx, &physical) {
+        Ok(query) => query,
+        Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
+    };
+    let columns = query.output_schema().to_vec();
+    let _ = setup_tx.send(CursorSetup {
+        txn: None,
+        default_isolation,
+        result: Ok(StartedCursorSetup { columns }),
+    });
+    drive_cursor_commands(&mut query, &mut cmd_rx);
+}
+
+fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction) {
+    let CursorWorkerInput {
+        service,
+        prepared,
+        params,
+        txn: _,
+        default_isolation,
+        session,
+        setup_tx,
+        mut cmd_rx,
+    } = input;
+    if txn.failed {
+        return send_failed_txn_setup_error(
+            setup_tx,
+            txn,
+            default_isolation,
+            DbError::execute(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
+        );
+    }
+    let bound = match service.substitute_prepared_params(&prepared, &params) {
+        Ok(bound) => bound,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    if !matches!(classify_bound(prepared.class, &bound), StatementClass::Read) {
+        return send_failed_txn_setup_error(
+            setup_tx,
+            txn,
+            default_isolation,
+            read_only_cursor_error(),
+        );
+    }
+    if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
+        return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
+    }
+    let snapshots = match service.snapshots_for_transaction(&mut txn) {
+        Ok(snapshots) => snapshots,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    txn.first_statement_ran = true;
+    let schema_versions =
+        match prepared_schema_versions(&bound, service.components.catalog.as_ref()) {
+            Ok(schema_versions) => schema_versions,
+            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+        };
+    if let Err(err) = service.validate_relation_snapshot_schema_versions(
+        snapshots.relations.as_ref(),
+        &schema_versions,
+        true,
+    ) {
+        return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
+    }
+    let TransactionSnapshots {
+        snapshot,
+        relations,
+        advertised,
+    } = snapshots;
+    let _cursor_advertised =
+        advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
+    let runtime = session.statement_runtime(
+        txn.current_default_isolation(default_isolation),
+        txn.isolation,
+    );
+    let ctx = match service.execution_context(ExecutionContextInput {
+        txn_id: txn.writing_xid(),
+        snapshot,
+        relations,
+        isolation: txn.isolation,
+        gc_horizon: service.components.gc_horizon(),
+        live_txns: txn.live_txns(),
+        runtime,
+    }) {
+        Ok(ctx) => ctx,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let logical = match logical_plan(&bound) {
+        Ok(logical) => logical,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let physical = match physical_plan(&logical, service.components.catalog.as_ref()) {
+        Ok(physical) => physical,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let mut query = match service.engine.open_query(&ctx, &physical) {
+        Ok(query) => query,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let columns = query.output_schema().to_vec();
+    let _ = setup_tx.send(CursorSetup {
+        txn: Some(txn),
+        default_isolation,
+        result: Ok(StartedCursorSetup { columns }),
+    });
+    drive_cursor_commands(&mut query, &mut cmd_rx);
+}
+
+fn drive_cursor_commands(
+    query: &mut executor::OpenQuery<'_>,
+    cmd_rx: &mut mpsc::Receiver<CursorCommand>,
+) {
+    while let Some(command) = cmd_rx.blocking_recv() {
+        match command {
+            CursorCommand::Fetch {
+                max_rows,
+                row_tx,
+                reply_tx,
+            } => {
+                let mut sink = super::ChannelRowSink::new(row_tx);
+                let result = query.fetch(max_rows, &mut sink, STREAM_BATCH_ROWS);
+                let terminal = !matches!(result, Ok(FetchStatus::Suspended { .. }));
+                let reply = result.map(|status| match status {
+                    FetchStatus::Exhausted { count } => CursorFetchStatus::Exhausted { count },
+                    FetchStatus::Suspended { count } => CursorFetchStatus::Suspended { count },
+                });
+                let _ = reply_tx.send(reply);
+                if terminal {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn read_only_cursor_error() -> DbError {
+    DbError::plan(
+        SqlState::FeatureNotSupported,
+        "portal suspension is supported only for read-only SELECT",
+    )
+}
+
+fn send_setup_error(
+    setup_tx: oneshot::Sender<CursorSetup>,
+    txn: Option<Transaction>,
+    default_isolation: IsolationLevel,
+    err: DbError,
+) {
+    let _ = setup_tx.send(CursorSetup {
+        txn,
+        default_isolation,
+        result: Err(err),
+    });
+}
+
+fn send_failed_txn_setup_error(
+    setup_tx: oneshot::Sender<CursorSetup>,
+    mut txn: Transaction,
+    default_isolation: IsolationLevel,
+    err: DbError,
+) {
+    txn.failed = true;
+    send_setup_error(setup_tx, Some(txn), default_isolation, err);
+}

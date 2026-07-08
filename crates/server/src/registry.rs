@@ -186,6 +186,19 @@ impl ActiveTxnRegistry {
         self.lock().xmins.keys().next().copied()
     }
 
+    /// Advertise an already-captured snapshot `xmin`, returning an RAII guard that
+    /// releases that advertisement on drop. This is for cursor/portal execution
+    /// that keeps using a transaction snapshot independently of the transaction
+    /// object that originally captured it.
+    pub(crate) fn advertise_xmin(&self, xmin: TxnId) -> AdvertisedSnapshot {
+        let mut guard = self.lock();
+        *guard.xmins.entry(xmin).or_insert(0) += 1;
+        AdvertisedSnapshot {
+            shared: Arc::clone(&self.shared),
+            xmin,
+        }
+    }
+
     /// Capture the data for a visibility snapshot — the active set (as `xip`
     /// source), the allocator boundary (`xmax`), and the snapshot's `xmin` — and
     /// **advertise** that `xmin` to the GC horizon, all under one acquisition of

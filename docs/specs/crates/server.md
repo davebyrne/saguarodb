@@ -443,10 +443,22 @@ as text because SaguaroDB has no binary array/vector value representation yet.
 thread pool; a SELECT streams its `DataRow`s through the same bounded-channel
 bridge as the simple-query path (`docs/specs/streaming.md`) in the requested
 result formats, followed by `CommandComplete` (no `RowDescription`, that came from
-`Describe`; no `ReadyForQuery`, that comes from `Sync`); every other statement is
-returned whole as `StreamOutcome::Direct` or, for `DISCARD ALL`,
-`StreamOutcome::SessionReset`, and written as before. `max_rows` is
-treated as all rows. `Execute` participates in the session's CURRENT transaction:
+`Describe`; no `ReadyForQuery`, that comes from `Sync`). For SELECT portals with
+`max_rows == 0`, `Execute` drains the query to completion. For read-only SELECT
+portals with `max_rows > 0`, `Execute` starts or resumes a server-local cursor
+worker backed by `executor::OpenQuery`, sends at most `max_rows` rows, and either
+sends `PortalSuspended` when rows remain or `CommandComplete("SELECT n")` when
+the portal is exhausted; `n` is the cumulative row count across every fetch of
+that portal. A suspended portal created outside an explicit transaction may be
+resumed only before the next `Sync` or simple `Query`; either closes any
+still-suspended autocommit portal before reporting `ReadyForQuery`. A suspended
+portal created inside an explicit transaction may survive `Sync`, but is closed
+when it is exhausted, explicitly closed, replaced by `Bind`, discarded by
+`DISCARD ALL`, invalidated by a successful `ROLLBACK TO SAVEPOINT` that changes
+the transaction's live subxid set, when the transaction ends, or when the
+connection closes. Every other statement is returned whole as
+`StreamOutcome::Direct` or, for `DISCARD ALL`, `StreamOutcome::SessionReset`, and
+`max_rows` does not limit it. `Execute` participates in the session's CURRENT transaction:
 when an explicit transaction is open on the session (`Session.txn` is `Some`), the
 portal runs *inside* that transaction via `QueryService::execute_prepared_in_session_streamed`
 (a thin wrapper over `…_with_context` that installs the channel sink),

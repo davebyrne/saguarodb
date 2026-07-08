@@ -1,16 +1,27 @@
-use common::{ColumnInfo, DbError, PgType, Result, Row, Value};
+use common::{ColumnInfo, DbError, PgType, Result, Row, SqlState, Value};
 use executor::ExecutionResult;
 use protocol::{PostgresCodec, ServerMessage, StatementKind};
 use std::sync::Arc;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::{PreparedStatement, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+use crate::query::{
+    CursorFetchStatus, PreparedStatement, QueryService, STREAM_CHANNEL_CAPACITY, StartedCursor,
+    StreamMessage, StreamOutcome,
+};
 
 use super::{
-    Portal, Session, TransactionState, command_complete_tag, encode_row, error_response,
-    protocol_error, resolve_format, resolve_result_formats, streamed_task_result, write_messages,
+    BoundPortal, Portal, Session, SuspendedPortal, TransactionState, command_complete_tag,
+    encode_row, error_response, protocol_error, resolve_format, resolve_result_formats,
+    streamed_task_result, write_messages,
 };
+
+struct LimitedBoundExecute {
+    statement: Arc<PreparedStatement>,
+    params: Vec<Value>,
+    result_formats: Vec<i16>,
+    max_rows: u64,
+}
 
 impl Session {
     pub(super) async fn run_execute<S>(
@@ -18,7 +29,7 @@ impl Session {
         stream: &mut S,
         codec: &PostgresCodec,
         portal_name: &str,
-        _max_rows: i32,
+        max_rows: i32,
     ) -> Result<()>
     where
         S: AsyncWrite + Unpin,
@@ -28,6 +39,55 @@ impl Session {
             let err = protocol_error(format!("portal \"{portal_name}\" does not exist"));
             return write_messages(stream, codec, &[error_response(&err)]).await;
         };
+
+        if matches!(portal, Portal::Suspended(_)) {
+            if self
+                .reject_failed_transaction_execute(stream, codec)
+                .await?
+            {
+                return Ok(());
+            }
+            let Some(Portal::Suspended(portal)) = self.portals.remove(portal_name) else {
+                unreachable!("portal state changed after suspended match");
+            };
+            return self
+                .run_suspended_execute(stream, codec, portal_name, portal, max_rows)
+                .await;
+        }
+
+        let Portal::Bound(portal) = portal else {
+            unreachable!("suspended portal handled above");
+        };
+        if max_rows > 0
+            && self
+                .app
+                .query_service
+                .prepared_supports_read_only_portal_suspension(&portal.statement, &portal.params)
+        {
+            if self
+                .reject_failed_transaction_execute(stream, codec)
+                .await?
+            {
+                return Ok(());
+            }
+            let Some(Portal::Bound(portal)) = self.portals.remove(portal_name) else {
+                unreachable!("portal state changed after bound match");
+            };
+            return self
+                .run_limited_bound_execute(
+                    stream,
+                    codec,
+                    portal_name,
+                    LimitedBoundExecute {
+                        statement: portal.statement,
+                        params: portal.params,
+                        result_formats: portal.result_formats,
+                        max_rows: max_rows as u64,
+                    },
+                )
+                .await;
+        }
+
         let statement = portal.statement.clone();
         let params = portal.params.clone();
         let result_formats = portal.result_formats.clone();
@@ -134,6 +194,9 @@ impl Session {
         // Keep the reported transaction-block status in sync with the slot, so the
         // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if self.txn.is_none() {
+            self.close_transaction_scoped_suspended_portals();
+        }
 
         // A socket-write failure while streaming means the connection is broken;
         // surface it (closing the connection) rather than writing a terminal
@@ -185,6 +248,179 @@ impl Session {
         }
     }
 
+    async fn reject_failed_transaction_execute<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+    ) -> Result<bool>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if TransactionState::from(crate::query::slot_status(&self.txn)) != TransactionState::Failed
+        {
+            return Ok(false);
+        }
+        self.failed = true;
+        let err = DbError::execute(
+            SqlState::InFailedSqlTransaction,
+            "current transaction is aborted, commands ignored until end of transaction block",
+        );
+        write_messages(stream, codec, &[error_response(&err)]).await?;
+        Ok(true)
+    }
+
+    async fn run_limited_bound_execute<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        portal_name: &str,
+        execute: LimitedBoundExecute,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let guard = match self.app.components.shutdown.begin_query() {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.failed = true;
+                return write_messages(stream, codec, &[error_response(&err)]).await;
+            }
+        };
+        let LimitedBoundExecute {
+            statement,
+            params,
+            result_formats,
+            max_rows,
+        } = execute;
+        let query_text = statement.sql().to_string();
+        let default_isolation = self.default_isolation;
+        let txn = self.txn.take();
+        let transaction_scoped = txn.is_some();
+        let service = self.app.query_service.clone();
+        let cancel = self.begin_cancelable();
+        let session = self.query_session_context(cancel);
+        self.begin_activity(&query_text);
+
+        let (txn, default_isolation, started) = QueryService::start_prepared_cursor(
+            service,
+            statement,
+            params,
+            txn,
+            default_isolation,
+            session,
+        )
+        .await;
+        self.txn = txn;
+        self.default_isolation = default_isolation;
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+
+        let started = match started {
+            Ok(started) => started,
+            Err(err) => {
+                self.failed = true;
+                self.end_activity();
+                drop(guard);
+                return write_messages(stream, codec, &[error_response(&err)]).await;
+            }
+        };
+
+        let fetch =
+            fetch_cursor_rows(stream, codec, &started, &result_formats, Some(max_rows)).await;
+        drop(guard);
+        match fetch {
+            Ok(CursorFetchStatus::Suspended { count }) => {
+                self.end_activity();
+                self.portals.insert(
+                    portal_name.to_string(),
+                    Portal::Suspended(SuspendedPortal {
+                        cursor: started.handle,
+                        result_formats,
+                        columns: started.columns,
+                        query_text,
+                        rows_sent: count,
+                        transaction_scoped,
+                    }),
+                );
+                write_messages(stream, codec, &[ServerMessage::PortalSuspended]).await
+            }
+            Ok(CursorFetchStatus::Exhausted { count }) => {
+                self.end_activity();
+                write_messages(
+                    stream,
+                    codec,
+                    &[ServerMessage::CommandComplete(format!("SELECT {count}"))],
+                )
+                .await
+            }
+            Err(err) => {
+                if let Some(txn) = self.txn.as_mut() {
+                    txn.mark_failed();
+                    self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+                }
+                self.failed = true;
+                self.end_activity();
+                write_messages(stream, codec, &[error_response(&err)]).await
+            }
+        }
+    }
+
+    async fn run_suspended_execute<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        portal_name: &str,
+        mut portal: SuspendedPortal,
+        max_rows: i32,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let guard = match self.app.components.shutdown.begin_query() {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.failed = true;
+                return write_messages(stream, codec, &[error_response(&err)]).await;
+            }
+        };
+        self.begin_cancelable();
+        self.begin_activity(&portal.query_text);
+        let max_rows = if max_rows <= 0 {
+            None
+        } else {
+            Some(max_rows as u64)
+        };
+        let fetch = fetch_suspended_rows(stream, codec, &portal, max_rows).await;
+        drop(guard);
+        match fetch {
+            Ok(CursorFetchStatus::Suspended { count }) => {
+                self.end_activity();
+                portal.rows_sent = portal.rows_sent.saturating_add(count);
+                self.portals
+                    .insert(portal_name.to_string(), Portal::Suspended(portal));
+                write_messages(stream, codec, &[ServerMessage::PortalSuspended]).await
+            }
+            Ok(CursorFetchStatus::Exhausted { count }) => {
+                self.end_activity();
+                let total = portal.rows_sent.saturating_add(count);
+                write_messages(
+                    stream,
+                    codec,
+                    &[ServerMessage::CommandComplete(format!("SELECT {total}"))],
+                )
+                .await
+            }
+            Err(err) => {
+                if let Some(txn) = self.txn.as_mut() {
+                    txn.mark_failed();
+                    self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+                }
+                self.failed = true;
+                self.end_activity();
+                write_messages(stream, codec, &[error_response(&err)]).await
+            }
+        }
+    }
+
     pub(super) fn process_parse(
         &mut self,
         name: String,
@@ -214,11 +450,11 @@ impl Session {
         let params = decode_bind_params(&prepared, param_formats, &params)?;
         self.portals.insert(
             portal,
-            Portal {
+            Portal::Bound(BoundPortal {
                 statement: prepared,
                 params,
                 result_formats,
-            },
+            }),
         );
         Ok(vec![ServerMessage::BindComplete])
     }
@@ -244,10 +480,17 @@ impl Session {
                     .portals
                     .get(name)
                     .ok_or_else(|| protocol_error(format!("portal \"{name}\" does not exist")))?;
-                Ok(vec![row_description_or_no_data(
-                    portal.statement.result_columns(),
-                    &portal.result_formats,
-                )])
+                let message = match portal {
+                    Portal::Bound(portal) => row_description_or_no_data(
+                        portal.statement.result_columns(),
+                        &portal.result_formats,
+                    ),
+                    Portal::Suspended(portal) => ServerMessage::RowDescription {
+                        columns: portal.columns.clone(),
+                        formats: resolve_result_formats(&portal.result_formats, &portal.columns),
+                    },
+                };
+                Ok(vec![message])
             }
         }
     }
@@ -285,6 +528,65 @@ impl Session {
             }
         }
     }
+}
+
+async fn fetch_cursor_rows<S>(
+    stream: &mut S,
+    codec: &PostgresCodec,
+    started: &StartedCursor,
+    result_formats: &[i16],
+    max_rows: Option<u64>,
+) -> Result<CursorFetchStatus>
+where
+    S: AsyncWrite + Unpin,
+{
+    let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
+    let reply_rx = started.handle.start_fetch(max_rows, row_tx).await?;
+    drain_cursor_rows(stream, codec, row_rx, result_formats).await?;
+    reply_rx
+        .await
+        .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
+}
+
+async fn fetch_suspended_rows<S>(
+    stream: &mut S,
+    codec: &PostgresCodec,
+    portal: &SuspendedPortal,
+    max_rows: Option<u64>,
+) -> Result<CursorFetchStatus>
+where
+    S: AsyncWrite + Unpin,
+{
+    let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
+    let reply_rx = portal.cursor.start_fetch(max_rows, row_tx).await?;
+    drain_cursor_rows(stream, codec, row_rx, &portal.result_formats).await?;
+    reply_rx
+        .await
+        .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
+}
+
+async fn drain_cursor_rows<S>(
+    stream: &mut S,
+    codec: &PostgresCodec,
+    mut row_rx: mpsc::Receiver<StreamMessage>,
+    result_formats: &[i16],
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut stream_columns: Vec<ColumnInfo> = Vec::new();
+    while let Some(message) = row_rx.recv().await {
+        match message {
+            StreamMessage::Start { columns } => {
+                stream_columns = columns;
+            }
+            StreamMessage::Rows(rows) => {
+                let messages = encode_portal_rows(&rows, &stream_columns, result_formats)?;
+                write_messages(stream, codec, &messages).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Map a client-declared parameter type OID to its wire type. Accepts the

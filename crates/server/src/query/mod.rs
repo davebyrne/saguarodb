@@ -31,6 +31,7 @@ use crate::session_registry::SessionRegistry;
 
 mod alter;
 mod copy;
+mod cursor;
 mod exec;
 mod gucs;
 mod stream;
@@ -39,6 +40,7 @@ mod txn;
 mod vacuum;
 
 pub use copy::CopyInChunk;
+pub(crate) use cursor::{CursorFetchStatus, QueryCursorHandle, StartedCursor};
 pub use gucs::SessionGucs;
 use stream::{ChannelRowSink, STREAM_BATCH_ROWS};
 pub(crate) use stream::{CopySnapshots, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
@@ -642,6 +644,10 @@ impl Transaction {
 }
 
 impl Transaction {
+    pub(crate) fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
     fn status(&self) -> SessionTxnStatus {
         if self.failed {
             SessionTxnStatus::Failed
@@ -1254,6 +1260,25 @@ impl QueryService {
             &session,
             Some(&mut sink),
         )
+    }
+
+    /// Return true only when this prepared statement still classifies as a
+    /// read-only SELECT after parameter substitution. If substitution itself
+    /// fails, let the normal execute path surface that error instead of changing
+    /// error ordering during portal-routing selection.
+    pub(crate) fn prepared_supports_read_only_portal_suspension(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> bool {
+        if !matches!(prepared.class, StatementClass::Read) {
+            return false;
+        }
+        let Ok(bound) = self.substitute_prepared_params(prepared, params) else {
+            return false;
+        };
+        matches!(bound, BoundStatement::Query(_))
+            && matches!(classify_bound(prepared.class, &bound), StatementClass::Read)
     }
 
     /// Validate the parameter count and substitute `params` into a prepared

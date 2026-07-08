@@ -1,11 +1,12 @@
 # SaguaroDB Cursors Implementation Plan
 
 **Date:** 2026-07-08
-**Status:** Draft implementation plan
+**Status:** Extended-protocol portal suspension implemented; SQL cursors planned
 
 ## 1. Goal
 
-Add cursor support in two layers:
+Add cursor support in two layers. This implementation slice covers the first
+layer; the SQL cursor layer remains planned follow-on work.
 
 1. PostgreSQL extended-protocol portal suspension: honor `Execute.max_rows`,
    return `PortalSuspended` when rows remain, and let a later `Execute` resume
@@ -18,18 +19,22 @@ materializing cursor results. A suspended cursor owns an open executor plus the
 MVCC snapshot, relation-generation snapshot, page pins, cancellation handle, and
 GC-horizon advertisement needed to keep that executor correct.
 
-## 2. Version 1 Scope
+## 2. Implemented Scope
 
 Supported:
 
-- Forward-only, read-only cursors over `SELECT`.
-- Extended-protocol `Execute` with `max_rows > 0` for SELECT portals.
+- Extended-protocol `Execute` with `max_rows > 0` for read-only SELECT portals.
 - `PortalSuspended` (`s`) for a partially drained extended-protocol portal.
-- SQL `DECLARE`, `FETCH`, and `CLOSE` in explicit transaction blocks.
-- Cursor cleanup on `CLOSE`, transaction end, portal replacement, `DISCARD ALL`,
-  connection close, cancellation, and error paths.
+- Suspended portal cleanup on portal `Close`, transaction end, portal
+  replacement, `DISCARD ALL`, `Sync`, simple `Query`, connection close,
+  cancellation, and error paths.
 
-Out of scope for v1:
+Planned follow-on SQL cursor support:
+
+- Forward-only, read-only SQL cursors over `SELECT`.
+- SQL `DECLARE`, `FETCH`, and `CLOSE` in explicit transaction blocks.
+
+Out of scope:
 
 - `SCROLL`, `BACKWARD`, `ABSOLUTE`, `RELATIVE`, `MOVE`.
 - `WITH HOLD`, `BINARY`, `INSENSITIVE`, and updatable cursors.
@@ -48,9 +53,9 @@ Out of scope for v1:
   with it through typed commands.
 - Recovery, WAL, manifest, catalog snapshots, and row/page encodings are
   unchanged. Open cursors are process-local session state.
-- SQL cursors are rejected outside explicit transaction blocks. This avoids
-  implicit transactions spanning `ReadyForQuery` in v1 and matches PostgreSQL's
-  ordinary transaction-scoped cursor model.
+- Planned SQL cursors should be rejected outside explicit transaction blocks.
+  This avoids implicit transactions spanning `ReadyForQuery` and matches
+  PostgreSQL's ordinary transaction-scoped cursor model.
 
 ## 4. Executor Changes
 
@@ -180,16 +185,18 @@ columns, and cumulative row count if needed for diagnostics.
   - If the portal is already `Suspended`, send another fetch command to the same
     worker.
 
-Autocommit rule for v1:
+Autocommit rule:
 
 - A suspended portal created outside an explicit transaction may be resumed only
-  before the next `Sync`. If `Sync` arrives while such a portal is still
-  suspended, close it before `ReadyForQuery`.
+  before the next `Sync` or simple `Query`. If either arrives while such a portal
+  is still suspended, close it before `ReadyForQuery`.
 - Inside an explicit transaction, a suspended portal may survive across `Sync`
-  until closed, exhausted, or transaction end.
+  until closed, exhausted, transaction end, or a successful `ROLLBACK TO
+  SAVEPOINT`. Savepoint rollback changes the transaction's live subxid set, so
+  any cursor worker holding the old statement context must be discarded.
 
-This keeps v1 from exposing implicit transactions that remain open after the
-server reports idle.
+This keeps portal suspension from exposing implicit transactions that remain
+open after the server reports idle.
 
 ### 6.4 Portal cleanup
 
@@ -199,11 +206,14 @@ Close suspended portals when:
 - A new `Bind` replaces the same portal name.
 - `DISCARD ALL` runs.
 - The transaction commits or rolls back.
+- A successful `ROLLBACK TO SAVEPOINT` runs while a transaction-scoped portal is
+  suspended.
 - The connection closes.
 - The extended-protocol error skip state reaches `Sync` for an autocommit
   suspended portal.
+- A simple `Query` arrives while an autocommit portal is suspended.
 
-## 7. SQL Cursor Plan
+## 7. SQL Cursor Follow-On Plan
 
 ### 7.1 Parser
 
@@ -240,20 +250,22 @@ Rejected syntax:
 
 - `DECLARE ... SCROLL`, `NO SCROLL`, `WITH HOLD`, `BINARY`, `INSENSITIVE`.
 - `FETCH BACKWARD`, `ABSOLUTE`, `RELATIVE`, negative counts.
-- `CLOSE ALL` in v1.
+- `CLOSE ALL` in the first SQL cursor slice.
 - Quoted cursor identifiers, matching the general quoted-identifier rule.
 
 ### 7.2 Planner/binder
 
 Cursor control is server-driven, like transaction control and savepoints:
 
-- `DECLARE` binds the SELECT to validate it, reject parameters in simple-query
-  v1, and capture result columns.
-- `DECLARE` rejects non-SELECT bodies and sequence-mutating SELECTs for v1.
+- `DECLARE` binds the SELECT to validate it, reject parameters in the first
+  simple-query SQL cursor slice, and capture result columns.
+- `DECLARE` rejects non-SELECT bodies and sequence-mutating SELECTs in the first
+  SQL cursor slice.
 - `FETCH` and `CLOSE` resolve cursor names against the session cursor registry at
   execution time.
-- Extended-protocol prepared cursor SQL is rejected in v1, matching savepoint's
-  simple-query-only treatment unless there is a later reason to support it.
+- Extended-protocol prepared cursor SQL is rejected in the first SQL cursor
+  slice, matching savepoint's simple-query-only treatment unless there is a later
+  reason to support it.
 
 ### 7.3 Server execution
 
@@ -333,6 +345,7 @@ Server extended-protocol tests:
 - Rebinding the same portal closes the old worker.
 - Autocommit `Sync` closes a still-suspended portal.
 - Explicit-transaction suspended portals survive `Sync` and close at commit.
+- `ROLLBACK TO SAVEPOINT` closes transaction-scoped suspended portals.
 - Client disconnect closes a suspended worker and releases GC-horizon pins.
 
 SQL cursor tests:

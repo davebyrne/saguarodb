@@ -331,6 +331,10 @@ fn terminate_bytes() -> Vec<u8> {
 }
 
 fn backend_pid_from_startup(response: &[u8]) -> i32 {
+    backend_key_from_startup(response).0
+}
+
+fn backend_key_from_startup(response: &[u8]) -> (i32, i32) {
     let mut offset = 0;
     while offset + 5 <= response.len() {
         let tag = response[offset];
@@ -339,7 +343,10 @@ fn backend_pid_from_startup(response: &[u8]) -> i32 {
         let body_start = offset + 5;
         let body_end = offset + 1 + len;
         if tag == b'K' {
-            return i32::from_be_bytes(response[body_start..body_start + 4].try_into().unwrap());
+            return (
+                i32::from_be_bytes(response[body_start..body_start + 4].try_into().unwrap()),
+                i32::from_be_bytes(response[body_start + 4..body_start + 8].try_into().unwrap()),
+            );
         }
         offset = body_end;
     }
@@ -444,15 +451,30 @@ fn describe_statement_bytes(name: &str) -> Vec<u8> {
 }
 
 fn execute_bytes(portal: &str) -> Vec<u8> {
+    execute_bytes_with_max(portal, 0)
+}
+
+fn execute_bytes_with_max(portal: &str, max_rows: i32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(portal.as_bytes());
     body.push(0);
-    body.extend_from_slice(&0i32.to_be_bytes());
+    body.extend_from_slice(&max_rows.to_be_bytes());
     tagged(b'E', &body)
 }
 
 fn sync_bytes() -> Vec<u8> {
     tagged(b'S', &[])
+}
+
+fn flush_bytes() -> Vec<u8> {
+    tagged(b'H', &[])
+}
+
+fn close_portal_bytes(name: &str) -> Vec<u8> {
+    let mut body = vec![b'P'];
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    tagged(b'C', &body)
 }
 
 #[tokio::test]
@@ -589,6 +611,921 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
 
     client.write_all(&terminate_bytes()).await.unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_execute_max_rows_suspends_and_resumes_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3), (4), (5)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[0]));
+    seq.extend(describe_portal_bytes(""));
+    seq.extend(execute_bytes_with_max("", 2));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    assert_eq!(message_tag_count(&response, b'D'), 2);
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended"
+    );
+
+    let mut seq = execute_bytes_with_max("", 2);
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    assert_eq!(message_tag_count(&response, b'D'), 2);
+
+    let mut seq = execute_bytes("");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 5\0"),
+        "final CommandComplete reports total rows"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_autocommit_sync_closes_suspended_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before Sync cleanup"
+    );
+
+    let mut seq = execute_bytes("");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "autocommit Sync closed the suspended portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_transaction_suspended_portal_survives_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+        "begin",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready_any(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before ReadyForQuery"
+    );
+    assert!(
+        response.windows(6).any(|w| w == b"Z\0\0\0\x05T"),
+        "transaction remains open"
+    );
+
+    let mut seq = execute_bytes("");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 2);
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 3\0"),
+        "remaining rows drained after Sync"
+    );
+
+    client.write_all(&query_bytes("commit")).await.unwrap();
+    read_until_ready(&mut client).await;
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_transaction_suspended_portal_closes_on_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+        "begin",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready_any(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before COMMIT"
+    );
+
+    let mut seq = parse_bytes("commit_stmt", "commit", &[]);
+    seq.extend(bind_bytes("", "commit_stmt", &[], &[], &[]));
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "COMMIT closed the transaction-scoped suspended portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_rollback_to_savepoint_closes_transaction_suspended_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "begin",
+        "insert into users (id) values (1)",
+        "savepoint s",
+        "insert into users (id) values (2)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready_any(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before ROLLBACK TO"
+    );
+
+    client
+        .write_all(&query_bytes("rollback to savepoint s"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(9).any(|w| w == b"ROLLBACK\0"),
+        "ROLLBACK TO completed successfully"
+    );
+    assert!(
+        response.windows(6).any(|w| w == b"Z\0\0\0\x05T"),
+        "transaction remains open after ROLLBACK TO"
+    );
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        0,
+        "stale savepoint cursor must not resume rows"
+    );
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "ROLLBACK TO closed the transaction-scoped suspended portal"
+    );
+
+    client.write_all(&query_bytes("commit")).await.unwrap();
+    read_until_ready(&mut client).await;
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_suspended_portal_rejects_resume_in_failed_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+        "begin",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready_any(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before transaction failure"
+    );
+
+    client
+        .write_all(&query_bytes("insert into users (id) values (1)"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(6).any(|w| w == b"Z\0\0\0\x05E"),
+        "duplicate insert leaves the transaction failed"
+    );
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        0,
+        "failed transaction resume must not return rows"
+    );
+    assert!(
+        response.windows(5).any(|w| w == b"25P02"),
+        "resume in failed transaction reports 25P02"
+    );
+    assert!(
+        response.windows(6).any(|w| w == b"Z\0\0\0\x05E"),
+        "failed transaction remains failed after rejected resume"
+    );
+
+    client.write_all(&query_bytes("rollback")).await.unwrap();
+    read_until_ready(&mut client).await;
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "ROLLBACK closed the transaction-scoped suspended portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_limited_execute_in_failed_transaction_preserves_bound_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+        "begin",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready_any(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_ready_any(&mut client).await;
+
+    client
+        .write_all(&query_bytes("insert into users (id) values (1)"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert!(
+        response.windows(6).any(|w| w == b"Z\0\0\0\x05E"),
+        "duplicate insert leaves the transaction failed"
+    );
+
+    let mut seq = execute_bytes_with_max("rows", 1);
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready_any(&mut client).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        0,
+        "failed transaction limited Execute must not return rows"
+    );
+    assert!(
+        response.windows(5).any(|w| w == b"25P02"),
+        "limited Execute in failed transaction reports 25P02"
+    );
+
+    client.write_all(&query_bytes("rollback")).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        3,
+        "rejected limited Execute left the bound portal intact"
+    );
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 3\0"),
+        "bound portal executes normally after rollback"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_simple_query_closes_autocommit_suspended_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    assert!(
+        response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "PortalSuspended before simple query"
+    );
+
+    client.write_all(&query_bytes("select 42")).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "simple query closed the autocommit suspended portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_max_rows_does_not_suspend_sequence_mutating_select() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create sequence users_id_seq",
+        "create table anchor (id integer primary key)",
+        "insert into anchor (id) values (1)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "select nextval('users_id_seq') from anchor", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 1\0"),
+        "sequence-mutating SELECT still executes normally"
+    );
+    assert!(
+        !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "sequence-mutating SELECT is not portal-suspended"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_limited_execute_exhaustion_closes_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 10));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 3);
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 3\0"),
+        "limited Execute exhausted the portal"
+    );
+    assert!(
+        !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "exhausted limited Execute does not suspend"
+    );
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "exhausted limited Execute closed the portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_max_rows_does_not_suspend_explain() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "explain select id from users order by id", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(
+        response.windows(8).any(|w| w == b"EXPLAIN\0"),
+        "EXPLAIN completes normally"
+    );
+    assert!(
+        !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "EXPLAIN is not portal-suspended"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_suspended_portal_preserves_binary_result_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("", "", &[], &[], &[1]));
+    seq.extend(execute_bytes_with_max("", 1));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(contains_binary_int4_field(&response, 1));
+
+    let mut seq = execute_bytes_with_max("", 1);
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(contains_binary_int4_field(&response, 2));
+
+    let mut seq = execute_bytes("");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(contains_binary_int4_field(&response, 3));
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 3\0"),
+        "final CommandComplete reports total rows"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_close_drops_suspended_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+
+    let mut seq = close_portal_bytes("rows");
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_message(&mut client, &[b'3', 0, 0, 0, 4]).await;
+
+    let mut seq = execute_bytes("rows");
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    let missing_portal = b"portal \"rows\" does not exist";
+    assert!(
+        response
+            .windows(missing_portal.len())
+            .any(|w| w == missing_portal),
+        "Close Portal dropped the suspended portal"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_rebind_replaces_suspended_portal() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+
+    let mut seq = parse_bytes("one_stmt", "select 99", &[]);
+    seq.extend(bind_bytes("rows", "one_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes("rows"));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 1);
+    assert!(
+        response.windows(2).any(|w| w == b"99"),
+        "replacement Bind executes the new portal"
+    );
+    assert!(
+        response.windows(9).any(|w| w == b"SELECT 1\0"),
+        "replacement portal completed normally"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_protocol_disconnect_closes_suspended_worker_and_releases_gc_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let app_for_assert = app.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3)",
+    ] {
+        client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut client).await;
+    }
+    assert_eq!(
+        app_for_assert.components.active_txns.oldest_xmin(),
+        None,
+        "setup should leave no advertised snapshot"
+    );
+
+    let mut seq = parse_bytes("rows_stmt", "select id from users order by id", &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(flush_bytes());
+    client.write_all(&seq).await.unwrap();
+    read_until_message(&mut client, &[b's', 0, 0, 0, 4]).await;
+    wait_for_advertised_snapshot(&app_for_assert).await;
+
+    drop(client);
+    server.await.unwrap();
+    wait_for_no_advertised_snapshot(&app_for_assert).await;
+}
+
+#[tokio::test]
+async fn extended_protocol_cancel_request_aborts_active_suspended_portal_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let app_for_assert = app.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(socket, app).await;
+                });
+            }
+        })
+    };
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    let startup = read_until_ready(&mut client).await;
+    let (process_id, secret_key) = backend_key_from_startup(&startup);
+    client
+        .write_all(&query_bytes("create table users (id integer primary key)"))
+        .await
+        .unwrap();
+    read_until_ready(&mut client).await;
+
+    const ROW_COUNT: i32 = 10_000;
+    const CHUNK: i32 = 1_000;
+    for start in (1..=ROW_COUNT).step_by(CHUNK as usize) {
+        let end = (start + CHUNK - 1).min(ROW_COUNT);
+        let values = (start..=end)
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        client
+            .write_all(&query_bytes(&format!(
+                "insert into users (id) values {values}"
+            )))
+            .await
+            .unwrap();
+        read_until_ready_with_timeout(&mut client, Duration::from_secs(10)).await;
+    }
+
+    let sql = format!("select id from users where id + 0 = {ROW_COUNT}");
+    let mut seq = parse_bytes("rows_stmt", &sql, &[]);
+    seq.extend(bind_bytes("rows", "rows_stmt", &[], &[], &[0]));
+    seq.extend(execute_bytes_with_max("rows", 1));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+
+    wait_for_advertised_snapshot(&app_for_assert).await;
+    let mut cancel = TcpStream::connect(addr).await.unwrap();
+    cancel
+        .write_all(&cancel_request_bytes(process_id, secret_key))
+        .await
+        .unwrap();
+    let mut eof = [0; 1];
+    assert_eq!(
+        cancel.read(&mut eof).await.unwrap(),
+        0,
+        "CancelRequest connection closes without a reply"
+    );
+
+    let response = read_until_ready_with_timeout(&mut client, Duration::from_secs(10)).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        0,
+        "canceled portal fetch must not return rows"
+    );
+    assert!(
+        !response.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
+        "canceled portal fetch must not suspend"
+    );
+    assert!(
+        response.windows(5).any(|w| w == b"57014"),
+        "canceled portal fetch reports QueryCanceled"
+    );
+    wait_for_no_advertised_snapshot(&app_for_assert).await;
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
@@ -1204,9 +2141,16 @@ async fn gssenc_decline_then_ssl_upgrade_serves_encrypted_session() {
 }
 
 async fn read_until_ready<S: AsyncRead + Unpin>(client: &mut S) -> Vec<u8> {
+    read_until_ready_with_timeout(client, Duration::from_secs(2)).await
+}
+
+async fn read_until_ready_with_timeout<S: AsyncRead + Unpin>(
+    client: &mut S,
+    timeout: Duration,
+) -> Vec<u8> {
     let mut response = Vec::new();
     let mut buf = [0; 1024];
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(timeout, async {
         loop {
             let read = client.read(&mut buf).await.unwrap();
             assert_ne!(read, 0, "connection closed before ReadyForQuery");
@@ -1219,6 +2163,81 @@ async fn read_until_ready<S: AsyncRead + Unpin>(client: &mut S) -> Vec<u8> {
     .await
     .unwrap();
     response
+}
+
+async fn read_until_message<S: AsyncRead + Unpin>(client: &mut S, needle: &[u8]) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut buf = [0; 1024];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let read = client.read(&mut buf).await.unwrap();
+            assert_ne!(read, 0, "connection closed before expected message");
+            response.extend_from_slice(&buf[..read]);
+            if response
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    response
+}
+
+fn message_tag_count(response: &[u8], tag: u8) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while offset + 5 <= response.len() {
+        if response[offset] == tag {
+            count += 1;
+        }
+        let len = i32::from_be_bytes(
+            response[offset + 1..offset + 5]
+                .try_into()
+                .expect("message length bytes"),
+        );
+        if len < 4 {
+            break;
+        }
+        offset += 1 + len as usize;
+    }
+    count
+}
+
+fn contains_binary_int4_field(response: &[u8], value: i32) -> bool {
+    let mut expected = 4i32.to_be_bytes().to_vec();
+    expected.extend_from_slice(&value.to_be_bytes());
+    response
+        .windows(expected.len())
+        .any(|window| window == expected)
+}
+
+async fn wait_for_advertised_snapshot(app: &AppState) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if app.components.active_txns.oldest_xmin().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cursor worker did not advertise a snapshot");
+}
+
+async fn wait_for_no_advertised_snapshot(app: &AppState) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if app.components.active_txns.oldest_xmin().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cursor worker did not release its snapshot pin");
 }
 
 /// Like [`read_until_ready`] but breaks on a `ReadyForQuery` carrying ANY

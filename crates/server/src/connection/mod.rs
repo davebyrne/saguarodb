@@ -19,8 +19,8 @@ use tokio::task::JoinHandle;
 use crate::app::AppState;
 use crate::cancel::BackendKey;
 use crate::query::{
-    CopyInChunk, PreparedStatement, QuerySessionContext, SessionGucs, SessionTxnStatus,
-    StreamOutcome, Transaction, abort_session_transaction,
+    CopyInChunk, PreparedStatement, QueryCursorHandle, QuerySessionContext, SessionGucs,
+    SessionTxnStatus, StreamOutcome, Transaction, abort_session_transaction,
 };
 use crate::session_registry::SessionActivityRecord;
 use crate::shutdown::InFlightQueryGuard;
@@ -167,12 +167,26 @@ pub async fn handle_connection(mut socket: TcpStream, app: Arc<AppState>) -> Res
     }
 }
 
+enum Portal {
+    Bound(BoundPortal),
+    Suspended(SuspendedPortal),
+}
+
 /// A bound portal: a prepared statement plus its parameter values and the
 /// requested result column formats.
-struct Portal {
+struct BoundPortal {
     statement: Arc<PreparedStatement>,
     params: Vec<Value>,
     result_formats: Vec<i16>,
+}
+
+struct SuspendedPortal {
+    cursor: QueryCursorHandle,
+    result_formats: Vec<i16>,
+    columns: Vec<ColumnInfo>,
+    query_text: String,
+    rows_sent: u64,
+    transaction_scoped: bool,
 }
 
 /// The PostgreSQL transaction-block status reported in `ReadyForQuery`. Each
@@ -448,6 +462,7 @@ impl Session {
             ClientMessage::Query(sql) => return self.run_query(stream, codec, sql).await,
             ClientMessage::Sync => {
                 self.failed = false;
+                self.close_autocommit_suspended_portals();
                 write_messages(
                     stream,
                     codec,
@@ -555,6 +570,30 @@ impl Session {
             }
         }
         Ok(ControlFlow::Continue(()))
+    }
+
+    fn close_autocommit_suspended_portals(&mut self) {
+        self.portals.retain(|_, portal| {
+            !matches!(
+                portal,
+                Portal::Suspended(SuspendedPortal {
+                    transaction_scoped: false,
+                    ..
+                })
+            )
+        });
+    }
+
+    fn close_transaction_scoped_suspended_portals(&mut self) {
+        self.portals.retain(|_, portal| {
+            !matches!(
+                portal,
+                Portal::Suspended(SuspendedPortal {
+                    transaction_scoped: true,
+                    ..
+                })
+            )
+        });
     }
 }
 

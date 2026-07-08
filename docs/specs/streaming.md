@@ -47,8 +47,11 @@ seam that already exists and is already proven by the COPY-out path.
 - `BeginCopyIn` / `BeginCopyOut` — COPY drives its own sub-protocol (and COPY-out
   is already streamed, see §2).
 
-**Not built here, but deliberately unblocked (see §8):** portal `max_rows` +
-`PortalSuspended`, `DECLARE`/`FETCH` cursors, and responsive statement timeouts.
+**Built as a follow-up on this foundation:** extended-protocol portal
+`max_rows` + `PortalSuspended` for read-only SELECT portals.
+
+**Still deliberately unblocked (see §8):** SQL `DECLARE`/`FETCH` cursors and
+responsive statement timeouts.
 
 ## 2. Precedent: the COPY-out bridge
 
@@ -295,29 +298,29 @@ invariant holds exactly as it does for `copy_out_autocommit` /
   `execute_query` does today with `row.row`); SELECT output never needs
   `RowIdentity`.
 
-## 8. Paving the way for the unlocks (not built here)
+## 8. Follow-On Unlocks
 
-The design positions the following features so that each is a localized,
-additive change rather than a rework. None are implemented in this work.
+The streaming design positioned the following features as localized, additive
+changes rather than reworks. Portal suspension is now implemented on that
+foundation; SQL cursors and timeouts remain follow-on work.
 
-- **Portal `max_rows` + `PortalSuspended`, and `DECLARE`/`FETCH` cursors.** These
-  require the `PlanExecutor` (with its snapshot, pins, and txn) to survive across
-  protocol round-trips — fetch *n* rows, then *suspend* rather than drain to
-  completion. The evolution is localized to the producer: turn its "drain to
-  completion" loop into a **command channel** carrying `Fetch(n)` / `Close`
-  messages, the direct analogue of COPY-in's existing `Chunk` / `Done` / `Fail`
-  command channel (`query/copy.rs::drive_copy_in`). The producer thread stays
-  parked between fetches, holding the snapshot and advertisement. The `RowSink`
-  batch drive and the `ControlFlow::Break` early-stop signal are already the
-  fetch-*n*-then-stop primitive this needs.
+- **Portal `max_rows` + `PortalSuspended`.** Implemented for read-only SELECT
+  portals by parking an `OpenQuery` worker behind the portal registry. The worker
+  receives fetch commands, keeps the snapshot and advertisement alive between
+  round trips, and closes when the portal is exhausted, closed, replaced,
+  discarded, invalidated by transaction end, or the connection drops.
+- **`DECLARE`/`FETCH` cursors.** These can reuse the same parked-worker shape
+  behind a SQL cursor registry instead of the extended-protocol portal registry.
 - **Responsive statement timeouts.** Cancellation is already observed per row in
   the drive loop; a timeout simply sets `ctx.cancel` from a timer, and the stream
   stops at the next batch boundary.
-- **Homes that already exist.** The portal registry (`self.portals`) is where a
-  suspended portal's parked-producer handle would live; the extended-protocol
-  `Execute` already routes through the session transaction slot.
+- **Homes that already exist.** The extended-protocol portal registry now stores
+  suspended portal workers; SQL cursors can add a sibling session registry for
+  named cursors.
 
-Per `overview.md:450`, none of this affects the protocol crate or SQL semantics.
+The base streaming bridge did not change protocol encoding or SQL semantics.
+Portal suspension adds the PostgreSQL-standard `PortalSuspended` frame for
+extended-protocol incremental fetch; SQL query semantics remain unchanged.
 
 ## 9. Testing
 
@@ -341,7 +344,8 @@ Per `overview.md:450`, none of this affects the protocol crate or SQL semantics.
 ## 10. Non-goals
 
 - No change to physical operators or their semantics.
-- No change to the wire protocol or to SQL behavior.
+- The base streaming bridge made no wire-protocol or SQL behavior change. Portal
+  suspension adds only the PostgreSQL-standard extended-protocol
+  `PortalSuspended` frame; SQL behavior is unchanged.
 - No change to DML, DDL, EXPLAIN, or COPY execution paths.
-- No implementation of `max_rows`, `PortalSuspended`, cursors, or statement
-  timeouts (see §8).
+- No implementation of SQL cursors or statement timeouts (see §8).

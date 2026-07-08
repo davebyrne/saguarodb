@@ -27,6 +27,7 @@ impl Session {
         // explicit transaction lifecycle and is updated from the slot returned
         // below, not reset here.
         self.failed = false;
+        self.close_autocommit_suspended_portals();
         let guard = match self.app.components.shutdown.begin_query() {
             Ok(guard) => guard,
             Err(err) => {
@@ -115,6 +116,9 @@ impl Session {
         self.txn = txn;
         self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        if self.txn.is_none() || successful_rollback_command(&outcome) {
+            self.close_transaction_scoped_suspended_portals();
+        }
         let status = self.status_byte();
 
         // A socket-write or encode failure while streaming means the connection is
@@ -186,6 +190,14 @@ impl Session {
         }
         Ok(ControlFlow::Continue(()))
     }
+}
+
+fn successful_rollback_command(outcome: &Result<StreamOutcome>) -> bool {
+    matches!(
+        outcome,
+        Ok(StreamOutcome::Direct(ExecutionResult::Modified { command, .. }))
+            if command == "ROLLBACK"
+    )
 }
 
 /// Encode a batch of result rows as `DataRow` messages in the simple-query
