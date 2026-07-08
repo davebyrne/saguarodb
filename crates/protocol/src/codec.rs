@@ -245,6 +245,7 @@ impl ProtocolCodec for PostgresCodec {
             ServerMessage::ParseComplete => encode_server_message(b'1', Vec::new()),
             ServerMessage::BindComplete => encode_server_message(b'2', Vec::new()),
             ServerMessage::CloseComplete => encode_server_message(b'3', Vec::new()),
+            ServerMessage::PortalSuspended => encode_server_message(b's', Vec::new()),
             ServerMessage::ParameterDescription(type_oids) => {
                 let mut body = Vec::new();
                 put_i16(

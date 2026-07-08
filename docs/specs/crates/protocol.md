@@ -56,6 +56,7 @@ pub enum ServerMessage {
     ParseComplete,
     BindComplete,
     CloseComplete,
+    PortalSuspended,
     ParameterDescription(Vec<i32>),
     NoData,
     ErrorResponse { severity: String, code: String, message: String },
@@ -241,6 +242,7 @@ Server messages:
 - `ParseComplete`: tag `b'1'`, length `4`.
 - `BindComplete`: tag `b'2'`, length `4`.
 - `CloseComplete`: tag `b'3'`, length `4`.
+- `PortalSuspended`: tag `b's'`, length `4`.
 - `ParameterDescription`: tag `b't'`, length, `int16 param_count`, then that many `int32` parameter type OIDs.
 - `NoData`: tag `b'n'`, length `4`.
 - `CopyInResponse`: tag `b'G'`, length, `int8 overall_format`, `int16 column_count`, then one `int16 format_code` per column (`0` = text). Used for `COPY ... FROM STDIN`.

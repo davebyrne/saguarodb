@@ -364,6 +364,10 @@ mod tests {
             codec.encode(&ServerMessage::CloseComplete),
             vec![b'3', 0, 0, 0, 4]
         );
+        assert_eq!(
+            codec.encode(&ServerMessage::PortalSuspended),
+            vec![b's', 0, 0, 0, 4]
+        );
         assert_eq!(codec.encode(&ServerMessage::NoData), vec![b'n', 0, 0, 0, 4]);
     }
 

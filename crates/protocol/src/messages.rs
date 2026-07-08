@@ -109,6 +109,9 @@ pub enum ServerMessage {
     BindComplete,
     /// Extended protocol: reply to a successful Close.
     CloseComplete,
+    /// Extended protocol: a portal produced the requested row count and can be
+    /// resumed by a later Execute.
+    PortalSuspended,
     /// Extended protocol: parameter type OIDs for a described statement.
     ParameterDescription(Vec<i32>),
     /// Extended protocol: a described statement/portal returns no rows.
