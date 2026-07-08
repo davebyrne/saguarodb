@@ -18,6 +18,7 @@ impl Session {
         stream: &mut S,
         codec: &PostgresCodec,
         portal_name: &str,
+        _max_rows: i32,
     ) -> Result<()>
     where
         S: AsyncWrite + Unpin,

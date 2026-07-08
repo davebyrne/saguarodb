@@ -488,8 +488,8 @@ impl Session {
                 let result = self.process_close(kind, &name);
                 self.reply_or_fail(stream, codec, result).await?;
             }
-            ClientMessage::Execute { portal, .. } if !self.failed => {
-                self.run_execute(stream, codec, &portal).await?;
+            ClientMessage::Execute { portal, max_rows } if !self.failed => {
+                self.run_execute(stream, codec, &portal, max_rows).await?;
             }
             // Extended messages while in the failed state are skipped until Sync.
             ClientMessage::Parse { .. }
