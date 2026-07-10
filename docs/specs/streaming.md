@@ -1,8 +1,8 @@
 # SaguaroDB Streaming Executor Bridge Specification
 
 **Date:** 2026-07-01
-**Status:** Implemented for SELECT streaming and extended-protocol portal
-suspension; SQL cursors and statement timeouts remain follow-on work.
+**Status:** Implemented for SELECT streaming, extended-protocol portal
+suspension, and SQL cursors; statement timeouts remain follow-on work.
 
 ## 1. Overview
 
@@ -41,10 +41,9 @@ boundary that already existed and was already proven by the COPY-out path.
   is already streamed, see §2).
 
 **Also implemented on this foundation:** extended-protocol portal `max_rows` +
-`PortalSuspended` for read-only SELECT portals.
+`PortalSuspended` for read-only SELECT portals, plus simple-query SQL cursors.
 
-**Still deliberately unblocked (see §8):** SQL `DECLARE`/`FETCH` cursors and
-responsive statement timeouts.
+**Still deliberately unblocked (see §8):** responsive statement timeouts.
 
 ## 2. Precedent: the COPY-out bridge
 
@@ -294,26 +293,27 @@ invariant holds exactly as it does for `copy_out_autocommit` /
 ## 8. Follow-On Unlocks
 
 The streaming design positioned the following features as localized, additive
-changes rather than reworks. Portal suspension is now implemented on that
-foundation; SQL cursors and timeouts remain follow-on work.
+changes rather than reworks. Portal suspension and SQL cursors are now
+implemented on that foundation; timeouts remain follow-on work.
 
 - **Portal `max_rows` + `PortalSuspended`.** Implemented for read-only SELECT
   portals by parking an `OpenQuery` worker behind the portal registry. The worker
   receives fetch commands, keeps the snapshot and advertisement alive between
   round trips, and closes when the portal is exhausted, closed, replaced,
   discarded, invalidated by transaction end, or the connection drops.
-- **`DECLARE`/`FETCH` cursors.** These can reuse the same parked-worker shape
+- **`DECLARE`/`FETCH` cursors.** Implemented with the same parked-worker shape
   behind a SQL cursor registry instead of the extended-protocol portal registry.
 - **Responsive statement timeouts.** Cancellation is already observed per row in
   the drive loop; a timeout simply sets `ctx.cancel` from a timer, and the stream
   stops at the next batch boundary.
-- **Homes that already exist.** The extended-protocol portal registry now stores
-  suspended portal workers; SQL cursors can add a sibling session registry for
-  named cursors.
+- **Homes that already exist.** The extended-protocol portal registry stores
+  suspended portal workers; SQL cursors use a sibling session registry for named
+  cursors.
 
 The base streaming bridge did not change protocol encoding or SQL semantics.
 Portal suspension adds the PostgreSQL-standard `PortalSuspended` frame for
-extended-protocol incremental fetch; SQL query semantics remain unchanged.
+extended-protocol incremental fetch; SQL cursors add transaction-scoped
+`DECLARE`/`FETCH`/`CLOSE` result iteration.
 
 ## 9. Testing
 
@@ -338,6 +338,7 @@ extended-protocol incremental fetch; SQL query semantics remain unchanged.
 - No change to physical operators or their semantics.
 - The base streaming bridge made no wire-protocol or SQL behavior change. Portal
   suspension adds only the PostgreSQL-standard extended-protocol
-  `PortalSuspended` frame; SQL behavior is unchanged.
+  `PortalSuspended` frame; SQL cursors add only the documented
+  transaction-scoped cursor statements.
 - No change to DML, DDL, EXPLAIN, or COPY SQL semantics.
-- No implementation of SQL cursors or statement timeouts (see §8).
+- No implementation of statement timeouts (see §8).

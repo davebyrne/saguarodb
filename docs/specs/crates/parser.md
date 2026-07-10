@@ -51,6 +51,9 @@ pub enum Statement {
     Query(Query),
     Update { table: String, assignments: Vec<Assignment>, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
     Delete { table: String, filter: Option<Expr>, returning: Option<Vec<SelectItem>> },
+    DeclareCursor { name: String, query: Query },
+    FetchCursor { name: String, count: FetchCount },
+    CloseCursor { name: String },
     Explain(Box<Statement>),
     // `BEGIN`/`START TRANSACTION [ISOLATION LEVEL <level>]`. `isolation` is the
     // requested level mapped onto Read Committed / Repeatable Read / Serializable
@@ -114,6 +117,12 @@ pub enum Statement {
         direction: CopyDirection,
         options: CopyOptions,
     },
+}
+
+pub enum FetchCount {
+    One,
+    Count(u64),
+    All,
 }
 
 pub enum InsertSource {

@@ -196,6 +196,7 @@ impl Session {
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         if self.txn.is_none() {
             self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
         }
 
         // A socket-write failure while streaming means the connection is broken;

@@ -2,9 +2,9 @@ mod ast;
 mod convert;
 
 pub use ast::{
-    Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FromItem, FunctionArg,
-    InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select, SelectItem, SetOp,
-    SetScope, Statement, UnaryOp,
+    Assignment, BinOp, ConflictAction, ConflictTarget, Cte, Distinct, Expr, FetchCount, FromItem,
+    FunctionArg, InsertSource, JoinType, OnConflict, OrderByItem, Query, QueryBody, Select,
+    SelectItem, SetOp, SetScope, Statement, UnaryOp,
 };
 
 use common::Result;
@@ -29,8 +29,8 @@ mod tests {
     };
 
     use crate::{
-        Assignment, BinOp, Expr, FromItem, FunctionArg, InsertSource, JoinType, Query, QueryBody,
-        SelectItem, SetOp, SetScope, Statement, UnaryOp, parse,
+        Assignment, BinOp, Expr, FetchCount, FromItem, FunctionArg, InsertSource, JoinType, Query,
+        QueryBody, SelectItem, SetOp, SetScope, Statement, UnaryOp, parse,
     };
 
     fn id_column() -> ParsedColumnDef {
@@ -187,6 +187,107 @@ mod tests {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
             assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn parses_sql_cursor_forms() {
+        let Statement::DeclareCursor { name, query } =
+            parse("DECLARE MyCursor CURSOR FOR SELECT id FROM users").unwrap()
+        else {
+            panic!("expected DECLARE CURSOR");
+        };
+        assert_eq!(name, "mycursor");
+        let QueryBody::Select(select) = query.body else {
+            panic!("expected SELECT cursor body");
+        };
+        assert!(matches!(
+            select.columns.as_slice(),
+            [SelectItem::Expression {
+                expr: Expr::ColumnRef { table: None, column },
+                alias: None,
+            }] if column == "id"
+        ));
+        assert!(matches!(
+            select.from.as_slice(),
+            [FromItem::Table {
+                schema: None,
+                name,
+                alias: None,
+            }] if name == "users"
+        ));
+
+        for sql in ["FETCH FROM c", "FETCH c", "FETCH FORWARD FROM c"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::FetchCursor {
+                    name: "c".to_string(),
+                    count: FetchCount::One,
+                },
+                "for `{sql}`"
+            );
+        }
+        for sql in ["FETCH 2 FROM c", "FETCH FORWARD 2 FROM c"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::FetchCursor {
+                    name: "c".to_string(),
+                    count: FetchCount::Count(2),
+                },
+                "for `{sql}`"
+            );
+        }
+        assert_eq!(
+            parse("FETCH ALL FROM c").unwrap(),
+            Statement::FetchCursor {
+                name: "c".to_string(),
+                count: FetchCount::All,
+            }
+        );
+        assert_eq!(
+            parse("CLOSE C").unwrap(),
+            Statement::CloseCursor {
+                name: "c".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_sql_cursor_forms() {
+        for sql in [
+            "DECLARE c SCROLL CURSOR FOR SELECT 1",
+            "DECLARE c NO SCROLL CURSOR FOR SELECT 1",
+            "DECLARE c BINARY CURSOR FOR SELECT 1",
+            "DECLARE c INSENSITIVE CURSOR FOR SELECT 1",
+            "DECLARE c ASENSITIVE CURSOR FOR SELECT 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT 1",
+            "DECLARE c CURSOR WITHOUT HOLD FOR SELECT 1",
+            "DECLARE c CURSOR FOR VALUES (1)",
+            "DECLARE c CURSOR FOR VALUES (1) UNION SELECT 2",
+            "FETCH BACKWARD",
+            "FETCH BACKWARD FROM c",
+            "FETCH ABSOLUTE",
+            "FETCH ABSOLUTE 1 FROM c",
+            "FETCH RELATIVE",
+            "FETCH RELATIVE 1 FROM c",
+            "FETCH NEXT",
+            "FETCH -1 FROM c",
+            "FETCH 1L FROM c",
+            "FETCH FORWARD ALL FROM c",
+            "CLOSE ALL",
+            "DECLARE \"c\" CURSOR FOR SELECT 1",
+            "FETCH FROM \"c\"",
+            "CLOSE \"c\"",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert!(
+                matches!(
+                    err.code,
+                    SqlState::SyntaxError | SqlState::FeatureNotSupported
+                ),
+                "unexpected SQLSTATE {:?} for `{sql}`",
+                err.code
+            );
         }
     }
 

@@ -648,6 +648,10 @@ impl Transaction {
         self.failed = true;
     }
 
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed
+    }
+
     fn status(&self) -> SessionTxnStatus {
         if self.failed {
             SessionTxnStatus::Failed
@@ -832,6 +836,12 @@ impl QueryService {
                 "savepoints require the simple query protocol",
             ));
         }
+        if let StatementClass::SqlCursor = class {
+            return Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "SQL cursors require the simple query protocol",
+            ));
+        }
         if let StatementClass::TransactionControl(_) = class {
             // BEGIN/COMMIT/ROLLBACK take no parameters and produce no rows; they do
             // not bind. Carry the prepared statement with a no-op bound payload so
@@ -1012,6 +1022,10 @@ impl QueryService {
             StatementClass::SessionConfig => {
                 unreachable!("session configuration is dispatched above before substitution")
             }
+            StatementClass::SqlCursor => Err(DbError::plan(
+                SqlState::FeatureNotSupported,
+                "SQL cursors require the simple query protocol",
+            )),
             StatementClass::TransactionControl(_) => Err(DbError::plan(
                 SqlState::FeatureNotSupported,
                 "transaction control statements require the simple query protocol",
@@ -1222,6 +1236,9 @@ impl QueryService {
                     }
                     StatementClass::TransactionControl(_) => {
                         unreachable!("transaction control is dispatched above before substitution")
+                    }
+                    StatementClass::SqlCursor => {
+                        unreachable!("SQL cursors are rejected at prepare time")
                     }
                     StatementClass::Copy(_) => {
                         unreachable!("COPY is rejected at prepare time for the extended protocol")
@@ -1956,6 +1973,9 @@ enum StatementClass {
     /// (`docs/specs/savepoints.md`); simple-query only. The op + name are read from
     /// the parsed `Statement` in `handle_savepoint` (so this stays a `Copy` marker).
     Savepoint,
+    /// `DECLARE` / `FETCH` / `CLOSE` SQL cursors. These are simple-query,
+    /// connection-session operations and never bind as normal relational plans.
+    SqlCursor,
     /// `SET`/`RESET`/`SHOW`/`DISCARD ALL` session configuration. These statements
     /// are non-relational and are handled against the connection's GUC/session
     /// state before binding or planning.
@@ -2106,6 +2126,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
         | Statement::RollbackToSavepoint { .. } => Ok(StatementClass::Savepoint),
+        Statement::DeclareCursor { .. }
+        | Statement::FetchCursor { .. }
+        | Statement::CloseCursor { .. } => Ok(StatementClass::SqlCursor),
     }
 }
 

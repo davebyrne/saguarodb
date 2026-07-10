@@ -189,6 +189,12 @@ struct SuspendedPortal {
     transaction_scoped: bool,
 }
 
+struct SqlCursor {
+    handle: Option<QueryCursorHandle>,
+    columns: Vec<ColumnInfo>,
+    query_text: String,
+}
+
 /// The PostgreSQL transaction-block status reported in `ReadyForQuery`. Each
 /// variant maps to the wire status byte the protocol encodes. The session's
 /// transaction slot drives the transitions: `Idle` (`b'I'`) with no open
@@ -233,6 +239,7 @@ struct Session {
     state: PostgresConnectionState,
     prepared: HashMap<String, Arc<PreparedStatement>>,
     portals: HashMap<String, Portal>,
+    cursors: HashMap<String, SqlCursor>,
     /// Set after an error inside an extended-query sequence; subsequent extended
     /// messages are skipped until the client sends `Sync`.
     failed: bool,
@@ -287,6 +294,7 @@ impl Drop for Session {
         if let Some(activity) = self.activity.take() {
             self.app.components.session_registry.deregister(&activity);
         }
+        self.cursors.clear();
         // A client that disconnected mid-transaction leaves an open transaction:
         // abort it so the exclusive write guard and the registry entry are not
         // leaked. The abort is in-memory before-image undo plus an (unflushed)
@@ -355,6 +363,7 @@ impl Session {
             state: PostgresConnectionState::new(),
             prepared: HashMap::new(),
             portals: HashMap::new(),
+            cursors: HashMap::new(),
             failed: false,
             tx: TransactionState::Idle,
             txn: None,
@@ -594,6 +603,10 @@ impl Session {
                 })
             )
         });
+    }
+
+    fn close_sql_cursors(&mut self) {
+        self.cursors.clear();
     }
 }
 

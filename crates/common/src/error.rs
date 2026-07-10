@@ -42,6 +42,9 @@ pub enum SqlState {
     /// relation kind, e.g. `DROP TABLE` names a view.
     WrongObjectType,
     DuplicateTable,
+    /// `42P03`: a cursor declaration used a name that is already open in the
+    /// current session.
+    DuplicateCursor,
     DatatypeMismatch,
     DivisionByZero,
     /// `22023`: a validly typed argument or option has an invalid value, e.g.
@@ -73,6 +76,8 @@ pub enum SqlState {
     /// operation, e.g. `currval` before this session has called `nextval`/`setval`
     /// for that sequence.
     ObjectNotInPrerequisiteState,
+    /// `34000`: `FETCH`/`CLOSE` named a cursor that is not open in the session.
+    InvalidCursorName,
     QueryCanceled,
     FeatureNotSupported,
     /// `25P02`: a statement other than `COMMIT`/`ROLLBACK` was issued inside a
@@ -116,6 +121,7 @@ impl SqlState {
             SqlState::InvalidColumnReference => "42P10",
             SqlState::WrongObjectType => "42809",
             SqlState::DuplicateTable => "42P07",
+            SqlState::DuplicateCursor => "42P03",
             SqlState::DatatypeMismatch => "42804",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
@@ -129,6 +135,7 @@ impl SqlState {
             SqlState::CardinalityViolation => "21000",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::ObjectNotInPrerequisiteState => "55000",
+            SqlState::InvalidCursorName => "34000",
             SqlState::QueryCanceled => "57014",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::InFailedSqlTransaction => "25P02",
@@ -153,6 +160,7 @@ impl SqlState {
             "42P10" => SqlState::InvalidColumnReference,
             "42809" => SqlState::WrongObjectType,
             "42P07" => SqlState::DuplicateTable,
+            "42P03" => SqlState::DuplicateCursor,
             "42804" => SqlState::DatatypeMismatch,
             "22012" => SqlState::DivisionByZero,
             "22023" => SqlState::InvalidParameterValue,
@@ -166,6 +174,7 @@ impl SqlState {
             "21000" => SqlState::CardinalityViolation,
             "2BP01" => SqlState::DependentObjectsStillExist,
             "55000" => SqlState::ObjectNotInPrerequisiteState,
+            "34000" => SqlState::InvalidCursorName,
             "57014" => SqlState::QueryCanceled,
             "0A000" => SqlState::FeatureNotSupported,
             "25P02" => SqlState::InFailedSqlTransaction,
@@ -243,6 +252,7 @@ mod tests {
             SqlState::InvalidColumnReference,
             SqlState::WrongObjectType,
             SqlState::DuplicateTable,
+            SqlState::DuplicateCursor,
             SqlState::DatatypeMismatch,
             SqlState::DivisionByZero,
             SqlState::InvalidParameterValue,
@@ -256,6 +266,7 @@ mod tests {
             SqlState::CardinalityViolation,
             SqlState::DependentObjectsStillExist,
             SqlState::ObjectNotInPrerequisiteState,
+            SqlState::InvalidCursorName,
             SqlState::QueryCanceled,
             SqlState::FeatureNotSupported,
             SqlState::InFailedSqlTransaction,

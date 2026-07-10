@@ -77,6 +77,17 @@ impl QueryService {
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
+        if let StatementClass::SqlCursor = class {
+            return (
+                mark_failed_on_error(slot),
+                default_isolation,
+                Err(DbError::plan(
+                    SqlState::FeatureNotSupported,
+                    "SQL cursors require the connection cursor path",
+                )),
+            );
+        }
+
         // Maintenance commands do not bind/plan, and like DDL are forbidden inside
         // an explicit transaction block (Postgres: "VACUUM cannot run inside a
         // transaction block"). Reject with the open transaction poisoned to the 'E'
@@ -581,6 +592,9 @@ impl QueryService {
             // Session configuration is dispatched before the autocommit data path.
             StatementClass::SessionConfig => Err(DbError::internal(
                 "session configuration reached the autocommit data path",
+            )),
+            StatementClass::SqlCursor => Err(DbError::internal(
+                "SQL cursor reached the autocommit data path",
             )),
             // COPY is intercepted by `dispatch` (→ `dispatch_copy`) and driven by the
             // connection loop, never the autocommit data path.

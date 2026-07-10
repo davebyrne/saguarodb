@@ -112,6 +112,21 @@ pub enum Statement {
         /// `DELETE ... RETURNING <items>`, evaluated over each deleted (old) row.
         returning: Option<Vec<SelectItem>>,
     },
+    /// `DECLARE <name> CURSOR FOR <query>`. SQL cursors are server-driven and
+    /// transaction-scoped; the server binds the query when opening the cursor.
+    DeclareCursor {
+        name: String,
+        query: Query,
+    },
+    /// `FETCH ... FROM <name>`. Only forward-only cursor fetches are supported.
+    FetchCursor {
+        name: String,
+        count: FetchCount,
+    },
+    /// `CLOSE <name>`.
+    CloseCursor {
+        name: String,
+    },
     Explain(Box<Statement>),
     /// `BEGIN [TRANSACTION] [ISOLATION LEVEL <level>] [READ WRITE]` /
     /// `START TRANSACTION ...`. `isolation` carries an explicit
@@ -237,6 +252,13 @@ pub enum Statement {
         direction: CopyDirection,
         options: CopyOptions,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchCount {
+    One,
+    Count(u64),
+    All,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

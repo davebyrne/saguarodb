@@ -377,7 +377,10 @@ fn bind_inner(
         | Statement::DiscardAll
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
-        | Statement::RollbackToSavepoint { .. } => Err(plan_error(
+        | Statement::RollbackToSavepoint { .. }
+        | Statement::DeclareCursor { .. }
+        | Statement::FetchCursor { .. }
+        | Statement::CloseCursor { .. } => Err(plan_error(
             SqlState::FeatureNotSupported,
             "session control statements do not bind",
         )),

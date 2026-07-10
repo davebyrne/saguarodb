@@ -462,6 +462,7 @@ pub enum SqlState {
     InvalidColumnReference,
     WrongObjectType,
     DuplicateTable,
+    DuplicateCursor,
     DatatypeMismatch,
     DivisionByZero,
     InvalidParameterValue,
@@ -475,6 +476,7 @@ pub enum SqlState {
     CardinalityViolation,
     DependentObjectsStillExist,
     ObjectNotInPrerequisiteState,
+    InvalidCursorName,
     QueryCanceled,
     FeatureNotSupported,
     InFailedSqlTransaction,
@@ -498,6 +500,10 @@ pub type Result<T> = std::result::Result<T, DbError>;
 All crates return `common::Result<T>`. Crates should map low-level errors into the nearest `ErrorKind` and SQLSTATE at the boundary where context is available.
 `SqlState::code` is the single source of truth for PostgreSQL wire SQLSTATE
 strings, and `SqlState::from_code` is the reverse parser for known codes.
+
+`DuplicateCursor` maps to `42P03` for a duplicate SQL cursor declaration.
+`InvalidCursorName` maps to `34000` for `FETCH`/`CLOSE` of a cursor that is not
+open in the current session.
 
 `SqlState::CheckViolation` maps to SQLSTATE `23514`: a proposed row violates a
 table's `CHECK` constraint — the constraint expression evaluated to `false` for

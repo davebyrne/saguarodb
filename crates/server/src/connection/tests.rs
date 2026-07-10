@@ -131,6 +131,335 @@ async fn loopback_startup_and_simple_query_return_protocol_rows() {
 }
 
 #[tokio::test]
+async fn loopback_sql_cursor_fetch_close_lifecycle() {
+    let mut test = open_loopback_test().await;
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2), (3), (4), (5)",
+    ] {
+        test.client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut test.client).await;
+    }
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes(
+            "/* cursor route */ declare c cursor for select id from users order by id",
+        ))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(
+        response.windows(15).any(|w| w == b"DECLARE CURSOR\0"),
+        "DECLARE command tag"
+    );
+
+    test.client
+        .write_all(&query_bytes("fetch 2 from c"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert_eq!(message_tag_count(&response, b'T'), 1, "RowDescription");
+    assert_eq!(message_tag_count(&response, b'D'), 2, "two fetched rows");
+    assert_eq!(
+        data_row_text_fields(&response),
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    assert!(response.windows(8).any(|w| w == b"FETCH 2\0"));
+
+    test.client
+        .write_all(&query_bytes("fetch all from c"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert_eq!(message_tag_count(&response, b'D'), 3, "remaining rows");
+    assert_eq!(
+        data_row_text_fields(&response),
+        vec![
+            vec!["3".to_string()],
+            vec!["4".to_string()],
+            vec!["5".to_string()]
+        ]
+    );
+    assert!(response.windows(8).any(|w| w == b"FETCH 3\0"));
+
+    test.client
+        .write_all(&query_bytes("fetch all from c"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert_eq!(
+        message_tag_count(&response, b'D'),
+        0,
+        "exhausted cursor returns no rows"
+    );
+    assert_eq!(data_row_text_fields(&response), Vec::<Vec<String>>::new());
+    assert_eq!(
+        message_tag_count(&response, b'T'),
+        1,
+        "exhausted fetch still describes the result"
+    );
+    assert!(response.windows(8).any(|w| w == b"FETCH 0\0"));
+
+    test.client
+        .write_all(&query_bytes("close c"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(
+        response.windows(13).any(|w| w == b"CLOSE CURSOR\0"),
+        "CLOSE command tag"
+    );
+    test.client.write_all(&query_bytes("commit")).await.unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&terminate_bytes()).await.unwrap();
+    test.server.await.unwrap();
+}
+
+#[tokio::test]
+async fn loopback_sql_cursor_errors_use_expected_sqlstates() {
+    let mut test = open_loopback_test().await;
+
+    test.client
+        .write_all(&query_bytes("declare c cursor for select 1"))
+        .await
+        .unwrap();
+    let response = read_until_ready(&mut test.client).await;
+    assert!(response.windows(5).any(|w| w == b"25P01"));
+
+    test.client
+        .write_all(&query_bytes("create sequence s"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare c cursor for select 1"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare c cursor for select 1"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(response.windows(5).any(|w| w == b"42P03"));
+    assert_ready_status(&response, b'E');
+    test.client
+        .write_all(&query_bytes("rollback"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("fetch from missing"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(response.windows(5).any(|w| w == b"34000"));
+    assert_ready_status(&response, b'E');
+    test.client
+        .write_all(&query_bytes("rollback"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare c cursor for select nextval('s')"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(response.windows(5).any(|w| w == b"0A000"));
+    assert_ready_status(&response, b'E');
+    test.client
+        .write_all(&query_bytes("rollback"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&terminate_bytes()).await.unwrap();
+    test.server.await.unwrap();
+}
+
+#[tokio::test]
+async fn loopback_sql_cursors_close_on_transaction_cleanup() {
+    let mut test = open_loopback_test().await;
+    test.client
+        .write_all(&query_bytes("create table users (id integer primary key)"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare c cursor for select id from users"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client.write_all(&query_bytes("commit")).await.unwrap();
+    read_until_ready(&mut test.client).await;
+    assert_cursor_missing_in_new_transaction(&mut test.client, "c").await;
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare r cursor for select id from users"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("rollback"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+    assert_cursor_missing_in_new_transaction(&mut test.client, "r").await;
+
+    test.client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("savepoint s"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("declare sp cursor for select id from users"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("rollback to savepoint s"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut test.client).await;
+    test.client
+        .write_all(&query_bytes("fetch from sp"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut test.client).await;
+    assert!(response.windows(5).any(|w| w == b"34000"));
+    test.client
+        .write_all(&query_bytes("rollback"))
+        .await
+        .unwrap();
+    read_until_ready(&mut test.client).await;
+
+    test.client.write_all(&terminate_bytes()).await.unwrap();
+    test.server.await.unwrap();
+}
+
+#[tokio::test]
+async fn loopback_sql_cursor_snapshot_survives_delete_and_vacuum() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let app_for_assert = app.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(socket, app).await;
+                });
+            }
+        })
+    };
+
+    let mut cursor_client = TcpStream::connect(addr).await.unwrap();
+    cursor_client
+        .write_all(&startup_bytes("cursor_owner"))
+        .await
+        .unwrap();
+    read_until_ready(&mut cursor_client).await;
+    let mut vacuum_client = TcpStream::connect(addr).await.unwrap();
+    vacuum_client
+        .write_all(&startup_bytes("vacuum_owner"))
+        .await
+        .unwrap();
+    read_until_ready(&mut vacuum_client).await;
+
+    for sql in [
+        "create table users (id integer primary key)",
+        "insert into users (id) values (1), (2)",
+    ] {
+        cursor_client.write_all(&query_bytes(sql)).await.unwrap();
+        read_until_ready(&mut cursor_client).await;
+    }
+    assert_eq!(app_for_assert.components.active_txns.oldest_xmin(), None);
+
+    cursor_client
+        .write_all(&query_bytes("begin"))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut cursor_client).await;
+    cursor_client
+        .write_all(&query_bytes(
+            "declare c cursor for select id from users order by id",
+        ))
+        .await
+        .unwrap();
+    read_until_ready_any(&mut cursor_client).await;
+    wait_for_advertised_snapshot(&app_for_assert).await;
+
+    vacuum_client
+        .write_all(&query_bytes("delete from users where id = 1"))
+        .await
+        .unwrap();
+    read_until_ready(&mut vacuum_client).await;
+    vacuum_client
+        .write_all(&query_bytes("vacuum users"))
+        .await
+        .unwrap();
+    read_until_ready(&mut vacuum_client).await;
+
+    cursor_client
+        .write_all(&query_bytes("fetch all from c"))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(&mut cursor_client).await;
+    assert_eq!(
+        data_row_text_fields(&response),
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "cursor snapshot must retain rows visible at DECLARE despite later VACUUM"
+    );
+    cursor_client
+        .write_all(&query_bytes("commit"))
+        .await
+        .unwrap();
+    read_until_ready(&mut cursor_client).await;
+    wait_for_no_advertised_snapshot(&app_for_assert).await;
+
+    cursor_client.write_all(&terminate_bytes()).await.unwrap();
+    vacuum_client.write_all(&terminate_bytes()).await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn extended_protocol_rejects_sql_cursor_parse() {
+    let mut test = open_loopback_test().await;
+
+    let mut seq = parse_bytes("", "declare c cursor for select 1", &[]);
+    seq.extend(sync_bytes());
+    test.client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut test.client).await;
+
+    assert!(response.windows(5).any(|w| w == b"0A000"));
+    test.client.write_all(&terminate_bytes()).await.unwrap();
+    test.server.await.unwrap();
+}
+
+#[tokio::test]
 async fn system_information_functions_use_startup_session_info() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
@@ -324,6 +653,33 @@ fn query_bytes(sql: &str) -> Vec<u8> {
     packet.extend_from_slice(sql.as_bytes());
     packet.push(0);
     packet
+}
+
+struct LoopbackTest {
+    _dir: tempfile::TempDir,
+    client: TcpStream,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn open_loopback_test() -> LoopbackTest {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    LoopbackTest {
+        _dir: dir,
+        client,
+        server,
+    }
 }
 
 fn terminate_bytes() -> Vec<u8> {
@@ -2204,6 +2560,29 @@ fn message_tag_count(response: &[u8], tag: u8) -> usize {
         offset += 1 + len as usize;
     }
     count
+}
+
+fn assert_ready_status(response: &[u8], status: u8) {
+    assert!(
+        response
+            .windows(6)
+            .any(|window| window == [b'Z', 0, 0, 0, 5, status]),
+        "ReadyForQuery status {} not found in response",
+        status as char
+    );
+}
+
+async fn assert_cursor_missing_in_new_transaction(client: &mut TcpStream, name: &str) {
+    client.write_all(&query_bytes("begin")).await.unwrap();
+    read_until_ready_any(client).await;
+    client
+        .write_all(&query_bytes(&format!("fetch from {name}")))
+        .await
+        .unwrap();
+    let response = read_until_ready_any(client).await;
+    assert!(response.windows(5).any(|w| w == b"34000"));
+    client.write_all(&query_bytes("rollback")).await.unwrap();
+    read_until_ready(client).await;
 }
 
 fn contains_binary_int4_field(response: &[u8], value: i32) -> bool {

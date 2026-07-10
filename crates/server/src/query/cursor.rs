@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use common::{ColumnInfo, DbError, IsolationLevel, Result, SqlState};
 use executor::FetchStatus;
-use planner::{logical_plan, physical_plan};
+use parser::{Query, Statement};
+use planner::{bind, logical_plan, physical_plan};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -75,6 +76,16 @@ struct CursorWorkerInput {
     cmd_rx: mpsc::Receiver<CursorCommand>,
 }
 
+struct SqlCursorWorkerInput {
+    service: Arc<QueryService>,
+    query: Query,
+    txn: Transaction,
+    default_isolation: IsolationLevel,
+    session: QuerySessionContext,
+    setup_tx: oneshot::Sender<CursorSetup>,
+    cmd_rx: mpsc::Receiver<CursorCommand>,
+}
+
 impl QueryService {
     pub(crate) async fn start_prepared_cursor(
         service: Arc<Self>,
@@ -91,6 +102,58 @@ impl QueryService {
                 service,
                 prepared,
                 params,
+                txn,
+                default_isolation,
+                session,
+                setup_tx,
+                cmd_rx,
+            });
+        });
+
+        let setup = match setup_rx.await {
+            Ok(setup) => setup,
+            Err(_) => {
+                return (
+                    None,
+                    default_isolation,
+                    Err(DbError::internal("cursor worker stopped before setup")),
+                );
+            }
+        };
+        let CursorSetup {
+            txn,
+            default_isolation,
+            result,
+        } = setup;
+        match result {
+            Ok(setup) => (
+                txn,
+                default_isolation,
+                Ok(StartedCursor {
+                    handle: QueryCursorHandle {
+                        tx: cmd_tx,
+                        _task: task,
+                    },
+                    columns: setup.columns,
+                }),
+            ),
+            Err(err) => (txn, default_isolation, Err(err)),
+        }
+    }
+
+    pub(crate) async fn start_sql_cursor(
+        service: Arc<Self>,
+        query: Query,
+        txn: Transaction,
+        default_isolation: IsolationLevel,
+        session: QuerySessionContext,
+    ) -> (Option<Transaction>, IsolationLevel, Result<StartedCursor>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (setup_tx, setup_rx) = oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            run_sql_cursor_worker(SqlCursorWorkerInput {
+                service,
+                query,
                 txn,
                 default_isolation,
                 session,
@@ -284,6 +347,109 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
     ) {
         return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
     }
+    let TransactionSnapshots {
+        snapshot,
+        relations,
+        advertised,
+    } = snapshots;
+    let _cursor_advertised =
+        advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
+    let runtime = session.statement_runtime(
+        txn.current_default_isolation(default_isolation),
+        txn.isolation,
+    );
+    let ctx = match service.execution_context(ExecutionContextInput {
+        txn_id: txn.writing_xid(),
+        snapshot,
+        relations,
+        isolation: txn.isolation,
+        gc_horizon: service.components.gc_horizon(),
+        live_txns: txn.live_txns(),
+        runtime,
+    }) {
+        Ok(ctx) => ctx,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let logical = match logical_plan(&bound) {
+        Ok(logical) => logical,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let physical = match physical_plan(&logical, service.components.catalog.as_ref()) {
+        Ok(physical) => physical,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let mut query = match service.engine.open_query(&ctx, &physical) {
+        Ok(query) => query,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    let columns = query.output_schema().to_vec();
+    let _ = setup_tx.send(CursorSetup {
+        txn: Some(txn),
+        default_isolation,
+        result: Ok(StartedCursorSetup { columns }),
+    });
+    drive_cursor_commands(&mut query, &mut cmd_rx);
+}
+
+fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
+    let SqlCursorWorkerInput {
+        service,
+        query,
+        mut txn,
+        default_isolation,
+        session,
+        setup_tx,
+        mut cmd_rx,
+    } = input;
+    let session = service.with_catalog_introspection(session);
+    if txn.failed {
+        return send_failed_txn_setup_error(
+            setup_tx,
+            txn,
+            default_isolation,
+            DbError::execute(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ),
+        );
+    }
+
+    let snapshots = match service.snapshots_for_transaction(&mut txn) {
+        Ok(snapshots) => snapshots,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    txn.first_statement_ran = true;
+
+    let statement = Statement::Query(query);
+    let bound = match bind(&statement, service.components.catalog.as_ref()) {
+        Ok(bound) => bound,
+        Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+    };
+    if !matches!(
+        classify_bound(StatementClass::Read, &bound),
+        StatementClass::Read
+    ) {
+        return send_failed_txn_setup_error(
+            setup_tx,
+            txn,
+            default_isolation,
+            read_only_cursor_error(),
+        );
+    }
+
+    let schema_versions =
+        match prepared_schema_versions(&bound, service.components.catalog.as_ref()) {
+            Ok(schema_versions) => schema_versions,
+            Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
+        };
+    if let Err(err) = service.validate_relation_snapshot_schema_versions(
+        snapshots.relations.as_ref(),
+        &schema_versions,
+        true,
+    ) {
+        return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
+    }
+
     let TransactionSnapshots {
         snapshot,
         relations,

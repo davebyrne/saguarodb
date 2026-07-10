@@ -7,7 +7,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use crate::{SetScope, Statement};
+use crate::{FetchCount, SetScope, Statement};
 
 mod ddl;
 mod dml;
@@ -43,6 +43,9 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     reject_set_global(sql)?;
     reject_comma_separated_truncate(sql)?;
     if let Some(statement) = try_parse_create_sequence(sql)? {
+        return Ok(statement);
+    }
+    if let Some(statement) = try_parse_fetch_cursor(sql)? {
         return Ok(statement);
     }
 
@@ -188,6 +191,13 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             })
         }
         sql::Statement::Delete(delete) => convert_delete(delete),
+        sql::Statement::Declare { stmts } => convert_declare_cursor(stmts),
+        sql::Statement::Fetch {
+            name,
+            direction,
+            into,
+        } => convert_fetch_cursor(name, direction, into),
+        sql::Statement::Close { cursor } => convert_close_cursor(cursor),
         sql::Statement::Explain {
             describe_alias,
             analyze,
@@ -287,6 +297,85 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             values,
         } => convert_copy(source, to, target, options, legacy_options, values),
         _ => unsupported("unsupported SQL statement"),
+    }
+}
+
+fn convert_declare_cursor(mut stmts: Vec<sql::Declare>) -> Result<Statement> {
+    if stmts.len() != 1 {
+        return unsupported("DECLARE supports a single cursor declaration");
+    }
+    let statement = stmts.remove(0);
+    if statement.names.len() != 1
+        || statement.data_type.is_some()
+        || statement.assignment.is_some()
+        || statement.declare_type != Some(sql::DeclareType::Cursor)
+    {
+        return unsupported("DECLARE supports cursor declarations only");
+    }
+    if statement.binary == Some(true) {
+        return feature_not_supported("BINARY cursors are not supported");
+    }
+    if statement.sensitive.is_some() {
+        return feature_not_supported("cursor sensitivity options are not supported");
+    }
+    if statement.scroll.is_some() {
+        return feature_not_supported("SCROLL cursors are not supported");
+    }
+    if statement.hold.is_some() {
+        return feature_not_supported("cursor hold options are not supported");
+    }
+    let query = statement
+        .for_query
+        .ok_or_else(|| parse_error("DECLARE CURSOR requires FOR SELECT"))?;
+    let query = convert_query(*query)?;
+    if !cursor_query_body_is_select(&query) {
+        return unsupported("DECLARE CURSOR requires SELECT");
+    }
+    Ok(Statement::DeclareCursor {
+        name: ident_name(&statement.names[0])?,
+        query,
+    })
+}
+
+fn cursor_query_body_is_select(query: &crate::Query) -> bool {
+    match &query.body {
+        crate::QueryBody::Select(_) => true,
+        crate::QueryBody::SetOp { left, right, .. } => {
+            cursor_query_body_is_select(left) && cursor_query_body_is_select(right)
+        }
+        crate::QueryBody::Values(_) => false,
+    }
+}
+
+fn convert_fetch_cursor(
+    name: sql::Ident,
+    direction: sql::FetchDirection,
+    into: Option<sql::ObjectName>,
+) -> Result<Statement> {
+    if into.is_some() {
+        return unsupported("FETCH INTO is not supported");
+    }
+    let count = match direction {
+        sql::FetchDirection::Count { limit } => FetchCount::Count(fetch_count_value(&limit)?),
+        sql::FetchDirection::All => FetchCount::All,
+        sql::FetchDirection::Forward { limit: Some(limit) } => {
+            FetchCount::Count(fetch_count_value(&limit)?)
+        }
+        sql::FetchDirection::Forward { limit: None } => FetchCount::One,
+        _ => return unsupported("unsupported FETCH direction"),
+    };
+    Ok(Statement::FetchCursor {
+        name: ident_name(&name)?,
+        count,
+    })
+}
+
+fn convert_close_cursor(cursor: sql::CloseCursor) -> Result<Statement> {
+    match cursor {
+        sql::CloseCursor::Specific { name } => Ok(Statement::CloseCursor {
+            name: ident_name(&name)?,
+        }),
+        sql::CloseCursor::All => feature_not_supported("CLOSE ALL is not supported"),
     }
 }
 
@@ -740,6 +829,143 @@ fn ident_name(ident: &sql::Ident) -> Result<String> {
         return Err(parse_error("quoted identifiers are not supported"));
     }
     Ok(ident.value.to_ascii_lowercase())
+}
+
+fn try_parse_fetch_cursor(sql: &str) -> Result<Option<Statement>> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokens: Vec<_> = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+
+    let Some(Token::Word(keyword)) = tokens.first() else {
+        return Ok(None);
+    };
+    if keyword.quote_style.is_some() || !keyword.value.eq_ignore_ascii_case("fetch") {
+        return Ok(None);
+    }
+
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    if tokens
+        .iter()
+        .skip(1)
+        .any(|token| *token == Token::SemiColon)
+    {
+        return Err(parse_error("expected exactly one SQL statement"));
+    }
+
+    let mut parser = FetchCursorParser { tokens, index: 1 };
+    let statement = parser.parse()?;
+    if !parser.is_at_end() {
+        return Err(parse_error("unexpected trailing tokens after FETCH"));
+    }
+    Ok(Some(statement))
+}
+
+struct FetchCursorParser {
+    tokens: Vec<Token>,
+    index: usize,
+}
+
+impl FetchCursorParser {
+    fn parse(&mut self) -> Result<Statement> {
+        let count = if self.consume_word("from") {
+            FetchCount::One
+        } else if self.consume_word("forward") {
+            if self.consume_word("from") {
+                FetchCount::One
+            } else {
+                let count = FetchCount::Count(self.parse_count()?);
+                self.expect_word("from")?;
+                count
+            }
+        } else if self.consume_word("all") {
+            self.expect_word("from")?;
+            FetchCount::All
+        } else if self.current_is_count() {
+            let count = FetchCount::Count(self.parse_count()?);
+            self.expect_word("from")?;
+            count
+        } else if self.current_is_unsupported_direction() {
+            return unsupported("unsupported FETCH direction");
+        } else {
+            FetchCount::One
+        };
+        let name = self.parse_identifier()?;
+        Ok(Statement::FetchCursor { name, count })
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.index >= self.tokens.len()
+    }
+
+    fn consume_word(&mut self, expected: &str) -> bool {
+        if matches_word(self.tokens.get(self.index), expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_word(&mut self, expected: &str) -> Result<()> {
+        if self.consume_word(expected) {
+            Ok(())
+        } else {
+            Err(parse_error(format!("expected {expected}")))
+        }
+    }
+
+    fn current_is_count(&self) -> bool {
+        matches!(self.tokens.get(self.index), Some(Token::Number(_, _)))
+            || matches!(self.tokens.get(self.index), Some(Token::Minus))
+    }
+
+    fn current_is_unsupported_direction(&self) -> bool {
+        [
+            "absolute", "backward", "first", "last", "next", "prior", "relative",
+        ]
+        .iter()
+        .any(|direction| matches_word(self.tokens.get(self.index), direction))
+    }
+
+    fn parse_count(&mut self) -> Result<u64> {
+        if matches!(self.tokens.get(self.index), Some(Token::Minus)) {
+            return unsupported("negative FETCH counts are not supported");
+        }
+        let Some(Token::Number(text, long)) = self.tokens.get(self.index) else {
+            return Err(parse_error("expected FETCH count"));
+        };
+        if *long {
+            return Err(parse_error("FETCH count must be an unsigned integer"));
+        }
+        self.index += 1;
+        text.parse::<u64>()
+            .map_err(|_| parse_error("FETCH count must be an unsigned integer"))
+    }
+
+    fn parse_identifier(&mut self) -> Result<String> {
+        match self.tokens.get(self.index) {
+            Some(Token::Word(word)) if word.quote_style.is_none() => {
+                self.index += 1;
+                Ok(word.value.to_ascii_lowercase())
+            }
+            Some(Token::Word(_)) => Err(parse_error("quoted identifiers are not supported")),
+            _ => Err(parse_error("expected cursor name")),
+        }
+    }
+}
+
+fn fetch_count_value(value: &sql::Value) -> Result<u64> {
+    let sql::Value::Number(text, false) = value else {
+        return Err(parse_error("FETCH count must be an unsigned integer"));
+    };
+    text.parse::<u64>()
+        .map_err(|_| parse_error("FETCH count must be an unsigned integer"))
 }
 
 /// Intercept `RESET <name>` / `RESET ALL` before sqlparser, which cannot parse

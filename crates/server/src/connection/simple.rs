@@ -1,14 +1,18 @@
-use common::{ColumnInfo, DataType, DbError, Result, Row};
+use common::{ColumnInfo, DataType, DbError, Result, Row, SqlState};
 use executor::ExecutionResult;
+use parser::{FetchCount, Statement};
 use protocol::{PostgresCodec, ServerMessage};
 use std::ops::ControlFlow;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-use crate::query::{STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome};
+use crate::query::{
+    CursorFetchStatus, QueryService, STREAM_CHANNEL_CAPACITY, StreamMessage, StreamOutcome,
+};
+use crate::shutdown::InFlightQueryGuard;
 
 use super::{
-    Session, TransactionState, command_complete_tag, encode_row, error_response,
+    Session, SqlCursor, TransactionState, command_complete_tag, encode_row, error_response,
     streamed_task_result, write_messages,
 };
 
@@ -46,6 +50,52 @@ impl Session {
                 return Ok(ControlFlow::Break(()));
             }
         };
+        match parse_statement_for_connection_routing(&sql) {
+            Ok(Some(statement @ Statement::DeclareCursor { .. }))
+            | Ok(Some(statement @ Statement::FetchCursor { .. }))
+            | Ok(Some(statement @ Statement::CloseCursor { .. })) => {
+                return self
+                    .run_sql_cursor_statement(stream, codec, &sql, statement, guard)
+                    .await;
+            }
+            Ok(Some(statement)) => {
+                let closes_cursors_on_success =
+                    matches!(statement, Statement::RollbackToSavepoint { .. });
+                return self
+                    .run_general_simple_query(stream, codec, sql, closes_cursors_on_success, guard)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.mark_current_transaction_failed();
+                drop(guard);
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        error_response(&err),
+                        ServerMessage::ReadyForQuery(self.status_byte()),
+                    ],
+                )
+                .await?;
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+        self.run_general_simple_query(stream, codec, sql, false, guard)
+            .await
+    }
+
+    async fn run_general_simple_query<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        sql: String,
+        closes_cursors_on_success: bool,
+        guard: InFlightQueryGuard,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
         let service = self.app.query_service.clone();
         let cancel = self.begin_cancelable();
         let session = self.query_session_context(cancel);
@@ -116,8 +166,11 @@ impl Session {
         self.txn = txn;
         self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
-        if self.txn.is_none() || successful_rollback_command(&outcome) {
+        let transaction_cleanup = self.txn.is_none() || successful_rollback_command(&outcome);
+        let statement_cleanup = closes_cursors_on_success && outcome.is_ok();
+        if transaction_cleanup || statement_cleanup {
             self.close_transaction_scoped_suspended_portals();
+            self.close_sql_cursors();
         }
         let status = self.status_byte();
 
@@ -166,6 +219,7 @@ impl Session {
             Ok(StreamOutcome::SessionReset(result)) => {
                 self.prepared.clear();
                 self.portals.clear();
+                self.close_sql_cursors();
                 drop(guard);
                 self.end_activity();
                 write_execution_result(stream, codec, result, status).await?
@@ -190,6 +244,405 @@ impl Session {
         }
         Ok(ControlFlow::Continue(()))
     }
+
+    async fn run_sql_cursor_statement<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        sql: &str,
+        statement: Statement,
+        guard: InFlightQueryGuard,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        match statement {
+            Statement::DeclareCursor { name, query } => {
+                self.declare_sql_cursor(stream, codec, sql, name, query, guard)
+                    .await
+            }
+            Statement::FetchCursor { name, count } => {
+                self.fetch_sql_cursor(stream, codec, name, count, guard)
+                    .await
+            }
+            Statement::CloseCursor { name } => {
+                self.close_sql_cursor(stream, codec, name, guard).await
+            }
+            _ => unreachable!("caller passes only SQL cursor statements"),
+        }
+    }
+
+    async fn declare_sql_cursor<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        sql: &str,
+        name: String,
+        query: parser::Query,
+        guard: InFlightQueryGuard,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if let Err(err) = self.require_healthy_sql_cursor_transaction() {
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, false)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        if self.cursors.contains_key(&name) {
+            let err = DbError::execute(
+                SqlState::DuplicateCursor,
+                format!("cursor \"{name}\" already exists"),
+            );
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, true)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        let service = self.app.query_service.clone();
+        let cancel = self.begin_cancelable();
+        let session = self.query_session_context(cancel);
+        self.begin_activity(sql);
+        let txn = self
+            .txn
+            .take()
+            .expect("DECLARE cursor requires an open transaction");
+        let default_isolation = self.default_isolation;
+        let (txn, default_isolation, started) =
+            QueryService::start_sql_cursor(service, query, txn, default_isolation, session).await;
+        self.txn = txn;
+        self.default_isolation = default_isolation;
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        let status = self.status_byte();
+        drop(guard);
+        self.end_activity();
+
+        match started {
+            Ok(started) => {
+                self.cursors.insert(
+                    name,
+                    SqlCursor {
+                        handle: Some(started.handle),
+                        columns: started.columns,
+                        query_text: sql.to_string(),
+                    },
+                );
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        ServerMessage::CommandComplete("DECLARE CURSOR".to_string()),
+                        ServerMessage::ReadyForQuery(status),
+                    ],
+                )
+                .await?;
+                Ok(ControlFlow::Continue(()))
+            }
+            Err(err) => {
+                write_messages(
+                    stream,
+                    codec,
+                    &[error_response(&err), ServerMessage::ReadyForQuery(status)],
+                )
+                .await?;
+                Ok(ControlFlow::Continue(()))
+            }
+        }
+    }
+
+    async fn fetch_sql_cursor<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        name: String,
+        count: FetchCount,
+        guard: InFlightQueryGuard,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if let Err(err) = self.require_healthy_sql_cursor_transaction() {
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, false)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        let Some(mut cursor) = self.cursors.remove(&name) else {
+            let err = DbError::execute(
+                SqlState::InvalidCursorName,
+                format!("cursor \"{name}\" does not exist"),
+            );
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, true)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        };
+        self.begin_cancelable();
+        self.begin_activity(&cursor.query_text);
+        let fetch = fetch_sql_cursor_rows(stream, codec, &mut cursor, count).await;
+        drop(guard);
+        self.end_activity();
+
+        match fetch {
+            Ok(fetched) => {
+                self.cursors.insert(name, cursor);
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        ServerMessage::CommandComplete(format!("FETCH {fetched}")),
+                        ServerMessage::ReadyForQuery(self.status_byte()),
+                    ],
+                )
+                .await?;
+                Ok(ControlFlow::Continue(()))
+            }
+            Err(SqlCursorFetchError::Stream(err)) => Err(err),
+            Err(SqlCursorFetchError::Worker(err)) => {
+                self.mark_current_transaction_failed();
+                write_messages(
+                    stream,
+                    codec,
+                    &[
+                        error_response(&err),
+                        ServerMessage::ReadyForQuery(self.status_byte()),
+                    ],
+                )
+                .await?;
+                Ok(ControlFlow::Continue(()))
+            }
+        }
+    }
+
+    async fn close_sql_cursor<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        name: String,
+        guard: InFlightQueryGuard,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if let Err(err) = self.require_healthy_sql_cursor_transaction() {
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, false)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        if self.cursors.remove(&name).is_none() {
+            let err = DbError::execute(
+                SqlState::InvalidCursorName,
+                format!("cursor \"{name}\" does not exist"),
+            );
+            drop(guard);
+            self.write_sql_cursor_error(stream, codec, err, true)
+                .await?;
+            return Ok(ControlFlow::Continue(()));
+        }
+        drop(guard);
+        write_messages(
+            stream,
+            codec,
+            &[
+                ServerMessage::CommandComplete("CLOSE CURSOR".to_string()),
+                ServerMessage::ReadyForQuery(self.status_byte()),
+            ],
+        )
+        .await?;
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn require_healthy_sql_cursor_transaction(&self) -> Result<()> {
+        match &self.txn {
+            None => Err(DbError::execute(
+                SqlState::NoActiveSqlTransaction,
+                "SQL cursors require an explicit transaction block",
+            )),
+            Some(txn) if txn.is_failed() => Err(DbError::execute(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    async fn write_sql_cursor_error<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        err: DbError,
+        fail_transaction: bool,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if fail_transaction {
+            self.mark_current_transaction_failed();
+        }
+        write_messages(
+            stream,
+            codec,
+            &[
+                error_response(&err),
+                ServerMessage::ReadyForQuery(self.status_byte()),
+            ],
+        )
+        .await
+    }
+
+    fn mark_current_transaction_failed(&mut self) {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.mark_failed();
+            self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        }
+    }
+}
+
+enum SqlCursorFetchError {
+    Stream(DbError),
+    Worker(DbError),
+}
+
+fn parse_statement_for_connection_routing(sql: &str) -> Result<Option<Statement>> {
+    if !routing_first_keyword_matches(sql, &["declare", "fetch", "close", "rollback"]) {
+        return Ok(None);
+    }
+    let statement = parser::parse(sql)?;
+    match statement {
+        Statement::DeclareCursor { .. }
+        | Statement::FetchCursor { .. }
+        | Statement::CloseCursor { .. }
+        | Statement::RollbackToSavepoint { .. } => Ok(Some(statement)),
+        _ => Ok(None),
+    }
+}
+
+fn routing_first_keyword_matches(sql: &str, expected: &[&str]) -> bool {
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0c => index += 1,
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                if index + 1 >= bytes.len() {
+                    return false;
+                }
+                index += 2;
+            }
+            ch if ch.is_ascii_alphabetic() || ch == b'_' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+                return expected
+                    .iter()
+                    .any(|candidate| sql[start..index].eq_ignore_ascii_case(candidate));
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+async fn fetch_sql_cursor_rows<S>(
+    stream: &mut S,
+    codec: &PostgresCodec,
+    cursor: &mut SqlCursor,
+    count: FetchCount,
+) -> std::result::Result<u64, SqlCursorFetchError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let max_rows = match count {
+        FetchCount::One => Some(1),
+        FetchCount::Count(count) => Some(count),
+        FetchCount::All => None,
+    };
+    if cursor.handle.is_none() {
+        write_messages(
+            stream,
+            codec,
+            &[ServerMessage::RowDescription {
+                columns: cursor.columns.clone(),
+                formats: Vec::new(),
+            }],
+        )
+        .await
+        .map_err(SqlCursorFetchError::Stream)?;
+        return Ok(0);
+    }
+
+    let handle = cursor
+        .handle
+        .take()
+        .expect("checked cursor handle is present");
+    let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
+    let reply_rx = handle
+        .start_fetch(max_rows, row_tx)
+        .await
+        .map_err(SqlCursorFetchError::Worker)?;
+    write_messages(
+        stream,
+        codec,
+        &[ServerMessage::RowDescription {
+            columns: cursor.columns.clone(),
+            formats: Vec::new(),
+        }],
+    )
+    .await
+    .map_err(SqlCursorFetchError::Stream)?;
+    drain_sql_cursor_rows(stream, codec, row_rx, &cursor.columns)
+        .await
+        .map_err(SqlCursorFetchError::Stream)?;
+    let status = reply_rx
+        .await
+        .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))
+        .and_then(|result| result)
+        .map_err(SqlCursorFetchError::Worker)?;
+    match status {
+        CursorFetchStatus::Suspended { count } => {
+            cursor.handle = Some(handle);
+            Ok(count)
+        }
+        CursorFetchStatus::Exhausted { count } => Ok(count),
+    }
+}
+
+async fn drain_sql_cursor_rows<S>(
+    stream: &mut S,
+    codec: &PostgresCodec,
+    mut row_rx: mpsc::Receiver<StreamMessage>,
+    columns: &[ColumnInfo],
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    while let Some(message) = row_rx.recv().await {
+        match message {
+            StreamMessage::Start { .. } => {}
+            StreamMessage::Rows(rows) => {
+                let messages = encode_data_rows(&rows, columns)?;
+                write_messages(stream, codec, &messages).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn successful_rollback_command(outcome: &Result<StreamOutcome>) -> bool {

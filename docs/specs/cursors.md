@@ -1,18 +1,18 @@
 # SaguaroDB Cursor Specification
 
 **Date:** 2026-07-08
-**Status:** Extended-protocol portal suspension implemented; SQL cursors planned
+**Status:** Extended-protocol portal suspension and SQL cursors implemented
 
 ## 1. Goal
 
-Cursor support is split across two layers. Extended-protocol portal suspension is
-implemented; the SQL cursor layer remains planned follow-on work.
+Cursor support is split across two implemented layers:
 
 1. PostgreSQL extended-protocol portal suspension: honor `Execute.max_rows`,
    return `PortalSuspended` when rows remain, and let a later `Execute` resume
    the same portal.
-2. SQL cursors: `DECLARE <name> CURSOR FOR <select>`, `FETCH [FORWARD]
-   [<count> | ALL] FROM <name>`, and `CLOSE <name>`.
+2. SQL cursors: `DECLARE <name> CURSOR FOR <select>`, `FETCH FROM <name>`,
+   `FETCH <name>`, `FETCH [FORWARD] <count> FROM <name>`,
+   `FETCH FORWARD FROM <name>`, `FETCH ALL FROM <name>`, and `CLOSE <name>`.
 
 The implementation reuses the streaming executor bridge rather than materializing
 cursor results. A suspended cursor owns an open executor plus the
@@ -28,9 +28,6 @@ Supported:
 - Suspended portal cleanup on portal `Close`, transaction end, portal
   replacement, `DISCARD ALL`, autocommit `Sync`, simple `Query`, connection
   close, cancellation, and error paths.
-
-Planned follow-on SQL cursor support:
-
 - Forward-only, read-only SQL cursors over `SELECT`.
 - SQL `DECLARE`, `FETCH`, and `CLOSE` in explicit transaction blocks.
 
@@ -54,9 +51,9 @@ Out of scope:
   with it through typed commands.
 - Recovery, WAL, manifest, catalog snapshots, and row/page encodings are
   unchanged. Open cursors are process-local session state.
-- Planned SQL cursors should be rejected outside explicit transaction blocks.
-  This avoids implicit transactions spanning `ReadyForQuery` and matches
-  PostgreSQL's ordinary transaction-scoped cursor model.
+- SQL cursors are rejected outside explicit transaction blocks. This avoids
+  implicit transactions spanning `ReadyForQuery` and matches PostgreSQL's
+  ordinary transaction-scoped cursor model.
 
 ## 4. Executor Changes
 
@@ -217,11 +214,11 @@ Close suspended portals when:
   suspended portal.
 - A simple `Query` arrives while an autocommit portal is suspended.
 
-## 7. SQL Cursor Follow-On Plan
+## 7. SQL Cursor Layer
 
 ### 7.1 Parser
 
-Add AST variants:
+The parser exposes cursor AST variants:
 
 ```rust
 DeclareCursor { name: String, query: Query }
@@ -254,6 +251,7 @@ Rejected syntax:
 
 - `DECLARE ... SCROLL`, `NO SCROLL`, `WITH HOLD`, `BINARY`, `INSENSITIVE`.
 - `FETCH BACKWARD`, `ABSOLUTE`, `RELATIVE`, negative counts.
+- `FETCH FORWARD ALL`; use `FETCH ALL FROM name` instead.
 - `CLOSE ALL` in the first SQL cursor slice.
 - Quoted cursor identifiers, matching the general quoted-identifier rule.
 
@@ -261,15 +259,14 @@ Rejected syntax:
 
 Cursor control is server-driven, like transaction control and savepoints:
 
-- `DECLARE` binds the SELECT to validate it, reject parameters in the first
-  simple-query SQL cursor slice, and capture result columns.
-- `DECLARE` rejects non-SELECT bodies and sequence-mutating SELECTs in the first
-  SQL cursor slice.
+- `DECLARE` binds the SELECT to validate it, reject parameters in simple-query
+  SQL cursor statements, and capture result columns.
+- `DECLARE` rejects non-SELECT bodies and sequence-mutating SELECTs.
 - `FETCH` and `CLOSE` resolve cursor names against the session cursor registry at
   execution time.
-- Extended-protocol prepared cursor SQL is rejected in the first SQL cursor
-  slice, matching savepoint's simple-query-only treatment unless there is a later
-  reason to support it.
+- Extended-protocol prepared cursor SQL is rejected with
+  `SqlState::FeatureNotSupported`, matching savepoint's simple-query-only
+  treatment.
 
 ### 7.3 Server execution
 
@@ -278,11 +275,16 @@ Add `Session.cursors: HashMap<String, SqlCursor>`.
 `DECLARE`:
 
 - Requires an open explicit transaction in healthy state.
+- Duplicate cursor names fail with `SqlState::DuplicateCursor` (`42P03`) and
+  poison the transaction.
 - Captures the transaction-appropriate MVCC/relation snapshot:
-  - Read Committed: capture a statement snapshot and keep its advertisement in
-    the worker for the cursor lifetime.
+  - Read Committed: capture a statement snapshot.
   - Repeatable Read / Serializable: reuse the transaction snapshot and relation
-    snapshot; the transaction owns the long-lived advertisement.
+    snapshot.
+- The cursor worker owns a cursor-lifetime GC-horizon advertisement for the
+  snapshot it holds, so the pin stays valid until the cursor closes even if
+  transaction-end code consumes the transaction slot before dropping cursor
+  handles.
 - Starts a cursor worker but does not fetch rows.
 - Stores the worker under the normalized cursor name.
 - Returns command tag `DECLARE CURSOR`.
@@ -290,6 +292,8 @@ Add `Session.cursors: HashMap<String, SqlCursor>`.
 `FETCH`:
 
 - Requires an open explicit transaction in healthy state.
+- Missing cursor names fail with `SqlState::InvalidCursorName` (`34000`) and
+  poison the transaction.
 - Sends a fetch command to the named cursor worker.
 - Streams rows like SELECT and returns `CommandComplete("FETCH n")`.
 - If the cursor exhausts, keep it open at end-of-cursor until `CLOSE` or
@@ -298,17 +302,16 @@ Add `Session.cursors: HashMap<String, SqlCursor>`.
 `CLOSE`:
 
 - Requires an open explicit transaction in healthy state.
+- Missing cursor names fail with `SqlState::InvalidCursorName` (`34000`) and
+  poison the transaction.
 - Closes and removes the named cursor.
 - Returns `CommandComplete("CLOSE CURSOR")`.
 
 Transaction end:
 
-- `COMMIT` and `ROLLBACK` close every SQL cursor before dropping the transaction
-  snapshot/guard state.
-- If cursor close fails during transaction end, treat it like other post-statement
-  cleanup uncertainty: return a structured error before reporting the transaction
-  complete when still pre-commit, or fatal if the durable commit point has already
-  passed.
+- `COMMIT` and `ROLLBACK` close every SQL cursor as part of transaction cleanup.
+- Successful `ROLLBACK TO SAVEPOINT`, `DISCARD ALL`, and connection close also
+  close SQL cursors.
 
 ## 8. Activity, Cancellation, and Shutdown
 
@@ -352,7 +355,7 @@ Server extended-protocol tests:
 - `ROLLBACK TO SAVEPOINT` closes transaction-scoped suspended portals.
 - Client disconnect closes a suspended worker and releases GC-horizon pins.
 
-Planned SQL cursor tests:
+SQL cursor tests:
 
 - `DECLARE` outside a transaction errors.
 - `DECLARE c CURSOR FOR SELECT ...`; `FETCH 2 FROM c`; `FETCH ALL FROM c`;
@@ -382,15 +385,13 @@ Implemented portal-suspension layer:
 - Integration coverage for MVCC snapshot retention, cancellation, binary result
   formats, and lifecycle cleanup.
 
-Remaining SQL cursor sequence:
+Implemented SQL cursor layer:
 
-1. Add parser AST and parser tests for `DECLARE`/`FETCH`/`CLOSE`.
-2. Add server-side SQL cursor registry and simple-query execution.
-3. Add SQL cursor integration coverage for transaction scoping, exhaustion,
-   cleanup, unsupported options, and VACUUM horizon retention.
-4. Update `overview.md`, `crates/parser.md`, `crates/planner.md`, and
-   `crates/server.md` from planned to implemented SQL cursor behavior once that
-   layer lands.
+- Parser AST and parser coverage for `DECLARE`/`FETCH`/`CLOSE`.
+- Server-side SQL cursor registry and simple-query execution.
+- Transaction-scoped cleanup on transaction end, successful `ROLLBACK TO
+  SAVEPOINT`, `DISCARD ALL`, and disconnect.
+- SQLSTATE coverage for duplicate and missing cursor names.
 
 ## 11. Verification
 
