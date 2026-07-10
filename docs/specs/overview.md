@@ -1,7 +1,7 @@
 # SaguaroDB Overview Specification
 
 **Date:** 2026-07-04
-**Status:** Draft
+**Status:** Living system contract
 
 ## 1. Overview
 

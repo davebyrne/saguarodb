@@ -1,7 +1,7 @@
 # `planner` Crate Specification
 
 **Date:** 2026-07-04
-**Status:** Draft
+**Status:** Living crate contract
 
 ## Purpose
 

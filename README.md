@@ -338,8 +338,9 @@ data/
 
 At runtime, the buffer pool holds clean pages loaded from the heap and index
 files plus dirty pages created by committed and in-flight statements. Dirty
-pages are flushed in place to their home files once their dirtying transaction
-has committed and its page-LSN is WAL-durable.
+pages are flushed in place to their home files once their page-LSN is
+WAL-durable. MVCC visibility is decided by the CLOG, so flushed pages may
+contain committed, aborted, or still-in-flight row versions.
 
 ```text
              normal operation
@@ -384,7 +385,7 @@ checkpoint
     |
     +-- flush WAL so every page it describes is durable
     |
-    +-- flush committed dirty pages in place to heap/index files
+    +-- flush WAL-durable dirty pages in place to heap/index files
     |
     +-- fsync the heap/index files
     |

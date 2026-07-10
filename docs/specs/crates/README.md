@@ -1,7 +1,7 @@
 # SaguaroDB Crate Specs
 
 **Date:** 2026-05-03
-**Status:** Draft
+**Status:** Living crate contract index
 
 This directory decomposes the overview spec into crate-level contracts for the implementation. The goal is to preserve the architecture while allowing naive implementations behind stable boundaries.
 

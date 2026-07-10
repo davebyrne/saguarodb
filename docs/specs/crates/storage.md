@@ -1,7 +1,7 @@
 # `storage` Crate Specification
 
 **Date:** 2026-05-03
-**Status:** Draft
+**Status:** Living crate contract
 
 ## Purpose
 

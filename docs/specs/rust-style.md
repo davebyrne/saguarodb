@@ -1,7 +1,7 @@
 # SaguaroDB Rust Style Guidelines
 
 **Date:** 2026-07-04
-**Status:** Draft
+**Status:** Living style and testing contract
 
 This document defines Rust style and engineering conventions for SaguaroDB. It complements the crate specs in `docs/specs/crates/` and applies to all Rust workspace crates unless a crate spec explicitly says otherwise.
 

@@ -1,7 +1,7 @@
 # SaguaroDB COPY Specification
 
 **Date:** 2026-06-26
-**Status:** Draft
+**Status:** Implemented feature specification
 
 ## 1. Overview
 
@@ -306,13 +306,15 @@ transferred, matching PostgreSQL.
 - `parser`: `Statement::Copy` AST and translation from `sqlparser::Statement::Copy`,
   including option normalization and rejection of unsupported forms.
 - `planner`: `BoundStatement::Copy` (binding: resolve table + columns to ids,
-  retain the bound table schema, and carry `direction`/`options`). `COPY` is not lowered by `logical_plan`
-  (which rejects it); the server drives both directions directly over the
-  storage scan/insert paths.
+  retain the bound table schema, carry `direction`/`options`, attach omitted
+  expression defaults for `COPY FROM`, and bind table `CHECK` constraints).
+  `COPY` is not lowered by `logical_plan` (which rejects it); the server drives
+  both directions directly over the storage scan/insert paths.
 - `executor`: a pure text/CSV format module (bytes ↔ `Vec<Value>`), plus the
   `CopyIn` row-insert driver and the `CopyOut` row-producer. `CopyIn` reuses the
-  shared INSERT row mapping (`validate_value_type`/`validate_not_null` →
-  `storage.insert`); `CopyOut` scans via `storage.scan` and projects the COPY
+  shared INSERT row mapping (`build_insert_row`, including defaults, type and
+  row-constraint validation, numeric coercion, and `CHECK` evaluation) before
+  `storage.insert`; `CopyOut` scans via `storage.scan` and projects the COPY
   columns by slot.
 - `server`: the COPY connection state machine, channels, transaction
   integration, command tag, and rejection of unsupported forms / extended-protocol
