@@ -39,6 +39,10 @@ pub enum ClientMessage {
     Close { kind: StatementKind, name: String },
     Sync,
     Flush,
+    // COPY sub-protocol.
+    CopyData(Vec<u8>),
+    CopyDone,
+    CopyFail(String),
     Terminate,
 }
 
@@ -59,6 +63,11 @@ pub enum ServerMessage {
     PortalSuspended,
     ParameterDescription(Vec<i32>),
     NoData,
+    // COPY sub-protocol.
+    CopyInResponse { overall_format: i8, column_formats: Vec<i16> },
+    CopyOutResponse { overall_format: i8, column_formats: Vec<i16> },
+    CopyData(Vec<u8>),
+    CopyDone,
     ErrorResponse { severity: String, code: String, message: String },
 }
 ```
@@ -113,6 +122,7 @@ pub trait ConnectionState: Send {
 3. Server sends:
    - `AuthenticationOk`
    - minimal `ParameterStatus` messages
+   - `BackendKeyData` with the cancellation identity for the connection
    - `ReadyForQuery`
 
 The server accepts all users/databases and performs no authentication.
@@ -273,7 +283,10 @@ Text value encoding:
 
 Binary value encoding (extended protocol, format code `1`):
 
-- `Integer`: 8-byte big-endian `int64`.
+- `Integer`: binary parameters may use 2-byte `int2`, 4-byte `int4`, or 8-byte
+  `int8` payloads, each sign-extended into the shared internal integer value;
+  result encoding is width-specific from the reported PostgreSQL type (`int2`,
+  `int4`, unsigned 4-byte `oid`, or 8-byte `int8`/shared integer fallback).
 - `Boolean`: one byte, `0x01` true / `0x00` false.
 - `Text`: raw UTF-8 bytes (identical to text format).
 - `Date`: 4-byte big-endian `int32` day count from 2000-01-01 (PostgreSQL's date epoch), converted to/from the internal Unix-epoch day count.

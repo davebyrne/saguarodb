@@ -186,7 +186,7 @@ results are unchanged from the pre-MVCC engine.
   the normal fully-indexed update path. When eligible it writes the prepared v3
   version as a `HEAP_ONLY` tuple on that page, stamps the predecessor
   `xmax`/`t_ctid → new` with `HOT_UPDATED` (`stamp_xmax_logged`, keeping the
-  first-updater-wins `40001` check), and inserts **no index entries** — the H1 walk
+  atomic row-conflict classifier), and inserts **no index entries** — the H1 walk
   reaches the new version via the root. Logged with existing `HeapInsert`
   (`HEAP_ONLY` carried in the row bytes) + `HeapUpdateHeader` records; recovery redoes
   both. When ineligible (indexed column changed, external TOAST ownership, or no
@@ -701,10 +701,10 @@ uniqueness:
 3. **Chain the old version forward (with an atomic conflict check).** The old
    version's header is stamped `xmax = ctx.txn_id` **and** `t_ctid = new_tid` in
    place via the same `stamp_xmax_logged` path as `delete`, so it runs the identical
-   atomic first-updater-wins `write_conflict` check under the frame latch before any
-   WAL append (step 2 above): if another committed transaction already claimed the
-   old version's `xmax`, the update returns `SqlState::SerializationFailure`
-   (`40001`); if the holder is still in progress, the caller waits and rechecks.
+   atomic `write_conflict` check under the frame latch before any WAL append (step
+   2 above): if another committed transaction already claimed the old version's
+   `xmax`, the update returns `SqlState::SerializationFailure` (`40001`); if the
+   holder is still in progress, the caller waits and rechecks.
    The line pointer stays `NORMAL`; `infomask` is carried through. This stamping
    happens *before* the new version's uniqueness checks, so the old version reads as
    own-deleted (`xmax == ctx.txn_id`) and does not falsely self-conflict. Because

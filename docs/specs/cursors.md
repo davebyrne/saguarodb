@@ -1,12 +1,12 @@
-# SaguaroDB Cursors Implementation Plan
+# SaguaroDB Cursor Specification
 
 **Date:** 2026-07-08
 **Status:** Extended-protocol portal suspension implemented; SQL cursors planned
 
 ## 1. Goal
 
-Add cursor support in two layers. This implementation slice covers the first
-layer; the SQL cursor layer remains planned follow-on work.
+Cursor support is split across two layers. Extended-protocol portal suspension is
+implemented; the SQL cursor layer remains planned follow-on work.
 
 1. PostgreSQL extended-protocol portal suspension: honor `Execute.max_rows`,
    return `PortalSuspended` when rows remain, and let a later `Execute` resume
@@ -14,8 +14,8 @@ layer; the SQL cursor layer remains planned follow-on work.
 2. SQL cursors: `DECLARE <name> CURSOR FOR <select>`, `FETCH [FORWARD]
    [<count> | ALL] FROM <name>`, and `CLOSE <name>`.
 
-The implementation should reuse the streaming executor bridge rather than
-materializing cursor results. A suspended cursor owns an open executor plus the
+The implementation reuses the streaming executor bridge rather than materializing
+cursor results. A suspended cursor owns an open executor plus the
 MVCC snapshot, relation-generation snapshot, page pins, cancellation handle, and
 GC-horizon advertisement needed to keep that executor correct.
 
@@ -26,8 +26,8 @@ Supported:
 - Extended-protocol `Execute` with `max_rows > 0` for read-only SELECT portals.
 - `PortalSuspended` (`s`) for a partially drained extended-protocol portal.
 - Suspended portal cleanup on portal `Close`, transaction end, portal
-  replacement, `DISCARD ALL`, `Sync`, simple `Query`, connection close,
-  cancellation, and error paths.
+  replacement, `DISCARD ALL`, autocommit `Sync`, simple `Query`, connection
+  close, cancellation, and error paths.
 
 Planned follow-on SQL cursor support:
 
@@ -41,7 +41,8 @@ Out of scope:
 - `WHERE CURRENT OF`.
 - Cursors over DML `RETURNING`, `COPY`, `EXPLAIN`, maintenance commands, or DDL.
 - Durable cursors or recovery of open cursors.
-- Multiple active cursor workers executing concurrently on the same session.
+- Simultaneous fetch execution on the same session; suspended portal workers are
+  session-local and fetches are sequenced by the connection loop.
 
 ## 3. Design Constraints
 
@@ -59,8 +60,8 @@ Out of scope:
 
 ## 4. Executor Changes
 
-Add an executor-owned open-query abstraction that can fetch a bounded number of
-rows without closing the executor:
+The executor exposes an open-query abstraction that can fetch a bounded number
+of rows without closing the executor:
 
 ```rust
 pub enum FetchStatus {
@@ -69,13 +70,14 @@ pub enum FetchStatus {
 }
 
 pub struct OpenQuery<'a> {
-    // wraps Box<dyn PlanExecutor + 'a>, cancel flag, and close state
+    // stores output columns, Box<dyn PlanExecutor + 'a>, cancel flag,
+    // pending lookahead row, and close/exhaustion state
 }
 
 impl QueryEngine {
     pub fn open_query<'a>(
         &'a self,
-        ctx: &'a ExecutionContext<'a>,
+        ctx: &'a ExecutionContext<'_>,
         plan: &PhysicalPlan,
     ) -> Result<OpenQuery<'a>>;
 }
@@ -102,31 +104,32 @@ Rules:
   emits no rows and uses the same lookahead rule.
 - `fetch(None)` drains to exhaustion.
 - `close` is idempotent and is also called from `Drop` as a best-effort cleanup.
-- Existing `execute_query_streamed` can be reimplemented as `open_query` plus
-  `fetch(None)` to keep one drive path.
+- `execute_query_streamed` uses `open_query` plus `fetch(None)` so bounded fetch,
+  full streaming, and materialized execution share the same drive path.
 
 ## 5. Server Cursor Worker
 
-Add a server-local cursor worker, likely under `crates/server/src/query/cursor.rs`.
+The server-local portal cursor worker lives under
+`crates/server/src/query/cursor.rs`.
 
 Worker commands:
 
 ```rust
 enum CursorCommand {
-    Fetch { max_rows: Option<u64>, row_tx: mpsc::Sender<StreamMessage> },
-    Close,
-    Cancel,
+    Fetch {
+        max_rows: Option<u64>,
+        row_tx: mpsc::Sender<StreamMessage>,
+        reply_tx: oneshot::Sender<Result<CursorFetchStatus>>,
+    },
 }
 ```
 
-Worker responses:
+Worker fetch status:
 
 ```rust
-enum CursorReply {
+enum CursorFetchStatus {
     Exhausted { count: u64 },
     Suspended { count: u64 },
-    Closed,
-    Error(DbError),
 }
 ```
 
@@ -146,20 +149,21 @@ Lifecycle rules:
   consumer needs column metadata, then `Rows` batches.
 - A dropped row receiver is treated as early stop for that fetch, not as a leaked
   cursor. The cursor remains usable unless the worker itself hit an error.
-- `Close`, `Cancel`, worker error, or connection drop closes the executor and
-  releases snapshots/page pins.
+- Closing or replacing the portal drops the worker handle. Cancellation is
+  delivered through the session's shared cancel flag. Worker error, exhaustion,
+  cancellation, or connection drop closes the executor and releases
+  snapshots/page pins.
 
-## 6. Extended Protocol Plan
+## 6. Extended Protocol Behavior
 
 ### 6.1 Protocol crate
 
-- Add `ServerMessage::PortalSuspended`.
-- Encode it as PostgreSQL server message tag `b's'` with length `4`.
-- Add codec unit coverage.
+- `ServerMessage::PortalSuspended` encodes as PostgreSQL server message tag
+  `b's'` with length `4`.
 
 ### 6.2 Connection state
 
-Change the connection `Portal` from a single bound payload into a state machine:
+The connection `Portal` is a state machine:
 
 ```rust
 enum Portal {
@@ -348,7 +352,7 @@ Server extended-protocol tests:
 - `ROLLBACK TO SAVEPOINT` closes transaction-scoped suspended portals.
 - Client disconnect closes a suspended worker and releases GC-horizon pins.
 
-SQL cursor tests:
+Planned SQL cursor tests:
 
 - `DECLARE` outside a transaction errors.
 - `DECLARE c CURSOR FOR SELECT ...`; `FETCH 2 FROM c`; `FETCH ALL FROM c`;
@@ -364,22 +368,29 @@ Recovery/durability tests:
 - Existing recovery tests should continue to pass, proving no WAL/control format
   changed.
 
-## 10. Implementation Sequence
+## 10. Implementation Status
 
-1. Add `PortalSuspended` to `protocol` and tests.
-2. Thread `Execute.max_rows` through `connection::run_execute`.
-3. Add executor `OpenQuery` and rebase `execute_query_streamed` onto it.
-4. Add server cursor worker command/reply plumbing.
-5. Implement extended-protocol suspended portals for SELECT.
-6. Add cleanup for portal replacement, `Close`, `DISCARD ALL`, transaction end,
-   `Sync`, and disconnect.
-7. Add parser AST and parser tests for `DECLARE`/`FETCH`/`CLOSE`.
-8. Add server-side SQL cursor registry and simple-query execution.
-9. Add integration coverage for MVCC snapshot retention, cancellation, binary
-   result formats, and lifecycle cleanup.
-10. Update `overview.md`, `crates/protocol.md`, `crates/executor.md`,
-    `crates/server.md`, and parser/planner specs from planned to implemented
-    behavior once the code lands.
+Implemented portal-suspension layer:
+
+- `ServerMessage::PortalSuspended` and codec coverage.
+- `Execute.max_rows` handling for read-only SELECT portals.
+- `executor::OpenQuery` and shared fetch path for bounded fetch and full-drain
+  streaming.
+- Server cursor worker plumbing for suspended portals.
+- Cleanup on portal replacement, `Close`, `DISCARD ALL`, transaction end,
+  autocommit `Sync`, simple `Query`, disconnect, cancellation, and error paths.
+- Integration coverage for MVCC snapshot retention, cancellation, binary result
+  formats, and lifecycle cleanup.
+
+Remaining SQL cursor sequence:
+
+1. Add parser AST and parser tests for `DECLARE`/`FETCH`/`CLOSE`.
+2. Add server-side SQL cursor registry and simple-query execution.
+3. Add SQL cursor integration coverage for transaction scoping, exhaustion,
+   cleanup, unsupported options, and VACUUM horizon retention.
+4. Update `overview.md`, `crates/parser.md`, `crates/planner.md`, and
+   `crates/server.md` from planned to implemented SQL cursor behavior once that
+   layer lands.
 
 ## 11. Verification
 

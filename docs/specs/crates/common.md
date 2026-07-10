@@ -845,7 +845,8 @@ pub fn is_dead_to_all(
   for a settled xid. The four bits are the canonical definition shared with the
   storage tuple codec, which re-exports them.
 - `is_visible` is pure (no I/O, no locks beyond whatever the caller's
-  `TxnStatusView` takes per probe) and is not yet called by any scan (B3.6).
+  `TxnStatusView` takes per probe). Storage scan and HOT-chain traversal paths use
+  it as the production MVCC visibility predicate.
 - `is_dead_to_all` is the VACUUM-side sibling of `is_visible` (`mvcc.md` §9): it
   returns true iff the version is dead to **every** possible snapshot, given the GC
   `horizon` (the oldest still-running xid). Reclaimable iff **either** the creator
@@ -855,8 +856,9 @@ pub fn is_dead_to_all(
   `status(xmax) == Committed`, **and** `xmax < horizon`, strict). A live committed
   version, an aborted/in-progress deleter, or a committed delete with
   `xmax >= horizon` is not reclaimable. Pure and honours the same `infomask` hint
-  bits to skip CLOG probes; takes a scalar `horizon` rather than a `Snapshot`. No
-  production caller yet (Milestone F2+ wires it into prune/vacuum).
+  bits to skip CLOG probes; takes a scalar `horizon` rather than a `Snapshot`.
+  Storage uses it for VACUUM/prune decisions and cleanup of dead versions below
+  the active snapshot horizon.
 
 ## Flush Policy
 

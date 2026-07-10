@@ -23,7 +23,7 @@ This directory decomposes the overview spec into crate-level contracts for the i
 | `buffer` | [buffer.md](buffer.md) | Page cache, RAII guards, dirty tracking, rollback, in-place page flushing |
 | `wal` | [wal.md](wal.md) | Physiological redo WAL, commit/checkpoint records, replay iterator |
 | `control` | [control.md](control.md) | Durable control record (checkpoint commit point): redo boundary, table ids, catalog |
-| `protocol` | [protocol.md](protocol.md) | PostgreSQL simple query codec and connection state |
+| `protocol` | [protocol.md](protocol.md) | PostgreSQL wire codec and connection state for startup, cancellation, simple query, extended query, and COPY messages |
 | `server` | [server.md](server.md) | Binary wiring, startup/recovery, Tokio listener, blocking query execution |
 
 ## Cross-Crate Rules
@@ -44,7 +44,9 @@ Each crate owns focused unit tests for its public contract. Cross-crate behavior
 - SQL pipeline: parse, bind, plan, explain.
 - Execution: SELECT, INSERT, UPDATE, DELETE against in-memory storage.
 - Durability: commit, rollback, checkpoint, recovery replay.
-- Protocol: startup, SSL negotiation (accept/reject), simple query response shape.
+- Protocol: startup, SSL/GSS negotiation, cancellation, simple-query response
+  shape, extended-query response shape, portal suspension, and COPY sub-protocol
+  messages.
 - Virtual system catalogs: `pg_catalog`/`information_schema` driver query
   shapes, `RowDescription` wire metadata, shadowing rules, read-only error
   paths, `pg_settings`, and live `pg_stat_activity` state.

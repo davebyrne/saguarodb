@@ -10,7 +10,9 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 ### Goals
 
 - Standalone multi-client server
-- PostgreSQL simple query wire protocol (abstracted for future custom protocol)
+- PostgreSQL wire protocol support for startup, cancellation, simple query,
+  extended query, and COPY sub-protocol messages (abstracted for future custom
+  protocol)
 - Page-oriented storage engine with a durable on-disk non-clustered storage-identity B-tree per table (primary-key values when present, hidden heap identity otherwise; abstracted for future clustered/on-disk-index work)
 - PostgreSQL-style MVCC with snapshot isolation: multi-statement transactions plus autocommit for standalone statements
 - Data types: `INTEGER` (i64; `SMALLINT`/`INT2`, `INTEGER`/`INT`/`INT4`, and `BIGINT`/`INT8` all share one 64-bit integer storage but report their distinct PostgreSQL width OIDs (`int2`/`int4`/`int8`; bare `INTEGER` is `int4`), and `int2`/`int4` values are range-checked at write and cast time (`SqlState::NumericValueOutOfRange` when out of range); `SERIAL`/`SMALLSERIAL`/`BIGSERIAL` family column pseudo-types desugar to `INTEGER NOT NULL DEFAULT nextval('<owned-sequence>')` and report their serial kind's width), `TEXT` (`VARCHAR(n)`/`CHAR(n)`/`CHARACTER(n)` are stored as `TEXT` with a max-length-of-`n`-characters constraint enforced at write time, and reported on the wire as `varchar`/`bpchar`/`text` with the declared length; not blank-padded), `BOOLEAN`, `DATE` (calendar date written `DATE 'YYYY-MM-DD'`, stored as days from the Unix epoch), `TIMESTAMP` (without time zone, written `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'`, stored as microseconds from the Unix epoch), `TIME` (without time zone, written `TIME 'HH:MM:SS[.ffffff]'`, stored as microseconds since midnight), `TIMESTAMP WITH TIME ZONE`/`TIMESTAMPTZ` (UTC-normalized: an input offset is converted to UTC, always displayed as `...+00`), `INTERVAL` (months/days/microseconds kept separate, PostgreSQL `postgres`-style text; compares by canonical estimate so `1 mon` = `30 days`; supports `interval ± interval`, `interval * integer`, unary `- interval`, and calendar-aware `DATE`/`TIMESTAMP`/`TIMESTAMPTZ`/`TIME` `± interval`), `BYTEA` (raw byte string; hex text I/O `\xDEADBEEF`), `UUID` (16 bytes; canonical `8-4-4-4-12` text), `DOUBLE PRECISION` (IEEE 754 `f64`; `FLOAT8`/`FLOAT` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `REAL` (IEEE 754 `f32`; `FLOAT4`/`FLOAT(1..24)` accepted as aliases; supports arithmetic and `SUM`/`AVG`), `NUMERIC`/`DECIMAL` (exact decimal written `NUMERIC 'D.DDD'`, optional `(precision[, scale])` up to 28 digits; values rounded to the column scale on store; supports arithmetic and `SUM`/`AVG`), `NULL`
@@ -440,6 +442,10 @@ pub enum ClientMessage {
     Close { kind: StatementKind, name: String },
     Sync,
     Flush,
+    // COPY sub-protocol:
+    CopyData(Vec<u8>),
+    CopyDone,
+    CopyFail(String),
     Terminate,
 }
 
@@ -461,6 +467,11 @@ pub enum ServerMessage {
     PortalSuspended,
     ParameterDescription(Vec<i32>),
     NoData,
+    // COPY sub-protocol:
+    CopyInResponse { overall_format: i8, column_formats: Vec<i16> },
+    CopyOutResponse { overall_format: i8, column_formats: Vec<i16> },
+    CopyData(Vec<u8>),
+    CopyDone,
     ErrorResponse { severity: String, code: String, message: String },
 }
 
@@ -487,7 +498,7 @@ pub trait ConnectionState: Send {
 
 ### Query Result Architecture
 
-A `SELECT` **streams** its rows: the `spawn_blocking` producer owns the `PlanExecutor` and pushes row batches through a bounded channel to the async connection task, which writes them to the socket as they arrive (`docs/specs/streaming.md`). This bounds server memory (the whole result is never materialized) and applies TCP backpressure — a slow client blocks the producer on a full channel rather than letting it run ahead. Every other statement (DML, DML `RETURNING`, DDL, EXPLAIN, and COPY requests) is still computed inside `spawn_blocking` and returned as a complete `ExecutionResult`.
+A `SELECT` **streams** its rows: the `spawn_blocking` producer owns the `PlanExecutor` and pushes row batches through a bounded channel to the async connection task, which writes them to the socket as they arrive (`docs/specs/streaming.md`). This bounds server memory (the whole result is never materialized) and applies TCP backpressure — a slow client blocks the producer on a full channel rather than letting it run ahead. DML, DML `RETURNING`, DDL, and `EXPLAIN` are still computed inside `spawn_blocking` and returned as complete results. `COPY` requests are bound in the query pipeline but return `BeginCopyIn`/`BeginCopyOut` outcomes; the connection task then drives the COPY sub-protocol, with COPY-out streamed through its own bounded channel.
 
 ```
 Async connection task (Tokio)           Blocking thread (spawn_blocking)
@@ -506,14 +517,14 @@ Async connection task (Tokio)           Blocking thread (spawn_blocking)
 9. Send CommandComplete + ReadyForQuery
 ```
 
-The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream, exactly as the materializing path did, so MVCC visibility and transaction semantics are unchanged. Streaming does not affect the protocol crate or SQL behavior; it is the executor's pull-based `PlanExecutor` boundary put to use. See `docs/specs/streaming.md` §8 for how this positions incremental fetch (portal `max_rows` / cursors).
+The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream, exactly as the materializing path did, so MVCC visibility and transaction semantics are unchanged. Streaming does not affect SQL behavior; it is the executor's pull-based `PlanExecutor` boundary put to use. Extended-protocol `Execute.max_rows` uses the same open-query shape to suspend read-only SELECT portals with `PortalSuspended` and resume them on a later `Execute`.
 
 This keeps the protocol layer testable without IO and keeps blocking work off Tokio threads.
 
 ### PostgreSQL Simple Query Flow
 
 1. **SSLRequest handling:** Many clients (psql, libpq-based drivers) send an `SSLRequest` before the real startup. The server detects this (8-byte message with code `80877103`). When TLS is configured (`--tls-cert-file`/`--tls-key-file`), it replies with a single `S` byte and performs the TLS handshake, after which the client sends its `StartupMessage` over the encrypted stream. When TLS is not configured, it replies with a single `N` byte and the client continues in plaintext (or retries with a plain `StartupMessage`). TLS is server-side only; no client certificate is requested. A `GSSENCRequest` (GSSAPI transport encryption) is likewise declined with a single `N` byte, after which the client continues with an `SSLRequest` or `StartupMessage`.
-2. **Startup:** Client sends `StartupMessage` (version 3.0, user, database). Server responds `AuthenticationOk` → `ParameterStatus` (server_version, etc.) → `ReadyForQuery`.
+2. **Startup:** Client sends `StartupMessage` (version 3.0, user, database). Server responds `AuthenticationOk` → `ParameterStatus` (server_version, etc.) → `BackendKeyData` → `ReadyForQuery`.
 3. **Query cycle:** Client sends `Query` (SQL string). Server responds with:
    - `RowDescription` (column names and types) for SELECT
    - `DataRow` (one per result row) for SELECT
@@ -643,10 +654,30 @@ pub enum Statement {
         checks: Vec<String>,
     },
     DropTable { name: String, if_exists: bool },
+    AlterTableAddColumn {
+        table: String,
+        if_not_exists: bool,
+        column: ParsedColumnDef,
+    },
+    AlterTableDropColumn {
+        table: String,
+        if_exists: bool,
+        column: String,
+    },
+    AlterTableRenameColumn { table: String, old_name: String, new_name: String },
+    AlterTableRenameTable { table: String, new_name: String },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
     CreateSequence { name: String, options: SequenceOptions },
     DropSequence { name: String, if_exists: bool },
+    CreateView {
+        name: String,
+        or_replace: bool,
+        columns: Vec<String>,
+        query: Query,
+        definition: String,
+    },
+    DropView { name: String, if_exists: bool },
     Insert {
         table: String,
         columns: Vec<String>,
@@ -677,8 +708,29 @@ pub enum Statement {
     RollbackToSavepoint { name: String },         // ROLLBACK ... TO [SAVEPOINT] <name>
     SetTransaction { isolation: Option<IsolationLevel> },            // SET TRANSACTION ... (txn-scoped)
     SetSessionCharacteristics { isolation: Option<IsolationLevel> }, // session default isolation
+    SetVariable { scope: SetScope, name: String, value: String },    // SET/SET LOCAL <guc>
+    ResetVariable { name: Option<String> },                          // RESET <guc> / RESET ALL
+    ShowVariable { name: Option<String> },                           // SHOW <guc> / SHOW ALL
+    DiscardAll,                                                      // DISCARD ALL
     Vacuum { table: Option<String> },             // VACUUM [table] — maintenance, not bound/planned
     Truncate { table: String },                   // TRUNCATE [TABLE] <table> — maintenance, not bound/planned
+    AlterTableSetCompression {                    // ALTER TABLE <table> SET (compression = ...)
+        table: String,
+        compression: CompressionSetting,
+    },
+    AlterTableSetOptions {                        // ALTER TABLE <table> SET (toast..., ...)
+        table: String,
+        options: TableOptionPatch,
+    },
+    AlterTableAddPrimaryKey {
+        table: String,
+        columns: Vec<String>,
+        constraint_name: Option<String>,
+    },
+    AlterTableDropPrimaryKey {
+        table: String,
+        constraint_name: Option<String>,
+    },
     Copy {                                        // COPY <table> [(cols)] FROM STDIN | TO STDOUT
         table: String,                            // (docs/specs/copy.md)
         columns: Vec<String>,
@@ -1997,7 +2049,7 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full
 
 ### Write Protocol
 
-Data writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple DML writers run concurrently; write-write safety comes from first-updater-wins conflict detection (`SqlState::SerializationFailure`, `40001`) plus per-index and per-heap structural latches (lock order: structural → frame → WAL). DDL is non-transactional and instead takes the **exclusive** guard for its autocommit statement so catalog rollback cannot race another committed DDL change. The protocol for a single autocommit DML statement:
+Data writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple DML writers run concurrently; write-write safety comes from row-conflict coordination plus per-index and per-heap structural latches (lock order: structural → frame → WAL). If a writer finds an in-progress row-lock holder, it waits through the installed `ConflictWaiter`/server `LockManager`, which runs timeout-based deadlock detection (`SqlState::DeadlockDetected`, `40P01`) and honors cancellation (`SqlState::QueryCanceled`, `57014`). If the blocker settles into a state that makes the row version conflict with the waiting writer's snapshot, the waiter fails with `SqlState::SerializationFailure` (`40001`). DDL is non-transactional and instead takes the **exclusive** guard for its autocommit statement so catalog rollback cannot race another committed DDL change. The protocol for a single autocommit DML statement:
 
 1. Acquire a shared writer guard via `controller.begin_writer()` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers)
 2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
@@ -2417,7 +2469,7 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers, but schema-generation rewrites can block new snapshot capture until they publish the new generation.
-- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus first-updater-wins conflict detection: when two transactions update the same row, the first to claim it wins and the loser fails fast with `SqlState::SerializationFailure` (`40001`).
+- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus row-conflict coordination: an in-progress row-lock holder makes the waiter block through the server `LockManager` and retry after the blocker settles; deadlock cycles return `SqlState::DeadlockDetected` (`40P01`), cancellation returns `SqlState::QueryCanceled` (`57014`), and committed-superseded conflicts still return `SqlState::SerializationFailure` (`40001`).
 - **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY` also get a stable physical chain view for backfill/validation. `ALTER TABLE ... ADD/DROP COLUMN` acquires the active-transaction registry's snapshot-exclusion guard before waiting for the checkpoint guard because these statements can publish a new storage generation and conditional no-op preflight is not stable until the exclusive guard is held. The fence blocks new snapshot captures while advertised snapshots drain. Transactions that already hold a writer guard may still capture statement snapshots so they can release the guard the DDL is waiting on; read-only transactions wait so they cannot bind one schema generation and scan another. Under the exclusive guard, the executor repeats catalog preflight and returns conditional no-ops before scanning rows.
 - **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <table>`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Implemented maintenance work takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs a relation-generation swap: fresh heap/index storage ids are prepared and logged before commit, then catalog/storage publish the empty generation after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
@@ -2459,11 +2511,13 @@ Loaded from command-line args only. There is no environment-variable or config-f
 
 ## 13. Future Work (Designed For, Not Implemented)
 
-- **Serializable Isolation (SSI):** `SERIALIZABLE` is its own level — Serializable Snapshot Isolation, the Repeatable Read snapshot plus rw-antidependency tracking and dangerous-structure detection (Cahill/Ports), with relation/tuple-granularity SIREAD locks; see `docs/specs/ssi.md`.
-- **Savepoints / Sub-transactions:** Implemented via sub-transaction xids without undo (`SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`, nested, crash-recoverable); see `docs/specs/savepoints.md`.
+- **SQL Cursors:** Extended-protocol portal suspension is implemented; SQL
+  `DECLARE`/`FETCH`/`CLOSE` cursors remain planned follow-on work.
 - **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
+- **Statement Timeouts:** Query cancellation is implemented via `CancelRequest`;
+  server-side timeout timers are not yet implemented.
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
-- **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol (with blocking + deadlock detection and fuzzy checkpointing) is future work.
+- **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among primary-key identity access and catalog indexes, preferring primary-key identity access when available; a cost model would replace that heuristic.
 - **Vectorized Execution:** `PlanExecutor::next_batch()` is defined with a default implementation. A vectorized engine overrides it with columnar batch processing.
 - **Custom Wire Protocol:** `ProtocolCodec` and `ConnectionState` traits are protocol-agnostic. A custom protocol implements these traits.

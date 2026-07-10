@@ -490,9 +490,9 @@ Committed**.
   exclusive writer lock is **inverted** into a shared-writer / exclusive-checkpoint
   guard: writers take the **shared** guard (`begin_writer`) and run concurrently,
   the checkpoint takes the **exclusive** guard (`begin_checkpoint`) and drains them.
-  Write-write safety comes from the E1 first-updater-wins conflict detection
-  (`40001`) and the E2a per-index / per-heap structural latches plus the buffer
-  pool's per-frame latches — not from a writer lock. Readers stay lock-free. The
+  Write-write safety comes from the row-conflict classifiers (`Conflict` /
+  `WouldBlock`) and the E2a per-index / per-heap structural latches plus the
+  buffer pool's per-frame latches — not from a writer lock. Readers stay lock-free. The
   exclusive checkpoint guard preserves the "no in-flight writer at checkpoint"
   invariant verbatim, so every transaction below the truncation boundary is settled
   and captured by `persist_clog`'s snapshot, keeping recovery correct with no fuzzy
@@ -1045,22 +1045,26 @@ correct recovery. Correct, but bloats heap and indexes until F.*
 
 ### Milestone E — Concurrent writers + conflict detection
 
-Commit breakdown (confirmed). E1 introduces fail-fast write-write conflict
-detection (§7.3); E2 replaces the global writer lock with finer structural latches
-plus a checkpoint-coordination guard.
+Commit breakdown (current). E1 introduces write-write conflict classifiers
+(§7.3); E2 replaces the global writer lock with finer structural latches plus a
+checkpoint-coordination guard. The current classifier distinguishes in-progress
+holders (`WouldBlock`, waited through `docs/specs/deadlock.md`) from committed
+conflicts (`40001`).
 
 - **E1a — SQLSTATE + pure predicate.** Add `SqlState::SerializationFailure`
   (`40001`, wire-mapped in `crates/server/src/connection.rs`) and the pure
   `common::mvcc::write_conflict(xmax, infomask, current_txn, status) ->
-  WriteConflict` classifier (`Proceed`/`Conflict`) with table-driven tests. No
-  engine wiring yet.
+  WriteConflict` classifier (`Proceed`/`Conflict`/`WouldBlock(holder)`) with
+  table-driven tests.
 - **E1b — UPDATE/DELETE conflict checks.** Wire `write_conflict` into the
   update/delete locating path: re-read the target version's physical header,
-  classify, and on `Conflict` abort the statement with `40001` (fail-fast,
-  first-updater-wins; §7.3).
-- **E1c — Concurrent-inserter unique conflicts.** Apply the same fail-fast policy
-  to two transactions racing to claim the same unique key, surfacing `40001`
-  (rather than blocking) on the conflicting index entry's tuple.
+  classify, abort the statement with `40001` on `Conflict`, and block/recheck on
+  `WouldBlock(holder)` through the server lock manager (§7.3).
+- **E1c — Concurrent-inserter unique conflicts.** Distinguish definite duplicate
+  keys from in-progress candidates. A settled duplicate surfaces
+  `SqlState::UniqueViolation` (`23505`); an in-progress candidate returns
+  `WouldBlock(creator)`, then waits and rechecks (commit → `23505`, abort → no
+  conflict).
 - **E2a — Structural write latches.** Replace the single global writer lock with
   **per-index and per-heap-file** structural write latches. A fully-concurrent
   B-tree is **deferred**: the current B-tree split protocol has no latch coupling
@@ -1167,8 +1171,9 @@ savepoints via sub-transaction xids (optional, deferred).
     position and so is already an upstream parse error.
   - **Write conflicts under RR.** No new machinery: a Repeatable Read transaction
     that writes a row another transaction changed and committed **after** its
-    snapshot hits the existing first-updater-wins detection and surfaces `40001`
-    (`SerializationFailure`), exactly as a concurrent autocommit conflict does.
+    snapshot hits the existing row-conflict classifier and surfaces `40001`
+    (`SerializationFailure`), exactly as a concurrent autocommit conflict does
+    after any in-progress blocker has settled.
 - **G2 — session-default isolation.** *(implemented.)*
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>` sets a
   **per-connection default** isolation (`Session.default_isolation`, default Read
@@ -1275,7 +1280,8 @@ savepoints via sub-transaction xids (optional, deferred).
     recovery redoes it — the row bytes are the source of truth for `infomask`). Then
     stamp the predecessor `xmax = txn`,
     `t_ctid → new`, and `HOT_UPDATED` via `stamp_xmax_logged` (which keeps the atomic
-    first-updater-wins check — E1b/§7.3: a concurrent claimer yields `40001`). Insert
+    row-conflict classifier — E1b/§7.3: a committed concurrent claimer yields
+    `40001`, while an in-progress claimer is waited on and rechecked). Insert
     **no index entries**: the index keeps pointing at the chain root, and H1's bounded
     walk reaches the new heap-only version via the `HOT_UPDATED → HEAP_ONLY` segment.
     Logged via existing records only (`HeapInsert` + `HeapUpdateHeader`; no new kinds).
@@ -1432,8 +1438,6 @@ savepoints via sub-transaction xids (optional, deferred).
 - **Concurrent / B-link writer protocol** — a latch-coupled, fully-concurrent
   B-tree; deferred from Milestone E (E2a takes per-index structural latches
   instead, because the current split protocol has no latch coupling).
-- **Blocking + deadlock detection** — wait-for-lock with cycle detection, instead
-  of Milestone E's fail-fast first-updater-wins `40001` (§7.3).
 - **Fuzzy checkpoint** — checkpointing with writers in flight; Milestone E keeps
   the "no in-flight writer at checkpoint" invariant via the shared-writer /
   exclusive-checkpoint guard (E2b), so Milestone-D recovery/truncation stays

@@ -1,22 +1,15 @@
 # SaguaroDB Streaming Executor Bridge Specification
 
 **Date:** 2026-07-01
-**Status:** Draft
+**Status:** Implemented for SELECT streaming and extended-protocol portal
+suspension; SQL cursors and statement timeouts remain follow-on work.
 
 ## 1. Overview
 
-Today the server fully materializes every SELECT result. The blocking task
-drains the `PlanExecutor` into a `Vec` and returns
-`ExecutionResult::Query { columns, rows }`; the async connection task then writes
-those rows to the socket (`docs/specs/overview.md` §Query Result Architecture,
-`connection/simple.rs`). The pull-based `PlanExecutor` boundary
-(`open`/`next`/`next_batch`/`close`) was deliberately preserved for a future
-streaming bridge (`overview.md:431,450`, `crates/executor.md:41`).
-
-This specification defines that bridge: SELECT results flow through a **bounded
+The server streams SELECT results through a **bounded
 channel** from a blocking producer that owns the `PlanExecutor` to the async task
 that writes the socket. This is not a redesign — it connects a channel across a
-seam that already exists and is already proven by the COPY-out path.
+boundary that already existed and was already proven by the COPY-out path.
 
 ### Motivation
 
@@ -47,8 +40,8 @@ seam that already exists and is already proven by the COPY-out path.
 - `BeginCopyIn` / `BeginCopyOut` — COPY drives its own sub-protocol (and COPY-out
   is already streamed, see §2).
 
-**Built as a follow-up on this foundation:** extended-protocol portal
-`max_rows` + `PortalSuspended` for read-only SELECT portals.
+**Also implemented on this foundation:** extended-protocol portal `max_rows` +
+`PortalSuspended` for read-only SELECT portals.
 
 **Still deliberately unblocked (see §8):** SQL `DECLARE`/`FETCH` cursors and
 responsive statement timeouts.
@@ -335,11 +328,10 @@ extended-protocol incremental fetch; SQL query semantics remain unchanged.
   an in-transaction SELECT preserves snapshot semantics and poisons the block on a
   mid-stream error; a streamed SELECT concurrent with VACUUM confirms the
   advertisement holds (no reclaim of visible versions).
-- **Spec updates in the same change:** `overview.md` §Query Result Architecture
-  (flip "materializes" → the streaming bridge, keeping the note that it does not
-  affect the protocol crate or SQL semantics), `crates/executor.md` (the
-  `RowSink` trait and `execute_query_streamed`), and `crates/server.md` (the
-  streaming producer/consumer and outcome enum).
+- **Spec coverage:** `overview.md` §Query Result Architecture,
+  `crates/executor.md` (the `RowSink` trait and streamed execution APIs), and
+  `crates/server.md` (the streaming producer/consumer and outcome enum) describe
+  the implemented boundaries.
 
 ## 10. Non-goals
 
@@ -347,5 +339,5 @@ extended-protocol incremental fetch; SQL query semantics remain unchanged.
 - The base streaming bridge made no wire-protocol or SQL behavior change. Portal
   suspension adds only the PostgreSQL-standard extended-protocol
   `PortalSuspended` frame; SQL behavior is unchanged.
-- No change to DML, DDL, EXPLAIN, or COPY execution paths.
+- No change to DML, DDL, EXPLAIN, or COPY SQL semantics.
 - No implementation of SQL cursors or statement timeouts (see §8).
