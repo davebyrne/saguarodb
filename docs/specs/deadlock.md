@@ -1,7 +1,7 @@
 # SaguaroDB Blocking Writes & Deadlock Detection Specification
 
-**Date:** 2026-06-28
-**Status:** Draft
+**Date:** 2026-07-10
+**Status:** Implemented feature specification
 
 ## 1. Overview
 

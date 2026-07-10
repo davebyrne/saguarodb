@@ -1,6 +1,7 @@
 # Serializable Snapshot Isolation (SSI)
 
-**Status:** Implemented on `feat/serializable-ssi` (see §12 for the milestones).
+**Date:** 2026-07-10
+**Status:** Implemented feature specification
 
 This document specifies SaguaroDB's `SERIALIZABLE` isolation level, implemented as
 Serializable Snapshot Isolation (SSI) layered on the existing snapshot-isolation

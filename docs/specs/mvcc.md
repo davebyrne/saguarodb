@@ -1,16 +1,15 @@
-# SaguaroDB MVCC — Design & Implementation Plan
+# SaguaroDB MVCC Specification
 
-**Date:** 2026-07-04
-**Status:** Draft
-**Branch:** `feat/mvcc`
-**Foundation:** `develop` @ `7035c89` (redo-WAL / on-disk-B-tree architecture)
+**Date:** 2026-07-10
+**Status:** Implemented feature specification
 
-This document is the canonical design and sequenced implementation plan for
-multi-version concurrency control (MVCC) in SaguaroDB. It elaborates the
-"Future Work: MVCC / Transactions" item in `docs/specs/overview.md`. Where this
-document and `overview.md` disagree once implementation begins, the contract
-being changed must be updated in `overview.md` and the relevant crate spec in
-the same change (per `AGENTS.md`).
+This document is the system-level contract and design record for multi-version
+concurrency control (MVCC) in SaguaroDB. MVCC is implemented: snapshot
+isolation, multi-statement transactions, concurrent writers, CLOG-backed
+visibility, redo-all recovery, VACUUM, and HOT are part of the current storage
+contract. The milestone sections below are retained as implementation history
+and rationale; current public behavior is governed by this document,
+`docs/specs/overview.md`, and the relevant crate specs.
 
 ---
 
@@ -25,25 +24,27 @@ the same change (per `AGENTS.md`).
   write lock.
 - **Concurrent writers** with row-level write-write conflict detection.
 - A **single, internally consistent storage model** — the Postgres family
-  (in-heap versions, index-per-version, no undo, VACUUM). The baseline is
-  Postgres-without-HOT; HOT is a later, purely additive optimization.
+  (in-heap versions, index-per-version, no undo, VACUUM). The baseline design
+  was Postgres-without-HOT; HOT is now implemented as a purely additive
+  optimization on that model.
 
-### Non-goals (initial)
+### Non-goals and related additions
 
 - **Transactional DDL** — DDL stays non-transactional, commits immediately, and
   is rejected inside an explicit transaction block. Statement-level guard choice
   is owned by the server and is statement-specific.
 - **Time-travel / as-of queries.**
-- **Savepoints / sub-transactions** — implemented via sub-transaction xids
-  without undo (`docs/specs/savepoints.md`); subxids share the xid space, CLOG,
-  and snapshot machinery, with no `pg_subtrans` mapping.
+- **Savepoints / sub-transactions** — originally deferred from the base MVCC
+  model, now implemented via sub-transaction xids without undo
+  (`docs/specs/savepoints.md`); subxids share the xid space, CLOG, and snapshot
+  machinery, with no `pg_subtrans` mapping.
 
 ---
 
-## 2. Foundation already in place (`develop` @ `7035c89`)
+## 2. Historical foundation and delivered scope
 
-MVCC builds on prerequisites that are **already merged** into `develop`. The
-overview spec states "the redo WAL is the prerequisite" for MVCC; it is done.
+MVCC was built on the redo-WAL / on-disk-B-tree architecture summarized below.
+Those prerequisites and the MVCC layer itself are now implemented.
 
 | Capability | Where | Relevance to MVCC |
 |---|---|---|
@@ -55,7 +56,7 @@ overview spec states "the redo WAL is the prerequisite" for MVCC; it is done.
 | Per-statement `txn_id`; durable-commit set | `ServerComponents.next_txn_id`, `crates/wal` (`committed_txns`) | Seed for the transaction id allocator and CLOG |
 | Owned-guard `ConcurrencyController`, extensible `StatementContext` | `crates/common` | Designed-for seams the MVCC layer swaps/extends |
 
-### What is missing (the MVCC layer this plan adds)
+### What the MVCC layer added
 
 - Per-row version metadata (`xmin`/`xmax`/`t_ctid`) and version chains.
 - A durable transaction status map (CLOG) consulted for visibility.

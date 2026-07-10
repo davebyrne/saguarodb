@@ -1,12 +1,11 @@
-# Design: Per-Table Page Compression and WAL Full-Page-Image Compression
+# SaguaroDB Compression and TOAST Specification
 
-**Date:** 2026-07-04
-**Status:** Approved design (pre-implementation)
-**Branch:** `feat/compression`
+**Date:** 2026-07-10
+**Status:** Implemented feature specification
 
 ## 1. Summary
 
-Add transparent compression at two points:
+SaguaroDB implements transparent compression at three points:
 
 1. **Pages at rest** — each 8 KiB page is individually compressed by
    `HeapPageStore` when flushed and decompressed when loaded, with the freed
@@ -17,14 +16,18 @@ Add transparent compression at two points:
 2. **WAL full-page images** — every FPI payload is compressed
    **unconditionally** (independent of any table setting) before it is
    appended, and decompressed during replay.
+3. **TOAST value payloads** — large `TEXT`/`BYTEA` values may be compressed
+   inline or stored out of line in a hidden TOAST relation, using the same codec
+   and dictionary registry as page/WAL compression.
 
 Both use zstd. Cross-page redundancy is captured with **per-table trained
-zstd dictionaries** shared by the at-rest path and the WAL path.
+zstd dictionaries** shared by the at-rest, WAL, and dictionary-backed TOAST
+value paths.
 
 Everything happens below the buffer pool and below the logical WAL contract:
 the buffer pool, executor, planner, and MVCC code see only uncompressed
-8 KiB page images. No logical page byte, PageLSN, TID, or index entry
-changes meaning.
+8 KiB page images and logical row values. No logical page byte, PageLSN, TID,
+or index entry changes meaning.
 
 ## 2. Goals and non-goals
 
@@ -33,17 +36,16 @@ changes meaning.
 - Reduce heap, index, and WAL disk footprint with zero hot-path (buffer-hit)
   cost. Compression CPU is paid on flush/append; decompression on buffer
   miss and replay.
+- Store large `TEXT`/`BYTEA` values out of line through hidden TOAST relations
+  while preserving MVCC visibility, VACUUM correctness, and logical index keys.
 - Preserve every existing durability invariant: WAL-before-data, first-touch
   FPI torn-page repair, PageLSN-gated redo, checkpoint ordering, `page_count`
   semantics, stable `(page, slot)` TIDs.
-- Build the shared codec/dictionary infrastructure that TOAST reuses
-  (codec-id registry, versioned envelopes, dictionary store).
+- Share one codec/dictionary infrastructure across page envelopes, WAL FPI
+  compression, and TOAST value payload compression.
 
 **Non-goals (explicit)**
 
-- TOAST / out-of-line value storage. That is specified separately; this page
-  compression design only defines the shared codec ids and value helpers that
-  TOAST reuses.
 - Multi-page compression groups on the live store (breaks the torn-page
   repair invariant for undirtied group members, or requires COW machinery;
   grouping belongs to future sealed/archival segments).
@@ -62,7 +64,7 @@ changes meaning.
   only control surface for at-rest compression. WAL FPI compression has no
   knob at all (always on, with a per-record raw fallback).
 
-## 3. New crate: `compress` (`saguarodb-compress`)
+## 3. `compress` crate (`saguarodb-compress`)
 
 Leaf library crate wrapping zstd. Depends on `common` only (plus the
 external `zstd` crate). Consumed by `storage` and `server`. `wal` does
@@ -90,10 +92,10 @@ and `parser`/binder can reference it without depending on `compress`.
 
 ## 4. Per-table setting and SQL surface
 
-- `TableSchema` gains `compression: CompressionSetting` and
+- `TableSchema` carries `compression: CompressionSetting` and
   `active_dict_id: Option<u32>`.
 - **`CREATE TABLE <name> (...) WITH (compression = 'none' | 'zstd')`** —
-  new optional trailing clause. Unknown option keys are rejected at parse
+  optional trailing clause. Unknown option keys are rejected at parse
   time (`SqlState::SyntaxError`) and an unsupported codec value is
   `SqlState::FeatureNotSupported` — there is no bind step. Omitted ⇒ `none`.
   String literal values; unquoted identifiers are also accepted and
@@ -205,8 +207,8 @@ error kind** (corruption-class):
 
 ### 5a. Store configuration
 
-`HeapPageStore` gains an engine-facing config API (the `PageStore` trait
-and the buffer pool are unchanged):
+`HeapPageStore` exposes an engine-facing config API (the `PageStore` trait and
+the buffer pool are unchanged):
 
 - `set_file_compression(file_id, CodecConfig)` — called by the storage
   engine when schemas are installed at startup/recovery, on `CREATE TABLE`,
@@ -222,7 +224,7 @@ envelopes are self-describing and mixed encodings are legal.
 
 ## 6. WAL full-page-image compression
 
-- New binary record type
+- Binary WAL record type
   `FullPageImageCompressed { file_id, page_num, codec: u8, dict_id: u32, payload }`.
   The existing `FullPageImage` type remains and remains decodable. The
   record CRC already covers the payload; no envelope or second CRC inside
@@ -392,12 +394,12 @@ full-slot writes).
 
 ## 9. Control file
 
-Gains a `page_size` field (with a format version bump per the durability
-rules). Validated at open: a mismatch between the binary's compile-time
-`PAGE_SIZE` and the data directory's recorded size is a clean startup
-error naming both values — never reported as page corruption. Existing
-data directories without the field are handled per the crate's existing
-versioning policy (development builds do not migrate old formats).
+The control file carries a `page_size` field (added with a format version bump
+per the durability rules). It is validated at open: a mismatch between the
+binary's compile-time `PAGE_SIZE` and the data directory's recorded size is a
+clean startup error naming both values — never reported as page corruption.
+Existing data directories without the field are handled per the crate's
+existing versioning policy (development builds do not migrate old formats).
 
 ## 10. What explicitly does not change
 
@@ -478,7 +480,11 @@ Decisions here deliberately keep a future data-dir-creation-time page size
   mechanical `[u8; PAGE_SIZE]` → runtime-length refactor, which costs the
   same then as now and is therefore deferred.
 
-## 13. Testing
+## 13. Verification coverage
+
+The implemented feature is covered at the codec, storage, WAL/recovery, and
+server-integration layers. The coverage is intentionally split along the same
+crate boundaries as the implementation:
 
 - **`compress`:** compress/decompress roundtrips with and without
   dictionaries; envelope encode/decode/detect (incl. raw-page and all-zero
@@ -507,24 +513,32 @@ Decisions here deliberately keep a future data-dir-creation-time page size
   `ALTER`'s rewrite counts toward `--checkpoint-wal-bytes` and triggers a
   checkpoint on its own (checkpoint-accounting regression test); recovery
   fails fast, naming the table and dict id, when the catalog's active
-  dictionary file is missing (boot-time validation regression test, §7).
+  dictionary file is missing (boot-time validation regression test, §7);
+  `ALTER TABLE ... SET (toast...)` updates future-write TOAST policy, can
+  train a TOAST dictionary when the corpus is sufficient, survives restart,
+  creates a hidden TOAST relation for legacy tables when needed, and rejects
+  mixed page-compression/TOAST option lists.
 
-## 14. Documentation updates (same change)
+## 14. Related crate specs
 
-- New `docs/specs/crates/compress.md`.
-- `docs/specs/crates/storage.md` — envelope, store config API, corruption
-  semantics, ALTER rewrite pass.
-- `docs/specs/crates/wal.md` — `FullPageImageCompressed`,
-  `CreateDictionary`, replay behavior.
-- `docs/specs/crates/catalog.md` — compression setting, `active_dict_id`,
-  dict-id allocation.
-- `docs/specs/crates/parser.md` — `WITH (...)` clause, `ALTER TABLE` form.
-- `docs/specs/crates/server.md` — ALTER dispatch, recovery dictionary
-  seeding.
-- `docs/specs/crates/control.md` — `page_size` field.
-- `docs/specs/overview.md` — crate graph (`compress`), SQL subset.
-- Project `CLAUDE.md` — SQL subset list gains
-  `ALTER TABLE ... SET (compression = ...)`; crate list mention.
+- `docs/specs/crates/compress.md` owns the codec, envelope, dictionary, and
+  `CompressionRegistry` API contract.
+- `docs/specs/crates/storage.md` owns the page-store integration, file
+  compression config registration, TOAST row preparation/materialization,
+  TOAST-aware VACUUM helpers, and `rewrite_table_pages`.
+- `docs/specs/crates/wal.md` owns the durable record shapes
+  `FullPageImageCompressed`, `CreateDictionary`, `AlterTableCompression`, and
+  `AlterTableToast`, plus replay ordering.
+- `docs/specs/crates/catalog.md` owns durable table compression metadata,
+  TOAST metadata, hidden TOAST relation metadata, and dictionary-id allocation.
+- `docs/specs/crates/parser.md` owns `CREATE TABLE ... WITH (...)`,
+  `ALTER TABLE ... SET (compression = ...)`, and
+  `ALTER TABLE ... SET (toast...)` parsing.
+- `docs/specs/crates/server.md` owns maintenance-command dispatch,
+  dictionary durability ordering, rewrite orchestration, and recovery
+  dictionary seeding/validation.
+- `docs/specs/crates/control.md` owns the control-file `page_size` field.
+- `docs/specs/overview.md` owns the system-level SQL and storage summary.
 
 ## 15. Future work (recorded, not scoped)
 
