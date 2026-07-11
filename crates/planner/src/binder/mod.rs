@@ -107,6 +107,12 @@ struct BindContext<'a> {
     /// `BoundQuery::correlations` when the boundary unwinds. Always empty for
     /// a scope with no `outer` chain.
     correlations: Vec<PendingCorrelation>,
+    /// While binding a join's `ON` condition: the index of the join's first
+    /// binding. Only bindings from that index on are visible — a reference to
+    /// an earlier sibling FROM entry is rejected like PostgreSQL's "invalid
+    /// reference to FROM-clause entry" (the join operator only sees its own
+    /// subtree's row). `None` outside `ON` binding.
+    on_scope_start: Option<usize>,
 }
 
 impl<'a> BindContext<'a> {
@@ -128,6 +134,7 @@ impl<'a> BindContext<'a> {
             cte_scope: CteScope::default(),
             outer,
             correlations: Vec::new(),
+            on_scope_start: None,
         }
     }
 

@@ -532,9 +532,10 @@ struct EquiSplit {
 
 /// Partition an inner-join predicate into `left_col = right_col` equality pairs
 /// (the hash keys) and the remaining conjuncts (a residual re-checked in a
-/// `Filter` above the join). Left key slots are as-is; right key slots are
-/// rebased by `left_width`. Residual conjuncts keep their global slots, which
-/// already index the joined (left ++ right) row.
+/// `Filter` above the join). The condition's slots are subtree-local (the
+/// lowering rebased them): left key slots are as-is, right key slots are
+/// rebased by `left_width`, and residual conjuncts keep their slots, which
+/// index the joined (left ++ right) row.
 fn split_equi_keys(condition: &BoundExpr, left_width: usize) -> EquiSplit {
     let mut left_keys = Vec::new();
     let mut right_keys = Vec::new();

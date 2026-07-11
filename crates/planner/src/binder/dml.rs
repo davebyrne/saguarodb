@@ -471,17 +471,6 @@ fn join_dml_from_items(
 ) -> Result<BoundFrom> {
     let mut bound = target;
     for item in items {
-        // An explicit JOIN item would carry FROM-scope slots into a join
-        // subtree that excludes the target (the engine's non-first-join
-        // limitation); the same join is expressible as comma items with the
-        // predicate in WHERE.
-        if matches!(item, parser::FromItem::Join { .. }) {
-            return Err(plan_error(
-                SqlState::FeatureNotSupported,
-                "an explicit JOIN among UPDATE ... FROM / DELETE ... USING items \
-                 is not supported; list the relations and join in WHERE",
-            ));
-        }
         let right = super::query::bind_from_item(catalog, ctx, item)?;
         bound = BoundFrom::Join {
             left: Box::new(bound),

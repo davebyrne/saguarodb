@@ -355,14 +355,15 @@ Restrictions:
 - `LATERAL` on the nullable side of a `RIGHT`/`FULL` join is rejected
   (`FeatureNotSupported`).
 - A sibling-referencing `LATERAL` must be the **right** side of its explicit
-  join, and that join must be the **first FROM item** — the Apply's input is
-  the join's left subtree, and sibling slots are FROM-scope slots, which only
-  align when nothing precedes the join (`FeatureNotSupported` otherwise;
-  comma-form FROM lists fold left-deep, so a comma-form lateral always sees
-  the whole preceding prefix and is unrestricted). A lateral whose
-  correlations are purely chained (enclosing-scope only) is unrestricted: it
-  lowers to an Apply over a unit `VALUES` row, carrying its correlation list
-  for the enclosing Apply to substitute.
+  join, and its sibling references must stay **inside that join's subtree** —
+  the Apply's input is the join's left subtree, so a reference crossing the
+  join boundary (an earlier comma sibling) cannot be supplied
+  (`FeatureNotSupported`; comma-form FROM lists fold left-deep, so a
+  comma-form lateral always sees the whole preceding prefix and is
+  unrestricted). Sibling slots are rebased onto the subtree's row at
+  lowering. A lateral whose correlations are purely chained (enclosing-scope
+  only) is unrestricted: it lowers to an Apply over a unit `VALUES` row,
+  carrying its correlation list for the enclosing Apply to substitute.
 
 Non-`LATERAL` derived tables remain uncorrelated scopes: sibling references
 still fail name resolution, and cross-level outer references keep the §1.1
@@ -412,11 +413,12 @@ modified target and sees the target columns only (the new row for `UPDATE`,
 the old-row prefix for `DELETE`) — a documented divergence from PostgreSQL,
 which also exposes the matched FROM row's columns.
 
-Restrictions: an explicit `JOIN` among the FROM/USING items is rejected with
-`FeatureNotSupported` (it would carry FROM-scope slots into a join subtree
-that excludes the target — the engine's non-first-join limitation; the same
-join is expressible as comma items with the predicate in `WHERE`). Derived
-tables and `LATERAL` items work.
+Explicit `JOIN` items, derived tables, and `LATERAL` items all work. A
+FROM-item join's `ON` clause sees only that join's operands (its condition is
+rebased onto the join's own row at lowering); referencing the target — or any
+FROM entry outside the join — is rejected with the PostgreSQL-style "invalid
+reference to FROM-clause entry" error, and the same predicate belongs in
+`WHERE`.
 
 `ON CONFLICT` is unaffected (INSERT-only). `UPDATE ... FROM` follows the same
 first-updater-wins / row-lock rules as plain `UPDATE` (`docs/specs/mvcc.md`

@@ -1294,7 +1294,35 @@ fn scope_matches<'c>(
 }
 
 fn bind_column_ref(ctx: &mut BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
-    let matches = scope_matches(&ctx.bindings, table, column);
+    // A join's ON condition sees only the join's own operands: earlier
+    // sibling FROM entries are hidden (they are not part of the join
+    // operator's row), and referencing one is an error rather than a fall
+    // through to enclosing scopes — matching PostgreSQL.
+    let visible_from = ctx.on_scope_start.unwrap_or(0);
+    let matches = scope_matches(&ctx.bindings[visible_from..], table, column);
+    if matches.is_empty()
+        && visible_from > 0
+        && !scope_matches(&ctx.bindings[..visible_from], table, column).is_empty()
+    {
+        // PostgreSQL codes: 42P01 for a qualified reference to the hidden
+        // FROM entry, 42703 for an unqualified column that only exists there.
+        return Err(match table {
+            Some(table) => plan_error(
+                SqlState::UndefinedTable,
+                format!(
+                    "invalid reference to FROM-clause entry for table {table}: it is \
+                     not part of this join's ON clause scope"
+                ),
+            ),
+            None => plan_error(
+                SqlState::UndefinedColumn,
+                format!(
+                    "column {column} does not exist in this join's ON clause scope \
+                     (it belongs to an earlier FROM entry)"
+                ),
+            ),
+        });
+    }
 
     match matches.as_slice() {
         [(binding, column)] => Ok(input_ref(binding, column)),
@@ -1322,6 +1350,13 @@ fn bind_column_ref(ctx: &mut BindContext, table: Option<&str>, column: &str) -> 
 /// that depth and binds as `OuterRef`. Resolution stops at the first scope
 /// with any match (an inner binding shadows an outer one); ambiguity within
 /// that one scope is still an error.
+///
+/// NOTE: this walk ignores each link's `on_scope_start`, so a subquery body
+/// inside a join's `ON` can bind a hidden ON-scope sibling as a correlation.
+/// Today that is harmless — every correlated subquery in an `ON` position is
+/// rejected at execution — but if that deferral is ever lifted, the walk must
+/// respect each link's ON scope or hidden-sibling references would silently
+/// become correlations instead of 42P01/42703 errors.
 fn bind_outer_column_ref(
     ctx: &mut BindContext,
     table: Option<&str>,

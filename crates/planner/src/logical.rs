@@ -622,6 +622,56 @@ fn plan_select_source(select: &BoundSelect) -> Result<LogicalPlan> {
 }
 
 fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan> {
+    plan_from_at(from, 0, filter)
+}
+
+/// The number of columns a FROM subtree contributes to the joined row.
+fn bound_from_width(from: &BoundFrom) -> usize {
+    match from {
+        BoundFrom::Table { schema, .. }
+        | BoundFrom::System { schema, .. }
+        | BoundFrom::Derived { schema, .. }
+        | BoundFrom::View { schema, .. } => schema.len(),
+        BoundFrom::Join { left, right, .. } => bound_from_width(left) + bound_from_width(right),
+    }
+}
+
+/// Rebase FROM-scope slot references onto a join subtree's local row: the
+/// binder assigns slots across the WHOLE FROM list, but a join operator (and
+/// a lateral Apply's input) sees only its subtree's columns, starting at
+/// `offset`. The binder's ON-scope visibility rule guarantees no reference
+/// points below `offset`.
+fn rebase_from_scope_expr(expr: &BoundExpr, offset: usize) -> Result<BoundExpr> {
+    if offset == 0 {
+        return Ok(expr.clone());
+    }
+    crate::rewrite::rewrite_expr(expr, &mut |node| match node {
+        BoundExpr::InputRef {
+            input,
+            column,
+            slot,
+            data_type,
+            nullable,
+        } => {
+            let slot = slot.checked_sub(offset).ok_or_else(|| {
+                DbError::internal("join-scope expression references a column outside its subtree")
+            })?;
+            Ok(Some(BoundExpr::InputRef {
+                input: *input,
+                column: *column,
+                slot,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+            }))
+        }
+        _ => Ok(None),
+    })
+}
+
+/// Lower a FROM subtree whose leftmost column sits at global slot `offset`.
+/// Join conditions and lateral correlations bind with global FROM-scope
+/// slots and are rebased here to the subtree's local row.
+fn plan_from_at(from: &BoundFrom, offset: usize, filter: Option<BoundExpr>) -> Result<LogicalPlan> {
     match from {
         BoundFrom::Table { table, .. } => Ok(LogicalPlan::Scan {
             table: *table,
@@ -706,16 +756,21 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
             } = &**right
             {
                 LogicalPlan::Apply {
-                    input: Box::new(plan_from(left, None)?),
+                    input: Box::new(plan_from_at(left, offset, None)?),
                     subplan: Box::new(plan_query(query)?),
                     correlations: query
                         .correlations
                         .iter()
-                        .map(|correlation| correlation.outer.clone())
-                        .collect(),
+                        .map(|correlation| rebase_from_scope_expr(&correlation.outer, offset))
+                        .collect::<Result<Vec<_>>>()?,
                     kind: ApplyKind::Lateral {
                         left_join: matches!(join_type, JoinType::Left),
-                        condition: condition.clone().map(Box::new),
+                        condition: condition
+                            .as_ref()
+                            .map(|condition| {
+                                rebase_from_scope_expr(condition, offset).map(Box::new)
+                            })
+                            .transpose()?,
                         output_schema: schema
                             .iter()
                             .map(|column| ColumnInfo {
@@ -730,9 +785,12 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
                 }
             } else {
                 LogicalPlan::Join {
-                    left: Box::new(plan_from(left, None)?),
-                    right: Box::new(plan_from(right, None)?),
-                    condition: condition.clone(),
+                    left: Box::new(plan_from_at(left, offset, None)?),
+                    right: Box::new(plan_from_at(right, offset + bound_from_width(left), None)?),
+                    condition: condition
+                        .as_ref()
+                        .map(|condition| rebase_from_scope_expr(condition, offset))
+                        .transpose()?,
                     join_type: *join_type,
                     identity_from: None,
                 }

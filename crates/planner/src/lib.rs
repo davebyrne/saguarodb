@@ -4084,22 +4084,55 @@ mod tests {
     }
 
     #[test]
-    fn sibling_lateral_join_after_comma_items_rejected() {
+    fn sibling_lateral_in_non_first_join_rebases_onto_subtree() {
         let catalog = catalog_with_users_and_accounts();
-        // The lateral's join is not the first FROM item: its sibling slots
-        // are FROM-scope slots that would misalign with the join-subtree
-        // input (silently wrong data before the guard).
+        // The lateral's join is not the first FROM item; its sibling
+        // reference (a.id, global slot 2) is rebased onto the join subtree
+        // (local slot 0) when the Apply is lowered.
+        let plan = plan_sql(
+            "select l.x from users u2, accounts a join \
+             lateral (select a.id as x) l on true",
+            &catalog,
+        );
+        fn find_lateral_correlations(plan: &PhysicalPlan) -> Option<&Vec<BoundExpr>> {
+            match plan {
+                PhysicalPlan::Apply {
+                    correlations,
+                    kind: ApplyKind::Lateral { .. },
+                    ..
+                } => Some(correlations),
+                PhysicalPlan::Projection { source, .. }
+                | PhysicalPlan::Filter { source, .. }
+                | PhysicalPlan::Sort { source, .. }
+                | PhysicalPlan::Limit { source, .. } => find_lateral_correlations(source),
+                PhysicalPlan::NestedLoopJoin { left, right, .. }
+                | PhysicalPlan::HashJoin { left, right, .. } => {
+                    find_lateral_correlations(left).or_else(|| find_lateral_correlations(right))
+                }
+                _ => None,
+            }
+        }
+        let correlations =
+            find_lateral_correlations(&plan).expect("plan should contain the lateral Apply");
+        assert!(
+            matches!(correlations[0], BoundExpr::InputRef { slot: 0, .. }),
+            "sibling reference should be rebased to the subtree row, got {:?}",
+            correlations[0]
+        );
+
+        // A reference CROSSING the join boundary (to the comma sibling u2)
+        // cannot be supplied by the Apply's input and stays rejected.
         let err = bind(
             &parse(
-                "select l.x from users u2, accounts a join \
-                 lateral (select a.id as x) l on true",
+                "select 1 from users u2, accounts a join \
+                 lateral (select u2.id as v) l on true",
             )
             .unwrap(),
             &catalog,
         )
         .unwrap_err();
         assert_eq!(err.code, SqlState::FeatureNotSupported);
-        assert!(err.message.contains("first FROM item"), "{}", err.message);
+        assert!(err.message.contains("outside that join"), "{}", err.message);
     }
 
     #[test]

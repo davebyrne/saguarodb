@@ -773,6 +773,7 @@ pub(super) fn bind_from_item(
                 ));
             }
             let slots_before = ctx.next_slot;
+            let join_scope_start = ctx.bindings.len();
             let left = bind_from_item(catalog, ctx, left)?;
             // A LATERAL body referencing its siblings must be the RIGHT side
             // of its join: the plan lowers it to an Apply whose input is the
@@ -797,27 +798,30 @@ pub(super) fn bind_from_item(
             }
             let right = bind_from_item(catalog, ctx, right)?;
             // A sibling-referencing LATERAL lowers to an Apply whose input is
-            // THIS join's left subtree, but its correlation slots are global
-            // FROM-scope slots: they only align when the join is the first
-            // FROM item. Purely chained (enclosing-scope) laterals carry no
-            // sibling slots and are unrestricted.
-            if slots_before > 0
-                && let BoundFrom::Derived {
-                    lateral: true,
-                    query,
-                    ..
-                } = &right
-                && query
-                    .correlations
-                    .iter()
-                    .any(|correlation| !matches!(correlation.outer, BoundExpr::OuterRef { .. }))
+            // THIS join's left subtree; correlation slots are rebased to that
+            // subtree during lowering, so references INTO the subtree are
+            // fine — but a reference crossing the join boundary (an earlier
+            // comma sibling) cannot be supplied by the Apply's input.
+            if let BoundFrom::Derived {
+                lateral: true,
+                query,
+                ..
+            } = &right
+                && query.correlations.iter().any(|correlation| {
+                    matches!(
+                        correlation.outer,
+                        BoundExpr::InputRef { slot, .. } if slot < slots_before
+                    )
+                })
             {
                 return Err(plan_error(
                     SqlState::FeatureNotSupported,
-                    "a sibling-referencing LATERAL derived table is only supported \
-                     when its join is the first FROM item",
+                    "a LATERAL derived table in an explicit join cannot reference \
+                     FROM items outside that join",
                 ));
             }
+            let saved_on_scope = ctx.on_scope_start;
+            ctx.on_scope_start = Some(join_scope_start);
             let condition = match (join_type, condition) {
                 (JoinType::Cross, None) => None,
                 (JoinType::Cross, Some(_)) => {
@@ -834,6 +838,7 @@ pub(super) fn bind_from_item(
                     ));
                 }
             };
+            ctx.on_scope_start = saved_on_scope;
             if let Some(condition) = &condition {
                 reject_aggregate(condition)?;
             }

@@ -3595,6 +3595,136 @@ async fn e2e_correlated_nested_volatile_subquery_not_memoized() {
 }
 
 #[tokio::test]
+async fn e2e_non_first_explicit_join_slots() {
+    // A non-first explicit join's ON condition binds with FROM-scope slots
+    // but executes against the join's own row; the lowering rebases it.
+    // Before the fix this errored ("input slot out of bounds") or silently
+    // matched the wrong columns.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table ta (x integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table tb (y integer primary key, tag text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table tc (z integer primary key, tag text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into ta (x) values (1), (2)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into tb (y, tag) values (10, 'b10'), (20, 'b20')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into tc (z, tag) values (10, 'c10'), (30, 'c30')")
+        .await
+        .unwrap();
+
+    // Equality ON (hash path): only y=z=10 matches; two ta rows multiply it.
+    let rows = server
+        .simple_query(
+            "select ta.x, tb.tag, tc.tag from ta, tb join tc on tc.z = tb.y \
+             order by ta.x",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".to_string()),
+                Some("b10".to_string()),
+                Some("c10".to_string())
+            ],
+            vec![
+                Some("2".to_string()),
+                Some("b10".to_string()),
+                Some("c10".to_string())
+            ],
+        ]
+    );
+
+    // Non-equality ON (nested-loop path) with a LEFT join variant that
+    // exercises the null-pad: no tc.z is below tb.y = 10.
+    let rows = server
+        .simple_query(
+            "select ta.x, tb.y, tc.z from ta, tb left join tc on tc.z < tb.y \
+             where ta.x = 1 order by tb.y, tc.z",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("10".to_string()), None],
+            vec![
+                Some("1".to_string()),
+                Some("20".to_string()),
+                Some("10".to_string())
+            ],
+        ]
+    );
+
+    // Sibling-referencing LATERAL inside a non-first explicit join: the
+    // correlations rebase onto the join subtree (previously guard-rejected).
+    let rows = server
+        .simple_query(
+            "select ta.x, l.t from ta, tb join \
+             lateral (select tb.tag || '!' as t) l on true \
+             where ta.x = 1 order by l.t",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("b10!".to_string())],
+            vec![Some("1".to_string()), Some("b20!".to_string())],
+        ]
+    );
+
+    // A lateral reference CROSSING the join boundary (to ta) still gets the
+    // clean rejection: the Apply's input is the join's subtree only.
+    let err = server
+        .simple_query("select 1 from ta, tb join lateral (select ta.x as v) l on true")
+        .await
+        .err()
+        .expect("boundary-crossing lateral should be rejected");
+    assert!(err.message.contains("0A000"), "{}", err.message);
+
+    // An ON reference to a hidden comma sibling is an error, not a wrong
+    // answer (PostgreSQL-style invalid FROM-clause reference).
+    let err = server
+        .simple_query("select 1 from ta, tb join tc on tc.z = ta.x")
+        .await
+        .err()
+        .expect("ON reference to a sibling outside the join should fail");
+    assert!(err.message.contains("42P01"), "{}", err.message);
+
+    // Correlated ON references from inside a subquery body still resolve to
+    // the enclosing scope (correlation), not the hidden sibling.
+    let rows = server
+        .simple_query(
+            "select ta.x from ta where exists \
+             (select 1 from tb join tc on tc.z = tb.y and tb.y = ta.x * 10) \
+             order by ta.x",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
 async fn e2e_update_from_and_delete_using() {
     // docs/specs/subqueries.md section 8: the source is an inner join of the
     // target with the FROM/USING relations; a target row matched by multiple
@@ -3676,18 +3806,34 @@ async fn e2e_update_from_and_delete_using() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("1".to_string())]]);
 
-    // Explicit JOIN items are rejected with a clear error (the engine's
-    // non-first-join slot limitation; comma items + WHERE express the same).
-    let err = server
+    // An explicit JOIN among the FROM items works: its ON condition is
+    // rebased to the join's own row (only Ada owns two accounts).
+    server
         .simple_query(
-            "update users set plan = 'x' \
-             from accounts a join accounts b on a.owner = b.owner \
+            "update users set plan = 'joined' \
+             from accounts a join accounts b on a.owner = b.owner and a.id < b.id \
              where a.owner = users.name",
         )
         .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where plan = 'joined'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // The ON clause of a FROM-item join sees only the join's operands; a
+    // reference to the target is rejected with a clear error.
+    let err = server
+        .simple_query(
+            "update users set plan = 'x' \
+             from accounts a join accounts b on a.owner = users.name",
+        )
+        .await
         .err()
-        .expect("explicit JOIN in UPDATE FROM should be rejected");
-    assert!(err.message.contains("0A000"), "{}", err.message);
+        .expect("target reference in a FROM-item ON should be rejected");
+    assert!(err.message.contains("42P01"), "{}", err.message);
 
     // DELETE ... USING with dedupe and RETURNING of the deleted (old) row.
     let rows = server
@@ -3701,7 +3847,7 @@ async fn e2e_update_from_and_delete_using() {
     assert_eq!(
         rows,
         vec![
-            vec![Some("1".to_string()), Some("dual".to_string())],
+            vec![Some("1".to_string()), Some("joined".to_string())],
             vec![Some("2".to_string()), Some("paid-Grace".to_string())],
         ]
     );
