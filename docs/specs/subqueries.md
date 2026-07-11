@@ -1,9 +1,9 @@
 # Correlated Subqueries, LATERAL, and Join-Sourced DML
 
-**Status:** In implementation on branch `subqueries` — milestones S0–S4
+**Status:** In implementation on branch `subqueries` — milestones S0–S5
 implemented (correlated subqueries execute via Apply in `WHERE`, the `SELECT`
 list, and `HAVING`; equality shapes decorrelate to semi/anti joins; `LATERAL`
-derived tables); S5+ are design (§12).
+derived tables; `UPDATE ... FROM` / `DELETE ... USING`); S6 is polish (§12).
 
 This document specifies correlated subquery execution and the features built on
 it: correlated `(SELECT ...)` / `[NOT] EXISTS` / `[NOT] IN`, semi/anti joins,
@@ -378,27 +378,43 @@ currently produce combined rows with `identity: None`. The join plan nodes
 (`NestedLoopJoin`, `HashJoin`) gain:
 
 ```rust
-identity_from: Option<JoinSide>,   // None = today's behavior
+identity_from: Option<JoinSide>,   // None = plain query joins (no identity)
 ```
 
-When set, the join copies that side's `RowIdentity` into every combined row it
-emits. Only DML-source planning sets it; the binder always plants the target
-table as the **left** input with `identity_from: Some(Left)`. `RowIdentity`
-never enters the `Value` domain — `Value`'s variant order is a durable on-disk
-key-ordering contract and must not grow variants for executor-internal needs.
+`JoinSide` has only `Left` (nothing plants a DML target on the right). When
+set, the join copies the left side's `RowIdentity` into every combined row it
+emits. Only DML-source lowering sets it — a marking pass walks the source's
+left spine (through filters, projections, and the Applys that `LATERAL` items
+lower to, into every inner/cross join) after the bound source is lowered, so
+the target scan's identity flows to the top. Semi/anti joins need no marker: they emit the left `ExecRow` whole.
+`RowIdentity` never enters the `Value` domain — `Value`'s variant order is a
+durable on-disk key-ordering contract and must not grow variants for
+executor-internal needs.
 
-The identity side of such a join is never null-padded: the source join is an
-inner join (§2). The operator asserts this invariant.
+The identity side of such a join is never null-padded: the source join spine
+is inner/cross joins only (§2).
 
 ### 8.2 Plan shape and dedupe
 
-`UPDATE t SET ... FROM f WHERE p` plans its `source` as
-`target ⨝ FROM-tables` (filtered by `p`) with the target left; `SET`
-expressions and `RETURNING` may reference all joined columns. The Update and
-Delete executors keep a `HashSet<RowId>` of already-written targets and skip a
-combined row whose target identity was already processed — implementing §2's
-"modified once, first match in scan order" deterministically. `RETURNING`
-emits one row per modified target row (not per join match).
+`UPDATE t SET ... FROM f WHERE p` binds the target table first (slots `0..`)
+and folds the FROM/USING items onto it comma-style (cross joins + `WHERE`),
+so the source produces the combined (target ++ FROM) row; `SET` expressions
+and the `WHERE` see the combined scope. A `joined_source` flag travels from
+the binder through the plans to the executor (width cannot stand in for it —
+a zero-column FROM item keeps the combined width equal to the table's): the
+target prefix is the row to update/delete, assignments
+evaluate against the full combined row, and a `HashSet` of target row ids
+skips a target already processed — implementing §2's "modified once, first
+match in scan order" deterministically. `RETURNING` emits one row per
+modified target and sees the target columns only (the new row for `UPDATE`,
+the old-row prefix for `DELETE`) — a documented divergence from PostgreSQL,
+which also exposes the matched FROM row's columns.
+
+Restrictions: an explicit `JOIN` among the FROM/USING items is rejected with
+`FeatureNotSupported` (it would carry FROM-scope slots into a join subtree
+that excludes the target — the engine's non-first-join limitation; the same
+join is expressible as comma items with the predicate in `WHERE`). Derived
+tables and `LATERAL` items work.
 
 `ON CONFLICT` is unaffected (INSERT-only). `UPDATE ... FROM` follows the same
 first-updater-wins / row-lock rules as plain `UPDATE` (`docs/specs/mvcc.md`
@@ -450,7 +466,7 @@ the existing plan-tree text format.
 - **S3** — `Semi`/`Anti` join types (nested-loop + hash); decorrelation rules.
 - **S4** — `LATERAL`.
 - **S5** — `identity_from` join propagation, then
-  `UPDATE ... FROM` / `DELETE ... USING` with dedupe.
+  `UPDATE ... FROM` / `DELETE ... USING` with dedupe. Implemented.
 - **S6** — polish: ApplyOp re-`open` rescan, `LIMIT 1` injection for `EXISTS`
   subplans, index-aware per-row template replanning, cancellation polling inside Apply's inner
   drains (today cancellation is observed between top-level rows, matching the

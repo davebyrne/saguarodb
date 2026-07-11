@@ -409,23 +409,27 @@ fn bind_inner(
         Statement::Update {
             table,
             assignments,
+            from,
             filter,
             returning,
         } => bind_update(
             catalog,
             table,
             assignments,
+            from,
             filter.as_ref(),
             returning.as_deref(),
             declared,
         ),
         Statement::Delete {
             table,
+            using,
             filter,
             returning,
         } => bind_delete(
             catalog,
             table,
+            using,
             filter.as_ref(),
             returning.as_deref(),
             declared,

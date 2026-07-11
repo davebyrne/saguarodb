@@ -102,12 +102,17 @@ pub enum Statement {
     Update {
         table: String,
         assignments: Vec<Assignment>,
+        /// `UPDATE ... FROM <items>`: extra relations joined with the target
+        /// (`docs/specs/subqueries.md` §8). Empty when absent.
+        from: Vec<FromItem>,
         filter: Option<Expr>,
         /// `UPDATE ... RETURNING <items>`, evaluated over each updated (new) row.
         returning: Option<Vec<SelectItem>>,
     },
     Delete {
         table: String,
+        /// `DELETE ... USING <items>` (`docs/specs/subqueries.md` §8).
+        using: Vec<FromItem>,
         filter: Option<Expr>,
         /// `DELETE ... RETURNING <items>`, evaluated over each deleted (old) row.
         returning: Option<Vec<SelectItem>>,

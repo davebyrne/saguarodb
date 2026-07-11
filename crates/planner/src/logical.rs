@@ -7,7 +7,7 @@ use common::{
 use crate::{
     AggregateExpr, ApplyKind, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource,
     BoundOnConflict, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect,
-    BoundStatement, JoinType, SetOp,
+    BoundStatement, JoinSide, JoinType, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +98,9 @@ pub enum LogicalPlan {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<LogicalPlan>,
+        /// `UPDATE ... FROM`: source rows are the combined (target ++ FROM)
+        /// row; hoisting must not narrow them (`docs/specs/subqueries.md` §8).
+        joined_source: bool,
         returning: Option<BoundReturning>,
         /// Bound `CHECK` expressions enforced per updated row (see
         /// `BoundStatement::Update`).
@@ -106,6 +109,8 @@ pub enum LogicalPlan {
     Delete {
         table: TableId,
         source: Box<LogicalPlan>,
+        /// `DELETE ... USING` (`docs/specs/subqueries.md` §8).
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
     Scan {
@@ -132,6 +137,9 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         condition: Option<BoundExpr>,
         join_type: JoinType,
+        /// `Some(Left)` on a DML-source join spine: combined rows carry the
+        /// left side's row identity (`docs/specs/subqueries.md` §8.1).
+        identity_from: Option<JoinSide>,
     },
     Filter {
         source: Box<LogicalPlan>,
@@ -329,24 +337,40 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             table,
             assignments,
             source,
+            joined_source,
             returning,
             check_exprs,
-        } => Ok(LogicalPlan::Update {
-            table: *table,
-            assignments: assignments.clone(),
-            source: Box::new(plan_select_source(source)?),
-            returning: returning.clone(),
-            check_exprs: check_exprs.clone(),
-        }),
+        } => {
+            let mut source = plan_select_source(source)?;
+            if *joined_source {
+                mark_dml_spine_identity(&mut source);
+            }
+            Ok(LogicalPlan::Update {
+                table: *table,
+                assignments: assignments.clone(),
+                source: Box::new(source),
+                joined_source: *joined_source,
+                returning: returning.clone(),
+                check_exprs: check_exprs.clone(),
+            })
+        }
         BoundStatement::Delete {
             table,
             source,
+            joined_source,
             returning,
-        } => Ok(LogicalPlan::Delete {
-            table: *table,
-            source: Box::new(plan_select_source(source)?),
-            returning: returning.clone(),
-        }),
+        } => {
+            let mut source = plan_select_source(source)?;
+            if *joined_source {
+                mark_dml_spine_identity(&mut source);
+            }
+            Ok(LogicalPlan::Delete {
+                table: *table,
+                source: Box::new(source),
+                joined_source: *joined_source,
+                returning: returning.clone(),
+            })
+        }
         BoundStatement::Explain(_) => Err(DbError::plan(
             common::SqlState::SyntaxError,
             "logical_plan does not accept EXPLAIN; plan the inner statement",
@@ -710,6 +734,7 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
                     right: Box::new(plan_from(right, None)?),
                     condition: condition.clone(),
                     join_type: *join_type,
+                    identity_from: None,
                 }
             };
             if let Some(filter) = filter {
@@ -1088,6 +1113,32 @@ fn rewrite_aggregate_expr(
         BoundExpr::AggregateCall { .. } => Err(DbError::internal(
             "nested aggregate survived binder validation",
         )),
+    }
+}
+
+/// Mark the join spine of a joined DML source so combined rows carry the
+/// TARGET table's physical row identity: the target is the leftmost input,
+/// and every inner/cross join on the left spine forwards its left side's
+/// identity (`docs/specs/subqueries.md` §8.1). Filters pass rows through
+/// whole; the walk stops at the target scan.
+fn mark_dml_spine_identity(plan: &mut LogicalPlan) {
+    match plan {
+        LogicalPlan::Filter { source, .. } | LogicalPlan::Projection { source, .. } => {
+            mark_dml_spine_identity(source)
+        }
+        // A LATERAL FROM item lowers to an Apply on the spine; ApplyOp passes
+        // its input rows' identity through, so the walk continues below it.
+        LogicalPlan::Apply { input, .. } => mark_dml_spine_identity(input),
+        LogicalPlan::Join {
+            left,
+            join_type: JoinType::Inner | JoinType::Cross,
+            identity_from,
+            ..
+        } => {
+            *identity_from = Some(JoinSide::Left);
+            mark_dml_spine_identity(left);
+        }
+        _ => {}
     }
 }
 

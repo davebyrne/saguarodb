@@ -5,8 +5,8 @@ use crate::{ConflictAction, ConflictTarget, InsertSource, OnConflict, Statement}
 
 use super::expr::convert_expr;
 use super::query::{
-    convert_assignment, convert_query, convert_returning, query_has_modifiers,
-    table_name_from_table_with_joins,
+    convert_assignment, convert_query, convert_returning, convert_table_with_joins,
+    query_has_modifiers, table_name_from_table_with_joins,
 };
 use super::{dml_target_name, feature_not_supported, ident_name, parse_error, unsupported};
 
@@ -334,13 +334,16 @@ fn validate_copy_options(options: &CopyOptions) -> Result<()> {
 }
 
 pub(super) fn convert_delete(delete: sql::Delete) -> Result<Statement> {
-    if !delete.tables.is_empty()
-        || delete.using.is_some()
-        || !delete.order_by.is_empty()
-        || delete.limit.is_some()
-    {
+    if !delete.tables.is_empty() || !delete.order_by.is_empty() || delete.limit.is_some() {
         return unsupported("unsupported DELETE form");
     }
+    let using = match &delete.using {
+        None => Vec::new(),
+        Some(tables) => tables
+            .iter()
+            .map(convert_table_with_joins)
+            .collect::<Result<Vec<_>>>()?,
+    };
 
     let tables = match &delete.from {
         sql::FromTable::WithFromKeyword(tables) => tables,
@@ -352,6 +355,7 @@ pub(super) fn convert_delete(delete: sql::Delete) -> Result<Statement> {
 
     Ok(Statement::Delete {
         table: table_name_from_table_with_joins(&tables[0])?,
+        using,
         filter: delete
             .selection
             .map(|expr| convert_expr(&expr))

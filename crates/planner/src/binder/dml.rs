@@ -10,8 +10,8 @@ use parser::{
 };
 
 use crate::{
-    BoundExpr, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect, BoundSelectItem,
-    BoundStatement,
+    BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict, BoundReturning, BoundSelect,
+    BoundSelectItem, BoundStatement,
 };
 
 use super::expr::{bind_boolean_expr, bind_expr};
@@ -19,9 +19,7 @@ use super::query::{
     bind_excluded_binding, bind_query, bind_select_item, bind_table_from_schema,
     select_output_schema,
 };
-use super::{
-    BindContext, Binding, CteScope, input_ref, plan_error, reject_aggregate, require_table,
-};
+use super::{BindContext, CteScope, plan_error, reject_aggregate, require_table};
 
 /// Bind `COPY <table> [(cols)] FROM STDIN | TO STDOUT`: resolve the table and the
 /// (possibly defaulted) column list to ids, reusing the INSERT column resolver.
@@ -363,14 +361,23 @@ pub(super) fn bind_update(
     catalog: &dyn CatalogManager,
     table_name: &str,
     assignments: &[Assignment],
+    from_items: &[parser::FromItem],
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<PgType>],
 ) -> Result<BoundStatement> {
     let table = require_table(catalog, table_name)?;
+    // RETURNING binds against the target table only: it is evaluated over the
+    // updated (new) row, which carries no FROM columns
+    // (docs/specs/subqueries.md section 8 — a documented divergence from
+    // PostgreSQL, which also exposes the matched FROM row).
     let returning = bind_returning(catalog, &table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
+    // UPDATE ... FROM: the extra relations join the target with the target as
+    // the leftmost input, so assignments and WHERE see the combined scope.
+    let from = join_dml_from_items(catalog, &mut ctx, from, from_items)?;
+    let joined_source = !from_items.is_empty();
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
@@ -402,13 +409,14 @@ pub(super) fn bind_update(
         assignments: bound_assignments,
         source: BoundSelect {
             distinct: None,
-            columns: table_select_items(&table, &ctx.bindings[0]),
+            columns: bindings_select_items(&ctx),
             from: Some(from),
             filter: source_filter,
             group_by: Vec::new(),
             having: None,
-            output_schema: table_output_schema(&table),
+            output_schema: bindings_output_schema(&ctx),
         },
+        joined_source,
         returning,
         check_exprs,
     })
@@ -417,6 +425,7 @@ pub(super) fn bind_update(
 pub(super) fn bind_delete(
     catalog: &dyn CatalogManager,
     table_name: &str,
+    using: &[parser::FromItem],
     filter: Option<&Expr>,
     returning: Option<&[SelectItem]>,
     declared: &[Option<PgType>],
@@ -425,6 +434,9 @@ pub(super) fn bind_delete(
     let returning = bind_returning(catalog, &table, returning, declared)?;
     let mut ctx = BindContext::new(catalog, declared);
     let from = bind_table_from_schema(&mut ctx, table.clone(), None);
+    // DELETE ... USING joins the extra relations exactly like UPDATE ... FROM.
+    let from = join_dml_from_items(catalog, &mut ctx, from, using)?;
+    let joined_source = !using.is_empty();
     let source_filter = filter
         .map(|expr| bind_boolean_expr(&mut ctx, expr))
         .transpose()?;
@@ -436,15 +448,79 @@ pub(super) fn bind_delete(
         table: table.id,
         source: BoundSelect {
             distinct: None,
-            columns: table_select_items(&table, &ctx.bindings[0]),
+            columns: bindings_select_items(&ctx),
             from: Some(from),
             filter: source_filter,
             group_by: Vec::new(),
             having: None,
-            output_schema: table_output_schema(&table),
+            output_schema: bindings_output_schema(&ctx),
         },
+        joined_source,
         returning,
     })
+}
+
+/// Fold `UPDATE ... FROM` / `DELETE ... USING` items onto the target's
+/// binding, target leftmost, mirroring a comma FROM list. Each item may
+/// itself be an explicit join or a (possibly LATERAL) derived table.
+fn join_dml_from_items(
+    catalog: &dyn CatalogManager,
+    ctx: &mut BindContext,
+    target: BoundFrom,
+    items: &[parser::FromItem],
+) -> Result<BoundFrom> {
+    let mut bound = target;
+    for item in items {
+        // An explicit JOIN item would carry FROM-scope slots into a join
+        // subtree that excludes the target (the engine's non-first-join
+        // limitation); the same join is expressible as comma items with the
+        // predicate in WHERE.
+        if matches!(item, parser::FromItem::Join { .. }) {
+            return Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "an explicit JOIN among UPDATE ... FROM / DELETE ... USING items \
+                 is not supported; list the relations and join in WHERE",
+            ));
+        }
+        let right = super::query::bind_from_item(catalog, ctx, item)?;
+        bound = BoundFrom::Join {
+            left: Box::new(bound),
+            right: Box::new(right),
+            join_type: crate::JoinType::Cross,
+            condition: None,
+        };
+    }
+    Ok(bound)
+}
+
+/// One select item per registered binding column, in slot order — the
+/// combined (target ++ FROM) row a joined DML source produces.
+fn bindings_select_items(ctx: &BindContext) -> Vec<BoundSelectItem> {
+    ctx.bindings
+        .iter()
+        .flat_map(|binding| {
+            binding.columns.iter().map(|column| BoundSelectItem {
+                expr: super::input_ref(binding, column),
+                alias: column.name.clone(),
+                wildcard_source: None,
+            })
+        })
+        .collect()
+}
+
+fn bindings_output_schema(ctx: &BindContext) -> Vec<ColumnInfo> {
+    ctx.bindings
+        .iter()
+        .flat_map(|binding| {
+            binding.columns.iter().map(|column| ColumnInfo {
+                name: column.name.clone(),
+                data_type: column.data_type.clone(),
+                table_id: binding.table_id,
+                column_id: Some(column.id),
+                pg_type: column.pg_type.clone(),
+            })
+        })
+        .collect()
 }
 
 fn insert_columns(table: &TableSchema, column_names: &[String]) -> Result<Vec<ColumnId>> {
@@ -568,26 +644,6 @@ fn validate_assignable_from(
         ));
     }
     Ok(())
-}
-
-fn table_select_items(table: &TableSchema, binding: &Binding) -> Vec<BoundSelectItem> {
-    table
-        .columns
-        .iter()
-        .map(|column| BoundSelectItem {
-            expr: input_ref(binding, column),
-            alias: column.name.clone(),
-            wildcard_source: None,
-        })
-        .collect()
-}
-
-fn table_output_schema(table: &TableSchema) -> Vec<ColumnInfo> {
-    table
-        .columns
-        .iter()
-        .map(|column| column_info_for_column(table, column))
-        .collect()
 }
 
 fn column_info_for_column(table: &TableSchema, column: &ColumnDef) -> ColumnInfo {

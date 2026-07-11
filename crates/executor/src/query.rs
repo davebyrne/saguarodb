@@ -371,6 +371,7 @@ impl QueryEngine {
                 table,
                 assignments,
                 source,
+                joined_source,
                 returning,
                 check_exprs,
             } => execute_update(
@@ -378,14 +379,16 @@ impl QueryEngine {
                 *table,
                 assignments,
                 source,
+                *joined_source,
                 returning.as_ref(),
                 check_exprs,
             ),
             PhysicalPlan::Delete {
                 table,
                 source,
+                joined_source,
                 returning,
-            } => execute_delete(ctx, *table, source, returning.as_ref()),
+            } => execute_delete(ctx, *table, source, *joined_source, returning.as_ref()),
             _ => execute_query(ctx, plan),
         }
     }
@@ -508,6 +511,7 @@ pub(crate) fn build_executor<'a>(
             right,
             condition,
             join_type,
+            identity_from,
         } => {
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
@@ -517,6 +521,7 @@ pub(crate) fn build_executor<'a>(
                 right,
                 condition.clone(),
                 *join_type,
+                *identity_from,
             )))
         }
         PhysicalPlan::HashJoin {
@@ -525,6 +530,7 @@ pub(crate) fn build_executor<'a>(
             left_keys,
             right_keys,
             join_type,
+            identity_from,
         } => {
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
@@ -534,6 +540,7 @@ pub(crate) fn build_executor<'a>(
                 left_keys.clone(),
                 right_keys.clone(),
                 *join_type,
+                *identity_from,
             )))
         }
         PhysicalPlan::Apply {
@@ -1213,11 +1220,13 @@ impl RowIterator for EmptyRowIterator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_update(
     ctx: &ExecutionContext<'_>,
     table: TableId,
     assignments: &[(ColumnId, planner::BoundExpr)],
     source: &PhysicalPlan,
+    joined_source: bool,
     returning: Option<&BoundReturning>,
     check_exprs: &[BoundExpr],
 ) -> Result<ExecutionResult> {
@@ -1227,21 +1236,34 @@ fn execute_update(
     let result = (|| {
         let mut count = 0;
         let mut returned = Vec::new();
+        // A joined source (UPDATE ... FROM) produces the combined
+        // (target ++ FROM) row: the target prefix is the row to update, and a
+        // target row matched by multiple source rows is updated once — first
+        // match in scan order (docs/specs/subqueries.md section 8.2).
+        let mut seen_targets = std::collections::HashSet::new();
         while let Some(source_row) = executor.next()? {
             check_canceled(ctx)?;
             let identity = source_row.identity.clone().ok_or_else(|| {
                 DbError::internal("UPDATE source row did not include storage identity")
             })?;
             let mut values = source_row.row.values.clone();
-            if values.len() != schema.columns.len() {
+            if values.len() < schema.columns.len() {
                 return Err(DbError::internal(
                     "UPDATE source row shape does not match table schema",
                 ));
+            }
+            // Width cannot stand in for `joined_source`: a zero-column FROM
+            // item keeps the combined width equal to the table's.
+            if joined_source
+                && !seen_targets.insert((identity.row_id.page_num, identity.row_id.slot_num))
+            {
+                continue;
             }
             for (column, expr) in assignments {
                 let slot = column_slot(&schema, *column)?;
                 values[slot] = eval_expr(&ctx.statement, expr, &source_row)?;
             }
+            values.truncate(schema.columns.len());
             coerce_numeric_columns(&schema, &mut values)?;
             validate_row_constraints(&schema, &values)?;
             validate_check_constraints(&ctx.statement, &schema, check_exprs, &values)?;
@@ -1269,19 +1291,39 @@ fn execute_delete(
     ctx: &ExecutionContext<'_>,
     table: TableId,
     source: &PhysicalPlan,
+    joined_source: bool,
     returning: Option<&BoundReturning>,
 ) -> Result<ExecutionResult> {
     let mut executor = build_executor(ctx, source)?;
     open_executor(executor.as_mut())?;
     let result = (|| {
+        let schema = require_table(ctx.catalog, table)?;
         let mut count = 0;
         let mut returned = Vec::new();
+        // DELETE ... USING: combined source rows, deleted once per target —
+        // first match in scan order (docs/specs/subqueries.md section 8.2).
+        let mut seen_targets = std::collections::HashSet::new();
         while let Some(source_row) = executor.next()? {
             check_canceled(ctx)?;
-            let returning_values = returning.map(|_| source_row.row.values.clone());
-            let identity = source_row.identity.ok_or_else(|| {
+            if source_row.row.values.len() < schema.columns.len() {
+                return Err(DbError::internal(
+                    "DELETE source row shape does not match table schema",
+                ));
+            }
+            let identity = source_row.identity.clone().ok_or_else(|| {
                 DbError::internal("DELETE source row did not include storage identity")
             })?;
+            if joined_source
+                && !seen_targets.insert((identity.row_id.page_num, identity.row_id.slot_num))
+            {
+                continue;
+            }
+            let returning_values = returning.map(|_| {
+                let mut values = source_row.row.values.clone();
+                // RETURNING sees the deleted (old) row: the target prefix.
+                values.truncate(schema.columns.len());
+                values
+            });
             if ctx
                 .storage
                 .delete(&ctx.statement, ctx.relations.as_ref(), table, &identity.key)?

@@ -17,7 +17,8 @@ pub use bound::{
 };
 pub use explain::format_explain;
 pub use expr::{
-    AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
+    AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinSide,
+    JoinType, UnaryOp,
 };
 pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_pg_types, collect_param_types, substitute_params};
@@ -3733,6 +3734,7 @@ mod tests {
             right,
             left_keys,
             right_keys,
+            ..
         } = *source
         else {
             panic!("expected hash semi join, got {source:?}");

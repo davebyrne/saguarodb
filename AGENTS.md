@@ -66,14 +66,17 @@ precedence.
   per-table at-rest page compression; `docs/specs/compression.md`),
   `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
   `INSERT ... VALUES`, `SELECT` with the supported clauses and joins (including
-  uncorrelated subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and
-  `[NOT] EXISTS (SELECT ...)` — in expressions, and derived tables
-  `FROM (SELECT ...) AS alias [(cols)]`), `UPDATE`, `DELETE`,
+  subqueries — scalar `(SELECT ...)`, `[NOT] IN (SELECT ...)`, and
+  `[NOT] EXISTS (SELECT ...)` — in expressions, correlated in `WHERE`, the
+  select list, and `HAVING` (equality shapes run as semi/anti joins), derived
+  tables `FROM (SELECT ...) AS alias [(cols)]`, and `[LEFT JOIN] LATERAL`
+  derived tables — `docs/specs/subqueries.md`), `UPDATE`, `DELETE`,
   `INSERT`/`UPDATE`/`DELETE ... RETURNING <expr_list | *>` (produces a result set
   over each affected row — new row for INSERT/UPDATE, old row for DELETE),
   `INSERT ... ON CONFLICT [(pk)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`
   (upsert; the conflict arbiter is the primary key only — `excluded.<col>` is the
-  proposed row; `UPDATE ... FROM` and `DELETE ... USING` remain unsupported),
+  proposed row; `UPDATE ... FROM <items>` and `DELETE ... USING <items>` join
+  extra relations with the target — `docs/specs/subqueries.md`),
   `EXPLAIN`, transaction control (`BEGIN`/`START TRANSACTION
   [ISOLATION LEVEL <level>]`, `COMMIT`, `ROLLBACK`, transaction-scoped
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped

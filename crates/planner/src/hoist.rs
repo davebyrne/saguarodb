@@ -85,30 +85,26 @@ pub(crate) fn hoist_correlated_subqueries(
             table,
             assignments,
             source,
+            joined_source,
             returning,
             check_exprs,
         } => LogicalPlan::Update {
             table,
             assignments,
-            source: Box::new(restore_dml_source_shape(
-                hoist_correlated_subqueries(*source, catalog)?,
-                table,
-                catalog,
-            )?),
+            source: Box::new(hoist_dml_source(*source, table, joined_source, catalog)?),
+            joined_source,
             returning,
             check_exprs,
         },
         LogicalPlan::Delete {
             table,
             source,
+            joined_source,
             returning,
         } => LogicalPlan::Delete {
             table,
-            source: Box::new(restore_dml_source_shape(
-                hoist_correlated_subqueries(*source, catalog)?,
-                table,
-                catalog,
-            )?),
+            source: Box::new(hoist_dml_source(*source, table, joined_source, catalog)?),
+            joined_source,
             returning,
         },
         LogicalPlan::Join {
@@ -116,11 +112,13 @@ pub(crate) fn hoist_correlated_subqueries(
             right,
             condition,
             join_type,
+            identity_from,
         } => LogicalPlan::Join {
             left: Box::new(hoist_correlated_subqueries(*left, catalog)?),
             right: Box::new(hoist_correlated_subqueries(*right, catalog)?),
             condition,
             join_type,
+            identity_from,
         },
         LogicalPlan::Sort { source, order_by } => LogicalPlan::Sort {
             source: Box::new(hoist_correlated_subqueries(*source, catalog)?),
@@ -219,6 +217,25 @@ pub(crate) fn hoist_correlated_subqueries(
         | LogicalPlan::CreateView { .. }
         | LogicalPlan::DropView { .. }) => plan,
     })
+}
+
+/// Hoist a DML source. A joined source (`UPDATE ... FROM`/`DELETE ... USING`)
+/// legitimately produces the combined (target ++ FROM) row — assignments and
+/// RETURNING-side evaluation read it by slot, and Apply-appended columns sit
+/// beyond it harmlessly — so it is never narrowed. A plain source is restored
+/// to the table's exact shape when hoisting widened it.
+fn hoist_dml_source(
+    source: LogicalPlan,
+    table: common::TableId,
+    joined_source: bool,
+    catalog: &dyn CatalogManager,
+) -> Result<LogicalPlan> {
+    let hoisted = hoist_correlated_subqueries(source, catalog)?;
+    if joined_source {
+        Ok(hoisted)
+    } else {
+        restore_dml_source_shape(hoisted, table, catalog)
+    }
 }
 
 /// An UPDATE/DELETE source must produce exactly the target table's row shape
@@ -459,6 +476,9 @@ fn try_decorrelate(
                 } else {
                     JoinType::Semi
                 },
+                // Semi/anti joins emit the left ExecRow whole, identity
+                // included; no marker needed.
+                identity_from: None,
             }))
         }
         BoundExpr::InSubquery {
@@ -507,6 +527,9 @@ fn try_decorrelate(
                 } else {
                     JoinType::Semi
                 },
+                // Semi/anti joins emit the left ExecRow whole, identity
+                // included; no marker needed.
+                identity_from: None,
             }))
         }
         _ => Ok(Decorrelation::No(source)),

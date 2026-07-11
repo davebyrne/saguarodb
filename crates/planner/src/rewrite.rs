@@ -56,22 +56,26 @@ pub fn rewrite_plan_exprs(
             table,
             assignments,
             source,
+            joined_source,
             returning,
             check_exprs,
         } => PhysicalPlan::Update {
             table: *table,
             assignments: rewrite_assignments(assignments, f)?,
             source: Box::new(rewrite_plan_exprs(source, f)?),
+            joined_source: *joined_source,
             returning: rewrite_returning(returning, f)?,
             check_exprs: rewrite_vec(check_exprs, f)?,
         },
         PhysicalPlan::Delete {
             table,
             source,
+            joined_source,
             returning,
         } => PhysicalPlan::Delete {
             table: *table,
             source: Box::new(rewrite_plan_exprs(source, f)?),
+            joined_source: *joined_source,
             returning: rewrite_returning(returning, f)?,
         },
         PhysicalPlan::SeqScan {
@@ -112,11 +116,13 @@ pub fn rewrite_plan_exprs(
             right,
             condition,
             join_type,
+            identity_from,
         } => PhysicalPlan::NestedLoopJoin {
             left: Box::new(rewrite_plan_exprs(left, f)?),
             right: Box::new(rewrite_plan_exprs(right, f)?),
             condition: rewrite_opt(condition, f)?,
             join_type: *join_type,
+            identity_from: *identity_from,
         },
         PhysicalPlan::HashJoin {
             left,
@@ -124,12 +130,14 @@ pub fn rewrite_plan_exprs(
             left_keys,
             right_keys,
             join_type,
+            identity_from,
         } => PhysicalPlan::HashJoin {
             left: Box::new(rewrite_plan_exprs(left, f)?),
             right: Box::new(rewrite_plan_exprs(right, f)?),
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
             join_type: *join_type,
+            identity_from: *identity_from,
         },
         // The subplan is a separate OuterRef namespace owned by the Apply
         // operator (docs/specs/subqueries.md section 5.2): it is cloned, not

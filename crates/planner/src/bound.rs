@@ -230,6 +230,11 @@ pub enum BoundStatement {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: BoundSelect,
+        /// True when `UPDATE ... FROM` joined extra relations into the
+        /// source: source rows are the combined (target ++ FROM) row and
+        /// the executor takes the target prefix and de-duplicates by row
+        /// identity (`docs/specs/subqueries.md` §8).
+        joined_source: bool,
         returning: Option<BoundReturning>,
         /// The table's bound `CHECK` constraint expressions, evaluated over each
         /// updated (new) full row by the executor. Empty when the table has no
@@ -239,6 +244,8 @@ pub enum BoundStatement {
     Delete {
         table: TableId,
         source: BoundSelect,
+        /// True for `DELETE ... USING` (`docs/specs/subqueries.md` §8).
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
     Explain(Box<BoundStatement>),

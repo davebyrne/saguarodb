@@ -1494,6 +1494,7 @@ fn collect_bound_statement_tables(
             table,
             assignments,
             source,
+            joined_source: _,
             returning,
             check_exprs,
         } => {
@@ -1512,6 +1513,7 @@ fn collect_bound_statement_tables(
         BoundStatement::Delete {
             table,
             source,
+            joined_source: _,
             returning,
         } => {
             record_bound_relation_version(relations, *table, None)?;

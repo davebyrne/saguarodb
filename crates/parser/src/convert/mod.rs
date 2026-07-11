@@ -21,7 +21,8 @@ use ddl::{
 use dml::{convert_copy, convert_delete, convert_insert};
 use expr::convert_expr;
 use query::{
-    convert_assignment, convert_query, convert_returning, table_name_from_table_with_joins,
+    convert_assignment, convert_query, convert_returning, convert_table_with_joins,
+    table_name_from_table_with_joins,
 };
 
 pub fn parse_statement(sql: &str) -> Result<Statement> {
@@ -172,9 +173,20 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             returning,
             or,
         } => {
-            if from.is_some() || or.is_some() {
+            if or.is_some() {
                 return unsupported("unsupported UPDATE form");
             }
+            let from = match from {
+                None => Vec::new(),
+                // The standard (PostgreSQL) placement, after SET.
+                Some(sql::UpdateTableFromKind::AfterSet(tables)) => tables
+                    .iter()
+                    .map(convert_table_with_joins)
+                    .collect::<Result<Vec<_>>>()?,
+                Some(sql::UpdateTableFromKind::BeforeSet(_)) => {
+                    return unsupported("UPDATE FROM before SET is not supported");
+                }
+            };
 
             let table = table_name_from_table_with_joins(&table)?;
             let assignments = assignments
@@ -186,6 +198,7 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
             Ok(Statement::Update {
                 table,
                 assignments,
+                from,
                 filter,
                 returning: convert_returning(&returning)?,
             })

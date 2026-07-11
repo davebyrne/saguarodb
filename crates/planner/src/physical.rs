@@ -9,7 +9,7 @@ use common::{
 
 use crate::{
     AggregateExpr, ApplyKind, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning,
-    JoinType, LogicalPlan, SetOp,
+    JoinSide, JoinType, LogicalPlan, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +100,12 @@ pub enum PhysicalPlan {
         table: TableId,
         assignments: Vec<(ColumnId, BoundExpr)>,
         source: Box<PhysicalPlan>,
+        /// `UPDATE ... FROM`: source rows are the combined (target ++ FROM)
+        /// row; the executor takes the target prefix and de-duplicates by row
+        /// identity (`docs/specs/subqueries.md` §8.2). Width cannot stand in
+        /// for this flag — a zero-column FROM item keeps the combined width
+        /// equal to the table's.
+        joined_source: bool,
         returning: Option<BoundReturning>,
         /// Bound `CHECK` expressions enforced per updated row (see
         /// `BoundStatement::Update`).
@@ -108,6 +114,8 @@ pub enum PhysicalPlan {
     Delete {
         table: TableId,
         source: Box<PhysicalPlan>,
+        /// `DELETE ... USING` (§8.2); see `Update::joined_source`.
+        joined_source: bool,
         returning: Option<BoundReturning>,
     },
     SeqScan {
@@ -145,6 +153,9 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Option<BoundExpr>,
         join_type: JoinType,
+        /// `Some(Left)` on a DML-source join spine: combined rows carry the
+        /// left side's row identity (`docs/specs/subqueries.md` §8.1).
+        identity_from: Option<JoinSide>,
     },
     /// Inner equi-join. `left_keys`/`right_keys` are paired column slots,
     /// relative to the left and right child rows respectively, that must be
@@ -157,6 +168,8 @@ pub enum PhysicalPlan {
         /// `Inner`, `Semi`, or `Anti`; outer joins never take the hash path.
         /// Semi/anti output the left side only.
         join_type: JoinType,
+        /// `Some(Left)` on a DML-source join spine (§8.1).
+        identity_from: Option<JoinSide>,
     },
     Filter {
         source: Box<PhysicalPlan>,
@@ -347,22 +360,26 @@ fn physical_plan_inner(
             table,
             assignments,
             source,
+            joined_source,
             returning,
             check_exprs,
         } => Ok(PhysicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
             source: Box::new(physical_plan_inner(source, catalog)?),
+            joined_source: *joined_source,
             returning: returning.clone(),
             check_exprs: check_exprs.clone(),
         }),
         LogicalPlan::Delete {
             table,
             source,
+            joined_source,
             returning,
         } => Ok(PhysicalPlan::Delete {
             table: *table,
             source: Box::new(physical_plan_inner(source, catalog)?),
+            joined_source: *joined_source,
             returning: returning.clone(),
         }),
         LogicalPlan::Scan { table, filter } => plan_scan(*table, filter.clone(), catalog),
@@ -376,7 +393,8 @@ fn physical_plan_inner(
             right,
             condition,
             join_type,
-        } => plan_join(left, right, condition, *join_type, catalog),
+            identity_from,
+        } => plan_join(left, right, condition, *join_type, *identity_from, catalog),
         LogicalPlan::Apply {
             input,
             subplan,
@@ -458,6 +476,7 @@ fn plan_join(
     right: &LogicalPlan,
     condition: &Option<BoundExpr>,
     join_type: JoinType,
+    identity_from: Option<JoinSide>,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<PhysicalPlan> {
     let left_plan = physical_plan_inner(left, catalog)?;
@@ -484,6 +503,7 @@ fn plan_join(
                 left_keys: split.left_keys,
                 right_keys: split.right_keys,
                 join_type,
+                identity_from,
             };
             return Ok(match split.residual {
                 Some(predicate) => PhysicalPlan::Filter {
@@ -500,6 +520,7 @@ fn plan_join(
         right: Box::new(right_plan),
         condition: condition.clone(),
         join_type,
+        identity_from,
     })
 }
 

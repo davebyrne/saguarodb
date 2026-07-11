@@ -44,11 +44,13 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             right,
             condition,
             join_type,
+            identity_from,
         } => LogicalPlan::Join {
             left: Box::new(simplify_logical(*left)),
             right: Box::new(simplify_logical(*right)),
             condition: condition.map(fold_expr),
             join_type,
+            identity_from,
         },
         // Apply nodes are created by the hoisting pass, which runs after
         // simplification; recurse defensively so a future reordering cannot
@@ -174,6 +176,7 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             table,
             assignments,
             source,
+            joined_source,
             returning,
             check_exprs,
         } => LogicalPlan::Update {
@@ -183,16 +186,19 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
                 .map(|(column, expr)| (column, fold_expr(expr)))
                 .collect(),
             source: Box::new(simplify_logical(*source)),
+            joined_source,
             returning,
             check_exprs: check_exprs.into_iter().map(fold_expr).collect(),
         },
         LogicalPlan::Delete {
             table,
             source,
+            joined_source,
             returning,
         } => LogicalPlan::Delete {
             table,
             source: Box::new(simplify_logical(*source)),
+            joined_source,
             returning,
         },
         ddl @ (LogicalPlan::CreateTable { .. }

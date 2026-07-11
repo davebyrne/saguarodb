@@ -219,6 +219,16 @@ impl JoinType {
     }
 }
 
+/// Which side's physical row identity a join's combined rows carry
+/// (`docs/specs/subqueries.md` §8.1). Set only on the join spine of an
+/// `UPDATE ... FROM` / `DELETE ... USING` source, where the target table is
+/// always planted as the left input; plain query joins carry no identity.
+/// Only `Left` exists because nothing plants a target on the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+}
+
 /// What an `Apply` (dependent join) computes per outer row from its correlated
 /// subplan, appended as one column after the input row
 /// (`docs/specs/subqueries.md` §5.1). The hoisting pass replaces the original

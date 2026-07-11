@@ -740,7 +740,7 @@ fn collect_from_binding_ids(from: &BoundFrom, output: &mut Vec<BindingId>) {
     }
 }
 
-fn bind_from_item(
+pub(super) fn bind_from_item(
     catalog: &dyn CatalogManager,
     ctx: &mut BindContext,
     item: &FromItem,

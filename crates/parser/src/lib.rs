@@ -837,18 +837,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_update_from_and_delete_using() {
-        // `UPDATE ... FROM` and `DELETE ... USING` (joins into the write target) are
-        // intentionally not supported; they are rejected as unsupported forms.
-        let err = parse("update users set name = 'x' from accounts where users.id = accounts.id")
-            .unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::SyntaxError);
+    fn parses_update_from_and_delete_using() {
+        // `UPDATE ... FROM` and `DELETE ... USING` join extra relations into
+        // the write target (docs/specs/subqueries.md section 8).
+        let Statement::Update { table, from, .. } =
+            parse("update users set name = 'x' from accounts where users.id = accounts.id")
+                .unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        assert_eq!(table, "users");
+        assert_eq!(from.len(), 1);
+        assert!(matches!(from[0], FromItem::Table { .. }));
 
-        let err =
-            parse("delete from users using accounts where users.id = accounts.id").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::SyntaxError);
+        let Statement::Delete { table, using, .. } =
+            parse("delete from users using accounts where users.id = accounts.id").unwrap()
+        else {
+            panic!("expected DELETE");
+        };
+        assert_eq!(table, "users");
+        assert_eq!(using.len(), 1);
     }
 
     #[test]
@@ -1416,6 +1424,7 @@ mod tests {
                     column: "name".to_string(),
                     value: Expr::Literal(Value::Text("Ada".to_string())),
                 }],
+                from: Vec::new(),
                 filter: None,
                 returning: None,
             }

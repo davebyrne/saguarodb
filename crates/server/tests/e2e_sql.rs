@@ -3595,6 +3595,175 @@ async fn e2e_correlated_nested_volatile_subquery_not_memoized() {
 }
 
 #[tokio::test]
+async fn e2e_update_from_and_delete_using() {
+    // docs/specs/subqueries.md section 8: the source is an inner join of the
+    // target with the FROM/USING relations; a target row matched by multiple
+    // source rows is modified once (first match in scan order).
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text, plan text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text, amount integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into users (id, name, plan) values \
+             (1, 'Ada', 'free'), (2, 'Grace', 'free'), (3, 'Alan', 'free')",
+        )
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into accounts (id, owner, amount) values \
+             (10, 'Ada', 100), (11, 'Ada', 5), (20, 'Grace', 50)",
+        )
+        .await
+        .unwrap();
+
+    // SET reads the FROM table; Ada matches TWO accounts but is updated once
+    // (count 1 per matched user); Alan has no match and stays untouched.
+    server
+        .simple_query(
+            "update users set plan = 'paid-' || accounts.owner \
+             from accounts where accounts.owner = users.name",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id, plan from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("paid-Ada".to_string())],
+            vec![Some("2".to_string()), Some("paid-Grace".to_string())],
+            vec![Some("3".to_string()), Some("free".to_string())],
+        ]
+    );
+
+    // RETURNING sees the updated (new) target row.
+    let rows = server
+        .simple_query(
+            "update users set plan = 'vip' from accounts \
+             where accounts.owner = users.name and accounts.amount > 60 \
+             returning id, plan",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("vip".to_string())]]
+    );
+
+    // Multiple FROM items join through WHERE: only Ada owns two accounts.
+    server
+        .simple_query(
+            "update users set plan = 'dual' from accounts a, accounts b \
+             where a.owner = b.owner and a.id < b.id and a.owner = users.name",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where plan = 'dual'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Explicit JOIN items are rejected with a clear error (the engine's
+    // non-first-join slot limitation; comma items + WHERE express the same).
+    let err = server
+        .simple_query(
+            "update users set plan = 'x' \
+             from accounts a join accounts b on a.owner = b.owner \
+             where a.owner = users.name",
+        )
+        .await
+        .err()
+        .expect("explicit JOIN in UPDATE FROM should be rejected");
+    assert!(err.message.contains("0A000"), "{}", err.message);
+
+    // DELETE ... USING with dedupe and RETURNING of the deleted (old) row.
+    let rows = server
+        .simple_query(
+            "delete from users using accounts \
+             where accounts.owner = users.name returning id, plan",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("dual".to_string())],
+            vec![Some("2".to_string()), Some("paid-Grace".to_string())],
+        ]
+    );
+    let rows = server
+        .simple_query("select id from users order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // Mixing a correlated subquery into the joined WHERE still works.
+    server
+        .simple_query("insert into users (id, name, plan) values (4, 'Ada', 'free')")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "update users set plan = 'both' from accounts \
+             where accounts.owner = users.name and exists \
+             (select 1 from accounts a2 where a2.owner = users.name and a2.amount > 60)",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select id from users where plan = 'both'")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("4".to_string())]]);
+
+    // A LATERAL item after another FROM item: the identity spine continues
+    // below the lateral Apply (a missing arm here used to lose row identity).
+    server
+        .simple_query(
+            "update users set plan = l.t from accounts a, \
+             lateral (select a.owner || '!' as t) l where a.owner = users.name",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select plan from users where id = 4")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("Ada!".to_string())]]);
+
+    // A zero-column FROM item still counts as a joined source: each target is
+    // updated once, not once per source row (width cannot stand in for the
+    // joined flag).
+    let rows = server
+        .simple_query("update users set plan = 'zc' from (select from accounts) d returning id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows.len(),
+        2,
+        "each surviving user must be updated exactly once, got {rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn e2e_lateral_derived_tables() {
     // docs/specs/subqueries.md section 7: LATERAL derived tables see their
     // left siblings and re-execute per outer row.

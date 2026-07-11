@@ -246,7 +246,7 @@ pub(super) fn convert_select_item(item: &sql::SelectItem) -> Result<SelectItem> 
     }
 }
 
-fn convert_table_with_joins(table: &sql::TableWithJoins) -> Result<FromItem> {
+pub(super) fn convert_table_with_joins(table: &sql::TableWithJoins) -> Result<FromItem> {
     let mut item = convert_table_factor(&table.relation)?;
     for join in &table.joins {
         item = convert_join(item, join)?;

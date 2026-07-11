@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use common::{ColumnInfo, DbError, ExecRow, Result, Row, StatementContext, Value};
-use planner::{BoundExpr, JoinType};
+use planner::{BoundExpr, JoinSide, JoinType};
 
 use crate::ops::predicate_matches;
 use crate::query::{PlanExecutor, collect_all};
@@ -12,6 +12,10 @@ pub struct NestedLoopJoinOp<'a> {
     right: Box<dyn PlanExecutor + 'a>,
     condition: Option<BoundExpr>,
     join_type: JoinType,
+    /// `Some(Left)` on a DML-source spine: combined rows carry the left
+    /// side's row identity (`docs/specs/subqueries.md` §8.1). The identity
+    /// side is never null-padded — DML spines are inner/cross joins.
+    identity_from: Option<JoinSide>,
     output_schema: Vec<ColumnInfo>,
     rows: Vec<ExecRow>,
     index: usize,
@@ -26,6 +30,7 @@ impl<'a> NestedLoopJoinOp<'a> {
         right: Box<dyn PlanExecutor + 'a>,
         condition: Option<BoundExpr>,
         join_type: JoinType,
+        identity_from: Option<JoinSide>,
     ) -> Self {
         let left_width = left.output_schema().len();
         let right_width = right.output_schema().len();
@@ -39,6 +44,7 @@ impl<'a> NestedLoopJoinOp<'a> {
             right,
             condition,
             join_type,
+            identity_from,
             output_schema,
             rows: Vec::new(),
             index: 0,
@@ -83,12 +89,15 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
         for left in &left_rows {
             let mut matched_left = false;
             for (right_index, right) in right_rows.iter().enumerate() {
-                let joined = join_row_refs(left, right);
+                let mut joined = join_row_refs(left, right);
                 if self.join_type == JoinType::Cross
                     || join_condition_matches(&self.ctx, &self.condition, &joined)?
                 {
                     matched_left = true;
                     matched_right[right_index] = true;
+                    if self.identity_from == Some(JoinSide::Left) {
+                        joined.identity = left.identity.clone();
+                    }
                     self.rows.push(joined);
                 }
             }
@@ -181,6 +190,8 @@ pub struct HashJoinOp<'a> {
     right_keys: Vec<usize>,
     /// `Inner`, `Semi`, or `Anti`. Outer joins never take the hash path.
     join_type: JoinType,
+    /// `Some(Left)` on a DML-source spine (`docs/specs/subqueries.md` §8.1).
+    identity_from: Option<JoinSide>,
     output_schema: Vec<ColumnInfo>,
     rows: Vec<ExecRow>,
     index: usize,
@@ -193,6 +204,7 @@ impl<'a> HashJoinOp<'a> {
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
         join_type: JoinType,
+        identity_from: Option<JoinSide>,
     ) -> Self {
         let mut output_schema = left.output_schema().to_vec();
         if !join_type.is_semi_or_anti() {
@@ -204,6 +216,7 @@ impl<'a> HashJoinOp<'a> {
             left_keys,
             right_keys,
             join_type,
+            identity_from,
             output_schema,
             rows: Vec::new(),
             index: 0,
@@ -253,8 +266,11 @@ impl PlanExecutor for HashJoinOp<'_> {
             };
             if let Some(matches) = table.get(&key) {
                 for &right_index in matches {
-                    self.rows
-                        .push(join_row_refs(left, &right_rows[right_index]));
+                    let mut joined = join_row_refs(left, &right_rows[right_index]);
+                    if self.identity_from == Some(JoinSide::Left) {
+                        joined.identity = left.identity.clone();
+                    }
+                    self.rows.push(joined);
                 }
             }
         }

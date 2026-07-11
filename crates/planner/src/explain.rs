@@ -134,6 +134,7 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             right,
             join_type,
             condition,
+            ..
         } => {
             output.push_str(&format!(
                 "{padding}NestedLoopJoin type={join_type:?} condition={}\n",
