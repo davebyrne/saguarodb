@@ -30,8 +30,11 @@ and rationale; current public behavior is governed by this document,
 
 ### Non-goals and related additions
 
-- **Transactional DDL** — DDL stays non-transactional, commits immediately, and
-  is rejected inside an explicit transaction block. Statement-level guard choice
+- **General transactional DDL** — CREATE, DROP, and ALTER stay non-transactional,
+  commit immediately, and are rejected inside an explicit transaction block.
+  Transactional `TRUNCATE` is the deliberately narrow relation-generation
+  exception specified in `docs/specs/table-locks.md`; it does not make catalog
+  names or arbitrary schema changes transactional. Statement-level guard choice
   is owned by the server and is statement-specific.
 - **Time-travel / as-of queries.**
 - **Savepoints / sub-transactions** — originally deferred from the base MVCC
@@ -184,8 +187,9 @@ additive) and Stage 1 is a correct, useful, shippable waypoint.
 
 **Decision 6 — DDL: non-transactional initially.**
 DDL commits immediately and is rejected inside an explicit transaction block.
-DDL uses the exclusive checkpoint/DDL guard so catalog rollback cannot overwrite
-another committed DDL change and index builds see a stable physical view. *Chosen
+DDL uses the shared writer guard, table locks, and a catalog-DDL mutex so catalog
+rollback cannot overwrite another committed DDL change and index builds see a
+stable target-table physical view. *Chosen
 over* transactional DDL, which requires making the catalog itself MVCC
 (versioned, abort-undoable) plus transactional file lifecycle — a second large
 subsystem orthogonal to data MVCC. Defers cleanly and additively.
@@ -368,7 +372,7 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
   WAL is still conservatively truncated) re-derives it conservatively as
   `min(allocation_boundary, oldest_non_committed_retained_xid)`.
 - **The vacuum floor `B` bounds snapshot pruning** (Milestone F4c). A FULL VACUUM
-  pass (every user table, under the exclusive guard) removes **every on-disk
+  pass (holding `Share` on every user table) removes **every on-disk
   reference** to every aborted transaction `< B` — both as a **creator** and as a
   **deleter**:
   - **As creator** (`xmin = T`), the tuple is **reclaimed** (heap + index;
@@ -389,11 +393,12 @@ durable CLOG snapshot (above) — **not** WAL retention — enforces this:
   below the floor — vacuously correct, no surviving reference). An aborted transaction
   `>= B` keeps its explicit `Aborted` entry. The dropping is gated STRICTLY on a
   CLOG-recorded `Aborted` status.
-  - **Computing/advancing `B`.** `B = next_txn_id` captured at the *start* of a full
-    pass under the exclusive guard, set as `vacuum_floor = max(vacuum_floor, B)`
-    *after* the pass. No user writer can allocate an id during the pass. TOAST cleanup
-    may allocate committed maintenance xids while the pass runs, but those ids are
-    `>= B`, so this floor advance does not cover them. Only a FULL pass advances it
+  - **Computing/advancing `B`.** At the start of a full pass, after all target
+    `Share` locks are held, capture `B = min(next_txn_id, oldest_active_xid)` where
+    the absent-active case contributes `next_txn_id`; set
+    `vacuum_floor = max(vacuum_floor, B)` after the pass. An xid allocated before
+    lock acquisition and waiting behind VACUUM is active and therefore prevents
+    `B` from passing it. Xids allocated after capture are `>= B`. Only a FULL pass advances it
     (on-demand `VACUUM` with no table, and the checkpoint auto-prune over all user
     tables — F4b); a single-table `VACUUM t` does **not** (other tables' aborted
     tuples survive). The catalog is not MVCC-versioned, so user-table tuples are the
@@ -659,10 +664,10 @@ design, because index entries accumulate per version as well as heap tuples.
   (`ActiveTxnRegistry::oldest_xmin`), or — when no snapshot is advertised — the next
   id to be assigned (`next_txn_id`); nothing older than the future can be needed.
   Captured **once** at the start of a VACUUM pass (`ServerComponents::gc_horizon`,
-  F1). It only advances as snapshots are released; a concurrent `BEGIN`/capture can
-  only advertise an `xmin >= horizon` once any already-finished transaction is
-  settled-past (see the race-free argument below), so it never lowers the captured
-  horizon.
+  F1). The captured value does not change during the pass. A transaction allocated
+  earlier but taking its first snapshot mid-pass may advertise `xmin < horizon`;
+  safety for that case comes from settled transaction visibility, not monotonic
+  snapshot xmin (see the race-free argument below).
   - **Why not the oldest active transaction id.** VACUUM's committed-delete branch
     reclaims a version when `xmax < horizon`, which is safe only when
     `horizon <= every live snapshot's xmin`. A snapshot freezes its `xmin` at
@@ -688,16 +693,17 @@ design, because index entries accumulate per version as well as heap tuples.
     released at commit/abort); the autocommit read/write paths advertise across the
     statement's execution.
   - **Race-freedom** (capture vs. horizon): at the instant `gc_horizon` reads the
-    min advertised `xmin` `H` under the registry latch, every snapshot that is live
-    OR being captured has `xmin >= H` or is not-yet-usable. A capture publishes
+    min advertised `xmin` `H` under the registry latch, every snapshot already live
+    or being captured is represented in that minimum or is not yet usable. A capture publishes
     `xmins[xmin]++` in the *same* latched critical section that reads `active`, and
     the snapshot is not returned/usable until that section completes; `gc_horizon`
     reads `oldest_xmin()` under the same latch, so the mutex total order leaves no
-    window where the horizon exceeds a usable snapshot's `xmin`. A snapshot published
-    **after** the horizon read derives its `xmin` from an `active`/`next_txn_id`
-    state in which any txn already gone-from-active — i.e. any committed deleter the
-    horizon could have reclaimed — is settled-past, so that later snapshot's `xmin`
-    is above any reclaimed `xmax` and it cannot see a reclaimed version live. This
+    window where an already-usable snapshot is omitted. For a snapshot published
+    **after** the horizon read, every committed deleter `X < H` used for reclamation
+    is already settled, absent from the new snapshot's `xip`, below its `xmax`, and
+    recorded Committed in CLOG. Its delete is therefore effective in the later
+    snapshot even if an old transaction id makes that snapshot's `xmin < H`. An
+    aborted creator is invisible to every snapshot regardless of age. This
     mirrors the existing `register_allocated`/capture latch discipline that closes
     the torn-snapshot window.
 - **Reclaimability** (`common::is_dead_to_all(xmin, xmax, infomask, horizon,
@@ -858,25 +864,28 @@ design, because index entries accumulate per version as well as heap tuples.
   `StatementClass::Maintenance` — it does **not** bind or plan — and rejected inside an
   explicit transaction block (like DDL, with `SqlState::FeatureNotSupported`, since
   `VACUUM` is non-transactional). `QueryService::run_vacuum` resolves the target
-  table(s), then acquires the **exclusive** checkpoint guard (`begin_checkpoint`) for
-  the whole pass, captures `gc_horizon()` **once, after the guard is held**, and calls
+  table(s), allocates/registers one maintenance xid, acquires the shared writer
+  guard and xid-owned `Share` on every target, then
+  captures `gc_horizon()` **once, after those locks are held**, and calls
   `engine.vacuum(schema, horizon)` for ordinary targets; the command tag is `VACUUM`.
   For TOAST-enabled tables, it first asks storage which external value ids are owned
   by parent tuples that full VACUUM would prune, deletes visible hidden chunks for
-  those value ids in a real committed maintenance transaction when needed, then calls
-  `engine.vacuum_after_toast_cleanup(schema, horizon)` for the parent and vacuums the
-  hidden TOAST relation. This preserves the parent tuple bytes needed to discover
-  chunk ownership until the chunk deletes are durable.
-  **No data loss (the horizon-under-the-guard argument):** under the exclusive guard no
-  writer runs, so no committed-deleter appears mid-pass; and the horizon — captured
-  after acquiring the guard — is the minimum `xmin` advertised by any live snapshot,
-  **including lock-free readers** (which advertise their `xmin`, §9). Every reclaimed
+  those value ids using that same maintenance xid when needed, appends/flushes its
+  one Commit, and only then calls `engine.vacuum_after_toast_cleanup` for the parent
+  and vacuums the hidden TOAST relation. The xid-keyed relation grants remain held
+  by the VACUUM owner token through that post-commit prune phase. This preserves
+  the parent tuple bytes needed to discover chunk ownership until deletes are durable.
+  **No data loss (the horizon-under-the-lock argument):** target `Share` locks exclude
+  target writers, so no committed deleter appears mid-pass; and the horizon — captured
+  after acquiring the locks — is the minimum `xmin` advertised by any live snapshot,
+  including readers (which advertise their `xmin`, §9). Every reclaimed
   version has `xmax < horizon`, i.e. its delete committed before every live snapshot's
-  `xmin`, so no current snapshot can see it live, and any reader that starts mid-pass
-  freezes `xmin >= horizon` (the deleter is in its settled past). Capturing the horizon
-  *after* the guard is load-bearing: a concurrent writer cannot then advance it, and it
-  already accounts for every reader advertised at that instant. VACUUM therefore never
-  reclaims a version any snapshot needs. This is exactly why the GC-horizon fix
+  `xmin`, so no current snapshot can see it live. A reader starting mid-pass may
+  advertise a lower xmin when its transaction id was allocated earlier, but the
+  reclaimed deleter is already settled Committed, absent from its new `xip`, and
+  therefore effective in that snapshot. Capturing after target locks is load-bearing:
+  no new target deleter can appear during the pass. VACUUM therefore never reclaims
+  a version any snapshot needs. This is exactly why the GC-horizon fix
   (minimum advertised `xmin`, not oldest active id) had to land before VACUUM went live.
 - **Triggering**: an on-demand `VACUUM` command (F4a, live) **plus auto-prune folded
   into the checkpoint behind a threshold** (F4b, live). A server-wide counter
@@ -893,7 +902,9 @@ design, because index entries accumulate per version as well as heap tuples.
   snapshot can see are reclaimed). Opportunistic pruning during scans is deferred.
 - **F4c — CLOG-snapshot pruning for reclaimed aborts (live).** A FULL VACUUM pass
   (on-demand `VACUUM` with no table, or the auto-prune over all tables) advances the
-  **vacuum floor** `B = next_txn_id` captured under the guard at the start of the pass.
+  **vacuum floor** `B = min(next_txn_id, oldest_active_xid)` captured at the start
+  of the pass after its exclusion locks are held (no active xid contributes
+  `next_txn_id`).
   A full pass leaves **no surviving on-disk reference** to any aborted txn below `B`,
   as creator OR deleter: it **reclaims** every aborted-**creator** tuple (heap + index;
   no age requirement) and **abort-cleans** every aborted-**deleter** stamp (resetting
@@ -995,12 +1006,12 @@ reference current files.
     torn relative to `next_txn_id`; id allocation and registration are done under
     the same latch) and reads via the buffer pool's per-frame latches, skipping an
     in-flight writer's uncommitted versions by MVCC visibility. Writers serialize:
-    a write transaction acquires the existing exclusive write guard **lazily** on
-    its first write statement and holds the owned guard on the `Session` for the
-    whole write-transaction, releasing it at `COMMIT`/`ROLLBACK`/disconnect. A
-    read-only explicit transaction never takes the write guard, so it stays
-    concurrent. Autocommit write = acquire for the one statement, release at the
-    implicit commit. DDL commits immediately (non-transactional, §4 Decision 6)
+    an explicit transaction acquires the shared checkpoint-participant guard
+    before its first retained table/sequence lock, even for a read, and holds it
+    through `COMMIT`/`ROLLBACK`/disconnect. This preserves guard-before-object
+    ordering if it later writes. Autocommit reads remain guard-free; autocommit
+    writes hold the shared side for one statement. DDL commits immediately
+    (non-transactional, §4 Decision 6)
     and is **rejected inside an explicit transaction block**; the current server
     spec owns the statement-specific guard policy. This is Stage 1: many readers
     concurrent with at most one writer; concurrent writers and write-write
@@ -1106,8 +1117,8 @@ in-progress conflicts — see §7.3 and `docs/specs/deadlock.md`.)
   line-pointer reclaim.** **F4a — On-demand `VACUUM` (live).** `engine.vacuum`
   orchestrates F2b → F3a → F3b in order; the `VACUUM [table]` command
   (`StatementClass::Maintenance`, parsed before sqlparser, rejected in a transaction
-  block) runs under the exclusive checkpoint guard with the GC horizon captured once
-  after the guard — the first real reclamation behavior change (§9). **F4b —
+  block) runs under the shared writer guard and target `Share` locks with the GC
+  horizon captured once afterward (§9). **F4b —
   auto-prune at checkpoint (live).** A checkpoint folds a VACUUM pass over every user
   table into itself when `dead_rows_since_vacuum >= --auto-vacuum-dead-rows` (committed
   dead versions since the last auto-prune; default `10000`, `0` disables), under the
@@ -1118,7 +1129,7 @@ in-progress conflicts — see §7.3 and `docs/specs/deadlock.md`.)
   **unconditional** (it drops everything below `checkpoint_lsn`), relying on the durable
   CLOG snapshot `clog.dat` — written by `persist_clog` before the truncation — to
   remember every aborted outcome. A full VACUUM pass advances the **vacuum floor** `B`
-  (= `next_txn_id` at the start of the pass, captured under the guard); the next
+  (`min(next_txn_id, oldest_active_xid)` at the start of the pass); the next
   checkpoint's `persist_clog` then drops the explicit `Aborted` entry of — and floats the
   implicit-committed floor past — aborted transactions `< B`, whose on-disk versions the
   pass reclaimed, while keeping the entry of un-vacuumed aborts. The reclamation is
@@ -1301,9 +1312,9 @@ savepoints via sub-transaction xids (optional, deferred).
     a single root-pointed entry then cannot serve all snapshots (the planner consumes
     equality predicates into the index range and does not re-check them —
     `planner/src/physical.rs` `residual_filter`). So `create_index` runs its backfill
-    under the **EXCLUSIVE guard** (`begin_checkpoint`, like VACUUM — taken in the
-    server's `autocommit_write` for `CREATE INDEX`) so the physical chain view is
-    stable, with the **GC horizon** captured once under that guard and threaded in
+    under a target-table **`Share` lock** plus the shared writer guard so the physical
+    chain view is stable and checkpoint is excluded, with the **GC horizon** captured
+    once under those guards and threaded in
     (`SchemaOperations::create_index(ctx, schema, gc_horizon)`). For each chain
     reachable from the PK index it examines the physically-present versions
     (`collect_chain_versions`): if TWO OR MORE are **not** `is_dead_to_all` at the
@@ -1450,8 +1461,10 @@ savepoints via sub-transaction xids (optional, deferred).
   correct.
 - **Per-tuple CLOG-probe contention** — reducing repeated CLOG probes on hot
   tuples (beyond the `infomask` hint bits) under concurrent writers.
-- **Transactional DDL** — requires catalog MVCC + transactional file lifecycle;
-  additive later, does not invalidate data MVCC.
+- **General transactional DDL** — requires catalog MVCC + transactional file
+  lifecycle; additive later, does not invalidate data MVCC. Transactional
+  `TRUNCATE` uses targeted generation undo and is the narrow exception described
+  in `docs/specs/table-locks.md`.
 - **Serializable (SSI)** — layer predicate/SIREAD tracking on snapshot isolation.
 - ~~**Savepoints / sub-transactions**~~ — **implemented** via sub-transaction
   xids + CLOG, no undo (`docs/specs/savepoints.md`).

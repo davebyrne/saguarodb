@@ -104,7 +104,8 @@ and `parser`/binder can reference it without depending on `compress`.
   `ALTER` form in the grammar; every other `ALTER` remains rejected.
   Semantics in §8. Classified `StatementClass::Maintenance` and dispatched
   like `VACUUM`: autocommit only, rejected inside a transaction block, runs
-  under the exclusive statement guard, and does not bind or plan — the
+  under the shared writer guard plus catalog publication gate and target
+  `AccessExclusive` lock, and does not bind or plan — the
   binder never sees `AlterTableSetCompression`. The compression value
   (`'none'`/`'zstd'`) is validated at parse time; table existence is
   checked by `run_alter_table_compression` itself once it holds the guard.
@@ -307,8 +308,8 @@ envelopes are self-describing and mixed encodings are legal.
 
 ## 8. `ALTER TABLE ... SET (compression = ...)` semantics
 
-Runs autocommit-only under the exclusive statement guard (writers drained,
-like `VACUUM` / `CREATE INDEX` backfill). Classified `StatementClass::Maintenance`
+Runs autocommit-only under the shared writer guard, catalog publication gate, and
+target `AccessExclusive` lock. Classified `StatementClass::Maintenance`
 and dispatched before binding, exactly like `VACUUM` — the binder never sees
 `AlterTableSetCompression`. Ordered steps:
 
@@ -318,11 +319,11 @@ Steps 5-8 are post-durable-commit cleanup: any error there is fatal
 (`fatal_after_durable_commit` — logs, best-effort WAL flush, `process::exit`)
 rather than a returned statement error, exactly like every other autocommit
 write path (`docs/specs/crates/server.md`), because the DDL already committed
-and misreporting it as failed would be worse than crashing. The exclusive
-guard covers steps 1-7 and is released before the post-commit checkpoint
+and misreporting it as failed would be worse than crashing. The shared writer,
+table-lock, and catalog-DDL guards cover steps 2-7 and are released before the post-commit checkpoint
 trigger runs (`record_commit_and_maybe_checkpoint_after_durable_commit`,
-`docs/specs/crates/server.md`) — that call takes its own exclusive guard, so
-calling it earlier would deadlock — which is also what makes the rewrite's
+`docs/specs/crates/server.md`) — that call may take the exclusive checkpoint
+guard, so calling it earlier would deadlock — which is also what makes the rewrite's
 WAL activity in step 6 count toward `--checkpoint-wal-bytes` right away
 instead of waiting on an unrelated later commit to notice it.
 
@@ -337,8 +338,9 @@ dictionary file, which is harmless and whose id startup reserves (§7).
    parser, `SqlState::FeatureNotSupported` otherwise). Table existence is
    NOT checked here (there is no bind step); `run_alter_table_compression`
    checks it below, once it holds the guard.
-2. Take the exclusive guard; look up the table by name
-   (`SqlState::UndefinedTable` if it does not exist).
+2. Look up the table, allocate/register the maintenance xid, acquire the shared
+   writer guard and target `AccessExclusive`, then revalidate under the
+   catalog publication gate (`SqlState::UndefinedTable` if it no longer exists).
 3. If the new setting is `zstd` and the table has data: train a dictionary
    from current heap page images; persist the dict file (§7). If training
    is skipped/fails, `active_dict_id` becomes `None`.
@@ -367,14 +369,15 @@ dictionary file, which is harmless and whose id startup reserves (§7).
    being durable, i.e. silent corruption on recovery. A resident page that
    was ALREADY dirty (from other in-flight work) is likewise FPI-logged and
    re-stamped by this pass.
-7. `flush_dirty_pages()` flushes the now-dirty pages through the buffer
+7. `flush_dirty_pages_for_files(target_file_ids)` flushes only the rewritten pages through the buffer
    pool: `PageStore::write_page` re-encodes each flushable dirty page under
    the just-installed config — the envelope encode step (§5) runs here.
-   Then `store.sync_all()`, then `buffer_pool.mark_all_clean()` —
+   Then `store.sync_files(target_file_ids)`, then
+   `buffer_pool.mark_files_clean(target_file_ids)` —
    `flush_dirty_pages` does not itself mark frames clean (the caller fsyncs
    via the store and only then calls `mark_all_clean`); skipping it would
-   not lose data, but would leave the rewrite's pages dirty and get them
-   redundantly re-written at the next checkpoint. Release the guard, then
+   not lose data, but would leave the rewrite pages dirty. Unrelated writer frames
+   are untouched by all three calls. Release the guards, then
    trigger the post-commit checkpoint accounting, then return command tag
    `ALTER TABLE`.
 

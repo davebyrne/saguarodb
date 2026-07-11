@@ -891,11 +891,11 @@ pub trait FlushPolicy: Send + Sync {
 
 ## Concurrency Controller
 
-The controller is the **writer-vs-exclusive-maintenance/DDL** coordination primitive. As of Milestone E2b (`mvcc.md` §7.1 Stage 2, §10 E2b) the lock is **inverted**: DML writers take the SHARED side, while checkpoint, VACUUM, and autocommit DDL take the EXCLUSIVE side. Many write-transactions run concurrently while an exclusive operation drains them and runs alone.
+The controller is the **page/WAL-writer-vs-checkpoint** coordination primitive. DML, DDL, and WAL-writing maintenance take the SHARED side; checkpoint takes the EXCLUSIVE side and drains them. Logical table access is coordinated separately by the server table-lock manager.
 
 ```rust
 pub trait ConcurrencyController: Send + Sync {
-    /// SHARED writer guard — many concurrent DML writers; blocks behind exclusive operations.
+    /// SHARED writer guard — many concurrent page/WAL writers; blocks behind checkpoint.
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
     /// EXCLUSIVE guard — drains all writers, then runs alone.
@@ -918,7 +918,7 @@ pub struct WriteGuard { /* owned ArcRwLockReadGuard — the SHARED side */ }
 pub struct CheckpointGuard { /* owned ArcRwLockWriteGuard — the EXCLUSIVE side */ }
 ```
 
-The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. **DML writers** acquire the SHARED side (`begin_writer` → `read_arc()`): many run at once, relying on per-row conflict detection (E1) and the per-index / per-heap structural latches (E2a) — not this lock — for write-write safety. **Exclusive operations** acquire the EXCLUSIVE side (`begin_checkpoint` → `write_arc()`): checkpoint and VACUUM run with no in-flight writer for recovery/GC safety, and autocommit DDL runs with no concurrent writer so whole-catalog rollback and file creation cannot race another DDL change. Foreground SQL uses the cancelable writer, checkpoint, and non-writing shared forms, which poll timed lock acquisition and return the token's `QueryCanceled` error; background checkpoint callers retain the unconditional forms. The trait defaults delegate through the corresponding writer methods so custom/test controllers remain source-compatible, while `RwLockConcurrencyController` provides interruptible writer waits. The shared side is re-entrant (a connection re-acquiring it cannot self-deadlock), so the "at most one writer guard per transaction" rule is a correctness assertion at the transaction layer, not a deadlock guard. **Readers take no guard at all** and run lock-free. Guards are owned to keep the trait object-safe.
+The implementation holds a `parking_lot::RwLock` in an `Arc` and hands out owned guards. DML, DDL, WAL-writing maintenance, and any explicit transaction before its first retained object lock acquire the SHARED side (`begin_writer` → `read_arc()`); table/sequence locks, the catalog-DDL mutex, row conflicts, and storage latches provide finer exclusion. Autocommit readers take no controller guard. Checkpoint alone acquires the EXCLUSIVE side. Foreground SQL uses cancelable shared/checkpoint forms that poll timed acquisition and return the token's reason-specific `QueryCanceled` error; background checkpoint callers retain the unconditional forms. The shared side is re-entrant, and guards are owned to keep the trait object-safe.
 
 ## Invariants
 

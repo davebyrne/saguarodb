@@ -1,7 +1,7 @@
-# SaguaroDB Blocking Writes & Deadlock Detection Specification
+# SaguaroDB Blocking Writes, Table Locks & Deadlock Detection Specification
 
 **Date:** 2026-07-10
-**Status:** Implemented feature specification
+**Status:** implementation contract
 
 ## 1. Overview
 
@@ -25,6 +25,9 @@ serialization failure now arises only for a *committed*-superseded conflict — 
 - Covers the two conflict sites: the `xmax` row lock (UPDATE/DELETE, and an
   UPDATE's old-version stamp) and the unique-key conflict (INSERT, and an UPDATE
   that writes a new index entry).
+- Covers transaction- and statement-owned table-lock waits. Table-lock modes,
+  compatibility, acquisition order, and lifetime are specified in
+  `docs/specs/table-locks.md`.
 - **No EvalPlanQual / row re-evaluation.** After a wait, a writer either proceeds
   (holder aborted) or fails with `40001` (holder committed) — it does not re-read
   and re-qualify the updated row version. (PostgreSQL's Read Committed
@@ -81,18 +84,23 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 
 ## 4. The lock manager & deadlock detection
 
-`LockManager` (a new `Arc` field on `ServerComponents`) owns the wait coordination:
+`LockManager` (an `Arc` field on `ServerComponents`) owns row and table wait
+coordination. Row waits and table-lock waits share one wait-for graph; a second
+manager or graph is not permitted because it would miss mixed cycles.
 
-- State: `Mutex<{ waits_for_top: HashMap<TopId, TopId> }>` + a `Condvar`, plus a
-  shared `ActiveTxnRegistry` handle and the configured `deadlock_timeout`. **The
-  wait-for graph is keyed and valued by *top-level* txn ids** (`TopId`), not subxids:
-  a transaction waits for at most one other at a time, and a deadlock is between
-  *transactions*. Each (sub)xid is canonicalized to its top via `registry.top_of`
-  (identity for a top-level id) at edge **insert** time.
+For row waits, the state and algorithm are:
+
+- State: `Mutex<{ waits_for: HashMap<Owner, Set<Owner>>, relation_queues: ... }>`
+  + a `Condvar`, plus a shared `ActiveTxnRegistry` handle and the configured
+  `deadlock_timeout`. Relation/sequence resource queues share this state.
+  Transaction graph nodes use *top-level* txn ids (`TopId`),
+  not subxids. Each (sub)xid is canonicalized to its top via `registry.top_of`
+  (identity for a top-level id) at edge **insert** time. Row waits insert one
+  blocker; table-lock waits may insert several blockers.
 - `wait_for(waiter_subxid, blocker_subxid, cancel)` — the engine passes the writer's
   *writing xid* (`ctx.txn_id`, the innermost subxid) and the stamped `xmax` (also
   possibly a subxid). Under the lock: insert the edge
-  `top_of(waiter_subxid) → top_of(blocker_subxid)` into `waits_for_top`, then loop:
+  `top_of(waiter_subxid) → {top_of(blocker_subxid)}` into `waits_for`, then loop:
   - blocker no longer active (`registry.is_active(blocker_subxid)` is false) → return
     `Ok` (re-check the row). **`is_active` is keyed on the specific blocker subxid**
     (held as a local, *not* in the graph), because a partial `ROLLBACK TO` aborts and
@@ -106,20 +114,41 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 - **Deadlock detection (single critical section).** Cycle detection, victim
   selection, and removal of the victim's edge happen **together, under the held
   `LockManager` lock** (the detector already holds it at the `wait_timeout` tick) —
-  so a chosen victim is no longer a graph node when any other detector reads the
-  graph, which is what makes §9's "exactly one victim" hold even though every waiter
-  is its own detector. Detection walks `waits_for_top` **top → top** (each top has at
-  most one outgoing edge); a cycle is a walk that revisits the waiter's own top.
-  Because both endpoints were canonicalized at insert, the next hop
-  `waits_for_top[current_top]` is well-defined regardless of which subxid stamped the
-  row or which subxid a blocked transaction is currently parked under — closing the
+  so the chosen wait request no longer has outgoing dependencies when any other
+  detector reads the graph, which is what makes §9's "exactly one victim" hold
+  even though every waiter is its own detector. Detection traverses every
+  dependency reachable from the
+  detecting owner and reports a cycle that reaches that owner. Because transaction
+  endpoints were canonicalized at insert, each next hop is well-defined regardless
+  of which subxid stamped the row or which subxid a blocked transaction is currently
+  parked under — closing the
   cross-subxid case (e.g. `{101→200, 201→101}` for tops 100/200 becomes
-  `{100→200, 200→100}`, a detected cycle). **Victim = the detecting waiter's
-  transaction**, which returns `Err(DeadlockDetected)` and drops its edge in the
-  same critical section. (`top_of` is backed by a small in-memory subxid→top map
+  `{100→200, 200→100}`, a detected cycle). **Victim = the detecting wait owner**,
+  which returns `Err(DeadlockDetected)` and removes its outgoing dependencies and
+  queued acquisition in the same critical section. Server handling immediately
+  performs top-level physical abort cleanup for a transaction victim—append Abort,
+  rollback storage/SSI state, deregister, and release every granted object/shared
+  guard—before returning `40P01`. This lets surviving waiters progress without a
+  client-issued ROLLBACK. The session retains only a failed transaction shell so
+  ReadyForQuery remains `E`; later ROLLBACK clears it and COMMIT behaves as rollback
+  without appending a second Abort. (`top_of` is backed by a small
+  in-memory subxid→top map
   maintained only for *active* transactions — distinct from a durable `pg_subtrans`,
   and not used by the visibility path.) A `poll_interval` of ~100 ms bounds cancel
   latency; cycle detection runs only at the full `deadlock_timeout`.
+
+The graph node type also represents generated autocommit statement owners.
+Transaction nodes use canonical top-level transaction ids; statement nodes are
+process-local ids and never enter the active-transaction registry. Table-lock
+table grants are keyed by logical `TableId`; sequence grants by logical
+`SequenceId`. Both retain the owner and strongest granted mode. Per-resource FIFO
+request queues prevent a later incompatible request from
+bypassing an earlier waiter. A blocked request depends on every incompatible
+holder and earlier incompatible waiter, waits on the same condition variable,
+and rebuilds that dependency set after every wake. Relation-only and mixed
+row/relation cycles use the same detection and victim rule. Removing a table-lock
+owner removes all of its grants, queued requests, and outgoing edges, then wakes
+waiters.
 
 ### Waking waiters (lost-wakeup-safe)
 

@@ -262,8 +262,9 @@ The replay iterator stops cleanly at EOF. A partial final record after crash is 
   has reclaimed its versions — which Milestone F4c tracks via the vacuum floor.
 - **Vacuum floor (`set_vacuum_floor`, Milestone F4c).** A `vacuum_floor`
   (monotonic) records the boundary below which a FULL VACUUM pass reclaimed every
-  aborted-creator tuple. The server captures `B = next_txn_id` at the start of a full
-  pass under the exclusive guard and calls `set_vacuum_floor(B)` after it.
+  aborted-creator tuple. At full-pass start the server captures
+  `B = min(next_txn_id, oldest_active_xid)` after exclusion locks, treating no
+  active xid as `next_txn_id`, and calls `set_vacuum_floor(B)` after pruning.
   `persist_clog`'s `live_snapshot` then **drops the explicit entry** of — and floats the
   implicit-committed floor past — an aborted transaction with id `< vacuum_floor`,
   because its on-disk versions are reclaimed (so "implicit-committed below floor" is

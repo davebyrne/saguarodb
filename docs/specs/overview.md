@@ -21,13 +21,19 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
   the corresponding VACUUM commands. The reclamation pass still runs; `ANALYZE`
   itself is discarded because the rule-based planner has no statistics catalog.
 - Rule-based query planner (no cost-based optimization)
+- Transaction-owned table locks coordinate reads, writes, DDL, and maintenance by
+  logical `TableId`, share the row-lock deadlock graph, and provide transactional
+  multi-table TRUNCATE; see `docs/specs/table-locks.md`.
 - Primary-key and secondary-index access paths (full table scans otherwise)
 - WAL with crash recovery
 - Async networking (Tokio) with blocking thread pool for query execution
 
 ### Non-Goals
 
-- Transactional DDL (DDL takes the exclusive guard, commits immediately, and is rejected inside an explicit transaction block)
+- General transactional DDL (CREATE, DROP, and ALTER commit immediately and are
+  rejected inside an explicit transaction block;
+  transactional `TRUNCATE` is the targeted generation-undo exception described
+  in `docs/specs/table-locks.md`)
 - Time-travel / as-of queries
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
@@ -373,18 +379,16 @@ pub trait FlushPolicy: Send + Sync {
 #### Concurrency Controller
 
 ```rust
-/// Coarse concurrency control. Server query orchestration acquires a guard
-/// before executing DML, DDL, checkpoint, or maintenance statements. Readers are
-/// lock-free and take no guard; writer acquisition yields a SHARED writer guard
-/// (concurrent DML writers run simultaneously); checkpoint acquisition yields
-/// an EXCLUSIVE guard used by checkpoint, maintenance, and autocommit DDL, which
-/// drains in-flight writers while readers stay lock-free.
+/// Coarse checkpoint exclusion. DML, DDL, and WAL-writing maintenance use a
+/// SHARED writer guard; `begin_checkpoint()` yields an EXCLUSIVE guard used by
+/// checkpoint to drain them. Readers take no controller guard; table locks
+/// separately coordinate logical relation access.
 ///
 /// Guards are owned types (no lifetime parameter) that hold Arc references
 /// internally and release the guard on Drop. This keeps the trait object-safe
 /// (usable as Box<dyn ConcurrencyController>) and avoids GAT complexity.
-/// The concrete controller uses an RwLock internally: DML writers share it;
-/// checkpoint/maintenance/autocommit DDL take it exclusively. Readers take no guard.
+/// The concrete controller uses an RwLock internally: all page/WAL writers share
+/// it and checkpoint takes it exclusively. Readers take no controller guard.
 pub trait ConcurrencyController: Send + Sync {
     fn begin_writer(&self) -> Result<WriteGuard>;
     fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
@@ -404,8 +408,8 @@ impl RwLockConcurrencyController {
 /// Concurrent writers hold it simultaneously; releases on Drop. Send safe.
 pub struct WriteGuard { /* Arc<RwLock<...>> + guard state */ }
 
-/// Owned exclusive guard for checkpoint, maintenance, and autocommit DDL. Drains
-/// in-flight writers (readers stay lock-free) and releases on Drop. Send safe.
+/// Owned exclusive guard for checkpoint. Drains in-flight writers and releases
+/// on Drop. Send safe.
 pub struct CheckpointGuard { /* Arc<RwLock<...>> + guard state */ }
 ```
 
@@ -1422,25 +1426,24 @@ pub enum PhysicalPlan {
 
 The executor receives a `PhysicalPlan` and only works with `BoundExpr`. Column access is by slot index (`row.values[slot]`) — O(1), no lookups. The `BindingId` and `ColumnId` fields in `InputRef` exist only for EXPLAIN output and debugging.
 
-Statement setup pairs the MVCC snapshot with the storage relation-generation
-snapshot using storage's relation epoch under
-`ServerComponents.relation_publish_gate`: take the gate's read side, read the
-epoch, capture/advertise the MVCC snapshot, capture relation `Arc`s, and retry
-if the relation snapshot's epoch differs. This closes the lock-free read race
-where a relation swap could otherwise land between the two captures and pair an
-old MVCC snapshot with a new empty generation. Relation-swap DDL takes the gate's
-write side before its durable commit point and holds it until catalog/storage
-generation publication finishes, then publishes the storage generation swap
-before it deregisters its committed transaction. A reader can start before the
-DDL commits or after it publishes, but cannot capture an old relation generation
-after the DDL commit is durable.
-Repeatable Read and Serializable transactions retain their first relation
-snapshot while name resolution continues to use current catalog metadata. When
-that current catalog resolves a table created after the retained relation
-snapshot, read-only table scans treat the relation as empty. They must not read
-the table's current heap/index files, and write paths remain strict.
+Statement setup binds far enough to discover logical table ids, acquires the
+required table locks, revalidates schema versions/object identity, and then
+captures the storage relation-generation snapshot used by execution. A newly
+captured MVCC snapshot is paired with relation `Arc`s using the relation epoch
+under `ServerComponents.relation_publish_gate`; relation-swap publication and
+rollback take the gate's write side. Repeatable Read and Serializable retain
+only their first MVCC snapshot. Their relation-generation snapshot is recaptured
+per statement after locking. Because explicit transactions retain table locks
+for every relation actually referenced, a recapture cannot change a referenced
+relation behind the transaction, while unrelated tables are not eagerly pinned.
+A session conflicting with transactional TRUNCATE waits before relation capture
+and therefore sees the committed replacement or restored original, never the
+uncommitted replacement. A newly referenced table whose generation changed after
+a retained MVCC snapshot follows PostgreSQL's non-MVCC-safe TRUNCATE behavior:
+the current generation is used, with ordinary tuple visibility still evaluated
+against the retained MVCC snapshot.
 
-`PRIMARY_KEY_INDEX_ID = 0` is reserved for storage's per-table identity index and is not assigned to catalog indexes. An `IndexScan` carries either that reserved identity-index id for predicates on the planned table schema's declared primary key, or a catalog index id for secondary/catalog indexes. `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, a declared primary key on `id` uses `PRIMARY_KEY_INDEX_ID` with `Exact(Key([7]))` and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. `IndexScan.full_filter` holds the original scan predicate so execution can fall back to a full scan when a catalog index chosen from the current catalog is unavailable for an older retained relation generation. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
+`PRIMARY_KEY_INDEX_ID = 0` is reserved for storage's per-table identity index and is not assigned to catalog indexes. An `IndexScan` carries either that reserved identity-index id for predicates on the planned table schema's declared primary key, or a catalog index id for secondary/catalog indexes. `IndexScan.filter` holds residual predicates not consumed by that index's range (re-checked by the scan operator, so the choice of index never changes results). For `WHERE id = 7 AND name = 'Ada'`, a declared primary key on `id` uses `PRIMARY_KEY_INDEX_ID` with `Exact(Key([7]))` and the residual filter is `name = 'Ada'`; for `WHERE id = 7`, the residual filter is `None`. `IndexScan.full_filter` holds the original scan predicate so execution can defensively fall back to a full scan if the statement's captured relation generation lacks a catalog index chosen during planning. Scan plan nodes capture `table_name` at planning time solely for EXPLAIN/debug output; execution still uses `table`.
 
 `SystemScan` is the planner and executor source for virtual system views. It is
 not considered for storage index selection and carries the view plus full output
@@ -1539,7 +1542,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | Operator | Behavior |
 |---|---|
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
-| `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the storage identity index, `index_scan` for a catalog index — and applies residual `IndexScan.filter` when present. If a catalog index is unavailable for a retained relation generation, falls back to a table scan and applies `IndexScan.full_filter` |
+| `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the storage identity index, `index_scan` for a catalog index — and applies residual `IndexScan.filter` when present. If a catalog index is unavailable in the statement's captured relation generation, falls back to a table scan and applies `IndexScan.full_filter` |
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right input keyed by `right_keys`, probes with `left_keys`; rows with a NULL key never match. |
@@ -1601,7 +1604,7 @@ The `ExecRow` then flows through the entire executor pipeline with identity pres
 
 ### Storage Engine Traits
 
-Data operations and DDL are separate traits — they have different concurrency semantics (DDL involves file creation and catalog updates and runs under the exclusive guard, while DML operates within existing table pages under concurrent writers). Keeping them split also leaves room for transactional DDL to handle the two differently in the future.
+Data operations and DDL are separate traits because DDL includes file creation and catalog updates while DML operates within existing table pages. Both run under the shared writer guard; table modes and the server catalog publication gate provide their distinct logical exclusion. Keeping the traits split also leaves room for broader transactional DDL later.
 
 ```rust
 pub trait StorageEngine: Send + Sync {
@@ -1752,7 +1755,7 @@ Storage uses a TOAST-aware row preparation helper for ordinary INSERT and normal
 User-facing storage reads resolve tuple visibility from MVCC headers before materializing v3 TOAST values. Only visible parent tuples decompress inline compressed values or read external chunks from the hidden TOAST relation; invisible tuples with missing or corrupt chunks are skipped without touching those chunks.
 
 VACUUM integrates hidden TOAST cleanup before discarding parent tuple bytes. Under
-the exclusive maintenance guard, storage first identifies external value ids owned by
+the target table's `Share` lock and shared writer guard, storage first identifies external value ids owned by
 parent tuples that full VACUUM would prune without detoasting. The server deletes
 visible hidden chunks for those value ids in a real committed maintenance transaction,
 then uses the coordinated TOAST parent-prune path and runs ordinary VACUUM on the
@@ -1827,7 +1830,10 @@ pub trait BufferPool: Send + Sync {
 
     /// Mark all dirty pages as clean (called by checkpoint after flushing them to the heap).
     fn mark_all_clean(&self) -> Result<()>;
-    // (Checkpoint flush and recovery redo add flush_dirty_pages / fetch_for_redo; see buffer.md.)
+    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()>;
+    fn flush_dirty_pages(&self) -> Result<()>;
+    fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()>;
+    // Recovery redo adds fetch_for_redo; see buffer.md.
 }
 ```
 
@@ -2060,11 +2066,11 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full
 
 ### Write Protocol
 
-Data writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple DML writers run concurrently; write-write safety comes from row-conflict coordination plus per-index and per-heap structural latches (lock order: structural → frame → WAL). If a writer finds an in-progress row-lock holder, it waits through the installed `ConflictWaiter`/server `LockManager`, which runs timeout-based deadlock detection (`SqlState::DeadlockDetected`, `40P01`) and honors cancellation (`SqlState::QueryCanceled`, `57014`). If the blocker settles into a state that makes the row version conflict with the waiting writer's snapshot, the waiter fails with `SqlState::SerializationFailure` (`40001`). DDL is non-transactional and instead takes the **exclusive** guard for its autocommit statement so catalog rollback cannot race another committed DDL change. The protocol for a single autocommit DML statement:
+Data writes, DDL, and WAL-writing maintenance coordinate through the `ConcurrencyController`'s **shared** writer guard, so unrelated operations can run concurrently while checkpoint drains all of them. DML write-write safety comes from table/row-conflict coordination plus per-index and per-heap structural latches (lock order: table → structural → frame → WAL). DDL is non-transactional and uses a catalog publication gate so whole-catalog rollback cannot race another DDL change. The protocol for a single autocommit DML statement:
 
-1. Acquire a shared writer guard via `controller.begin_writer_cancelable(cancel)` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers). Timed lock polling returns the reason-specific cancellation error.
-2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
-3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
+1. Bind/preflight without mutation to discover table ids.
+2. Assign and register `txn_id`, acquire the shared writer guard through the cancelable timed-poll form, then acquire xid-owned table locks in ascending id order and revalidate. Cancellation returns the token's reason-specific error.
+3. Capture the statement snapshot and execute through storage.
 4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the in-memory CLOG; not fsynced) and only then deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore, deletion of unpublished truncate replacement files, and retired-generation protection for rollback-removed published generations), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore only for catalog-mutating DDL; return error to client and drop the statement guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If the Abort append fails before the commit record is durable, log the failure, attempt to flush WAL, and exit without deregistering the transaction. If post-abort cleanup fails, normal query paths also exit fatally rather than returning with uncertain DDL metadata; direct internal callers surface the cleanup error for tests.
 5. Check the cancellation token at the last safe pre-durable boundary, then append a `Commit` record for this `txn_id`. Cancellation before this boundary follows the abort path; after the durable flush begins, cleanup and success reporting remain authoritative.
 6. Flush WAL through the commit record to disk (`fsync`)
@@ -2076,7 +2082,10 @@ Data writes coordinate through the `ConcurrencyController`'s **shared** writer g
 
 `storage.commit_txn` and `buffer_pool.commit` are cleanup-only in-memory operations and must not perform I/O. For a valid `txn_id`, they should not fail. If either returns an error after WAL flush through the `Commit` record succeeded, the server must not call rollback. It logs the fatal internal error, flushes WAL, and terminates because recovery will replay the durable commit.
 
-Reads take no `ConcurrencyController` guard and proceed concurrently with each other and with writers. Only the exclusive checkpoint/VACUUM/DDL guard drains in-flight writers; readers stay lock-free throughout.
+Autocommit reads take no `ConcurrencyController` guard and proceed concurrently
+with writers. An explicit transaction takes the shared side before its first
+retained object lock so a later write cannot invert checkpoint/object order. Reads
+take `AccessShare`, so relation-changing `AccessExclusive` holders block them.
 
 ### Failed Statement Rollback
 
@@ -2227,7 +2236,19 @@ pub struct ViewDependency {
 }
 ```
 
-`ColumnDef` (with `id`, `name`, `data_type`, `nullable`), `DataType`, `ToastOptions`, `RelationKind`, `IndexSchema`, `ViewColumn`, `ViewDependency`, `ViewSchema`, `SequenceOptions`, and `SequenceSchema` are defined in `common`. The catalog uses `ColumnDef` for stored table schemas and view result columns, and `ViewColumn` as the pre-ID view-output input shape so view nullability and wire type survive catalog creation. The parser uses `ParsedColumnDef` (no IDs). `ColumnId`s are dense row-slot IDs within a specific `TableSchema.schema_version`; rewrite-style schema evolution may renumber them, and catalog-owned metadata that survives the rewrite is remapped before publication. `TableSchema.id`/`IndexSchema.id` are logical catalog identities; `storage_id` is the current physical relation identity and is changed by relation-swap truncate and rewrite-style schema evolution without changing logical identity. `TableSchema.schema_version` and `ViewSchema.schema_version` start at `1` and increment on public schema metadata changes; prepared statements store table/view schema versions and are rejected at execution if any referenced relation changed. User views share the relation-name namespace with user tables but are stored in separate `views_by_*` maps and do not have heap storage. View dependencies currently target user tables only and record referenced table IDs plus referenced column IDs, an `all_columns` marker for `SELECT *`-style dependencies, or a relation-existence dependency for forms such as `count(*)`; deserializing an older dependency payload with missing `all_columns` and empty `columns` treats it as `all_columns = true`. The catalog's SQL DDL API `create_table_with_options` accepts `ParsedColumnDef`, assigns `ColumnId`s, stores the binder-resolved `ToastOptions`, and creates a hidden TOAST relation for user tables with at least one `TEXT` or `BYTEA` column. `add_table_column` creates the same hidden TOAST metadata when adding the first toastable column to a table whose TOAST policy requires one. Read-only ADD/DROP column preflight helpers run the same no-op and dependency checks as the mutating helpers so the executor can avoid scanning rows for statements that will not rewrite; the server still fences syntactic ADD/DROP COLUMN before the exclusive guard because a conditional no-op preflight can race with another DDL. The hidden relation is stored by ID only, named `"\0toast_<base_table_id>"`, has `(value_id BIGINT, seq INTEGER, data BYTEA)` with primary key `(value_id, seq)`, uses `compression = none`, and has a distinct table/TOAST storage id. `ToastOptions::legacy_catalog_default()` preserves pre-TOAST catalog compatibility (`toast.mode = Off`, no active dictionary), and `RelationKind::default()` is `User`. Public construction from persisted catalog snapshots must use validated loading; unchecked snapshot installation is crate-internal only. Catalog validation rejects TOAST policy values outside their durable bounds (`toast.tuple_target` in `256..=8000`, `toast.min_value_size >= 128`), rejects dictionary id `0` for `toast.active_dict_id`, validates hidden TOAST relation cross-links when `toast_table_id` is present, validates view output columns/dependencies, rejects table/view name or id collisions, and requires nonzero storage ids without file-kind high bits. It rejects duplicate storage ids within table/TOAST relations and within secondary indexes, while allowing a legacy table/index raw-id collision because file-kind bits keep the actual files distinct. Hidden TOAST relations must not be present in the user table name index.
+`ColumnDef`, `DataType`, `ToastOptions`, relation/index/view/sequence schemas, and their input forms are defined in `common`. Column IDs are dense row slots within a schema version; rewrite DDL may renumber them and must remap surviving index/view metadata before publication. Logical table/index IDs remain stable while `storage_id` identifies the current physical generation and changes on TRUNCATE or rewrite. Public schema changes increment `schema_version`, which prepared execution revalidates after table-lock acquisition. Tables and views share the public relation-name namespace; hidden TOAST relations are stored only by ID and are never user-resolvable. ADD/DROP column preflight is read-only and repeated after the server holds the catalog publication gate plus target `AccessExclusive`, because an earlier conditional no-op decision may race another DDL. Catalog loading validates identifiers, storage-id uniqueness, TOAST bounds/cross-links, view dependencies, and table/view namespace collisions; unchecked snapshot installation remains crate-private.
+
+`create_table_with_options` assigns column IDs, stores resolved TOAST/CHECK
+metadata, and creates hidden TOAST metadata for tables with `TEXT`/`BYTEA`;
+adding the first toastable column does the same when policy requires it. Hidden
+relations are named `"\0toast_<base_table_id>"`, use `(value_id BIGINT, seq
+INTEGER, data BYTEA)` with primary key `(value_id, seq)`, disable page compression,
+and have distinct storage ids. Legacy snapshots use
+`ToastOptions::legacy_catalog_default()` and default missing relation kind to
+`User`. Validation enforces TOAST bounds, nonzero dictionary/storage ids,
+cross-links, and duplicate storage-id rules while preserving the legacy raw
+table/index collision allowed by file-kind bits. Older view dependencies with no
+`all_columns` field and no columns retain `all_columns = true` compatibility.
 
 The catalog is the authority for name-to-ID resolution. Table IDs, catalog-index IDs, and sequence IDs are stable and never reused (monotonically increasing in independent namespaces; index id `0` is reserved for storage's per-table identity index). User tables, user views, user-visible indexes, public sequences, and primary-key auto-names share the public relation-name namespace exposed through `pg_class`/`to_regclass`; duplicate names across those kinds are rejected. Rollback `restore` reinstalls a previous object map but preserves the current allocator high-water marks so a failed DDL cannot cause later objects to reuse table/index IDs whose storage pages may still exist as aborted artifacts, or sequence IDs observed in WAL. The binder resolves ordinary table/index/column names to IDs so that the planner, executor, and storage engine work with stable relation/index IDs plus schema-version-local column IDs; `DROP TABLE IF EXISTS` and `DROP SEQUENCE` resolve by name at execution time to preserve extended-protocol prepared-statement semantics, `CREATE TABLE IF NOT EXISTS` makes its duplicate-table no-op decision at execution time, and `CREATE TABLE ... SERIAL` chooses its owned sequence names at execution time to avoid stale prepared-plan collision checks.
 
@@ -2420,7 +2441,7 @@ pub struct CatalogSnapshot {
 }
 ```
 
-Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, `next_sequence_id = 1`, and `next_storage_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing logical IDs and advances `next_table_id` and `next_storage_id` past that schema; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` and `reserve_storage_id` advance allocators without installing schemas; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_update_index_schema`/`apply_drop_index` do the same for catalog indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Normal `CREATE INDEX` may make the catalog index visible before the storage tree is published, but storage publishes the new `IndexGeneration` only after the empty tree is created and backfill succeeds; scans planned from the current catalog fall back to table scans when a retained relation snapshot does not contain that index. `prepare_truncate_table` burns fresh storage ids for the base table, optional hidden TOAST table, and catalog indexes without publishing them; `build_truncate_table_update` returns the updated schemas without mutating the catalog so storage can prepare empty files before commit; `apply_truncate_table` revalidates and swaps only `storage_id` fields after durable commit. `preflight_add_table_column` and `preflight_drop_table_column` validate schema-evolution changes without mutating the catalog so executor no-op and dependency failures can return before storage rewrites; `add_table_column`/`drop_table_column` allocate fresh storage ids and publish the new schema for rewrite execution; renames are metadata-only and keep existing storage ids. `apply_update_table_and_index_schemas` is the recovery path for committed rewrite DDL and validates the replayed table schema together with its carried index schemas before publishing either, so remapped primary-key constraint indexes are checked against the replayed table metadata. Primary-key catalog helpers atomically add or drop the table's primary-key metadata together with the backing primary-key constraint index. `create_view` validates the shared table/view name namespace, assigns a relation ID from `next_table_id`, and stores dependency metadata; `CREATE OR REPLACE VIEW` preserves the relation ID and increments `schema_version`; `drop_view` removes only view metadata. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records so their IDs and rewrite storage IDs are not reused while physical page records, relation files, or logical sequence IDs may have been observed in WAL.
+Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, `next_sequence_id = 1`, and `next_storage_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing logical IDs and advances `next_table_id` and `next_storage_id` past that schema; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` and `reserve_storage_id` advance allocators without installing schemas; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_update_index_schema`/`apply_drop_index` do the same for catalog indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Normal `CREATE INDEX` may make the catalog index visible before the storage tree is published, but storage publishes the new `IndexGeneration` only after the empty tree is created and backfill succeeds; a scan defensively falls back to a table scan if its statement-captured relation generation lacks the planned index. `prepare_truncate_table` burns fresh storage ids for the base table, optional hidden TOAST table, and catalog indexes without publishing them; `build_truncate_table_update` returns the updated schemas without mutating the catalog so storage can prepare empty files before commit; `apply_truncate_table` revalidates and swaps only `storage_id` fields after durable commit. `preflight_add_table_column` and `preflight_drop_table_column` validate schema-evolution changes without mutating state so the server can avoid snapshot fencing for harmless conditional statements. ADD/DROP column rewrites use `add_table_column`/`drop_table_column` to allocate fresh `storage_id`s as part of the logical schema change, then storage publishes the matching `UpdateTableSchema` record. Renames are metadata-only and keep existing storage ids. `apply_update_table_and_index_schemas` is the recovery path for committed rewrite DDL and validates the replayed table schema together with its carried index schemas before publishing either, so remapped primary-key constraint indexes are checked against the replayed table metadata. Primary-key catalog helpers atomically add or drop the table's primary-key metadata together with the backing primary-key constraint index. `create_view` validates the shared table/view name namespace, assigns a relation ID from `next_table_id`, and stores dependency metadata; `CREATE OR REPLACE VIEW` preserves the relation ID and increments `schema_version`; `drop_view` removes only view metadata. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records so their IDs and rewrite storage IDs are not reused while physical page records, relation-generation files, or logical sequence IDs may have been observed in WAL.
 
 For multi-table TRUNCATE, `apply_truncate_tables` validates every prepared plan
 against one catalog state, rejects any replacement storage id reused across the
@@ -2499,13 +2520,13 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
-- **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers, but schema-generation rewrites can block new snapshot capture until they publish the new generation.
-- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer_cancelable()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus row-conflict coordination: an in-progress row-lock holder makes the waiter block through the server `LockManager` and retry after the blocker settles; deadlock cycles return `SqlState::DeadlockDetected` (`40P01`), cancellation returns `SqlState::QueryCanceled` (`57014`), and committed-superseded conflicts still return `SqlState::SerializationFailure` (`40001`).
-- **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint_cancelable()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY` also get a stable physical chain view for backfill/validation. `ALTER TABLE ... ADD/DROP COLUMN` acquires the active-transaction registry's cancelable snapshot-exclusion guard before waiting for the checkpoint guard because these statements can publish a new storage generation and conditional no-op preflight is not stable until the exclusive guard is held. The fence blocks new snapshot captures while advertised snapshots drain. Transactions that already hold a writer guard may still capture statement snapshots so they can release the guard the DDL is waiting on; read-only transactions wait so they cannot bind one schema generation and scan another. Under the exclusive guard, the executor repeats catalog preflight and returns conditional no-ops before scanning rows.
-- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <name> [, ...]`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Foreground maintenance takes the **exclusive** concurrency guard through `begin_checkpoint_cancelable`, which drains in-flight writers while polling the statement token (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs one statement-atomic relation-generation swap for every target: all targets and replacement heap/index storage ids are prepared and logged before one commit, then catalog/storage publish the complete batch after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
-- The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
+- **Read-only statements** (`SELECT`, `EXPLAIN`): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward.
+- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): bind to discover relations, allocate/register the autocommit xid (or use the explicit transaction's top xid), acquire the shared writer guard, then acquire xid-owned table locks and revalidate before snapshot capture. Targets use `RowExclusive`; read sources use `AccessShare`. Row and table waits share the same graph node and deadlock manager.
+- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL allocates/registers an xid, takes the shared writer guard, acquires all table/sequence locks, and only then takes the exclusive catalog publication gate to revalidate and execute. The gate blocks catalog readers from provisional mutation through Commit/rollback; object modes scope data/lifetime access.
+- **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE and ALTER take `AccessExclusive`. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback.
+- Shared writer guards are held for the operation lifetime. Actual checkpoint alone takes the exclusive guard and drains all page/WAL writers. `WalFlushPolicy` admits any WAL-durable page; uncommitted/aborted pages may reach the heap but remain hidden by CLOG.
 
-The concrete `ConcurrencyController` is an `RwLock`: writer acquisition takes it shared (DML writers run together), and checkpoint/maintenance/DDL acquisition takes it exclusively. Foreground SQL uses cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.
+The concrete `ConcurrencyController` is an `RwLock`: all page/WAL writers take it shared and `begin_checkpoint()` takes it exclusively. Foreground waits use cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no controller guard. Table locks coordinate relation access and the catalog publication gate serializes catalog undo.
 
 **Other latches:**
 - **Buffer pool:** Frame-level read/write latches managed by page guards.
@@ -2543,7 +2564,10 @@ Loaded from command-line args only. There is no environment-variable or config-f
 
 ## 13. Future Work (Designed For, Not Implemented)
 
-- **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
+- **General transactional DDL:** CREATE, DROP, and ALTER commit immediately and
+  cannot be rolled back inside a transaction block.
+  Transactional `TRUNCATE` is the targeted relation-generation exception and does
+  not imply general catalog MVCC (`docs/specs/table-locks.md`).
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among primary-key identity access and catalog indexes, preferring primary-key identity access when available; a cost model would replace that heuristic.

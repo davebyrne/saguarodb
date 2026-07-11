@@ -7,6 +7,14 @@
 
 `catalog` owns schema metadata, stable table/column IDs, and name-to-ID resolution for binder. Its persisted form is included in the control record and updated by replaying WAL DDL records for changes after the checkpoint.
 
+The catalog's internal lock protects data-structure consistency. Separately, the
+server wraps SQL binding/name lookup and system-catalog capture in the shared
+catalog publication gate. DDL holds the exclusive side after object locking and
+through Commit or restore, allowing existing immediate catalog mutation/rollback
+without exposing provisional state. Startup/recovery precedes user access and does
+not need the gate. Transactional TRUNCATE instead uses a transaction-local overlay
+and publishes it only at top-level commit.
+
 ## Depends On
 
 - `common`
@@ -333,7 +341,7 @@ relation metadata and that relation's indexes, while directly dropping a linked
 hidden TOAST relation is rejected as catalog corruption. A missing ID returns
 `SqlState::UndefinedTable`.
 
-Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them under the DDL guard before scanning rows. The server treats ADD/DROP COLUMN as potentially rewriting when taking its snapshot-exclusion fence because a conditional no-op decision can race with another DDL before the exclusive guard is acquired. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `rename_table` and `rename_table_column` reject dependent views and stored CHECK expressions so stored SQL text cannot become stale. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
+Schema-evolution helpers are catalog operations used by `ALTER TABLE` DDL execution. `rename_table`, `add_table_column`, `drop_table_column`, and `rename_table_column` require a user table and return the updated schema. `preflight_add_table_column` and `preflight_drop_table_column` are read-only companions that run the same no-op and dependency validation as the mutating ADD/DROP helpers and return `TableColumnAlteration::{Noop, Rewrite}`; the executor uses them before scanning rows and repeats preflight under the server catalog publication gate plus target `AccessExclusive` lock. Table/column renames and add/drop column increment `TableSchema.schema_version`. `add_table_column` appends the next dense `ColumnId`, resolves any sequence default through the current sequence registry, rejects relation-wide view dependencies (`all_columns = true`), and allocates a hidden TOAST relation by ID when adding the first `TEXT`/`BYTEA` column to a table whose TOAST policy requires one. `drop_table_column` rejects primary-key columns, columns used by secondary indexes, columns referenced by view dependencies, owned-sequence default columns (so SERIAL-owned sequences are not orphaned), and tables with stored CHECK expressions (because the catalog does not parse those expressions for column-level dependency yet); when a later column is dropped, surviving column/index/view dependency IDs above it are remapped to keep dense column IDs. `rename_table` and `rename_table_column` reject dependent views and stored CHECK expressions so stored SQL text cannot become stale. `apply_update_index_schema` is the recovery/update companion for remapped secondary indexes; it replaces an existing index schema by id after validating it against the current table.
 
 `create_view`, `replace_view`, `apply_create_view`, `apply_replace_view`, `drop_view`, and `apply_drop_view` manage durable user-view metadata. Creating a view allocates from `next_table_id`, rejects relation-name/id collisions with tables or views, stores dense output columns from `ViewColumn` (including result nullability and wire type), stores canonical SQL text, validates dependencies, and starts `schema_version = 1`. View dependencies may target user tables only; dependencies on views or hidden TOAST relations are rejected to avoid dependency cycles while view expansion remains single-level for stored view definitions. `replace_view` keeps the existing id/name and increments `schema_version`. Dropping a view is rejected while another view depends on it. `list_views` returns views ordered by id.
 
@@ -408,6 +416,15 @@ against one catalog state, and applies the complete batch under one catalog
 write lock. Normal multi-table TRUNCATE uses the batch method;
 recovery keeps applying individual committed logical WAL records whose shared
 transaction outcome makes the batch durable together.
+
+Transactional TRUNCATE validates the same batch but stores its replacement base,
+hidden TOAST, and secondary-index schemas in a transaction-local catalog overlay;
+public catalog maps remain unchanged. Owner binding resolves overlay entries before
+the committed catalog. Top-level commit publishes the complete overlay under the
+server catalog gate and one catalog write lock; rollback discards it. Allocated ids
+remain burned. Repeated truncates replace the overlay entry with the newest schema
+while storage retains first-before-images. Savepoint-local overlay rollback is out
+of scope, so TRUNCATE is rejected while a savepoint is open.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE`
 execution. `rename_table`, `add_table_column`, `drop_table_column`, and

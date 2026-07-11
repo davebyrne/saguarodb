@@ -105,21 +105,14 @@ pub trait RecoveryOperations: Send + Sync {
 `RelationSnapshot` captures the table/index generation `Arc`s and table schema
 versions a statement should resolve plus the storage relation epoch observed
 while capturing them. The epoch increments whenever storage publishes or
-restores relation metadata. Server statement setup uses it to retry MVCC +
-relation snapshot capture if a relation generation swap lands between the two
-captures. Read Committed/autocommit callers capture one per statement;
-Repeatable Read and Serializable keep the captured relation snapshot with the
-transaction's MVCC snapshot. Before execution, server query orchestration
-validates every bound table's schema version against the captured relation
-snapshot; a mismatch is a retryable `SerializationFailure`, preventing row
-description / row-shape mismatches. Reads use captured generations for tables
-present in the snapshot. Writes reject a captured stale generation with
-`SerializationFailure` instead of mutating retired files. A later-created
-secondary index may be used with an older relation snapshot only when the table
-generation itself is unchanged. A retained transaction snapshot can be marked so
-read-only scans of a catalog-resolved table absent from the relation snapshot
-return empty; storage relation-handle lookups and all write paths stay strict and
-must not fall back to current heap/index files.
+restores relation metadata. Every statement, including Repeatable Read and
+Serializable statements, captures a fresh relation snapshot only after acquiring
+all referenced table locks and revalidating bound schema versions. Those isolation
+levels retain only their MVCC snapshot. Explicit transactions retain table locks
+for relations actually referenced, which pins their generations without eagerly
+pinning unrelated tables. Reads and writes use only the statement-captured
+generations; missing/stale write handles remain errors. A relation snapshot is
+retained through its statement stream/portal/COPY lifetime and then released.
 
 `RecoveryOperations` carries storage-owned logical replay; row-level recovery is physiological page redo via `apply_physical_redo` (see Heap Page Store), not the storage `StorageEngine` methods. Normal methods append WAL records. Sequence DDL installs/removes storage's in-memory sequence state in addition to catalog metadata. `nextval` and `setval` append and flush `SequenceAdvance` / `SetSequenceValue` records before updating runtime state, without rollback tracking, so aborted transactions keep sequence gaps. Relation-swap truncate preparation appends the logical `TruncateTable` WAL record before creating replacement heap/index files, so recovery can reserve replacement storage IDs before replaying orphan page records from an uncommitted prepare; committed truncate replay publishes the catalog-provided replacement generations without appending WAL. Schema-rewrite `update_table_schema` follows the same durable ordering for fresh rewrite storage ids: append `UpdateTableSchema` first, then initialize replacement B-tree pages. `rollback_txn` restores storage-owned DDL metadata; heap and index page bytes are not undone under status-based abort, and aborted versions/entries stay physically present but invisible through the CLOG until VACUUM reclaims them. Unpublished relation-generation files created by an aborted truncate prepare may be removed after buffer pin checks. If rollback removes a generation that had already been published to relation snapshots, storage queues it as retired instead of deleting its files immediately; normal retired-generation cleanup removes it after all `Arc` snapshots drain. `commit_txn` discards storage rollback metadata after WAL flush succeeds and queues committed drop generations for retired cleanup; it remains cleanup-only, must not perform I/O, and should not fail for a valid `txn_id`. `RecoveryOperations` must not append WAL records.
 
@@ -458,7 +451,7 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
     non-HOT aborted UPDATE/DELETE — is reset **in place** exactly as before (un-HOT shape),
     so the stamp (the only on-disk reference to the aborted txn as a deleter) does not
     survive to be misread as an implicit-committed delete after truncation (`mvcc.md`
-    §5.4). VACUUM holds the exclusive guard, so `xmax`'s status is settled — the reset
+    §5.4). VACUUM holds target `Share`, so no target writer remains and `xmax`'s status is settled — the reset
     fires only on a definitive abort, never on an in-progress xmax.
 - **Apply + log.** A page with any collapse/free/dead/reset work is rewritten — the
   header resets applied **first** (before compaction relocates survivors), then the
@@ -488,8 +481,8 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
   skipped without being dirtied or flushed.
 - **Latching.** Per page it takes the per-heap structural latch then the frame write
   latch (lock order structural → frame → WAL) and releases both before the next page
-  (never held across pages). VACUUM runs under the exclusive checkpoint guard, so
-  no writer runs during the pass; the latches keep the same lock ordering as normal
+  (never held across pages). VACUUM holds target `Share`, so no target writer runs
+  during the pass; the latches keep the same lock ordering as normal
   heap mutations and make the page-level primitive safe if reused elsewhere.
 - **Maintenance txn.** Pages are dirtied and logged under txn id `0` — the
   recovery/maintenance convention (shared with `fetch_for_redo`) — because VACUUM is
@@ -526,8 +519,8 @@ relies on this. It is the middle phase of the live VACUUM orchestration
   `index_page::remove_entry` under that leaf's frame write latch — no re-descent per
   entry. A leaf that changed is logged as a single `FullPageImage` (the
   `btree::log_full_page` pattern); an unchanged leaf is skipped (no WAL, no mutation).
-- **No node merging — B-link safe vs lock-free scanners.** VACUUM runs under the
-  exclusive guard but lock-free readers scan concurrently (they take no guard, only a
+- **No node merging — B-link safe with concurrent scanners.** VACUUM holds target
+  `Share` while `AccessShare` readers scan concurrently (plus a
   short-lived per-leaf read latch, and follow the right-sibling `link`). The pass
   never merges or frees a leaf and never rewrites a right-sibling link, so the leaf
   chain a reader is walking is structurally unchanged; an emptied leaf is left in
@@ -1209,10 +1202,9 @@ into `write_page`'s encode step and `load_page`'s decode step.
   initialized page images, evenly sampled across the heap file's current
   extent (`page::is_initialized`, the `PAGE_TYPE_DATA` check). Used by `ALTER
   TABLE ... SET (compression = 'zstd')` to build a dictionary-training corpus.
-  The caller holds the exclusive checkpoint guard, so the sampled images are a
-  stable snapshot; an abandoned fresh-page hole is skipped without being
-  faulted in. Foreground compression ALTER uses the cancelable variant, which
-  polls the statement token at each sampled page.
+  The caller holds target `AccessExclusive`, so sampled images are stable; an
+  abandoned fresh-page hole is skipped without being faulted in. Foreground
+  compression ALTER polls the statement token at each sampled page.
 - **`sample_toast_values(ctx, schema, max_samples, max_bytes)`.** Returns
   bounded logical `TEXT`/`BYTEA` samples for TOAST value-dictionary training.
   It walks heap pages directly instead of calling the public scan iterator so
@@ -1226,7 +1218,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
   varlena bodies or reading hidden chunks. Empty values and non-toastable columns are
   skipped. The scan polls `ctx.cancel` at heap-page and row boundaries, so sparse or
   mostly-unsuitable tables remain responsive to statement cancellation. The server
-  calls this under the exclusive maintenance guard for `ALTER TABLE ... SET
+  calls this under target `AccessExclusive`, the catalog-DDL mutex, and the shared
+  writer guard for `ALTER TABLE ... SET
   (toast_compression = zstd_dict)`.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
@@ -1252,9 +1245,11 @@ into `write_page`'s encode step and `load_page`'s decode step.
   on PageLSN (it passes `page_lsn: None` and assumes the caller already made
   the WAL durable), so skipping this flush would not error; it would let a
   torn page write precede its FPI being durable, i.e. silent corruption on
-  recovery. The caller holds the exclusive checkpoint guard for the whole
-  ALTER, so no concurrent writer observes an inconsistent mix of
-  dirtied-but-unflushed and not-yet-dirtied pages.
+  recovery. It returns `RewriteTablePages { pages_touched, file_ids }`, where
+  `file_ids` is the deduplicated heap/identity/catalog-index set visited. The
+  caller holds target `AccessExclusive` and uses file-scoped
+  flush/sync/clean operations for exactly the rewritten heap/index ids. Unrelated
+  writers remain concurrent and their frames are untouched.
 - **Corruption semantics.** An envelope validation failure is a distinct
   structured corruption-class error (`SqlState::InternalError`), never
   confused with "this is a raw page." A normal `load_page`/`write_page` fault
@@ -1376,9 +1371,12 @@ impl PageBackedStorageEngine {
     /// config. Logs a FullPageImage per page and stamps its LSN as the new
     /// PageLSN (torn-page repair, like VACUUM). Returns the number of pages
     /// touched.
-    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<usize>;
+    pub fn rewrite_table_pages(&self, schema: &TableSchema) -> Result<RewriteTablePages>;
 }
 ```
+
+`RewriteTablePages` contains `pages_touched: usize` and `file_ids: Vec<FileId>`;
+the file ids are sorted/deduplicated for deterministic scoped flushing.
 
 `open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table, TOAST value-id allocator, and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables and hidden TOAST relations), `install_index_schemas` (catalog indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. In normal mode, `install_schemas` seeds every hidden TOAST relation's in-memory value-id allocator by physically scanning its heap rows (including aborted and in-flight tuples) and setting `next_value_id = 1 + max(value_id)`, or `1` when the relation has no chunks. In recovery mode, `install_schemas` intentionally leaves TOAST allocator entries absent: post-checkpoint physical redo may install additional chunk rows after schema metadata is loaded, so the recovery-to-normal transition reseeds every live hidden TOAST relation after redo has finished and before maintenance or DML can prune rows. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
 
@@ -1393,6 +1391,26 @@ state write lock. The server also holds `relation_publish_gate` across catalog
 and storage batch publication, so new relation snapshots cannot observe a
 committed subset.
 
+Transactional TRUNCATE uses a distinct transactional batch publication path.
+It validates the complete update set before mutation, records the old base,
+TOAST, and secondary-index schemas in the transaction's existing storage
+before-image state, records the previous TOAST allocator state, installs every
+replacement generation under one storage state write lock, and deliberately
+keeps the replacement files in the transaction's unpublished-file set. Normal
+`commit_txn` cleanup then retires the old generations and makes the replacements
+permanent; normal `rollback_txn` restores the old schemas and allocator state and
+retires or removes the replacements. The transactional path never appends or
+flushes a Commit record itself. Replacement storage ids remain reserved after
+rollback. See `docs/specs/table-locks.md` for ownership and visibility rules.
+
+Before-images use first-write semantics across repeated truncates of one logical
+table. All replacement files remain transaction-tracked. Commit retains the last
+installed generation and retires the original and superseded replacements;
+rollback restores the original and removes every replacement. Restoring the old
+TOAST allocator on rollback is a generation-swap exception to process-monotonic
+allocation: ids consumed only in discarded replacement files may be reused, but
+an id is never reused within any surviving physical generation.
+
 `RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, truncate generation publication, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 
 ## TOAST Value ID Allocation
@@ -1401,7 +1419,10 @@ Hidden TOAST relations store chunk keys as `(value_id INTEGER, seq INTEGER)`.
 Storage owns an in-memory per-TOAST-relation allocator for `value_id`; it is
 intentionally not part of the public `StorageEngine` trait and is consumed by
 the storage-private TOAST write path. Allocation starts at `1`, is monotonic for
-the life of the process, and is not rolled back on transaction abort. The
+the life of each surviving physical generation, and is not rolled back on an
+ordinary transaction abort. Transactional TRUNCATE rollback may restore the old
+generation's allocator while discarding the complete replacement generation, as
+specified above; it never reuses an id in a surviving generation. The
 allocator refuses to hand out any value above `i64::MAX` because the hidden
 relation key stores `value_id` as `Value::Integer`; exceeding that bound returns
 `SqlState::ProgramLimitExceeded` with a clear TOAST allocator message.

@@ -223,6 +223,16 @@ sufficient; the read-side `CheckForSerializableConflictOut` is equally required)
 Conflict-in and conflict-out are exact duals: both form the edge `T_r →rw T_w` and
 both use the same concurrency test.
 
+**Whole-relation writes.** Transactional `TRUNCATE` calls
+`note_relation_write(table)` before installing a replacement generation. On the
+write side it forms `T_r →rw T_w` for every concurrent holder in
+`relation_readers[table]` and every tuple-reader entry for that table. It records
+the writer in `relation_writers[table]`. A later relation or tuple SIREAD on the
+table consults that relation-writer entry and forms the same conflict-out edge.
+This makes a generation replacement conflict with all logical rows, including
+point reads, absent-key reads, and scans, without enumerating heap tuples. Repeated
+TRUNCATE by one top-level transaction is idempotent in SSI tracking.
+
 **Concurrency test.** An edge `T_r →rw T_w` is relevant only when `T_w` is *not
 visible* to `T_r`'s snapshot (`T_w` committed after `T_r`'s snapshot, or is still
 in-flight). If `T_w` were already visible to `T_r`, then `T_r` read `T_w`'s own

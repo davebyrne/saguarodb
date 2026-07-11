@@ -47,6 +47,7 @@ pub trait PageLoader: Send + Sync {
 pub trait PageStore: PageLoader {
     fn write_page(&self, file_id: FileId, page_num: PageNum, data: &PageData) -> Result<()>;
     fn sync_all(&self) -> Result<()>;
+    fn sync_files(&self, file_ids: &[FileId]) -> Result<()>;
     fn page_count(&self, file_id: FileId) -> Result<PageNum>;
 }
 
@@ -60,15 +61,25 @@ pub trait BufferPool: Send + Sync {
     fn abandon_unpublished_new_page(&self, guard: PageWriteGuard) -> Result<()>;
     fn is_page_abandoned(&self, file_id: FileId, page_num: PageNum) -> bool;
     fn mark_all_clean(&self) -> Result<()>;
+    fn mark_files_clean(&self, file_ids: &[FileId]) -> Result<()>;
     fn rollback(&self, txn_id: u64) -> Result<()>;
     fn commit(&self, txn_id: u64) -> Result<()>;
     fn flush_dirty_pages(&self) -> Result<()>;
+    fn flush_dirty_pages_for_files(&self, file_ids: &[FileId]) -> Result<()>;
     fn fetch_for_redo(&self, file_id: FileId, page_num: PageNum) -> Result<PageWriteGuard>;
     fn enable_stealing(&self);
 }
 
 pub struct MemoryBufferPool { /* the concrete BufferPool implementation */ }
 ```
+
+The file-scoped variants apply the ordinary flush/sync/clean rules only to the
+deduplicated input file ids. Compression ALTER calls
+`flush_dirty_pages_for_files` → `PageStore::sync_files` → `mark_files_clean` for
+the target heap/identity/catalog-index files while holding target
+`AccessExclusive`. No target writer can race this sequence, and unrelated frames
+are neither written nor marked clean. An error/partial flush is never followed by
+marking files clean.
 
 `flush_dirty_pages` writes every flushable dirty page (per `FlushPolicy`) to its home via the `PageStore`, regardless of whether its dirtying transaction committed (the CLOG hides the non-committed tuples). It does not fsync or mark frames clean; checkpoint calls it, then `PageStore::sync_all`, then `mark_all_clean`. `fetch_for_redo` returns a writable frame for recovery redo, loading a miss via `store.load_page_lenient` (not `load_page`) and inserting a zeroed frame both when the page is absent from the store (a new page being re-established) and when the stored page fails validation (e.g. a torn compressed envelope) — recovery redo is the ONE caller that uses the lenient form, since a torn stored page there is exactly like a torn raw page: it was dirty, so its first post-checkpoint modification logged a `FullPageImage` that redo will replay, making a zeroed-then-repaired frame sound (`docs/specs/compression.md` §5, `docs/specs/crates/storage.md`). It marks the frame dirty under the recovery txn id (`0`). Every other caller (`read_page`/`write_page`/normal `get_or_insert_clean` misses) uses the strict `load_page`, which surfaces the same failure loudly as page corruption. `enable_stealing` turns on eviction-flush-on-steal; it is off at construction and the server enables it during startup, before redo (the durable on-disk index means recovery rebuilds nothing in memory, so redo may spill).
 

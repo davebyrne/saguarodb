@@ -416,12 +416,24 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 ## 7. Server dispatch
 
 - `CREATE SEQUENCE` / `DROP SEQUENCE` are classified `StatementClass::Ddl`:
-  autocommit-only, take the exclusive DDL guard, append their logical WAL
-  records, and are **rejected inside an explicit transaction block** by the
+  autocommit-only and take the shared writer guard. DROP resolves the sequence id,
+  takes `SequenceExclusive` through the server lock manager, then takes the
+  exclusive catalog publication gate and revalidates before appending WAL. CREATE
+  has no existing object lock and takes the exclusive gate after its shared writer
+  guard. Both mutate catalog/runtime state while readers are blocked, append their
+  logical WAL records, and are
+  **rejected inside an explicit transaction block** by the
   existing DDL-in-block path.
+  The gate releases only after Commit or rollback restore, so catalog/sequence
+  readers never observe provisional state.
 - Statements flagged `mutates_sequences` are routed to the write path even when
-  they are syntactically `SELECT`.
-- `currval` adds no routing change (pure read).
+  they are syntactically `SELECT`; binding collects their sequence ids and the
+  xid owner takes `SequenceAccess` before snapshot/execution. DML defaults do the
+  same. DROP TABLE includes every owned sequence in its ordered object-lock set
+  and takes `SequenceExclusive` before the catalog publication gate.
+- `currval` remains a pure read with no writer-guard routing, but binding includes
+  its resolved sequence id and execution takes `SequenceAccess` before
+  revalidation so DROP cannot expose provisional absence.
 
 ## 8. Error handling
 

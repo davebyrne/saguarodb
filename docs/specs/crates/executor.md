@@ -128,9 +128,9 @@ impl QueryEngine {
 
 | Operator | Behavior |
 |---|---|
-| `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, applies scan filter if present. If the relation snapshot explicitly marks missing catalog-resolved tables as empty, an `UndefinedTable` scan result opens an empty iterator instead of reading current relation files |
-| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a secondary index chosen from the current catalog is unavailable for the retained relation snapshot, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. If that fallback scan or a primary-key range scan hits a relation snapshot that explicitly marks missing catalog-resolved tables as empty, opens an empty iterator. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
-| `SystemScanOp` | Materializes rows for a virtual `pg_catalog`/`information_schema` system view from catalog metadata, the static registry, and `StatementContext.system_state`; applies scan filter if present; emits rows with no identity |
+| `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, and applies the scan filter. A missing table generation is an execution error; statement locking/revalidation must make it unreachable during normal execution |
+| `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a planned secondary index is defensively unavailable in the statement-captured relation generation, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. Missing table generations are execution errors. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
+| `SystemScanOp` | Materializes virtual catalog rows from the immutable statement catalog/provider snapshot captured by the server after lock convergence; applies filters and emits rows with no identity |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
 | `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
 | `FilterOp` | Evaluates predicate, preserves identity |
@@ -142,10 +142,8 @@ impl QueryEngine {
 | `ValuesOp` | Emits literal rows, identity is `None` |
 
 `COPY TO` uses the same table scan and row decoding as SELECT, then formats the
-requested columns with the COPY text/CSV encoder. If a retained transaction
-snapshot explicitly marks missing catalog-resolved tables as empty, `COPY TO`
-opens an empty iterator just like `SeqScanOp` instead of reading current relation
-files.
+requested columns with the COPY text/CSV encoder. A missing generation is an
+execution error under the same statement-snapshot contract as `SeqScanOp`.
 
 ## Identity Rules
 
@@ -286,7 +284,9 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 `CREATE TABLE`:
 
-- Server query orchestration acquires the exclusive DDL guard before execution.
+- Server query orchestration acquires the shared writer guard and then the
+  exclusive catalog publication gate (CREATE has no existing object lock), holding
+  the gate through Commit or rollback restore. Catalog binders/readers are blocked.
 - For `IF NOT EXISTS`, validate the table definition shape first (columns,
   primary key, and unique-constraint column references). If the table already
   exists, return the normal command tag without creating serial sequences,
@@ -294,18 +294,16 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
   If a view already exists with the requested name, return
   `SqlState::DuplicateTable` because user tables and views share the relation
   name namespace.
-- For `SERIAL` family columns, choose owned sequence names at execution time
+- For `SERIAL` family columns, choose owned sequence names/ids at execution time
   (`<table>_<column>_seq`, with the smallest free numeric suffix if needed),
   create each owned sequence first (`owned: true`, default sequence options),
   then replace the parse-time `ParsedDefault::Serial` marker with the internal
   owned `nextval` default before creating the table. If any later table or
   unique-index step fails, drop the created serial sequences as part of
   statement cleanup.
-- Use `CatalogManager::create_table_with_options` to assign IDs, store
-  compression/TOAST/CHECK metadata, and create any hidden TOAST relation
-  metadata.
-- Call `SchemaOperations::create_table`.
-- `SchemaOperations::create_table` appends the `CreateTable` WAL operation record; server query orchestration appends the statement `Commit`.
+- Create catalog/storage metadata and append logical WAL while the publication
+  gate excludes readers. On pre-commit failure restore the catalog/storage state;
+  after Commit release the gate so the complete durable object becomes visible.
 - Return `Modified { command: "CREATE TABLE", count: 0 }`.
 
 `DROP TABLE [IF EXISTS] <name> [, ...]`:
@@ -313,7 +311,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - Resolve every target in the binder for plain `DROP TABLE`; if any name belongs
   to a view, return `SqlState::WrongObjectType`. For `DROP TABLE IF EXISTS`,
   carry ordered names through planning and resolve the complete list at
-  execution time under the exclusive DDL guard. Skip absent tables without
+  execution time under the catalog publication gate and xid-owned table locks. Skip absent tables without
   catalog/storage mutation or logical DDL WAL records, but return
   `SqlState::WrongObjectType` if a view owns any requested name.
 - Call `SchemaOperations::drop_table`.
@@ -369,13 +367,13 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 `CREATE VIEW` / `CREATE OR REPLACE VIEW`:
 
-- Server query orchestration acquires the exclusive DDL guard before execution.
+- Server query orchestration uses shared writer then existing-view
+  `AccessExclusive` (for replace), then the exclusive catalog publication gate.
+  A new view has no existing object lock and goes directly to the gate.
 - The binder has already bound the view query, validated the optional output
   column list, rejected query parameters, and attached durable dependencies.
-- For a new view, call `CatalogManager::create_view` to allocate the relation id
-  and install metadata, then call `SchemaOperations::create_view`, which appends
-  the `CreateView` WAL operation record. If storage/WAL append fails, remove the
-  catalog view before returning the error.
+- Create/replace metadata and append WAL while the gate blocks catalog readers;
+  release it only after Commit or rollback restore.
 - For `OR REPLACE` with an existing view, call `CatalogManager::replace_view`
   (same id/name, incremented schema version), then
   `SchemaOperations::replace_view`, which appends `ReplaceView`; if storage/WAL
@@ -398,15 +396,14 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 `ALTER TABLE` schema evolution:
 
 - `ADD COLUMN [IF NOT EXISTS]`, `DROP COLUMN [IF EXISTS]`, `RENAME COLUMN`, and
-  `RENAME TO` execute through the DDL path under the server-owned exclusive
-  guard.
+  `RENAME TO` execute through the DDL path under the shared writer guard, then
+  target `AccessExclusive`, then the catalog publication gate.
 - `RENAME COLUMN` and `RENAME TO` are metadata updates: mutate catalog schema,
   then call `SchemaOperations::update_table_schema` with the updated table and
   current secondary-index schemas. Catalog rejects these renames when dependent
   views or stored CHECK expressions would leave SQL text stale.
-- `ADD COLUMN` and `DROP COLUMN` are logical rewrites. The server holds its
-  snapshot-exclusion guard before the executor runs these plans, so no new
-  statement can bind one storage generation and scan another. The executor first
+- `ADD COLUMN` and `DROP COLUMN` are logical rewrites. Target `AccessExclusive`
+  drains users of the old generation before the executor runs these plans. The executor first
   calls the catalog preflight helper, returning no-op/error outcomes before
   materializing rows. For a real rewrite it scans visible rows under the old
   schema, applies the catalog schema change with fresh storage ids, calls
@@ -425,7 +422,7 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 
 ## Statement Guards
 
-Statement guards are owned by server query orchestration, not by the executor crate. The server parses SQL to classify the top-level statement: lock-free SELECT and EXPLAIN take **no** `ConcurrencyController` guard; INSERT, UPDATE, DELETE, and SELECTs whose bound tree contains `nextval`/`setval` acquire the shared writer guard `ConcurrencyController::begin_writer` (many DML writers run concurrently); CREATE TABLE (including `IF NOT EXISTS`), DROP TABLE (including `IF EXISTS`), CREATE VIEW, DROP VIEW, CREATE INDEX, DROP INDEX, CREATE SEQUENCE, DROP SEQUENCE, schema-evolution ALTER TABLE, checkpoint, and implemented maintenance commands (`VACUUM`, `TRUNCATE`, and `ALTER TABLE ... SET (...)`) take the exclusive `begin_checkpoint` guard. `ALTER TABLE ... ADD/DROP COLUMN` also takes the server active-snapshot exclusion guard before the checkpoint guard. EXPLAIN runs bind and plan for the inner statement, formats the physical plan in server/planner code, and never calls the executor. A writer's guard lives for the full statement (and, in an explicit transaction, the whole write-transaction). See `docs/specs/crates/server.md` and `docs/specs/mvcc.md` §7 for the full concurrency model.
+Statement guards are owned by server query orchestration, not by the executor crate. SELECT and EXPLAIN take no `ConcurrencyController` guard but do take `AccessShare` on referenced tables. DML, COPY FROM, DDL, and WAL-writing maintenance acquire `ConcurrencyController::begin_writer`; DDL additionally takes the catalog publication gate. Table modes are `RowExclusive` for DML targets, `Share` for CREATE INDEX/VACUUM, and `AccessExclusive` for DROP/ALTER/TRUNCATE. Actual checkpoint alone takes `begin_checkpoint`. EXPLAIN formats the inner physical plan without invoking the executor. Shared writer and table-lock guards live for the full statement (and transaction-owned locks live through top-level completion). See `docs/specs/crates/server.md` and `docs/specs/table-locks.md`.
 
 ## Acceptance Tests
 
