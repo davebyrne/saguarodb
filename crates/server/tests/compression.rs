@@ -401,8 +401,9 @@ async fn alter_rejected_inside_transaction_block() {
     assert!(after.rows().is_empty());
 }
 
-/// §13: unknown `WITH`/`SET` keys and unsupported codecs are rejected at
-/// parse time; nothing reaches storage.
+/// Unknown `WITH`/`SET` keys and unsupported codecs are rejected at parse
+/// time. PostgreSQL's `fillfactor` is accepted on `CREATE TABLE` as a
+/// validated compatibility no-op, but remains unsupported by `ALTER TABLE`.
 #[tokio::test]
 async fn bad_options_are_rejected() {
     let server = TestServer::start().await.unwrap();
@@ -410,9 +411,12 @@ async fn bad_options_are_rejected() {
         .simple_query("create table t (id integer primary key)")
         .await
         .unwrap();
+    server
+        .simple_query("create table fillfactor_ok (id integer primary key) with (fillfactor = 70)")
+        .await
+        .unwrap();
 
     for sql in [
-        "create table u (id integer primary key) with (fillfactor = 70)",
         "create table u (id integer primary key) with (compression = 'lz4')",
         "alter table t set (compression = 'lz4')",
         "alter table t set (fillfactor = 70)",

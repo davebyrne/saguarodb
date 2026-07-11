@@ -251,21 +251,27 @@ fn bind_inner(
                 checks: checks.clone(),
             })
         }
-        Statement::DropTable { name, if_exists } => {
-            let table = if *if_exists {
-                None
-            } else if catalog.get_view_by_name(name)?.is_some() {
-                return Err(plan_error(
-                    SqlState::WrongObjectType,
-                    format!("relation {name} is a view, not a table"),
-                ));
-            } else {
-                Some(require_table(catalog, name)?.id)
-            };
+        Statement::DropTable { names, if_exists } => {
+            let mut targets = Vec::with_capacity(names.len());
+            for name in names {
+                let table = if *if_exists {
+                    None
+                } else if catalog.get_view_by_name(name)?.is_some() {
+                    return Err(plan_error(
+                        SqlState::WrongObjectType,
+                        format!("relation {name} is a view, not a table"),
+                    ));
+                } else {
+                    Some(require_table(catalog, name)?.id)
+                };
+                targets.push(crate::DropTableTarget {
+                    name: name.clone(),
+                    table,
+                });
+            }
             Ok(BoundStatement::DropTable {
-                name: name.clone(),
+                targets,
                 if_exists: *if_exists,
-                table,
             })
         }
         Statement::AlterTableAddColumn {

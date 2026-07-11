@@ -1334,7 +1334,9 @@ savepoints via sub-transaction xids (optional, deferred).
   isolation, on two triggers: **(a) VACUUM** and **(b) the UPDATE path** when a
   same-page HOT update needs room. It does NOT prune on the lock-free reader path
   (reads stay pure — pruning lives on the write/VACUUM paths, §10 H1). There is **no
-  fillfactor**: pages pack 100%, and steady-state room comes from update-path pruning.
+  effective/physical fillfactor**: pages pack 100%. The accepted CREATE TABLE
+  `fillfactor` compatibility option is a validated no-op, and steady-state room
+  comes from update-path pruning.
 
   - **The collapse primitive** (`vacuum_heap` → `classify_page_for_prune` /
     `plan_chain`; page primitives `page::{free_slots_to_unused, set_redirect,

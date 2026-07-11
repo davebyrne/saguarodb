@@ -65,7 +65,7 @@ module and are re-exported from the crate root; `bind`/`bind_parameterized` call
 
 ## Binder Contract
 
-Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. Schema-evolution `ALTER TABLE` binds the target table to `TableId` and carries the original name only for diagnostics/explain output, so prepared schema-evolution DDL is rejected if the bound table is dropped or its `schema_version` changes before execution. `DROP TABLE IF EXISTS` and `DROP SEQUENCE` are deliberate exceptions: they carry the normalized object name plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. `CREATE TABLE IF NOT EXISTS` also carries the table name through execution so the duplicate-table no-op decision uses the current catalog. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
+Binder output is fully resolved for DML and most DDL. No downstream phase performs table, column, or index name lookup; the executor may still defensively validate runtime DML values before storage writes. Schema-evolution `ALTER TABLE` binds the target table to `TableId` and carries the original name only for diagnostics/explain output, so prepared schema-evolution DDL is rejected if the bound table is dropped or its `schema_version` changes before execution. `DROP TABLE IF EXISTS` and `DROP SEQUENCE` are deliberate exceptions: they carry normalized object names plus the `IF EXISTS` flag so extended-protocol prepared statements resolve existence at execution time instead of baking in a stale missing-object no-op. Multi-table DROP retains input order and executes as one statement. `CREATE TABLE IF NOT EXISTS` also carries the table name through execution so the duplicate-table no-op decision uses the current catalog. `CREATE TABLE` with `SERIAL` is another exception: the SERIAL marker travels on the parsed column list itself (`ParsedColumnDef.default = ParsedDefault::Serial`; no parallel list is threaded through the plan), and the executor derives the SERIAL columns and chooses owned sequence names at execution time under the DDL guard so prepared DDL cannot bake in stale collision checks.
 
 Binder responsibilities:
 
@@ -92,13 +92,13 @@ Binder responsibilities:
   statements. The server binds the inner `DECLARE ... FOR SELECT` query when it
   starts the SQL cursor worker; `FETCH`/`CLOSE` resolve names against the
   connection's cursor registry.
-- Bind `DROP TABLE` by resolving the table to `TableId` when `IF EXISTS` is
-  absent; if the name belongs to a view, return `SqlState::WrongObjectType`.
-  Bind `DROP TABLE IF EXISTS` as a pass-through carrying the normalized table
-  name and `IF EXISTS`; the executor resolves the table at statement execution
-  time so a prepared conditional drop does not remain a no-op if the table is
-  created after `Parse` and before `Execute`, and returns
-  `SqlState::WrongObjectType` if the name belongs to a view.
+- Bind every `DROP TABLE` target to `TableId` when `IF EXISTS` is absent; if any
+  name belongs to a view, return `SqlState::WrongObjectType`. Bind `DROP TABLE
+  IF EXISTS` as a pass-through carrying ordered normalized names; the executor
+  resolves every target at statement execution time so a prepared conditional
+  drop does not bake in stale existence, skips missing targets, and returns
+  `SqlState::WrongObjectType` if any name belongs to a view. Execution resolves
+  the complete target list before changing catalog or storage.
 - Bind `CREATE VIEW` by binding its query, validating any explicit view column
   list against the query output width, rejecting query parameters, and deriving
   durable `ViewDependency` metadata. Specific column references become named
@@ -127,6 +127,11 @@ Binder responsibilities:
 - Reject unsupported forms. Concretely, the binder rejects duplicate primary-key columns (`SqlState::SyntaxError`) in `CREATE TABLE` (empty primary keys and composite multi-column primary keys are accepted), and duplicate `UPDATE` assignments or duplicate `INSERT` target columns (`SqlState::DatatypeMismatch`).
 
 ```rust
+pub struct DropTableTarget {
+    pub name: String,
+    pub table: Option<TableId>,
+}
+
 pub enum BoundStatement {
     CreateTable {
         name: String,
@@ -138,7 +143,7 @@ pub enum BoundStatement {
         toast: ToastOptions,
         checks: Vec<String>,
     },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
     AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
@@ -545,7 +550,7 @@ Scalar functions remain `BoundExpr::Function`. The set of scalar functions and t
 ```rust
 pub enum LogicalPlan {
     CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
     AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
@@ -637,7 +642,7 @@ usable (e.g. `id = 3 + 4` folds to `id = 7`).
 ```rust
 pub enum PhysicalPlan {
     CreateTable { name: String, if_not_exists: bool, columns: Vec<ParsedColumnDef>, primary_key: Vec<String>, unique: Vec<Vec<String>>, compression: CompressionSetting, toast: ToastOptions, checks: Vec<String> },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     AlterTableAddColumn { table: TableId, table_name: String, if_not_exists: bool, column: ParsedColumnDef },
     AlterTableDropColumn { table: TableId, table_name: String, if_exists: bool, column: String },
     AlterTableRenameColumn { table: TableId, table_name: String, old_name: String, new_name: String },
@@ -712,12 +717,14 @@ pub enum PhysicalPlan {
 
 The executor crate is not called for `EXPLAIN`.
 
-`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable table=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
+`format_explain` renders each physical node on its own indented line with a stable label vocabulary, including: `SeqScan table=name(id) filter=yes|none`, `SystemScan view=schema.name filter=yes|none`, `IndexScan table=name(id) index=N range=exact(...)|range(...) filter=yes|none`, `NestedLoopJoin type=… condition=yes|none`, `HashJoin keys=N`, `Filter`, `Projection exprs=N`, `Sort keys=N`, `Distinct keys=N`, `Limit count=… offset=…`, `Aggregate groups=… aggregates=…`, `Values rows=N`, `CreateTable`, `DropTable tables=… if_exists=true|false`, `Create[Unique]Index name on table`, `DropIndex index=N`, `CreateSequence name`, `DropSequence name if_exists=true|false`, and `Insert`/`Update`/`Delete table=…`.
 
 ## Acceptance Tests
 
 - Binder resolves aliases and self-joins with distinct `BindingId`s.
 - Binder rejects ambiguous unqualified columns.
+- Binder/planner preserve ordered multi-table DROP targets; a late missing or
+  wrong-kind target fails before execution can remove an earlier table.
 - Binder expands wildcard projection into explicit bound expressions.
 - Binder binds `INSERT ... SELECT` into `BoundInsertSource::Query`, rejecting column-count, type, and nullability mismatches against the target.
 - Binder resolves `pg_catalog` and `information_schema` views as `BoundFrom::System`, while preserving CTE/user-table precedence for bare names and rejecting system-catalog write targets.

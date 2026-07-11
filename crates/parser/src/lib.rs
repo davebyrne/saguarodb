@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(
             parse("truncate table users").unwrap(),
             Statement::Truncate {
-                table: "users".to_string(),
+                tables: vec!["users".to_string()],
             }
         );
     }
@@ -807,6 +807,13 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            parse("drop table if exists Users, Orders").unwrap(),
+            Statement::DropTable {
+                names: vec!["users".to_string(), "orders".to_string()],
+                if_exists: true,
+            }
+        );
         assert!(matches!(
             parse("insert into users (id, name) values (1, 'ann')").unwrap(),
             Statement::Insert {
@@ -1199,7 +1206,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::Truncate {
-                    table: "users".to_string(),
+                    tables: vec!["users".to_string()],
                 },
                 "for `{sql}`"
             );
@@ -1207,9 +1214,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_multi_table_truncate_and_rejects_duplicate_targets() {
+        assert_eq!(
+            parse("truncate table Users, Orders").unwrap(),
+            Statement::Truncate {
+                tables: vec!["users".to_string(), "orders".to_string()],
+            }
+        );
+
+        for sql in [
+            "truncate users, USERS",
+            "drop table users, USERS",
+            "drop table if exists users, users",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn rejects_multi_target_drop_for_non_table_objects() {
+        for sql in [
+            "drop view first_view, second_view",
+            "drop index first_idx, second_idx",
+            "drop sequence first_seq, second_seq",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_truncate_forms() {
         for sql in [
-            "truncate users, orders",
             "truncate table only users",
             "truncate users restart identity",
             "truncate users continue identity",
@@ -2159,10 +2198,6 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Parse);
         assert_eq!(err.code, SqlState::SyntaxError);
 
-        let err = parse("create table users (id integer) with (fillfactor = 70)").unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Parse);
-        assert_eq!(err.code, SqlState::SyntaxError);
-
         let err = parse("create table users (id integer primary key, org integer primary key)")
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Parse);
@@ -2203,6 +2238,22 @@ mod tests {
     }
 
     #[test]
+    fn accepts_validated_noop_fillfactor() {
+        for value in [10, 70, 100] {
+            let sql =
+                format!("create table t (id integer primary key) with (fillfactor = {value})");
+            let Statement::CreateTable {
+                compression, toast, ..
+            } = parse(&sql).unwrap()
+            else {
+                panic!("expected CreateTable for `{sql}`");
+            };
+            assert_eq!(compression, None);
+            assert_eq!(toast, ToastOptionPatch::default());
+        }
+    }
+
+    #[test]
     fn parses_create_table_with_toast_options() {
         let Statement::CreateTable { toast, .. } = parse(
             "create table t (id integer primary key, body text) with \
@@ -2221,10 +2272,24 @@ mod tests {
 
     #[test]
     fn rejects_bad_create_table_options() {
-        // Unknown key stays a syntax error (the old fillfactor rejection).
-        let err =
-            parse("create table t (id integer primary key) with (fillfactor = 70)").unwrap_err();
-        assert_eq!(err.code, SqlState::SyntaxError);
+        for sql in [
+            "create table t (id integer) with (fillfactor = '70')",
+            "create table t (id integer) with (fillfactor = 10.5)",
+            "create table t (id integer) with (fillfactor = -10.5)",
+            "create table t (id integer) with (fillfactor = 10, fillfactor = 20)",
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+        for value in [9, 101] {
+            let sql = format!("create table t (id integer) with (fillfactor = {value})");
+            let err = parse(&sql).unwrap_err();
+            assert_eq!(err.code, SqlState::InvalidParameterValue, "for `{sql}`");
+        }
+        let err = parse("create table t (id integer) with (fillfactor = -10)").unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidParameterValue);
+        let err = parse("create table t (id integer) with (fillfactor = 4294967296)").unwrap_err();
+        assert_eq!(err.code, SqlState::InvalidParameterValue);
         // Known key, unknown codec: deliberately-unsupported => 0A000.
         let err = parse("create table t (id integer primary key) with (compression = 'lz4')")
             .unwrap_err();

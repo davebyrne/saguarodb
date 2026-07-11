@@ -134,6 +134,12 @@ impl BoundQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTableTarget {
+    pub name: String,
+    pub table: Option<TableId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundStatement {
     CreateTable {
         name: String,
@@ -154,9 +160,8 @@ pub enum BoundStatement {
         checks: Vec<String>,
     },
     DropTable {
-        name: String,
+        targets: Vec<DropTableTarget>,
         if_exists: bool,
-        table: Option<TableId>,
     },
     AlterTableAddColumn {
         table: TableId,

@@ -13,7 +13,7 @@ pub use binder::{bind, bind_default_expr, bind_parameterized, bind_parameterized
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
     BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
-    CorrelatedColumn, OutputColumn,
+    CorrelatedColumn, DropTableTarget, OutputColumn,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -2603,10 +2603,12 @@ mod tests {
         assert!(matches!(
             bound,
             BoundStatement::DropTable {
-                ref name,
+                ref targets,
                 if_exists: false,
-                table: Some(1)
-            } if name == "users"
+            } if targets.as_slice() == [DropTableTarget {
+                name: "users".to_string(),
+                table: Some(1),
+            }]
         ));
     }
 
@@ -2619,11 +2621,55 @@ mod tests {
         assert!(matches!(
             bound,
             BoundStatement::DropTable {
-                ref name,
+                ref targets,
                 if_exists: true,
-                table: None
-            } if name == "missing"
+            } if targets.as_slice() == [DropTableTarget {
+                name: "missing".to_string(),
+                table: None,
+            }]
         ));
+    }
+
+    #[test]
+    fn binder_preserves_multi_table_drop_targets() {
+        let catalog = catalog_with_users();
+        let orders = catalog
+            .create_table(
+                "orders".to_string(),
+                vec![ParsedColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                }],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+
+        let bound = bind(&parse("drop table users, orders").unwrap(), &catalog).unwrap();
+        let BoundStatement::DropTable {
+            targets,
+            if_exists: false,
+        } = bound
+        else {
+            panic!("expected DropTable");
+        };
+        assert_eq!(
+            targets,
+            vec![
+                DropTableTarget {
+                    name: "users".to_string(),
+                    table: Some(1),
+                },
+                DropTableTarget {
+                    name: "orders".to_string(),
+                    table: Some(orders.id),
+                },
+            ]
+        );
     }
 
     #[test]

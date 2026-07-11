@@ -34,7 +34,7 @@ pub enum Statement {
         checks: Vec<String>,
     },
     DropTable {
-        name: String,
+        names: Vec<String>,
         if_exists: bool,
     },
     AlterTableAddColumn {
@@ -213,12 +213,12 @@ pub enum Statement {
     Vacuum {
         table: Option<String>,
     },
-    /// `TRUNCATE [TABLE] <table>` — immediate table truncation. A maintenance
-    /// command that does not bind/plan relationally; unsupported PostgreSQL
-    /// options such as multiple tables, ONLY, identity handling, and cascade are
-    /// rejected by the parser.
+    /// `TRUNCATE [TABLE] <name> [, ...]` — immediate table truncation. A
+    /// maintenance command that does not bind/plan relationally. Targets retain
+    /// input order; duplicate normalized names and unsupported PostgreSQL options
+    /// such as ONLY, identity handling, and cascade are rejected by the parser.
     Truncate {
-        table: String,
+        tables: Vec<String>,
     },
     /// `ALTER TABLE <name> SET (compression = 'none' | 'zstd')`. Intercepted
     /// before sqlparser because sqlparser does not parse PostgreSQL storage

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use common::{
     CompressionSetting, DbError, IsolationLevel, PgType, Result, SequenceOptions, SqlState,
     TableOptionPatch, ToastCompression, ToastMode, ToastOptions,
@@ -42,7 +44,6 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
         return Ok(statement);
     }
     reject_set_global(sql)?;
-    reject_comma_separated_truncate(sql)?;
     if let Some(statement) = try_parse_create_sequence(sql)? {
         return Ok(statement);
     }
@@ -144,23 +145,36 @@ fn convert_statement(statement: sql::Statement) -> Result<Statement> {
         sql::Statement::Drop {
             object_type,
             if_exists,
-            mut names,
+            names,
             cascade,
             restrict,
             purge,
             temporary,
         } => {
-            if names.len() != 1 || cascade || restrict || purge || temporary {
+            if cascade || restrict || purge || temporary {
                 return unsupported("unsupported DROP form");
             }
-            let name = object_name(&names.remove(0))?;
             match object_type {
-                sql::ObjectType::Table => Ok(Statement::DropTable { name, if_exists }),
-                sql::ObjectType::View => Ok(Statement::DropView { name, if_exists }),
-                sql::ObjectType::Index if !if_exists => Ok(Statement::DropIndex { name }),
-                sql::ObjectType::Sequence => Ok(Statement::DropSequence { name, if_exists }),
-                sql::ObjectType::Index => unsupported("unsupported DROP form"),
-                _ => unsupported("unsupported DROP object type"),
+                sql::ObjectType::Table => {
+                    let names = names.iter().map(object_name).collect::<Result<Vec<_>>>()?;
+                    reject_duplicate_relation_names(&names, "DROP TABLE")?;
+                    Ok(Statement::DropTable { names, if_exists })
+                }
+                object_type => {
+                    if names.len() != 1 {
+                        return unsupported("unsupported DROP form");
+                    }
+                    let name = object_name(&names[0])?;
+                    match object_type {
+                        sql::ObjectType::View => Ok(Statement::DropView { name, if_exists }),
+                        sql::ObjectType::Index if !if_exists => Ok(Statement::DropIndex { name }),
+                        sql::ObjectType::Sequence => {
+                            Ok(Statement::DropSequence { name, if_exists })
+                        }
+                        sql::ObjectType::Index => unsupported("unsupported DROP form"),
+                        _ => unsupported("unsupported DROP object type"),
+                    }
+                }
             }
         }
         sql::Statement::Insert(insert) => convert_insert(insert),
@@ -770,6 +784,18 @@ fn object_name(name: &sql::ObjectName) -> Result<String> {
     ident_name(ident)
 }
 
+fn reject_duplicate_relation_names(names: &[String], operation: &str) -> Result<()> {
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in names {
+        if !seen.insert(name) {
+            return Err(parse_error(format!(
+                "{operation} target {name} specified more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn function_name(name: &sql::ObjectName) -> Result<String> {
     match name.0.as_slice() {
         [name] => {
@@ -1063,30 +1089,6 @@ fn reject_set_global(sql: &str) -> Result<()> {
         && global.value.eq_ignore_ascii_case("global")
     {
         return unsupported("SET GLOBAL is not supported");
-    }
-    Ok(())
-}
-
-fn reject_comma_separated_truncate(sql: &str) -> Result<()> {
-    let dialect = PostgreSqlDialect {};
-    let mut tokens: Vec<_> = Tokenizer::new(&dialect, sql)
-        .tokenize()
-        .map_err(|err| parse_error(format!("failed to parse SQL: {err}")))?
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_)))
-        .collect();
-
-    let Some(Token::Word(keyword)) = tokens.first() else {
-        return Ok(());
-    };
-    if keyword.quote_style.is_some() || !keyword.value.eq_ignore_ascii_case("truncate") {
-        return Ok(());
-    }
-    if tokens.last() == Some(&Token::SemiColon) {
-        tokens.pop();
-    }
-    if tokens.contains(&Token::Comma) {
-        return feature_not_supported("unsupported TRUNCATE form");
     }
     Ok(())
 }

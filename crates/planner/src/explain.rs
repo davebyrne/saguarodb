@@ -18,10 +18,15 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!("{padding}CreateTable {name}\n"));
         }
         PhysicalPlan::DropTable {
-            name, if_exists, ..
+            targets, if_exists, ..
         } => {
             let conditional = if *if_exists { " if_exists=true" } else { "" };
-            output.push_str(&format!("{padding}DropTable {name}{conditional}\n"));
+            let names = targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            output.push_str(&format!("{padding}DropTable tables={names}{conditional}\n"));
         }
         PhysicalPlan::AlterTableAddColumn {
             table_name, column, ..

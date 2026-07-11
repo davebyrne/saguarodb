@@ -308,15 +308,14 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - `SchemaOperations::create_table` appends the `CreateTable` WAL operation record; server query orchestration appends the statement `Commit`.
 - Return `Modified { command: "CREATE TABLE", count: 0 }`.
 
-`DROP TABLE`:
+`DROP TABLE [IF EXISTS] <name> [, ...]`:
 
-- Resolve table in binder for plain `DROP TABLE`; if the name belongs to a
-  view, return `SqlState::WrongObjectType`. For `DROP TABLE IF EXISTS`, carry
-  the table name through planning and resolve it at execution time under the
-  exclusive DDL guard. If the table is absent, return the normal command tag
-  without catalog/storage mutation or logical DDL WAL records. If a view exists
-  with the requested name, return `SqlState::WrongObjectType` rather than
-  treating the statement as a no-op.
+- Resolve every target in the binder for plain `DROP TABLE`; if any name belongs
+  to a view, return `SqlState::WrongObjectType`. For `DROP TABLE IF EXISTS`,
+  carry ordered names through planning and resolve the complete list at
+  execution time under the exclusive DDL guard. Skip absent tables without
+  catalog/storage mutation or logical DDL WAL records, but return
+  `SqlState::WrongObjectType` if a view owns any requested name.
 - Call `SchemaOperations::drop_table`.
 - For each column default that references an owned sequence, call
   `SchemaOperations::drop_sequence` in the same statement.
@@ -325,7 +324,9 @@ If a write errors after mutating pages or storage-owned metadata, the executor p
 - `SchemaOperations::drop_table` appends the `DropTable` WAL operation record
   and each owned sequence appends a sibling `DropSequence`; server query
   orchestration appends the statement `Commit`.
-- Return `Modified { command: "DROP TABLE", count: 0 }`.
+- Apply every target under one statement transaction and return `Modified {
+  command: "DROP TABLE", count: 0 }`. A pre-commit failure restores the entire
+  statement; WAL uses the existing per-object records under one transaction id.
 
 `CREATE INDEX`:
 

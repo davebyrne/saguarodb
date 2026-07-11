@@ -8,7 +8,8 @@ use crate::{Expr, Statement, UnaryOp};
 
 use super::{
     column_char_length, compression_from_str, convert_expr, convert_pg_type, convert_query,
-    feature_not_supported, ident_name, object_name, parse_error, serial_pg_type, unsupported,
+    feature_not_supported, ident_name, object_name, parse_error, reject_duplicate_relation_names,
+    serial_pg_type, unsupported,
 };
 
 pub(super) fn convert_create_index(index: sql::CreateIndex) -> Result<Statement> {
@@ -209,22 +210,30 @@ pub(super) fn convert_truncate(
     cascade: Option<sql::CascadeOption>,
     on_cluster: Option<sql::Ident>,
 ) -> Result<Statement> {
-    if table_names.len() != 1
-        || partitions.is_some()
-        || only
-        || identity.is_some()
-        || cascade.is_some()
-        || on_cluster.is_some()
-    {
-        return feature_not_supported("unsupported TRUNCATE form");
+    if table_names.is_empty() {
+        return feature_not_supported("TRUNCATE requires at least one table");
     }
-    let table = table_names
-        .into_iter()
-        .next()
-        .expect("checked exactly one table");
-    Ok(Statement::Truncate {
-        table: object_name(&table.name)?,
-    })
+    if partitions.is_some() {
+        return feature_not_supported("TRUNCATE partitions are not supported");
+    }
+    if only {
+        return feature_not_supported("TRUNCATE ONLY is not supported");
+    }
+    if identity.is_some() {
+        return feature_not_supported("TRUNCATE identity options are not supported");
+    }
+    if cascade.is_some() {
+        return feature_not_supported("TRUNCATE cascade options are not supported");
+    }
+    if on_cluster.is_some() {
+        return feature_not_supported("TRUNCATE ON CLUSTER is not supported");
+    }
+    let tables = table_names
+        .iter()
+        .map(|table| object_name(&table.name))
+        .collect::<Result<Vec<_>>>()?;
+    reject_duplicate_relation_names(&tables, "TRUNCATE")?;
+    Ok(Statement::Truncate { tables })
 }
 
 fn convert_index_column(column: &sql::IndexColumn) -> Result<String> {
@@ -435,6 +444,7 @@ pub(super) fn convert_create_table(table: sql::CreateTable) -> Result<Statement>
 /// (the CREATE SEQUENCE duplicate-option convention).
 fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<TableOptionPatch> {
     let mut parsed = TableOptionPatch::default();
+    let mut saw_fillfactor = false;
     for option in options {
         let sql::SqlOption::KeyValue { key, value } = option else {
             return Err(parse_error("unsupported storage option form"));
@@ -487,6 +497,18 @@ fn convert_table_options(options: Vec<sql::SqlOption>) -> Result<TableOptionPatc
                     return Err(parse_error("duplicate toast_compression option"));
                 }
                 parsed.toast.compression = Some(parse_toast_compression_value(&value)?);
+            }
+            "fillfactor" => {
+                if saw_fillfactor {
+                    return Err(parse_error("duplicate fillfactor option"));
+                }
+                saw_fillfactor = true;
+                let value = parse_fillfactor_value(&value)?;
+                if !(10..=100).contains(&value) {
+                    return Err(invalid_parameter_value(
+                        "fillfactor must be between 10 and 100",
+                    ));
+                }
             }
             _ => return Err(parse_error(format!("unsupported storage option {name}"))),
         }
@@ -561,6 +583,36 @@ fn parse_u32_storage_option(name: &str, value: &sql::Expr) -> Result<u32> {
         }
         _ => Err(parse_error(format!("{name} must be an integer literal"))),
     }
+}
+
+fn parse_fillfactor_value(value: &sql::Expr) -> Result<u32> {
+    let (text, negative) = match value {
+        sql::Expr::Value(v) => match &v.value {
+            sql::Value::Number(text, false) => (text.as_str(), false),
+            _ => return Err(parse_error("fillfactor must be an integer literal")),
+        },
+        sql::Expr::UnaryOp {
+            op: sql::UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            sql::Expr::Value(sql::ValueWithSpan {
+                value: sql::Value::Number(text, false),
+                ..
+            }) => (text.as_str(), true),
+            _ => return Err(parse_error("fillfactor must be an integer literal")),
+        },
+        _ => return Err(parse_error("fillfactor must be an integer literal")),
+    };
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(parse_error("fillfactor must be an integer literal"));
+    }
+    if negative {
+        return Err(invalid_parameter_value(
+            "fillfactor must be between 10 and 100",
+        ));
+    }
+    text.parse::<u32>()
+        .map_err(|_| invalid_parameter_value("fillfactor must be between 10 and 100"))
 }
 
 fn invalid_parameter_value(message: impl Into<String>) -> DbError {

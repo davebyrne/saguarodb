@@ -1340,6 +1340,13 @@ impl PageBackedStorageEngine {
     /// Install an ALTERed table schema's TOAST metadata into the live state.
     /// No WAL; the caller owns logical record emission and commit ordering.
     pub fn set_table_toast_metadata(&self, schema: &TableSchema) -> Result<()>;
+    /// Validate globally unique target and replacement storage ids, then publish
+    /// a complete committed multi-table TRUNCATE batch under one storage state
+    /// write lock. No WAL is appended here.
+    pub fn publish_truncate_tables(
+        &self,
+        updates: Vec<TruncateCatalogUpdate>,
+    ) -> Result<()>;
     /// Up to `cap` evenly-sampled initialized heap page images, for
     /// dictionary training.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
@@ -1376,6 +1383,15 @@ impl PageBackedStorageEngine {
 `open` stores shared `Arc` handles to the buffer pool and WAL manager and initializes empty table, TOAST value-id allocator, and sequence metadata. It does not read schemas from disk; server startup installs catalog schemas explicitly with `install_schemas` (tables and hidden TOAST relations), `install_index_schemas` (catalog indexes), and `install_sequences` after loading the catalog snapshot, so DML maintains the indexes and sequence functions can advance existing sequences. In normal mode, `install_schemas` seeds every hidden TOAST relation's in-memory value-id allocator by physically scanning its heap rows (including aborted and in-flight tuples) and setting `next_value_id = 1 + max(value_id)`, or `1` when the relation has no chunks. In recovery mode, `install_schemas` intentionally leaves TOAST allocator entries absent: post-checkpoint physical redo may install additional chunk rows after schema metadata is loaded, so the recovery-to-normal transition reseeds every live hidden TOAST relation after redo has finished and before maintenance or DML can prune rows. Checkpoint uses `sequence_schemas_for_checkpoint` to copy live `(last_value, is_called)` state back into the catalog snapshot it serializes.
 
 `PageBackedStorageEngine` implements `StorageEngine`, `SchemaOperations`, `common::SequenceManager`, and `RecoveryOperations`. Server code stores `Arc<PageBackedStorageEngine>` so startup can call concrete recovery-mode methods, query execution can pass `storage.as_ref()` as both `&dyn StorageEngine` and `&dyn SchemaOperations`, and `StatementContext` can carry the same value as the sequence manager.
+
+Normal standalone TRUNCATE preparation remains per table so each target emits
+the existing `TruncateTable` logical WAL record under the statement's shared
+transaction id. Multi-table publication uses
+`publish_truncate_tables(Vec<TruncateCatalogUpdate>)`, which validates the
+complete update set and swaps every table/index generation under one storage
+state write lock. The server also holds `relation_publish_gate` across catalog
+and storage batch publication, so new relation snapshots cannot observe a
+committed subset.
 
 `RecoveryOperations` is implemented directly for `PageBackedStorageEngine`. There is no separate public `StorageRecovery` adapter; `crates/storage/src/recovery.rs` contains the `impl RecoveryOperations for PageBackedStorageEngine`, which delegates to the recovery-mode helpers (`apply_create_table_without_wal` / `apply_drop_table_without_wal`, schema metadata setters, truncate generation publication, plus sequence create/drop/value replay helpers) defined on `PageBackedStorageEngine` in `engine.rs`.
 
@@ -1584,6 +1600,13 @@ different files can proceed concurrently.
 - Scan returns all rows with `StoredRow` identity.
 - Range scan returns expected ordered keys.
 - Recovery DDL apply mutates metadata without WAL append.
+- Multi-table truncate preparation failure can be rolled back without publishing
+  any target; batch publication rejects a late cross-update storage-id collision
+  without partial publication and otherwise swaps every prepared base,
+  secondary-index, and hidden-TOAST generation under one storage state lock.
+- Direct batch publication rejects duplicate logical table targets before any
+  table/index generation, rollback bookkeeping, retired-generation queue, or
+  relation epoch changes.
 - A reopened engine reads rows through the durable on-disk index (no rebuild).
 - A B-tree splits correctly under variable-length keys (byte-balanced) and stays searchable.
 - After a restart, inserting a row or growing the index never reuses an on-disk page.

@@ -822,23 +822,45 @@ impl CatalogManager for MemoryCatalog {
     }
 
     fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate> {
+        let mut updates = self.apply_truncate_tables(std::slice::from_ref(plan))?;
+        Ok(updates.remove(0))
+    }
+
+    fn apply_truncate_tables(
+        &self,
+        plans: &[TruncateTablePlan],
+    ) -> Result<Vec<TruncateCatalogUpdate>> {
         let mut snapshot = self.write_snapshot()?;
-        let update = build_truncate_catalog_update(&snapshot, plan)?;
+        validate_truncate_batch(plans)?;
 
-        reserve_storage_id_value(&mut snapshot.next_storage_id, update.table.storage_id)?;
-        snapshot
-            .tables_by_id
-            .insert(update.table.id, update.table.clone());
-        if let Some(toast) = &update.toast_table {
-            reserve_storage_id_value(&mut snapshot.next_storage_id, toast.storage_id)?;
-            snapshot.tables_by_id.insert(toast.id, toast.clone());
-        }
-        for index in &update.indexes {
-            reserve_storage_id_value(&mut snapshot.next_storage_id, index.storage_id)?;
-            snapshot.indexes_by_id.insert(index.id, index.clone());
+        let updates = plans
+            .iter()
+            .map(|plan| build_truncate_catalog_update(&snapshot, plan))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Reserve every id before publishing any schema so even a malformed
+        // caller that reaches the allocator limit cannot leave a partial batch.
+        let mut next_storage_id = snapshot.next_storage_id;
+        for update in &updates {
+            for storage_id in truncate_update_storage_ids(update) {
+                reserve_storage_id_value(&mut next_storage_id, storage_id)?;
+            }
         }
 
-        Ok(update)
+        for update in &updates {
+            snapshot
+                .tables_by_id
+                .insert(update.table.id, update.table.clone());
+            if let Some(toast) = &update.toast_table {
+                snapshot.tables_by_id.insert(toast.id, toast.clone());
+            }
+            for index in &update.indexes {
+                snapshot.indexes_by_id.insert(index.id, index.clone());
+            }
+        }
+        snapshot.next_storage_id = next_storage_id;
+
+        Ok(updates)
     }
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
@@ -1585,6 +1607,42 @@ fn validate_truncate_plan_storage_ids(plan: &TruncateTablePlan) -> Result<()> {
         validate_truncate_plan_storage_id(*storage_id, &mut ids)?;
     }
     Ok(())
+}
+
+fn validate_truncate_batch(plans: &[TruncateTablePlan]) -> Result<()> {
+    let mut targets = HashSet::new();
+    let mut storage_ids = HashSet::new();
+    for plan in plans {
+        if !targets.insert(plan.table_id) {
+            return Err(DbError::internal(format!(
+                "truncate batch repeats table {}",
+                plan.table_id
+            )));
+        }
+        validate_truncate_plan_storage_ids(plan)?;
+        for storage_id in truncate_plan_storage_ids(plan) {
+            if !storage_ids.insert(storage_id) {
+                return Err(DbError::internal(format!(
+                    "truncate batch repeats storage id {storage_id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn truncate_plan_storage_ids(plan: &TruncateTablePlan) -> impl Iterator<Item = FileId> + '_ {
+    std::iter::once(plan.new_table_storage_id)
+        .chain(plan.new_toast_storage_id.map(|(_, id)| id))
+        .chain(plan.new_index_storage_ids.iter().map(|(_, id)| *id))
+}
+
+fn truncate_update_storage_ids(
+    update: &TruncateCatalogUpdate,
+) -> impl Iterator<Item = FileId> + '_ {
+    std::iter::once(update.table.storage_id)
+        .chain(update.toast_table.iter().map(|toast| toast.storage_id))
+        .chain(update.indexes.iter().map(|index| index.storage_id))
 }
 
 fn validate_truncate_plan_storage_id(storage_id: FileId, ids: &mut HashSet<FileId>) -> Result<()> {

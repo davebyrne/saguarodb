@@ -149,6 +149,10 @@ pub trait CatalogManager: Send + Sync {
         plan: &TruncateTablePlan,
     ) -> Result<TruncateCatalogUpdate>;
     fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
+    fn apply_truncate_tables(
+        &self,
+        plans: &[TruncateTablePlan],
+    ) -> Result<Vec<TruncateCatalogUpdate>>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -1453,6 +1457,81 @@ mod tests {
             catalog.get_index_by_name("users_bio").unwrap(),
             Some(expected_index)
         );
+    }
+
+    #[test]
+    fn apply_truncate_tables_publishes_the_complete_batch() {
+        let catalog = MemoryCatalog::empty();
+        let first = catalog
+            .create_table(
+                "first".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let second = catalog
+            .create_table(
+                "second".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let plans = [
+            catalog.prepare_truncate_table(first.id).unwrap(),
+            catalog.prepare_truncate_table(second.id).unwrap(),
+        ];
+
+        let updates = catalog.apply_truncate_tables(&plans).unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            catalog.get_table(first.id).unwrap().unwrap().storage_id,
+            plans[0].new_table_storage_id
+        );
+        assert_eq!(
+            catalog.get_table(second.id).unwrap().unwrap().storage_id,
+            plans[1].new_table_storage_id
+        );
+    }
+
+    #[test]
+    fn apply_truncate_tables_rejects_batch_collisions_without_publishing() {
+        let catalog = MemoryCatalog::empty();
+        let first = catalog
+            .create_table(
+                "first".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let second = catalog
+            .create_table(
+                "second".to_string(),
+                vec![id_column(false)],
+                vec!["id".to_string()],
+                CompressionSetting::None,
+            )
+            .unwrap();
+        let first_plan = catalog.prepare_truncate_table(first.id).unwrap();
+        let mut second_plan = catalog.prepare_truncate_table(second.id).unwrap();
+        second_plan.new_table_storage_id = first_plan.new_table_storage_id;
+
+        let err = catalog
+            .apply_truncate_tables(&[first_plan.clone(), second_plan])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(catalog.get_table(first.id).unwrap(), Some(first.clone()));
+        assert_eq!(catalog.get_table(second.id).unwrap(), Some(second.clone()));
+
+        let err = catalog
+            .apply_truncate_tables(&[first_plan.clone(), first_plan])
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+        assert_eq!(catalog.get_table(first.id).unwrap(), Some(first));
+        assert_eq!(catalog.get_table(second.id).unwrap(), Some(second));
     }
 
     #[test]

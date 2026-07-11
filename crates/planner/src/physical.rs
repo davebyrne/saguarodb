@@ -27,9 +27,8 @@ pub enum PhysicalPlan {
         checks: Vec<String>,
     },
     DropTable {
-        name: String,
+        targets: Vec<crate::DropTableTarget>,
         if_exists: bool,
-        table: Option<TableId>,
     },
     AlterTableAddColumn {
         table: TableId,
@@ -249,14 +248,9 @@ fn physical_plan_inner(
             toast: toast.clone(),
             checks: checks.clone(),
         }),
-        LogicalPlan::DropTable {
-            name,
-            if_exists,
-            table,
-        } => Ok(PhysicalPlan::DropTable {
-            name: name.clone(),
+        LogicalPlan::DropTable { targets, if_exists } => Ok(PhysicalPlan::DropTable {
+            targets: targets.clone(),
             if_exists: *if_exists,
-            table: *table,
         }),
         LogicalPlan::AlterTableAddColumn {
             table,

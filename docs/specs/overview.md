@@ -656,7 +656,7 @@ pub enum Statement {
         toast: ToastOptionPatch,
         checks: Vec<String>,
     },
-    DropTable { name: String, if_exists: bool },
+    DropTable { names: Vec<String>, if_exists: bool },
     AlterTableAddColumn {
         table: String,
         if_not_exists: bool,
@@ -716,7 +716,7 @@ pub enum Statement {
     ShowVariable { name: Option<String> },                           // SHOW <guc> / SHOW ALL
     DiscardAll,                                                      // DISCARD ALL
     Vacuum { table: Option<String> },             // VACUUM [table] — maintenance, not bound/planned
-    Truncate { table: String },                   // TRUNCATE [TABLE] <table> — maintenance, not bound/planned
+    Truncate { tables: Vec<String> },             // TRUNCATE [TABLE] <name> [, ...] — maintenance, not bound/planned
     AlterTableSetCompression {                    // ALTER TABLE <table> SET (compression = ...)
         table: String,
         compression: CompressionSetting,
@@ -950,6 +950,11 @@ The binder:
 - Expands `SELECT *` into explicit column lists
 
 ```rust
+pub struct DropTableTarget {
+    pub name: String,
+    pub table: Option<TableId>,
+}
+
 /// Fully resolved statement. Names are resolved except for documented
 /// execution-time DDL cases; all types are checked and all column references are
 /// assigned physical slot positions.
@@ -964,7 +969,7 @@ pub enum BoundStatement {
         toast: ToastOptions,
         checks: Vec<String>,
     },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -1249,7 +1254,7 @@ pub enum LogicalPlan {
         toast: ToastOptions,
         checks: Vec<String>,
     },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -1346,7 +1351,7 @@ pub enum PhysicalPlan {
         toast: ToastOptions,
         checks: Vec<String>,
     },
-    DropTable { name: String, if_exists: bool, table: Option<TableId> },
+    DropTable { targets: Vec<DropTableTarget>, if_exists: bool },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
     DropIndex { index: IndexId },
     CreateSequence { name: String, options: SequenceOptions },
@@ -2331,6 +2336,10 @@ pub trait CatalogManager: Send + Sync {
         plan: &TruncateTablePlan,
     ) -> Result<TruncateCatalogUpdate>;
     fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
+    fn apply_truncate_tables(
+        &self,
+        plans: &[TruncateTablePlan],
+    ) -> Result<Vec<TruncateCatalogUpdate>>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -2410,6 +2419,13 @@ pub struct CatalogSnapshot {
 
 Empty catalogs start with `next_table_id = 1`, `next_index_id = 1`, `next_sequence_id = 1`, and `next_storage_id = 1`. `apply_create_table` and `apply_drop_table` are recovery-only APIs. `apply_create_table` inserts a fully assigned historical schema without changing logical IDs and advances `next_table_id` and `next_storage_id` past that schema; user tables enter the table name map, while hidden TOAST relations are installed by ID only. `reserve_table_id` and `reserve_storage_id` advance allocators without installing schemas; `apply_drop_table` removes by ID without assigning IDs and cascades a user-table drop to its linked hidden TOAST relation metadata. `apply_create_index`/`apply_update_index_schema`/`apply_drop_index` do the same for catalog indexes, and `reserve_index_id` advances `next_index_id` past a skipped historical index ID without installing an index schema. Normal `CREATE INDEX` may make the catalog index visible before the storage tree is published, but storage publishes the new `IndexGeneration` only after the empty tree is created and backfill succeeds; scans planned from the current catalog fall back to table scans when a retained relation snapshot does not contain that index. `prepare_truncate_table` burns fresh storage ids for the base table, optional hidden TOAST table, and catalog indexes without publishing them; `build_truncate_table_update` returns the updated schemas without mutating the catalog so storage can prepare empty files before commit; `apply_truncate_table` revalidates and swaps only `storage_id` fields after durable commit. `preflight_add_table_column` and `preflight_drop_table_column` validate schema-evolution changes without mutating the catalog so executor no-op and dependency failures can return before storage rewrites; `add_table_column`/`drop_table_column` allocate fresh storage ids and publish the new schema for rewrite execution; renames are metadata-only and keep existing storage ids. `apply_update_table_and_index_schemas` is the recovery path for committed rewrite DDL and validates the replayed table schema together with its carried index schemas before publishing either, so remapped primary-key constraint indexes are checked against the replayed table metadata. Primary-key catalog helpers atomically add or drop the table's primary-key metadata together with the backing primary-key constraint index. `create_view` validates the shared table/view name namespace, assigns a relation ID from `next_table_id`, and stores dependency metadata; `CREATE OR REPLACE VIEW` preserves the relation ID and increments `schema_version`; `drop_view` removes only view metadata. `create_sequence` validates and normalizes options, assigns a `SequenceId`, stores a `SequenceSchema`, and returns it; `apply_create_sequence`/`apply_drop_sequence` are the matching recovery-only APIs, and `reserve_sequence_id` advances `next_sequence_id` past a skipped historical sequence ID without installing a schema. Recovery uses the reserve methods for aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records so their IDs and rewrite storage IDs are not reused while physical page records, relation files, or logical sequence IDs may have been observed in WAL.
 
+For multi-table TRUNCATE, `apply_truncate_tables` validates every prepared plan
+against one catalog state, rejects any replacement storage id reused across the
+batch, and publishes the complete set of storage-id swaps under one catalog
+write lock. Storage performs the same global collision check before one-lock
+batch publication. The single-plan apply method remains the recovery path for
+each existing logical WAL record.
+
 ### Persistence
 
 The catalog is stored in the control record (`data/manifest.dat`) at each checkpoint. Loaded into memory on startup. All reads from the in-memory copy. Mutations update memory; persistence happens at the next checkpoint. Between checkpoints, the WAL ensures catalog changes (CREATE/DROP TABLE, TRUNCATE, schema-evolution ALTER TABLE, CREATE/DROP INDEX, CREATE/DROP SEQUENCE, CREATE/REPLACE/DROP VIEW, dictionaries, and table metadata ALTERs) are durable.
@@ -2483,7 +2499,7 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers, but schema-generation rewrites can block new snapshot capture until they publish the new generation.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer_cancelable()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus row-conflict coordination: an in-progress row-lock holder makes the waiter block through the server `LockManager` and retry after the blocker settles; deadlock cycles return `SqlState::DeadlockDetected` (`40P01`), cancellation returns `SqlState::QueryCanceled` (`57014`), and committed-superseded conflicts still return `SqlState::SerializationFailure` (`40001`).
 - **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint_cancelable()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY` also get a stable physical chain view for backfill/validation. `ALTER TABLE ... ADD/DROP COLUMN` acquires the active-transaction registry's cancelable snapshot-exclusion guard before waiting for the checkpoint guard because these statements can publish a new storage generation and conditional no-op preflight is not stable until the exclusive guard is held. The fence blocks new snapshot captures while advertised snapshots drain. Transactions that already hold a writer guard may still capture statement snapshots so they can release the guard the DDL is waiting on; read-only transactions wait so they cannot bind one schema generation and scan another. Under the exclusive guard, the executor repeats catalog preflight and returns conditional no-ops before scanning rows.
-- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <table>`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Foreground maintenance takes the **exclusive** concurrency guard through `begin_checkpoint_cancelable`, which drains in-flight writers while polling the statement token (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs a relation-generation swap: fresh heap/index storage ids are prepared and logged before commit, then catalog/storage publish the empty generation after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
+- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <name> [, ...]`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Foreground maintenance takes the **exclusive** concurrency guard through `begin_checkpoint_cancelable`, which drains in-flight writers while polling the statement token (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs one statement-atomic relation-generation swap for every target: all targets and replacement heap/index storage ids are prepared and logged before one commit, then catalog/storage publish the complete batch after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
 The concrete `ConcurrencyController` is an `RwLock`: writer acquisition takes it shared (DML writers run together), and checkpoint/maintenance/DDL acquisition takes it exclusively. Foreground SQL uses cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.

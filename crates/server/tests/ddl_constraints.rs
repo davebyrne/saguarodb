@@ -184,6 +184,157 @@ async fn conditional_table_ddl_is_noop_only_for_existence_conflicts() {
 }
 
 #[tokio::test]
+async fn drop_table_accepts_pgbench_cleanup_list() {
+    let server = TestServer::start().await.unwrap();
+
+    server
+        .simple_query(
+            "drop table if exists pgbench_accounts, pgbench_branches, \
+             pgbench_history, pgbench_tellers",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn create_table_accepts_pgbench_schema_with_fillfactor() {
+    let server = TestServer::start().await.unwrap();
+    for sql in [
+        "create table pgbench_history (tid int, bid int, aid bigint, delta int, \
+         mtime timestamp, filler char(22)) with (fillfactor = 70)",
+        "create table pgbench_tellers (tid int not null, bid int, tbalance int, \
+         filler char(84)) with (fillfactor = 70)",
+        "create table pgbench_accounts (aid bigint not null, bid int, abalance int, \
+         filler char(84)) with (fillfactor = 70)",
+        "create table pgbench_branches (bid int not null, bbalance int, \
+         filler char(88)) with (fillfactor = 70)",
+    ] {
+        server.simple_query(sql).await.unwrap();
+    }
+
+    for table in [
+        "pgbench_accounts",
+        "pgbench_branches",
+        "pgbench_history",
+        "pgbench_tellers",
+    ] {
+        assert!(
+            server
+                .simple_query(&format!("select * from {table}"))
+                .await
+                .unwrap()
+                .unwrap_rows()
+                .is_empty()
+        );
+    }
+
+    server
+        .simple_query(
+            "truncate table pgbench_accounts, pgbench_branches, \
+             pgbench_history, pgbench_tellers",
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drop_table_removes_multiple_tables_in_one_statement() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table first_table (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table second_table (id integer primary key)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("drop table first_table, second_table")
+        .await
+        .unwrap();
+
+    for table in ["first_table", "second_table"] {
+        let err = server
+            .simple_query(&format!("select id from {table}"))
+            .await
+            .err()
+            .expect("dropped table should not be queryable");
+        assert!(
+            err.message.contains("42P01"),
+            "expected UndefinedTable for {table}: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn drop_table_if_exists_skips_missing_targets_within_the_list() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table first_present (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table second_present (id integer primary key)")
+        .await
+        .unwrap();
+
+    server
+        .simple_query("drop table if exists first_present, missing_between, second_present")
+        .await
+        .unwrap();
+
+    for table in ["first_present", "second_present"] {
+        let err = server
+            .simple_query(&format!("select id from {table}"))
+            .await
+            .err()
+            .expect("present target should have been dropped");
+        assert!(
+            err.message.contains("42P01"),
+            "expected UndefinedTable for {table}: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn drop_table_validates_every_target_before_dropping_any() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table kept (id integer primary key)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into kept values (1)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create view not_a_table as select id from kept")
+        .await
+        .unwrap();
+
+    let err = server
+        .simple_query("drop table if exists kept, not_a_table")
+        .await
+        .err()
+        .expect("a view in the target list should reject the statement");
+    assert!(
+        err.message.contains("42809"),
+        "expected WrongObjectType: {}",
+        err.message
+    );
+
+    let rows = server
+        .simple_query("select id from kept")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
+#[tokio::test]
 async fn conditional_table_ddl_noops_do_not_log_logical_ddl_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

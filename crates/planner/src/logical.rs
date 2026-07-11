@@ -25,9 +25,8 @@ pub enum LogicalPlan {
         checks: Vec<String>,
     },
     DropTable {
-        name: String,
+        targets: Vec<crate::DropTableTarget>,
         if_exists: bool,
-        table: Option<TableId>,
     },
     AlterTableAddColumn {
         table: TableId,
@@ -213,14 +212,9 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
             toast: toast.clone(),
             checks: checks.clone(),
         }),
-        BoundStatement::DropTable {
-            name,
-            if_exists,
-            table,
-        } => Ok(LogicalPlan::DropTable {
-            name: name.clone(),
+        BoundStatement::DropTable { targets, if_exists } => Ok(LogicalPlan::DropTable {
+            targets: targets.clone(),
             if_exists: *if_exists,
-            table: *table,
         }),
         BoundStatement::AlterTableAddColumn {
             table,

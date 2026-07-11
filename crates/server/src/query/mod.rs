@@ -2824,6 +2824,13 @@ mod tests {
             self.inner.apply_truncate_table(plan)
         }
 
+        fn apply_truncate_tables(
+            &self,
+            plans: &[common::TruncateTablePlan],
+        ) -> Result<Vec<common::TruncateCatalogUpdate>> {
+            self.inner.apply_truncate_tables(plans)
+        }
+
         fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>> {
             self.inner.get_index_by_name(name)
         }

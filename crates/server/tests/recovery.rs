@@ -88,6 +88,106 @@ async fn timed_out_partial_copy_stays_aborted_after_checkpoint_and_restart() {
 }
 
 #[tokio::test]
+async fn committed_multi_table_drop_survives_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table drop_one (id integer primary key)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create table drop_two (id integer primary key)")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("drop table drop_one, drop_two")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    for table in ["drop_one", "drop_two"] {
+        let err = server
+            .simple_query(&format!("select id from {table}"))
+            .await
+            .err()
+            .expect("committed drop should survive WAL recovery");
+        assert!(
+            err.message.contains("42P01"),
+            "expected UndefinedTable for {table}: {}",
+            err.message
+        );
+    }
+}
+
+#[tokio::test]
+async fn committed_multi_table_truncate_survives_wal_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        server
+            .simple_query("create table trunc_one (id integer primary key)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create table trunc_two (id integer primary key, note text)")
+            .await
+            .unwrap();
+        server
+            .simple_query("create index trunc_two_note on trunc_two (note)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into trunc_one values (1)")
+            .await
+            .unwrap();
+        server
+            .simple_query("insert into trunc_two values (1, 'before')")
+            .await
+            .unwrap();
+        server.force_checkpoint().await.unwrap();
+        server
+            .simple_query("truncate table trunc_one, trunc_two")
+            .await
+            .unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert!(
+        server
+            .simple_query("select id from trunc_one")
+            .await
+            .unwrap()
+            .unwrap_rows()
+            .is_empty()
+    );
+    assert!(
+        server
+            .simple_query("select id from trunc_two where note = 'before'")
+            .await
+            .unwrap()
+            .unwrap_rows()
+            .is_empty()
+    );
+    server
+        .simple_query("insert into trunc_two values (2, 'after')")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("select id from trunc_two where note = 'after'")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn no_primary_key_table_survives_restart_with_dml_and_secondary_index() {
     let dir = tempfile::tempdir().unwrap();
 

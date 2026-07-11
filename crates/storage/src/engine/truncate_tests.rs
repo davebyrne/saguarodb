@@ -20,15 +20,18 @@ const TABLE_ID: u32 = 1;
 const TOAST_TABLE_ID: u32 = 2;
 const NAME_INDEX_ID: u32 = 3;
 const NOTE_INDEX_ID: u32 = 4;
+const OTHER_TABLE_ID: u32 = 5;
 
 const BASE_STORAGE_ID: FileId = 10;
 const TOAST_STORAGE_ID: FileId = 20;
 const NAME_INDEX_STORAGE_ID: FileId = 30;
 const NOTE_INDEX_STORAGE_ID: FileId = 40;
+const OTHER_STORAGE_ID: FileId = 50;
 
 const NEW_BASE_STORAGE_ID: FileId = 110;
 const NEW_TOAST_STORAGE_ID: FileId = 120;
 const NEW_NAME_INDEX_STORAGE_ID: FileId = 130;
+const NEW_OTHER_STORAGE_ID: FileId = 140;
 
 struct AlwaysFlush;
 
@@ -371,6 +374,23 @@ fn truncate_update() -> TruncateCatalogUpdate {
     }
 }
 
+fn other_schema(storage_id: FileId) -> TableSchema {
+    let mut schema = users_schema(storage_id);
+    schema.id = OTHER_TABLE_ID;
+    schema.name = "other".to_string();
+    schema.toast = ToastOptions::legacy_catalog_default();
+    schema.toast_table_id = None;
+    schema
+}
+
+fn other_truncate_update(storage_id: FileId) -> TruncateCatalogUpdate {
+    TruncateCatalogUpdate {
+        table: other_schema(storage_id),
+        toast_table: None,
+        indexes: Vec::new(),
+    }
+}
+
 fn user_row(id: i64, name: &str, note: &str) -> Row {
     Row {
         values: vec![
@@ -542,6 +562,54 @@ fn failed_publish_truncate_does_not_partially_swap_generations() {
     assert_eq!(
         fixture.index_rows(&ctx(301), current_relations.as_ref(), "alice"),
         vec![row]
+    );
+}
+
+#[test]
+fn batch_publish_rejects_collisions_without_swapping_any_generation() {
+    let fixture = Fixture::new();
+    fixture
+        .engine
+        .create_table(&ctx(150), &other_schema(OTHER_STORAGE_ID))
+        .unwrap();
+    commit(&fixture.wal, 150);
+    let mut colliding = other_truncate_update(NEW_OTHER_STORAGE_ID);
+    colliding.table.storage_id = NEW_BASE_STORAGE_ID;
+
+    let err = fixture
+        .engine
+        .publish_truncate_tables(vec![truncate_update(), colliding])
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+
+    let state = fixture.engine.lock_state().unwrap();
+    assert_eq!(
+        state.tables.get(&TABLE_ID).unwrap().schema.storage_id,
+        BASE_STORAGE_ID
+    );
+    assert_eq!(
+        state.tables.get(&OTHER_TABLE_ID).unwrap().schema.storage_id,
+        OTHER_STORAGE_ID
+    );
+    drop(state);
+
+    let update = truncate_update();
+    let err = fixture
+        .engine
+        .publish_truncate_tables(vec![update.clone(), update])
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::InternalError);
+    assert_eq!(
+        fixture
+            .engine
+            .lock_state()
+            .unwrap()
+            .tables
+            .get(&TABLE_ID)
+            .unwrap()
+            .schema
+            .storage_id,
+        BASE_STORAGE_ID
     );
 }
 

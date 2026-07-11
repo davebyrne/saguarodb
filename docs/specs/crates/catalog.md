@@ -241,6 +241,10 @@ pub trait CatalogManager: Send + Sync {
         plan: &TruncateTablePlan,
     ) -> Result<TruncateCatalogUpdate>;
     fn apply_truncate_table(&self, plan: &TruncateTablePlan) -> Result<TruncateCatalogUpdate>;
+    fn apply_truncate_tables(
+        &self,
+        plans: &[TruncateTablePlan],
+    ) -> Result<Vec<TruncateCatalogUpdate>>;
 
     fn get_index_by_name(&self, name: &str) -> Result<Option<IndexSchema>>;
     fn get_index(&self, id: IndexId) -> Result<Option<IndexSchema>>;
@@ -398,7 +402,12 @@ files before the commit record is durable. `apply_truncate_table(plan)`
 revalidates the same plan, updates only the `storage_id` fields on the base
 table, hidden TOAST table, and secondary indexes, reserves every planned storage
 id, and returns `TruncateCatalogUpdate` for storage publication after durable
-commit.
+commit. `apply_truncate_tables(plans)` rejects duplicate logical targets and any
+replacement storage id reused anywhere across the batch, validates every plan
+against one catalog state, and applies the complete batch under one catalog
+write lock. Normal multi-table TRUNCATE uses the batch method;
+recovery keeps applying individual committed logical WAL records whose shared
+transaction outcome makes the batch durable together.
 
 Schema-evolution helpers are catalog operations used by `ALTER TABLE`
 execution. `rename_table`, `add_table_column`, `drop_table_column`, and
@@ -548,6 +557,9 @@ Recovery apply methods must update catalog state consistently with storage state
 - Duplicate column is rejected.
 - Primary key on missing column is rejected.
 - Drop removes name and ID lookup.
+- Batch truncate apply rejects duplicate targets and cross-plan replacement
+  storage-id collisions before atomically swapping base-table, secondary-index,
+  and hidden-TOAST storage ids; a late collision publishes no target.
 - Serialization round-trip preserves `next_table_id`.
 - Recovery create/drop updates catalog without name leaks into executor.
 - Create index resolves columns and assigns monotonically increasing index IDs.

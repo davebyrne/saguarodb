@@ -9,7 +9,9 @@ use common::{
     QueryCancel, Result, Row, SequenceOptions, SequenceSchema, SqlState, StatementContext,
     StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, Value, ViewColumn,
 };
-use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, bind_default_expr};
+use planner::{
+    BoundExpr, BoundOnConflict, BoundReturning, DropTableTarget, PhysicalPlan, bind_default_expr,
+};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
 use crate::ExecutionResult;
@@ -284,11 +286,9 @@ impl QueryEngine {
                 toast.clone(),
                 checks,
             ),
-            PhysicalPlan::DropTable {
-                name,
-                if_exists,
-                table,
-            } => execute_drop_table(ctx, name, *if_exists, *table),
+            PhysicalPlan::DropTable { targets, if_exists } => {
+                execute_drop_tables(ctx, targets, *if_exists)
+            }
             PhysicalPlan::AlterTableAddColumn {
                 table,
                 table_name: _,
@@ -1583,44 +1583,44 @@ fn create_primary_key_constraint_index(
     Ok(())
 }
 
-fn execute_drop_table(
+fn execute_drop_tables(
     ctx: &ExecutionContext<'_>,
-    name: &str,
+    targets: &[DropTableTarget],
     if_exists: bool,
-    table: Option<TableId>,
 ) -> Result<ExecutionResult> {
-    let table = match table {
-        Some(table) => table,
-        None if if_exists => match ctx.catalog.get_table_by_name(name)? {
-            Some(table) => table.id,
-            None if ctx.catalog.get_view_by_name(name)?.is_some() => {
+    let mut resolved = Vec::with_capacity(targets.len());
+    for target in targets {
+        let table = match target.table {
+            Some(table) => table,
+            None if if_exists => match ctx.catalog.get_table_by_name(&target.name)? {
+                Some(table) => table.id,
+                None if ctx.catalog.get_view_by_name(&target.name)?.is_some() => {
+                    return Err(DbError::plan(
+                        SqlState::WrongObjectType,
+                        format!("relation {} is a view, not a table", target.name),
+                    ));
+                }
+                None => continue,
+            },
+            None => {
                 return Err(DbError::plan(
-                    SqlState::WrongObjectType,
-                    format!("relation {name} is a view, not a table"),
+                    SqlState::UndefinedTable,
+                    format!("table {} does not exist", target.name),
                 ));
             }
-            None => {
-                return Ok(ExecutionResult::Modified {
-                    command: "DROP TABLE".to_string(),
-                    count: 0,
-                });
-            }
-        },
-        None => {
-            return Err(DbError::plan(
-                SqlState::UndefinedTable,
-                format!("table {name} does not exist"),
-            ));
-        }
-    };
-    let owned_sequences = owned_sequences_for_table(ctx, table)?;
-    ctx.schema_ops.drop_table(&ctx.statement, table)?;
-    for sequence in &owned_sequences {
-        ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
+        };
+        resolved.push((table, owned_sequences_for_table(ctx, table)?));
     }
-    ctx.catalog.drop_table(table)?;
-    for sequence in &owned_sequences {
-        ctx.catalog.apply_drop_sequence(sequence.id)?;
+
+    for (table, owned_sequences) in resolved {
+        ctx.schema_ops.drop_table(&ctx.statement, table)?;
+        for sequence in &owned_sequences {
+            ctx.schema_ops.drop_sequence(&ctx.statement, sequence.id)?;
+        }
+        ctx.catalog.drop_table(table)?;
+        for sequence in owned_sequences {
+            ctx.catalog.apply_drop_sequence(sequence.id)?;
+        }
     }
     Ok(ExecutionResult::Modified {
         command: "DROP TABLE".to_string(),

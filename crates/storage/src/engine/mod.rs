@@ -1605,172 +1605,75 @@ impl PageBackedStorageEngine {
     }
 
     pub fn publish_truncate_table(&self, update: TruncateCatalogUpdate) -> Result<()> {
-        self.publish_truncate_table_update(update)
+        self.publish_truncate_tables(vec![update])
+    }
+
+    pub fn publish_truncate_tables(&self, updates: Vec<TruncateCatalogUpdate>) -> Result<()> {
+        let mut state = self.lock_state()?;
+        let retired = validate_truncate_batch_for_publish(&state, &updates)?;
+        let published_files = updates
+            .iter()
+            .flat_map(truncate_update_files)
+            .collect::<BTreeSet<_>>();
+
+        for update in &updates {
+            self.register_table_compression(&update.table);
+            if let Some(toast) = &update.toast_table {
+                self.register_table_compression(toast);
+            }
+            let index_config = index_compression_for(update.table.compression);
+            for index in &update.indexes {
+                self.compression
+                    .set_file_config(secondary_index_file_id(index.storage_id), index_config);
+            }
+
+            state.tables.insert(
+                update.table.id,
+                Arc::new(TableGeneration {
+                    schema: update.table.clone(),
+                    dropped: false,
+                }),
+            );
+            if let Some(toast) = &update.toast_table {
+                state.tables.insert(
+                    toast.id,
+                    Arc::new(TableGeneration {
+                        schema: toast.clone(),
+                        dropped: false,
+                    }),
+                );
+                state
+                    .toast_next_value_ids
+                    .insert(toast.id, crate::toast::FIRST_TOAST_VALUE_ID);
+            }
+            for index in &update.indexes {
+                state.indexes.insert(
+                    index.id,
+                    Arc::new(IndexGeneration {
+                        schema: index.clone(),
+                        dropped: false,
+                    }),
+                );
+            }
+        }
+
+        for rollback in state.rollback.values_mut() {
+            rollback
+                .unpublished_files
+                .retain(|file_id| !published_files.contains(file_id));
+        }
+        state.retired_generations.extend(retired);
+        if !updates.is_empty() {
+            bump_relation_epoch(&mut state);
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_truncate_table_without_wal(
         &self,
         update: TruncateCatalogUpdate,
     ) -> Result<()> {
-        self.publish_truncate_table_update(update)
-    }
-
-    fn publish_truncate_table_update(&self, update: TruncateCatalogUpdate) -> Result<()> {
-        let mut state = self.lock_state()?;
-
-        let old_table = state
-            .tables
-            .get(&update.table.id)
-            .filter(|table| !table.dropped)
-            .cloned()
-            .ok_or_else(|| {
-                storage_internal(format!(
-                    "truncate target table {} is not installed",
-                    update.table.id
-                ))
-            })?;
-        if old_table.schema.relation_kind != RelationKind::User {
-            return Err(storage_internal(format!(
-                "truncate target table {} is not a user relation",
-                update.table.id
-            )));
-        }
-        if update.table.toast_table_id != old_table.schema.toast_table_id {
-            return Err(storage_internal(format!(
-                "truncate update for table {} does not preserve its TOAST relation link",
-                update.table.id
-            )));
-        }
-        validate_truncate_update_indexes_match_current(&state, &update)?;
-        validate_truncate_update_storage_ids_are_fresh(&state, &update)?;
-
-        let old_toast = match &update.toast_table {
-            Some(toast) => {
-                if old_table.schema.toast_table_id != Some(toast.id) {
-                    return Err(storage_internal(format!(
-                        "truncate update names TOAST table {} but target table {} references {:?}",
-                        toast.id, update.table.id, old_table.schema.toast_table_id
-                    )));
-                }
-                let old_toast = state
-                    .tables
-                    .get(&toast.id)
-                    .filter(|table| !table.dropped)
-                    .cloned()
-                    .ok_or_else(|| {
-                        storage_internal(format!(
-                            "truncate TOAST table {} is not installed",
-                            toast.id
-                        ))
-                    })?;
-                if old_toast.schema.relation_kind
-                    != (RelationKind::Toast {
-                        base_table: update.table.id,
-                    })
-                {
-                    return Err(storage_internal(format!(
-                        "truncate TOAST table {} does not belong to target table {}",
-                        toast.id, update.table.id
-                    )));
-                }
-                Some(old_toast)
-            }
-            None => {
-                if let Some(old_toast_id) = old_table.schema.toast_table_id {
-                    return Err(storage_internal(format!(
-                        "truncate update missing TOAST table {old_toast_id} for target table {}",
-                        update.table.id
-                    )));
-                }
-                None
-            }
-        };
-
-        let mut old_indexes = Vec::with_capacity(update.indexes.len());
-        for index in &update.indexes {
-            let old_index = state
-                .indexes
-                .get(&index.id)
-                .filter(|old| !old.dropped)
-                .cloned()
-                .ok_or_else(|| {
-                    storage_internal(format!("truncate index {} is not installed", index.id))
-                })?;
-            if old_index.schema.table != update.table.id {
-                return Err(storage_internal(format!(
-                    "truncate index {} belongs to table {}, expected {}",
-                    index.id, old_index.schema.table, update.table.id
-                )));
-            }
-            old_indexes.push(old_index);
-        }
-
-        let mut retired = RetiredGeneration {
-            files: Vec::new(),
-            table_refs: Vec::new(),
-            index_refs: Vec::new(),
-        };
-        retired.files.extend(table_files(&old_table.schema));
-        retired.table_refs.push(Arc::downgrade(&old_table));
-        if let Some(old_toast) = &old_toast {
-            retired.files.extend(table_files(&old_toast.schema));
-            retired.table_refs.push(Arc::downgrade(old_toast));
-        }
-        for old_index in &old_indexes {
-            retired
-                .files
-                .push(secondary_index_file_id(old_index.schema.storage_id));
-            retired.index_refs.push(Arc::downgrade(old_index));
-        }
-
-        self.register_table_compression(&update.table);
-        if let Some(toast) = &update.toast_table {
-            self.register_table_compression(toast);
-        }
-        let index_config = index_compression_for(update.table.compression);
-        for index in &update.indexes {
-            self.compression
-                .set_file_config(secondary_index_file_id(index.storage_id), index_config);
-        }
-
-        state.tables.insert(
-            update.table.id,
-            Arc::new(TableGeneration {
-                schema: update.table.clone(),
-                dropped: false,
-            }),
-        );
-        if let Some(toast) = &update.toast_table {
-            state.tables.insert(
-                toast.id,
-                Arc::new(TableGeneration {
-                    schema: toast.clone(),
-                    dropped: false,
-                }),
-            );
-            state
-                .toast_next_value_ids
-                .insert(toast.id, crate::toast::FIRST_TOAST_VALUE_ID);
-        }
-        for index in &update.indexes {
-            state.indexes.insert(
-                index.id,
-                Arc::new(IndexGeneration {
-                    schema: index.clone(),
-                    dropped: false,
-                }),
-            );
-        }
-        let published_files: BTreeSet<FileId> =
-            truncate_update_files(&update).into_iter().collect();
-        for rollback in state.rollback.values_mut() {
-            rollback
-                .unpublished_files
-                .retain(|file_id| !published_files.contains(file_id));
-        }
-        state.retired_generations.push_back(retired);
-        bump_relation_epoch(&mut state);
-        Ok(())
+        self.publish_truncate_tables(vec![update])
     }
 
     pub fn try_cleanup_retired_generations(&self) -> Result<usize> {
@@ -3063,6 +2966,148 @@ fn validate_truncate_update_matches_plan(
     }
 
     Ok(())
+}
+
+fn validate_truncate_batch_for_publish(
+    state: &StorageState,
+    updates: &[TruncateCatalogUpdate],
+) -> Result<Vec<RetiredGeneration>> {
+    let mut targets = BTreeSet::new();
+    let mut replacement_storage_ids = BTreeSet::new();
+    for update in updates {
+        if !targets.insert(update.table.id) {
+            return Err(storage_internal(format!(
+                "truncate batch repeats table {}",
+                update.table.id
+            )));
+        }
+        let ids = std::iter::once(update.table.storage_id)
+            .chain(update.toast_table.iter().map(|toast| toast.storage_id))
+            .chain(update.indexes.iter().map(|index| index.storage_id));
+        for storage_id in ids {
+            if !replacement_storage_ids.insert(storage_id) {
+                return Err(storage_internal(format!(
+                    "truncate batch repeats storage id {storage_id}"
+                )));
+            }
+        }
+    }
+
+    updates
+        .iter()
+        .map(|update| validate_truncate_update_for_publish(state, update))
+        .collect()
+}
+
+fn validate_truncate_update_for_publish(
+    state: &StorageState,
+    update: &TruncateCatalogUpdate,
+) -> Result<RetiredGeneration> {
+    let old_table = state
+        .tables
+        .get(&update.table.id)
+        .filter(|table| !table.dropped)
+        .cloned()
+        .ok_or_else(|| {
+            storage_internal(format!(
+                "truncate target table {} is not installed",
+                update.table.id
+            ))
+        })?;
+    if old_table.schema.relation_kind != RelationKind::User {
+        return Err(storage_internal(format!(
+            "truncate target table {} is not a user relation",
+            update.table.id
+        )));
+    }
+    if update.table.toast_table_id != old_table.schema.toast_table_id {
+        return Err(storage_internal(format!(
+            "truncate update for table {} does not preserve its TOAST relation link",
+            update.table.id
+        )));
+    }
+    validate_truncate_update_indexes_match_current(state, update)?;
+    validate_truncate_update_storage_ids_are_fresh(state, update)?;
+
+    let old_toast = match &update.toast_table {
+        Some(toast) => {
+            if old_table.schema.toast_table_id != Some(toast.id) {
+                return Err(storage_internal(format!(
+                    "truncate update names TOAST table {} but target table {} references {:?}",
+                    toast.id, update.table.id, old_table.schema.toast_table_id
+                )));
+            }
+            let old_toast = state
+                .tables
+                .get(&toast.id)
+                .filter(|table| !table.dropped)
+                .cloned()
+                .ok_or_else(|| {
+                    storage_internal(format!(
+                        "truncate TOAST table {} is not installed",
+                        toast.id
+                    ))
+                })?;
+            if old_toast.schema.relation_kind
+                != (RelationKind::Toast {
+                    base_table: update.table.id,
+                })
+            {
+                return Err(storage_internal(format!(
+                    "truncate TOAST table {} does not belong to target table {}",
+                    toast.id, update.table.id
+                )));
+            }
+            Some(old_toast)
+        }
+        None => {
+            if let Some(old_toast_id) = old_table.schema.toast_table_id {
+                return Err(storage_internal(format!(
+                    "truncate update missing TOAST table {old_toast_id} for target table {}",
+                    update.table.id
+                )));
+            }
+            None
+        }
+    };
+
+    let mut old_indexes = Vec::with_capacity(update.indexes.len());
+    for index in &update.indexes {
+        let old_index = state
+            .indexes
+            .get(&index.id)
+            .filter(|old| !old.dropped)
+            .cloned()
+            .ok_or_else(|| {
+                storage_internal(format!("truncate index {} is not installed", index.id))
+            })?;
+        if old_index.schema.table != update.table.id {
+            return Err(storage_internal(format!(
+                "truncate index {} belongs to table {}, expected {}",
+                index.id, old_index.schema.table, update.table.id
+            )));
+        }
+        old_indexes.push(old_index);
+    }
+
+    let mut retired = RetiredGeneration {
+        files: Vec::new(),
+        table_refs: Vec::new(),
+        index_refs: Vec::new(),
+    };
+    retired.files.extend(table_files(&old_table.schema));
+    retired.table_refs.push(Arc::downgrade(&old_table));
+    if let Some(old_toast) = &old_toast {
+        retired.files.extend(table_files(&old_toast.schema));
+        retired.table_refs.push(Arc::downgrade(old_toast));
+    }
+    for old_index in &old_indexes {
+        retired
+            .files
+            .push(secondary_index_file_id(old_index.schema.storage_id));
+        retired.index_refs.push(Arc::downgrade(old_index));
+    }
+    Ok(retired)
 }
 
 fn validate_truncate_update_indexes_match_current(
