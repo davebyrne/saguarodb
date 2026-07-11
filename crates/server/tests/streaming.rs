@@ -225,6 +225,45 @@ async fn statement_timeout_interrupts_active_stream_under_client_backpressure() 
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_portal_timeout_under_backpressure_keeps_frames_valid_or_closes() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table portal_rows (id integer primary key, payload text)")
+        .await;
+    let payload = "x".repeat(8 * 1024);
+    for start in (1..=600).step_by(20) {
+        let end = (start + 19).min(600);
+        let values = (start..=end)
+            .map(|id| format!("({id},'{payload}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.ok(&format!(
+            "insert into portal_rows (id, payload) values {values}"
+        ))
+        .await;
+    }
+    conn.ok("set statement_timeout = '200 ms'").await.rows();
+
+    let prefix = conn
+        .begin_extended_until_data_row("select id, payload from portal_rows", 600)
+        .await
+        .unwrap();
+    assert!(has_complete_frame(&prefix, b'D'));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = conn.send_extended_sync().await;
+    let (tail, closed) = conn
+        .read_until_ready_or_close(Duration::from_secs(3))
+        .await
+        .unwrap();
+    if !closed {
+        let error = complete_frame_body(&tail, b'E')
+            .expect("portal timeout must return a complete error frame or close safely");
+        assert!(error.windows(5).any(|window| window == b"57014"));
+    }
+}
+
 /// An empty SELECT still streams a schema (RowDescription) and a `SELECT 0` tag,
 /// and the connection stays usable for the next query.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

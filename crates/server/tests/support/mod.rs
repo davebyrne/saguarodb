@@ -320,6 +320,30 @@ impl Connection {
         read_until_tag_without_overread(&mut self.stream, b'D').await
     }
 
+    /// Start a row-limited extended Execute without Sync and stop reading after
+    /// its first complete DataRow, leaving the active portal fetch backpressured.
+    pub async fn begin_extended_until_data_row(
+        &mut self,
+        sql: &str,
+        max_rows: i32,
+    ) -> Result<Vec<u8>> {
+        let mut seq = parse_bytes("", sql, &[]);
+        seq.extend(bind_bytes("", ""));
+        seq.extend(execute_bytes_with_max_rows("", max_rows));
+        self.stream
+            .write_all(&seq)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send extended query: {err}")))?;
+        read_until_tag_without_overread(&mut self.stream, b'D').await
+    }
+
+    pub async fn send_extended_sync(&mut self) -> Result<()> {
+        self.stream
+            .write_all(&sync_bytes())
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send extended Sync: {err}")))
+    }
+
     /// Resume reading a query after a deliberate pause, stopping at either a
     /// complete ReadyForQuery or connection close. The boolean is true on close.
     pub async fn read_until_ready_or_close(
@@ -330,9 +354,24 @@ impl Connection {
         let mut buf = [0; 8192];
         tokio::time::timeout(timeout, async {
             loop {
-                let read = self.stream.read(&mut buf).await.map_err(|err| {
-                    common::DbError::io(format!("failed to read query response: {err}"))
-                })?;
+                let read = match self.stream.read(&mut buf).await {
+                    Ok(read) => read,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return Ok((response, true));
+                    }
+                    Err(err) => {
+                        return Err(common::DbError::io(format!(
+                            "failed to read query response: {err}"
+                        )));
+                    }
+                };
                 if read == 0 {
                     return Ok((response, true));
                 }
@@ -1185,10 +1224,14 @@ fn describe_bytes(kind: u8, name: &str) -> Vec<u8> {
 
 /// An `Execute` message for `portal` with no row limit (all rows).
 fn execute_bytes(portal: &str) -> Vec<u8> {
+    execute_bytes_with_max_rows(portal, 0)
+}
+
+fn execute_bytes_with_max_rows(portal: &str, max_rows: i32) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(portal.as_bytes());
     body.push(0);
-    body.extend_from_slice(&0i32.to_be_bytes());
+    body.extend_from_slice(&max_rows.to_be_bytes());
     tagged(b'E', &body)
 }
 

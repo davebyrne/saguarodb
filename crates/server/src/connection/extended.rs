@@ -395,7 +395,8 @@ impl Session {
                 )
                 .await
             }
-            Err(err) => {
+            Err(PortalFetchError::Stream(err)) => Err(err),
+            Err(PortalFetchError::Canceled(err) | PortalFetchError::Worker(err)) => {
                 if let Some(txn) = self.txn.as_mut() {
                     txn.mark_failed();
                     self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
@@ -452,7 +453,8 @@ impl Session {
                 )
                 .await
             }
-            Err(err) => {
+            Err(PortalFetchError::Stream(err)) => Err(err),
+            Err(PortalFetchError::Canceled(err) | PortalFetchError::Worker(err)) => {
                 if let Some(txn) = self.txn.as_mut() {
                     txn.mark_failed();
                     self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
@@ -574,6 +576,15 @@ impl Session {
     }
 }
 
+enum PortalFetchError {
+    /// Cancellation between frames: safe to send a protocol ErrorResponse.
+    Canceled(DbError),
+    /// Encoding/socket-write failure, including cancellation that may leave a
+    /// partial frame: close the connection without appending another frame.
+    Stream(DbError),
+    Worker(DbError),
+}
+
 async fn fetch_cursor_rows<S>(
     stream: &mut S,
     codec: &PostgresCodec,
@@ -581,16 +592,25 @@ async fn fetch_cursor_rows<S>(
     result_formats: &[i16],
     max_rows: Option<u64>,
     cancel: &common::QueryCancel,
-) -> Result<CursorFetchStatus>
+) -> std::result::Result<CursorFetchStatus, PortalFetchError>
 where
     S: AsyncWrite + Unpin,
 {
     let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
-    let reply_rx = started.handle.start_fetch(max_rows, row_tx).await?;
+    let reply_rx = started
+        .handle
+        .start_fetch(max_rows, row_tx)
+        .await
+        .map_err(PortalFetchError::Worker)?;
     drain_cursor_rows(stream, codec, row_rx, result_formats, cancel).await?;
     reply_rx
         .await
-        .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
+        .map_err(|_| {
+            PortalFetchError::Worker(DbError::internal(
+                "cursor worker stopped before fetch completed",
+            ))
+        })?
+        .map_err(PortalFetchError::Worker)
 }
 
 async fn fetch_suspended_rows<S>(
@@ -599,16 +619,25 @@ async fn fetch_suspended_rows<S>(
     portal: &SuspendedPortal,
     max_rows: Option<u64>,
     cancel: &common::QueryCancel,
-) -> Result<CursorFetchStatus>
+) -> std::result::Result<CursorFetchStatus, PortalFetchError>
 where
     S: AsyncWrite + Unpin,
 {
     let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
-    let reply_rx = portal.cursor.start_fetch(max_rows, row_tx).await?;
+    let reply_rx = portal
+        .cursor
+        .start_fetch(max_rows, row_tx)
+        .await
+        .map_err(PortalFetchError::Worker)?;
     drain_cursor_rows(stream, codec, row_rx, &portal.result_formats, cancel).await?;
     reply_rx
         .await
-        .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
+        .map_err(|_| {
+            PortalFetchError::Worker(DbError::internal(
+                "cursor worker stopped before fetch completed",
+            ))
+        })?
+        .map_err(PortalFetchError::Worker)
 }
 
 async fn drain_cursor_rows<S>(
@@ -617,13 +646,16 @@ async fn drain_cursor_rows<S>(
     mut row_rx: mpsc::Receiver<StreamMessage>,
     result_formats: &[i16],
     cancel: &common::QueryCancel,
-) -> Result<()>
+) -> std::result::Result<(), PortalFetchError>
 where
     S: AsyncWrite + Unpin,
 {
     let mut stream_columns: Vec<ColumnInfo> = Vec::new();
     loop {
-        let Some(message) = wait_cancelable(cancel, row_rx.recv()).await? else {
+        let Some(message) = wait_cancelable(cancel, row_rx.recv())
+            .await
+            .map_err(PortalFetchError::Canceled)?
+        else {
             break;
         };
         match message {
@@ -631,8 +663,12 @@ where
                 stream_columns = columns;
             }
             StreamMessage::Rows(rows) => {
-                let messages = encode_portal_rows(&rows, &stream_columns, result_formats)?;
-                wait_cancelable(cancel, write_messages(stream, codec, &messages)).await??;
+                let messages = encode_portal_rows(&rows, &stream_columns, result_formats)
+                    .map_err(PortalFetchError::Stream)?;
+                wait_cancelable(cancel, write_messages(stream, codec, &messages))
+                    .await
+                    .and_then(|result| result)
+                    .map_err(PortalFetchError::Stream)?;
             }
         }
     }

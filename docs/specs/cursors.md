@@ -322,9 +322,11 @@ Transaction end:
   session cancellation token and the worker observes it at row boundaries.
   Cancellation observed while waiting for the next row batch is between protocol
   frames: the transaction is poisoned and the simple-query path sends the
-  reason-specific `57014` plus `ReadyForQuery`, leaving the connection usable for
-  `ROLLBACK`. Cancellation that interrupts a socket frame closes the connection
-  because appending an error to a possibly partial frame would corrupt framing.
+  reason-specific `57014` plus `ReadyForQuery`, while the extended path sends
+  `57014` and waits for `Sync`; both remain usable for recovery. Cancellation that
+  interrupts a socket frame closes the connection because appending an error to a
+  possibly partial frame would corrupt framing. The same split applies to a
+  row-limited or resumed suspended portal fetch.
 - A parked cursor should not keep `pg_stat_activity.state = active`; the session
   remains idle-in-transaction while the cursor is open but not fetching.
 - Graceful shutdown must close parked cursor workers on connection shutdown and
