@@ -318,8 +318,13 @@ Transaction end:
 - A cursor worker counts as an in-flight query while it is actively fetching, not
   while it is merely parked between fetches. Its open snapshot still contributes
   to the GC horizon through its advertisement.
-- `CancelRequest` during a fetch records a reason on the same session cancellation token and the worker
-  observes it at row boundaries.
+- `CancelRequest` or statement timeout during a fetch records a reason on the same
+  session cancellation token and the worker observes it at row boundaries.
+  Cancellation observed while waiting for the next row batch is between protocol
+  frames: the transaction is poisoned and the simple-query path sends the
+  reason-specific `57014` plus `ReadyForQuery`, leaving the connection usable for
+  `ROLLBACK`. Cancellation that interrupts a socket frame closes the connection
+  because appending an error to a possibly partial frame would corrupt framing.
 - A parked cursor should not keep `pg_stat_activity.state = active`; the session
   remains idle-in-transaction while the cursor is open but not fetching.
 - Graceful shutdown must close parked cursor workers on connection shutdown and

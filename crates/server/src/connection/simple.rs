@@ -438,7 +438,7 @@ impl Session {
                 Ok(ControlFlow::Continue(()))
             }
             Err(SqlCursorFetchError::Stream(err)) => Err(err),
-            Err(SqlCursorFetchError::Worker(err)) => {
+            Err(SqlCursorFetchError::Canceled(err) | SqlCursorFetchError::Worker(err)) => {
                 self.mark_current_transaction_failed();
                 write_messages(
                     stream,
@@ -540,6 +540,11 @@ impl Session {
 }
 
 enum SqlCursorFetchError {
+    /// Cancellation observed while waiting between protocol frames. The socket
+    /// remains framed, so the statement can report 57014 and keep the connection.
+    Canceled(DbError),
+    /// Encoding/socket-write failure, including cancellation that may have
+    /// interrupted a partially written frame. The connection must close.
     Stream(DbError),
     Worker(DbError),
 }
@@ -655,9 +660,7 @@ where
     .await
     .and_then(|result| result)
     .map_err(SqlCursorFetchError::Stream)?;
-    drain_sql_cursor_rows(stream, codec, row_rx, &cursor.columns, cancel)
-        .await
-        .map_err(SqlCursorFetchError::Stream)?;
+    drain_sql_cursor_rows(stream, codec, row_rx, &cursor.columns, cancel).await?;
     let status = reply_rx
         .await
         .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))
@@ -678,19 +681,26 @@ async fn drain_sql_cursor_rows<S>(
     mut row_rx: mpsc::Receiver<StreamMessage>,
     columns: &[ColumnInfo],
     cancel: &common::QueryCancel,
-) -> Result<()>
+) -> std::result::Result<(), SqlCursorFetchError>
 where
     S: AsyncWrite + Unpin,
 {
     loop {
-        let Some(message) = wait_cancelable(cancel, row_rx.recv()).await? else {
+        let Some(message) = wait_cancelable(cancel, row_rx.recv())
+            .await
+            .map_err(SqlCursorFetchError::Canceled)?
+        else {
             break;
         };
         match message {
             StreamMessage::Start { .. } => {}
             StreamMessage::Rows(rows) => {
-                let messages = encode_data_rows(&rows, columns)?;
-                wait_cancelable(cancel, write_messages(stream, codec, &messages)).await??;
+                let messages =
+                    encode_data_rows(&rows, columns).map_err(SqlCursorFetchError::Stream)?;
+                wait_cancelable(cancel, write_messages(stream, codec, &messages))
+                    .await
+                    .and_then(|result| result)
+                    .map_err(SqlCursorFetchError::Stream)?;
             }
         }
     }
@@ -806,5 +816,30 @@ where
         ExecutionResult::BeginCopyIn(_) | ExecutionResult::BeginCopyOut(_) => Err(
             DbError::internal("COPY result must be handled by the connection loop"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{CancelReason, QueryCancel, SqlState};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cursor_receive_cancellation_is_protocol_recoverable() {
+        let (row_tx, row_rx) = mpsc::channel(1);
+        let cancel = QueryCancel::new();
+        cancel.request(CancelReason::StatementTimeout);
+        let mut stream = tokio::io::sink();
+
+        let err = drain_sql_cursor_rows(&mut stream, &PostgresCodec::new(), row_rx, &[], &cancel)
+            .await
+            .unwrap_err();
+
+        drop(row_tx);
+        assert!(matches!(
+            err,
+            SqlCursorFetchError::Canceled(err) if err.code == SqlState::QueryCanceled
+        ));
     }
 }
