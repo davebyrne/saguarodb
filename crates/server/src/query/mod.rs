@@ -1170,9 +1170,7 @@ impl QueryService {
                 return (mark_failed_on_error(slot), default_isolation, Err(err));
             }
             let had_txn = slot.is_some();
-            let durable = (matches!(kind, TransactionControl::Commit) && had_txn)
-                || (matches!(kind, TransactionControl::SetSessionCharacteristics(Some(_)))
-                    && !had_txn);
+            let durable = transaction_control_is_irreversible(kind, had_txn);
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,
@@ -2069,6 +2067,14 @@ enum TransactionControl {
     /// until commit (`docs/specs/mvcc.md` §10 G2). `None` is a
     /// `SET SESSION CHARACTERISTICS` with no level mode (a no-op success).
     SetSessionCharacteristics(Option<IsolationLevel>),
+}
+
+fn transaction_control_is_irreversible(kind: TransactionControl, had_txn: bool) -> bool {
+    (matches!(
+        kind,
+        TransactionControl::Commit | TransactionControl::Rollback
+    ) && had_txn)
+        || (matches!(kind, TransactionControl::SetSessionCharacteristics(Some(_))) && !had_txn)
 }
 
 #[derive(Clone, Copy)]
@@ -4007,6 +4013,26 @@ mod tests {
             .execute_simple_default("rollback", None, &cancel);
         result.unwrap();
         assert!(slot.is_none());
+    }
+
+    #[test]
+    fn transaction_end_is_irreversible_only_with_an_open_transaction() {
+        assert!(super::transaction_control_is_irreversible(
+            super::TransactionControl::Commit,
+            true,
+        ));
+        assert!(super::transaction_control_is_irreversible(
+            super::TransactionControl::Rollback,
+            true,
+        ));
+        assert!(!super::transaction_control_is_irreversible(
+            super::TransactionControl::Commit,
+            false,
+        ));
+        assert!(!super::transaction_control_is_irreversible(
+            super::TransactionControl::Rollback,
+            false,
+        ));
     }
 
     #[tokio::test]

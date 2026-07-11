@@ -223,7 +223,16 @@ impl Session {
         }
 
         if let Some(message) = self.application_name_status_change() {
-            write_messages(stream, codec, &[message]).await?;
+            if outcome.is_ok() {
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_messages(stream, codec, &[message]),
+                )
+                .await
+                .and_then(|result| result)?;
+            } else {
+                write_messages(stream, codec, &[message]).await?;
+            }
         }
 
         match outcome {
@@ -233,15 +242,19 @@ impl Session {
             Ok(StreamOutcome::Streamed { count }) => {
                 drop(guard);
                 self.end_activity();
-                write_messages(
-                    stream,
-                    codec,
-                    &[
-                        ServerMessage::CommandComplete(format!("SELECT {count}")),
-                        ServerMessage::ReadyForQuery(status),
-                    ],
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_messages(
+                        stream,
+                        codec,
+                        &[
+                            ServerMessage::CommandComplete(format!("SELECT {count}")),
+                            ServerMessage::ReadyForQuery(status),
+                        ],
+                    ),
                 )
-                .await?
+                .await
+                .and_then(|result| result)?
             }
             // COPY enters its sub-protocol instead of returning a finished result:
             // `BeginCopyIn` spawns the streaming insert and routes subsequent
@@ -261,14 +274,24 @@ impl Session {
                 self.close_sql_cursors();
                 drop(guard);
                 self.end_activity();
-                write_execution_result(stream, codec, result, status).await?
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_execution_result(stream, codec, result, status),
+                )
+                .await
+                .and_then(|result| result)?
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
             Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
                 drop(guard);
                 self.end_activity();
-                write_execution_result(stream, codec, result, status).await?
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_execution_result(stream, codec, result, status),
+                )
+                .await
+                .and_then(|result| result)?
             }
             Err(err) => {
                 drop(guard);
@@ -367,15 +390,19 @@ impl Session {
                         query_text: sql.to_string(),
                     },
                 );
-                write_messages(
-                    stream,
-                    codec,
-                    &[
-                        ServerMessage::CommandComplete("DECLARE CURSOR".to_string()),
-                        ServerMessage::ReadyForQuery(status),
-                    ],
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(
+                        stream,
+                        codec,
+                        &[
+                            ServerMessage::CommandComplete("DECLARE CURSOR".to_string()),
+                            ServerMessage::ReadyForQuery(status),
+                        ],
+                    ),
                 )
-                .await?;
+                .await
+                .and_then(|result| result)?;
                 Ok(ControlFlow::Continue(()))
             }
             Err(err) => {
@@ -426,15 +453,19 @@ impl Session {
         match fetch {
             Ok(fetched) => {
                 self.cursors.insert(name, cursor);
-                write_messages(
-                    stream,
-                    codec,
-                    &[
-                        ServerMessage::CommandComplete(format!("FETCH {fetched}")),
-                        ServerMessage::ReadyForQuery(self.status_byte()),
-                    ],
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(
+                        stream,
+                        codec,
+                        &[
+                            ServerMessage::CommandComplete(format!("FETCH {fetched}")),
+                            ServerMessage::ReadyForQuery(self.status_byte()),
+                        ],
+                    ),
                 )
-                .await?;
+                .await
+                .and_then(|result| result)?;
                 Ok(ControlFlow::Continue(()))
             }
             Err(SqlCursorFetchError::Stream(err)) => Err(err),
@@ -481,15 +512,19 @@ impl Session {
             return Ok(ControlFlow::Continue(()));
         }
         drop(guard);
-        write_messages(
-            stream,
-            codec,
-            &[
-                ServerMessage::CommandComplete("CLOSE CURSOR".to_string()),
-                ServerMessage::ReadyForQuery(self.status_byte()),
-            ],
+        wait_cancelable(
+            self.cancel.as_ref(),
+            write_messages(
+                stream,
+                codec,
+                &[
+                    ServerMessage::CommandComplete("CLOSE CURSOR".to_string()),
+                    ServerMessage::ReadyForQuery(self.status_byte()),
+                ],
+            ),
         )
-        .await?;
+        .await
+        .and_then(|result| result)?;
         Ok(ControlFlow::Continue(()))
     }
 

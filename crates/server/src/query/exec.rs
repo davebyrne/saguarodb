@@ -11,8 +11,9 @@ use storage::StorageEngine;
 use super::{
     BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService,
     QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome, Transaction,
-    TransactionControl, TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in,
-    exec_or_stream, mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
+    TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
+    mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
+    transaction_control_is_irreversible,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::SnapshotExclusionGuard;
@@ -48,9 +49,7 @@ impl QueryService {
                 return (mark_failed_on_error(slot), default_isolation, Err(err));
             }
             let had_txn = slot.is_some();
-            let durable = (matches!(kind, TransactionControl::Commit) && had_txn)
-                || (matches!(kind, TransactionControl::SetSessionCharacteristics(Some(_)))
-                    && !had_txn);
+            let durable = transaction_control_is_irreversible(kind, had_txn);
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,

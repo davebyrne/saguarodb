@@ -151,7 +151,8 @@ impl Session {
         self.end_activity();
 
         let response = match result {
-            Ok(count) => {
+            Ok(count) => wait_cancelable(
+                self.cancel.as_ref(),
                 write_messages(
                     stream,
                     codec,
@@ -159,9 +160,10 @@ impl Session {
                         ServerMessage::CommandComplete(format!("COPY {count}")),
                         ServerMessage::ReadyForQuery(status),
                     ],
-                )
-                .await
-            }
+                ),
+            )
+            .await
+            .and_then(|result| result),
             Err(task_err) => {
                 // A client CopyFail (with no prior insert error) reports the client's
                 // message; otherwise the insert/row error.
@@ -318,7 +320,8 @@ impl Session {
         }
         self.end_activity();
         match result {
-            Ok(count) => {
+            Ok(count) => wait_cancelable(
+                io_cancel.as_ref(),
                 write_messages(
                     stream,
                     codec,
@@ -327,9 +330,10 @@ impl Session {
                         ServerMessage::CommandComplete(format!("COPY {count}")),
                         ServerMessage::ReadyForQuery(status),
                     ],
-                )
-                .await
-            }
+                ),
+            )
+            .await
+            .and_then(|result| result),
             // A producer error after CopyOutResponse: ErrorResponse, no CopyDone.
             Err(err) => {
                 write_messages(

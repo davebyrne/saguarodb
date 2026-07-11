@@ -252,23 +252,45 @@ impl Session {
                     messages.push(message);
                 }
                 messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
-                write_messages(stream, codec, &messages).await
+                wait_cancelable(io_cancel.as_ref(), write_messages(stream, codec, &messages))
+                    .await
+                    .and_then(|result| result)
             }
             Ok(StreamOutcome::SessionReset(result)) => {
                 self.prepared.clear();
                 self.portals.clear();
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_messages(stream, codec, &[message]).await?;
+                    wait_cancelable(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await
+                    .and_then(|result| result)?;
                 }
-                write_portal_result(stream, codec, result, &result_formats).await
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_portal_result(stream, codec, result, &result_formats),
+                )
+                .await
+                .and_then(|result| result)
             }
             Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_messages(stream, codec, &[message]).await?;
+                    wait_cancelable(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await
+                    .and_then(|result| result)?;
                 }
-                write_portal_result(stream, codec, result, &result_formats).await
+                wait_cancelable(
+                    io_cancel.as_ref(),
+                    write_portal_result(stream, codec, result, &result_formats),
+                )
+                .await
+                .and_then(|result| result)
             }
             Ok(StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. }) => {
                 self.failed = true;
@@ -384,16 +406,25 @@ impl Session {
                         transaction_scoped,
                     }),
                 );
-                write_messages(stream, codec, &[ServerMessage::PortalSuspended]).await
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(stream, codec, &[ServerMessage::PortalSuspended]),
+                )
+                .await
+                .and_then(|result| result)
             }
             Ok(CursorFetchStatus::Exhausted { count }) => {
                 self.end_activity();
-                write_messages(
-                    stream,
-                    codec,
-                    &[ServerMessage::CommandComplete(format!("SELECT {count}"))],
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(
+                        stream,
+                        codec,
+                        &[ServerMessage::CommandComplete(format!("SELECT {count}"))],
+                    ),
                 )
                 .await
+                .and_then(|result| result)
             }
             Err(PortalFetchError::Stream(err)) => Err(err),
             Err(PortalFetchError::Canceled(err) | PortalFetchError::Worker(err)) => {
@@ -441,17 +472,26 @@ impl Session {
                 portal.rows_sent = portal.rows_sent.saturating_add(count);
                 self.portals
                     .insert(portal_name.to_string(), Portal::Suspended(portal));
-                write_messages(stream, codec, &[ServerMessage::PortalSuspended]).await
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(stream, codec, &[ServerMessage::PortalSuspended]),
+                )
+                .await
+                .and_then(|result| result)
             }
             Ok(CursorFetchStatus::Exhausted { count }) => {
                 self.end_activity();
                 let total = portal.rows_sent.saturating_add(count);
-                write_messages(
-                    stream,
-                    codec,
-                    &[ServerMessage::CommandComplete(format!("SELECT {total}"))],
+                wait_cancelable(
+                    self.cancel.as_ref(),
+                    write_messages(
+                        stream,
+                        codec,
+                        &[ServerMessage::CommandComplete(format!("SELECT {total}"))],
+                    ),
                 )
                 .await
+                .and_then(|result| result)
             }
             Err(PortalFetchError::Stream(err)) => Err(err),
             Err(PortalFetchError::Canceled(err) | PortalFetchError::Worker(err)) => {

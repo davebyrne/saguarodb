@@ -498,8 +498,8 @@ correctness assertion — leaking a second guard would keep a writer in flight p
 commit/abort and could stall a checkpoint draining writers. `Sync` sends
 `ReadyForQuery`; `Flush` flushes; `Close` drops a statement or portal and replies
 `CloseComplete`. An error inside an extended sequence sends `ErrorResponse` and then
-skips the remaining extended messages until `Sync`; a simple `Query` also clears
-that aborted state.
+skips every message except `Sync`/`Terminate`; only `Sync` clears that aborted
+state, so a simple `Query` arriving first is discarded.
 
 The per-connection session tracks a `TransactionState` (`Idle` -> `b'I'`,
 `InTransaction` -> `b'T'`, `Failed` -> `b'E'`; defaulting to `Idle`) via its
@@ -570,7 +570,13 @@ boundary so the protocol cannot report a canceled `SET`/`RESET`/`DISCARD ALL`
 whose effects remain applied. `Direct`, interrupted stream/COPY, and still-open
 explicit-transaction data outcomes remain cancelable at that boundary. Channel
 receive/write waits check cancellation both before selection and after their future
-becomes ready, so simultaneous channel closure cannot hide expiration. Once an
+becomes ready, so simultaneous channel closure cannot hide expiration. Successful
+terminal response writes (including COPY completion) use the same cancellation
+race through `CommandComplete`/`ReadyForQuery`; if cancellation interrupts a
+possibly partial terminal frame, the connection closes instead of appending an
+error to corrupt framing. A completed transaction-ending `ROLLBACK`, like COMMIT,
+is an irreversible `Durable` outcome, so late consumer cancellation cannot report
+failure after the transaction has already been removed. Once an
 autocommit xid has been registered, every fallible snapshot
 or execution-context setup path uses the normal pre-durable rollback so timeout
 cannot leave an `InProgress` xid pinning snapshots or GC.
