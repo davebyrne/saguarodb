@@ -1,9 +1,10 @@
 # Correlated Subqueries, LATERAL, and Join-Sourced DML
 
-**Status:** In implementation on branch `subqueries` — milestones S0–S5
-implemented (correlated subqueries execute via Apply in `WHERE`, the `SELECT`
-list, and `HAVING`; equality shapes decorrelate to semi/anti joins; `LATERAL`
-derived tables; `UPDATE ... FROM` / `DELETE ... USING`); S6 is polish (§12).
+**Status:** Implemented on branch `subqueries` (milestones S0–S6). Correlated
+subqueries execute via Apply in `WHERE`, the `SELECT` list, and `HAVING`;
+equality shapes decorrelate to semi/anti joins; `LATERAL` derived tables and
+`UPDATE ... FROM` / `DELETE ... USING` are supported. Remaining deferrals are
+listed in §1.1 and `docs/specs/overview.md` §13.
 
 This document specifies correlated subquery execution and the features built on
 it: correlated `(SELECT ...)` / `[NOT] EXISTS` / `[NOT] IN`, semi/anti joins,
@@ -266,12 +267,13 @@ turn, so nesting works at any depth.
   values, only when the template is volatile-free (§2). The cache is
   per-operator, bounded only by the statement's lifetime.
 - Rebuilding the inner executor per outer row is the accepted v1 cost; reusing
-  a built executor via re-`open` is a later optimization (§12 milestone S6)
-  and must not change behavior.
+  a built executor via re-`open` is a deferred optimization (§12 S6,
+  `overview.md` §13) and must not change behavior.
 - An `OuterRef` is not a literal, so index selection inside the template sees
   no usable key: template scans plan as full scans plus filters. Substituting
-  first and re-planning per row (index-aware rescans) is future work (§12 S6);
-  the S3 decorrelation rules are the fast path for equality shapes.
+  first and re-planning per row (index-aware rescans) is deferred (§12 S6,
+  `overview.md` §13); the S3 decorrelation rules are the fast path for
+  equality shapes.
 - The `In` kind memoizes the materialized subquery column, not the membership
   verdict: the operand is evaluated per outer row independently of the
   correlation key.
@@ -467,13 +469,14 @@ the existing plan-tree text format.
 - **S4** — `LATERAL`.
 - **S5** — `identity_from` join propagation, then
   `UPDATE ... FROM` / `DELETE ... USING` with dedupe. Implemented.
-- **S6** — polish: ApplyOp re-`open` rescan, `LIMIT 1` injection for `EXISTS`
-  subplans, index-aware per-row template replanning, cancellation polling inside Apply's inner
-  drains (today cancellation is observed between top-level rows, matching the
-  uncorrelated pre-pass), README updates, and an `overview.md` §13 entry
-  for the remaining deferrals (correlated-`IN` decorrelation, correlation in
-  join `ON` / `ORDER BY` / set-operation arms / non-`LATERAL` derived-table
-  bodies).
+- **S6** — polish, implemented as: cancellation polling per outer row and
+  inside Apply's inner drains, and the README / `overview.md` documentation
+  sweep. `LIMIT 1` injection above `EXISTS` templates was evaluated and
+  dropped as inert: the Exists drain already pulls at most one row, and this
+  engine's materializing operators do their work in `open()`, which a
+  plan-level `LIMIT` cannot reach. Deferred to `overview.md` §13: ApplyOp
+  re-`open` rescans (per-row rebuild is the accepted cost) and index-aware
+  per-row template replanning.
 
 Each milestone updates the SQL-subset language in `docs/specs/overview.md` and
 the affected crate specs in the same change, per the repository's spec-sync

@@ -25,13 +25,17 @@ trait seams.
   `CREATE`/`DROP SEQUENCE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `TRUNCATE`,
   `VACUUM`, table compression/TOAST option changes, primary-key add/drop, and
   schema evolution for add/drop/rename columns and table renames.
-- DML for `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE`, `DELETE`,
-  `RETURNING`, primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and
+- DML for `INSERT ... VALUES`, `INSERT ... SELECT`, `UPDATE` (including
+  `UPDATE ... FROM`), `DELETE` (including `DELETE ... USING`), `RETURNING`,
+  primary-key `ON CONFLICT DO NOTHING` / `DO UPDATE`, and
   `COPY ... FROM STDIN` / `COPY ... TO STDOUT` in text or CSV format.
 - `SELECT` support includes FROM-less projections, `VALUES`, views,
   non-recursive CTEs, derived tables, set operations, `DISTINCT`, `WHERE`,
   inner/cross/left/right/full joins, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`,
-  `OFFSET`, and uncorrelated scalar, `IN`, and `EXISTS` subqueries.
+  `OFFSET`, scalar / `[NOT] IN` / `[NOT] EXISTS` subqueries — correlated in
+  `WHERE`, the select list, and `HAVING`, with equality shapes decorrelated to
+  hash semi/anti joins — and `LATERAL` derived tables
+  (`docs/specs/subqueries.md`).
 - Data types include integer widths and serial families, boolean, text and
   bounded character types, date/time/timestamp/timestamptz/interval, bytea,
   uuid, floating point, numeric, and null values.
@@ -61,10 +65,9 @@ SaguaroDB deliberately does not implement authentication, replication, a custom
 wire protocol, mutual TLS/client-certificate authentication, transactional DDL,
 or time-travel queries. Important follow-on areas include SQL cursors
 (`DECLARE`/`FETCH`/`CLOSE`), statement timeouts, a cost-based optimizer and
-statistics, correlated/LATERAL/recursive queries, window functions, row-locking
-SELECTs, `UPDATE ... FROM`, `DELETE ... USING`, advanced index options
-(partial/expression/concurrent/include indexes), and more complete sequence and
-constraint DDL.
+statistics, recursive queries, window functions, row-locking SELECTs, advanced
+index options (partial/expression/concurrent/include indexes), and more
+complete sequence and constraint DDL.
 
 ## Quick Start
 

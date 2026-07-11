@@ -41,7 +41,7 @@ pub struct ExecutionContext<'a> {
 
 /// Abort with `QueryCanceled` if a cancellation has been requested. Called
 /// between rows in the row-producing and write loops.
-fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {
+pub(crate) fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {
     check_canceled_flag(ctx.cancel)
 }
 

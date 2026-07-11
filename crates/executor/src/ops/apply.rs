@@ -8,7 +8,9 @@ use common::{ColumnInfo, DataType, DbError, ExecRow, Result, Row, SqlState, Valu
 use planner::{ApplyKind, BoundExpr, PhysicalPlan, rewrite_plan_exprs};
 
 use crate::expr::{compare_values, eval_expr};
-use crate::query::{ExecutionContext, PlanExecutor, build_executor, close_after, open_executor};
+use crate::query::{
+    ExecutionContext, PlanExecutor, build_executor, check_canceled, close_after, open_executor,
+};
 
 /// One memoized subplan result, keyed by the correlation-value tuple. The
 /// `In` kind memoizes the materialized column — not the membership verdict —
@@ -119,6 +121,7 @@ impl<'a> ApplyOp<'a> {
                 ApplyKind::In { .. } => {
                     let mut column = Vec::new();
                     while let Some(row) = inner.next()? {
+                        check_canceled(self.ctx)?;
                         column.push(single_value(row.row)?);
                     }
                     MemoEntry::Column(Rc::new(column))
@@ -164,6 +167,7 @@ impl PlanExecutor for ApplyOp<'_> {
         let Some(outer) = self.input.next()? else {
             return Ok(None);
         };
+        check_canceled(self.ctx)?;
         let statement = &self.ctx.statement;
         let key = self
             .correlations
@@ -281,6 +285,7 @@ impl<'a> LateralApplyOp<'a> {
         let result = (|| {
             let mut rows = Vec::new();
             while let Some(row) = inner.next()? {
+                check_canceled(self.ctx)?;
                 rows.push(row.row);
             }
             Ok(rows)
@@ -316,6 +321,7 @@ impl PlanExecutor for LateralApplyOp<'_> {
             let Some(outer) = self.input.next()? else {
                 return Ok(None);
             };
+            check_canceled(self.ctx)?;
             let statement = &self.ctx.statement;
             let key = self
                 .correlations
