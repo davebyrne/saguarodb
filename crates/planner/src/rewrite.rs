@@ -6,8 +6,10 @@
 //! traversal, so the two passes cannot drift as plan nodes are added.
 
 use common::Result;
-use planner::{
-    AggregateExpr, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning, PhysicalPlan,
+
+use crate::{
+    AggregateExpr, ApplyKind, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning,
+    PhysicalPlan,
 };
 
 /// Rewrite every bound expression embedded in `plan` (filters, projections,
@@ -16,7 +18,7 @@ use planner::{
 /// CHECK expressions) by applying `f` through [`rewrite_expr`], recursing into
 /// child plans. Plan structure and non-expression fields are cloned unchanged.
 /// DDL nodes carry no runtime expressions and are cloned wholesale.
-pub(crate) fn rewrite_plan_exprs(
+pub fn rewrite_plan_exprs(
     plan: &PhysicalPlan,
     f: &mut impl FnMut(&BoundExpr) -> Result<Option<BoundExpr>>,
 ) -> Result<PhysicalPlan> {
@@ -127,6 +129,27 @@ pub(crate) fn rewrite_plan_exprs(
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
         },
+        // The subplan is a separate OuterRef namespace owned by the Apply
+        // operator (docs/specs/subqueries.md section 5.2): it is cloned, not
+        // walked. The correlations and the In-operand are expressions over
+        // THIS plan's rows and are rewritten.
+        PhysicalPlan::Apply {
+            input,
+            subplan,
+            correlations,
+            kind,
+        } => PhysicalPlan::Apply {
+            input: Box::new(rewrite_plan_exprs(input, f)?),
+            subplan: subplan.clone(),
+            correlations: rewrite_vec(correlations, f)?,
+            kind: match kind {
+                ApplyKind::In { operand, negated } => ApplyKind::In {
+                    operand: Box::new(rewrite_expr(operand, f)?),
+                    negated: *negated,
+                },
+                other => other.clone(),
+            },
+        },
         PhysicalPlan::Filter { source, predicate } => PhysicalPlan::Filter {
             source: Box::new(rewrite_plan_exprs(source, f)?),
             predicate: rewrite_expr(predicate, f)?,
@@ -222,7 +245,7 @@ pub(crate) fn rewrite_plan_exprs(
 /// own children — for example the operand carried into an `InList` — are still
 /// rewritten). A replacement must strictly reduce the content `f` matches on,
 /// or the rewrite will not terminate.
-pub(crate) fn rewrite_expr(
+pub fn rewrite_expr(
     expr: &BoundExpr,
     f: &mut impl FnMut(&BoundExpr) -> Result<Option<BoundExpr>>,
 ) -> Result<BoundExpr> {

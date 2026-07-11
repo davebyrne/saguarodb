@@ -10,14 +10,17 @@
 //! - `expr [NOT] IN (...)` becomes an `InList` of literals, so the existing
 //!   three-valued-logic `IN` evaluation applies unchanged.
 //!
-//! Because the subqueries are uncorrelated, executing them once under the
-//! statement's snapshot is sufficient; correlation is not yet supported.
+//! Correlated subqueries in supported positions were hoisted into `Apply`
+//! nodes by the planner and never appear here as expressions; one that does
+//! appear sits in an unsupported position and is rejected
+//! (`docs/specs/subqueries.md` §5).
 
 use common::{DataType, DbError, Result, Row, SqlState, Value};
 use planner::{BoundExpr, BoundQuery, BoundStatement, PhysicalPlan, logical_plan, physical_plan};
 
+use planner::rewrite_plan_exprs;
+
 use crate::query::{ExecutionContext, build_executor, collect_all};
-use crate::rewrite::rewrite_plan_exprs;
 
 /// Rewrite every subquery expression in `plan` to a constant by executing it,
 /// via the shared structural rewriter (`docs/specs/subqueries.md` §5.3).
@@ -94,30 +97,29 @@ fn resolve_subquery_expr(
                 nullable: *nullable,
             }))
         }
-        // An `OuterRef` lives only inside a correlated subquery's body, and a
-        // correlated subquery is rejected above before its body is planned;
-        // one at this level means the binder mis-attached a correlation.
-        BoundExpr::OuterRef { .. } => Err(DbError::internal(
-            "correlated outer reference outside any subquery body",
-        )),
+        // `OuterRef`s are left in place: inside an Apply template they are
+        // the substitution points the Apply operator owns; a stray one
+        // anywhere else fails loudly in expression evaluation.
         _ => Ok(None),
     }
 }
 
-/// The staging guard for correlated subqueries (`docs/specs/subqueries.md`
-/// §4.4): the binder records correlations, but per-outer-row execution (the
-/// `Apply` operator, milestone S2) does not exist yet, so a correlated
-/// subquery is rejected here rather than resolved to a wrong constant. The
-/// guard runs recursively — `materialize_subquery` re-enters this pre-pass for
-/// the inner plan — so a correlated subquery nested anywhere is caught at its
-/// boundary.
+/// The unsupported-position guard for correlated subqueries
+/// (`docs/specs/subqueries.md` §5, §10): the hoisting pass lifted every
+/// correlated subquery in a supported position into an `Apply` node, so a
+/// correlated subquery expression reaching this pre-pass sits in a position
+/// the planner does not hoist (join `ON`, `ORDER BY`, DML assignments,
+/// RETURNING, ON CONFLICT, ...). It is rejected rather than resolved to a
+/// wrong constant. The guard runs recursively — `materialize_subquery`
+/// re-enters this pre-pass for the inner plan — so a correlated subquery
+/// nested anywhere is caught at its boundary.
 fn reject_correlated(query: &BoundQuery) -> Result<()> {
     if query.correlations.is_empty() {
         return Ok(());
     }
     Err(DbError::execute(
         SqlState::FeatureNotSupported,
-        "correlated subqueries are not supported yet",
+        "correlated subqueries are not supported in this position",
     ))
 }
 

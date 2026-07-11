@@ -50,6 +50,20 @@ pub(crate) fn simplify_logical(plan: LogicalPlan) -> LogicalPlan {
             condition: condition.map(fold_expr),
             join_type,
         },
+        // Apply nodes are created by the hoisting pass, which runs after
+        // simplification; recurse defensively so a future reordering cannot
+        // silently skip a subtree.
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            correlations,
+            kind,
+        } => LogicalPlan::Apply {
+            input: Box::new(simplify_logical(*input)),
+            subplan: Box::new(simplify_logical(*subplan)),
+            correlations,
+            kind,
+        },
         LogicalPlan::Filter { source, predicate } => {
             let source = simplify_logical(*source);
             let predicate = fold_expr(predicate);

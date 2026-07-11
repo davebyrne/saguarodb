@@ -2,9 +2,11 @@ mod binder;
 mod bound;
 mod explain;
 mod expr;
+mod hoist;
 mod logical;
 mod params;
 mod physical;
+mod rewrite;
 mod simplify;
 
 pub use binder::{bind, bind_default_expr, bind_parameterized, bind_parameterized_with_pg_types};
@@ -15,12 +17,13 @@ pub use bound::{
 };
 pub use explain::format_explain;
 pub use expr::{
-    AggregateExpr, AggregateFunc, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
+    AggregateExpr, AggregateFunc, ApplyKind, BinOp, BoundExpr, BoundOrderByItem, JoinType, UnaryOp,
 };
 pub use logical::{LogicalPlan, logical_plan};
 pub use params::{collect_param_pg_types, collect_param_types, substitute_params};
 pub use parser::SetOp;
 pub use physical::{PhysicalPlan, physical_plan};
+pub use rewrite::{rewrite_expr, rewrite_plan_exprs};
 
 pub fn mutates_sequences(statement: &BoundStatement) -> bool {
     match statement {
@@ -60,13 +63,13 @@ pub fn mutates_sequences(statement: &BoundStatement) -> bool {
             assignments
                 .iter()
                 .any(|(_, expr)| expr_mutates_sequences(expr))
-                || select_mutates_sequences(source)
+                || select_sequences(source, SequenceScan::Mutating)
                 || returning.as_ref().is_some_and(returning_mutates_sequences)
         }
         BoundStatement::Delete {
             source, returning, ..
         } => {
-            select_mutates_sequences(source)
+            select_sequences(source, SequenceScan::Mutating)
                 || returning.as_ref().is_some_and(returning_mutates_sequences)
         }
     }
@@ -102,43 +105,79 @@ fn insert_source_mutates_sequences(source: &BoundInsertSource) -> bool {
     }
 }
 
+/// Which sequence expressions a walk looks for: only the mutating ones
+/// (`nextval`/`setval`), or any sequence function including `currval` —
+/// the volatility set of `docs/specs/subqueries.md` §2.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SequenceScan {
+    Mutating,
+    Any,
+}
+
+/// Whether a bound query contains any sequence-function expression
+/// (`nextval`, `setval`, `currval`) anywhere, including bodies of nested
+/// subquery expressions. The Apply operator uses this to disable memoization.
+pub fn query_contains_sequence_exprs(query: &BoundQuery) -> bool {
+    query_sequences(query, SequenceScan::Any)
+}
+
 /// Whether evaluating a bound query advances or sets a sequence — its body plus
 /// the query-level `ORDER BY` (which lives on the wrapper, not the `SELECT`).
 fn query_mutates_sequences(query: &BoundQuery) -> bool {
-    let body_mutates = match &query.body {
-        BoundQueryBody::Select(select) => select_mutates_sequences(select),
-        BoundQueryBody::Values(values) => values.rows.iter().flatten().any(expr_mutates_sequences),
+    query_sequences(query, SequenceScan::Mutating)
+}
+
+fn query_sequences(query: &BoundQuery, scan: SequenceScan) -> bool {
+    let body_matches = match &query.body {
+        BoundQueryBody::Select(select) => select_sequences(select, scan),
+        BoundQueryBody::Values(values) => values
+            .rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_sequences(expr, scan)),
         BoundQueryBody::SetOp(set_op) => {
-            query_mutates_sequences(&set_op.left) || query_mutates_sequences(&set_op.right)
+            query_sequences(&set_op.left, scan) || query_sequences(&set_op.right, scan)
         }
     };
-    body_mutates
+    body_matches
         || query
             .order_by
             .iter()
-            .any(|item| expr_mutates_sequences(&item.expr))
+            .any(|item| expr_sequences(&item.expr, scan))
 }
 
-fn select_mutates_sequences(select: &BoundSelect) -> bool {
+fn select_sequences(select: &BoundSelect, scan: SequenceScan) -> bool {
     select
         .columns
         .iter()
-        .any(|item| expr_mutates_sequences(&item.expr))
-        || select.from.as_ref().is_some_and(from_mutates_sequences)
-        || select.filter.as_ref().is_some_and(expr_mutates_sequences)
-        || select.group_by.iter().any(expr_mutates_sequences)
-        || select.having.as_ref().is_some_and(expr_mutates_sequences)
+        .any(|item| expr_sequences(&item.expr, scan))
+        || select
+            .from
+            .as_ref()
+            .is_some_and(|from| from_sequences(from, scan))
+        || select
+            .filter
+            .as_ref()
+            .is_some_and(|expr| expr_sequences(expr, scan))
+        || select
+            .group_by
+            .iter()
+            .any(|expr| expr_sequences(expr, scan))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_sequences(expr, scan))
         || match &select.distinct {
-            Some(BoundDistinct::On(exprs)) => exprs.iter().any(expr_mutates_sequences),
+            Some(BoundDistinct::On(exprs)) => exprs.iter().any(|expr| expr_sequences(expr, scan)),
             Some(BoundDistinct::All) | None => false,
         }
 }
 
-fn from_mutates_sequences(from: &BoundFrom) -> bool {
+fn from_sequences(from: &BoundFrom, scan: SequenceScan) -> bool {
     match from {
         BoundFrom::Table { .. } | BoundFrom::System { .. } => false,
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
-            query_mutates_sequences(query)
+            query_sequences(query, scan)
         }
         BoundFrom::Join {
             left,
@@ -146,37 +185,42 @@ fn from_mutates_sequences(from: &BoundFrom) -> bool {
             condition,
             ..
         } => {
-            from_mutates_sequences(left)
-                || from_mutates_sequences(right)
-                || condition.as_ref().is_some_and(expr_mutates_sequences)
+            from_sequences(left, scan)
+                || from_sequences(right, scan)
+                || condition
+                    .as_ref()
+                    .is_some_and(|expr| expr_sequences(expr, scan))
         }
     }
 }
 
 fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
+    expr_sequences(expr, SequenceScan::Mutating)
+}
+
+fn expr_sequences(expr: &BoundExpr, scan: SequenceScan) -> bool {
     match expr {
         BoundExpr::Nextval { .. } | BoundExpr::Setval { .. } => true,
+        BoundExpr::Currval { .. } => scan == SequenceScan::Any,
         BoundExpr::BinaryOp { left, right, .. } => {
-            expr_mutates_sequences(left) || expr_mutates_sequences(right)
+            expr_sequences(left, scan) || expr_sequences(right, scan)
         }
         BoundExpr::UnaryOp { expr, .. }
         | BoundExpr::IsNull { expr, .. }
         | BoundExpr::IsNotNull { expr, .. }
-        | BoundExpr::Cast { expr, .. } => expr_mutates_sequences(expr),
-        BoundExpr::Function { args, .. } => args.iter().any(expr_mutates_sequences),
-        BoundExpr::AggregateCall { arg, .. } => arg.as_deref().is_some_and(expr_mutates_sequences),
+        | BoundExpr::Cast { expr, .. } => expr_sequences(expr, scan),
+        BoundExpr::Function { args, .. } => args.iter().any(|arg| expr_sequences(arg, scan)),
+        BoundExpr::AggregateCall { arg, .. } => {
+            arg.as_deref().is_some_and(|arg| expr_sequences(arg, scan))
+        }
         BoundExpr::InList { expr, list, .. } => {
-            expr_mutates_sequences(expr) || list.iter().any(expr_mutates_sequences)
+            expr_sequences(expr, scan) || list.iter().any(|item| expr_sequences(item, scan))
         }
         BoundExpr::Between {
             expr, low, high, ..
-        } => {
-            expr_mutates_sequences(expr)
-                || expr_mutates_sequences(low)
-                || expr_mutates_sequences(high)
-        }
+        } => expr_sequences(expr, scan) || expr_sequences(low, scan) || expr_sequences(high, scan),
         BoundExpr::Like { expr, pattern, .. } => {
-            expr_mutates_sequences(expr) || expr_mutates_sequences(pattern)
+            expr_sequences(expr, scan) || expr_sequences(pattern, scan)
         }
         BoundExpr::Case {
             operand,
@@ -184,24 +228,27 @@ fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
             else_clause,
             ..
         } => {
-            operand.as_deref().is_some_and(expr_mutates_sequences)
-                || when_clauses.iter().any(|(when, then)| {
-                    expr_mutates_sequences(when) || expr_mutates_sequences(then)
-                })
-                || else_clause.as_deref().is_some_and(expr_mutates_sequences)
+            operand
+                .as_deref()
+                .is_some_and(|op| expr_sequences(op, scan))
+                || when_clauses
+                    .iter()
+                    .any(|(when, then)| expr_sequences(when, scan) || expr_sequences(then, scan))
+                || else_clause
+                    .as_deref()
+                    .is_some_and(|expr| expr_sequences(expr, scan))
         }
         BoundExpr::InSubquery { expr, query, .. } => {
-            expr_mutates_sequences(expr) || query_mutates_sequences(query)
+            expr_sequences(expr, scan) || query_sequences(query, scan)
         }
         BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
-            query_mutates_sequences(query)
+            query_sequences(query, scan)
         }
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
-        | BoundExpr::OuterRef { .. }
-        | BoundExpr::Currval { .. } => false,
+        | BoundExpr::OuterRef { .. } => false,
     }
 }
 
@@ -3657,5 +3704,134 @@ mod tests {
         let query = bound_query_of(bind(&stmt, &catalog).unwrap());
         let sub = exists_query(select_of(&query).filter.as_ref().unwrap());
         assert!(sub.correlations.is_empty());
+    }
+
+    // --- Apply hoisting (docs/specs/subqueries.md §5, milestone S2) ---
+
+    fn plan_sql(sql: &str, catalog: &MemoryCatalog) -> PhysicalPlan {
+        let bound = bind(&parse(sql).unwrap(), catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        physical_plan(&logical, catalog).unwrap()
+    }
+
+    #[test]
+    fn where_correlation_hoists_apply_above_scan() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        // Projection over Filter over Apply over the unfiltered scan; the
+        // predicate references the appended column (users has 2 columns, so
+        // the Apply column is slot 2).
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection at top, got {plan:?}");
+        };
+        let PhysicalPlan::Filter { source, predicate } = *source else {
+            panic!("expected Filter, got {source:?}");
+        };
+        assert!(
+            matches!(predicate, BoundExpr::LocalRef { slot: 2, .. }),
+            "predicate should reference the appended column, got {predicate:?}"
+        );
+        let PhysicalPlan::Apply {
+            input,
+            kind: ApplyKind::Exists { negated: false },
+            correlations,
+            ..
+        } = *source
+        else {
+            panic!("expected Apply(Exists), got {source:?}");
+        };
+        assert_eq!(correlations.len(), 1);
+        assert!(matches!(*input, PhysicalPlan::SeqScan { filter: None, .. }));
+    }
+
+    #[test]
+    fn select_list_correlation_hoists_apply_below_projection() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select (select max(a.id) from accounts a where a.owner = users.name) from users",
+            &catalog,
+        );
+        let PhysicalPlan::Projection {
+            source,
+            expressions,
+            ..
+        } = plan
+        else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        assert!(
+            matches!(expressions[0], BoundExpr::LocalRef { slot: 2, .. }),
+            "projection should reference the appended column, got {:?}",
+            expressions[0]
+        );
+        assert!(matches!(
+            *source,
+            PhysicalPlan::Apply {
+                kind: ApplyKind::Scalar { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn having_correlation_hoists_apply_above_aggregate() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select name from users group by name having exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        let PhysicalPlan::Filter { source, .. } = *source else {
+            panic!("expected HAVING Filter, got {source:?}");
+        };
+        let PhysicalPlan::Apply { input, .. } = *source else {
+            panic!("expected Apply above the Aggregate, got {source:?}");
+        };
+        assert!(matches!(*input, PhysicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn update_source_shape_is_restored_after_hoisting() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "update users set name = 'x' where exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        let PhysicalPlan::Update { source, .. } = plan else {
+            panic!("expected Update, got {plan:?}");
+        };
+        // The restoring projection narrows the source back to the table's
+        // two columns.
+        let PhysicalPlan::Projection {
+            expressions,
+            output_schema,
+            ..
+        } = *source
+        else {
+            panic!("expected shape-restoring Projection, got {source:?}");
+        };
+        assert_eq!(expressions.len(), 2);
+        assert_eq!(output_schema.len(), 2);
+    }
+
+    #[test]
+    fn uncorrelated_subquery_is_not_hoisted() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select id from users where exists (select 1 from accounts)",
+            &catalog,
+        );
+        assert!(
+            !format!("{plan:?}").contains("Apply"),
+            "uncorrelated subqueries stay with the pre-pass, got {plan:?}"
+        );
     }
 }

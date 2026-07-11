@@ -1,4 +1,5 @@
 mod aggregate;
+mod apply;
 mod distinct;
 mod dml;
 mod filter;
@@ -12,6 +13,7 @@ mod system_scan;
 mod values;
 
 pub use aggregate::AggregateOp;
+pub use apply::ApplyOp;
 pub use distinct::DistinctOp;
 pub use filter::FilterOp;
 pub use join::HashJoinOp;

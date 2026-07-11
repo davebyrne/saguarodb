@@ -1,5 +1,6 @@
 use std::ops::Bound;
 
+use crate::ApplyKind;
 use crate::PhysicalPlan;
 use common::{Key, KeyRange};
 
@@ -149,6 +150,26 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             output.push_str(&format!("{padding}HashJoin keys={}\n", left_keys.len()));
             format_node(left, indent + 1, output);
             format_node(right, indent + 1, output);
+        }
+        PhysicalPlan::Apply {
+            input,
+            subplan,
+            correlations,
+            kind,
+        } => {
+            let kind = match kind {
+                ApplyKind::Scalar { .. } => "Scalar",
+                ApplyKind::Exists { negated: false } => "Exists",
+                ApplyKind::Exists { negated: true } => "Not Exists",
+                ApplyKind::In { negated: false, .. } => "In",
+                ApplyKind::In { negated: true, .. } => "Not In",
+            };
+            output.push_str(&format!(
+                "{padding}Apply ({kind}) correlations={}\n",
+                correlations.len()
+            ));
+            format_node(input, indent + 1, output);
+            format_node(subplan, indent + 1, output);
         }
         PhysicalPlan::Filter { source, .. } => {
             output.push_str(&format!("{padding}Filter\n"));

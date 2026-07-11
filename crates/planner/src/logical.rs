@@ -5,9 +5,9 @@ use common::{
 };
 
 use crate::{
-    AggregateExpr, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource, BoundOnConflict,
-    BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect, BoundStatement,
-    JoinType, SetOp,
+    AggregateExpr, ApplyKind, BoundDistinct, BoundExpr, BoundFrom, BoundInsertSource,
+    BoundOnConflict, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundReturning, BoundSelect,
+    BoundStatement, JoinType, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +111,17 @@ pub enum LogicalPlan {
     Scan {
         table: TableId,
         filter: Option<BoundExpr>,
+    },
+    /// Dependent join (`docs/specs/subqueries.md` §5): per `input` row, the
+    /// correlated `subplan` template is re-executed with each `OuterRef { slot }`
+    /// replaced by the value of `correlations[slot]` evaluated against that
+    /// row, and one column (per `kind`) is appended after the input columns.
+    /// Row identity passes through from the input side.
+    Apply {
+        input: Box<LogicalPlan>,
+        subplan: Box<LogicalPlan>,
+        correlations: Vec<BoundExpr>,
+        kind: ApplyKind,
     },
     SystemScan {
         view: SystemView,
@@ -352,7 +363,7 @@ fn build_logical_plan(bound: &BoundStatement) -> Result<LogicalPlan> {
 /// Lower a bound query: lower its body, then apply the query-level
 /// `ORDER BY`/`LIMIT`/`OFFSET`. A set-operation body adds an arm here that combines
 /// its arms' plans before those modifiers.
-fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
+pub(crate) fn plan_query(query: &BoundQuery) -> Result<LogicalPlan> {
     match &query.body {
         BoundQueryBody::Select(select) => {
             plan_select_body(select, &query.order_by, query.limit, query.offset)

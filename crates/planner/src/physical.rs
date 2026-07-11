@@ -8,8 +8,8 @@ use common::{
 };
 
 use crate::{
-    AggregateExpr, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning, JoinType,
-    LogicalPlan, SetOp,
+    AggregateExpr, ApplyKind, BinOp, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundReturning,
+    JoinType, LogicalPlan, SetOp,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +115,18 @@ pub enum PhysicalPlan {
         table_name: String,
         filter: Option<BoundExpr>,
     },
+    /// Dependent join (`docs/specs/subqueries.md` section 5): per `input` row,
+    /// `subplan` is re-executed with each `OuterRef { slot }` replaced by the
+    /// value of `correlations[slot]` evaluated against that row, and one
+    /// column (per `kind`) is appended after the input columns. Row identity
+    /// passes through from the input side. The statement-level subquery
+    /// pre-pass does not descend into `subplan`; the Apply operator owns it.
+    Apply {
+        input: Box<PhysicalPlan>,
+        subplan: Box<PhysicalPlan>,
+        correlations: Vec<BoundExpr>,
+        kind: ApplyKind,
+    },
     SystemScan {
         view: SystemView,
         output_schema: Vec<ColumnInfo>,
@@ -186,6 +198,18 @@ pub enum PhysicalPlan {
 }
 
 pub fn physical_plan(
+    logical: &LogicalPlan,
+    catalog: &dyn catalog::CatalogManager,
+) -> Result<PhysicalPlan> {
+    // Hoist correlated subqueries into Apply nodes first
+    // (docs/specs/subqueries.md section 5.1); physical planning below maps the
+    // hoisted tree. Apply subplans are planned by the Apply arm directly, so
+    // the hoist runs once per statement.
+    let hoisted = crate::hoist::hoist_correlated_subqueries(logical.clone(), catalog)?;
+    physical_plan_inner(&hoisted, catalog)
+}
+
+fn physical_plan_inner(
     logical: &LogicalPlan,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<PhysicalPlan> {
@@ -310,7 +334,7 @@ pub fn physical_plan(
         } => Ok(PhysicalPlan::Insert {
             table: *table,
             columns: columns.clone(),
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
             default_exprs: default_exprs.clone(),
@@ -325,7 +349,7 @@ pub fn physical_plan(
         } => Ok(PhysicalPlan::Update {
             table: *table,
             assignments: assignments.clone(),
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             returning: returning.clone(),
             check_exprs: check_exprs.clone(),
         }),
@@ -335,7 +359,7 @@ pub fn physical_plan(
             returning,
         } => Ok(PhysicalPlan::Delete {
             table: *table,
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             returning: returning.clone(),
         }),
         LogicalPlan::Scan { table, filter } => plan_scan(*table, filter.clone(), catalog),
@@ -350,8 +374,22 @@ pub fn physical_plan(
             condition,
             join_type,
         } => plan_join(left, right, condition, *join_type, catalog),
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            correlations,
+            kind,
+        } => Ok(PhysicalPlan::Apply {
+            input: Box::new(physical_plan_inner(input, catalog)?),
+            // The subplan was already hoisted; plan it directly. OuterRef
+            // expressions inside it are not index-usable, so its scans plan
+            // as full scans plus filters until substitution.
+            subplan: Box::new(physical_plan_inner(subplan, catalog)?),
+            correlations: correlations.clone(),
+            kind: kind.clone(),
+        }),
         LogicalPlan::Filter { source, predicate } => Ok(PhysicalPlan::Filter {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             predicate: predicate.clone(),
         }),
         LogicalPlan::Projection {
@@ -359,16 +397,16 @@ pub fn physical_plan(
             expressions,
             output_schema,
         } => Ok(PhysicalPlan::Projection {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             expressions: expressions.clone(),
             output_schema: output_schema.clone(),
         }),
         LogicalPlan::Sort { source, order_by } => Ok(PhysicalPlan::Sort {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             order_by: order_by.clone(),
         }),
         LogicalPlan::Distinct { source, on_keys } => Ok(PhysicalPlan::Distinct {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             on_keys: on_keys.clone(),
         }),
         LogicalPlan::Limit {
@@ -376,7 +414,7 @@ pub fn physical_plan(
             count,
             offset,
         } => Ok(PhysicalPlan::Limit {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             count: *count,
             offset: *offset,
         }),
@@ -386,7 +424,7 @@ pub fn physical_plan(
             aggregates,
             output_schema,
         } => Ok(PhysicalPlan::Aggregate {
-            source: Box::new(physical_plan(source, catalog)?),
+            source: Box::new(physical_plan_inner(source, catalog)?),
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
             output_schema: output_schema.clone(),
@@ -406,8 +444,8 @@ pub fn physical_plan(
         } => Ok(PhysicalPlan::SetOp {
             op: *op,
             all: *all,
-            left: Box::new(physical_plan(left, catalog)?),
-            right: Box::new(physical_plan(right, catalog)?),
+            left: Box::new(physical_plan_inner(left, catalog)?),
+            right: Box::new(physical_plan_inner(right, catalog)?),
         }),
     }
 }
@@ -419,8 +457,8 @@ fn plan_join(
     join_type: JoinType,
     catalog: &dyn catalog::CatalogManager,
 ) -> Result<PhysicalPlan> {
-    let left_plan = physical_plan(left, catalog)?;
-    let right_plan = physical_plan(right, catalog)?;
+    let left_plan = physical_plan_inner(left, catalog)?;
+    let right_plan = physical_plan_inner(right, catalog)?;
 
     // An inner join whose ON predicate has at least one `left_col = right_col`
     // equality conjunct can run as a hash join on those equality pairs. Any
@@ -566,6 +604,7 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Limit { source, .. } => output_width(source, catalog),
         // Both arms have equal width (the binder reconciled them); use the left.
         PhysicalPlan::SetOp { left, .. } => output_width(left, catalog),
+        PhysicalPlan::Apply { input, .. } => Ok(output_width(input, catalog)? + 1),
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
         | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),

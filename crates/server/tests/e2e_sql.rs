@@ -3292,11 +3292,275 @@ async fn e2e_scalar_subquery_in_projection_and_where() {
 }
 
 #[tokio::test]
-async fn e2e_correlated_subquery_rejected_until_apply_lands() {
-    // Staging guard (docs/specs/subqueries.md section 4.4): the binder records
-    // correlations, but per-outer-row execution does not exist yet, so a
-    // correlated subquery must fail cleanly (0A000) instead of resolving to a
-    // wrong constant — while uncorrelated subqueries keep working.
+async fn e2e_correlated_subqueries_execute() {
+    // Milestone S2 (docs/specs/subqueries.md section 5): correlated
+    // subqueries in WHERE, the SELECT list, and HAVING execute via the Apply
+    // operator with per-outer-row semantics.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text, amount integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada'), (2, 'Grace'), (3, 'Alan')")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into accounts (id, owner, amount) values \
+             (10, 'Ada', 100), (11, 'Ada', 5), (20, 'Grace', 50), (21, 'Grace', null)",
+        )
+        .await
+        .unwrap();
+
+    // Correlated EXISTS / NOT EXISTS in WHERE.
+    let rows = server
+        .simple_query(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name) order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]]
+    );
+    let rows = server
+        .simple_query(
+            "select id from users where not exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // Correlated scalar subquery in the SELECT list; empty result is NULL.
+    let rows = server
+        .simple_query(
+            "select name, (select max(amount) from accounts a where a.owner = users.name) \
+             from users order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("Ada".to_string()), Some("100".to_string())],
+            vec![Some("Grace".to_string()), Some("50".to_string())],
+            vec![Some("Alan".to_string()), None],
+        ]
+    );
+
+    // Correlated IN: true only where a matching amount exists.
+    let rows = server
+        .simple_query(
+            "select id from users where 100 in \
+             (select amount from accounts where accounts.owner = users.name) order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Correlated NOT IN three-valued logic: Grace's amounts include NULL, so
+    // her NOT IN is NULL (filtered); Ada's contains 100 (false); Alan's set is
+    // empty (true).
+    let rows = server
+        .simple_query(
+            "select id from users where 100 not in \
+             (select amount from accounts where accounts.owner = users.name) order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("3".to_string())]]);
+
+    // Nested correlation (depth 2): only Ada has an account strictly cheaper
+    // than another of her own accounts.
+    let rows = server
+        .simple_query(
+            "select id from users u where exists \
+             (select 1 from accounts a where a.owner = u.name and exists \
+              (select 1 from accounts a2 where a2.owner = u.name and a2.amount > a.amount))",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Correlated HAVING against the grouped column.
+    let rows = server
+        .simple_query(
+            "select owner, count(*) from accounts group by owner having exists \
+             (select 1 from users where users.name = accounts.owner and users.id = 1) \
+             order by owner",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("Ada".to_string()), Some("2".to_string())]]
+    );
+
+    // A correlated scalar subquery returning more than one row for some outer
+    // row is a per-row cardinality violation (21000).
+    let err = server
+        .simple_query(
+            "select (select amount from accounts a where a.owner = users.name) from users",
+        )
+        .await
+        .err()
+        .expect("multi-row scalar subquery should fail");
+    assert!(err.message.contains("21000"), "{}", err.message);
+
+    // EXPLAIN shows the Apply node.
+    let rows = server
+        .simple_query(
+            "explain select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    let plan = rows
+        .iter()
+        .map(|row| row[0].clone().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("Apply (Exists)"), "plan was: {plan}");
+
+    // Correlated WHERE drives UPDATE and DELETE through the same hoisting
+    // (identity passes through the Apply).
+    server
+        .simple_query(
+            "update users set name = 'Nameless' where not exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select name from users where id = 3")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("Nameless".to_string())]]);
+    server
+        .simple_query(
+            "delete from users where not exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query("select count(*) from users")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+}
+
+#[tokio::test]
+async fn e2e_correlated_subquery_volatile_not_memoized() {
+    // Two outer rows share the correlation key; a volatile subplan (nextval)
+    // must re-execute per outer row, a stable one is memoized either way.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, k text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table s (id integer primary key, k text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, k) values (1, 'a'), (2, 'a')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into s (id, k) values (7, 'a')")
+        .await
+        .unwrap();
+    server.simple_query("create sequence seq1").await.unwrap();
+
+    let rows = server
+        .simple_query("select (select nextval('seq1') from s where s.k = t.k) from t order by id")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string())], vec![Some("2".to_string())]],
+        "volatile subplan must run once per outer row"
+    );
+}
+
+#[tokio::test]
+async fn e2e_correlated_nested_volatile_subquery_not_memoized() {
+    // A nextval hidden inside an UNCORRELATED subquery inside a NESTED Apply
+    // template is invisible to a plan-only probe (the body is resolved lazily
+    // per outer memo miss); the volatility probe must reach bound subquery
+    // bodies so the outer Apply never memoizes a sequence-advancing subplan.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table t (id integer primary key, k text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table s (id integer primary key, k text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into t (id, k) values (1, 'a'), (2, 'a')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into s (id, k) values (7, 'a')")
+        .await
+        .unwrap();
+    server.simple_query("create sequence seq2").await.unwrap();
+
+    // Outer scalar subquery (correlated on t.k) contains a nested correlated
+    // EXISTS whose template holds an uncorrelated nextval subquery.
+    let rows = server
+        .simple_query(
+            "select (select s.id from s where s.k = t.k and exists \
+              (select 1 from s s2 where s2.k = s.k and s2.id >= (select nextval('seq2')))) \
+             from t order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    // Both outer rows share the key 'a'; without the body probe the second
+    // row would reuse the memoized result and the sequence would advance only
+    // once.
+    assert_eq!(rows.len(), 2);
+    // The sequence is global state: two outer rows must have advanced it
+    // twice (a memoized subplan would advance it once), so the next value
+    // is 3.
+    let rows = server
+        .simple_query("select nextval('seq2')")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".to_string())]],
+        "the sequence must advance once per outer row"
+    );
+}
+
+#[tokio::test]
+async fn e2e_correlated_subqueries_unsupported_positions() {
+    // Positions the hoisting pass does not cover keep the 0A000 guard
+    // (docs/specs/subqueries.md section 10).
     let server = TestServer::start().await.unwrap();
     server
         .simple_query("create table users (id integer primary key, name text)")
@@ -3310,65 +3574,20 @@ async fn e2e_correlated_subquery_rejected_until_apply_lands() {
         .simple_query("insert into users (id, name) values (1, 'Ada')")
         .await
         .unwrap();
-    server
-        .simple_query("insert into accounts (id, owner) values (10, 'Ada')")
-        .await
-        .unwrap();
 
-    // Correlated EXISTS in WHERE.
-    let err = server
-        .simple_query(
-            "select id from users where exists \
-             (select 1 from accounts where accounts.owner = users.name)",
-        )
-        .await
-        .err()
-        .expect("correlated EXISTS should be rejected");
-    assert!(
-        err.message.contains("0A000") && err.message.contains("correlated"),
-        "expected the correlated-subquery guard: {}",
-        err.message
-    );
-
-    // Correlated scalar subquery in the projection.
-    let err = server
-        .simple_query("select (select owner from accounts where accounts.id = users.id) from users")
-        .await
-        .err()
-        .expect("correlated scalar subquery should be rejected");
-    assert!(
-        err.message.contains("0A000") && err.message.contains("correlated"),
-        "expected the correlated-subquery guard: {}",
-        err.message
-    );
-
-    // A correlated subquery nested inside an UNCORRELATED one is caught at its
-    // own boundary when the outer body is materialized.
-    let err = server
-        .simple_query(
-            "select id from users where exists \
-             (select 1 from accounts a1 where exists \
-              (select 1 from accounts a2 where a2.owner = a1.owner))",
-        )
-        .await
-        .err()
-        .expect("nested correlated subquery should be rejected");
-    assert!(
-        err.message.contains("0A000") && err.message.contains("correlated"),
-        "expected the correlated-subquery guard: {}",
-        err.message
-    );
-
-    // DML positions hit the same guard: UPDATE SET/WHERE, DELETE WHERE,
-    // RETURNING, and ON CONFLICT DO UPDATE.
     for sql in [
-        "update users set name = 'x' where exists \
-         (select 1 from accounts where accounts.owner = users.name)",
+        // ORDER BY expression.
+        "select id from users order by \
+         (select max(a.id) from accounts a where a.owner = users.name)",
+        // Join ON condition.
+        "select u.id from users u join accounts a \
+         on exists (select 1 from accounts b where b.owner = u.name)",
+        // UPDATE assignment.
         "update users set name = (select owner from accounts where accounts.id = users.id)",
-        "delete from users where exists \
-         (select 1 from accounts where accounts.owner = users.name)",
-        "insert into users (id, name) values (3, 'Eve') \
+        // RETURNING projection.
+        "insert into users (id, name) values (5, 'Eve') \
          returning (select owner from accounts where accounts.id = users.id)",
+        // ON CONFLICT DO UPDATE assignment.
         "insert into users (id, name) values (1, 'Ada') on conflict (id) do update \
          set name = (select owner from accounts where accounts.id = users.id)",
     ] {
@@ -3378,24 +3597,24 @@ async fn e2e_correlated_subquery_rejected_until_apply_lands() {
             .err()
             .unwrap_or_else(|| panic!("correlated subquery should be rejected: {sql}"));
         assert!(
-            err.message.contains("0A000") && err.message.contains("correlated"),
-            "expected the correlated-subquery guard for {sql}: {}",
+            err.message.contains("0A000") && err.message.contains("position"),
+            "expected the unsupported-position guard for {sql}: {}",
             err.message
         );
     }
 
-    // Uncorrelated subqueries are untouched by the guard.
+    // Uncorrelated subqueries keep working everywhere they did — including
+    // RETURNING and ON CONFLICT DO UPDATE, which resolve via the pre-pass.
     let rows = server
-        .simple_query(
-            "select id from users where exists (select 1 from accounts where owner = 'Ada')",
-        )
+        .simple_query("select id from users where exists (select 1 from users where name = 'Ada')")
         .await
         .unwrap()
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("1".to_string())]]);
-
-    // Uncorrelated subqueries in RETURNING and ON CONFLICT DO UPDATE resolve
-    // through the same pre-pass (once per statement) instead of erroring.
+    server
+        .simple_query("insert into accounts (id, owner) values (10, 'Ada')")
+        .await
+        .unwrap();
     let rows = server
         .simple_query(
             "insert into users (id, name) values (4, 'Kay') \

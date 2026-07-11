@@ -204,6 +204,26 @@ pub enum JoinType {
     Cross,
 }
 
+/// What an `Apply` (dependent join) computes per outer row from its correlated
+/// subplan, appended as one column after the input row
+/// (`docs/specs/subqueries.md` §5.1). The hoisting pass replaces the original
+/// subquery expression with a `LocalRef` to the appended column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApplyKind {
+    /// A correlated scalar subquery: the appended column is its single value
+    /// (`NULL` when empty; more than one row is a `CardinalityViolation`).
+    Scalar { data_type: DataType },
+    /// `[NOT] EXISTS`: the appended column is a non-null boolean; evaluation
+    /// may stop at the subplan's first row.
+    Exists { negated: bool },
+    /// `operand [NOT] IN (subplan)`: the appended column is the three-valued
+    /// membership result. `operand` is an expression over the outer row.
+    In {
+        operand: Box<BoundExpr>,
+        negated: bool,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AggregateExpr {
     pub func: AggregateFunc,

@@ -2,7 +2,6 @@ pub mod copy;
 mod expr;
 mod query;
 mod result;
-mod rewrite;
 mod subquery;
 mod system;
 

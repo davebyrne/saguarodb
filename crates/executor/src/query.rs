@@ -534,6 +534,24 @@ pub(crate) fn build_executor<'a>(
                 right_keys.clone(),
             )))
         }
+        PhysicalPlan::Apply {
+            input,
+            subplan,
+            correlations,
+            kind,
+        } => {
+            // Resolve the template's uncorrelated nested subqueries once at
+            // construction (docs/specs/subqueries.md section 5.2); the
+            // statement-level pre-pass deliberately did not descend into it.
+            let subplan = crate::subquery::resolve_plan_subqueries(ctx, subplan)?;
+            Ok(Box::new(crate::ops::ApplyOp::new(
+                ctx,
+                build_executor(ctx, input)?,
+                subplan,
+                correlations.clone(),
+                kind.clone(),
+            )))
+        }
         PhysicalPlan::Filter { source, predicate } => Ok(Box::new(FilterOp::new(
             ctx.statement.clone(),
             build_executor(ctx, source)?,
@@ -2135,7 +2153,7 @@ pub(crate) fn collect_all(source: &mut dyn PlanExecutor) -> Result<Vec<ExecRow>>
     close_after(source, result)
 }
 
-fn open_executor(executor: &mut dyn PlanExecutor) -> Result<()> {
+pub(crate) fn open_executor(executor: &mut dyn PlanExecutor) -> Result<()> {
     if let Err(err) = executor.open() {
         let _ = executor.close();
         return Err(err);
@@ -2143,7 +2161,7 @@ fn open_executor(executor: &mut dyn PlanExecutor) -> Result<()> {
     Ok(())
 }
 
-fn close_after<T>(executor: &mut dyn PlanExecutor, result: Result<T>) -> Result<T> {
+pub(crate) fn close_after<T>(executor: &mut dyn PlanExecutor, result: Result<T>) -> Result<T> {
     let close_result = executor.close();
     match (result, close_result) {
         (Err(err), _) => Err(err),

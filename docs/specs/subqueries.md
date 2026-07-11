@@ -1,7 +1,8 @@
 # Correlated Subqueries, LATERAL, and Join-Sourced DML
 
-**Status:** Approved design — implementation staged on branch `subqueries`
-(§12 milestones; the Status line is updated as milestones land).
+**Status:** In implementation on branch `subqueries` — milestones S0–S2
+implemented (correlated subqueries execute via Apply in `WHERE`, the `SELECT`
+list, and `HAVING`); S3+ are design (§12).
 
 This document specifies correlated subquery execution and the features built on
 it: correlated `(SELECT ...)` / `[NOT] EXISTS` / `[NOT] IN`, semi/anti joins,
@@ -35,7 +36,10 @@ This feature adds:
 ### 1.1 Non-goals (deferred, documented)
 
 - Correlated subqueries in join `ON` conditions and in `ORDER BY` expressions
-  (rejected with `FeatureNotSupported` until a later milestone).
+  (rejected with `FeatureNotSupported` until a later milestone). This includes
+  a correlated `SELECT`-list subquery that `SELECT DISTINCT` or an `ORDER BY`
+  output alias duplicates into the distinct keys / sort keys — the duplicate
+  copy sits in an unhoisted position and trips the same rejection.
 - Outer references from inside a **set-operation arm**, a **`VALUES` list**,
   or a **derived table's body** within a subquery (rejected with
   `FeatureNotSupported`; the outer scope chain is still threaded there so the
@@ -103,7 +107,7 @@ rescan:
    ordered **correlation list** of the outer columns it uses (§4).
 2. A **planner pass** hoists each correlated subquery expression out of the
    expression tree into an **`Apply` plan node** above the expression's input
-   plan, replacing the expression with an `InputRef` to a column the Apply
+   plan, replacing the expression with a `LocalRef` to the column the Apply
    appends (§5).
 3. The executor's **`ApplyOp`** re-executes the inner plan per outer row by
    substituting the outer row's correlation values as literals — the same
@@ -185,22 +189,26 @@ subquery body as an opaque leaf today; with correlation they must traverse
 the carried `BoundQuery` (and the correlation lists' `outer` expressions,
 which live in the enclosing scope's terms).
 
-### 4.4 Staging guard
+### 4.4 Position guard
 
-Until the executor supports Apply (§12 milestone S2), a plan containing a
-correlated subquery is rejected by the executor pre-pass with
-`SqlState::FeatureNotSupported` and a message naming the construct. Binder
-correlation (milestone S1) is therefore behavior-neutral on its own.
+The hoisting pass lifts every correlated subquery in a supported position
+(§5.1); one that remains as an expression sits in a position the planner does
+not hoist (join `ON`, `ORDER BY`, DML assignments, `RETURNING`,
+`ON CONFLICT`, ...) and is rejected by the executor pre-pass with
+`SqlState::FeatureNotSupported`. During milestone S1 — before Apply existed —
+this same guard rejected every correlated subquery, which made binder
+correlation behavior-neutral on its own.
 
 ## 5. Apply: plan node and operator
 
 ### 5.1 Plan node
 
 ```rust
-PhysicalPlan::Apply {
-    input: Box<PhysicalPlan>,        // outer side
-    subplan: Box<PhysicalPlan>,      // inner template, contains OuterRef exprs
-    correlations: Vec<BoundExpr>,    // per slot: expr over the *outer* row
+// Same shape at both plan levels (LogicalPlan::Apply / PhysicalPlan::Apply).
+Apply {
+    input: Box<Plan>,          // outer side
+    subplan: Box<Plan>,        // inner template, contains OuterRef exprs
+    correlations: Vec<BoundExpr>, // per OuterRef slot: expr over the outer row
     kind: ApplyKind,
 }
 
@@ -211,16 +219,31 @@ pub enum ApplyKind {
     Exists { negated: bool },
     /// Appends one boolean column: `operand [NOT] IN (subplan)` with
     /// three-valued logic; `operand` is an expression over the outer row.
-    In { operand: BoundExpr, negated: bool },
+    In { operand: Box<BoundExpr>, negated: bool },
 }
 ```
 
-The logical planner hoists correlated subquery expressions bottom-up: for each
-expression tree containing one, it inserts `Apply` above the expression's
-input plan and replaces the subquery expression with an `InputRef` to the
-appended column. Multiple correlated subqueries in one expression tree stack
-one Apply per subquery. A projection above the consumer drops appended columns
-from the statement's visible output.
+An Apply always appends its column; the hoisted expression consumes it via
+the replacement `LocalRef`, and an enclosing projection drops it from the
+statement's visible output. Two consequences of the plan shapes:
+
+- A single-table `WHERE` lowers into the scan's own filter, so a correlated
+  predicate is pulled back out — the scan runs unfiltered and the rewritten
+  predicate filters above the Apply. The *whole* predicate loses scan-level
+  filtering and index selection in that case; conjunct splitting is future
+  work (§12 S6).
+- An `UPDATE`/`DELETE` source must produce exactly the target table's row
+  shape, so after hoisting the planner layers a projection back to the
+  table's columns above the Apply (row identity passes through projections).
+
+The hoisting pass runs on the logical plan at the start of physical planning
+(it needs the catalog for row widths): for each expression tree containing a
+correlated subquery, it inserts `Apply` above the expression's input plan and
+replaces the subquery expression with a `LocalRef` to the appended column.
+Multiple correlated subqueries in one expression tree stack one Apply per
+subquery; an `IN` operand's own correlated subqueries are hoisted before the
+operand is captured. Subquery bodies planned during hoisting are hoisted in
+turn, so nesting works at any depth.
 
 ### 5.2 `ApplyOp` (executor)
 
@@ -243,13 +266,28 @@ from the statement's visible output.
 - Rebuilding the inner executor per outer row is the accepted v1 cost; reusing
   a built executor via re-`open` is a later optimization (§12 milestone S6)
   and must not change behavior.
+- An `OuterRef` is not a literal, so index selection inside the template sees
+  no usable key: template scans plan as full scans plus filters. Substituting
+  first and re-planning per row (index-aware rescans) is future work (§12 S6);
+  the S3 decorrelation rules are the fast path for equality shapes.
+- The `In` kind memoizes the materialized subquery column, not the membership
+  verdict: the operand is evaluated per outer row independently of the
+  correlation key.
+- The volatility probe (§2) covers the template's expressions, nested Apply
+  templates, and the bound bodies of not-yet-resolved subquery expressions —
+  the last because a nested template's uncorrelated subqueries are resolved
+  lazily at that nested operator's construction, i.e. once per outer memo
+  miss rather than once per statement (an accepted v1 cost).
 
 ### 5.3 One plan rewriter
 
-The existing pre-pass and the new OuterRef substitution share one generic
-structural rewriter (`rewrite_plan_exprs(plan, f)` where
-`f: FnMut(&BoundExpr) -> Result<Option<BoundExpr>>`), so the two passes cannot
-drift as plan nodes are added.
+The pre-pass, the OuterRef substitution, and the hoisting pass share one
+generic structural rewriter (`planner::rewrite_plan_exprs` /
+`planner::rewrite_expr`, with `f: FnMut(&BoundExpr) -> Result<Option<BoundExpr>>`),
+so the passes cannot drift as plan nodes are added. The plan-level walker
+rewrites an Apply node's `correlations` and `In` operand (expressions over
+that plan's rows) but never descends into its `subplan` — a separate
+`OuterRef` namespace owned by the Apply operator.
 
 ## 6. Decorrelation: semi/anti joins
 
@@ -380,9 +418,13 @@ the existing plan-tree text format.
 - **S5** — `identity_from` join propagation, then
   `UPDATE ... FROM` / `DELETE ... USING` with dedupe.
 - **S6** — polish: ApplyOp re-`open` rescan, `LIMIT 1` injection for `EXISTS`
-  subplans, README updates, and an `overview.md` §13 entry for the remaining
-  deferrals (correlated-`IN` decorrelation, correlation in join `ON` /
-  `ORDER BY` / set-operation arms / non-`LATERAL` derived-table bodies).
+  subplans, scan-filter conjunct splitting around Applies, index-aware
+  per-row template replanning, cancellation polling inside Apply's inner
+  drains (today cancellation is observed between top-level rows, matching the
+  uncorrelated pre-pass), README updates, and an `overview.md` §13 entry
+  for the remaining deferrals (correlated-`IN` decorrelation, correlation in
+  join `ON` / `ORDER BY` / set-operation arms / non-`LATERAL` derived-table
+  bodies).
 
 Each milestone updates the SQL-subset language in `docs/specs/overview.md` and
 the affected crate specs in the same change, per the repository's spec-sync
