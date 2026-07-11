@@ -641,8 +641,8 @@ impl Session {
                 self.reply_or_fail(stream, codec, result).await?;
             }
             ClientMessage::Close { kind, name } if !self.failed => {
-                let result = self.process_close(kind, &name);
-                self.reply_or_fail(stream, codec, result).await?;
+                let messages = self.process_close(kind, &name);
+                write_messages(stream, codec, &messages).await?;
             }
             ClientMessage::Execute { portal, max_rows } if !self.failed => {
                 self.run_execute(stream, codec, &portal, max_rows).await?;

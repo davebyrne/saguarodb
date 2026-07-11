@@ -584,11 +584,7 @@ impl Session {
         Ok(messages)
     }
 
-    pub(super) fn process_close(
-        &mut self,
-        kind: StatementKind,
-        name: &str,
-    ) -> Result<Vec<ServerMessage>> {
+    pub(super) fn process_close(&mut self, kind: StatementKind, name: &str) -> Vec<ServerMessage> {
         match kind {
             StatementKind::Statement => {
                 self.prepared.remove(name);
@@ -597,7 +593,7 @@ impl Session {
                 self.portals.remove(name);
             }
         }
-        Ok(vec![ServerMessage::CloseComplete])
+        vec![ServerMessage::CloseComplete]
     }
 
     pub(super) async fn reply_or_fail<S>(

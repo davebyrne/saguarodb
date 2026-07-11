@@ -1021,6 +1021,57 @@ async fn cancel_request_signals_the_target_backend() {
 }
 
 #[tokio::test]
+async fn idle_cancel_does_not_interrupt_standalone_extended_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let app = app.clone();
+            connections.push(tokio::spawn(async move {
+                handle_connection(socket, app).await.unwrap();
+            }));
+        }
+        for connection in connections {
+            connection.await.unwrap();
+        }
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    let startup = read_until_ready(&mut client).await;
+    let (process_id, secret_key) = backend_key_from_startup(&startup);
+
+    let mut setup = parse_bytes("statement", "select 1", &[]);
+    setup.extend(bind_bytes("portal", "statement", &[], &[], &[]));
+    setup.extend(sync_bytes());
+    client.write_all(&setup).await.unwrap();
+    read_until_ready(&mut client).await;
+
+    let mut cancel = TcpStream::connect(addr).await.unwrap();
+    cancel
+        .write_all(&cancel_request_bytes(process_id, secret_key))
+        .await
+        .unwrap();
+    let mut eof = [0; 1];
+    assert_eq!(cancel.read(&mut eof).await.unwrap(), 0);
+
+    let mut close = close_portal_bytes("portal");
+    close.extend(sync_bytes());
+    client.write_all(&close).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_eq!(message_tag_count(&response, b'3'), 1);
+
+    client.write_all(&query_bytes("select 1")).await.unwrap();
+    read_until_ready(&mut client).await;
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn extended_protocol_runs_parameterized_query_text_and_binary() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());

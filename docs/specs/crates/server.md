@@ -499,7 +499,8 @@ is re-entrant (a second acquire would not self-deadlock), so this is now a cheap
 correctness assertion — leaking a second guard would keep a writer in flight past
 commit/abort and could stall a checkpoint draining writers. `Sync` sends
 `ReadyForQuery`; `Flush` flushes; `Close` drops a statement or portal and replies
-`CloseComplete`. An error inside an extended sequence sends `ErrorResponse` and then
+`CloseComplete`. `Close` is not a timed statement, so stale cancellation recorded
+while the backend was idle does not interrupt its response. An error inside an extended sequence sends `ErrorResponse` and then
 skips every message except `Sync`/`Terminate`; only `Sync` clears that aborted
 state, so a simple `Query` arriving first is discarded.
 
