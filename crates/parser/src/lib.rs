@@ -1177,6 +1177,28 @@ mod tests {
                 "for `{sql}`"
             );
         }
+        // ANALYZE is a compatibility-only modifier and is discarded because the
+        // rule-based planner has no optimizer statistics.
+        for sql in ["vacuum analyze", "VACUUM ANALYZE;"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Vacuum { table: None },
+                "for `{sql}`"
+            );
+        }
+        for sql in [
+            "vacuum analyze users",
+            "VACUUM ANALYZE Users;",
+            "  vacuum   analyze   users  ; ",
+        ] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Vacuum {
+                    table: Some("users".to_string()),
+                },
+                "for `{sql}`"
+            );
+        }
     }
 
     #[test]
@@ -1184,12 +1206,14 @@ mod tests {
         // Parenthesized options, multiple tables, qualified/quoted names, and a glued
         // keyword argument are all rejected as parse errors.
         for sql in [
-            "vacuum (full) users",  // parenthesized options
-            "vacuum full",          // FULL keyword as a bare second token
-            "vacuum users orders",  // multiple tables
-            "vacuum public.users",  // qualified name
-            "vacuum \"Users\"",     // quoted identifier
-            "vacuum analyze users", // ANALYZE keyword
+            "vacuum (full) users",         // parenthesized options
+            "vacuum full",                 // FULL keyword as a bare second token
+            "vacuum users orders",         // multiple tables
+            "vacuum public.users",         // qualified name
+            "vacuum \"Users\"",            // quoted identifier
+            "vacuum analyze users orders", // too many ANALYZE arguments
+            "vacuum analyze full",         // unsupported second option
+            "vacuum analyze analyze",      // repeated ANALYZE option
         ] {
             let err = parse(sql).unwrap_err();
             assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");

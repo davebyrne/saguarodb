@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use common::{KeyRange, RelationKind, StatementContext};
 use saguarodb_server::config::Config;
-use support::{Connection, TestServer};
+use support::{Connection, TestServer, command_tags};
 
 #[tokio::test]
 async fn statement_timeout_cancels_vacuum_waiting_for_writers() {
@@ -117,6 +117,21 @@ async fn vacuum_command_succeeds_for_database_and_single_table() {
     let all = conn.ok("vacuum").await;
     assert!(all.result.is_ok(), "VACUUM should succeed");
     assert_eq!(all.status, b'I');
+}
+
+#[tokio::test]
+async fn vacuum_analyze_is_accepted_as_a_compatibility_noop() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table users (id integer primary key)").await;
+    conn.ok("insert into users values (1)").await;
+    conn.ok("delete from users where id = 1").await;
+
+    let one = conn.query_raw("vacuum analyze users").await.unwrap();
+    assert_eq!(command_tags(&one).unwrap(), vec!["VACUUM"]);
+
+    let all = conn.query_raw("vacuum analyze").await.unwrap();
+    assert_eq!(command_tags(&all).unwrap(), vec!["VACUUM"]);
 }
 
 /// `VACUUM <unknown>` errors with an undefined-table error and does not open a

@@ -1093,12 +1093,14 @@ fn reject_set_global(sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// Intercept `VACUUM` (and `VACUUM <table>`) before sqlparser, which cannot parse
-/// it. Returns `Ok(Some(_))` for a VACUUM statement, `Ok(None)` when the input does
-/// not start with the `vacuum` keyword (so the normal parse path runs), and `Err`
-/// for a VACUUM with an unsupported clause (parenthesized options, multiple tables,
-/// a qualified/quoted name). The optional target identifier is lowercase-normalized,
-/// matching the v1 unquoted-identifier rule (`ident_name`).
+/// Intercept `VACUUM [ANALYZE] [<table>]` before sqlparser, which cannot parse it.
+/// `ANALYZE` is accepted only as a PostgreSQL/pgbench compatibility modifier and is
+/// discarded because SaguaroDB has no optimizer statistics. Returns `Ok(Some(_))`
+/// for a VACUUM statement, `Ok(None)` when the input does not start with the
+/// `vacuum` keyword (so the normal parse path runs), and `Err` for an unsupported
+/// clause (parenthesized options, multiple tables, a qualified/quoted name). The
+/// optional target identifier is lowercase-normalized, matching the v1
+/// unquoted-identifier rule (`ident_name`).
 fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
     // Strip a single trailing semicolon and surrounding whitespace; the rest is the
     // VACUUM body. `VACUUM`, `VACUUM;`, `VACUUM t`, and `VACUUM t ;` are all accepted.
@@ -1116,20 +1118,27 @@ fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
         return Ok(None);
     }
 
-    // At most one argument: the target table. Any further token (a second table, a
-    // `(`-options list, …) is an unsupported VACUUM form.
-    let table = match tokens.next() {
+    // Accept ANALYZE in PostgreSQL's option position and intentionally discard it.
+    // With or without it, at most one remaining token may name the target table.
+    let first = tokens.next();
+    let first_is_analyze = first.is_some_and(|token| token.eq_ignore_ascii_case("analyze"));
+    let target = if first_is_analyze {
+        tokens.next()
+    } else {
+        first
+    };
+    let table = match target {
         None => None,
         Some(target) => {
             if tokens.next().is_some() {
                 return unsupported("VACUUM supports an optional single table name only in v1");
             }
             // The single argument is the target table. Reject Postgres VACUUM option
-            // keywords (FULL/FREEZE/ANALYZE/VERBOSE/…) so `VACUUM FULL` is a clear
-            // unsupported-option error rather than silently meaning a table named
-            // `full`; v1 supports none of these options.
+            // keywords other than the already-consumed ANALYZE compatibility option,
+            // so `VACUUM FULL` is a clear unsupported-option error rather than
+            // silently meaning a table named `full`.
             if is_vacuum_option_keyword(target) {
-                return unsupported("VACUUM options are not supported in v1");
+                return unsupported("VACUUM option is not supported");
             }
             Some(normalize_vacuum_target(target)?)
         }
@@ -1138,9 +1147,9 @@ fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
     Ok(Some(Statement::Vacuum { table }))
 }
 
-/// Whether `token` is a Postgres VACUUM option keyword (none supported in v1). Used
-/// to reject `VACUUM FULL`/`VACUUM ANALYZE`/… with an explicit unsupported-option
-/// error instead of treating the keyword as a table name.
+/// Whether `token` is a Postgres VACUUM option keyword. `ANALYZE` is consumed before
+/// target parsing; finding any option keyword here is therefore an unsupported option
+/// or a repeated/misplaced `ANALYZE`, not a table name.
 fn is_vacuum_option_keyword(token: &str) -> bool {
     const OPTIONS: [&str; 6] = [
         "full",
