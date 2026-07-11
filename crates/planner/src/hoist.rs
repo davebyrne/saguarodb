@@ -16,6 +16,7 @@ use catalog::CatalogManager;
 use common::{DataType, DbError, Result};
 
 use crate::BoundExpr;
+use crate::JoinType;
 use crate::expr::ApplyKind;
 use crate::logical::LogicalPlan;
 use crate::rewrite::rewrite_expr;
@@ -30,14 +31,15 @@ pub(crate) fn hoist_correlated_subqueries(
 ) -> Result<LogicalPlan> {
     Ok(match plan {
         LogicalPlan::Filter { source, predicate } => {
-            let mut hoister = Hoister {
-                source: Some(Box::new(hoist_correlated_subqueries(*source, catalog)?)),
-                catalog,
-            };
-            let predicate = hoister.hoist_expr(&predicate)?;
-            LogicalPlan::Filter {
-                source: hoister.into_source(),
-                predicate,
+            let source = hoist_correlated_subqueries(*source, catalog)?;
+            if predicate_has_pipeline_candidate(&predicate) {
+                hoist_predicate(source, predicate, catalog, false)?
+            } else {
+                // No correlation: keep the predicate tree exactly as bound.
+                LogicalPlan::Filter {
+                    source: Box::new(source),
+                    predicate,
+                }
             }
         }
         LogicalPlan::Projection {
@@ -179,21 +181,23 @@ pub(crate) fn hoist_correlated_subqueries(
         LogicalPlan::Scan {
             table,
             filter: Some(predicate),
-        } if expr_has_correlated_subquery(&predicate) => hoist_scan_filter(
+        } if predicate_has_pipeline_candidate(&predicate) => hoist_predicate(
             LogicalPlan::Scan {
                 table,
                 filter: None,
             },
             predicate,
             catalog,
+            true,
         )?,
         LogicalPlan::SystemScan {
             view,
             filter: Some(predicate),
-        } if expr_has_correlated_subquery(&predicate) => hoist_scan_filter(
+        } if predicate_has_pipeline_candidate(&predicate) => hoist_predicate(
             LogicalPlan::SystemScan { view, filter: None },
             predicate,
             catalog,
+            true,
         )?,
         // Leaves and DDL: nothing to hoist.
         plan @ (LogicalPlan::Scan { .. }
@@ -258,22 +262,431 @@ fn restore_dml_source_shape(
     })
 }
 
-/// Pull a correlated scan filter above its (now unfiltered) scan as
-/// `Filter { Apply { scan } }`.
-fn hoist_scan_filter(
-    scan: LogicalPlan,
+/// The filter pipeline for a predicate containing correlated subqueries
+/// (`docs/specs/subqueries.md` §5–§6). The predicate is split into `AND`
+/// conjuncts, then:
+///
+/// 1. conjuncts without correlated subqueries stay plain — pushed back into
+///    the scan's own filter when the source is a bare scan
+///    (`plain_into_scan`), else re-checked in the final `Filter`;
+/// 2. decorrelatable `[NOT] EXISTS` / `[NOT] IN` conjuncts become semi/anti
+///    joins stacked above the source (their output is the left side only, so
+///    downstream slots are unchanged);
+/// 3. everything else hoists through an `Apply`, consumed by the final
+///    `Filter`.
+fn hoist_predicate(
+    source: LogicalPlan,
     predicate: BoundExpr,
     catalog: &dyn CatalogManager,
+    plain_into_scan: bool,
 ) -> Result<LogicalPlan> {
-    let mut hoister = Hoister {
-        source: Some(Box::new(scan)),
-        catalog,
-    };
-    let predicate = hoister.hoist_expr(&predicate)?;
-    Ok(LogicalPlan::Filter {
-        source: hoister.into_source(),
-        predicate,
+    let mut plain = Vec::new();
+    let mut candidates = Vec::new();
+    for conjunct in split_and(predicate) {
+        if expr_has_correlated_subquery(&conjunct) || is_uncorrelated_in_conjunct(&conjunct) {
+            candidates.push(conjunct);
+        } else {
+            plain.push(conjunct);
+        }
+    }
+
+    // Decorrelation first, so the joins sit directly above the (still
+    // unfiltered) scan and failed uncorrelated candidates can return to the
+    // plain bucket.
+    let mut source = source;
+    let mut leftovers = Vec::new();
+    for conjunct in candidates {
+        match try_decorrelate(source, &conjunct, catalog)? {
+            Decorrelation::Joined(joined) => source = joined,
+            Decorrelation::No(original) => {
+                source = original;
+                if expr_has_correlated_subquery(&conjunct) {
+                    leftovers.push(conjunct);
+                } else {
+                    // An uncorrelated IN that did not qualify (non-column
+                    // operand, nullable NOT IN) keeps its pre-pass path.
+                    plain.push(conjunct);
+                }
+            }
+        }
+    }
+
+    if plain_into_scan
+        && !plain.is_empty()
+        && let Some(filter) = and_reduce(std::mem::take(&mut plain))
+    {
+        attach_to_leftmost_scan(&mut source, filter);
+    }
+
+    let mut residual = plain;
+    if !leftovers.is_empty() {
+        let mut hoister = Hoister {
+            source: Some(Box::new(source)),
+            catalog,
+        };
+        for conjunct in leftovers {
+            residual.push(hoister.hoist_expr(&conjunct)?);
+        }
+        source = *hoister.into_source();
+    }
+
+    Ok(match and_reduce(residual) {
+        Some(predicate) => LogicalPlan::Filter {
+            source: Box::new(source),
+            predicate,
+        },
+        None => source,
     })
+}
+
+/// Attach a predicate to the leftmost scan under any semi/anti joins the
+/// decorrelation stacked (the plain conjuncts reference only that scan's
+/// columns, and semi/anti joins preserve the left side unchanged). Falls back
+/// to a `Filter` above `source` if the leftmost node is not a bare scan.
+fn attach_to_leftmost_scan(source: &mut LogicalPlan, filter: BoundExpr) {
+    match source {
+        LogicalPlan::Scan {
+            filter: slot @ None,
+            ..
+        }
+        | LogicalPlan::SystemScan {
+            filter: slot @ None,
+            ..
+        } => *slot = Some(filter),
+        LogicalPlan::Join {
+            left,
+            join_type: JoinType::Semi | JoinType::Anti,
+            ..
+        } => attach_to_leftmost_scan(left, filter),
+        other => {
+            let source_plan = std::mem::replace(
+                other,
+                LogicalPlan::Values {
+                    rows: Vec::new(),
+                    output_schema: Vec::new(),
+                },
+            );
+            *other = LogicalPlan::Filter {
+                source: Box::new(source_plan),
+                predicate: filter,
+            };
+        }
+    }
+}
+
+/// The pipeline gate: a predicate is worth splitting when it contains a
+/// correlated subquery or a top-level uncorrelated `[NOT] IN (subquery)`
+/// conjunct (a semi/anti-join candidate).
+fn predicate_has_pipeline_candidate(expr: &BoundExpr) -> bool {
+    expr_has_correlated_subquery(expr) || has_top_level_in_conjunct(expr)
+}
+
+fn has_top_level_in_conjunct(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::BinaryOp {
+            op: crate::BinOp::And,
+            left,
+            right,
+            ..
+        } => has_top_level_in_conjunct(left) || has_top_level_in_conjunct(right),
+        other => is_uncorrelated_in_conjunct(other),
+    }
+}
+
+fn is_uncorrelated_in_conjunct(expr: &BoundExpr) -> bool {
+    matches!(expr, BoundExpr::InSubquery { query, .. } if query.correlations.is_empty())
+}
+
+/// A decorrelation attempt either wraps the source in a semi/anti join or
+/// hands the source back untouched.
+enum Decorrelation {
+    Joined(LogicalPlan),
+    No(LogicalPlan),
+}
+
+/// Try to run one filter conjunct as a semi/anti join
+/// (`docs/specs/subqueries.md` §6.2):
+///
+/// - `[NOT] EXISTS (SELECT ... FROM one_table WHERE conjuncts)`, correlated
+///   only through `inner_col = outer_col` equality conjuncts — the equalities
+///   become the join condition, the remaining body conjuncts stay as the
+///   inner scan's filter.
+/// - `col [NOT] IN (uncorrelated subquery)` with a plain column operand;
+///   `NOT IN` only when both the operand and the subquery column are
+///   non-nullable (otherwise three-valued `NULL` semantics differ).
+///
+/// Anything else falls back to Apply. Chained correlation entries
+/// (`OuterRef` outers) are allowed: they land in the join condition, which
+/// keeps the join on the nested-loop path and is substituted by the enclosing
+/// Apply like any other template expression.
+fn try_decorrelate(
+    source: LogicalPlan,
+    conjunct: &BoundExpr,
+    catalog: &dyn CatalogManager,
+) -> Result<Decorrelation> {
+    match conjunct {
+        BoundExpr::Exists { query, negated, .. } if !query.correlations.is_empty() => {
+            let Some(parts) = qualify_exists_body(query) else {
+                return Ok(Decorrelation::No(source));
+            };
+            let left_width = logical_output_width(&source, catalog)?;
+            let right = hoist_correlated_subqueries(
+                crate::simplify::simplify_logical(LogicalPlan::Scan {
+                    table: parts.table,
+                    filter: parts.inner_filter,
+                }),
+                catalog,
+            )?;
+            let condition = parts
+                .equalities
+                .into_iter()
+                .map(|(correlation_slot, inner_column)| {
+                    equality(
+                        query.correlations[correlation_slot].outer.clone(),
+                        rebase_slot(inner_column, left_width),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(Decorrelation::Joined(LogicalPlan::Join {
+                left: Box::new(source),
+                right: Box::new(right),
+                condition: and_reduce(condition),
+                join_type: if *negated {
+                    JoinType::Anti
+                } else {
+                    JoinType::Semi
+                },
+            }))
+        }
+        BoundExpr::InSubquery {
+            expr: operand,
+            query,
+            negated,
+            ..
+        } if query.correlations.is_empty() => {
+            if !matches!(
+                **operand,
+                BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. }
+            ) {
+                return Ok(Decorrelation::No(source));
+            }
+            let output = query.output_columns();
+            let [column] = output.as_slice() else {
+                return Ok(Decorrelation::No(source));
+            };
+            // NOT IN differs from an anti join whenever a NULL can appear on
+            // either side (three-valued logic); only provably NULL-free
+            // shapes decorrelate.
+            if *negated && (operand.nullable() || column.nullable) {
+                return Ok(Decorrelation::No(source));
+            }
+            let left_width = logical_output_width(&source, catalog)?;
+            let right = hoist_correlated_subqueries(
+                crate::simplify::simplify_logical(crate::logical::plan_query(query)?),
+                catalog,
+            )?;
+            let condition = equality(
+                (**operand).clone(),
+                BoundExpr::InputRef {
+                    input: 0,
+                    column: 0,
+                    slot: left_width,
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+            );
+            Ok(Decorrelation::Joined(LogicalPlan::Join {
+                left: Box::new(source),
+                right: Box::new(right),
+                condition: Some(condition),
+                join_type: if *negated {
+                    JoinType::Anti
+                } else {
+                    JoinType::Semi
+                },
+            }))
+        }
+        _ => Ok(Decorrelation::No(source)),
+    }
+}
+
+struct ExistsBodyParts {
+    table: common::TableId,
+    /// Uncorrelated body conjuncts, in body-scope slots (the inner scan's
+    /// filter).
+    inner_filter: Option<BoundExpr>,
+    /// Per equality conjunct: the correlation slot the body compared against,
+    /// and the inner column reference (body-scope slot).
+    equalities: Vec<(usize, BoundExpr)>,
+}
+
+/// Qualify a correlated EXISTS body for decorrelation: a plain single-table
+/// SELECT (no grouping, distinct, ordering, or limits) whose only use of the
+/// outer scope is `inner_col = OuterRef` equality conjuncts.
+fn qualify_exists_body(query: &crate::BoundQuery) -> Option<ExistsBodyParts> {
+    if !query.order_by.is_empty() || query.limit.is_some() || query.offset.is_some() {
+        return None;
+    }
+    let crate::BoundQueryBody::Select(select) = &query.body else {
+        return None;
+    };
+    if select.distinct.is_some() || !select.group_by.is_empty() || select.having.is_some() {
+        return None;
+    }
+    // An aggregate call in the select list makes the body an implicit
+    // aggregate query producing EXACTLY ONE row regardless of the filter —
+    // EXISTS over it is constant-true, which a semi join would break.
+    if select
+        .columns
+        .iter()
+        .any(|item| crate::logical::contains_aggregate(&item.expr))
+    {
+        return None;
+    }
+    let Some(crate::BoundFrom::Table { table, .. }) = &select.from else {
+        return None;
+    };
+
+    let mut equalities = Vec::new();
+    let mut inner_filter = Vec::new();
+    for conjunct in select.filter.clone().map(split_and).unwrap_or_default() {
+        if let BoundExpr::BinaryOp {
+            op: crate::BinOp::Eq,
+            left,
+            right,
+            ..
+        } = &conjunct
+        {
+            match (&**left, &**right) {
+                (BoundExpr::InputRef { .. }, BoundExpr::OuterRef { slot, .. }) => {
+                    equalities.push((*slot, (**left).clone()));
+                    continue;
+                }
+                (BoundExpr::OuterRef { slot, .. }, BoundExpr::InputRef { .. }) => {
+                    equalities.push((*slot, (**right).clone()));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        inner_filter.push(conjunct);
+    }
+    if equalities.is_empty() {
+        return None;
+    }
+
+    // No other use of the outer scope anywhere in the body: not in the
+    // remaining conjuncts, not in the projection, and not chained through a
+    // nested subquery's correlation entries (the body's boundary disappears
+    // after decorrelation, so nothing could ever substitute them).
+    if inner_filter.iter().any(references_enclosing_boundary)
+        || select
+            .columns
+            .iter()
+            .any(|item| references_enclosing_boundary(&item.expr))
+    {
+        return None;
+    }
+
+    Some(ExistsBodyParts {
+        table: *table,
+        inner_filter: and_reduce(inner_filter),
+        equalities,
+    })
+}
+
+/// Whether an expression references the enclosing subquery boundary: an
+/// `OuterRef` directly, or — through a nested subquery's correlation entries
+/// (which are expressions in THIS scope's terms) — a chained one. Nested
+/// subquery bodies themselves are separate scopes and are not entered.
+fn references_enclosing_boundary(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::OuterRef { .. } => true,
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => query
+            .correlations
+            .iter()
+            .any(|correlation| references_enclosing_boundary(&correlation.outer)),
+        BoundExpr::InSubquery {
+            expr: operand,
+            query,
+            ..
+        } => {
+            references_enclosing_boundary(operand)
+                || query
+                    .correlations
+                    .iter()
+                    .any(|correlation| references_enclosing_boundary(&correlation.outer))
+        }
+        _ => {
+            let mut found = false;
+            let _ = crate::params::for_each_child(expr, &mut |child| {
+                found = found || references_enclosing_boundary(child);
+                Ok(())
+            });
+            found
+        }
+    }
+}
+
+/// Split an expression into its top-level `AND` conjuncts.
+fn split_and(expr: BoundExpr) -> Vec<BoundExpr> {
+    match expr {
+        BoundExpr::BinaryOp {
+            op: crate::BinOp::And,
+            left,
+            right,
+            ..
+        } => {
+            let mut conjuncts = split_and(*left);
+            conjuncts.extend(split_and(*right));
+            conjuncts
+        }
+        other => vec![other],
+    }
+}
+
+/// Re-`AND` conjuncts; `None` when empty.
+fn and_reduce(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
+    conjuncts
+        .into_iter()
+        .reduce(|acc, next| BoundExpr::BinaryOp {
+            left: Box::new(acc),
+            op: crate::BinOp::And,
+            right: Box::new(next),
+            data_type: DataType::Boolean,
+            nullable: true,
+        })
+}
+
+fn equality(left: BoundExpr, right: BoundExpr) -> BoundExpr {
+    BoundExpr::BinaryOp {
+        left: Box::new(left),
+        op: crate::BinOp::Eq,
+        right: Box::new(right),
+        data_type: DataType::Boolean,
+        nullable: true,
+    }
+}
+
+/// Rebase a body-scope column reference onto the joined row (right columns
+/// follow the left side's).
+fn rebase_slot(expr: BoundExpr, left_width: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::InputRef {
+            input,
+            column,
+            slot,
+            data_type,
+            nullable,
+        } => BoundExpr::InputRef {
+            input,
+            column,
+            slot: slot + left_width,
+            data_type,
+            nullable,
+        },
+        other => other,
+    }
 }
 
 /// Whether an expression tree contains a correlated subquery (probed through
@@ -402,8 +815,17 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
             schema.columns.len()
         }
         LogicalPlan::SystemScan { view, .. } => view.columns().len(),
-        LogicalPlan::Join { left, right, .. } => {
-            logical_output_width(left, catalog)? + logical_output_width(right, catalog)?
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            if join_type.is_semi_or_anti() {
+                logical_output_width(left, catalog)?
+            } else {
+                logical_output_width(left, catalog)? + logical_output_width(right, catalog)?
+            }
         }
         LogicalPlan::Filter { source, .. }
         | LogicalPlan::Sort { source, .. }

@@ -1,8 +1,9 @@
 # Correlated Subqueries, LATERAL, and Join-Sourced DML
 
-**Status:** In implementation on branch `subqueries` — milestones S0–S2
+**Status:** In implementation on branch `subqueries` — milestones S0–S3
 implemented (correlated subqueries execute via Apply in `WHERE`, the `SELECT`
-list, and `HAVING`); S3+ are design (§12).
+list, and `HAVING`; equality shapes decorrelate to semi/anti joins); S4+ are
+design (§12).
 
 This document specifies correlated subquery execution and the features built on
 it: correlated `(SELECT ...)` / `[NOT] EXISTS` / `[NOT] IN`, semi/anti joins,
@@ -227,11 +228,12 @@ An Apply always appends its column; the hoisted expression consumes it via
 the replacement `LocalRef`, and an enclosing projection drops it from the
 statement's visible output. Two consequences of the plan shapes:
 
-- A single-table `WHERE` lowers into the scan's own filter, so a correlated
-  predicate is pulled back out — the scan runs unfiltered and the rewritten
-  predicate filters above the Apply. The *whole* predicate loses scan-level
-  filtering and index selection in that case; conjunct splitting is future
-  work (§12 S6).
+- A single-table `WHERE` lowers into the scan's own filter, so a predicate
+  containing subquery candidates is pulled back out and split into `AND`
+  conjuncts: conjuncts without candidates return to the scan's filter
+  (keeping index selection), decorrelatable conjuncts become semi/anti joins
+  stacked above the scan (§6), and the rest hoist through an Apply consumed
+  by a `Filter` above everything.
 - An `UPDATE`/`DELETE` source must produce exactly the target table's row
   shape, so after hoisting the planner layers a projection back to the
   table's columns above the Apply (row identity passes through projections).
@@ -301,23 +303,33 @@ build/probe structure with early-out probes.
 
 ### 6.2 Rules
 
-Applied during logical planning, before Apply-hoisting; a shape the rules do
-not match falls back to Apply, so the rules are pure optimization:
+Applied to top-level `AND` conjuncts of `WHERE`/`HAVING` predicates during
+the hoisting pipeline (§5.1); a shape the rules do not match falls back to
+Apply (correlated) or the pre-pass (uncorrelated), so the rules are pure
+optimization:
 
-- **`[NOT] EXISTS`** in `WHERE`, where the subquery's correlation appears only
-  as a conjunction of `inner_col = outer_col` equality predicates (any other
-  use of an outer reference disqualifies): strip those predicates, join the
-  outer input to the de-correlated inner on the equality keys as
-  `Semi`/`Anti`. Equality keys make it a hash join by the existing equi-join
-  rule; otherwise nested-loop.
-- **Uncorrelated `IN (SELECT c ...)`** in `WHERE`: `Semi` hash join on
-  `operand = c`.
-- **Uncorrelated `NOT IN (SELECT c ...)`** in `WHERE`: `Anti` hash join
-  **only when** `operand` and `c` are both non-nullable (by binder
-  nullability); otherwise Apply preserves the three-valued `NULL` semantics.
+- **`[NOT] EXISTS`** whose body is a plain single-table `SELECT` (no
+  grouping, `DISTINCT`, ordering, limits, joins, or derived tables) and whose
+  only use of the outer scope is a conjunction of `inner_col = outer_col`
+  equality predicates — anywhere else in the body (remaining conjuncts,
+  projection, or a nested subquery's correlation entries) an outer reference
+  disqualifies. The equalities are stripped and become the join condition of
+  a `Semi`/`Anti` join; the remaining body conjuncts stay on the inner scan
+  (index-selectable). A chained correlation entry (`OuterRef` outer) is
+  allowed: it lands in the join condition, keeps the join on the nested-loop
+  path, and is substituted by the enclosing Apply.
+- **Uncorrelated `col IN (SELECT ...)`**: `Semi` hash join on
+  `col = subquery output`. The operand must be a plain column reference
+  (hash-key-shaped); anything else keeps the pre-pass `InList` path.
+- **Uncorrelated `col NOT IN (SELECT ...)`**: `Anti` hash join **only when**
+  the operand column and the subquery's output column are both non-nullable
+  (by binder nullability); otherwise the pre-pass preserves the three-valued
+  `NULL` semantics.
 
-Correlated `IN` decorrelation (combining the operand key with correlation
-keys) is deliberately deferred; it runs as Apply.
+The equi-key extraction accepts `LocalRef` as well as `InputRef` slots, so a
+`HAVING` decorrelation (post-aggregate `LocalRef` correlation entries) also
+takes the hash path. Correlated `IN` decorrelation (combining the operand key
+with correlation keys) is deliberately deferred; it runs as Apply.
 
 ## 7. LATERAL
 
@@ -418,8 +430,7 @@ the existing plan-tree text format.
 - **S5** — `identity_from` join propagation, then
   `UPDATE ... FROM` / `DELETE ... USING` with dedupe.
 - **S6** — polish: ApplyOp re-`open` rescan, `LIMIT 1` injection for `EXISTS`
-  subplans, scan-filter conjunct splitting around Applies, index-aware
-  per-row template replanning, cancellation polling inside Apply's inner
+  subplans, index-aware per-row template replanning, cancellation polling inside Apply's inner
   drains (today cancellation is observed between top-level rows, matching the
   uncorrelated pre-pass), README updates, and an `overview.md` §13 entry
   for the remaining deferrals (correlated-`IN` decorrelation, correlation in

@@ -1,6 +1,7 @@
 use std::ops::Bound;
 
 use crate::ApplyKind;
+use crate::JoinType;
 use crate::PhysicalPlan;
 use common::{Key, KeyRange};
 
@@ -145,9 +146,15 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
             left,
             right,
             left_keys,
+            join_type,
             ..
         } => {
-            output.push_str(&format!("{padding}HashJoin keys={}\n", left_keys.len()));
+            let label = match join_type {
+                JoinType::Semi => "HashJoin type=Semi",
+                JoinType::Anti => "HashJoin type=Anti",
+                _ => "HashJoin",
+            };
+            output.push_str(&format!("{padding}{label} keys={}\n", left_keys.len()));
             format_node(left, indent + 1, output);
             format_node(right, indent + 1, output);
         }

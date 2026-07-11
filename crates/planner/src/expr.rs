@@ -202,6 +202,21 @@ pub enum JoinType {
     Right,
     Full,
     Cross,
+    /// Emit each left row once if ANY right row matches; output is the left
+    /// side only. Produced only by decorrelation (`docs/specs/subqueries.md`
+    /// §6), never by the binder.
+    Semi,
+    /// Emit each left row once if NO right row matches; output is the left
+    /// side only. Produced only by decorrelation.
+    Anti,
+}
+
+impl JoinType {
+    /// Semi/anti joins output the left side only and emit each left row at
+    /// most once.
+    pub fn is_semi_or_anti(self) -> bool {
+        matches!(self, JoinType::Semi | JoinType::Anti)
+    }
 }
 
 /// What an `Apply` (dependent join) computes per outer row from its correlated

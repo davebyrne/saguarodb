@@ -154,6 +154,9 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
+        /// `Inner`, `Semi`, or `Anti`; outer joins never take the hash path.
+        /// Semi/anti output the left side only.
+        join_type: JoinType,
     },
     Filter {
         source: Box<PhysicalPlan>,
@@ -463,19 +466,24 @@ fn plan_join(
     // An inner join whose ON predicate has at least one `left_col = right_col`
     // equality conjunct can run as a hash join on those equality pairs. Any
     // remaining (non-equi or expression) conjuncts are re-checked in a Filter
-    // above the hash join. Anything else (outer/cross joins, or inner joins with
-    // no column-equality conjunct) falls back to the nested-loop join.
-    if join_type == JoinType::Inner
+    // above the hash join. A semi/anti join (produced by decorrelation) takes
+    // the hash path only when the WHOLE condition is equality pairs — its
+    // output has no right columns, so a residual could not be re-checked
+    // above it. Anything else falls back to the nested-loop join.
+    if matches!(join_type, JoinType::Inner | JoinType::Semi | JoinType::Anti)
         && let Some(condition) = condition
     {
         let left_width = output_width(&left_plan, catalog)?;
         let split = split_equi_keys(condition, left_width);
-        if !split.left_keys.is_empty() {
+        let hashable = !split.left_keys.is_empty()
+            && (join_type == JoinType::Inner || split.residual.is_none());
+        if hashable {
             let hash = PhysicalPlan::HashJoin {
                 left: Box::new(left_plan),
                 right: Box::new(right_plan),
                 left_keys: split.left_keys,
                 right_keys: split.right_keys,
+                join_type,
             };
             return Ok(match split.residual {
                 Some(predicate) => PhysicalPlan::Filter {
@@ -581,7 +589,10 @@ fn equi_key_pair(a: &BoundExpr, b: &BoundExpr, left_width: usize) -> Option<(usi
 
 fn input_ref_slot(expr: &BoundExpr) -> Option<usize> {
     match expr {
-        BoundExpr::InputRef { slot, .. } => Some(*slot),
+        // Both reference kinds index the operator's input row by slot;
+        // `LocalRef` appears in post-aggregate positions (e.g. a HAVING
+        // decorrelation's join condition).
+        BoundExpr::InputRef { slot, .. } | BoundExpr::LocalRef { slot, .. } => Some(*slot),
         _ => None,
     }
 }
@@ -594,9 +605,23 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
             table_column_count(*table, catalog)
         }
         PhysicalPlan::SystemScan { output_schema, .. } => Ok(output_schema.len()),
-        PhysicalPlan::NestedLoopJoin { left, right, .. }
-        | PhysicalPlan::HashJoin { left, right, .. } => {
-            Ok(output_width(left, catalog)? + output_width(right, catalog)?)
+        PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            join_type,
+            ..
+        }
+        | PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            if join_type.is_semi_or_anti() {
+                output_width(left, catalog)
+            } else {
+                Ok(output_width(left, catalog)? + output_width(right, catalog)?)
+            }
         }
         PhysicalPlan::Filter { source, .. }
         | PhysicalPlan::Sort { source, .. }

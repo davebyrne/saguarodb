@@ -649,6 +649,11 @@ fn apply_outer_join_nullability(ctx: &mut BindContext, from: &BoundFrom) {
                     mark_from_bindings_nullable(ctx, right);
                 }
                 JoinType::Inner | JoinType::Cross => {}
+                // Semi/anti joins are planner-made (decorrelation); the
+                // binder never produces them in a FROM clause.
+                JoinType::Semi | JoinType::Anti => {
+                    unreachable!("semi/anti joins do not appear in bound FROM clauses")
+                }
             }
         }
         BoundFrom::Table { .. }

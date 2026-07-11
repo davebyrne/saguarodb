@@ -3382,6 +3382,25 @@ async fn e2e_correlated_subqueries_execute() {
         .unwrap_rows();
     assert_eq!(rows, vec![vec![Some("3".to_string())]]);
 
+    // EXISTS over an implicitly-aggregated body: exactly one row always, so
+    // every user qualifies (the Apply path must be taken, not a semi join).
+    let rows = server
+        .simple_query(
+            "select id from users where exists \
+             (select max(id) from accounts where accounts.owner = users.name) order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
     // Nested correlation (depth 2): only Ada has an account strictly cheaper
     // than another of her own accounts.
     let rows = server
@@ -3421,11 +3440,26 @@ async fn e2e_correlated_subqueries_execute() {
         .expect("multi-row scalar subquery should fail");
     assert!(err.message.contains("21000"), "{}", err.message);
 
-    // EXPLAIN shows the Apply node.
+    // EXPLAIN: an equality-correlated EXISTS decorrelates to a hash semi
+    // join; a non-equality correlation keeps the Apply.
     let rows = server
         .simple_query(
             "explain select id from users where exists \
              (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    let plan = rows
+        .iter()
+        .map(|row| row[0].clone().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("HashJoin type=Semi"), "plan was: {plan}");
+    let rows = server
+        .simple_query(
+            "explain select id from users where exists \
+             (select 1 from accounts where accounts.owner > users.name)",
         )
         .await
         .unwrap()
@@ -3528,11 +3562,14 @@ async fn e2e_correlated_nested_volatile_subquery_not_memoized() {
     server.simple_query("create sequence seq2").await.unwrap();
 
     // Outer scalar subquery (correlated on t.k) contains a nested correlated
-    // EXISTS whose template holds an uncorrelated nextval subquery.
+    // EXISTS whose template holds an uncorrelated nextval subquery. The
+    // nested correlation is a NON-equality (>=), so it cannot decorrelate to
+    // a semi join and stays a nested Apply with lazy template resolution —
+    // the shape the body probe exists for.
     let rows = server
         .simple_query(
             "select (select s.id from s where s.k = t.k and exists \
-              (select 1 from s s2 where s2.k = s.k and s2.id >= (select nextval('seq2')))) \
+              (select 1 from s s2 where s2.k >= s.k and s2.id >= (select nextval('seq2')))) \
              from t order by id",
         )
         .await

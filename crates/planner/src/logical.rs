@@ -1033,7 +1033,7 @@ fn rewrite_query_correlations(
     Ok(query)
 }
 
-fn contains_aggregate(expr: &BoundExpr) -> bool {
+pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::AggregateCall { .. } => true,
         BoundExpr::BinaryOp { left, right, .. } => {

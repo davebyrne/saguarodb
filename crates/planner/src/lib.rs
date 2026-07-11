@@ -3715,16 +3715,74 @@ mod tests {
     }
 
     #[test]
-    fn where_correlation_hoists_apply_above_scan() {
+    fn equality_correlated_exists_decorrelates_to_hash_semi_join() {
         let catalog = catalog_with_users_and_accounts();
         let plan = plan_sql(
             "select id from users where exists \
              (select 1 from accounts where accounts.owner = users.name)",
             &catalog,
         );
-        // Projection over Filter over Apply over the unfiltered scan; the
-        // predicate references the appended column (users has 2 columns, so
-        // the Apply column is slot 2).
+        // The EXISTS conjunct is consumed entirely by the semi join: no
+        // Filter, no Apply, output slots unchanged for the projection.
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection at top, got {plan:?}");
+        };
+        let PhysicalPlan::HashJoin {
+            join_type: JoinType::Semi,
+            left,
+            right,
+            left_keys,
+            right_keys,
+        } = *source
+        else {
+            panic!("expected hash semi join, got {source:?}");
+        };
+        assert_eq!(
+            (left_keys.as_slice(), right_keys.as_slice()),
+            (&[1][..], &[1][..])
+        );
+        assert!(matches!(*left, PhysicalPlan::SeqScan { filter: None, .. }));
+        assert!(matches!(*right, PhysicalPlan::SeqScan { filter: None, .. }));
+    }
+
+    #[test]
+    fn not_exists_with_body_filter_decorrelates_to_anti_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select id from users where not exists \
+             (select 1 from accounts where accounts.owner = users.name and accounts.id > 5)",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        let PhysicalPlan::HashJoin {
+            join_type: JoinType::Anti,
+            right,
+            ..
+        } = *source
+        else {
+            panic!("expected hash anti join, got {source:?}");
+        };
+        // The uncorrelated body conjunct stays on the inner scan — here as a
+        // primary-key range, so the scan plans as an IndexScan.
+        assert!(
+            matches!(*right, PhysicalPlan::IndexScan { .. }),
+            "got {right:?}"
+        );
+    }
+
+    #[test]
+    fn non_equality_correlation_hoists_apply_above_scan() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner > users.name)",
+            &catalog,
+        );
+        // Not decorrelatable: Projection over Filter over Apply over the
+        // unfiltered scan; the predicate references the appended column
+        // (users has 2 columns, so the Apply column is slot 2).
         let PhysicalPlan::Projection { source, .. } = plan else {
             panic!("expected Projection at top, got {plan:?}");
         };
@@ -3746,6 +3804,97 @@ mod tests {
         };
         assert_eq!(correlations.len(), 1);
         assert!(matches!(*input, PhysicalPlan::SeqScan { filter: None, .. }));
+    }
+
+    #[test]
+    fn uncorrelated_in_with_column_operand_decorrelates_to_semi_join() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select name from users where id in (select id from accounts)",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        assert!(
+            matches!(
+                *source,
+                PhysicalPlan::HashJoin {
+                    join_type: JoinType::Semi,
+                    ..
+                }
+            ),
+            "expected hash semi join, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn not_in_decorrelates_only_when_null_free() {
+        let catalog = catalog_with_users_and_accounts();
+        // users.id and accounts.id are both primary keys (non-nullable):
+        // NOT IN is an anti join.
+        let plan = plan_sql(
+            "select name from users where id not in (select id from accounts)",
+            &catalog,
+        );
+        assert!(
+            format!("{plan:?}").contains("Anti"),
+            "expected anti join, got {plan:?}"
+        );
+        // accounts.owner is nullable: NOT IN must keep three-valued
+        // semantics via the pre-pass InList (no join, no Apply).
+        let plan = plan_sql(
+            "select name from users where name not in (select owner from accounts)",
+            &catalog,
+        );
+        let plan_text = format!("{plan:?}");
+        assert!(
+            !plan_text.contains("Anti") && !plan_text.contains("Apply"),
+            "nullable NOT IN must stay a subquery expression, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn exists_with_aggregate_body_falls_back_to_apply() {
+        let catalog = catalog_with_users_and_accounts();
+        // An implicitly-aggregated body (`select max(...)`) produces exactly
+        // one row no matter what the correlation filter matches, so EXISTS
+        // over it is constant-true: it must NOT decorrelate to a semi join.
+        let plan = plan_sql(
+            "select id from users where exists \
+             (select max(id) from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        let plan_text = format!("{plan:?}");
+        assert!(
+            plan_text.contains("Apply") && !plan_text.contains("Semi"),
+            "expected Apply fallback, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn exists_with_disqualifying_body_falls_back_to_apply() {
+        let catalog = catalog_with_users_and_accounts();
+        // A LIMIT in the body disqualifies decorrelation.
+        let plan = plan_sql(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name limit 1)",
+            &catalog,
+        );
+        assert!(
+            format!("{plan:?}").contains("Apply"),
+            "expected Apply fallback, got {plan:?}"
+        );
+        // An EXISTS under OR is not a top-level conjunct.
+        let plan = plan_sql(
+            "select id from users where id = 1 or exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        assert!(
+            format!("{plan:?}").contains("Apply"),
+            "expected Apply fallback, got {plan:?}"
+        );
     }
 
     #[test]
@@ -3778,11 +3927,36 @@ mod tests {
     }
 
     #[test]
-    fn having_correlation_hoists_apply_above_aggregate() {
+    fn having_equality_correlation_decorrelates_above_aggregate() {
         let catalog = catalog_with_users_and_accounts();
         let plan = plan_sql(
             "select name from users group by name having exists \
              (select 1 from accounts where accounts.owner = users.name)",
+            &catalog,
+        );
+        // The correlation entry was rewritten to a post-aggregate LocalRef,
+        // which the equi-key extraction accepts: hash semi join above the
+        // Aggregate, HAVING filter fully consumed.
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        let PhysicalPlan::HashJoin {
+            join_type: JoinType::Semi,
+            left,
+            ..
+        } = *source
+        else {
+            panic!("expected hash semi join, got {source:?}");
+        };
+        assert!(matches!(*left, PhysicalPlan::Aggregate { .. }));
+    }
+
+    #[test]
+    fn having_non_equality_correlation_hoists_apply_above_aggregate() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select name from users group by name having exists \
+             (select 1 from accounts where accounts.owner > users.name)",
             &catalog,
         );
         let PhysicalPlan::Projection { source, .. } = plan else {
@@ -3798,7 +3972,7 @@ mod tests {
     }
 
     #[test]
-    fn update_source_shape_is_restored_after_hoisting() {
+    fn update_with_decorrelated_where_needs_no_shape_restore() {
         let catalog = catalog_with_users_and_accounts();
         let plan = plan_sql(
             "update users set name = 'x' where exists \
@@ -3808,8 +3982,33 @@ mod tests {
         let PhysicalPlan::Update { source, .. } = plan else {
             panic!("expected Update, got {plan:?}");
         };
-        // The restoring projection narrows the source back to the table's
-        // two columns.
+        // A semi join outputs the left side only, so the source keeps the
+        // table's shape (and row identity) with no restoring projection.
+        assert!(
+            matches!(
+                *source,
+                PhysicalPlan::HashJoin {
+                    join_type: JoinType::Semi,
+                    ..
+                }
+            ),
+            "expected the semi join directly, got {source:?}"
+        );
+    }
+
+    #[test]
+    fn update_source_shape_is_restored_after_apply_hoisting() {
+        let catalog = catalog_with_users_and_accounts();
+        // Non-equality correlation: the Apply widens the source, so the
+        // restoring projection narrows it back to the table's two columns.
+        let plan = plan_sql(
+            "update users set name = 'x' where exists \
+             (select 1 from accounts where accounts.owner > users.name)",
+            &catalog,
+        );
+        let PhysicalPlan::Update { source, .. } = plan else {
+            panic!("expected Update, got {plan:?}");
+        };
         let PhysicalPlan::Projection {
             expressions,
             output_schema,

@@ -123,11 +123,13 @@ pub fn rewrite_plan_exprs(
             right,
             left_keys,
             right_keys,
+            join_type,
         } => PhysicalPlan::HashJoin {
             left: Box::new(rewrite_plan_exprs(left, f)?),
             right: Box::new(rewrite_plan_exprs(right, f)?),
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
+            join_type: *join_type,
         },
         // The subplan is a separate OuterRef namespace owned by the Apply
         // operator (docs/specs/subqueries.md section 5.2): it is cloned, not

@@ -30,7 +30,9 @@ impl<'a> NestedLoopJoinOp<'a> {
         let left_width = left.output_schema().len();
         let right_width = right.output_schema().len();
         let mut output_schema = left.output_schema().to_vec();
-        output_schema.extend_from_slice(right.output_schema());
+        if !join_type.is_semi_or_anti() {
+            output_schema.extend_from_slice(right.output_schema());
+        }
         Self {
             ctx,
             left,
@@ -57,6 +59,25 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
 
         let left_rows = collect_all(self.left.as_mut())?;
         let right_rows = collect_all(self.right.as_mut())?;
+
+        // Semi/anti joins emit the left ExecRow itself (row identity intact,
+        // no right columns) at most once per left row.
+        if self.join_type.is_semi_or_anti() {
+            for left in left_rows {
+                let mut matched = false;
+                for right in &right_rows {
+                    let joined = join_row_refs(&left, right);
+                    if join_condition_matches(&self.ctx, &self.condition, &joined)? {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched == (self.join_type == JoinType::Semi) {
+                    self.rows.push(left);
+                }
+            }
+            return Ok(());
+        }
 
         let mut matched_right = vec![false; right_rows.len()];
         for left in &left_rows {
@@ -158,6 +179,8 @@ pub struct HashJoinOp<'a> {
     right: Box<dyn PlanExecutor + 'a>,
     left_keys: Vec<usize>,
     right_keys: Vec<usize>,
+    /// `Inner`, `Semi`, or `Anti`. Outer joins never take the hash path.
+    join_type: JoinType,
     output_schema: Vec<ColumnInfo>,
     rows: Vec<ExecRow>,
     index: usize,
@@ -169,14 +192,18 @@ impl<'a> HashJoinOp<'a> {
         right: Box<dyn PlanExecutor + 'a>,
         left_keys: Vec<usize>,
         right_keys: Vec<usize>,
+        join_type: JoinType,
     ) -> Self {
         let mut output_schema = left.output_schema().to_vec();
-        output_schema.extend_from_slice(right.output_schema());
+        if !join_type.is_semi_or_anti() {
+            output_schema.extend_from_slice(right.output_schema());
+        }
         Self {
             left,
             right,
             left_keys,
             right_keys,
+            join_type,
             output_schema,
             rows: Vec::new(),
             index: 0,
@@ -201,6 +228,23 @@ impl PlanExecutor for HashJoinOp<'_> {
             if let Some(key) = join_key(&right.row.values, &self.right_keys)? {
                 table.entry(key).or_default().push(right_index);
             }
+        }
+
+        if self.join_type.is_semi_or_anti() {
+            // Semi/anti probes emit the left ExecRow itself (identity intact)
+            // at most once. A NULL in a left key never equals anything, so it
+            // is a non-match: dropped for semi, emitted for anti — exactly
+            // the [NOT] EXISTS equality semantics decorrelation relies on.
+            for left in left_rows {
+                let matched = match join_key(&left.row.values, &self.left_keys)? {
+                    Some(key) => table.contains_key(&key),
+                    None => false,
+                };
+                if matched == (self.join_type == JoinType::Semi) {
+                    self.rows.push(left);
+                }
+            }
+            return Ok(());
         }
 
         for left in &left_rows {
