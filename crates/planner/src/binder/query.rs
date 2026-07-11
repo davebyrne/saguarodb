@@ -14,8 +14,8 @@ use crate::{
 
 use super::expr::{bind_boolean_expr, bind_expr};
 use super::{
-    BindContext, Binding, CteBinding, CteScope, contains_aggregate, input_ref, plan_error,
-    reject_aggregate, require_type,
+    BindContext, Binding, CteBinding, CteScope, OuterLink, PendingCorrelation, contains_aggregate,
+    input_ref, plan_error, reject_aggregate, require_type,
 };
 
 /// Bind a query expression: bind any `WITH` CTEs into a child scope, then bind the
@@ -25,23 +25,34 @@ use super::{
 /// target type per output column, used only to type a bare `NULL` output column
 /// (from the sibling arm of an enclosing set operation); `None` when there is no
 /// such context.
-pub(super) fn bind_query(
-    catalog: &dyn CatalogManager,
+pub(super) fn bind_query<'a>(
+    catalog: &'a dyn CatalogManager,
     query: &Query,
     declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
+    outer: &[OuterLink<'a>],
+    pending: &mut Vec<PendingCorrelation>,
 ) -> Result<BoundQuery> {
     let scope = bind_ctes(catalog, &query.with, ctes, declared)?;
     match &query.body {
         QueryBody::Select(select) => {
-            let (bound_select, order_by) =
-                bind_select(catalog, select, &query.order_by, declared, &scope, expected)?;
+            let (bound_select, order_by) = bind_select(
+                catalog,
+                select,
+                &query.order_by,
+                declared,
+                &scope,
+                expected,
+                outer,
+                pending,
+            )?;
             Ok(BoundQuery {
                 body: BoundQueryBody::Select(Box::new(bound_select)),
                 order_by,
                 limit: query.limit,
                 offset: query.offset,
+                correlations: Vec::new(),
             })
         }
         QueryBody::Values(rows) => {
@@ -49,12 +60,13 @@ pub(super) fn bind_query(
             // VALUES output columns by position or name (like a set operation). The
             // CTE scope is threaded in because a subquery inside a VALUES row can
             // reference an enclosing CTE, even though VALUES itself has no FROM.
-            let values = bind_values(catalog, rows, declared, &scope, expected)?;
+            let values = bind_values(catalog, rows, declared, &scope, expected, outer)?;
             let mut bound = BoundQuery {
                 body: BoundQueryBody::Values(values),
                 order_by: Vec::new(),
                 limit: query.limit,
                 offset: query.offset,
+                correlations: Vec::new(),
             };
             bound.order_by = bind_output_order_by(&query.order_by, &bound.output_columns())?;
             Ok(bound)
@@ -65,7 +77,8 @@ pub(super) fn bind_query(
             left,
             right,
         } => {
-            let (left, right) = bind_set_op_arms(catalog, left, right, declared, &scope, expected)?;
+            let (left, right) =
+                bind_set_op_arms(catalog, left, right, declared, &scope, expected, outer)?;
             let (output_schema, output_columns) = reconcile_set_op(&left, &right)?;
             // `ORDER BY` over a set operation resolves against the combined output
             // by position or name only (there is no single input scope).
@@ -81,9 +94,25 @@ pub(super) fn bind_query(
                 order_by,
                 limit: query.limit,
                 offset: query.offset,
+                correlations: Vec::new(),
             })
         }
     }
+}
+
+/// Mark every link of an outer chain as rejected: the scopes stay walkable so
+/// an outer reference produces a `FeatureNotSupported` error naming
+/// `construct`, but no correlation can be recorded through them
+/// (`docs/specs/subqueries.md` §1.1). An inner construct's marker overrides an
+/// outer one — the reference crosses the inner boundary first.
+fn rejected_links<'a>(outer: &[OuterLink<'a>], construct: &'static str) -> Vec<OuterLink<'a>> {
+    outer
+        .iter()
+        .map(|link| OuterLink {
+            ctx: link.ctx,
+            reject: Some(construct),
+        })
+        .collect()
 }
 
 /// Bind the two arms of a set operation, resolving a bare-`NULL` output column in
@@ -106,32 +135,78 @@ pub(super) fn bind_query(
 /// doubling per nesting level. A column that is a bare `NULL` in *both* arms (or
 /// split across the arms so each needs the other) stays unresolved and is rejected;
 /// an explicit cast is required.
-fn bind_set_op_arms(
-    catalog: &dyn CatalogManager,
+fn bind_set_op_arms<'a>(
+    catalog: &'a dyn CatalogManager,
     left: &Query,
     right: &Query,
     declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
+    outer: &[OuterLink<'a>],
 ) -> Result<(BoundQuery, BoundQuery)> {
+    // An outer reference from a set-operation arm is rejected
+    // (`docs/specs/subqueries.md` §1.1): the arms bind against a chain whose
+    // links all reject, so `arm_pending` can never gain an entry.
+    let arm_outer = rejected_links(outer, "a set-operation arm");
+    let arm_pending = &mut Vec::new();
     if let Some(expected) = expected {
         // Output types already known: bind both arms directly, no retry.
-        let left = bind_query(catalog, left, declared, ctes, Some(expected))?;
-        let right = bind_query(catalog, right, declared, ctes, Some(expected))?;
+        let left = bind_query(
+            catalog,
+            left,
+            declared,
+            ctes,
+            Some(expected),
+            &arm_outer,
+            arm_pending,
+        )?;
+        let right = bind_query(
+            catalog,
+            right,
+            declared,
+            ctes,
+            Some(expected),
+            &arm_outer,
+            arm_pending,
+        )?;
         return Ok((left, right));
     }
-    match bind_query(catalog, left, declared, ctes, None) {
+    match bind_query(catalog, left, declared, ctes, None, &arm_outer, arm_pending) {
         Ok(left) => {
             let types = output_column_types(&left);
-            let right = bind_query(catalog, right, declared, ctes, Some(&types))?;
+            let right = bind_query(
+                catalog,
+                right,
+                declared,
+                ctes,
+                Some(&types),
+                &arm_outer,
+                arm_pending,
+            )?;
             Ok((left, right))
         }
         Err(left_err) => {
-            let Ok(right) = bind_query(catalog, right, declared, ctes, None) else {
+            let Ok(right) = bind_query(
+                catalog,
+                right,
+                declared,
+                ctes,
+                None,
+                &arm_outer,
+                arm_pending,
+            ) else {
                 return Err(left_err);
             };
             let types = output_column_types(&right);
-            let left = bind_query(catalog, left, declared, ctes, Some(&types))?;
+            let left = bind_query(
+                catalog,
+                left,
+                declared,
+                ctes,
+                Some(&types),
+                &arm_outer,
+                arm_pending,
+            )?;
             Ok((left, right))
         }
     }
@@ -182,7 +257,17 @@ fn bind_cte(
     scope: &CteScope,
     declared: &[Option<PgType>],
 ) -> Result<CteBinding> {
-    let query = bind_query(catalog, &cte.query, declared, scope, None)?;
+    // A CTE body is an isolated scope: it sees no enclosing bindings, so an
+    // outer reference fails name resolution (matching PostgreSQL).
+    let query = bind_query(
+        catalog,
+        &cte.query,
+        declared,
+        scope,
+        None,
+        &[],
+        &mut Vec::new(),
+    )?;
     let columns = derive_alias_columns(&query.output_columns(), &cte.column_aliases, || {
         format!("CTE \"{}\"", cte.name)
     })?;
@@ -343,13 +428,18 @@ fn bind_output_order_by(
 /// table bindings (so a bare column reference cannot resolve) but with the
 /// enclosing CTEs visible (a subquery in a row may reference one). Output columns
 /// are named `column1`, ...
-fn bind_values(
-    catalog: &dyn CatalogManager,
+fn bind_values<'a>(
+    catalog: &'a dyn CatalogManager,
     rows: &[Vec<Expr>],
     declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
+    outer: &[OuterLink<'a>],
 ) -> Result<BoundValues> {
+    // Every VALUES entry binds in its own throwaway context, so there is no
+    // single accumulator for `OuterRef` slots: outer references from a VALUES
+    // body are rejected (`docs/specs/subqueries.md` §1.1).
+    let outer = rejected_links(outer, "a VALUES list");
     let width = rows[0].len();
     for row in rows {
         if row.len() != width {
@@ -371,7 +461,7 @@ fn bind_values(
             if matches!(row[column], Expr::Literal(Value::Null)) {
                 continue;
             }
-            let mut ctx = BindContext::new(catalog, declared);
+            let mut ctx = BindContext::with_outer(catalog, declared, outer.clone());
             ctx.cte_scope = ctes.clone();
             data_type = Some(bind_expr(&mut ctx, &row[column], None)?.data_type());
             break;
@@ -404,7 +494,7 @@ fn bind_values(
         let mut bound_row = Vec::with_capacity(width);
         for (column, expr) in row.iter().enumerate() {
             let data_type = output_schema[column].data_type.clone();
-            let mut ctx = BindContext::new(catalog, declared);
+            let mut ctx = BindContext::with_outer(catalog, declared, outer.clone());
             ctx.cte_scope = ctes.clone();
             let bound = bind_expr(&mut ctx, expr, Some(data_type.clone()))?;
             reject_aggregate(&bound)?;
@@ -426,15 +516,18 @@ fn bind_values(
 /// `ORDER BY` and `DISTINCT` are bound here because their validation is coupled
 /// (`SELECT DISTINCT` requires each `ORDER BY` expression to be in the select
 /// list, and `DISTINCT ON` keys must match the leading `ORDER BY`).
-fn bind_select(
-    catalog: &dyn CatalogManager,
+#[allow(clippy::too_many_arguments)]
+fn bind_select<'a>(
+    catalog: &'a dyn CatalogManager,
     select: &Select,
     order_by: &[OrderByItem],
     declared: &[Option<PgType>],
     ctes: &CteScope,
     expected: Option<&[DataType]>,
+    outer: &[OuterLink<'a>],
+    pending: &mut Vec<PendingCorrelation>,
 ) -> Result<(BoundSelect, Vec<BoundOrderByItem>)> {
-    let mut ctx = BindContext::new(catalog, declared);
+    let mut ctx = BindContext::with_outer(catalog, declared, outer.to_vec());
     ctx.cte_scope = ctes.clone();
     // A FROM-less SELECT (`SELECT 1`) has no source relation: no bindings are
     // registered, so any column reference correctly fails to resolve.
@@ -500,6 +593,11 @@ fn bind_select(
     )?;
 
     let output_schema = select_output_schema(&ctx, &columns);
+
+    // Hand the correlations recorded against this scope's subquery boundary to
+    // the caller; `bind_subquery` translates them into
+    // `BoundQuery::correlations` when the boundary unwinds.
+    pending.append(&mut ctx.correlations);
 
     Ok((
         BoundSelect {
@@ -710,14 +808,18 @@ fn bind_view_from_schema(
     alias: Option<String>,
 ) -> Result<BoundFrom> {
     let query_ast = parse_view_query(&view)?;
-    // A stored view definition binds in its own scope. Caller CTEs must not
-    // change what base relations the persisted SQL resolves to.
+    // A stored view definition binds in its own isolated scope. Caller CTEs
+    // must not change what base relations the persisted SQL resolves to, and
+    // it sees no enclosing bindings (an outer reference in a persisted view
+    // definition is impossible: CREATE VIEW binds with no outer scope).
     let query = bind_query(
         catalog,
         &query_ast,
         &ctx.declared_params,
         &CteScope::default(),
         None,
+        &[],
+        &mut Vec::new(),
     )?;
     let output_len = query.output_schema().len();
     if output_len != view.columns.len() {
@@ -848,13 +950,20 @@ fn bind_derived_table(
     column_aliases: &[String],
 ) -> Result<BoundFrom> {
     // The derived subquery is bound in its own binding scope but still sees the
-    // enclosing query's CTEs.
+    // enclosing query's CTEs. It does not see the enclosing query's own FROM
+    // bindings (non-LATERAL semantics), and outer references past the derived
+    // boundary are rejected rather than recorded — the enclosing chain is
+    // threaded reject-marked purely so the error names the construct
+    // (`docs/specs/subqueries.md` §1.1).
+    let derived_outer = rejected_links(&ctx.outer, "a derived table");
     let query = bind_query(
         catalog,
         subquery,
         &ctx.declared_params,
         &ctx.cte_scope,
         None,
+        &derived_outer,
+        &mut Vec::new(),
     )?;
     let columns = derive_alias_columns(&query.output_columns(), column_aliases, || {
         format!("table \"{alias}\"")
@@ -1141,6 +1250,23 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
     if matches!(expr, BoundExpr::AggregateCall { .. }) {
         return Ok(());
     }
+    // A subquery's body is its own scope; only its correlation entries (and
+    // `InSubquery`'s left operand) are this query's expressions, so they —
+    // not the whole subquery — must obey the grouped rule.
+    match expr {
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            return validate_grouped_correlations(query, group_by);
+        }
+        BoundExpr::InSubquery {
+            expr: operand,
+            query,
+            ..
+        } => {
+            validate_grouped_expr(operand, group_by)?;
+            return validate_grouped_correlations(query, group_by);
+        }
+        _ => {}
+    }
     if !contains_aggregate(expr) {
         if !references_input(expr) || group_by.iter().any(|group| group == expr) {
             return Ok(());
@@ -1211,19 +1337,30 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             }
             Ok(())
         }
-        // `InSubquery`'s left operand is an outer-scope expression; the subquery
-        // body is its own (uncorrelated) scope and is treated as a constant.
-        BoundExpr::InSubquery { expr, .. } => validate_grouped_expr(expr, group_by),
+        // Subquery variants returned early above; the remaining leaves cannot
+        // contain an aggregate, so this arm is unreachable in practice.
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::Exists { .. } => validate_grouped_expr(expr, group_by),
+        | BoundExpr::Exists { .. }
+        | BoundExpr::InSubquery { .. } => Ok(()),
         BoundExpr::AggregateCall { .. } => Ok(()),
     }
+}
+
+/// Validate a correlated subquery's correlation entries against the grouped
+/// rule: each `outer` expression is evaluated against this query's rows, so
+/// in an aggregate query it must be grouped (or reference no input).
+fn validate_grouped_correlations(query: &BoundQuery, group_by: &[BoundExpr]) -> Result<()> {
+    for correlation in &query.correlations {
+        validate_grouped_expr(&correlation.outer, group_by)?;
+    }
+    Ok(())
 }
 
 fn references_input(expr: &BoundExpr) -> bool {
@@ -1262,17 +1399,30 @@ fn references_input(expr: &BoundExpr) -> bool {
                     .any(|(when, then)| references_input(when) || references_input(then))
                 || else_clause.as_deref().is_some_and(references_input)
         }
-        // The left operand of `IN (subquery)` is an outer-scope expression; the
-        // subquery body itself is uncorrelated and never references outer input.
-        BoundExpr::InSubquery { expr, .. } => references_input(expr),
+        // A subquery references this scope's input only through its correlation
+        // entries (`OuterRef`s inside the body point here via them); the body
+        // itself is a separate scope. An `OuterRef` at THIS level references
+        // the next scope out, not this one's input.
+        BoundExpr::InSubquery { expr, query, .. } => {
+            references_input(expr) || correlations_reference_input(query)
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            correlations_reference_input(query)
+        }
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
-        | BoundExpr::Currval { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::Exists { .. } => false,
+        | BoundExpr::Currval { .. } => false,
     }
+}
+
+fn correlations_reference_input(query: &BoundQuery) -> bool {
+    query
+        .correlations
+        .iter()
+        .any(|correlation| references_input(&correlation.outer))
 }
 
 fn resolve_binding<'a>(ctx: &'a BindContext, qualifier: &str) -> Result<&'a Binding> {

@@ -121,6 +121,12 @@ fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> R
         | BoundExpr::InSubquery { .. } => Err(DbError::internal(
             "subquery expression reached scalar evaluation without being resolved",
         )),
+        // A correlated reference is substituted to a literal before its
+        // subquery body executes (`docs/specs/subqueries.md` §5.2); reaching
+        // here is a routing bug.
+        BoundExpr::OuterRef { .. } => Err(DbError::internal(
+            "correlated outer reference reached scalar evaluation without being substituted",
+        )),
     }
 }
 

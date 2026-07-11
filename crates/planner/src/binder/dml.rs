@@ -336,7 +336,15 @@ fn bind_insert_query(
 ) -> Result<BoundInsertSource> {
     // The INSERT source is a top-level query; it carries its own `WITH` (if any),
     // has no enclosing CTE scope, and gets no external `expected` types.
-    let query = bind_query(catalog, subquery, declared, &CteScope::default(), None)?;
+    let query = bind_query(
+        catalog,
+        subquery,
+        declared,
+        &CteScope::default(),
+        None,
+        &[],
+        &mut Vec::new(),
+    )?;
     let source_columns = query.output_columns();
     if source_columns.len() != columns.len() {
         return Err(plan_error(

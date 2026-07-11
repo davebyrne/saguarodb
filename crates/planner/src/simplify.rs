@@ -521,6 +521,7 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }

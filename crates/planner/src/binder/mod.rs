@@ -9,7 +9,7 @@ use parser::{Expr, FromItem, FunctionArg, Query, QueryBody, SelectItem, Statemen
 
 use crate::{
     BoundDistinct, BoundExpr, BoundFrom, BoundOrderByItem, BoundQuery, BoundQueryBody, BoundSelect,
-    BoundStatement, BoundValues,
+    BoundStatement, BoundValues, CorrelatedColumn,
 };
 
 mod dml;
@@ -61,9 +61,31 @@ impl CteScope {
     }
 }
 
+/// One enclosing scope visible from a subquery body, innermost first in a
+/// chain. `reject` names the construct when a reference resolving to this
+/// scope is rejected instead of recorded (`docs/specs/subqueries.md` §1.1):
+/// the chain is still walked so the error names the construct rather than
+/// claiming the column does not exist. The flag survives flattening into the
+/// chains of deeper subqueries.
+#[derive(Clone, Copy)]
+struct OuterLink<'a> {
+    ctx: &'a BindContext<'a>,
+    reject: Option<&'static str>,
+}
+
+/// A correlated reference recorded while binding a subquery body, tagged with
+/// the scope distance at which the name resolved (1 = the immediately
+/// enclosing scope). When the subquery boundary unwinds, entries with
+/// `depth > 1` are re-interned into the parent's accumulator and their
+/// `outer` becomes an `OuterRef` into the parent's list
+/// (`docs/specs/subqueries.md` §4.2).
+struct PendingCorrelation {
+    depth: usize,
+    column: CorrelatedColumn,
+}
+
 struct BindContext<'a> {
-    /// The catalog, carried so expression binding can resolve a subquery's tables
-    /// (a subquery is bound in its own fresh scope — uncorrelated semantics).
+    /// The catalog, carried so expression binding can resolve a subquery's tables.
     catalog: &'a dyn CatalogManager,
     bindings: Vec<Binding>,
     next_binding: BindingId,
@@ -76,10 +98,27 @@ struct BindContext<'a> {
     /// The CTEs (`WITH`) in scope for `FROM` resolution. Empty unless the query or
     /// an enclosing query has a `WITH` clause.
     cte_scope: CteScope,
+    /// The enclosing scopes a subquery body may reference, innermost first.
+    /// Empty at the top level and for deliberately isolated scopes (CTE and
+    /// view bodies). `docs/specs/subqueries.md` §4.1.
+    outer: Vec<OuterLink<'a>>,
+    /// The correlated references recorded against this scope's subquery
+    /// boundary, in `OuterRef` slot order. Drained into
+    /// `BoundQuery::correlations` when the boundary unwinds. Always empty for
+    /// a scope with no `outer` chain.
+    correlations: Vec<PendingCorrelation>,
 }
 
 impl<'a> BindContext<'a> {
     fn new(catalog: &'a dyn CatalogManager, declared_params: &[Option<PgType>]) -> Self {
+        Self::with_outer(catalog, declared_params, Vec::new())
+    }
+
+    fn with_outer(
+        catalog: &'a dyn CatalogManager,
+        declared_params: &[Option<PgType>],
+        outer: Vec<OuterLink<'a>>,
+    ) -> Self {
         Self {
             catalog,
             bindings: Vec::new(),
@@ -87,7 +126,23 @@ impl<'a> BindContext<'a> {
             next_slot: 0,
             declared_params: declared_params.to_vec(),
             cte_scope: CteScope::default(),
+            outer,
+            correlations: Vec::new(),
         }
+    }
+
+    /// Record a correlated reference resolved at `depth`, re-using the slot of
+    /// an identical existing entry. Returns the `OuterRef` slot.
+    fn intern_correlation(&mut self, depth: usize, column: CorrelatedColumn) -> usize {
+        if let Some(slot) = self
+            .correlations
+            .iter()
+            .position(|pending| pending.depth == depth && pending.column == column)
+        {
+            return slot;
+        }
+        self.correlations.push(PendingCorrelation { depth, column });
+        self.correlations.len() - 1
     }
 
     fn declared_param(&self, index: usize) -> Option<DataType> {
@@ -302,7 +357,15 @@ fn bind_inner(
                     "CREATE VIEW does not support sequence functions",
                 ));
             }
-            let bound_query = bind_query(catalog, query, declared, &CteScope::default(), None)?;
+            let bound_query = bind_query(
+                catalog,
+                query,
+                declared,
+                &CteScope::default(),
+                None,
+                &[],
+                &mut Vec::new(),
+            )?;
             validate_create_view_columns(columns, &bound_query)?;
             let dependencies = collect_view_dependencies(catalog, declared, query, &bound_query)?;
             Ok(BoundStatement::CreateView {
@@ -333,8 +396,16 @@ fn bind_inner(
             returning.as_deref(),
             declared,
         ),
-        Statement::Query(query) => bind_query(catalog, query, declared, &CteScope::default(), None)
-            .map(BoundStatement::Query),
+        Statement::Query(query) => bind_query(
+            catalog,
+            query,
+            declared,
+            &CteScope::default(),
+            None,
+            &[],
+            &mut Vec::new(),
+        )
+        .map(BoundStatement::Query),
         Statement::Update {
             table,
             assignments,
@@ -529,7 +600,8 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::Exists { .. } => false,
+        | BoundExpr::Exists { .. }
+        | BoundExpr::OuterRef { .. } => false,
     }
 }
 
@@ -1057,7 +1129,15 @@ fn collect_bound_but_unretained_cte_dependencies(
 ) -> Result<()> {
     let mut scope = enclosing.clone();
     for cte in &query.with {
-        let bound = bind_query(catalog, &cte.query, declared, &scope, None)?;
+        let bound = bind_query(
+            catalog,
+            &cte.query,
+            declared,
+            &scope,
+            None,
+            &[],
+            &mut Vec::new(),
+        )?;
         collect_query_dependencies(&cte.query, &bound, builder);
         collect_bound_but_unretained_cte_dependencies(
             catalog, declared, &scope, &cte.query, builder,
@@ -1397,6 +1477,7 @@ fn collect_expr_dependencies(
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::AggregateCall { arg: None, .. } => {}

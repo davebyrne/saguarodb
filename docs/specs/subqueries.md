@@ -36,10 +36,12 @@ This feature adds:
 
 - Correlated subqueries in join `ON` conditions and in `ORDER BY` expressions
   (rejected with `FeatureNotSupported` until a later milestone).
-- Outer references from inside a **set-operation arm** or a **derived table's
-  body** within a subquery (rejected with `FeatureNotSupported`; the outer
-  scope chain is still threaded there so the error names the construct instead
-  of claiming the column does not exist). `LATERAL` (S4) makes *sibling*
+- Outer references from inside a **set-operation arm**, a **`VALUES` list**,
+  or a **derived table's body** within a subquery (rejected with
+  `FeatureNotSupported`; the outer scope chain is still threaded there so the
+  error names the construct instead of claiming the column does not exist —
+  `VALUES` entries bind in per-entry throwaway contexts, so there is no single
+  accumulator for their `OuterRef` slots). `LATERAL` (S4) makes *sibling*
   references expressible via the `LATERAL` keyword; cross-level outer
   references from a non-`LATERAL` derived-table body — legal in PostgreSQL —
   remain rejected with `FeatureNotSupported` until explicitly lifted, a
@@ -80,6 +82,17 @@ deferral:
   inner join: a target row with no join match is not modified. A target row
   matched by multiple source rows is modified **once**, using the first match
   in scan order; subsequent matches for the same target row are skipped.
+- **Aggregate attribution.** PostgreSQL attributes an aggregate whose
+  arguments reference only outer-level columns to the outer query. SaguaroDB
+  does not implement outer-level aggregation and rejects the form
+  (`FeatureNotSupported`) rather than silently evaluating it at the inner
+  level; a mixed inner/outer argument belongs to the inner query in both
+  systems and is allowed.
+- **Grouped rule for correlations.** A correlation entry's outer column is
+  evaluated against the enclosing query's rows, so in an aggregate outer
+  query it must obey the same grouped-expression rule as any other
+  expression: a correlated reference to an ungrouped outer column in
+  `HAVING`/the select list is rejected.
 
 ## 3. Architecture overview
 
@@ -333,8 +346,10 @@ the existing plan-tree text format.
 |---|---|
 | Correlated scalar subquery returns >1 row for some outer row | `21000` `CardinalityViolation` |
 | Correlated subquery in a not-yet-supported position (join `ON`, `ORDER BY`) | `0A000` `FeatureNotSupported` |
-| Outer reference from a set-operation arm or a derived-table body (§1.1) | `0A000` `FeatureNotSupported` |
+| Outer reference from a set-operation arm, `VALUES` list, or derived-table body (§1.1) | `0A000` `FeatureNotSupported` |
 | Correlated subquery before milestone S2 (staging guard, §4.4) | `0A000` `FeatureNotSupported` |
+| Aggregate whose argument references only outer-level columns (§2) | `0A000` `FeatureNotSupported` |
+| Correlated reference to an ungrouped column of an aggregate outer query (§2) | `42804` `DatatypeMismatch` |
 | Correlation into a CTE or view body | normal name-resolution error (`42703`) |
 
 ## 11. Testing

@@ -1,10 +1,12 @@
-use common::{DataType, PgType, Result, SqlState, Value};
+use common::{ColumnDef, DataType, PgType, Result, SqlState, Value};
 use parser::{Expr, FunctionArg, Query};
 
-use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, UnaryOp};
+use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, CorrelatedColumn, UnaryOp};
 
 use super::query::bind_query;
-use super::{BindContext, input_ref, plan_error, reject_aggregate, require_type};
+use super::{
+    BindContext, Binding, OuterLink, input_ref, plan_error, reject_aggregate, require_type,
+};
 
 pub(super) fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
     let bound = bind_expr(ctx, expr, Some(DataType::Boolean))?;
@@ -104,21 +106,57 @@ fn bind_expr_with_pg_type(
     }
 }
 
-/// Bind a subquery's inner query in its own fresh binding scope (uncorrelated
-/// semantics: it does not see the outer query's columns), reusing the outer
-/// parameter declarations so `$n` placeholders inside the subquery resolve the
-/// same way.
-fn bind_subquery(ctx: &BindContext, subquery: &Query) -> Result<BoundQuery> {
+/// Bind a subquery's inner query in a child scope that may reference the
+/// enclosing scopes (correlation), reusing the outer parameter declarations so
+/// `$n` placeholders inside the subquery resolve the same way. Correlated
+/// references recorded during the body's bind are translated into the
+/// returned query's `correlations` list: entries that resolved past the
+/// immediately enclosing scope are re-interned into `ctx`'s own accumulator
+/// and chained through an `OuterRef` (`docs/specs/subqueries.md` §4.2).
+fn bind_subquery(ctx: &mut BindContext, subquery: &Query) -> Result<BoundQuery> {
     // A subquery is bound in its own binding scope but still sees the enclosing
     // query's CTEs. A subquery result has no external type context, so no
     // `expected` types are supplied.
-    bind_query(
-        ctx.catalog,
-        subquery,
-        &ctx.declared_params,
-        &ctx.cte_scope,
-        None,
-    )
+    let mut pending = Vec::new();
+    let mut query = {
+        let mut chain = Vec::with_capacity(1 + ctx.outer.len());
+        chain.push(OuterLink { ctx, reject: None });
+        chain.extend(ctx.outer.iter().copied());
+        bind_query(
+            ctx.catalog,
+            subquery,
+            &ctx.declared_params,
+            &ctx.cte_scope,
+            None,
+            &chain,
+            &mut pending,
+        )?
+    };
+    query.correlations = pending
+        .into_iter()
+        .map(|entry| {
+            if entry.depth == 1 {
+                entry.column
+            } else {
+                // Resolved past the immediate parent: intern one level up and
+                // chain. `bind_column_ref` already rejected any reference that
+                // crossed a reject-marked link, so this intern is always legal.
+                let data_type = entry.column.data_type.clone();
+                let nullable = entry.column.nullable;
+                let slot = ctx.intern_correlation(entry.depth - 1, entry.column);
+                CorrelatedColumn {
+                    outer: BoundExpr::OuterRef {
+                        slot,
+                        data_type: data_type.clone(),
+                        nullable,
+                    },
+                    data_type,
+                    nullable,
+                }
+            }
+        })
+        .collect();
+    Ok(query)
 }
 
 /// Require that a subquery used where a single value is expected (a scalar
@@ -791,6 +829,7 @@ fn bind_aggregate(
         [FunctionArg::Expr(expr)] => {
             let arg = bind_expr(ctx, expr, None)?;
             reject_aggregate(&arg)?;
+            reject_outer_only_aggregate_arg(&arg)?;
             Some(Box::new(arg))
         }
         _ => {
@@ -886,6 +925,59 @@ fn bind_aggregate(
         data_type,
         nullable,
     })
+}
+
+/// PostgreSQL attributes an aggregate whose arguments reference ONLY
+/// outer-level columns to the outer query, not the subquery it appears in.
+/// SaguaroDB does not implement outer-level aggregation, and evaluating such
+/// an aggregate at the inner level would silently return a different result
+/// (e.g. `sum(t.x)` over the inner row count instead of the outer group), so
+/// the form is rejected. A mixed inner/outer argument belongs to the inner
+/// query in PostgreSQL too and is allowed.
+fn reject_outer_only_aggregate_arg(arg: &BoundExpr) -> Result<()> {
+    let mut refs_outer = false;
+    let mut refs_current = false;
+    scope_level_refs(arg, &mut refs_outer, &mut refs_current);
+    if refs_outer && !refs_current {
+        return Err(plan_error(
+            SqlState::FeatureNotSupported,
+            "aggregates over only outer-level columns are not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// Scan an expression for references at THIS scope level: `OuterRef`s (and,
+/// through a nested subquery's correlation entries, the outer columns it
+/// captures) versus this scope's own `InputRef`/`LocalRef`s. Subquery bodies
+/// are separate scopes and are not entered — only their correlation entries
+/// speak in this scope's terms.
+fn scope_level_refs(expr: &BoundExpr, refs_outer: &mut bool, refs_current: &mut bool) {
+    match expr {
+        BoundExpr::OuterRef { .. } => *refs_outer = true,
+        BoundExpr::InputRef { .. } | BoundExpr::LocalRef { .. } => *refs_current = true,
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            for correlation in &query.correlations {
+                scope_level_refs(&correlation.outer, refs_outer, refs_current);
+            }
+        }
+        BoundExpr::InSubquery {
+            expr: operand,
+            query,
+            ..
+        } => {
+            scope_level_refs(operand, refs_outer, refs_current);
+            for correlation in &query.correlations {
+                scope_level_refs(&correlation.outer, refs_outer, refs_current);
+            }
+        }
+        _ => {
+            let _ = crate::params::for_each_child(expr, &mut |child| {
+                scope_level_refs(child, refs_outer, refs_current);
+                Ok(())
+            });
+        }
+    }
 }
 
 fn bind_scalar_function(
@@ -1218,9 +1310,15 @@ fn update_case_type(
     }
 }
 
-fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
+/// The bindings of one scope that match a (possibly qualified) column
+/// reference. Shared by same-scope resolution and the outer-scope walk.
+fn scope_matches<'c>(
+    bindings: &'c [Binding],
+    table: Option<&str>,
+    column: &str,
+) -> Vec<(&'c Binding, &'c ColumnDef)> {
     let mut matches = Vec::new();
-    for binding in &ctx.bindings {
+    for binding in bindings {
         // A `qualified_only` binding (the `excluded` pseudo-table) participates
         // only when the reference is explicitly qualified with its name.
         if table.is_none() && binding.qualified_only {
@@ -1238,6 +1336,11 @@ fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Resu
             }
         }
     }
+    matches
+}
+
+fn bind_column_ref(ctx: &mut BindContext, table: Option<&str>, column: &str) -> Result<BoundExpr> {
+    let matches = scope_matches(&ctx.bindings, table, column);
 
     match matches.as_slice() {
         [(binding, column)] => Ok(input_ref(binding, column)),
@@ -1251,15 +1354,73 @@ fn bind_column_ref(ctx: &BindContext, table: Option<&str>, column: &str) -> Resu
                     ))
                 })
         }
-        [] => Err(plan_error(
-            SqlState::UndefinedColumn,
-            format!("column {column} does not exist"),
-        )),
+        [] => bind_outer_column_ref(ctx, table, column),
         _ => Err(plan_error(
             SqlState::UndefinedColumn,
             format!("column {column} is ambiguous"),
         )),
     }
+}
+
+/// Resolve a column reference against the enclosing scopes, innermost first
+/// (`docs/specs/subqueries.md` §4). A hit on a reject-marked link is
+/// `FeatureNotSupported`; a hit on a recordable link interns a correlation at
+/// that depth and binds as `OuterRef`. Resolution stops at the first scope
+/// with any match (an inner binding shadows an outer one); ambiguity within
+/// that one scope is still an error.
+fn bind_outer_column_ref(
+    ctx: &mut BindContext,
+    table: Option<&str>,
+    column: &str,
+) -> Result<BoundExpr> {
+    let mut resolved = None;
+    for (index, link) in ctx.outer.iter().enumerate() {
+        let matches = scope_matches(&link.ctx.bindings, table, column);
+        match matches.as_slice() {
+            [] => continue,
+            [(binding, column_def)] => {
+                if let Some(construct) = link.reject {
+                    return Err(plan_error(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "outer reference to column {column} from inside {construct} \
+                             is not supported"
+                        ),
+                    ));
+                }
+                resolved = Some((
+                    index + 1,
+                    CorrelatedColumn {
+                        outer: input_ref(binding, column_def),
+                        data_type: column_def.data_type.clone(),
+                        nullable: column_def.nullable,
+                    },
+                ));
+                break;
+            }
+            _ => {
+                return Err(plan_error(
+                    SqlState::UndefinedColumn,
+                    format!("column {column} is ambiguous"),
+                ));
+            }
+        }
+    }
+
+    let Some((depth, entry)) = resolved else {
+        return Err(plan_error(
+            SqlState::UndefinedColumn,
+            format!("column {column} does not exist"),
+        ));
+    };
+    let data_type = entry.data_type.clone();
+    let nullable = entry.nullable;
+    let slot = ctx.intern_correlation(depth, entry);
+    Ok(BoundExpr::OuterRef {
+        slot,
+        data_type,
+        nullable,
+    })
 }
 
 fn is_null_literal(expr: &Expr) -> bool {

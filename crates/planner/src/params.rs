@@ -537,6 +537,7 @@ pub(crate) fn for_each_child(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
@@ -619,6 +620,7 @@ fn for_each_child_mut(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }

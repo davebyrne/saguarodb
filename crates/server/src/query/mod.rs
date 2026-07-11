@@ -1703,7 +1703,8 @@ fn collect_expr_tables(expr: &BoundExpr, relations: &mut BoundRelationVersions) 
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::AggregateCall { arg: None, .. }
-        | BoundExpr::LocalRef { .. } => {}
+        | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. } => {}
         BoundExpr::BinaryOp { left, right, .. } => {
             collect_expr_tables(left, relations)?;
             collect_expr_tables(right, relations)?;

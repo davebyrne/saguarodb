@@ -73,6 +73,18 @@ pub enum BoundExpr {
         data_type: DataType,
         nullable: bool,
     },
+    /// A correlated reference to an enclosing query's column, from inside a
+    /// subquery body. `slot` indexes the correlation list of the *immediately
+    /// enclosing* subquery boundary (`BoundQuery::correlations`); the entry's
+    /// `outer` expression, evaluated against the enclosing row, supplies the
+    /// value. Substituted to a `Literal` per outer row before the subquery
+    /// body executes — an `OuterRef` never reaches expression evaluation.
+    /// `docs/specs/subqueries.md` §4.2.
+    OuterRef {
+        slot: usize,
+        data_type: DataType,
+        nullable: bool,
+    },
     IsNull {
         expr: Box<BoundExpr>,
         data_type: DataType,
@@ -241,6 +253,7 @@ impl BoundExpr {
             | BoundExpr::Setval { data_type, .. }
             | BoundExpr::AggregateCall { data_type, .. }
             | BoundExpr::LocalRef { data_type, .. }
+            | BoundExpr::OuterRef { data_type, .. }
             | BoundExpr::IsNull { data_type, .. }
             | BoundExpr::IsNotNull { data_type, .. }
             | BoundExpr::InList { data_type, .. }
@@ -269,6 +282,7 @@ impl BoundExpr {
             | BoundExpr::Setval { nullable, .. }
             | BoundExpr::AggregateCall { nullable, .. }
             | BoundExpr::LocalRef { nullable, .. }
+            | BoundExpr::OuterRef { nullable, .. }
             | BoundExpr::IsNull { nullable, .. }
             | BoundExpr::IsNotNull { nullable, .. }
             | BoundExpr::InList { nullable, .. }

@@ -18,6 +18,22 @@ pub struct BoundQuery {
     pub order_by: Vec<BoundOrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// The outer columns this query's body references, in `OuterRef` slot
+    /// order. Empty for an uncorrelated query (including every top-level
+    /// statement query); set only at a subquery boundary by the binder.
+    /// `docs/specs/subqueries.md` §4.2.
+    pub correlations: Vec<CorrelatedColumn>,
+}
+
+/// One entry of a correlated query's correlation list: the outer column an
+/// `OuterRef { slot }` inside the body refers to. `outer` is an expression in
+/// the *immediately enclosing* scope's terms — an `InputRef`, or an `OuterRef`
+/// when the correlation chains further out (`docs/specs/subqueries.md` §4.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorrelatedColumn {
+    pub outer: BoundExpr,
+    pub data_type: DataType,
+    pub nullable: bool,
 }
 
 /// The bound body of a query expression. Set operations attach here as a further

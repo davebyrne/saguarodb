@@ -11,7 +11,7 @@ pub use binder::{bind, bind_default_expr, bind_parameterized, bind_parameterized
 pub use bound::{
     BoundDistinct, BoundFrom, BoundInsertSource, BoundOnConflict, BoundQuery, BoundQueryBody,
     BoundReturning, BoundSelect, BoundSelectItem, BoundSetOp, BoundStatement, BoundValues,
-    OutputColumn,
+    CorrelatedColumn, OutputColumn,
 };
 pub use explain::format_explain;
 pub use expr::{
@@ -200,6 +200,7 @@ fn expr_mutates_sequences(expr: &BoundExpr) -> bool {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Currval { .. } => false,
     }
 }
@@ -3376,5 +3377,285 @@ mod tests {
         let catalog = catalog_with_users();
         let err = bind(&parse("copy users (id, id) from stdin").unwrap(), &catalog).unwrap_err();
         assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    // --- correlated subquery binding (docs/specs/subqueries.md, milestone S1) ---
+
+    fn bound_query_of(stmt: BoundStatement) -> BoundQuery {
+        match stmt {
+            BoundStatement::Query(query) => query,
+            other => panic!("expected a bound query, got {other:?}"),
+        }
+    }
+
+    fn select_of(query: &BoundQuery) -> &BoundSelect {
+        match &query.body {
+            BoundQueryBody::Select(select) => select,
+            other => panic!("expected a SELECT body, got {other:?}"),
+        }
+    }
+
+    /// The subquery carried by an `Exists` filter expression.
+    fn exists_query(filter: &BoundExpr) -> &BoundQuery {
+        match filter {
+            BoundExpr::Exists { query, .. } => query,
+            other => panic!("expected EXISTS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correlated_exists_records_depth_one_correlation() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .unwrap();
+        let query = bound_query_of(bind(&stmt, &catalog).unwrap());
+        assert!(query.correlations.is_empty());
+
+        let outer_select = select_of(&query);
+        let sub = exists_query(outer_select.filter.as_ref().unwrap());
+        assert_eq!(sub.correlations.len(), 1);
+        let entry = &sub.correlations[0];
+        assert_eq!(entry.data_type, DataType::Text);
+        assert!(entry.nullable);
+        // The entry's outer expression is users.name in the outer scope's terms.
+        assert!(
+            matches!(entry.outer, BoundExpr::InputRef { slot: 1, .. }),
+            "expected InputRef to users.name, got {:?}",
+            entry.outer
+        );
+        // The body's filter compares accounts.owner to OuterRef slot 0.
+        let body_filter = select_of(sub).filter.as_ref().unwrap();
+        let BoundExpr::BinaryOp { right, .. } = body_filter else {
+            panic!("expected comparison, got {body_filter:?}");
+        };
+        assert!(
+            matches!(**right, BoundExpr::OuterRef { slot: 0, .. }),
+            "expected OuterRef slot 0, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn inner_binding_shadows_outer_column() {
+        let catalog = catalog_with_users_and_accounts();
+        // `name` exists in the inner `users u` scope, so it binds there — not
+        // as a correlation to the outer users.
+        let stmt = parse(
+            "select id from users where exists \
+             (select 1 from users u where name = 'x')",
+        )
+        .unwrap();
+        let query = bound_query_of(bind(&stmt, &catalog).unwrap());
+        let sub = exists_query(select_of(&query).filter.as_ref().unwrap());
+        assert!(sub.correlations.is_empty());
+        let body_filter = select_of(sub).filter.as_ref().unwrap();
+        let BoundExpr::BinaryOp { left, .. } = body_filter else {
+            panic!("expected comparison, got {body_filter:?}");
+        };
+        assert!(matches!(**left, BoundExpr::InputRef { .. }));
+    }
+
+    #[test]
+    fn repeated_outer_references_share_one_slot() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (select 1 from accounts where owner = users.name and owner <> users.name)",
+        )
+        .unwrap();
+        let query = bound_query_of(bind(&stmt, &catalog).unwrap());
+        let sub = exists_query(select_of(&query).filter.as_ref().unwrap());
+        assert_eq!(sub.correlations.len(), 1);
+    }
+
+    #[test]
+    fn depth_two_correlation_chains_through_middle_scope() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (select 1 from accounts where exists \
+              (select 1 from accounts a2 where a2.owner = users.name))",
+        )
+        .unwrap();
+        let query = bound_query_of(bind(&stmt, &catalog).unwrap());
+
+        // The middle subquery became correlated through re-interning: its own
+        // entry is the outer users.name.
+        let middle = exists_query(select_of(&query).filter.as_ref().unwrap());
+        assert_eq!(middle.correlations.len(), 1);
+        assert!(matches!(
+            middle.correlations[0].outer,
+            BoundExpr::InputRef { slot: 1, .. }
+        ));
+
+        // The innermost subquery's entry chains via OuterRef into the middle's
+        // correlation list.
+        let inner = exists_query(select_of(middle).filter.as_ref().unwrap());
+        assert_eq!(inner.correlations.len(), 1);
+        assert!(
+            matches!(
+                inner.correlations[0].outer,
+                BoundExpr::OuterRef { slot: 0, .. }
+            ),
+            "expected chained OuterRef, got {:?}",
+            inner.correlations[0].outer
+        );
+    }
+
+    #[test]
+    fn outer_reference_ambiguous_across_outer_bindings() {
+        let catalog = catalog_with_users_and_accounts();
+        // Both u1.name and u2.name match in the (single) outer scope.
+        let stmt = parse(
+            "select u1.id from users u1, users u2 where exists \
+             (select 1 from accounts where owner = name)",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+        assert!(err.message.contains("ambiguous"), "{}", err.message);
+    }
+
+    #[test]
+    fn set_op_arm_outer_reference_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (select owner from accounts where owner = users.name \
+              union select owner from accounts)",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("set-operation arm"), "{}", err.message);
+    }
+
+    #[test]
+    fn derived_table_outer_reference_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (select 1 from (select owner from accounts where accounts.owner = users.name) d)",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("derived table"), "{}", err.message);
+    }
+
+    #[test]
+    fn values_list_outer_reference_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt =
+            parse("select id from users where name in (values ('a'), (users.name))").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("VALUES list"), "{}", err.message);
+    }
+
+    #[test]
+    fn cte_body_outer_reference_fails_name_resolution() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select id from users where exists \
+             (with x as (select owner from accounts where accounts.owner = users.name) \
+              select 1 from x)",
+        )
+        .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedColumn);
+    }
+
+    #[test]
+    fn correlated_having_requires_grouped_outer_column() {
+        let catalog = catalog_with_users_and_accounts();
+        // Correlating on the grouped column is fine.
+        let grouped = parse(
+            "select name from users group by name having exists \
+             (select 1 from accounts where owner = users.name)",
+        )
+        .unwrap();
+        bind(&grouped, &catalog).unwrap();
+
+        // Correlating on an ungrouped column violates the grouped rule.
+        let ungrouped = parse(
+            "select name from users group by name having exists \
+             (select 1 from accounts where accounts.id = users.id)",
+        )
+        .unwrap();
+        let err = bind(&ungrouped, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
+    fn grouped_correlation_rewrites_to_post_aggregate_slot() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse(
+            "select name from users group by name having exists \
+             (select 1 from accounts where owner = users.name)",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        // The logical plan rewrites the correlation entry from InputRef
+        // (pre-aggregate) to LocalRef slot 0 (the first GROUP BY column of the
+        // post-aggregate row).
+        let plan = logical_plan(&bound).unwrap();
+        let having = find_having_predicate(&plan).expect("plan should contain the HAVING filter");
+        let BoundExpr::Exists { query, .. } = having else {
+            panic!("expected EXISTS in HAVING, got {having:?}");
+        };
+        assert!(
+            matches!(
+                query.correlations[0].outer,
+                BoundExpr::LocalRef { slot: 0, .. }
+            ),
+            "expected the correlation entry rewritten to LocalRef slot 0, got {:?}",
+            query.correlations[0].outer
+        );
+    }
+
+    /// The predicate of the first `Filter` above an `Aggregate` (the HAVING
+    /// filter) anywhere in the plan tree.
+    fn find_having_predicate(plan: &LogicalPlan) -> Option<&BoundExpr> {
+        match plan {
+            LogicalPlan::Filter { source, predicate } => {
+                if matches!(**source, LogicalPlan::Aggregate { .. }) {
+                    Some(predicate)
+                } else {
+                    find_having_predicate(source)
+                }
+            }
+            LogicalPlan::Projection { source, .. }
+            | LogicalPlan::Sort { source, .. }
+            | LogicalPlan::Limit { source, .. }
+            | LogicalPlan::Distinct { source, .. }
+            | LogicalPlan::Aggregate { source, .. } => find_having_predicate(source),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn aggregate_over_only_outer_columns_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select id from users where exists (select sum(users.id) from accounts)")
+            .unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(
+            err.message.contains("outer-level columns"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn uncorrelated_subquery_has_empty_correlations() {
+        let catalog = catalog_with_users_and_accounts();
+        let stmt = parse("select id from users where exists (select 1 from accounts)").unwrap();
+        let query = bound_query_of(bind(&stmt, &catalog).unwrap());
+        let sub = exists_query(select_of(&query).filter.as_ref().unwrap());
+        assert!(sub.correlations.is_empty());
     }
 }

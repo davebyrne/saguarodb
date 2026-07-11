@@ -15,8 +15,8 @@
 
 use common::{DataType, DbError, Result, Row, SqlState, Value};
 use planner::{
-    AggregateExpr, BoundExpr, BoundOrderByItem, BoundQuery, BoundStatement, PhysicalPlan,
-    logical_plan, physical_plan,
+    AggregateExpr, BoundExpr, BoundOnConflict, BoundOrderByItem, BoundQuery, BoundReturning,
+    BoundStatement, PhysicalPlan, logical_plan, physical_plan,
 };
 
 use crate::query::{ExecutionContext, build_executor, collect_all};
@@ -52,8 +52,8 @@ pub(crate) fn resolve_plan_subqueries(
             table: *table,
             columns: columns.clone(),
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
-            on_conflict: on_conflict.clone(),
-            returning: returning.clone(),
+            on_conflict: resolve_on_conflict(ctx, on_conflict)?,
+            returning: resolve_returning(ctx, returning)?,
             // Default and CHECK expressions cannot contain subqueries (rejected at
             // bind), so they are carried through this rewrite unchanged.
             default_exprs: default_exprs.clone(),
@@ -72,7 +72,7 @@ pub(crate) fn resolve_plan_subqueries(
                 .map(|(column, expr)| Ok((*column, resolve_expr(ctx, expr)?)))
                 .collect::<Result<Vec<_>>>()?,
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
-            returning: returning.clone(),
+            returning: resolve_returning(ctx, returning)?,
             // CHECK expressions cannot contain subqueries (rejected at bind).
             check_exprs: check_exprs.clone(),
         },
@@ -83,7 +83,7 @@ pub(crate) fn resolve_plan_subqueries(
         } => PhysicalPlan::Delete {
             table: *table,
             source: Box::new(resolve_plan_subqueries(ctx, source)?),
-            returning: returning.clone(),
+            returning: resolve_returning(ctx, returning)?,
         },
         PhysicalPlan::SeqScan {
             table,
@@ -235,6 +235,51 @@ fn resolve_opt(ctx: &ExecutionContext<'_>, expr: &Option<BoundExpr>) -> Result<O
         .transpose()
 }
 
+/// Resolve the subqueries in a `RETURNING` projection. RETURNING expressions
+/// are evaluated per affected row by the DML executor, so like every other
+/// expression position they must pass through the pre-pass (an uncorrelated
+/// subquery becomes a constant; a correlated one hits the staging guard).
+fn resolve_returning(
+    ctx: &ExecutionContext<'_>,
+    returning: &Option<BoundReturning>,
+) -> Result<Option<BoundReturning>> {
+    returning
+        .as_ref()
+        .map(|returning| {
+            Ok(BoundReturning {
+                exprs: resolve_vec(ctx, &returning.exprs)?,
+                output_schema: returning.output_schema.clone(),
+            })
+        })
+        .transpose()
+}
+
+/// Resolve the subqueries in `ON CONFLICT DO UPDATE` assignments and its
+/// `WHERE` filter (`DO NOTHING` carries no expressions).
+fn resolve_on_conflict(
+    ctx: &ExecutionContext<'_>,
+    on_conflict: &Option<BoundOnConflict>,
+) -> Result<Option<BoundOnConflict>> {
+    match on_conflict {
+        None => Ok(None),
+        Some(BoundOnConflict::DoNothing { target }) => Ok(Some(BoundOnConflict::DoNothing {
+            target: target.clone(),
+        })),
+        Some(BoundOnConflict::DoUpdate {
+            target,
+            assignments,
+            filter,
+        }) => Ok(Some(BoundOnConflict::DoUpdate {
+            target: target.clone(),
+            assignments: assignments
+                .iter()
+                .map(|(column, expr)| Ok((*column, resolve_expr(ctx, expr)?)))
+                .collect::<Result<Vec<_>>>()?,
+            filter: resolve_opt(ctx, filter)?,
+        })),
+    }
+}
+
 fn resolve_vec(ctx: &ExecutionContext<'_>, exprs: &[BoundExpr]) -> Result<Vec<BoundExpr>> {
     exprs.iter().map(|expr| resolve_expr(ctx, expr)).collect()
 }
@@ -251,17 +296,21 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
             query,
             data_type,
             nullable,
-        } => Ok(BoundExpr::Literal {
-            value: run_scalar_subquery(ctx, query)?,
-            data_type: data_type.clone(),
-            nullable: *nullable,
-        }),
+        } => {
+            reject_correlated(query)?;
+            Ok(BoundExpr::Literal {
+                value: run_scalar_subquery(ctx, query)?,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+            })
+        }
         BoundExpr::Exists {
             query,
             negated,
             data_type,
             nullable,
         } => {
+            reject_correlated(query)?;
             let exists = !materialize_subquery(ctx, query)?.is_empty();
             Ok(BoundExpr::Literal {
                 value: Value::Boolean(exists ^ *negated),
@@ -276,6 +325,7 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
             data_type,
             nullable,
         } => {
+            reject_correlated(query)?;
             let operand = resolve_boxed(ctx, operand)?;
             let column_type = subquery_column_type(query)?;
             let rows = materialize_subquery(ctx, query)?;
@@ -303,6 +353,12 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
         | BoundExpr::LocalRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. } => Ok(expr.clone()),
+        // An `OuterRef` lives only inside a correlated subquery's body, and a
+        // correlated subquery is rejected above before its body is planned;
+        // one at this level means the binder mis-attached a correlation.
+        BoundExpr::OuterRef { .. } => Err(DbError::internal(
+            "correlated outer reference outside any subquery body",
+        )),
         BoundExpr::BinaryOp {
             left,
             op,
@@ -469,6 +525,23 @@ fn resolve_expr(ctx: &ExecutionContext<'_>, expr: &BoundExpr) -> Result<BoundExp
             nullable: *nullable,
         }),
     }
+}
+
+/// The staging guard for correlated subqueries (`docs/specs/subqueries.md`
+/// §4.4): the binder records correlations, but per-outer-row execution (the
+/// `Apply` operator, milestone S2) does not exist yet, so a correlated
+/// subquery is rejected here rather than resolved to a wrong constant. The
+/// guard runs recursively — `materialize_subquery` re-enters this pre-pass for
+/// the inner plan — so a correlated subquery nested anywhere is caught at its
+/// boundary.
+fn reject_correlated(query: &BoundQuery) -> Result<()> {
+    if query.correlations.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::execute(
+        SqlState::FeatureNotSupported,
+        "correlated subqueries are not supported yet",
+    ))
 }
 
 /// Execute a scalar subquery: at most one row (else a `CardinalityViolation`),

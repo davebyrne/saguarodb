@@ -734,13 +734,16 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
                 collect_aggregates(else_clause, output);
             }
         }
-        // A subquery body is its own (uncorrelated) scope; only `InSubquery`'s
+        // A subquery body is its own aggregation scope; only `InSubquery`'s
         // left operand belongs to the outer query and may carry an aggregate.
+        // Correlation entries are bare column references (`InputRef`/`OuterRef`),
+        // never aggregates.
         BoundExpr::InSubquery { expr, .. } => collect_aggregates(expr, output),
         BoundExpr::Literal { .. }
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }
@@ -948,8 +951,10 @@ fn rewrite_aggregate_expr(
             pg_type: pg_type.clone(),
             nullable: *nullable,
         }),
-        // The subquery body is uncorrelated (its own scope), so it needs no
-        // grouped-expression rewrite; only `InSubquery`'s left operand does.
+        // A subquery body is its own scope and needs no grouped-expression
+        // rewrite, but its correlation entries are THIS query's expressions —
+        // evaluated against the post-aggregate row — and are rewritten like
+        // any other outer expression. `InSubquery`'s left operand too.
         BoundExpr::InSubquery {
             expr,
             query,
@@ -958,7 +963,27 @@ fn rewrite_aggregate_expr(
             nullable,
         } => Ok(BoundExpr::InSubquery {
             expr: Box::new(rewrite_aggregate_expr(expr, group_by, aggregates)?),
-            query: query.clone(),
+            query: Box::new(rewrite_query_correlations(query, group_by, aggregates)?),
+            negated: *negated,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::ScalarSubquery {
+            query,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::ScalarSubquery {
+            query: Box::new(rewrite_query_correlations(query, group_by, aggregates)?),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::Exists {
+            query,
+            negated,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::Exists {
+            query: Box::new(rewrite_query_correlations(query, group_by, aggregates)?),
             negated: *negated,
             data_type: data_type.clone(),
             nullable: *nullable,
@@ -967,14 +992,34 @@ fn rewrite_aggregate_expr(
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
-        | BoundExpr::Currval { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::Exists { .. } => Ok(expr.clone()),
+        | BoundExpr::Currval { .. } => Ok(expr.clone()),
         BoundExpr::AggregateCall { .. } => Err(DbError::internal(
             "nested aggregate survived binder validation",
         )),
     }
+}
+
+/// Rewrite a correlated subquery's correlation entries for an aggregate
+/// query: each `outer` expression is evaluated against the post-aggregate row
+/// and must be mapped to its `LocalRef` slot like any grouped expression. The
+/// body itself is untouched. Binder validation already rejected ungrouped
+/// correlation entries, so the rewrite always finds a mapping when one is
+/// required.
+fn rewrite_query_correlations(
+    query: &BoundQuery,
+    group_by: &[BoundExpr],
+    aggregates: &[AggregateExpr],
+) -> Result<BoundQuery> {
+    if query.correlations.is_empty() {
+        return Ok(query.clone());
+    }
+    let mut query = query.clone();
+    for correlation in &mut query.correlations {
+        correlation.outer = rewrite_aggregate_expr(&correlation.outer, group_by, aggregates)?;
+    }
+    Ok(query)
 }
 
 fn contains_aggregate(expr: &BoundExpr) -> bool {
@@ -1017,6 +1062,7 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::Parameter { .. }
         | BoundExpr::InputRef { .. }
         | BoundExpr::LocalRef { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::Nextval { .. }
         | BoundExpr::Currval { .. }
         | BoundExpr::ScalarSubquery { .. }

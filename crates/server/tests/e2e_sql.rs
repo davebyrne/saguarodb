@@ -3292,6 +3292,135 @@ async fn e2e_scalar_subquery_in_projection_and_where() {
 }
 
 #[tokio::test]
+async fn e2e_correlated_subquery_rejected_until_apply_lands() {
+    // Staging guard (docs/specs/subqueries.md section 4.4): the binder records
+    // correlations, but per-outer-row execution does not exist yet, so a
+    // correlated subquery must fail cleanly (0A000) instead of resolving to a
+    // wrong constant — while uncorrelated subqueries keep working.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada')")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into accounts (id, owner) values (10, 'Ada')")
+        .await
+        .unwrap();
+
+    // Correlated EXISTS in WHERE.
+    let err = server
+        .simple_query(
+            "select id from users where exists \
+             (select 1 from accounts where accounts.owner = users.name)",
+        )
+        .await
+        .err()
+        .expect("correlated EXISTS should be rejected");
+    assert!(
+        err.message.contains("0A000") && err.message.contains("correlated"),
+        "expected the correlated-subquery guard: {}",
+        err.message
+    );
+
+    // Correlated scalar subquery in the projection.
+    let err = server
+        .simple_query("select (select owner from accounts where accounts.id = users.id) from users")
+        .await
+        .err()
+        .expect("correlated scalar subquery should be rejected");
+    assert!(
+        err.message.contains("0A000") && err.message.contains("correlated"),
+        "expected the correlated-subquery guard: {}",
+        err.message
+    );
+
+    // A correlated subquery nested inside an UNCORRELATED one is caught at its
+    // own boundary when the outer body is materialized.
+    let err = server
+        .simple_query(
+            "select id from users where exists \
+             (select 1 from accounts a1 where exists \
+              (select 1 from accounts a2 where a2.owner = a1.owner))",
+        )
+        .await
+        .err()
+        .expect("nested correlated subquery should be rejected");
+    assert!(
+        err.message.contains("0A000") && err.message.contains("correlated"),
+        "expected the correlated-subquery guard: {}",
+        err.message
+    );
+
+    // DML positions hit the same guard: UPDATE SET/WHERE, DELETE WHERE,
+    // RETURNING, and ON CONFLICT DO UPDATE.
+    for sql in [
+        "update users set name = 'x' where exists \
+         (select 1 from accounts where accounts.owner = users.name)",
+        "update users set name = (select owner from accounts where accounts.id = users.id)",
+        "delete from users where exists \
+         (select 1 from accounts where accounts.owner = users.name)",
+        "insert into users (id, name) values (3, 'Eve') \
+         returning (select owner from accounts where accounts.id = users.id)",
+        "insert into users (id, name) values (1, 'Ada') on conflict (id) do update \
+         set name = (select owner from accounts where accounts.id = users.id)",
+    ] {
+        let err = server
+            .simple_query(sql)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("correlated subquery should be rejected: {sql}"));
+        assert!(
+            err.message.contains("0A000") && err.message.contains("correlated"),
+            "expected the correlated-subquery guard for {sql}: {}",
+            err.message
+        );
+    }
+
+    // Uncorrelated subqueries are untouched by the guard.
+    let rows = server
+        .simple_query(
+            "select id from users where exists (select 1 from accounts where owner = 'Ada')",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Uncorrelated subqueries in RETURNING and ON CONFLICT DO UPDATE resolve
+    // through the same pre-pass (once per statement) instead of erroring.
+    let rows = server
+        .simple_query(
+            "insert into users (id, name) values (4, 'Kay') \
+             returning id, (select max(id) from accounts)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("4".to_string()), Some("10".to_string())]]
+    );
+    let rows = server
+        .simple_query(
+            "insert into users (id, name) values (4, 'dup') on conflict (id) do update \
+             set name = (select owner from accounts where id = 10) \
+             returning name",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("Ada".to_string())]]);
+}
+
+#[tokio::test]
 async fn e2e_in_and_not_in_subquery_null_semantics() {
     let server = TestServer::start().await.unwrap();
     server
