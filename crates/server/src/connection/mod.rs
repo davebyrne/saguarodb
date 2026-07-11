@@ -46,11 +46,10 @@ struct CopyInSession {
     /// been sent. Further CopyData is discarded until CopyDone/CopyFail restores
     /// protocol synchronization and emits the sole ReadyForQuery.
     draining_after_cancel: bool,
-    /// Keeps the COPY counted as an in-flight query for its whole streaming
-    /// lifetime, so graceful shutdown's `wait_for_idle` accounts for it (the insert
-    /// task holds the shared writer guard, which the final checkpoint must drain).
-    /// Held until the task is awaited in `finish_copy_in` / dropped on disconnect.
-    _guard: InFlightQueryGuard,
+    /// Keeps a running COPY counted as an in-flight query, so graceful shutdown's
+    /// `wait_for_idle` accounts for its worker and transaction. Released when the
+    /// worker is awaited, including before canceled protocol-drain state is kept.
+    guard: Option<InFlightQueryGuard>,
 }
 
 /// Accept a connection, run optional SSL/GSS negotiation, then serve the
@@ -836,6 +835,22 @@ async fn wait_cancelable<T>(
                 cancel.check()?;
             }
         }
+    }
+}
+
+/// Write a terminal success response without allowing cancellation observed after
+/// an authoritative durable boundary to replace that success.
+async fn write_terminal_response(
+    cancel: &QueryCancel,
+    durable: bool,
+    response: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    if durable {
+        response.await
+    } else {
+        wait_cancelable(cancel, response)
+            .await
+            .and_then(|result| result)
     }
 }
 

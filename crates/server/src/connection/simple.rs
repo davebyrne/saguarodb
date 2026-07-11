@@ -14,6 +14,7 @@ use crate::shutdown::InFlightQueryGuard;
 use super::{
     Session, SqlCursor, TransactionState, apply_stream_consumer_cancel, command_complete_tag,
     encode_row, error_response, streamed_task_result, wait_cancelable, write_messages,
+    write_terminal_response,
 };
 
 impl Session {
@@ -224,12 +225,15 @@ impl Session {
 
         if let Some(message) = self.application_name_status_change() {
             if outcome.is_ok() {
-                wait_cancelable(
+                write_terminal_response(
                     io_cancel.as_ref(),
+                    matches!(
+                        outcome,
+                        Ok(StreamOutcome::Durable(_) | StreamOutcome::SessionReset(_))
+                    ),
                     write_messages(stream, codec, &[message]),
                 )
-                .await
-                .and_then(|result| result)?;
+                .await?;
             } else {
                 write_messages(stream, codec, &[message]).await?;
             }
@@ -274,24 +278,34 @@ impl Session {
                 self.close_sql_cursors();
                 drop(guard);
                 self.end_activity();
-                wait_cancelable(
+                write_terminal_response(
                     io_cancel.as_ref(),
+                    true,
                     write_execution_result(stream, codec, result, status),
                 )
-                .await
-                .and_then(|result| result)?
+                .await?
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
-            Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
+            Ok(StreamOutcome::Direct(result)) => {
                 drop(guard);
                 self.end_activity();
-                wait_cancelable(
+                write_terminal_response(
                     io_cancel.as_ref(),
+                    false,
                     write_execution_result(stream, codec, result, status),
                 )
-                .await
-                .and_then(|result| result)?
+                .await?
+            }
+            Ok(StreamOutcome::Durable(result)) => {
+                drop(guard);
+                self.end_activity();
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    true,
+                    write_execution_result(stream, codec, result, status),
+                )
+                .await?
             }
             Err(err) => {
                 drop(guard);

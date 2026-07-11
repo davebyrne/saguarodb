@@ -14,6 +14,7 @@ use super::{
     BoundPortal, Portal, Session, SuspendedPortal, TransactionState, apply_stream_consumer_cancel,
     command_complete_tag, encode_row, error_response, protocol_error, resolve_format,
     resolve_result_formats, streamed_task_result, wait_cancelable, write_messages,
+    write_terminal_response,
 };
 
 struct LimitedBoundExecute {
@@ -261,36 +262,53 @@ impl Session {
                 self.portals.clear();
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    wait_cancelable(
+                    write_terminal_response(
                         io_cancel.as_ref(),
+                        true,
                         write_messages(stream, codec, &[message]),
                     )
-                    .await
-                    .and_then(|result| result)?;
+                    .await?;
                 }
-                wait_cancelable(
+                write_terminal_response(
                     io_cancel.as_ref(),
+                    true,
                     write_portal_result(stream, codec, result, &result_formats),
                 )
                 .await
-                .and_then(|result| result)
             }
-            Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
+            Ok(StreamOutcome::Direct(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    wait_cancelable(
+                    write_terminal_response(
                         io_cancel.as_ref(),
+                        false,
                         write_messages(stream, codec, &[message]),
                     )
-                    .await
-                    .and_then(|result| result)?;
+                    .await?;
                 }
-                wait_cancelable(
+                write_terminal_response(
                     io_cancel.as_ref(),
+                    false,
                     write_portal_result(stream, codec, result, &result_formats),
                 )
                 .await
-                .and_then(|result| result)
+            }
+            Ok(StreamOutcome::Durable(result)) => {
+                self.end_activity();
+                if let Some(message) = self.application_name_status_change() {
+                    write_terminal_response(
+                        io_cancel.as_ref(),
+                        true,
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await?;
+                }
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    true,
+                    write_portal_result(stream, codec, result, &result_formats),
+                )
+                .await
             }
             Ok(StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. }) => {
                 self.failed = true;

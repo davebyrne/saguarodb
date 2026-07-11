@@ -70,6 +70,14 @@ async fn cancel_request_wakes_idle_copy_from_without_more_copy_data() {
     assert_eq!(err.code, SqlState::QueryCanceled);
     assert!(err.message.contains("user request"));
 
+    server
+        .app()
+        .components
+        .shutdown
+        .wait_for_idle(Duration::from_millis(100))
+        .await
+        .expect("canceled COPY drain state must not remain in flight");
+
     // ErrorResponse is immediate, but ReadyForQuery remains correctly deferred
     // until COPY's terminator restores framing synchronization.
     let completion = conn.finish_copy_from(&[]).await.unwrap();

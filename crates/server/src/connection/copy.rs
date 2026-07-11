@@ -9,7 +9,7 @@ use crate::shutdown::InFlightQueryGuard;
 
 use super::{
     CopyInSession, Session, TransactionState, error_response, protocol_error, wait_cancelable,
-    write_messages,
+    write_messages, write_terminal_response,
 };
 
 impl Session {
@@ -58,7 +58,7 @@ impl Session {
             task: Some(task),
             insert_failed: false,
             draining_after_cancel: false,
-            _guard: guard,
+            guard: Some(guard),
         });
         Ok(())
     }
@@ -152,22 +152,25 @@ impl Session {
         self.txn = txn;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
+        let success_is_durable = self.txn.is_none();
         self.end_activity();
 
         let response = match result {
-            Ok(count) => wait_cancelable(
-                self.cancel.as_ref(),
-                write_messages(
-                    stream,
-                    codec,
-                    &[
-                        ServerMessage::CommandComplete(format!("COPY {count}")),
-                        ServerMessage::ReadyForQuery(status),
-                    ],
-                ),
-            )
-            .await
-            .and_then(|result| result),
+            Ok(count) => {
+                write_terminal_response(
+                    self.cancel.as_ref(),
+                    success_is_durable,
+                    write_messages(
+                        stream,
+                        codec,
+                        &[
+                            ServerMessage::CommandComplete(format!("COPY {count}")),
+                            ServerMessage::ReadyForQuery(status),
+                        ],
+                    ),
+                )
+                .await
+            }
             Err(task_err) => {
                 // A client CopyFail (with no prior insert error) reports the client's
                 // message; otherwise the insert/row error.
@@ -222,10 +225,14 @@ impl Session {
         self.txn = txn;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         self.end_activity();
-        self.copy_in
+        let copy = self
+            .copy_in
             .as_mut()
-            .expect("COPY draining state remains installed")
-            .draining_after_cancel = true;
+            .expect("COPY draining state remains installed");
+        copy.draining_after_cancel = true;
+        // The worker and its transaction are gone. Keep only protocol drain state;
+        // canceled clients must not hold graceful shutdown open indefinitely.
+        drop(copy.guard.take());
         self.stop_statement_timer().await;
 
         let err = match self.cancel.check() {

@@ -8,7 +8,7 @@ use common::{
     CancelReason, ColumnInfo, DataType, ErrorKind, IsolationLevel, PgType, QueryCancel, Result,
     Row, SqlState, Value,
 };
-use protocol::{PostgresCodec, StatementKind};
+use protocol::{PostgresCodec, ServerMessage, StatementKind};
 
 use super::{
     Session, StreamOutcome, TransactionState, apply_stream_consumer_cancel, encode_row,
@@ -83,6 +83,30 @@ async fn wait_cancelable_checks_cancellation_when_future_is_already_ready() {
         .unwrap_err();
 
     assert_eq!(err.code, SqlState::QueryCanceled);
+}
+
+#[tokio::test]
+async fn durable_terminal_response_ignores_late_cancellation() {
+    let cancel = QueryCancel::new();
+    cancel.request(CancelReason::StatementTimeout);
+    let codec = PostgresCodec::new();
+    let (mut writer, mut reader) = tokio::io::duplex(128);
+
+    super::write_terminal_response(
+        &cancel,
+        true,
+        super::write_messages(
+            &mut writer,
+            &codec,
+            &[ServerMessage::CommandComplete("INSERT 0 1".to_string())],
+        ),
+    )
+    .await
+    .unwrap();
+
+    let mut tag = [0; 1];
+    reader.read_exact(&mut tag).await.unwrap();
+    assert_eq!(tag, [b'C']);
 }
 
 #[test]
