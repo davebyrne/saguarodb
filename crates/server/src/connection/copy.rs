@@ -186,7 +186,7 @@ impl Session {
                 ];
                 let response = write_messages(stream, codec, &messages);
                 if success_is_durable {
-                    write_terminal_response(response).await
+                    write_terminal_response(self.cancel.as_ref(), response).await
                 } else {
                     wait_cancelable_write(self.cancel.as_ref(), response)
                         .await

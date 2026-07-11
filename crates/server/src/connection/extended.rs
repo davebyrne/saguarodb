@@ -271,10 +271,17 @@ impl Session {
                 self.portals.clear();
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
+                    write_terminal_response(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await?;
                 }
-                write_terminal_response(write_portal_result(stream, codec, result, &result_formats))
-                    .await
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    write_portal_result(stream, codec, result, &result_formats),
+                )
+                .await
             }
             Ok(StreamOutcome::Direct(result)) => {
                 self.end_activity();
@@ -296,10 +303,17 @@ impl Session {
             Ok(StreamOutcome::Durable(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
+                    write_terminal_response(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await?;
                 }
-                write_terminal_response(write_portal_result(stream, codec, result, &result_formats))
-                    .await
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    write_portal_result(stream, codec, result, &result_formats),
+                )
+                .await
             }
             Ok(StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. }) => {
                 self.failed = true;

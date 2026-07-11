@@ -109,19 +109,43 @@ async fn cancelable_write_completes_a_ready_frame_when_cancellation_is_pending()
 #[tokio::test]
 async fn authoritative_terminal_response_writes_complete_frame() {
     let codec = PostgresCodec::new();
+    let cancel = QueryCancel::new();
     let (mut writer, mut reader) = tokio::io::duplex(128);
 
-    super::write_terminal_response(super::write_messages(
-        &mut writer,
-        &codec,
-        &[ServerMessage::CommandComplete("INSERT 0 1".to_string())],
-    ))
+    super::write_terminal_response(
+        &cancel,
+        super::write_messages(
+            &mut writer,
+            &codec,
+            &[ServerMessage::CommandComplete("INSERT 0 1".to_string())],
+        ),
+    )
     .await
     .unwrap();
 
     let mut tag = [0; 1];
     reader.read_exact(&mut tag).await.unwrap();
     assert_eq!(tag, [b'C']);
+}
+
+#[tokio::test]
+async fn authoritative_terminal_response_cancels_a_blocked_partial_write() {
+    let codec = PostgresCodec::new();
+    let cancel = QueryCancel::new();
+    let (mut writer, _reader) = tokio::io::duplex(1);
+    let messages = [ServerMessage::CommandComplete("INSERT 0 1".to_string())];
+    let response = super::write_terminal_response(
+        &cancel,
+        super::write_messages(&mut writer, &codec, &messages),
+    );
+    let request_cancel = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.request(CancelReason::StatementTimeout);
+    };
+
+    let (result, ()) = tokio::join!(response, request_cancel);
+
+    assert_eq!(result.unwrap_err().code, SqlState::QueryCanceled);
 }
 
 #[tokio::test]

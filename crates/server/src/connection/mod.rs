@@ -871,10 +871,16 @@ async fn wait_cancelable_write<T>(
     }
 }
 
-/// Write a terminal success response without allowing cancellation observed after
-/// an authoritative durable boundary to replace that success.
-async fn write_terminal_response(response: impl Future<Output = Result<()>>) -> Result<()> {
-    response.await
+/// Write an authoritative terminal success response. A completed frame wins a
+/// cancellation race, preserving the durable outcome; cancellation while the
+/// write remains pending is fatal because the socket may contain a partial frame.
+async fn write_terminal_response(
+    cancel: &QueryCancel,
+    response: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    wait_cancelable_write(cancel, response)
+        .await
+        .and_then(|result| result)
 }
 
 /// Reconcile cancellation observed by the async stream consumer with the

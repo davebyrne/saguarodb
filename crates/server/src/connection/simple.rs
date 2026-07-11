@@ -240,7 +240,11 @@ impl Session {
                     .await
                     .and_then(|result| result)?;
                 } else {
-                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
+                    write_terminal_response(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await?;
                 }
             } else {
                 write_messages(stream, codec, &[message]).await?;
@@ -290,8 +294,11 @@ impl Session {
                     drop(guard);
                 }
                 self.end_activity();
-                write_terminal_response(write_execution_result(stream, codec, result, status))
-                    .await?
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    write_execution_result(stream, codec, result, status),
+                )
+                .await?
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
@@ -312,8 +319,11 @@ impl Session {
                     drop(guard);
                 }
                 self.end_activity();
-                write_terminal_response(write_execution_result(stream, codec, result, status))
-                    .await?
+                write_terminal_response(
+                    io_cancel.as_ref(),
+                    write_execution_result(stream, codec, result, status),
+                )
+                .await?
             }
             Err(err) => {
                 if !transaction_holds_writer {
