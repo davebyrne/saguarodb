@@ -344,7 +344,7 @@ where
 
     loop {
         for message in std::mem::take(&mut batch) {
-            if session.statement_timer.is_expired() {
+            if session.statement_active && session.cancel.reason().is_some() {
                 session
                     .handle_idle_statement_timeout(&mut stream, &codec)
                     .await?;
@@ -460,7 +460,15 @@ impl Session {
 
     async fn start_statement_timer(&mut self) {
         let timeout = Duration::from_millis(self.effective_statement_timeout_ms());
-        self.statement_timer.arm(timeout, self.cancel.clone()).await;
+        if self.statement_active {
+            self.statement_timer
+                .rearm(timeout, self.cancel.clone())
+                .await;
+        } else {
+            self.statement_timer
+                .arm_new(timeout, self.cancel.clone())
+                .await;
+        }
         self.statement_active = true;
     }
 
@@ -583,6 +591,10 @@ impl Session {
             )
         {
             self.start_statement_timer().await;
+            if self.cancel.reason().is_some() {
+                self.handle_idle_statement_timeout(stream, codec).await?;
+                return Ok(ControlFlow::Continue(()));
+            }
         }
         match message {
             ClientMessage::Query(sql) if !self.failed => {
@@ -813,9 +825,13 @@ async fn wait_cancelable<T>(
 ) -> std::result::Result<T, DbError> {
     tokio::pin!(future);
     loop {
+        cancel.check()?;
         tokio::select! {
             biased;
-            output = &mut future => return Ok(output),
+            output = &mut future => {
+                cancel.check()?;
+                return Ok(output);
+            },
             _ = tokio::time::sleep(Duration::from_millis(5)) => {
                 cancel.check()?;
             }
@@ -824,9 +840,9 @@ async fn wait_cancelable<T>(
 }
 
 /// Reconcile cancellation observed by the async stream consumer with the
-/// blocking producer's authoritative result. Only an explicitly durable outcome
-/// remains successful; a direct read/session result has no commit boundary and
-/// must honor the timeout observed by the consumer. Streaming/COPY work was
+/// blocking producer's authoritative result. Only an explicitly durable or
+/// session-reset outcome remains successful; a direct read result has no completion
+/// boundary and must honor the timeout observed by the consumer. Streaming/COPY was
 /// interrupted before its terminal response, and explicit-transaction work can
 /// still be safely poisoned.
 fn apply_stream_consumer_cancel(
@@ -837,7 +853,10 @@ fn apply_stream_consumer_cancel(
     if outcome.is_err() {
         return;
     }
-    if txn.is_none() && matches!(outcome, Ok(StreamOutcome::Durable(_))) {
+    if matches!(
+        outcome,
+        Ok(StreamOutcome::Durable(_) | StreamOutcome::SessionReset(_))
+    ) {
         return;
     }
     if let Some(txn) = txn.as_mut() {

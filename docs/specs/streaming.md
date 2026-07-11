@@ -178,9 +178,9 @@ enum StreamOutcome {
     /// SELECT rows were pushed through the channel; carries the authoritative
     /// row count for the `SELECT n` command tag.
     Streamed { count: u64 },
-    /// Everything else — handled by the async side exactly as today.
+    /// A cancelable non-streamed read or session result.
     Direct(ExecutionResult),
-    /// Autocommit work that crossed its durable/irreversible boundary.
+    /// Autocommit or session work that crossed its durable/irreversible boundary.
     Durable(ExecutionResult),
     /// `DISCARD ALL`: write the result and clear connection-owned objects.
     SessionReset(ExecutionResult),
@@ -200,9 +200,10 @@ For a `Read` statement that is a plain SELECT, the read helpers build a
 channel-backed `RowSink` and call `execute_query_streamed`, returning
 `Streamed { count }`. EXPLAIN (also a `Read`) returns `Direct(Explanation)`; the
 sink is used only for the plain-SELECT sub-case. Successful autocommit writes,
-maintenance, and COMMIT return `Durable(result)` after their last safe
-cancellation boundary. Other non-read arms return `Direct(result)` (or
-`SessionReset(result)` for `DISCARD ALL`) and never touch the channel.
+maintenance, COMMIT, and session-state mutations return `Durable(result)` after
+their last safe cancellation/completion boundary. Other non-read arms return
+`Direct(result)`; completed `DISCARD ALL` returns `SessionReset(result)` and never
+touches the channel.
 
 ### 4.2 Sink threading
 

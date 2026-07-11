@@ -292,7 +292,7 @@ Checkpoint may run after successful writes according to configured thresholds. I
 
 ## Query Results
 
-A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`). The connection creates an `mpsc` channel and calls `execute_simple_streamed`, whose `spawn_blocking` producer owns the `PlanExecutor` and pushes a `StreamMessage::Start { columns }` then `StreamMessage::Rows` batches into it (via a `ChannelRowSink` implementing `executor::RowSink`); the async task drains the channel — emitting `RowDescription` from `Start` and `DataRow`s from each batch — concurrently while the producer runs, then finishes with `CommandComplete("SELECT n")` (n is the producer's authoritative row count, carried on `StreamOutcome::Streamed { count }`) and `ReadyForQuery`. The producer returns a `StreamOutcome`: `Streamed` for a SELECT, `Direct(ExecutionResult)` for ordinary non-streamed statements, or `SessionReset(ExecutionResult)` for `DISCARD ALL` so the connection clears prepared statements and portals through a typed signal. The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream and returns the transaction slot only when it finishes, so MVCC and transaction semantics are unchanged. A retrying `try_send` loop provides backpressure while polling the statement cancellation token; a dropped receiver (client gone) turns the next push into a graceful stop. The extended-protocol `Execute` streams identically through `execute_prepared_cancelable_streamed` / `execute_prepared_in_session_streamed`, differing only in that its `RowDescription` comes from `Describe` (so `Start` is consumed without emitting one) and its `ReadyForQuery` comes from `Sync` (see Connection Handling). Streaming alters neither protocol message encoding nor physical operator semantics; the materializing path (`execute_simple_with_session_sequences` and the `execute_sql` / `execute_prepared` convenience helpers, used by tests) shares the same executor drive.
+A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`). The connection creates an `mpsc` channel and calls `execute_simple_streamed`, whose `spawn_blocking` producer owns the `PlanExecutor` and pushes a `StreamMessage::Start { columns }` then `StreamMessage::Rows` batches into it (via a `ChannelRowSink` implementing `executor::RowSink`); the async task drains the channel — emitting `RowDescription` from `Start` and `DataRow`s from each batch — concurrently while the producer runs, then finishes with `CommandComplete("SELECT n")` (n is the producer's authoritative row count, carried on `StreamOutcome::Streamed { count }`) and `ReadyForQuery`. The producer returns a `StreamOutcome`: `Streamed` for a SELECT, `Direct(ExecutionResult)` for an ordinary cancelable non-streamed result, `Durable(ExecutionResult)` after an autocommit or completed session-state boundary, or `SessionReset(ExecutionResult)` for completed `DISCARD ALL` so the connection clears prepared statements and portals through a typed signal. The producer holds the snapshot's GC-horizon advertisement and any transaction guard for the whole stream and returns the transaction slot only when it finishes, so MVCC and transaction semantics are unchanged. A retrying `try_send` loop provides backpressure while polling the statement cancellation token; a dropped receiver (client gone) turns the next push into a graceful stop. The extended-protocol `Execute` streams identically through `execute_prepared_cancelable_streamed` / `execute_prepared_in_session_streamed`, differing only in that its `RowDescription` comes from `Describe` (so `Start` is consumed without emitting one) and its `ReadyForQuery` comes from `Sync` (see Connection Handling). Streaming alters neither protocol message encoding nor physical operator semantics; the materializing path (`execute_simple_with_session_sequences` and the `execute_sql` / `execute_prepared` convenience helpers, used by tests) shares the same executor drive.
 
 A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the auto-prune dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
 
@@ -525,9 +525,13 @@ SSL negotiation happens before startup. A client may lead with an `SSLRequest`. 
 Query cancellation uses a process-wide `CancelRegistry` on `ServerComponents` mapping a per-connection `BackendKey { process_id, secret_key }` to that connection's `QueryCancel` token plus an async protocol-loop wakeup. At startup the server allocates a key (a counter-based `process_id` and a random `secret_key`), registers the target, and sends `BackendKeyData` after the `ParameterStatus` messages and before `ReadyForQuery`. A `CancelRequest` arrives on its own connection (handled during negotiation, before startup): the server looks up the `BackendKey`, records `CancelReason::UserRequest` if the token has no earlier reason, wakes an idle protocol loop (notably COPY FROM waiting for input), and closes without any reply; an unknown or stale key is ignored. The wakeup is honored only while a statement lifecycle is active, so canceling an idle backend produces no spurious response. The connection deregisters its key on disconnect. See the cancellation-token plumbing under Connection Handling.
 
 Each session also owns a race-safe statement timer driven by the effective
-transaction/session `statement_timeout`. Arming first aborts and joins any prior
-timer task, then resets the shared `QueryCancel`, so an expired timer from an old
-statement cannot cancel later work on a reused connection. Expiry records
+transaction/session `statement_timeout`. Arming a genuinely new statement first
+aborts and joins any prior timer task, then resets the shared `QueryCancel`, so an
+expired timer from old idle work cannot cancel later work on a reused connection.
+Restarting the timer for another message in the same extended-query lifecycle
+aborts/joins the old task but does **not** reset cancellation: a timeout or
+`CancelRequest` racing Parse/Bind/Describe/Execute remains pending and enters
+skip-until-Sync instead of being erased. Expiry records
 `CancelReason::StatementTimeout`; the token's first reason wins if a concurrent
 `CancelRequest` races it. The simple-query timer starts when the `Query` message is
 handled and is disarmed only after the statement's terminal response (or retained
@@ -559,10 +563,15 @@ VACUUM is nontransactional and may durably commit a hidden-TOAST cleanup
 subtransaction, then observe cancellation before parent/hidden physical vacuum;
 that restart-safe partial maintenance is reported as `QueryCanceled`, and a later
 VACUUM resumes the remaining work. After joining a blocking producer, the connection
-therefore preserves only an explicit `StreamOutcome::Durable` if the async channel
-wait observed a late cancellation. `Direct`, `SessionReset`, interrupted
-stream/COPY, and still-open explicit-transaction outcomes remain cancelable at
-that boundary. Once an autocommit xid has been registered, every fallible snapshot
+therefore preserves an explicit `StreamOutcome::Durable` or completed
+`SessionReset` if the async channel wait observed a late cancellation. Session
+mutations check cancellation before changing state, then use that completed
+boundary so the protocol cannot report a canceled `SET`/`RESET`/`DISCARD ALL`
+whose effects remain applied. `Direct`, interrupted stream/COPY, and still-open
+explicit-transaction data outcomes remain cancelable at that boundary. Channel
+receive/write waits check cancellation both before selection and after their future
+becomes ready, so simultaneous channel closure cannot hide expiration. Once an
+autocommit xid has been registered, every fallible snapshot
 or execution-context setup path uses the normal pre-durable rollback so timeout
 cannot leave an `InProgress` xid pinning snapshots or GC.
 

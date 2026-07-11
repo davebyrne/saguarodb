@@ -1166,7 +1166,13 @@ impl QueryService {
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let session = self.with_catalog_introspection(session.clone());
         if let StatementClass::TransactionControl(kind) = prepared.class {
-            let durable = matches!(kind, TransactionControl::Commit) && slot.is_some();
+            if let Err(err) = session.cancel().check() {
+                return (mark_failed_on_error(slot), default_isolation, Err(err));
+            }
+            let had_txn = slot.is_some();
+            let durable = (matches!(kind, TransactionControl::Commit) && had_txn)
+                || (matches!(kind, TransactionControl::SetSessionCharacteristics(Some(_)))
+                    && !had_txn);
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,
@@ -1185,6 +1191,9 @@ impl QueryService {
         }
 
         if let StatementClass::SessionConfig = prepared.class {
+            if let Err(err) = session.cancel().check() {
+                return (mark_failed_on_error(slot), default_isolation, Err(err));
+            }
             let statement = match prepared.session_config.clone() {
                 Some(statement) => statement,
                 None => {
@@ -1198,6 +1207,12 @@ impl QueryService {
                 }
             };
             let resets_session_objects = matches!(statement, Statement::DiscardAll);
+            let mutates_session = matches!(
+                statement,
+                Statement::SetVariable { .. }
+                    | Statement::ResetVariable { .. }
+                    | Statement::DiscardAll
+            );
             let (slot, default_isolation, result) = self.handle_session_config(
                 statement,
                 slot,
@@ -1208,6 +1223,8 @@ impl QueryService {
             let result = result.map(|result| {
                 if resets_session_objects {
                     StreamOutcome::SessionReset(result)
+                } else if mutates_session {
+                    StreamOutcome::Durable(result)
                 } else {
                     StreamOutcome::Direct(result)
                 }

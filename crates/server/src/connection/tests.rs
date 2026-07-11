@@ -61,7 +61,7 @@ fn late_consumer_cancellation_preserves_only_explicitly_durable_results() {
         &mut session_reset,
         common::DbError::execute(SqlState::QueryCanceled, "discard timeout"),
     );
-    assert!(matches!(session_reset, Err(err) if err.code == SqlState::QueryCanceled));
+    assert!(matches!(session_reset, Ok(StreamOutcome::SessionReset(_))));
 
     let mut streamed = Ok(StreamOutcome::Streamed { count: 1 });
     apply_stream_consumer_cancel(
@@ -70,6 +70,18 @@ fn late_consumer_cancellation_preserves_only_explicitly_durable_results() {
         common::DbError::execute(SqlState::QueryCanceled, "stream timeout"),
     );
     assert!(matches!(streamed, Err(err) if err.code == SqlState::QueryCanceled));
+}
+
+#[tokio::test]
+async fn wait_cancelable_checks_cancellation_when_future_is_already_ready() {
+    let cancel = QueryCancel::new();
+    cancel.request(CancelReason::StatementTimeout);
+
+    let err = super::wait_cancelable(&cancel, async { None::<()> })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.code, SqlState::QueryCanceled);
 }
 
 #[test]

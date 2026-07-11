@@ -29,9 +29,25 @@ impl StatementTimer {
         }
     }
 
-    pub(super) async fn arm(&mut self, timeout: Duration, cancel: Arc<QueryCancel>) {
+    /// Arm a genuinely new statement, clearing cancellation left while idle.
+    pub(super) async fn arm_new(&mut self, timeout: Duration, cancel: Arc<QueryCancel>) {
         self.disarm().await;
         cancel.reset();
+        self.arm_current(timeout, cancel);
+    }
+
+    /// Restart the timer inside the same extended-query lifecycle. A cancellation
+    /// that raced the previous message must remain pending rather than being reset.
+    pub(super) async fn rearm(&mut self, timeout: Duration, cancel: Arc<QueryCancel>) {
+        self.disarm().await;
+        if cancel.reason().is_some() {
+            self.state_tx.send_replace(TimerState::Expired);
+            return;
+        }
+        self.arm_current(timeout, cancel);
+    }
+
+    fn arm_current(&mut self, timeout: Duration, cancel: Arc<QueryCancel>) {
         if timeout.is_zero() {
             return;
         }
@@ -53,6 +69,7 @@ impl StatementTimer {
         self.state_tx.send_replace(TimerState::Idle);
     }
 
+    #[cfg(test)]
     pub(super) fn is_expired(&self) -> bool {
         *self.state_tx.borrow() == TimerState::Expired
     }
@@ -83,8 +100,12 @@ mod tests {
         let cancel = Arc::new(QueryCancel::new());
         let mut timer = StatementTimer::new();
 
-        timer.arm(Duration::from_millis(10), cancel.clone()).await;
-        timer.arm(Duration::from_millis(100), cancel.clone()).await;
+        timer
+            .arm_new(Duration::from_millis(10), cancel.clone())
+            .await;
+        timer
+            .arm_new(Duration::from_millis(100), cancel.clone())
+            .await;
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(cancel.reason().is_none());
         assert!(!timer.is_expired());
@@ -99,10 +120,12 @@ mod tests {
         let cancel = Arc::new(QueryCancel::new());
         let mut timer = StatementTimer::new();
 
-        timer.arm(Duration::ZERO, cancel.clone()).await;
+        timer.arm_new(Duration::ZERO, cancel.clone()).await;
         assert!(cancel.reason().is_none());
 
-        timer.arm(Duration::from_millis(10), cancel.clone()).await;
+        timer
+            .arm_new(Duration::from_millis(10), cancel.clone())
+            .await;
         timer.disarm().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(cancel.reason().is_none());
@@ -113,7 +136,9 @@ mod tests {
     async fn subscriber_created_after_expiry_observes_current_state() {
         let cancel = Arc::new(QueryCancel::new());
         let mut timer = StatementTimer::new();
-        timer.arm(Duration::from_millis(1), cancel.clone()).await;
+        timer
+            .arm_new(Duration::from_millis(1), cancel.clone())
+            .await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while !timer.is_expired() {
                 tokio::task::yield_now().await;
@@ -125,5 +150,18 @@ mod tests {
         let receiver = timer.subscribe();
         assert!(StatementTimer::receiver_is_expired(&receiver));
         assert_eq!(cancel.reason(), Some(CancelReason::StatementTimeout));
+    }
+
+    #[tokio::test]
+    async fn rearm_preserves_cancellation_from_the_same_extended_cycle() {
+        let cancel = Arc::new(QueryCancel::new());
+        let mut timer = StatementTimer::new();
+        timer.arm_new(Duration::from_secs(1), cancel.clone()).await;
+        cancel.request(CancelReason::UserRequest);
+
+        timer.rearm(Duration::from_secs(1), cancel.clone()).await;
+
+        assert_eq!(cancel.reason(), Some(CancelReason::UserRequest));
+        assert!(timer.is_expired());
     }
 }
