@@ -443,10 +443,12 @@ unspecified, including PostgreSQL `oid` OID 26 as SaguaroDB integer semantics,
 while retaining the declared `PgType`, or an unambiguous catalog-function
 argument `PgType` for unspecified parameters, for `ParameterDescription` and
 selected parameter result metadata), caches referenced table/view schema
-versions for bound data statements, and replies `ParseComplete`. `Bind` decodes
+versions for bound data statements, and replies `ParseComplete`. Cancellation
+is checked after preparing and before publishing the named statement. `Bind` decodes
 each parameter value (text or binary, per the Bind format codes, via the
 declared `PgType`) into a portal
-and replies `BindComplete`. `Describe` replies `ParameterDescription` +
+and checks cancellation before publishing it, then replies `BindComplete`.
+`Describe` builds its metadata and checks cancellation before replying with `ParameterDescription` +
 `RowDescription`/`NoData` for a statement, or `RowDescription`/`NoData` in the
 portal's result formats for a portal. Requested binary result formats are
 preserved for supported scalar wire types, but virtual-catalog vector/array

@@ -8,10 +8,11 @@ use common::{
     CancelReason, ColumnInfo, DataType, ErrorKind, IsolationLevel, PgType, QueryCancel, Result,
     Row, SqlState, Value,
 };
+use protocol::{PostgresCodec, StatementKind};
 
 use super::{
-    StreamOutcome, TransactionState, apply_stream_consumer_cancel, encode_row, handle_connection,
-    resolve_result_formats, sqlstate_code, streamed_task_result,
+    Session, StreamOutcome, TransactionState, apply_stream_consumer_cancel, encode_row,
+    handle_connection, resolve_result_formats, sqlstate_code, streamed_task_result,
 };
 use crate::app::AppState;
 
@@ -87,6 +88,67 @@ async fn wait_cancelable_checks_cancellation_when_future_is_already_ready() {
 #[test]
 fn program_limit_exceeded_maps_to_sqlstate_54000() {
     assert_eq!(sqlstate_code(SqlState::ProgramLimitExceeded), "54000");
+}
+
+#[test]
+fn extended_control_work_does_not_publish_after_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let mut session = Session::new(app);
+
+    session.cancel.request(CancelReason::StatementTimeout);
+    let err = session
+        .process_parse("timed_out".to_string(), "select 1".to_string(), &[])
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+    assert!(!session.prepared.contains_key("timed_out"));
+
+    session.cancel.reset();
+    session
+        .process_parse("statement".to_string(), "select 1".to_string(), &[])
+        .unwrap();
+    session.cancel.request(CancelReason::StatementTimeout);
+    let err = session
+        .process_bind(
+            "timed_out".to_string(),
+            "statement",
+            &[],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+    assert!(!session.portals.contains_key("timed_out"));
+
+    let err = session
+        .process_describe(StatementKind::Statement, "statement")
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+}
+
+#[tokio::test]
+async fn extended_control_error_marks_open_transaction_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let mut session = Session::new(app);
+    let codec = PostgresCodec::new();
+    let (mut server_stream, _client_stream) = tokio::io::duplex(4_096);
+
+    let _ = session
+        .run_query(&mut server_stream, &codec, "begin".to_string())
+        .await
+        .unwrap();
+    assert_eq!(session.tx, TransactionState::InTransaction);
+
+    session.cancel.request(CancelReason::StatementTimeout);
+    let result = session.process_parse("timed_out".to_string(), "select 1".to_string(), &[]);
+    session
+        .reply_or_fail(&mut server_stream, &codec, result)
+        .await
+        .unwrap();
+
+    assert_eq!(session.tx, TransactionState::Failed);
+    assert!(session.txn.as_ref().unwrap().is_failed());
 }
 
 #[test]

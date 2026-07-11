@@ -517,6 +517,7 @@ impl Session {
             .map(|oid| oid_to_pg_type(*oid))
             .collect::<Result<Vec<_>>>()?;
         let prepared = self.app.query_service.prepare_sql(&query, &declared)?;
+        self.cancel.check()?;
         self.prepared.insert(name, Arc::new(prepared));
         Ok(vec![ServerMessage::ParseComplete])
     }
@@ -533,6 +534,7 @@ impl Session {
             protocol_error(format!("prepared statement \"{statement}\" does not exist"))
         })?;
         let params = decode_bind_params(&prepared, param_formats, &params)?;
+        self.cancel.check()?;
         self.portals.insert(
             portal,
             Portal::Bound(BoundPortal {
@@ -549,16 +551,16 @@ impl Session {
         kind: StatementKind,
         name: &str,
     ) -> Result<Vec<ServerMessage>> {
-        match kind {
+        let messages = match kind {
             StatementKind::Statement => {
                 let prepared = self.prepared.get(name).ok_or_else(|| {
                     protocol_error(format!("prepared statement \"{name}\" does not exist"))
                 })?;
                 let oids = prepared.param_pg_types().iter().map(PgType::oid).collect();
-                Ok(vec![
+                vec![
                     ServerMessage::ParameterDescription(oids),
                     row_description_or_no_data(prepared.result_columns(), &[]),
-                ])
+                ]
             }
             StatementKind::Portal => {
                 let portal = self
@@ -575,9 +577,11 @@ impl Session {
                         formats: resolve_result_formats(&portal.result_formats, &portal.columns),
                     },
                 };
-                Ok(vec![message])
+                vec![message]
             }
-        }
+        };
+        self.cancel.check()?;
+        Ok(messages)
     }
 
     pub(super) fn process_close(
@@ -615,6 +619,7 @@ impl Session {
             Err(err) => {
                 self.stop_statement_timer().await;
                 self.failed = true;
+                self.mark_current_transaction_failed();
                 write_messages(stream, codec, &[error_response(&err)]).await
             }
         }
