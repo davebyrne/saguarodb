@@ -145,7 +145,7 @@ impl Session {
         }
         drop(sender);
         let task = copy.task.take().expect("running COPY has a worker task");
-        let (txn, result) = match task.await {
+        let (txn, mut result) = match task.await {
             Ok(pair) => pair,
             Err(join_err) => (
                 None,
@@ -153,29 +153,45 @@ impl Session {
             ),
         };
         self.txn = txn;
+        let success_is_durable = self.txn.is_none();
+        if result.is_ok()
+            && !success_is_durable
+            && let Err(err) = self.cancel.check()
+        {
+            if let Some(txn) = self.txn.as_mut() {
+                txn.mark_failed();
+            }
+            result = Err(err);
+        }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
-        let success_is_durable = self.txn.is_none();
+        let transaction_holds_writer = self
+            .txn
+            .as_ref()
+            .is_some_and(crate::query::Transaction::holds_write_guard);
         self.end_activity();
         // Database work is complete. Like ordinary query paths, do not let a
-        // blocked terminal socket write keep graceful shutdown waiting.
-        drop(copy.guard.take());
+        // blocked terminal socket write keep graceful shutdown waiting unless an
+        // explicit transaction still owns the writer guard the shutdown checkpoint
+        // must wait for.
+        if !transaction_holds_writer {
+            drop(copy.guard.take());
+        }
 
         let response = match result {
             Ok(count) => {
-                write_terminal_response(
-                    self.cancel.as_ref(),
-                    success_is_durable,
-                    write_messages(
-                        stream,
-                        codec,
-                        &[
-                            ServerMessage::CommandComplete(format!("COPY {count}")),
-                            ServerMessage::ReadyForQuery(status),
-                        ],
-                    ),
-                )
-                .await
+                let messages = [
+                    ServerMessage::CommandComplete(format!("COPY {count}")),
+                    ServerMessage::ReadyForQuery(status),
+                ];
+                let response = write_messages(stream, codec, &messages);
+                if success_is_durable {
+                    write_terminal_response(response).await
+                } else {
+                    wait_cancelable(self.cancel.as_ref(), response)
+                        .await
+                        .and_then(|result| result)
+                }
             }
             Err(task_err) => {
                 // A client CopyFail (with no prior insert error) reports the client's
@@ -237,8 +253,15 @@ impl Session {
             .expect("COPY draining state remains installed");
         copy.draining_after_cancel = true;
         // The worker and its transaction are gone. Keep only protocol drain state;
-        // canceled clients must not hold graceful shutdown open indefinitely.
-        drop(copy.guard.take());
+        // canceled clients must not hold graceful shutdown open unless the restored
+        // explicit transaction still owns a writer guard.
+        if !self
+            .txn
+            .as_ref()
+            .is_some_and(crate::query::Transaction::holds_write_guard)
+        {
+            drop(copy.guard.take());
+        }
         self.stop_statement_timer().await;
 
         let err = match self.cancel.check() {
@@ -334,9 +357,18 @@ impl Session {
         }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
-        // The producer and transaction are settled even if the client stops reading
-        // before CopyDone/CommandComplete/ReadyForQuery.
-        drop(guard);
+        let transaction_holds_writer = self
+            .txn
+            .as_ref()
+            .is_some_and(crate::query::Transaction::holds_write_guard);
+        // The producer is settled even if the client stops reading. A read-only or
+        // autocommit COPY can release the guard now; an explicit write transaction
+        // retains it through the terminal response so shutdown times out safely
+        // instead of entering a checkpoint that blocks forever on its writer guard.
+        let mut guard = Some(guard);
+        if !transaction_holds_writer {
+            drop(guard.take());
+        }
 
         if let Some(err) = write_err {
             self.end_activity();

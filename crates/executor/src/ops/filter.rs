@@ -38,6 +38,7 @@ impl PlanExecutor for FilterOp<'_> {
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
         while let Some(row) = self.source.next()? {
+            self.ctx.cancel.check()?;
             if predicate_matches(&self.ctx, &self.predicate, &row)? {
                 return Ok(Some(row));
             }

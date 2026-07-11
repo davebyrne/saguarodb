@@ -67,6 +67,7 @@ impl PlanExecutor for SeqScanOp<'_> {
             .as_mut()
             .ok_or_else(|| common::DbError::internal("SeqScanOp was not opened"))?;
         while let Some(stored) = iter.next()? {
+            self.ctx.cancel.check()?;
             let row = ExecRow {
                 row: stored.row,
                 identity: Some(RowIdentity {
@@ -203,6 +204,7 @@ impl PlanExecutor for IndexScanOp<'_> {
             .as_mut()
             .ok_or_else(|| common::DbError::internal("IndexScanOp was not opened"))?;
         while let Some(stored) = iter.next()? {
+            self.ctx.cancel.check()?;
             let row = ExecRow {
                 row: stored.row,
                 identity: Some(RowIdentity {

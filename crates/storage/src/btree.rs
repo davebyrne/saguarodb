@@ -376,6 +376,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// are disambiguated by the leaf `value` (heap TID), so an equality bound
     /// matches every row sharing the indexed value. Entries are returned with their
     /// full key.
+    #[cfg(test)]
     pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, V)>> {
         self.range_cancelable(range, None)
     }
@@ -393,17 +394,7 @@ impl<'a, V: IndexValue> BTree<'a, V> {
         Ok(out)
     }
 
-    /// Visit entries within `range` in `(key, value)` order, buffering only one
-    /// leaf page at a time so callers can process large ranges without building
-    /// one table-sized vector.
-    pub(crate) fn range_for_each<F>(&self, range: &KeyRange, visitor: F) -> Result<()>
-    where
-        F: FnMut(Key, V) -> Result<()>,
-    {
-        self.range_for_each_cancelable(range, None, visitor)
-    }
-
-    fn range_for_each_cancelable<F>(
+    pub(crate) fn range_for_each_cancelable<F>(
         &self,
         range: &KeyRange,
         cancel: Option<&QueryCancel>,

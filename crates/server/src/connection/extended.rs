@@ -226,7 +226,16 @@ impl Session {
         if let Some(err) = stream_cancel {
             apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
         }
-        drop(guard);
+        if let Err(err) = io_cancel.check() {
+            apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
+        }
+        let transaction_holds_writer = self
+            .txn
+            .as_ref()
+            .is_some_and(crate::query::Transaction::holds_write_guard);
+        if !transaction_holds_writer {
+            drop(guard);
+        }
         // Keep the reported transaction-block status in sync with the slot, so the
         // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
@@ -262,53 +271,35 @@ impl Session {
                 self.portals.clear();
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_terminal_response(
-                        io_cancel.as_ref(),
-                        true,
-                        write_messages(stream, codec, &[message]),
-                    )
-                    .await?;
+                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
                 }
-                write_terminal_response(
-                    io_cancel.as_ref(),
-                    true,
-                    write_portal_result(stream, codec, result, &result_formats),
-                )
-                .await
+                write_terminal_response(write_portal_result(stream, codec, result, &result_formats))
+                    .await
             }
             Ok(StreamOutcome::Direct(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_terminal_response(
+                    wait_cancelable(
                         io_cancel.as_ref(),
-                        false,
                         write_messages(stream, codec, &[message]),
                     )
-                    .await?;
+                    .await
+                    .and_then(|result| result)?;
                 }
-                write_terminal_response(
+                wait_cancelable(
                     io_cancel.as_ref(),
-                    false,
                     write_portal_result(stream, codec, result, &result_formats),
                 )
                 .await
+                .and_then(|result| result)
             }
             Ok(StreamOutcome::Durable(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    write_terminal_response(
-                        io_cancel.as_ref(),
-                        true,
-                        write_messages(stream, codec, &[message]),
-                    )
-                    .await?;
+                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
                 }
-                write_terminal_response(
-                    io_cancel.as_ref(),
-                    true,
-                    write_portal_result(stream, codec, result, &result_formats),
-                )
-                .await
+                write_terminal_response(write_portal_result(stream, codec, result, &result_formats))
+                    .await
             }
             Ok(StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. }) => {
                 self.failed = true;
@@ -395,7 +386,7 @@ impl Session {
             Err(err) => {
                 self.failed = true;
                 self.end_activity();
-                drop(guard);
+                let _guard = self.retain_query_guard_for_writer(guard);
                 return write_messages(stream, codec, &[error_response(&err)]).await;
             }
         };
@@ -409,7 +400,7 @@ impl Session {
             self.cancel.as_ref(),
         )
         .await;
-        drop(guard);
+        let _guard = self.retain_query_guard_for_writer(guard);
         match fetch {
             Ok(CursorFetchStatus::Suspended { count }) => {
                 self.end_activity();
@@ -483,7 +474,7 @@ impl Session {
         };
         let fetch =
             fetch_suspended_rows(stream, codec, &portal, max_rows, self.cancel.as_ref()).await;
-        drop(guard);
+        let _guard = self.retain_query_guard_for_writer(guard);
         match fetch {
             Ok(CursorFetchStatus::Suspended { count }) => {
                 self.end_activity();

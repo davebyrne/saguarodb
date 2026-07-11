@@ -10,5 +10,5 @@ pub use codec::{
     ENVELOPE_VERSION, Envelope, LEVEL_AT_REST, LEVEL_WAL, TOAST_ZSTD_LEVEL, compress_value_zstd,
     decode_envelope, encode_envelope, is_envelope,
 };
-pub use dict::{DictStore, train_dictionary};
+pub use dict::{DictStore, train_dictionary, train_dictionary_cancelable};
 pub use registry::{CompressionRegistry, FileCompression};

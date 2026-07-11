@@ -113,6 +113,7 @@ impl CompressionRegistry {
 
 /// Train a zstd dictionary from page-image samples (`compression.md` §7).
 pub fn train_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>>;
+pub fn train_dictionary_cancelable(samples: &[Vec<u8>], cancel: &QueryCancel) -> Result<Option<Vec<u8>>>;
 
 /// Immutable dictionary files under `<data>/dicts/<dict_id>.dict`.
 pub struct DictStore { /* private */ }
@@ -214,6 +215,11 @@ impl DictStore {
   training itself fails. Callers treat both as "proceed dict-less" — training
   failure is never a statement error. Trained dictionaries are capped at
   ~110 KiB (`MAX_DICT_BYTES`, zstd's customary ceiling).
+- `train_dictionary_cancelable(samples, cancel)` — the foreground-DDL wrapper.
+  ZDICT runs on a side-effect-free helper thread because it has no interruption
+  callback; one process-wide permit bounds training to a single job, thread creation
+  is fallible, and the caller polls `cancel` every 10 ms. Cancellation may return
+  while that one bounded training job finishes in the background.
 - `DictStore::open(dir)` — creates `dir` if it does not already exist.
 - `DictStore::save(dict_id, table_id, bytes)` — **idempotent**: if
   `<dict_id>.dict` already exists it returns `Ok(())` without touching the

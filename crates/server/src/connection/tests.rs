@@ -87,21 +87,15 @@ async fn wait_cancelable_checks_cancellation_when_future_is_already_ready() {
 }
 
 #[tokio::test]
-async fn durable_terminal_response_ignores_late_cancellation() {
-    let cancel = QueryCancel::new();
-    cancel.request(CancelReason::StatementTimeout);
+async fn authoritative_terminal_response_writes_complete_frame() {
     let codec = PostgresCodec::new();
     let (mut writer, mut reader) = tokio::io::duplex(128);
 
-    super::write_terminal_response(
-        &cancel,
-        true,
-        super::write_messages(
-            &mut writer,
-            &codec,
-            &[ServerMessage::CommandComplete("INSERT 0 1".to_string())],
-        ),
-    )
+    super::write_terminal_response(super::write_messages(
+        &mut writer,
+        &codec,
+        &[ServerMessage::CommandComplete("INSERT 0 1".to_string())],
+    ))
     .await
     .unwrap();
 

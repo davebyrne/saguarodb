@@ -1,8 +1,9 @@
-use common::{ColumnInfo, ExecRow, Result};
+use common::{ColumnInfo, ExecRow, Result, StatementContext};
 
 use crate::query::PlanExecutor;
 
 pub struct LimitOp<'a> {
+    ctx: StatementContext,
     source: Box<dyn PlanExecutor + 'a>,
     count: u64,
     offset: u64,
@@ -11,9 +12,15 @@ pub struct LimitOp<'a> {
 }
 
 impl<'a> LimitOp<'a> {
-    pub fn new(source: Box<dyn PlanExecutor + 'a>, count: u64, offset: u64) -> Self {
+    pub fn new(
+        ctx: StatementContext,
+        source: Box<dyn PlanExecutor + 'a>,
+        count: u64,
+        offset: u64,
+    ) -> Self {
         let output_schema = source.output_schema().to_vec();
         Self {
+            ctx,
             source,
             count,
             offset,
@@ -32,6 +39,7 @@ impl PlanExecutor for LimitOp<'_> {
         self.emitted = 0;
         self.source.open()?;
         for _ in 0..self.offset {
+            self.ctx.cancel.check()?;
             if self.source.next()?.is_none() {
                 break;
             }
@@ -40,6 +48,7 @@ impl PlanExecutor for LimitOp<'_> {
     }
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
+        self.ctx.cancel.check()?;
         if self.emitted >= self.count {
             return Ok(None);
         }

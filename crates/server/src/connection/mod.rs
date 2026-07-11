@@ -48,7 +48,8 @@ struct CopyInSession {
     draining_after_cancel: bool,
     /// Keeps a running COPY counted as an in-flight query, so graceful shutdown's
     /// `wait_for_idle` accounts for its worker and transaction. Released when the
-    /// worker is awaited, including before canceled protocol-drain state is kept.
+    /// worker is awaited unless a restored explicit transaction still owns the
+    /// writer guard that a shutdown checkpoint must not bypass.
     guard: Option<InFlightQueryGuard>,
 }
 
@@ -449,6 +450,18 @@ impl Session {
         self.cancel.clone()
     }
 
+    /// Keep a statement counted as in flight through its terminal response when
+    /// the session still owns a writer guard that shutdown must not bypass.
+    fn retain_query_guard_for_writer(
+        &self,
+        guard: InFlightQueryGuard,
+    ) -> Option<InFlightQueryGuard> {
+        self.txn
+            .as_ref()
+            .is_some_and(Transaction::holds_write_guard)
+            .then_some(guard)
+    }
+
     fn effective_statement_timeout_ms(&self) -> u64 {
         let session_timeout_ms = self.session_gucs.statement_timeout_ms();
         self.txn
@@ -840,18 +853,8 @@ async fn wait_cancelable<T>(
 
 /// Write a terminal success response without allowing cancellation observed after
 /// an authoritative durable boundary to replace that success.
-async fn write_terminal_response(
-    cancel: &QueryCancel,
-    durable: bool,
-    response: impl Future<Output = Result<()>>,
-) -> Result<()> {
-    if durable {
-        response.await
-    } else {
-        wait_cancelable(cancel, response)
-            .await
-            .and_then(|result| result)
-    }
+async fn write_terminal_response(response: impl Future<Output = Result<()>>) -> Result<()> {
+    response.await
 }
 
 /// Reconcile cancellation observed by the async stream consumer with the

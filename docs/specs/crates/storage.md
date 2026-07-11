@@ -132,6 +132,10 @@ Each table is page-backed. Full rows live in heap pages; a durable, non-clustere
 - `scan` / `scan_range` walk the reserved identity B-tree leaves in key order and read rows from their heap locations.
 - `for_each_visible_row` visits visible rows from a retained relation snapshot without requiring a table-sized result vector. The page-backed engine walks the identity B-tree one leaf page at a time; the default trait implementation may delegate through `scan` for simple test engines.
 - `index_scan` walks a catalog index, which points directly at heap TIDs, and reads each row from its heap location (no identity-index indirection; see Catalog Indexes).
+
+Range collection and visible-row materialization poll `ctx.cancel` at B-tree leaf
+and candidate-row boundaries, so large ordinary and secondary-index scans do not
+hide statement timeout or user cancellation until the full range is materialized.
 - `delete` marks the visible version deleted in place (MVCC delete; see below) and
   retains its index entries. `update` writes a new heap version, chains the old
   version forward to it (`xmax` + `t_ctid`), and inserts a per-version entry into

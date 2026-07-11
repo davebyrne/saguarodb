@@ -1,7 +1,10 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
-use common::{DbError, Result, SqlState};
+use common::{DbError, QueryCancel, Result, SqlState};
 
 /// Dictionary file: [magic "SGDC"][version u8][dict_id u32 LE][table_id u32 LE]
 /// [payload_len u32 LE][crc32(payload) u32 LE][payload] (`compression.md` §7).
@@ -11,6 +14,15 @@ const DICT_HEADER_LEN: usize = 4 + 1 + 4 + 4 + 4 + 4;
 
 /// Cap trained dictionaries at ~110 KiB (zstd's customary maximum).
 const MAX_DICT_BYTES: usize = 112_640;
+static TRAINING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct TrainingPermit;
+
+impl Drop for TrainingPermit {
+    fn drop(&mut self) {
+        TRAINING_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 fn corrupt(message: impl Into<String>) -> DbError {
     DbError::storage(SqlState::InternalError, message)
@@ -31,6 +43,50 @@ pub fn train_dictionary(samples: &[Vec<u8>]) -> Option<Vec<u8>> {
         return None;
     }
     zstd::dict::from_samples(samples, MAX_DICT_BYTES).ok()
+}
+
+/// Cancellation-aware dictionary training for foreground DDL. ZDICT exposes no
+/// interruption callback, so training owns a bounded copy on a helper thread while
+/// the caller polls the statement token. Cancellation returns promptly and the
+/// side-effect-free helper is allowed to finish in the background.
+pub fn train_dictionary_cancelable(
+    samples: &[Vec<u8>],
+    cancel: &QueryCancel,
+) -> Result<Option<Vec<u8>>> {
+    cancel.check()?;
+    if samples.len() < 8 {
+        return Ok(None);
+    }
+    loop {
+        cancel.check()?;
+        if TRAINING_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let permit = TrainingPermit;
+    let samples = samples.to_vec();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("saguarodb-dict-training".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = tx.send(train_dictionary(&samples));
+        })
+        .map_err(|err| DbError::internal(format!("failed to start dictionary training: {err}")))?;
+    loop {
+        cancel.check()?;
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(dictionary) => return Ok(dictionary),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(DbError::internal("dictionary training worker stopped"));
+            }
+        }
+    }
 }
 
 /// Immutable dictionary files under `<data>/dicts/<dict_id>.dict`.
@@ -163,6 +219,17 @@ fn decode_dict_file(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelable_training_honors_a_pending_timeout() {
+        let cancel = QueryCancel::new();
+        cancel.request(common::CancelReason::StatementTimeout);
+        let samples = vec![vec![b'x'; 1024]; 8];
+
+        let err = train_dictionary_cancelable(&samples, &cancel).unwrap_err();
+
+        assert_eq!(err.code, SqlState::QueryCanceled);
+    }
 
     #[test]
     fn dict_store_saves_and_loads_with_crc() {

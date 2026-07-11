@@ -120,8 +120,9 @@ impl QueryService {
                         DICT_TRAINING_PAGE_CAP,
                         cancel.as_ref(),
                     )?;
-                    if let Some(bytes) = compress::train_dictionary(&samples) {
-                        cancel.check()?;
+                    if let Some(bytes) =
+                        compress::train_dictionary_cancelable(&samples, cancel.as_ref())?
+                    {
                         let dict_id = components.catalog.allocate_dictionary_id()?;
                         // Track the id before the durable save so rollback also
                         // removes a temporary file left by a failed save.
@@ -361,7 +362,7 @@ impl QueryService {
     ) -> Result<ToastAlterPostCommit> {
         let components = &self.components;
         let ctx = StatementContext::new(txn_id)
-            .with_conflict_waiter(components.lock_manager.clone(), cancel);
+            .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
 
         let mut toast = schema.toast.apply_patch(&options.toast);
         if options.toast.compression == Some(ToastCompression::ZstdDict) {
@@ -371,7 +372,7 @@ impl QueryService {
                 TOAST_DICT_MAX_SAMPLES,
                 TOAST_DICT_MAX_BYTES,
             )?;
-            if let Some(bytes) = compress::train_dictionary(&samples) {
+            if let Some(bytes) = compress::train_dictionary_cancelable(&samples, cancel.as_ref())? {
                 let dict_id = components.catalog.allocate_dictionary_id()?;
                 *prepared_dict_id = Some(dict_id);
                 components.dict_store.save(dict_id, schema.id, &bytes)?;

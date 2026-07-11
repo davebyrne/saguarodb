@@ -2215,8 +2215,10 @@ impl StorageEngine for PageBackedStorageEngine {
         let schema = table_handle.schema.clone();
         let index_fid = table_handle.primary_index_file_id;
 
-        self.btree(index_fid)
-            .range_for_each(&KeyRange::All, |key, location| {
+        self.btree(index_fid).range_for_each_cancelable(
+            &KeyRange::All,
+            Some(ctx.cancel.as_ref()),
+            |key, location| {
                 let Some((resolved, row)) =
                     self.read_visible_row(ctx, relations, &schema, location)?
                 else {
@@ -2230,7 +2232,8 @@ impl StorageEngine for PageBackedStorageEngine {
                     key,
                     row,
                 })
-            })
+            },
+        )
     }
 
     fn scan_range(
@@ -2247,11 +2250,13 @@ impl StorageEngine for PageBackedStorageEngine {
         let entries = {
             let rewrite_latch = self.identity_rewrite_latch(table);
             let _rewrite_guard = rewrite_latch.read();
-            self.btree(index_fid).range(range)?
+            self.btree(index_fid)
+                .range_cancelable(range, Some(ctx.cancel.as_ref()))?
         };
 
         let mut rows = Vec::with_capacity(entries.len());
         for (key, location) in entries {
+            ctx.cancel.check()?;
             // Resolve the index entry's TID (a possibly-HOT root: REDIRECT + bounded
             // `t_ctid` chain) to the version this snapshot sees; an invisible chain
             // (or a reclaimed root slot) is skipped, not returned or errored. A
@@ -2303,9 +2308,12 @@ impl StorageEngine for PageBackedStorageEngine {
         // `t_ctid` walk (REDIRECT + chain in `read_visible_row`; `mvcc.md` §5.2, §10
         // Milestone H1). Because the walk stops at any independently-indexed
         // successor, a row is never yielded via two index entries.
-        let entries = self.secondary_btree(&index_schema).range(range)?;
+        let entries = self
+            .secondary_btree(&index_schema)
+            .range_cancelable(range, Some(ctx.cancel.as_ref()))?;
         let mut rows = Vec::with_capacity(entries.len());
         for (_entry_key, location) in entries {
+            ctx.cancel.check()?;
             // Resolve to the visible version; an invisible chain (or a DEAD/absent
             // root line pointer) is skipped, not an error.
             let Some((resolved, row)) = self.read_visible_row(ctx, relations, &schema, location)?

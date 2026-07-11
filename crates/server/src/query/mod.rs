@@ -710,6 +710,10 @@ impl Transaction {
         self.failed
     }
 
+    pub(crate) fn holds_write_guard(&self) -> bool {
+        self.write_guard.is_some()
+    }
+
     fn status(&self) -> SessionTxnStatus {
         if self.failed {
             SessionTxnStatus::Failed

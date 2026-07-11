@@ -604,6 +604,7 @@ pub(crate) fn build_executor<'a>(
             count,
             offset,
         } => Ok(Box::new(LimitOp::new(
+            ctx.statement.clone(),
             build_executor(ctx, source)?,
             *count,
             offset.unwrap_or(0),

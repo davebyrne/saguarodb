@@ -48,6 +48,7 @@ impl PlanExecutor for DistinctOp<'_> {
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
         while let Some(row) = self.source.next()? {
+            self.ctx.cancel.check()?;
             let key = self
                 .on_keys
                 .iter()

@@ -86,7 +86,7 @@ impl Session {
             Ok(None) => {}
             Err(err) => {
                 self.mark_current_transaction_failed();
-                drop(guard);
+                let _guard = self.retain_query_guard_for_writer(guard);
                 write_messages(
                     stream,
                     codec,
@@ -205,6 +205,9 @@ impl Session {
         if let Some(err) = stream_cancel {
             apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
         }
+        if let Err(err) = io_cancel.check() {
+            apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
+        }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let transaction_cleanup = self.txn.is_none() || successful_rollback_command(&outcome);
         let statement_cleanup = closes_cursors_on_success && outcome.is_ok();
@@ -213,27 +216,32 @@ impl Session {
             self.close_sql_cursors();
         }
         let status = self.status_byte();
+        let transaction_holds_writer = self
+            .txn
+            .as_ref()
+            .is_some_and(crate::query::Transaction::holds_write_guard);
 
         // A socket-write or encode failure while streaming means the connection is
         // broken; surface it (closing the connection) rather than trying to write a
         // terminal message the client cannot receive.
         if let Some(err) = write_err {
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.end_activity();
             return Err(err);
         }
 
         if let Some(message) = self.application_name_status_change() {
             if outcome.is_ok() {
-                write_terminal_response(
-                    io_cancel.as_ref(),
-                    matches!(
-                        outcome,
-                        Ok(StreamOutcome::Durable(_) | StreamOutcome::SessionReset(_))
-                    ),
-                    write_messages(stream, codec, &[message]),
-                )
-                .await?;
+                if matches!(outcome, Ok(StreamOutcome::Direct(_))) {
+                    wait_cancelable(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &[message]),
+                    )
+                    .await
+                    .and_then(|result| result)?;
+                } else {
+                    write_terminal_response(write_messages(stream, codec, &[message])).await?;
+                }
             } else {
                 write_messages(stream, codec, &[message]).await?;
             }
@@ -244,7 +252,9 @@ impl Session {
             // written above; finish with the command tag (the producer's
             // authoritative row count) and status.
             Ok(StreamOutcome::Streamed { count }) => {
-                drop(guard);
+                if !transaction_holds_writer {
+                    drop(guard);
+                }
                 self.end_activity();
                 wait_cancelable(
                     io_cancel.as_ref(),
@@ -276,39 +286,39 @@ impl Session {
                 self.prepared.clear();
                 self.portals.clear();
                 self.close_sql_cursors();
-                drop(guard);
+                if !transaction_holds_writer {
+                    drop(guard);
+                }
                 self.end_activity();
-                write_terminal_response(
-                    io_cancel.as_ref(),
-                    true,
-                    write_execution_result(stream, codec, result, status),
-                )
-                .await?
+                write_terminal_response(write_execution_result(stream, codec, result, status))
+                    .await?
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
             Ok(StreamOutcome::Direct(result)) => {
-                drop(guard);
+                if !transaction_holds_writer {
+                    drop(guard);
+                }
                 self.end_activity();
-                write_terminal_response(
+                wait_cancelable(
                     io_cancel.as_ref(),
-                    false,
                     write_execution_result(stream, codec, result, status),
                 )
-                .await?
+                .await
+                .and_then(|result| result)?
             }
             Ok(StreamOutcome::Durable(result)) => {
-                drop(guard);
+                if !transaction_holds_writer {
+                    drop(guard);
+                }
                 self.end_activity();
-                write_terminal_response(
-                    io_cancel.as_ref(),
-                    true,
-                    write_execution_result(stream, codec, result, status),
-                )
-                .await?
+                write_terminal_response(write_execution_result(stream, codec, result, status))
+                    .await?
             }
             Err(err) => {
-                drop(guard);
+                if !transaction_holds_writer {
+                    drop(guard);
+                }
                 self.end_activity();
                 write_messages(
                     stream,
@@ -361,7 +371,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         if let Err(err) = self.require_healthy_sql_cursor_transaction() {
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, false)
                 .await?;
             return Ok(ControlFlow::Continue(()));
@@ -371,7 +381,7 @@ impl Session {
                 SqlState::DuplicateCursor,
                 format!("cursor \"{name}\" already exists"),
             );
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, true)
                 .await?;
             return Ok(ControlFlow::Continue(()));
@@ -391,7 +401,7 @@ impl Session {
         self.default_isolation = default_isolation;
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
-        drop(guard);
+        let _guard = self.retain_query_guard_for_writer(guard);
         self.end_activity();
 
         match started {
@@ -443,7 +453,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         if let Err(err) = self.require_healthy_sql_cursor_transaction() {
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, false)
                 .await?;
             return Ok(ControlFlow::Continue(()));
@@ -453,7 +463,7 @@ impl Session {
                 SqlState::InvalidCursorName,
                 format!("cursor \"{name}\" does not exist"),
             );
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, true)
                 .await?;
             return Ok(ControlFlow::Continue(()));
@@ -461,7 +471,7 @@ impl Session {
         self.begin_activity(&cursor.query_text);
         let fetch =
             fetch_sql_cursor_rows(stream, codec, &mut cursor, count, self.cancel.as_ref()).await;
-        drop(guard);
+        let _guard = self.retain_query_guard_for_writer(guard);
         self.end_activity();
 
         match fetch {
@@ -510,7 +520,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         if let Err(err) = self.require_healthy_sql_cursor_transaction() {
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, false)
                 .await?;
             return Ok(ControlFlow::Continue(()));
@@ -520,12 +530,12 @@ impl Session {
                 SqlState::InvalidCursorName,
                 format!("cursor \"{name}\" does not exist"),
             );
-            drop(guard);
+            let _guard = self.retain_query_guard_for_writer(guard);
             self.write_sql_cursor_error(stream, codec, err, true)
                 .await?;
             return Ok(ControlFlow::Continue(()));
         }
-        drop(guard);
+        let _guard = self.retain_query_guard_for_writer(guard);
         wait_cancelable(
             self.cancel.as_ref(),
             write_messages(

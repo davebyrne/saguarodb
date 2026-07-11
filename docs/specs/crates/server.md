@@ -296,7 +296,7 @@ A `SELECT` streams its rows through a bounded channel (`docs/specs/streaming.md`
 
 Once an autocommit operation has crossed its durable commit boundary, a later timeout or `CancelRequest` cannot replace or interrupt its terminal success response. This applies to simple and extended execution, completed session resets, and successful autocommit `COPY FROM`; direct or explicit-transaction outcomes remain cancelable until their terminal response.
 
-COPY IN/OUT retains its in-flight shutdown guard while its blocking worker owns database work, then releases the guard immediately after joining the worker and restoring transaction state, before terminal socket responses. A client that stops reading a terminal response therefore cannot make graceful shutdown skip its final checkpoint and WAL flush after the COPY worker has already settled.
+COPY IN/OUT retains its in-flight shutdown guard while its blocking worker owns database work, then normally releases the guard immediately after joining the worker and restoring transaction state, before terminal socket responses. If a restored explicit transaction still owns a writer guard, the in-flight guard is retained through the response/drain boundary so graceful shutdown times out safely instead of entering a checkpoint that would block behind that transaction. Thus a non-reading client cannot make shutdown skip its final checkpoint after settled autocommit/read-only COPY work or bypass the timeout gate while a write transaction remains open.
 
 A DML statement with a `RETURNING` clause yields `ExecutionResult::ModifiedReturning { command, count, columns, rows }`. The simple-query writer sends `RowDescription` (the `columns`), one `DataRow` per returned row, and then `CommandComplete` carrying the **DML** command tag (e.g. `INSERT 0 n` / `UPDATE n` / `DELETE n`, from `count`) — not `SELECT n`. Over the extended protocol the `RowDescription` comes from `Describe` (`result_columns` returns the `RETURNING` projection schema for an `Insert`/`Update`/`Delete` whose `returning` is `Some`), and `Execute` streams the `DataRow`s followed by the DML `CommandComplete`. `RETURNING` rows count toward the auto-prune dead-version accounting exactly like the equivalent plain `UPDATE`/`DELETE`.
 
@@ -555,9 +555,10 @@ If COPY FROM is canceled while waiting for client input, timer expiry or the
 emit exactly one reason-specific `ErrorResponse`, and enter
 a lightweight drain state: later `CopyData` is discarded until `CopyDone` or
 `CopyFail`, which emits the sole `ReadyForQuery` without a second error.
-The worker transaction and in-flight shutdown guard are released before entering
-that drain state, so an unresponsive client cannot delay graceful shutdown after
-the database work has already been canceled.
+The worker is joined before entering that drain state. Its in-flight shutdown
+guard is normally released then, but remains installed when the restored explicit
+transaction still owns a writer guard, so shutdown cannot bypass its timeout gate
+and block indefinitely in the final checkpoint.
 
 Foreground statement waits are cancellation-aware beyond executor row polling:
 writer/exclusive concurrency guards, relation-publication gates, and snapshot-exclusion waits use short timed
@@ -565,7 +566,8 @@ lock waits, bounded producer channels retry nonblocking sends, COPY FROM polls i
 input channel, and the async socket side races channel receives and writes against
 the same cancellation token. Foreground VACUUM, primary-key validation/backfill,
 TOAST scans, and compression sampling check cancellation while waiting for
-exclusion and at page/leaf boundaries; post-durable rewrites deliberately remain
+exclusion and at page/leaf boundaries. ZDICT training runs as a bounded,
+side-effect-free helper job while foreground DDL polls cancellation; post-durable rewrites deliberately remain
 uninterruptible. Autocommit DML/DDL/COPY write paths check once more immediately
 before appending the statement's durable commit record; cancellation before that
 boundary rolls back (or poisons an explicit transaction), while cancellation after

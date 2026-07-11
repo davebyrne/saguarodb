@@ -90,6 +90,32 @@ async fn cancel_request_wakes_idle_copy_from_without_more_copy_data() {
 }
 
 #[tokio::test]
+async fn canceled_copy_in_write_transaction_stays_in_flight_until_drain() {
+    let (server, mut conn) = server_with_table().await;
+    conn.ok("begin").await;
+    conn.ok("insert into t values (1, 'held')").await;
+    conn.begin_copy_from("copy t from stdin").await.unwrap();
+    let (process_id, secret_key) = conn.backend_key();
+
+    server.send_cancel(process_id, secret_key).await.unwrap();
+    conn.wait_for_copy_error().await.unwrap();
+
+    assert!(
+        server
+            .app()
+            .components
+            .shutdown
+            .wait_for_idle(Duration::from_millis(50))
+            .await
+            .is_err(),
+        "COPY drain must retain the timeout gate while its transaction owns a writer guard"
+    );
+
+    conn.finish_copy_from(&[]).await.unwrap();
+    conn.ok("rollback").await;
+}
+
+#[tokio::test]
 async fn copy_from_stdin_csv_skips_header_and_splits_chunks() {
     let (_server, mut conn) = server_with_table().await;
 
