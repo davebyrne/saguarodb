@@ -622,7 +622,7 @@ impl Session {
                 query,
                 param_types,
             } if !self.failed => {
-                let result = self.process_parse(name, query, &param_types);
+                let result = self.process_parse(name, query, &param_types).await;
                 self.reply_or_fail(stream, codec, result).await?;
             }
             ClientMessage::Bind {

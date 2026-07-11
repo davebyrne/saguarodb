@@ -875,7 +875,20 @@ impl QueryService {
         sql: &str,
         declared_param_types: &[Option<PgType>],
     ) -> Result<PreparedStatement> {
+        self.prepare_sql_cancelable(sql, declared_param_types, &QueryCancel::new())
+    }
+
+    /// Cancelable preparation for extended-protocol `Parse`. In particular, the
+    /// schema guard wait must not outlive the statement timer.
+    pub fn prepare_sql_cancelable(
+        &self,
+        sql: &str,
+        declared_param_types: &[Option<PgType>],
+        cancel: &QueryCancel,
+    ) -> Result<PreparedStatement> {
+        cancel.check()?;
         let statement = parser::parse(sql)?;
+        cancel.check()?;
         let class = statement_class(&statement)?;
         if let StatementClass::Copy(_) = class {
             // COPY needs the simple-query COPY sub-protocol; PostgreSQL likewise
@@ -945,18 +958,23 @@ impl QueryService {
                 result_columns,
             });
         }
-        let _schema_guard = self.components.concurrency.begin_shared()?;
+        let _schema_guard = self
+            .components
+            .concurrency
+            .begin_shared_cancelable(cancel)?;
         let (bound, param_types) = bind_parameterized_with_pg_types(
             &statement,
             self.components.catalog.as_ref(),
             declared_param_types,
         )?;
+        cancel.check()?;
         // Remember each parameter's wire type so `ParameterDescription` echoes the
         // OID the client declared, or the more specific wire type inferred from
         // catalog function arguments.
         let param_pg_types = collect_param_pg_types(&bound, &param_types, declared_param_types)?;
         let schema_versions = prepared_schema_versions(&bound, self.components.catalog.as_ref())?;
         let result_columns = result_columns(&bound);
+        cancel.check()?;
         Ok(PreparedStatement {
             sql: sql.to_string(),
             class,

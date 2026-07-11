@@ -506,7 +506,7 @@ impl Session {
         }
     }
 
-    pub(super) fn process_parse(
+    pub(super) async fn process_parse(
         &mut self,
         name: String,
         query: String,
@@ -516,7 +516,13 @@ impl Session {
             .iter()
             .map(|oid| oid_to_pg_type(*oid))
             .collect::<Result<Vec<_>>>()?;
-        let prepared = self.app.query_service.prepare_sql(&query, &declared)?;
+        let service = self.app.query_service.clone();
+        let cancel = self.cancel.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            service.prepare_sql_cancelable(&query, &declared, cancel.as_ref())
+        })
+        .await
+        .map_err(|_| DbError::internal("statement preparation panicked"))??;
         self.cancel.check()?;
         self.prepared.insert(name, Arc::new(prepared));
         Ok(vec![ServerMessage::ParseComplete])

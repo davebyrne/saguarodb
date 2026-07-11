@@ -388,6 +388,7 @@ pub trait ConcurrencyController: Send + Sync {
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
     fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard>;
     fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
+    fn begin_shared_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
 }
 
 pub struct RwLockConcurrencyController { /* parking_lot::RwLock<()> */ }

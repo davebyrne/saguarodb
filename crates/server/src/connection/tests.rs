@@ -90,8 +90,8 @@ fn program_limit_exceeded_maps_to_sqlstate_54000() {
     assert_eq!(sqlstate_code(SqlState::ProgramLimitExceeded), "54000");
 }
 
-#[test]
-fn extended_control_work_does_not_publish_after_cancellation() {
+#[tokio::test]
+async fn extended_control_work_does_not_publish_after_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
     let mut session = Session::new(app);
@@ -99,6 +99,7 @@ fn extended_control_work_does_not_publish_after_cancellation() {
     session.cancel.request(CancelReason::StatementTimeout);
     let err = session
         .process_parse("timed_out".to_string(), "select 1".to_string(), &[])
+        .await
         .unwrap_err();
     assert_eq!(err.code, SqlState::QueryCanceled);
     assert!(!session.prepared.contains_key("timed_out"));
@@ -106,6 +107,7 @@ fn extended_control_work_does_not_publish_after_cancellation() {
     session.cancel.reset();
     session
         .process_parse("statement".to_string(), "select 1".to_string(), &[])
+        .await
         .unwrap();
     session.cancel.request(CancelReason::StatementTimeout);
     let err = session
@@ -141,7 +143,9 @@ async fn extended_control_error_marks_open_transaction_failed() {
     assert_eq!(session.tx, TransactionState::InTransaction);
 
     session.cancel.request(CancelReason::StatementTimeout);
-    let result = session.process_parse("timed_out".to_string(), "select 1".to_string(), &[]);
+    let result = session
+        .process_parse("timed_out".to_string(), "select 1".to_string(), &[])
+        .await;
     session
         .reply_or_fail(&mut server_stream, &codec, result)
         .await
@@ -149,6 +153,32 @@ async fn extended_control_error_marks_open_transaction_failed() {
 
     assert_eq!(session.tx, TransactionState::Failed);
     assert!(session.txn.as_ref().unwrap().is_failed());
+}
+
+#[tokio::test]
+async fn extended_parse_schema_guard_wait_is_cancelable() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let exclusive = app.components.concurrency.begin_checkpoint().unwrap();
+    let mut session = Session::new(app);
+    let cancel = session.cancel.clone();
+    let request = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        cancel.request(CancelReason::StatementTimeout);
+    });
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.process_parse("blocked".to_string(), "select 1".to_string(), &[]),
+    )
+    .await
+    .expect("Parse should observe cancellation while waiting for the schema guard")
+    .unwrap_err();
+
+    assert_eq!(err.code, SqlState::QueryCanceled);
+    assert!(!session.prepared.contains_key("blocked"));
+    request.await.unwrap();
+    drop(exclusive);
 }
 
 #[test]

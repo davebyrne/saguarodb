@@ -444,7 +444,8 @@ while retaining the declared `PgType`, or an unambiguous catalog-function
 argument `PgType` for unspecified parameters, for `ParameterDescription` and
 selected parameter result metadata), caches referenced table/view schema
 versions for bound data statements, and replies `ParseComplete`. Cancellation
-is checked after preparing and before publishing the named statement. `Bind` decodes
+is checked during the blocking-pool schema-guard wait and binding work, then again
+before publishing the named statement. `Bind` decodes
 each parameter value (text or binary, per the Bind format codes, via the
 declared `PgType`) into a portal
 and checks cancellation before publishing it, then replies `BindComplete`.

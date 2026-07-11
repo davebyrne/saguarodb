@@ -55,6 +55,12 @@ pub trait ConcurrencyController: Send + Sync {
     fn begin_shared(&self) -> Result<WriteGuard> {
         self.begin_writer()
     }
+
+    /// Cancelable shared acquisition for foreground non-writing exclusion
+    /// participants such as extended-protocol statement preparation.
+    fn begin_shared_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard> {
+        self.begin_writer_cancelable(cancel)
+    }
 }
 
 #[derive(Debug)]
