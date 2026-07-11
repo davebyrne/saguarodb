@@ -29,15 +29,19 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         let column_formats = vec![0i16; job.columns.len()];
-        write_messages(
-            stream,
-            codec,
-            &[ServerMessage::CopyInResponse {
-                overall_format: 0,
-                column_formats,
-            }],
+        wait_cancelable(
+            self.cancel.as_ref(),
+            write_messages(
+                stream,
+                codec,
+                &[ServerMessage::CopyInResponse {
+                    overall_format: 0,
+                    column_formats,
+                }],
+            ),
         )
-        .await?;
+        .await
+        .and_then(|result| result)?;
 
         // A bounded channel gives TCP backpressure: when the insert task lags, the
         // forwarder's `send` awaits and the socket read stalls.
@@ -251,15 +255,19 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         let column_formats = vec![0i16; job.columns.len()];
-        write_messages(
-            stream,
-            codec,
-            &[ServerMessage::CopyOutResponse {
-                overall_format: 0,
-                column_formats,
-            }],
+        wait_cancelable(
+            self.cancel.as_ref(),
+            write_messages(
+                stream,
+                codec,
+                &[ServerMessage::CopyOutResponse {
+                    overall_format: 0,
+                    column_formats,
+                }],
+            ),
         )
-        .await?;
+        .await
+        .and_then(|result| result)?;
 
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(8);
         let service = self.app.query_service.clone();

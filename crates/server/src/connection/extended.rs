@@ -606,7 +606,12 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         match result {
-            Ok(messages) => write_messages(stream, codec, &messages).await,
+            Ok(messages) => wait_cancelable(
+                self.cancel.as_ref(),
+                write_messages(stream, codec, &messages),
+            )
+            .await
+            .and_then(|result| result),
             Err(err) => {
                 self.stop_statement_timer().await;
                 self.failed = true;

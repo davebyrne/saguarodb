@@ -15,6 +15,11 @@ are reclaimed by VACUUM like any aborted xid.
 
 This promotes savepoints from a documented non-goal to an implemented feature.
 
+A pending statement cancellation is checked before SAVEPOINT, RELEASE, or
+ROLLBACK TO mutates the savepoint stack or allocates/deregisters subxids. The
+statement returns `QueryCanceled`, poisons the existing transaction, and leaves
+the stack and live-subxid set unchanged.
+
 ### Supported (full PostgreSQL semantics)
 
 - `SAVEPOINT <name>` — establish a savepoint (open a subtransaction).

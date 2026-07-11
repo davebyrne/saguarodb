@@ -52,15 +52,10 @@ impl PlanExecutor for SortOp<'_> {
             keyed.push((row, keys));
         }
         self.ctx.cancel.check()?;
-        keyed.sort_by(|left, right| {
-            if self.ctx.cancel.reason().is_some() {
-                // Once canceled, make the remaining comparisons cheap; the check
-                // immediately below returns the reason-specific error.
-                Ordering::Equal
-            } else {
-                compare_keys(&left.1, &right.1, &self.order_by)
-            }
-        });
+        // `sort_by` requires one stable total ordering for the whole call. Do not
+        // change comparator behavior when cancellation arrives mid-sort; observe
+        // it immediately after the sort instead.
+        keyed.sort_by(|left, right| compare_keys(&left.1, &right.1, &self.order_by));
         self.ctx.cancel.check()?;
         self.rows = keyed.into_iter().map(|(row, _)| row).collect();
         Ok(())

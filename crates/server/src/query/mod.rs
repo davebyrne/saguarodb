@@ -4036,6 +4036,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_cancellation_does_not_mutate_savepoint_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let cancel = Arc::new(QueryCancel::new());
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let active_before = app.components.active_txns.active_ids();
+
+        cancel.request(CancelReason::StatementTimeout);
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("savepoint s", slot, &cancel);
+
+        assert_eq!(result.unwrap_err().code, SqlState::QueryCanceled);
+        let txn = slot.expect("canceled savepoint keeps the failed transaction");
+        assert!(txn.failed);
+        assert!(txn.savepoints.is_empty());
+        assert!(txn.live_subxids.is_empty());
+        assert_eq!(app.components.active_txns.active_ids(), active_before);
+    }
+
+    #[tokio::test]
     async fn begin_inside_transaction_is_a_noop_warning_staying_in_t() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
