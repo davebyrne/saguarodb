@@ -2992,6 +2992,38 @@ mod tests {
     }
 
     #[test]
+    fn relation_publish_gate_wait_is_cancelable() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app_with_parts(
+            dir.path(),
+            Config::default(),
+            Arc::new(MemoryCatalog::empty()),
+            Arc::new(FileWalManager::open(dir.path().join("wal.dat")).unwrap()),
+            Arc::new(
+                control::FileControlStore::open(dir.path(), buffer::PAGE_SIZE as u32).unwrap(),
+            ),
+            Arc::new(RwLockConcurrencyController::new()),
+        );
+        let gate = app.components.relation_publish_gate.write().unwrap();
+        let service = app.query_service.clone();
+        let cancel = Arc::new(QueryCancel::new());
+        let waiter_cancel = cancel.clone();
+        let waiter = std::thread::spawn(move || {
+            service.capture_consistent_snapshots_cancelable(0, waiter_cancel.as_ref())
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        cancel.request(CancelReason::StatementTimeout);
+        let err = match waiter.join().unwrap() {
+            Err(err) => err,
+            Ok(_) => panic!("snapshot capture unexpectedly acquired the publish gate"),
+        };
+
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        drop(gate);
+    }
+
+    #[test]
     fn snapshot_capture_drops_relation_gate_while_waiting_for_schema_exclusion() {
         let dir = tempfile::tempdir().unwrap();
         let app = app_with_parts(
@@ -4075,6 +4107,38 @@ mod tests {
         assert!(txn.savepoints.is_empty());
         assert!(txn.live_subxids.is_empty());
         assert_eq!(app.components.active_txns.active_ids(), active_before);
+    }
+
+    #[test]
+    fn completed_savepoint_has_an_authoritative_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let cancel = Arc::new(QueryCancel::new());
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let session = super::QuerySessionContext::new(
+            cancel.clone(),
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+            Arc::new(super::SessionGucs::default()),
+        );
+        let (row_tx, _row_rx) = tokio::sync::mpsc::channel(1);
+
+        let (slot, _, outcome) = app.query_service.execute_simple_streamed(
+            "savepoint s",
+            slot,
+            IsolationLevel::default(),
+            session,
+            row_tx,
+        );
+
+        assert!(matches!(outcome, Ok(super::StreamOutcome::Durable(_))));
+        let (_, result) = app
+            .query_service
+            .execute_simple_default("rollback", slot, &cancel);
+        result.unwrap();
     }
 
     #[tokio::test]

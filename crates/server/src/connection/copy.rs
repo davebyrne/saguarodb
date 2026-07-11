@@ -116,7 +116,7 @@ impl Session {
     where
         S: AsyncWrite + Unpin,
     {
-        let copy = self
+        let mut copy = self
             .copy_in
             .take()
             .expect("finish_copy_in called with no active COPY");
@@ -130,7 +130,10 @@ impl Session {
             .await;
         }
         let insert_failed = copy.insert_failed;
-        let sender = copy.sender.expect("running COPY has an input sender");
+        let sender = copy
+            .sender
+            .take()
+            .expect("running COPY has an input sender");
         if !insert_failed {
             // Signal a clean end (`Done` → commit) or a client abort (`Fail`).
             let signal = if fail_message.is_some() {
@@ -141,7 +144,7 @@ impl Session {
             let _ = sender.send(signal).await;
         }
         drop(sender);
-        let task = copy.task.expect("running COPY has a worker task");
+        let task = copy.task.take().expect("running COPY has a worker task");
         let (txn, result) = match task.await {
             Ok(pair) => pair,
             Err(join_err) => (
@@ -154,6 +157,9 @@ impl Session {
         let status = self.status_byte();
         let success_is_durable = self.txn.is_none();
         self.end_activity();
+        // Database work is complete. Like ordinary query paths, do not let a
+        // blocked terminal socket write keep graceful shutdown waiting.
+        drop(copy.guard.take());
 
         let response = match result {
             Ok(count) => {
@@ -254,9 +260,9 @@ impl Session {
         codec: &PostgresCodec,
         job: CopyJob,
         snapshots: CopySnapshots,
-        // Held for the COPY's lifetime so it counts as an in-flight query during the
-        // streaming scan; dropped when this returns.
-        _guard: InFlightQueryGuard,
+        // Held while the producer is active so the streaming scan counts as an
+        // in-flight query. Released after its join, before terminal socket writes.
+        guard: InFlightQueryGuard,
     ) -> Result<()>
     where
         S: AsyncWrite + Unpin,
@@ -328,6 +334,9 @@ impl Session {
         }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
+        // The producer and transaction are settled even if the client stops reading
+        // before CopyDone/CommandComplete/ReadyForQuery.
+        drop(guard);
 
         if let Some(err) = write_err {
             self.end_activity();

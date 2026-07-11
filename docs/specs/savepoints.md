@@ -18,7 +18,10 @@ This promotes savepoints from a documented non-goal to an implemented feature.
 A pending statement cancellation is checked before SAVEPOINT, RELEASE, or
 ROLLBACK TO mutates the savepoint stack or allocates/deregisters subxids. The
 statement returns `QueryCanceled`, poisons the existing transaction, and leaves
-the stack and live-subxid set unchanged.
+the stack and live-subxid set unchanged. Once a savepoint command completes its
+state mutation, that result is authoritative: cancellation observed later by the
+async protocol consumer cannot replace success or suppress ROLLBACK TO cursor
+cleanup.
 
 ### Supported (full PostgreSQL semantics)
 

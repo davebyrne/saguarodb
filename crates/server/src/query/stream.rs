@@ -66,9 +66,9 @@ pub(crate) enum StreamOutcome {
     /// Any non-streamed result — DML, DDL, EXPLAIN, or a SELECT run on the
     /// materializing path — returned in full.
     Direct(ExecutionResult),
-    /// A non-streamed autocommit result that crossed its durable/irreversible
-    /// completion boundary. A timeout noticed slightly later by the async
-    /// consumer must not replace this success with an error.
+    /// A non-streamed result that crossed its durable or irreversible session-state
+    /// completion boundary. A timeout noticed slightly later by the async consumer
+    /// must not replace this success with an error.
     Durable(ExecutionResult),
     /// `COPY ... FROM STDIN`: the connection loop sends `CopyInResponse` and
     /// streams client data while holding `snapshots` for the COPY lifetime.

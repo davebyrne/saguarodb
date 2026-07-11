@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use common::{
     CatalogIntrospectionProvider, DbError, IsolationLevel, QueryCancel, Result, SequenceManager,
@@ -775,11 +776,25 @@ impl QueryService {
             if let Some(cancel) = cancel {
                 cancel.check()?;
             }
-            let relation_publish_read = self
-                .components
-                .relation_publish_gate
-                .read()
-                .map_err(|_| DbError::internal("relation publish gate poisoned"))?;
+            let relation_publish_read = if let Some(cancel) = cancel {
+                loop {
+                    cancel.check()?;
+                    match self.components.relation_publish_gate.try_read() {
+                        Ok(guard) => break guard,
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            return Err(DbError::internal("relation publish gate poisoned"));
+                        }
+                    }
+                }
+            } else {
+                self.components
+                    .relation_publish_gate
+                    .read()
+                    .map_err(|_| DbError::internal("relation publish gate poisoned"))?
+            };
             let relation_epoch = self.components.storage.relation_epoch()?;
             let Some((snapshot, advertised)) =
                 self.try_capture_snapshot_for_transaction(own_txn, bypass_snapshot_exclusion)

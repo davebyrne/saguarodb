@@ -106,7 +106,7 @@ impl QueryService {
             }
             let (slot, default_isolation, result) =
                 self.handle_savepoint(statement, slot, default_isolation);
-            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+            return (slot, default_isolation, result.map(StreamOutcome::Durable));
         }
 
         if let StatementClass::SqlCursor = class {

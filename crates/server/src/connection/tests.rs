@@ -11,10 +11,11 @@ use common::{
 use protocol::{PostgresCodec, ServerMessage, StatementKind};
 
 use super::{
-    Session, StreamOutcome, TransactionState, apply_stream_consumer_cancel, encode_row,
-    handle_connection, resolve_result_formats, sqlstate_code, streamed_task_result,
+    CopyInSession, Session, StreamOutcome, TransactionState, apply_stream_consumer_cancel,
+    encode_row, handle_connection, resolve_result_formats, sqlstate_code, streamed_task_result,
 };
 use crate::app::AppState;
+use crate::query::CopyInChunk;
 
 #[test]
 fn transaction_state_maps_to_postgres_status_byte() {
@@ -107,6 +108,44 @@ async fn durable_terminal_response_ignores_late_cancellation() {
     let mut tag = [0; 1];
     reader.read_exact(&mut tag).await.unwrap();
     assert_eq!(tag, [b'C']);
+}
+
+#[tokio::test]
+async fn completed_copy_in_releases_guard_before_terminal_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let shutdown = app.components.shutdown.clone();
+    let mut session = Session::new(app);
+    let guard = shutdown.begin_query().unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        assert!(matches!(receiver.recv().await, Some(CopyInChunk::Done)));
+        (None, Ok(1))
+    });
+    session.copy_in = Some(CopyInSession {
+        sender: Some(sender),
+        task: Some(task),
+        insert_failed: false,
+        draining_after_cancel: false,
+        guard: Some(guard),
+    });
+    let codec = PostgresCodec::new();
+    // One byte lets the terminal frame start but keeps it blocked without a reader.
+    let (mut writer, _reader) = tokio::io::duplex(1);
+
+    let finish =
+        tokio::spawn(async move { session.finish_copy_in(&mut writer, &codec, None).await });
+
+    shutdown
+        .wait_for_idle(Duration::from_secs(1))
+        .await
+        .expect("joined COPY worker must release its in-flight guard");
+    assert!(
+        !finish.is_finished(),
+        "terminal response should still be blocked by the unread socket"
+    );
+    finish.abort();
+    let _ = finish.await;
 }
 
 #[test]
