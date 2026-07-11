@@ -76,8 +76,8 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
 
 - **Deadlock** → `SqlState::DeadlockDetected` (`40P01`); the statement errors and
   (inside a transaction block) poisons it to the failed state.
-- **Cancel** → `SqlState::QueryCanceled` (`57014`), from the existing
-  per-statement cancel flag.
+- **Cancel** → `SqlState::QueryCanceled` (`57014`), from the per-statement
+  cancellation token.
 
 ## 4. The lock manager & deadlock detection
 
@@ -98,7 +98,7 @@ When `wait_for(me, B)` returns (B has finished), the writer re-checks the row:
     (held as a local, *not* in the graph), because a partial `ROLLBACK TO` aborts and
     deregisters only that subxid — a waiter on it must then proceed even though the
     top is still live.
-  - `cancel` set → return `Err(QueryCanceled)`;
+  - `cancel.check()` fails → return `Err(QueryCanceled)` with the recorded reason;
   - `condvar.wait_timeout(poll_interval)`; accumulate elapsed; every
     `deadlock_timeout` of accumulated wait, run cycle detection from
     `top_of(waiter_subxid)`.
@@ -139,11 +139,11 @@ waiter to the next poll tick, never lose correctness.
 
 ## 5. Cancel & graceful shutdown
 
-The wait honors the per-statement cancel flag, polled on each `poll_interval` tick,
+The wait honors the per-statement cancellation token, polled on each `poll_interval` tick,
 so a blocked writer responds to a client `CancelRequest` within ~100 ms. The cancel
-flag is the connection's `Arc<AtomicBool>` (from `begin_cancelable`); since the
+token is the connection's `Arc<QueryCancel>` (from `cancel_token`); since the
 conflict point only has the `StatementContext` (not the `ExecutionContext` that
-currently borrows `&AtomicBool`), `StatementContext` carries the cancel handle as a
+currently borrows `&QueryCancel`), `StatementContext` carries the cancel handle as a
 field (§6) so the storage wait-loop can thread it into `wait_for`. A blocked writer
 keeps holding
 its `InFlightQueryGuard`, so graceful shutdown's `wait_for_idle` accounts for it
@@ -159,13 +159,13 @@ long-running statement — no new hang path.
   `WouldBlock(TxnId)` (carrying the in-flight creator's xid). The pure classifiers
   `write_conflict` / `classify_unique_conflict` return the blocker.
 - A `ConflictWaiter` trait in `common`; `StatementContext` carries
-  `Arc<dyn ConflictWaiter>` AND the cancel handle `Arc<AtomicBool>`. The default
+  `Arc<dyn ConflictWaiter>` AND the cancel handle `Arc<QueryCancel>`. The default
   `ConflictWaiter` (read/test contexts) **errors loudly** (`InternalError`) if its
   `wait_for` is ever actually called — a real `WouldBlock` must never reach it, so a
   mis-wired write context fails fast instead of spinning forever (`WouldBlock →
   no-op Ok → re-attempt → WouldBlock → …`). The server sets the real `LockManager`
   waiter and the connection's cancel `Arc` on every write-capable context. (Neither
-  `Arc<dyn ConflictWaiter>` nor `Arc<AtomicBool>` is `PartialEq`/`Eq`, so
+  `Arc<dyn ConflictWaiter>` nor `Arc<QueryCancel>` is `PartialEq`/`Eq`, so
   `StatementContext`'s derived `PartialEq`/`Eq` must be hand-rolled to exclude both
   new fields — comparing the existing value fields as today.)
 

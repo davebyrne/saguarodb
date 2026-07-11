@@ -4,8 +4,11 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use common::{ColumnInfo, DbError, Result, Row, SqlState};
+use common::{ColumnInfo, DbError, QueryCancel, Result, Row, SqlState};
 use executor::{CopyJob, ExecutionResult, RowSink};
 use tokio::sync::mpsc;
 
@@ -102,35 +105,59 @@ impl StreamOutcome {
 }
 
 /// A [`RowSink`] that forwards streamed SELECT output over a bounded channel to
-/// the async connection task. `blocking_send` applies backpressure (it blocks the
-/// producer thread while the channel is full); a dropped receiver (client gone)
-/// turns the next push into a graceful stop rather than an error, so a mere
-/// disconnect never poisons an open transaction. Mirrors the COPY-out driver.
+/// the async connection task. Retrying `try_send` applies backpressure while
+/// polling cancellation; a dropped receiver (client gone) turns the next push
+/// into a graceful stop rather than an error, so a mere disconnect never poisons
+/// an open transaction. Mirrors the COPY-out driver.
 pub(crate) struct ChannelRowSink {
     tx: mpsc::Sender<StreamMessage>,
+    cancel: Arc<QueryCancel>,
 }
 
 impl ChannelRowSink {
-    pub(crate) fn new(tx: mpsc::Sender<StreamMessage>) -> Self {
-        Self { tx }
+    pub(crate) fn new(tx: mpsc::Sender<StreamMessage>, cancel: Arc<QueryCancel>) -> Self {
+        Self { tx, cancel }
+    }
+
+    fn send(&self, message: StreamMessage) -> Result<bool> {
+        send_cancelable(&self.tx, self.cancel.as_ref(), message)
+    }
+}
+
+pub(crate) fn send_cancelable<T>(
+    sender: &mpsc::Sender<T>,
+    cancel: &QueryCancel,
+    mut message: T,
+) -> Result<bool> {
+    loop {
+        cancel.check()?;
+        match sender.try_send(message) {
+            Ok(()) => return Ok(true),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                cancel.check()?;
+                return Ok(false);
+            }
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                message = returned;
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
 impl RowSink for ChannelRowSink {
     fn start(&mut self, columns: &[ColumnInfo]) -> Result<()> {
-        // Best effort: if the receiver is already gone the connection is dead, and
-        // the first `push` will stop the scan. There is no useful error to raise.
-        let _ = self.tx.blocking_send(StreamMessage::Start {
+        let _ = self.send(StreamMessage::Start {
             columns: columns.to_vec(),
-        });
+        })?;
         Ok(())
     }
 
     fn push(&mut self, rows: Vec<Row>) -> Result<ControlFlow<()>> {
-        match self.tx.blocking_send(StreamMessage::Rows(rows)) {
-            Ok(()) => Ok(ControlFlow::Continue(())),
-            // Receiver dropped: the consumer is gone. Stop gracefully.
-            Err(_) => Ok(ControlFlow::Break(())),
+        if self.send(StreamMessage::Rows(rows))? {
+            Ok(ControlFlow::Continue(()))
+        } else {
+            Ok(ControlFlow::Break(()))
         }
     }
 }

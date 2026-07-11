@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use common::{
-    CatalogIntrospectionProvider, DbError, IsolationLevel, Result, SequenceManager, SessionInfo,
-    SessionSequenceState, Snapshot, SqlState, StatementContext, SystemStateProvider,
+    CatalogIntrospectionProvider, DbError, IsolationLevel, QueryCancel, Result, SequenceManager,
+    SessionInfo, SessionSequenceState, Snapshot, SqlState, StatementContext, SystemStateProvider,
     no_catalog_introspection, no_system_state,
 };
 use executor::{ExecutionContext, ExecutionResult};
@@ -12,14 +12,14 @@ use storage::{RelationSnapshot, StorageEngine};
 use wal::{WalRecord, WalRecordKind};
 
 use super::{
-    QueryService, SavepointLevel, Transaction, TransactionControl, begin_complete, commit_complete,
-    release_complete, rollback_complete, savepoint_complete, set_complete,
+    QueryService, SavepointLevel, SessionGucs, Transaction, TransactionControl, begin_complete,
+    commit_complete, release_complete, rollback_complete, savepoint_complete, set_complete,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::AdvertisedSnapshot;
 
 pub(super) struct StatementRuntime<'a> {
-    cancel: &'a Arc<AtomicBool>,
+    pub(super) cancel: &'a Arc<QueryCancel>,
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     system_state: Arc<dyn SystemStateProvider>,
@@ -50,7 +50,7 @@ pub(super) struct ExecutionContextInput<'a> {
 
 impl<'a> StatementRuntime<'a> {
     pub(super) fn new(
-        cancel: &'a Arc<AtomicBool>,
+        cancel: &'a Arc<QueryCancel>,
         session_sequences: Arc<SessionSequenceState>,
         session_info: Arc<SessionInfo>,
     ) -> Self {
@@ -109,7 +109,8 @@ impl QueryService {
         kind: TransactionControl,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        _cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
+        gucs: &SessionGucs,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         match kind {
             TransactionControl::Begin(isolation) => match slot {
@@ -136,10 +137,19 @@ impl QueryService {
             }
             TransactionControl::Commit => match slot {
                 // COMMIT of a healthy transaction commits durably.
-                Some(txn) if !txn.failed => {
+                Some(mut txn) if !txn.failed => {
+                    if let Err(err) = cancel.check() {
+                        txn.failed = true;
+                        return (Some(txn), default_isolation, Err(err));
+                    }
                     let committed_default = txn.committed_default_isolation(default_isolation);
-                    let result = self.commit_transaction(txn).map(|()| commit_complete());
+                    let committed_statement_timeout =
+                        txn.committed_statement_timeout_ms(gucs.statement_timeout_ms());
+                    let result = self
+                        .commit_transaction(txn, cancel.as_ref())
+                        .map(|()| commit_complete());
                     let default_isolation = if result.is_ok() {
+                        gucs.set("statement_timeout", committed_statement_timeout.to_string());
                         committed_default
                     } else {
                         default_isolation
@@ -212,6 +222,7 @@ impl QueryService {
                     name,
                     subxid,
                     default_isolation_override: txn.default_isolation_override,
+                    statement_timeout_override: txn.statement_timeout_override,
                 });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
             }
@@ -248,6 +259,8 @@ impl QueryService {
                         let level_subxid = txn.savepoints[idx].subxid;
                         let default_isolation_override =
                             txn.savepoints[idx].default_isolation_override;
+                        let statement_timeout_override =
+                            txn.savepoints[idx].statement_timeout_override;
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -258,6 +271,7 @@ impl QueryService {
                         txn.live_subxids.retain(|&s| s < level_subxid);
                         txn.savepoints.truncate(idx);
                         txn.default_isolation_override = default_isolation_override;
+                        txn.statement_timeout_override = statement_timeout_override;
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -266,6 +280,7 @@ impl QueryService {
                             name,
                             subxid: fresh,
                             default_isolation_override,
+                            statement_timeout_override,
                         });
                         // ROLLBACK TO recovers a failed ('E') block to this savepoint.
                         txn.failed = false;
@@ -399,6 +414,7 @@ impl QueryService {
             txn_id,
             isolation,
             default_isolation_override: None,
+            statement_timeout_override: None,
             first_statement_ran: false,
             failed: false,
             write_guard: None,
@@ -424,7 +440,11 @@ impl QueryService {
     /// catches a routing regression that would leak a second guard, which would keep
     /// a writer in flight past commit/abort and could stall a checkpoint waiting to
     /// drain.
-    pub(super) fn acquire_write_guard(&self, txn: &mut Transaction) -> Result<()> {
+    pub(super) fn acquire_write_guard(
+        &self,
+        txn: &mut Transaction,
+        cancel: &QueryCancel,
+    ) -> Result<()> {
         if txn.write_guard.is_some() {
             debug_assert!(
                 false,
@@ -435,7 +455,10 @@ impl QueryService {
                 "duplicate write-guard acquisition (transaction already holds a writer guard)",
             ));
         }
-        let guard = self.components.concurrency.begin_writer()?;
+        let guard = self
+            .components
+            .concurrency
+            .begin_writer_cancelable(cancel)?;
         txn.write_guard = Some(guard);
         Ok(())
     }
@@ -463,7 +486,7 @@ impl QueryService {
         }
     }
 
-    fn commit_transaction(&self, txn: Transaction) -> Result<()> {
+    fn commit_transaction(&self, txn: Transaction, cancel: &QueryCancel) -> Result<()> {
         let txn_id = txn.txn_id;
         let isolation = txn.isolation;
         let dead_versions = txn.dead_versions_pending;
@@ -495,6 +518,17 @@ impl QueryService {
         {
             // Abort the whole family (mirroring the flush-failure path) and drop its
             // SSI state, then surface 40001.
+            self.abort_subxids(&txn.live_subxids);
+            self.rollback_pre_durable_or_die(txn_id, None);
+            self.ssi_finish(txn_id, isolation, false);
+            return Err(err);
+        }
+
+        // The outer transaction-control gate catches already-expired statements;
+        // check again after SSI work at the last safe boundary before the durable
+        // commit record. Once that record is flushed, cancellation must not turn a
+        // committed transaction into an error.
+        if let Err(err) = cancel.check() {
             self.abort_subxids(&txn.live_subxids);
             self.rollback_pre_durable_or_die(txn_id, None);
             self.ssi_finish(txn_id, isolation, false);
@@ -641,6 +675,7 @@ impl QueryService {
     pub(super) fn snapshots_for_transaction(
         &self,
         txn: &mut Transaction,
+        cancel: &QueryCancel,
     ) -> Result<TransactionSnapshots> {
         match txn.isolation {
             IsolationLevel::ReadCommitted => {
@@ -652,6 +687,7 @@ impl QueryService {
                 } = self.capture_consistent_snapshots_with_exclusion_bypass(
                     txn.txn_id,
                     bypass_snapshot_exclusion,
+                    Some(cancel),
                 )?;
                 Ok(TransactionSnapshots {
                     snapshot,
@@ -673,8 +709,10 @@ impl QueryService {
                         snapshot,
                         relations,
                         advertised,
-                    } =
-                        self.capture_consistent_snapshots_allowing_missing_table_reads(txn.txn_id)?;
+                    } = self.capture_consistent_snapshots_allowing_missing_table_reads(
+                        txn.txn_id,
+                        Some(cancel),
+                    )?;
                     txn.rr_snapshot = Some(snapshot.clone());
                     txn.rr_relations = Some(relations.clone());
                     // Hold the advertisement for the transaction's life (released
@@ -691,23 +729,39 @@ impl QueryService {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn capture_consistent_snapshots(&self, own_txn: u64) -> Result<CapturedSnapshots> {
-        self.capture_consistent_snapshots_with_options(own_txn, false, false)
+        self.capture_consistent_snapshots_with_options(own_txn, false, false, None)
+    }
+
+    pub(super) fn capture_consistent_snapshots_cancelable(
+        &self,
+        own_txn: u64,
+        cancel: &QueryCancel,
+    ) -> Result<CapturedSnapshots> {
+        self.capture_consistent_snapshots_with_options(own_txn, false, false, Some(cancel))
     }
 
     fn capture_consistent_snapshots_allowing_missing_table_reads(
         &self,
         own_txn: u64,
+        cancel: Option<&QueryCancel>,
     ) -> Result<CapturedSnapshots> {
-        self.capture_consistent_snapshots_with_options(own_txn, false, true)
+        self.capture_consistent_snapshots_with_options(own_txn, false, true, cancel)
     }
 
     fn capture_consistent_snapshots_with_exclusion_bypass(
         &self,
         own_txn: u64,
         bypass_snapshot_exclusion: bool,
+        cancel: Option<&QueryCancel>,
     ) -> Result<CapturedSnapshots> {
-        self.capture_consistent_snapshots_with_options(own_txn, bypass_snapshot_exclusion, false)
+        self.capture_consistent_snapshots_with_options(
+            own_txn,
+            bypass_snapshot_exclusion,
+            false,
+            cancel,
+        )
     }
 
     fn capture_consistent_snapshots_with_options(
@@ -715,8 +769,12 @@ impl QueryService {
         own_txn: u64,
         bypass_snapshot_exclusion: bool,
         missing_table_reads_are_empty: bool,
+        cancel: Option<&QueryCancel>,
     ) -> Result<CapturedSnapshots> {
         loop {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let relation_publish_read = self
                 .components
                 .relation_publish_gate
@@ -727,9 +785,15 @@ impl QueryService {
                 self.try_capture_snapshot_for_transaction(own_txn, bypass_snapshot_exclusion)
             else {
                 drop(relation_publish_read);
-                self.components
-                    .active_txns
-                    .wait_for_snapshot_exclusion_clear();
+                if let Some(cancel) = cancel {
+                    self.components
+                        .active_txns
+                        .wait_for_snapshot_exclusion_clear_cancelable(cancel)?;
+                } else {
+                    self.components
+                        .active_txns
+                        .wait_for_snapshot_exclusion_clear();
+                }
                 continue;
             };
             let relations = match if missing_table_reads_are_empty {
@@ -969,7 +1033,7 @@ impl QueryService {
         std::process::exit(1);
     }
 
-    fn fatal_pre_durable_rollback_failure(&self, err: DbError) -> ! {
+    pub(super) fn fatal_pre_durable_rollback_failure(&self, err: DbError) -> ! {
         eprintln!("fatal rollback failure before durable commit: {err}");
         let _ = self.components.wal.flush();
         std::process::exit(1);

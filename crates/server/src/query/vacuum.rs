@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-use common::{DbError, RelationKind, Result, SqlState, StatementContext, TableSchema};
+use common::{DbError, QueryCancel, RelationKind, Result, SqlState, StatementContext, TableSchema};
 use executor::ExecutionResult;
 use parser::Statement;
 use storage::StorageEngine;
@@ -17,29 +17,37 @@ impl QueryService {
     pub(super) fn run_prepared_maintenance(
         &self,
         prepared: &PreparedStatement,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
             DbError::internal("maintenance prepared statement has no carried payload")
         })?;
-        self.run_maintenance(statement.clone())
+        self.run_maintenance(statement.clone(), cancel)
     }
 
     /// Shared entry point for every maintenance command: dispatches to the
     /// statement-specific implementation. Both the simple-query and
     /// extended-protocol paths route maintenance through this one router.
-    pub(super) fn run_maintenance(&self, statement: Statement) -> Result<ExecutionResult> {
+    pub(super) fn run_maintenance(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<ExecutionResult> {
+        cancel.check()?;
         match &statement {
-            Statement::Vacuum { .. } => self.run_vacuum(statement),
-            Statement::Truncate { .. } => self.run_truncate(statement),
+            Statement::Vacuum { .. } => self.run_vacuum(statement, cancel),
+            Statement::Truncate { .. } => self.run_truncate(statement, cancel),
             Statement::AlterTableSetCompression { .. } => {
-                self.run_alter_table_compression(statement)
+                self.run_alter_table_compression(statement, cancel)
             }
-            Statement::AlterTableSetOptions { .. } => self.run_alter_table_toast_options(statement),
+            Statement::AlterTableSetOptions { .. } => {
+                self.run_alter_table_toast_options(statement, cancel)
+            }
             Statement::AlterTableAddPrimaryKey { .. } => {
-                self.run_alter_table_add_primary_key(statement)
+                self.run_alter_table_add_primary_key(statement, cancel)
             }
             Statement::AlterTableDropPrimaryKey { .. } => {
-                self.run_alter_table_drop_primary_key(statement)
+                self.run_alter_table_drop_primary_key(statement, cancel)
             }
             _ => Err(DbError::internal(
                 "run_maintenance called with a non-maintenance statement",
@@ -65,7 +73,11 @@ impl QueryService {
     /// AFTER acquiring the guard is load-bearing: it cannot then be advanced by a
     /// concurrent writer/commit, and it already accounts for every reader advertised at
     /// that instant. VACUUM therefore never reclaims a version any snapshot needs.
-    pub(super) fn run_vacuum(&self, statement: Statement) -> Result<ExecutionResult> {
+    pub(super) fn run_vacuum(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<ExecutionResult> {
         let Statement::Vacuum { table } = statement else {
             return Err(DbError::internal(
                 "run_vacuum called with a non-VACUUM statement",
@@ -78,7 +90,10 @@ impl QueryService {
         // the shared writer guard, which is excluded here). The guard is released when
         // `_guard` drops at return. Resolving the target table(s) under the guard —
         // like `run_checkpoint` — means the resolved schema is stable for the pass.
-        let _guard = self.components.concurrency.begin_checkpoint()?;
+        let _guard = self
+            .components
+            .concurrency
+            .begin_checkpoint_cancelable(cancel)?;
 
         // Capture the horizon ONCE, AFTER the guard is held (see the method doc): it is
         // the min advertised snapshot `xmin`, so no version a live snapshot can see is
@@ -103,7 +118,12 @@ impl QueryService {
                     })?;
                 // Single-table pass: reclaim `t`'s dead versions but DO NOT advance the
                 // vacuum floor (other tables may still hold aborted-creator tuples).
-                vacuum_tables(&self.components, std::slice::from_ref(&schema), horizon)?;
+                vacuum_tables(
+                    &self.components,
+                    std::slice::from_ref(&schema),
+                    horizon,
+                    Some(cancel),
+                )?;
             }
             None => {
                 // Full pass: capture the boundary BEFORE the pass and advance the vacuum
@@ -111,7 +131,7 @@ impl QueryService {
                 // reclamation becomes durable in the NEXT checkpoint, which flushes all
                 // dirty pages before its `persist_clog` consults the floor, so no
                 // aborted entry is dropped from the snapshot while its tuples remain on disk.
-                full_vacuum_pass(&self.components, horizon)?;
+                full_vacuum_pass_cancelable(&self.components, horizon, cancel)?;
             }
         }
 
@@ -141,22 +161,53 @@ fn vacuum_tables(
     components: &ServerComponents,
     tables: &[TableSchema],
     horizon: u64,
+    cancel: Option<&Arc<QueryCancel>>,
 ) -> Result<()> {
     for schema in tables {
-        let cleanup_txn = delete_toast_values_pending_parent_vacuum(components, schema, horizon)?;
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
+        let cleanup_txn =
+            delete_toast_values_pending_parent_vacuum(components, schema, horizon, cancel)?;
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         if schema.toast_table_id.is_some() {
+            if let Some(cancel) = cancel {
+                components.storage.vacuum_after_toast_cleanup_cancelable(
+                    schema,
+                    horizon,
+                    cancel.as_ref(),
+                )?;
+            } else {
+                components
+                    .storage
+                    .vacuum_after_toast_cleanup(schema, horizon)?;
+            }
+        } else if let Some(cancel) = cancel {
             components
                 .storage
-                .vacuum_after_toast_cleanup(schema, horizon)?;
+                .vacuum_cancelable(schema, horizon, cancel.as_ref())?;
         } else {
             components.storage.vacuum(schema, horizon)?;
+        }
+        if let Some(cancel) = cancel {
+            cancel.check()?;
         }
         let toast_horizon = cleanup_txn
             .map(|txn_id| horizon.max(txn_id.saturating_add(1)))
             .unwrap_or(horizon);
-        components
-            .storage
-            .vacuum_hidden_toast_relation(schema, toast_horizon)?;
+        if let Some(cancel) = cancel {
+            components.storage.vacuum_hidden_toast_relation_cancelable(
+                schema,
+                toast_horizon,
+                cancel.as_ref(),
+            )?;
+        } else {
+            components
+                .storage
+                .vacuum_hidden_toast_relation(schema, toast_horizon)?;
+        }
     }
     Ok(())
 }
@@ -165,10 +216,16 @@ fn delete_toast_values_pending_parent_vacuum(
     components: &ServerComponents,
     schema: &TableSchema,
     horizon: u64,
+    cancel: Option<&Arc<QueryCancel>>,
 ) -> Result<Option<u64>> {
-    let value_ids = components
-        .storage
-        .toast_value_ids_pending_vacuum(schema, horizon)?;
+    let value_ids = match cancel {
+        Some(cancel) => components
+            .storage
+            .toast_value_ids_pending_vacuum_cancelable(schema, horizon, cancel.as_ref())?,
+        None => components
+            .storage
+            .toast_value_ids_pending_vacuum(schema, horizon)?,
+    };
     if value_ids.is_empty() {
         return Ok(None);
     }
@@ -176,10 +233,11 @@ fn delete_toast_values_pending_parent_vacuum(
     let txn_id = components
         .active_txns
         .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
-    let ctx = StatementContext::new(txn_id).with_conflict_waiter(
-        components.lock_manager.clone(),
-        Arc::new(AtomicBool::new(false)),
-    );
+    let cleanup_cancel = cancel
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::new(QueryCancel::new()));
+    let ctx = StatementContext::new(txn_id)
+        .with_conflict_waiter(components.lock_manager.clone(), cleanup_cancel);
 
     let deleted = match components
         .storage
@@ -195,6 +253,13 @@ fn delete_toast_values_pending_parent_vacuum(
         components.active_txns.deregister(txn_id);
         components.lock_manager.on_txn_finished();
         return Ok(None);
+    }
+
+    if let Some(cancel) = cancel
+        && let Err(err) = cancel.check()
+    {
+        rollback_toast_cleanup_txn_or_die(components, txn_id);
+        return Err(err);
     }
 
     if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
@@ -290,9 +355,28 @@ fn fatal_pre_durable_maintenance_rollback(err: DbError) -> ! {
 /// checkpoint; on-demand: a later checkpoint) is fsynced to the heap. No aborted entry
 /// is dropped from the snapshot while its reclaimed tuples are still only in memory.
 pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> Result<()> {
+    full_vacuum_pass_inner(components, horizon, None)
+}
+
+fn full_vacuum_pass_cancelable(
+    components: &ServerComponents,
+    horizon: u64,
+    cancel: &Arc<QueryCancel>,
+) -> Result<()> {
+    full_vacuum_pass_inner(components, horizon, Some(cancel))
+}
+
+fn full_vacuum_pass_inner(
+    components: &ServerComponents,
+    horizon: u64,
+    cancel: Option<&Arc<QueryCancel>>,
+) -> Result<()> {
     // Capture B BEFORE the pass, under the guard (no concurrent allocation).
     let boundary = components.next_txn_id.load(Ordering::Acquire);
-    vacuum_all_user_tables(components, horizon)?;
+    vacuum_all_user_tables(components, horizon, cancel)?;
+    if let Some(cancel) = cancel {
+        cancel.check()?;
+    }
     // Advance the floor only AFTER the pass has reclaimed every aborted-creator tuple
     // below B. Monotonic; persisted in `clog.dat` and reloaded at open (falls back to the
     // conservative value when no snapshot is present) — see `WalManager::set_vacuum_floor`.
@@ -303,12 +387,16 @@ pub(crate) fn full_vacuum_pass(components: &ServerComponents, horizon: u64) -> R
 /// Same caller contract as [`vacuum_tables`]: the exclusive guard is held and
 /// `horizon` was captured under it. This does NOT advance the vacuum floor; callers
 /// that perform a *full* pass and want the floor advanced use [`full_vacuum_pass`].
-fn vacuum_all_user_tables(components: &ServerComponents, horizon: u64) -> Result<()> {
+fn vacuum_all_user_tables(
+    components: &ServerComponents,
+    horizon: u64,
+    cancel: Option<&Arc<QueryCancel>>,
+) -> Result<()> {
     let tables: Vec<_> = components
         .catalog
         .list_tables()?
         .into_iter()
         .filter(|schema| matches!(&schema.relation_kind, RelationKind::User))
         .collect();
-    vacuum_tables(components, &tables, horizon)
+    vacuum_tables(components, &tables, horizon, cancel)
 }

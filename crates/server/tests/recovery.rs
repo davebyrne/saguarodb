@@ -2,8 +2,11 @@ mod support;
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use common::{KeyRange, RelationKind, StatementContext, ToastCompression, ToastMode};
+use common::{
+    KeyRange, QueryCancel, RelationKind, SqlState, StatementContext, ToastCompression, ToastMode,
+};
 use support::{Connection, TestServer, write_uncommitted_record_for_test};
 
 #[tokio::test]
@@ -41,6 +44,47 @@ async fn committed_data_survives_restart_with_checkpoint_and_wal() {
             vec![Some("2".to_string()), Some("Grace".to_string())],
         ]
     );
+}
+
+#[tokio::test]
+async fn timed_out_partial_copy_stays_aborted_after_checkpoint_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("create table timeout_copy (id integer primary key, value text)")
+            .await;
+        conn.ok("set statement_timeout = '1 s'").await.rows();
+        conn.begin_copy_from("copy timeout_copy from stdin")
+            .await
+            .unwrap();
+        conn.send_copy_data(&[b"1\tpartial\n"]).await.unwrap();
+        server
+            .wait_for_heap_insert("timeout_copy")
+            .await
+            .expect("COPY row should reach the heap before timeout");
+
+        let err = tokio::time::timeout(Duration::from_secs(3), conn.wait_for_copy_error())
+            .await
+            .expect("partial COPY should time out while waiting for more input")
+            .unwrap();
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        assert!(err.message.contains("statement timeout"));
+        let completion = conn.finish_copy_from(&[]).await.unwrap();
+        assert_eq!(completion.error_count, 0);
+        assert_eq!(completion.status, b'I');
+
+        server.force_checkpoint().await.unwrap();
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    let rows = server
+        .simple_query("select count(*) from timeout_copy")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("0".to_string())]]);
 }
 
 #[tokio::test]
@@ -305,7 +349,7 @@ async fn in_flight_toasted_insert_is_hidden_after_restart_and_vacuum_allows_futu
             )
             .unwrap();
 
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let iso = common::IsolationLevel::default();
         let (mut slot, _iso, result) = app
             .query_service
@@ -2220,7 +2264,7 @@ async fn uncommitted_pages_evicted_under_pressure_then_committed_are_visible() {
         // pages must spill to the heap mid-transaction. The autocommit `execute_sql`
         // cannot hold a transaction across calls, so drive the explicit transaction
         // through the session-carrying simple path.
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         // The session default isolation is irrelevant here (these are plain explicit
         // transactions); thread the built-in default and ignore the returned one.
         let iso = common::IsolationLevel::default();
@@ -2266,7 +2310,7 @@ async fn uncommitted_pages_evicted_under_pressure_then_aborted_are_invisible() {
         app.query_service
             .execute_sql("create table big (id integer primary key, payload text)")
             .unwrap();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         // The session default isolation is irrelevant here (these are plain explicit
         // transactions); thread the built-in default and ignore the returned one.
         let iso = common::IsolationLevel::default();

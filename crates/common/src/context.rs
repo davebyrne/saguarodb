@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 
+use crate::cancel::QueryCancel;
 use crate::datetime::now_micros;
 use crate::error::{DbError, Result};
 use crate::ids::{SequenceId, TableId, TxnId};
@@ -17,7 +17,7 @@ use crate::row::Key;
 /// `DeadlockDetected` (`40P01`) if waiting would deadlock, or `QueryCanceled`
 /// (`57014`) if `cancel` is set.
 pub trait ConflictWaiter: Send + Sync + std::fmt::Debug {
-    fn wait_for(&self, waiter: u64, blocker: u64, cancel: &AtomicBool) -> Result<()>;
+    fn wait_for(&self, waiter: u64, blocker: u64, cancel: &QueryCancel) -> Result<()>;
 }
 
 /// The default `ConflictWaiter` for read-only / test contexts. A real `WouldBlock`
@@ -29,7 +29,7 @@ pub trait ConflictWaiter: Send + Sync + std::fmt::Debug {
 struct NoConflictWaiter;
 
 impl ConflictWaiter for NoConflictWaiter {
-    fn wait_for(&self, waiter: u64, blocker: u64, _cancel: &AtomicBool) -> Result<()> {
+    fn wait_for(&self, waiter: u64, blocker: u64, _cancel: &QueryCancel) -> Result<()> {
         Err(DbError::internal(format!(
             "no conflict waiter configured: a write path reached a row-lock conflict \
              (waiter={waiter}, blocker={blocker}) without a lock manager"
@@ -339,10 +339,10 @@ pub struct StatementContext {
     /// (`NoConflictWaiter`) errors if ever asked to wait; the server installs the
     /// real lock manager on write-capable contexts.
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
-    /// The per-statement cancel flag, shared with the connection (set by a client
-    /// `CancelRequest`). Threaded to the storage conflict point so a blocked writer
-    /// can be interrupted (`docs/specs/deadlock.md` §5). Defaults to a never-set flag.
-    pub cancel: Arc<AtomicBool>,
+    /// Per-statement cancellation state shared with the connection. Threaded to
+    /// storage conflict waits so user requests and statement timeouts can interrupt
+    /// a blocked writer (`docs/specs/deadlock.md` §5).
+    pub cancel: Arc<QueryCancel>,
     /// The reading/writing transaction's **live (sub)xid set** — `txn_id` plus any
     /// not-rolled-back savepoint subxids (`docs/specs/savepoints.md` §4). A tuple
     /// whose `xmin`/`xmax` is in this set is the transaction's own (uncommitted)
@@ -396,7 +396,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
@@ -419,7 +419,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
@@ -444,7 +444,7 @@ impl StatementContext {
             gc_horizon: 0,
             live_txns: Arc::from([txn_id]),
             conflict_waiter: Arc::new(NoConflictWaiter),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(QueryCancel::new()),
             ssi_tracker: Arc::new(NoSsiTracker),
             sequence_manager: Arc::new(NoSequenceManager),
             session_sequences: Arc::new(SessionSequenceState::new()),
@@ -485,7 +485,7 @@ impl StatementContext {
     pub fn with_conflict_waiter(
         mut self,
         conflict_waiter: Arc<dyn ConflictWaiter>,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<QueryCancel>,
     ) -> Self {
         self.conflict_waiter = conflict_waiter;
         self.cancel = cancel;
@@ -568,9 +568,7 @@ impl Eq for StatementContext {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
-
-    use super::{IsolationLevel, Snapshot, StatementContext};
+    use super::{IsolationLevel, QueryCancel, Snapshot, StatementContext};
 
     #[test]
     fn default_conflict_waiter_errors_rather_than_spinning() {
@@ -580,7 +578,7 @@ mod tests {
         let ctx = StatementContext::new(7);
         let err = ctx
             .conflict_waiter
-            .wait_for(7, 8, &AtomicBool::new(false))
+            .wait_for(7, 8, &QueryCancel::new())
             .expect_err("default waiter must error, not return Ok");
         assert!(err.message.contains("no conflict waiter configured"));
     }

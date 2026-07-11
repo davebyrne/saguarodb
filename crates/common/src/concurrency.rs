@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock};
 
-use crate::Result;
+use crate::{QueryCancel, Result};
+
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The writer-vs-checkpoint coordination primitive (`docs/specs/mvcc.md` §7.1
 /// Stage 2, §10 E2b). The lock is **inverted** relative to Stage 1:
@@ -26,10 +29,24 @@ pub trait ConcurrencyController: Send + Sync {
     /// simultaneously; it only blocks while a checkpoint holds the exclusive guard.
     fn begin_writer(&self) -> Result<WriteGuard>;
 
+    /// Cancelable form used by foreground SQL statements. Implementations that
+    /// can poll lock acquisition should override this; the default preserves
+    /// compatibility for test/custom controllers.
+    fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard> {
+        cancel.check()?;
+        self.begin_writer()
+    }
+
     /// Acquire the EXCLUSIVE checkpoint guard. Blocks until every in-flight shared
     /// writer has released its guard, then holds off any new writer until released,
     /// so the checkpoint body runs with no concurrent writer.
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
+
+    /// Cancelable form used by foreground maintenance and DDL statements.
+    fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard> {
+        cancel.check()?;
+        self.begin_checkpoint()
+    }
 
     /// Acquire the SHARED guard for a non-writing exclusion participant (e.g. a
     /// test or a future drain point). Shares with writers; only the checkpoint
@@ -76,6 +93,15 @@ impl ConcurrencyController for RwLockConcurrencyController {
         })
     }
 
+    fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard> {
+        loop {
+            cancel.check()?;
+            if let Some(guard) = self.lock.try_read_arc_for(CANCEL_POLL_INTERVAL) {
+                return Ok(WriteGuard { _guard: guard });
+            }
+        }
+    }
+
     fn begin_checkpoint(&self) -> Result<CheckpointGuard> {
         // Exclusive (`write_arc`): blocks until all shared writers have drained and
         // then holds off any new writer, so the checkpoint runs alone. This is the
@@ -84,6 +110,15 @@ impl ConcurrencyController for RwLockConcurrencyController {
         Ok(CheckpointGuard {
             _guard: self.lock.write_arc(),
         })
+    }
+
+    fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard> {
+        loop {
+            cancel.check()?;
+            if let Some(guard) = self.lock.try_write_arc_for(CANCEL_POLL_INTERVAL) {
+                return Ok(CheckpointGuard { _guard: guard });
+            }
+        }
     }
 }
 
@@ -108,6 +143,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard};
+    use crate::{CancelReason, QueryCancel, SqlState};
 
     #[test]
     fn guards_satisfy_thread_safety_contract() {
@@ -212,6 +248,42 @@ mod tests {
         drop(checkpoint);
         writer.join().expect("writer thread finished");
         assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn foreground_guard_waits_are_cancelable() {
+        let controller = Arc::new(RwLockConcurrencyController::new());
+        let checkpoint = controller.begin_checkpoint().unwrap();
+        let cancel = Arc::new(QueryCancel::new());
+        let waiter = {
+            let controller = controller.clone();
+            let cancel = cancel.clone();
+            thread::spawn(move || controller.begin_writer_cancelable(cancel.as_ref()))
+        };
+        thread::sleep(Duration::from_millis(25));
+        cancel.request(CancelReason::StatementTimeout);
+        let err = match waiter.join().unwrap() {
+            Err(err) => err,
+            Ok(_) => panic!("writer guard unexpectedly acquired"),
+        };
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        drop(checkpoint);
+
+        let writer = controller.begin_writer().unwrap();
+        cancel.reset();
+        let waiter = {
+            let controller = controller.clone();
+            let cancel = cancel.clone();
+            thread::spawn(move || controller.begin_checkpoint_cancelable(cancel.as_ref()))
+        };
+        thread::sleep(Duration::from_millis(25));
+        cancel.request(CancelReason::StatementTimeout);
+        let err = match waiter.join().unwrap() {
+            Err(err) => err,
+            Ok(_) => panic!("checkpoint guard unexpectedly acquired"),
+        };
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        drop(writer);
     }
 
     /// The shared writer guard is re-entrant on one thread: a connection re-acquiring

@@ -11,9 +11,9 @@ use crate::query::{
 };
 
 use super::{
-    BoundPortal, Portal, Session, SuspendedPortal, TransactionState, command_complete_tag,
-    encode_row, error_response, protocol_error, resolve_format, resolve_result_formats,
-    streamed_task_result, write_messages,
+    BoundPortal, Portal, Session, SuspendedPortal, TransactionState, apply_stream_consumer_cancel,
+    command_complete_tag, encode_row, error_response, protocol_error, resolve_format,
+    resolve_result_formats, streamed_task_result, wait_cancelable, write_messages,
 };
 
 struct LimitedBoundExecute {
@@ -25,6 +25,23 @@ struct LimitedBoundExecute {
 
 impl Session {
     pub(super) async fn run_execute<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        portal_name: &str,
+        max_rows: i32,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let result = self
+            .run_execute_inner(stream, codec, portal_name, max_rows)
+            .await;
+        self.stop_statement_timer().await;
+        result
+    }
+
+    async fn run_execute_inner<S>(
         &mut self,
         stream: &mut S,
         codec: &PostgresCodec,
@@ -101,7 +118,8 @@ impl Session {
             }
         };
         let service = self.app.query_service.clone();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
+        let io_cancel = cancel.clone();
         let session = self.query_session_context(cancel);
         self.begin_activity(&query_text);
 
@@ -162,11 +180,20 @@ impl Session {
         // consumed without emitting one; `DataRow`s use the portal's result formats;
         // and no `ReadyForQuery` is sent here (`Sync` emits it).
         let mut write_err: Option<DbError> = None;
+        let mut stream_cancel: Option<DbError> = None;
         // `RowDescription` already came from `Describe`, but keep `Start`'s columns
         // so each `Rows` batch can encode each value against its declared wire type
         // (the portal's result formats may be binary).
         let mut stream_columns: Vec<ColumnInfo> = Vec::new();
-        while let Some(message) = row_rx.recv().await {
+        loop {
+            let message = match wait_cancelable(io_cancel.as_ref(), row_rx.recv()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(err) => {
+                    stream_cancel = Some(err);
+                    break;
+                }
+            };
             let write_result = match message {
                 StreamMessage::Start { columns } => {
                     stream_columns = columns;
@@ -174,7 +201,12 @@ impl Session {
                 }
                 StreamMessage::Rows(rows) => {
                     match encode_portal_rows(&rows, &stream_columns, &result_formats) {
-                        Ok(messages) => write_messages(stream, codec, &messages).await,
+                        Ok(messages) => wait_cancelable(
+                            io_cancel.as_ref(),
+                            write_messages(stream, codec, &messages),
+                        )
+                        .await
+                        .and_then(|result| result),
                         Err(err) => Err(err),
                     }
                 }
@@ -186,10 +218,13 @@ impl Session {
         }
         drop(row_rx);
 
-        let (txn, default_isolation, outcome) =
+        let (txn, default_isolation, mut outcome) =
             streamed_task_result(task.await, self.default_isolation);
         self.txn = txn;
         self.default_isolation = default_isolation;
+        if let Some(err) = stream_cancel {
+            apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
+        }
         drop(guard);
         // Keep the reported transaction-block status in sync with the slot, so the
         // `ReadyForQuery` that `Sync` later emits carries the right `I`/`T`/`E` byte.
@@ -298,7 +333,7 @@ impl Session {
         let txn = self.txn.take();
         let transaction_scoped = txn.is_some();
         let service = self.app.query_service.clone();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
         let session = self.query_session_context(cancel);
         self.begin_activity(&query_text);
 
@@ -325,8 +360,15 @@ impl Session {
             }
         };
 
-        let fetch =
-            fetch_cursor_rows(stream, codec, &started, &result_formats, Some(max_rows)).await;
+        let fetch = fetch_cursor_rows(
+            stream,
+            codec,
+            &started,
+            &result_formats,
+            Some(max_rows),
+            self.cancel.as_ref(),
+        )
+        .await;
         drop(guard);
         match fetch {
             Ok(CursorFetchStatus::Suspended { count }) => {
@@ -383,14 +425,14 @@ impl Session {
                 return write_messages(stream, codec, &[error_response(&err)]).await;
             }
         };
-        self.begin_cancelable();
         self.begin_activity(&portal.query_text);
         let max_rows = if max_rows <= 0 {
             None
         } else {
             Some(max_rows as u64)
         };
-        let fetch = fetch_suspended_rows(stream, codec, &portal, max_rows).await;
+        let fetch =
+            fetch_suspended_rows(stream, codec, &portal, max_rows, self.cancel.as_ref()).await;
         drop(guard);
         match fetch {
             Ok(CursorFetchStatus::Suspended { count }) => {
@@ -524,6 +566,7 @@ impl Session {
         match result {
             Ok(messages) => write_messages(stream, codec, &messages).await,
             Err(err) => {
+                self.stop_statement_timer().await;
                 self.failed = true;
                 write_messages(stream, codec, &[error_response(&err)]).await
             }
@@ -537,13 +580,14 @@ async fn fetch_cursor_rows<S>(
     started: &StartedCursor,
     result_formats: &[i16],
     max_rows: Option<u64>,
+    cancel: &common::QueryCancel,
 ) -> Result<CursorFetchStatus>
 where
     S: AsyncWrite + Unpin,
 {
     let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
     let reply_rx = started.handle.start_fetch(max_rows, row_tx).await?;
-    drain_cursor_rows(stream, codec, row_rx, result_formats).await?;
+    drain_cursor_rows(stream, codec, row_rx, result_formats, cancel).await?;
     reply_rx
         .await
         .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
@@ -554,13 +598,14 @@ async fn fetch_suspended_rows<S>(
     codec: &PostgresCodec,
     portal: &SuspendedPortal,
     max_rows: Option<u64>,
+    cancel: &common::QueryCancel,
 ) -> Result<CursorFetchStatus>
 where
     S: AsyncWrite + Unpin,
 {
     let (row_tx, row_rx) = mpsc::channel::<StreamMessage>(STREAM_CHANNEL_CAPACITY);
     let reply_rx = portal.cursor.start_fetch(max_rows, row_tx).await?;
-    drain_cursor_rows(stream, codec, row_rx, &portal.result_formats).await?;
+    drain_cursor_rows(stream, codec, row_rx, &portal.result_formats, cancel).await?;
     reply_rx
         .await
         .map_err(|_| DbError::internal("cursor worker stopped before fetch completed"))?
@@ -571,19 +616,23 @@ async fn drain_cursor_rows<S>(
     codec: &PostgresCodec,
     mut row_rx: mpsc::Receiver<StreamMessage>,
     result_formats: &[i16],
+    cancel: &common::QueryCancel,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     let mut stream_columns: Vec<ColumnInfo> = Vec::new();
-    while let Some(message) = row_rx.recv().await {
+    loop {
+        let Some(message) = wait_cancelable(cancel, row_rx.recv()).await? else {
+            break;
+        };
         match message {
             StreamMessage::Start { columns } => {
                 stream_columns = columns;
             }
             StreamMessage::Rows(rows) => {
                 let messages = encode_portal_rows(&rows, &stream_columns, result_formats)?;
-                write_messages(stream, codec, &messages).await?;
+                wait_cancelable(cancel, write_messages(stream, codec, &messages)).await??;
             }
         }
     }

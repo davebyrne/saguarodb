@@ -1,12 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 
 use common::{
-    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema, RelationKind,
-    Result, SqlState, StatementContext, TableId, TableOptionPatch, TableSchema, ToastCompression,
-    ToastOptions, needs_toast_relation, toast_schema,
+    ColumnId, CompressionSetting, DbError, IndexConstraintKind, IndexId, IndexSchema, QueryCancel,
+    RelationKind, Result, SqlState, StatementContext, TableId, TableOptionPatch, TableSchema,
+    ToastCompression, ToastOptions, needs_toast_relation, toast_schema,
 };
 use executor::ExecutionResult;
 use parser::Statement;
@@ -82,6 +79,7 @@ impl QueryService {
     pub(super) fn run_alter_table_compression(
         &self,
         statement: Statement,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let Statement::AlterTableSetCompression { table, compression } = statement else {
             return Err(DbError::internal("expected ALTER TABLE statement"));
@@ -92,7 +90,9 @@ impl QueryService {
             // 1-2. Bind the table name; take the exclusive guard (drains writers,
             // like VACUUM / CREATE INDEX backfill). Scoped to this block so it is
             // dropped before the checkpoint trigger below runs.
-            let _guard = components.concurrency.begin_checkpoint()?;
+            let _guard = components
+                .concurrency
+                .begin_checkpoint_cancelable(cancel.as_ref())?;
             let schema = components
                 .catalog
                 .get_table_by_name(&table)?
@@ -103,55 +103,73 @@ impl QueryService {
                     )
                 })?;
 
-            let txn_id = components.next_txn_id.fetch_add(1, Ordering::AcqRel);
+            let txn_id = components
+                .active_txns
+                .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
 
             // 3. Train a dictionary from current heap images (zstd only, and only
             // when the corpus suffices — a tiny/empty table proceeds dict-less).
             // Pre-commit: a failure here is a legitimate statement error, since
             // nothing has committed yet.
-            let mut active_dict_id = None;
-            if compression == CompressionSetting::Zstd {
-                let samples = components
-                    .storage
-                    .sample_heap_pages(&schema, DICT_TRAINING_PAGE_CAP)?;
-                if let Some(bytes) = compress::train_dictionary(&samples) {
-                    let dict_id = components.catalog.allocate_dictionary_id()?;
-                    // Durability order: dict file BEFORE any WAL reference (§7).
-                    components.dict_store.save(dict_id, schema.id, &bytes)?;
-                    components
-                        .compression
-                        .register_dictionary(dict_id, &bytes)?;
-                    components.wal.append(WalRecord {
-                        lsn: 0,
-                        txn_id,
-                        kind: WalRecordKind::CreateDictionary {
-                            dict_id,
-                            table_id: schema.id,
-                            bytes,
-                        },
-                    })?;
-                    active_dict_id = Some(dict_id);
+            let mut prepared_dict_id = None;
+            let pre_commit = (|| {
+                let mut active_dict_id = None;
+                if compression == CompressionSetting::Zstd {
+                    let samples = components.storage.sample_heap_pages_cancelable(
+                        &schema,
+                        DICT_TRAINING_PAGE_CAP,
+                        cancel.as_ref(),
+                    )?;
+                    if let Some(bytes) = compress::train_dictionary(&samples) {
+                        cancel.check()?;
+                        let dict_id = components.catalog.allocate_dictionary_id()?;
+                        // Track the id before the durable save so rollback also
+                        // removes a temporary file left by a failed save.
+                        prepared_dict_id = Some(dict_id);
+                        // Durability order: dict file BEFORE any WAL reference (§7).
+                        components.dict_store.save(dict_id, schema.id, &bytes)?;
+                        components
+                            .compression
+                            .register_dictionary(dict_id, &bytes)?;
+                        components.wal.append(WalRecord {
+                            lsn: 0,
+                            txn_id,
+                            kind: WalRecordKind::CreateDictionary {
+                                dict_id,
+                                table_id: schema.id,
+                                bytes,
+                            },
+                        })?;
+                        active_dict_id = Some(dict_id);
+                    }
                 }
-            }
 
-            // 4. DDL record + immediate commit, flushed durable before any page
-            // image can reference the new state. THIS is the durable commit
-            // point: everything above (and this block) propagates `?` normally.
-            components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::AlterTableCompression {
-                    table_id: schema.id,
-                    compression,
-                    active_dict_id,
-                },
-            })?;
-            components.wal.append(WalRecord {
-                lsn: 0,
-                txn_id,
-                kind: WalRecordKind::Commit,
-            })?;
-            components.wal.flush()?;
+                // 4. DDL record + immediate commit, flushed durable before any page
+                // image can reference the new state. THIS is the durable commit
+                // point: everything above (and this block) is rolled back on error.
+                components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::AlterTableCompression {
+                        table_id: schema.id,
+                        compression,
+                        active_dict_id,
+                    },
+                })?;
+                cancel.check()?;
+                Ok(active_dict_id)
+            })();
+            let active_dict_id = match pre_commit {
+                Ok(active_dict_id) => active_dict_id,
+                Err(err) => {
+                    self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
+                self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
+                return Err(err);
+            }
 
             // Post-durable-commit cleanup: install + rewrite + fsync. Any error
             // from here on is fatal (process exit) rather than a statement
@@ -163,6 +181,11 @@ impl QueryService {
             ) {
                 self.fatal_after_durable_commit(err);
             }
+            if let Err(err) = self.cleanup_after_durable_commit(txn_id) {
+                self.fatal_after_durable_commit(err);
+            }
+            components.active_txns.deregister(txn_id);
+            components.lock_manager.on_txn_finished();
         }
         // The exclusive guard dropped when the block above ended.
         // `record_commit_and_maybe_checkpoint_after_durable_commit` acquires its
@@ -231,6 +254,7 @@ impl QueryService {
     pub(super) fn run_alter_table_toast_options(
         &self,
         statement: Statement,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let Statement::AlterTableSetOptions { table, options } = statement else {
             return Err(DbError::internal(
@@ -251,7 +275,9 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components.concurrency.begin_checkpoint()?;
+            let _guard = components
+                .concurrency
+                .begin_checkpoint_cancelable(cancel.as_ref())?;
             let schema = components
                 .catalog
                 .get_table_by_name(&table)?
@@ -271,11 +297,18 @@ impl QueryService {
             let txn_id = components
                 .active_txns
                 .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
-            let pre_commit = self.prepare_alter_table_toast_commit(txn_id, &schema, &options);
+            let mut prepared_dict_id = None;
+            let pre_commit = self.prepare_alter_table_toast_commit(
+                txn_id,
+                &schema,
+                &options,
+                cancel.clone(),
+                &mut prepared_dict_id,
+            );
             let post_commit = match pre_commit {
                 Ok(post_commit) => post_commit,
                 Err(err) => {
-                    self.rollback_pre_durable_or_die(txn_id, None);
+                    self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                     return Err(err);
                 }
             };
@@ -289,11 +322,15 @@ impl QueryService {
                     toast_table_id: post_commit.toast_table_id,
                 },
             }) {
-                self.rollback_pre_durable_or_die(txn_id, None);
+                self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
+                return Err(err);
+            }
+            if let Err(err) = cancel.check() {
+                self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                 return Err(err);
             }
             if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
-                self.rollback_pre_durable_or_die(txn_id, None);
+                self.rollback_prepared_dictionary_or_die(txn_id, prepared_dict_id);
                 return Err(err);
             }
 
@@ -319,12 +356,12 @@ impl QueryService {
         txn_id: u64,
         schema: &TableSchema,
         options: &TableOptionPatch,
+        cancel: Arc<QueryCancel>,
+        prepared_dict_id: &mut Option<u32>,
     ) -> Result<ToastAlterPostCommit> {
         let components = &self.components;
-        let ctx = StatementContext::new(txn_id).with_conflict_waiter(
-            components.lock_manager.clone(),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let ctx = StatementContext::new(txn_id)
+            .with_conflict_waiter(components.lock_manager.clone(), cancel);
 
         let mut toast = schema.toast.apply_patch(&options.toast);
         if options.toast.compression == Some(ToastCompression::ZstdDict) {
@@ -336,6 +373,7 @@ impl QueryService {
             )?;
             if let Some(bytes) = compress::train_dictionary(&samples) {
                 let dict_id = components.catalog.allocate_dictionary_id()?;
+                *prepared_dict_id = Some(dict_id);
                 components.dict_store.save(dict_id, schema.id, &bytes)?;
                 components
                     .compression
@@ -379,6 +417,18 @@ impl QueryService {
         })
     }
 
+    /// Abort an immediate-commit ALTER and remove any dictionary it prepared
+    /// before the commit record became durable. Dictionary ids remain burned.
+    fn rollback_prepared_dictionary_or_die(&self, txn_id: u64, dict_id: Option<u32>) {
+        self.rollback_pre_durable_or_die(txn_id, None);
+        if let Some(dict_id) = dict_id {
+            self.components.compression.remove_dictionary(dict_id);
+            if let Err(err) = self.components.dict_store.remove(dict_id) {
+                self.fatal_pre_durable_rollback_failure(err);
+            }
+        }
+    }
+
     fn finish_alter_table_toast_after_commit(&self, post: ToastAlterPostCommit) -> Result<()> {
         let components = &self.components;
         if let Some(hidden_schema) = post.hidden_schema {
@@ -400,6 +450,7 @@ impl QueryService {
     pub(super) fn run_alter_table_add_primary_key(
         &self,
         statement: Statement,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let Statement::AlterTableAddPrimaryKey {
             table,
@@ -414,7 +465,9 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components.concurrency.begin_checkpoint()?;
+            let _guard = components
+                .concurrency
+                .begin_checkpoint_cancelable(cancel.as_ref())?;
             let schema = self.require_user_table(&table)?;
             if !schema.primary_key.is_empty() {
                 return Err(DbError::plan(
@@ -448,7 +501,7 @@ impl QueryService {
                 .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
 
             let pre_commit = (|| {
-                let ctx = maintenance_statement_context(txn_id, self, gc_horizon);
+                let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
                 components.storage.validate_table_primary_key_change(
                     &ctx,
                     &new_schema,
@@ -480,6 +533,10 @@ impl QueryService {
                     return Err(err);
                 }
             };
+            if let Err(err) = cancel.check() {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
             if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
                 self.rollback_pre_durable_or_die(txn_id, catalog_before);
                 return Err(err);
@@ -505,6 +562,7 @@ impl QueryService {
     pub(super) fn run_alter_table_drop_primary_key(
         &self,
         statement: Statement,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let Statement::AlterTableDropPrimaryKey {
             table,
@@ -518,7 +576,9 @@ impl QueryService {
 
         let components = &self.components;
         {
-            let _guard = components.concurrency.begin_checkpoint()?;
+            let _guard = components
+                .concurrency
+                .begin_checkpoint_cancelable(cancel.as_ref())?;
             let schema = self.require_user_table(&table)?;
             if schema.primary_key.is_empty() {
                 return Err(DbError::plan(
@@ -545,7 +605,7 @@ impl QueryService {
                 .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
 
             let pre_commit = (|| {
-                let ctx = maintenance_statement_context(txn_id, self, gc_horizon);
+                let ctx = maintenance_statement_context(txn_id, self, gc_horizon, cancel.clone());
                 components.storage.validate_table_primary_key_change(
                     &ctx,
                     &new_schema,
@@ -579,6 +639,10 @@ impl QueryService {
                     return Err(err);
                 }
             };
+            if let Err(err) = cancel.check() {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
             if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
                 self.rollback_pre_durable_or_die(txn_id, catalog_before);
                 return Err(err);
@@ -676,13 +740,11 @@ fn maintenance_statement_context(
     txn_id: u64,
     service: &QueryService,
     gc_horizon: u64,
+    cancel: Arc<QueryCancel>,
 ) -> StatementContext {
     StatementContext::new(txn_id)
         .with_gc_horizon(gc_horizon)
-        .with_conflict_waiter(
-            service.components.lock_manager.clone(),
-            Arc::new(AtomicBool::new(false)),
-        )
+        .with_conflict_waiter(service.components.lock_manager.clone(), cancel)
 }
 
 fn primary_key_column_ids(schema: &TableSchema, columns: &[String]) -> Result<Vec<ColumnId>> {

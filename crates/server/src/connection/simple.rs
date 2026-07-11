@@ -12,8 +12,8 @@ use crate::query::{
 use crate::shutdown::InFlightQueryGuard;
 
 use super::{
-    Session, SqlCursor, TransactionState, command_complete_tag, encode_row, error_response,
-    streamed_task_result, write_messages,
+    Session, SqlCursor, TransactionState, apply_stream_consumer_cancel, command_complete_tag,
+    encode_row, error_response, streamed_task_result, wait_cancelable, write_messages,
 };
 
 impl Session {
@@ -26,10 +26,27 @@ impl Session {
     where
         S: AsyncWrite + Unpin,
     {
-        // A simple query clears any aborted extended-query sequence, matching
-        // PostgreSQL. The transaction-block status (`self.tx`) is owned by the
-        // explicit transaction lifecycle and is updated from the slot returned
-        // below, not reset here.
+        self.start_statement_timer().await;
+        let result = self.run_query_inner(stream, codec, sql).await;
+        if self.copy_in.is_none() {
+            self.stop_statement_timer().await;
+        }
+        result
+    }
+
+    async fn run_query_inner<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        sql: String,
+    ) -> Result<ControlFlow<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        // The connection router only admits a simple Query when no extended
+        // error is waiting for Sync. The transaction-block status (`self.tx`) is
+        // owned by the explicit transaction lifecycle and is updated from the
+        // slot returned below, not reset here.
         self.failed = false;
         self.close_autocommit_suspended_portals();
         let guard = match self.app.components.shutdown.begin_query() {
@@ -97,7 +114,8 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         let service = self.app.query_service.clone();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
+        let io_cancel = cancel.clone();
         let session = self.query_session_context(cancel);
         self.begin_activity(&sql);
         // A SELECT streams its rows through this bounded channel: the blocking
@@ -126,25 +144,43 @@ impl Session {
         // never lost). The `SELECT n` count is taken from the producer's outcome,
         // not re-derived here.
         let mut write_err: Option<DbError> = None;
+        let mut stream_cancel: Option<DbError> = None;
         // The `Start` message carries the result columns; keep them so each `Rows`
         // batch can encode each value against its declared wire type.
         let mut stream_columns: Vec<ColumnInfo> = Vec::new();
-        while let Some(message) = row_rx.recv().await {
+        loop {
+            let message = match wait_cancelable(io_cancel.as_ref(), row_rx.recv()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(err) => {
+                    stream_cancel = Some(err);
+                    break;
+                }
+            };
             let write_result = match message {
                 StreamMessage::Start { columns } => {
                     stream_columns = columns.clone();
-                    write_messages(
-                        stream,
-                        codec,
-                        &[ServerMessage::RowDescription {
-                            columns,
-                            formats: Vec::new(),
-                        }],
+                    wait_cancelable(
+                        io_cancel.as_ref(),
+                        write_messages(
+                            stream,
+                            codec,
+                            &[ServerMessage::RowDescription {
+                                columns,
+                                formats: Vec::new(),
+                            }],
+                        ),
                     )
                     .await
+                    .and_then(|result| result)
                 }
                 StreamMessage::Rows(rows) => match encode_data_rows(&rows, &stream_columns) {
-                    Ok(messages) => write_messages(stream, codec, &messages).await,
+                    Ok(messages) => wait_cancelable(
+                        io_cancel.as_ref(),
+                        write_messages(stream, codec, &messages),
+                    )
+                    .await
+                    .and_then(|result| result),
                     Err(err) => Err(err),
                 },
             };
@@ -153,18 +189,21 @@ impl Session {
                 break;
             }
         }
-        // Drop the receiver so the producer's next `blocking_send` fails fast if we
-        // broke out early (matching the COPY-out driver).
+        // Drop the receiver so the producer's next send fails fast if we broke out
+        // early (matching the COPY-out driver).
         drop(row_rx);
 
         // `guard` (the in-flight-query guard) is held across the whole stream and
         // released per arm below: the normal arms drop it before the terminal
         // message; the COPY arms hand it to the streaming driver so the COPY keeps
         // counting as in-flight for its whole lifetime (graceful-shutdown).
-        let (txn, default_isolation, outcome) =
+        let (txn, default_isolation, mut outcome) =
             streamed_task_result(task.await, self.default_isolation);
         self.txn = txn;
         self.default_isolation = default_isolation;
+        if let Some(err) = stream_cancel {
+            apply_stream_consumer_cancel(&mut self.txn, &mut outcome, err);
+        }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let transaction_cleanup = self.txn.is_none() || successful_rollback_command(&outcome);
         let statement_cleanup = closes_cursors_on_success && outcome.is_ok();
@@ -301,7 +340,7 @@ impl Session {
             return Ok(ControlFlow::Continue(()));
         }
         let service = self.app.query_service.clone();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
         let session = self.query_session_context(cancel);
         self.begin_activity(sql);
         let txn = self
@@ -378,9 +417,9 @@ impl Session {
                 .await?;
             return Ok(ControlFlow::Continue(()));
         };
-        self.begin_cancelable();
         self.begin_activity(&cursor.query_text);
-        let fetch = fetch_sql_cursor_rows(stream, codec, &mut cursor, count).await;
+        let fetch =
+            fetch_sql_cursor_rows(stream, codec, &mut cursor, count, self.cancel.as_ref()).await;
         drop(guard);
         self.end_activity();
 
@@ -492,7 +531,7 @@ impl Session {
         .await
     }
 
-    fn mark_current_transaction_failed(&mut self) {
+    pub(super) fn mark_current_transaction_failed(&mut self) {
         if let Some(txn) = self.txn.as_mut() {
             txn.mark_failed();
             self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
@@ -565,6 +604,7 @@ async fn fetch_sql_cursor_rows<S>(
     codec: &PostgresCodec,
     cursor: &mut SqlCursor,
     count: FetchCount,
+    cancel: &common::QueryCancel,
 ) -> std::result::Result<u64, SqlCursorFetchError>
 where
     S: AsyncWrite + Unpin,
@@ -575,15 +615,19 @@ where
         FetchCount::All => None,
     };
     if cursor.handle.is_none() {
-        write_messages(
-            stream,
-            codec,
-            &[ServerMessage::RowDescription {
-                columns: cursor.columns.clone(),
-                formats: Vec::new(),
-            }],
+        wait_cancelable(
+            cancel,
+            write_messages(
+                stream,
+                codec,
+                &[ServerMessage::RowDescription {
+                    columns: cursor.columns.clone(),
+                    formats: Vec::new(),
+                }],
+            ),
         )
         .await
+        .and_then(|result| result)
         .map_err(SqlCursorFetchError::Stream)?;
         return Ok(0);
     }
@@ -597,17 +641,21 @@ where
         .start_fetch(max_rows, row_tx)
         .await
         .map_err(SqlCursorFetchError::Worker)?;
-    write_messages(
-        stream,
-        codec,
-        &[ServerMessage::RowDescription {
-            columns: cursor.columns.clone(),
-            formats: Vec::new(),
-        }],
+    wait_cancelable(
+        cancel,
+        write_messages(
+            stream,
+            codec,
+            &[ServerMessage::RowDescription {
+                columns: cursor.columns.clone(),
+                formats: Vec::new(),
+            }],
+        ),
     )
     .await
+    .and_then(|result| result)
     .map_err(SqlCursorFetchError::Stream)?;
-    drain_sql_cursor_rows(stream, codec, row_rx, &cursor.columns)
+    drain_sql_cursor_rows(stream, codec, row_rx, &cursor.columns, cancel)
         .await
         .map_err(SqlCursorFetchError::Stream)?;
     let status = reply_rx
@@ -629,16 +677,20 @@ async fn drain_sql_cursor_rows<S>(
     codec: &PostgresCodec,
     mut row_rx: mpsc::Receiver<StreamMessage>,
     columns: &[ColumnInfo],
+    cancel: &common::QueryCancel,
 ) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    while let Some(message) = row_rx.recv().await {
+    loop {
+        let Some(message) = wait_cancelable(cancel, row_rx.recv()).await? else {
+            break;
+        };
         match message {
             StreamMessage::Start { .. } => {}
             StreamMessage::Rows(rows) => {
                 let messages = encode_data_rows(&rows, columns)?;
-                write_messages(stream, codec, &messages).await?;
+                wait_cancelable(cancel, write_messages(stream, codec, &messages)).await??;
             }
         }
     }

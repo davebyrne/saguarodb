@@ -1,4 +1,5 @@
 pub mod bytea;
+pub mod cancel;
 pub mod concurrency;
 pub mod context;
 pub mod copy;
@@ -21,6 +22,7 @@ pub mod value;
 /// `server_version`, startup `ParameterStatus`, and `version()`.
 pub const POSTGRES_COMPAT_VERSION: &str = "16.0";
 
+pub use cancel::{CancelReason, QueryCancel};
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,
 };

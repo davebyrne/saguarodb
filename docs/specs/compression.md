@@ -326,6 +326,13 @@ calling it earlier would deadlock — which is also what makes the rewrite's
 WAL activity in step 6 count toward `--checkpoint-wal-bytes` right away
 instead of waiting on an unrelated later commit to notice it.
 
+The maintenance transaction is registered while steps 3-4 are prepared. A
+returned error or statement cancellation before the commit flush aborts and
+deregisters that transaction and durably removes any dictionary prepared by the
+statement from both the resolver and dictionary store; the allocated dictionary
+id remains burned. A process crash at the same point can leave an unreferenced
+dictionary file, which is harmless and whose id startup reserves (§7).
+
 1. Parse: the compression value must be `'none'` or `'zstd'` (checked by the
    parser, `SqlState::FeatureNotSupported` otherwise). Table existence is
    NOT checked here (there is no bind step); `run_alter_table_compression`

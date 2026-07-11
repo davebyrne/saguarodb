@@ -148,6 +148,38 @@ impl TestServer {
             .map_err(|err| common::DbError::internal(format!("checkpoint task failed: {err}")))?
     }
 
+    /// Wait until normal storage has appended a heap insert for `table`. This is
+    /// used to establish that a streaming COPY mutated a page before cancellation,
+    /// rather than merely assuming a sent TCP frame was already consumed.
+    pub async fn wait_for_heap_insert(&self, table: &str) -> Result<()> {
+        let file_id = self
+            .app
+            .components
+            .catalog
+            .get_table_by_name(table)?
+            .ok_or_else(|| common::DbError::internal(format!("table {table} is missing")))?
+            .storage_id;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let found = self
+                    .app
+                    .components
+                    .wal
+                    .replay_from(0)?
+                    .filter_map(|record| record.ok())
+                    .any(|record| {
+                        matches!(record.kind, WalRecordKind::HeapInsert { file_id: id, .. } if id == file_id)
+                    });
+                if found {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| common::DbError::internal("timed out waiting for heap insert"))?
+    }
+
     /// The shared application state, for tests that inspect server internals such
     /// as the active-transaction registry.
     pub fn app(&self) -> &Arc<AppState> {
@@ -278,6 +310,42 @@ impl Connection {
         read_until_ready(&mut self.stream).await
     }
 
+    /// Send a simple query and stop reading as soon as the first complete DataRow
+    /// arrives, leaving the remaining result to exercise server-side backpressure.
+    pub async fn begin_query_until_data_row(&mut self, sql: &str) -> Result<Vec<u8>> {
+        self.stream
+            .write_all(&query_bytes(sql))
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send query: {err}")))?;
+        read_until_tag_without_overread(&mut self.stream, b'D').await
+    }
+
+    /// Resume reading a query after a deliberate pause, stopping at either a
+    /// complete ReadyForQuery or connection close. The boolean is true on close.
+    pub async fn read_until_ready_or_close(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, bool)> {
+        let mut response = Vec::new();
+        let mut buf = [0; 8192];
+        tokio::time::timeout(timeout, async {
+            loop {
+                let read = self.stream.read(&mut buf).await.map_err(|err| {
+                    common::DbError::io(format!("failed to read query response: {err}"))
+                })?;
+                if read == 0 {
+                    return Ok((response, true));
+                }
+                response.extend_from_slice(&buf[..read]);
+                if for_each_message(&response, |tag, _| tag == b'Z')? {
+                    return Ok((response, false));
+                }
+            }
+        })
+        .await
+        .map_err(|_| common::DbError::internal("timed out waiting for query cancellation"))?
+    }
+
     /// Run a query expecting transport success; panics on protocol/transport
     /// error (a server SQL error is still returned in the `QueryOutcome`).
     pub async fn ok(&mut self, sql: &str) -> QueryOutcome {
@@ -401,6 +469,18 @@ impl Connection {
         Ok(())
     }
 
+    /// Send COPY FROM data frames without ending the sub-protocol.
+    pub async fn send_copy_data(&mut self, chunks: &[&[u8]]) -> Result<()> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&tagged(b'd', chunk));
+        }
+        self.stream
+            .write_all(&out)
+            .await
+            .map_err(|err| common::DbError::io(format!("failed to send COPY data: {err}")))
+    }
+
     /// Finish a COPY FROM that was opened with [`Self::begin_copy_from`], streaming
     /// the supplied chunks followed by `CopyDone`.
     pub async fn finish_copy_from(&mut self, chunks: &[&[u8]]) -> Result<CopyCompletion> {
@@ -416,6 +496,18 @@ impl Connection {
 
         let response = read_until_ready(&mut self.stream).await?;
         parse_copy_completion(&response)
+    }
+
+    /// Wait for an ErrorResponse emitted while COPY FROM remains in protocol drain
+    /// mode (for example after a CancelRequest), without sending a COPY terminator.
+    pub async fn wait_for_copy_error(&mut self) -> Result<common::DbError> {
+        let response = read_until_tag(&mut self.stream, b'E').await?;
+        match decode_simple_query_response(&response) {
+            Err(err) => Ok(err),
+            Ok(_) => Err(common::DbError::internal(
+                "COPY response contained no decodable error",
+            )),
+        }
     }
 
     /// Like [`copy_from`](Self::copy_from) but aborts with `CopyFail(message)`
@@ -482,6 +574,7 @@ impl Connection {
 pub struct CopyCompletion {
     pub command_tag: Option<String>,
     pub error_code: Option<String>,
+    pub error_count: usize,
     pub status: u8,
 }
 
@@ -706,6 +799,14 @@ async fn read_until_tag(stream: &mut TcpStream, tag: u8) -> Result<Vec<u8>> {
                 ));
             }
             response.extend_from_slice(&buf[..read]);
+            if tag != b'E' && for_each_message(&response, |t, _| t == b'E')? {
+                return match decode_simple_query_response(&response) {
+                    Err(err) => Err(err),
+                    Ok(_) => Err(common::DbError::internal(
+                        "COPY startup returned an undecodable ErrorResponse",
+                    )),
+                };
+            }
             if for_each_message(&response, |t, _| t == tag)? {
                 return Ok(response);
             }
@@ -714,6 +815,41 @@ async fn read_until_tag(stream: &mut TcpStream, tag: u8) -> Result<Vec<u8>> {
     tokio::time::timeout(READY_FOR_QUERY_TIMEOUT, read_loop)
         .await
         .map_err(|_| common::DbError::internal("timed out waiting for COPY message"))?
+}
+
+/// Variant used when the caller will resume reading the same response: reads one
+/// byte at a time so it stops exactly on the requested frame boundary and does not
+/// discard a partial following frame.
+async fn read_until_tag_without_overread(stream: &mut TcpStream, tag: u8) -> Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    tokio::time::timeout(READY_FOR_QUERY_TIMEOUT, async {
+        loop {
+            let read = stream.read(&mut byte).await.map_err(|err| {
+                common::DbError::io(format!("failed to read query response: {err}"))
+            })?;
+            if read == 0 {
+                return Err(common::DbError::protocol(
+                    common::SqlState::InternalError,
+                    "connection closed before expected query message",
+                ));
+            }
+            response.push(byte[0]);
+            if for_each_message(&response, |t, _| t == b'E')? {
+                return match decode_simple_query_response(&response) {
+                    Err(err) => Err(err),
+                    Ok(_) => Err(common::DbError::internal(
+                        "query returned an undecodable ErrorResponse",
+                    )),
+                };
+            }
+            if for_each_message(&response, |t, _| t == tag)? {
+                return Ok(response);
+            }
+        }
+    })
+    .await
+    .map_err(|_| common::DbError::internal("timed out waiting for query message"))?
 }
 
 /// Visit each complete tagged message `(tag, body)` in `bytes`; returns `true` if
@@ -752,6 +888,7 @@ fn extract_copy_data(bytes: &[u8]) -> Vec<u8> {
 fn parse_copy_completion(bytes: &[u8]) -> Result<CopyCompletion> {
     let mut command_tag = None;
     let mut error_code = None;
+    let mut error_count = 0;
     let _ = for_each_message(bytes, |tag, body| {
         match tag {
             b'C' => {
@@ -760,7 +897,10 @@ fn parse_copy_completion(bytes: &[u8]) -> Result<CopyCompletion> {
                         .into_owned(),
                 );
             }
-            b'E' => error_code = error_sqlstate(body),
+            b'E' => {
+                error_count += 1;
+                error_code = error_sqlstate(body);
+            }
             _ => {}
         }
         false
@@ -768,6 +908,7 @@ fn parse_copy_completion(bytes: &[u8]) -> Result<CopyCompletion> {
     Ok(CopyCompletion {
         command_tag,
         error_code,
+        error_count,
         status: ready_for_query_status(bytes)?,
     })
 }

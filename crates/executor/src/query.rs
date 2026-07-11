@@ -1,14 +1,13 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use catalog::{CatalogManager, TableColumnAlteration};
 use common::{
     ColumnDefault, ColumnId, ColumnInfo, CompressionSetting, CopyOptions, DataType, DbError,
-    ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault, Result,
-    Row, SequenceOptions, SequenceSchema, SqlState, StatementContext, StoredRow, TableId,
-    TableSchema, ToastOptions, TruncateCatalogUpdate, Value, ViewColumn,
+    ExecRow, IndexConstraintKind, IndexId, Key, KeyRange, ParsedColumnDef, ParsedDefault,
+    QueryCancel, Result, Row, SequenceOptions, SequenceSchema, SqlState, StatementContext,
+    StoredRow, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, Value, ViewColumn,
 };
 use planner::{BoundExpr, BoundOnConflict, BoundReturning, PhysicalPlan, bind_default_expr};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
@@ -36,7 +35,7 @@ pub struct ExecutionContext<'a> {
     pub gc_horizon: u64,
     /// Set from another connection's `CancelRequest`; the engine polls it
     /// between rows and aborts with `QueryCanceled` when it becomes true.
-    pub cancel: &'a AtomicBool,
+    pub cancel: &'a QueryCancel,
 }
 
 /// Abort with `QueryCanceled` if a cancellation has been requested. Called
@@ -47,14 +46,8 @@ pub(crate) fn check_canceled(ctx: &ExecutionContext<'_>) -> Result<()> {
 
 /// The cancellation check on the bare flag, so the streaming drive can poll it
 /// without threading the whole `ExecutionContext`.
-fn check_canceled_flag(cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(DbError::execute(
-            SqlState::QueryCanceled,
-            "canceling statement due to user request",
-        ));
-    }
-    Ok(())
+fn check_canceled_flag(cancel: &QueryCancel) -> Result<()> {
+    cancel.check()
 }
 
 pub trait PlanExecutor {
@@ -108,7 +101,7 @@ impl FetchStatus {
 pub struct OpenQuery<'a> {
     columns: Vec<ColumnInfo>,
     executor: Option<Box<dyn PlanExecutor + 'a>>,
-    cancel: &'a AtomicBool,
+    cancel: &'a QueryCancel,
     pending: Option<ExecRow>,
     exhausted: bool,
     closed: bool,
@@ -116,7 +109,7 @@ pub struct OpenQuery<'a> {
 
 impl<'a> OpenQuery<'a> {
     fn from_executor(
-        cancel: &'a AtomicBool,
+        cancel: &'a QueryCancel,
         mut executor: Box<dyn PlanExecutor + 'a>,
     ) -> Result<Self> {
         let columns = executor.output_schema().to_vec();
@@ -535,6 +528,7 @@ pub(crate) fn build_executor<'a>(
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
             Ok(Box::new(HashJoinOp::new(
+                ctx.statement.clone(),
                 left,
                 right,
                 left_keys.clone(),
@@ -640,6 +634,7 @@ pub(crate) fn build_executor<'a>(
             left,
             right,
         } => Ok(Box::new(SetOpOp::new(
+            ctx.statement.clone(),
             *op,
             *all,
             build_executor(ctx, left)?,
@@ -738,7 +733,7 @@ fn execute_insert(
     // that reads the target table, this makes the query observe only the
     // pre-insert rows (the Halloween problem) regardless of how the storage
     // engine iterates.
-    let source_rows = collect_all(executor.as_mut())?;
+    let source_rows = collect_all_cancelable(executor.as_mut(), ctx.cancel)?;
 
     let mut count = 0;
     let mut returned = Vec::new();
@@ -2204,13 +2199,26 @@ fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> 
     ))
 }
 
-pub(crate) fn collect_all(source: &mut dyn PlanExecutor) -> Result<Vec<ExecRow>> {
+pub(crate) fn collect_all_cancelable(
+    source: &mut dyn PlanExecutor,
+    cancel: &QueryCancel,
+) -> Result<Vec<ExecRow>> {
+    collect_all_inner(source, cancel)
+}
+
+fn collect_all_inner(source: &mut dyn PlanExecutor, cancel: &QueryCancel) -> Result<Vec<ExecRow>> {
+    cancel.check()?;
     open_executor(source)?;
     let result = (|| {
         let mut rows = Vec::new();
-        while let Some(row) = source.next()? {
+        loop {
+            cancel.check()?;
+            let Some(row) = source.next()? else {
+                break;
+            };
             rows.push(row);
         }
+        cancel.check()?;
         Ok(rows)
     })();
     close_after(source, result)
@@ -2255,10 +2263,10 @@ fn _type_name(data_type: &DataType) -> &'static str {
 #[cfg(test)]
 mod drive_tests {
     use super::*;
+    use common::{CancelReason, QueryCancel};
     use common::{ColumnInfo, ExecRow, Row, Value};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::AtomicBool;
 
     #[derive(Default)]
     struct MockCounts {
@@ -2415,7 +2423,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_closes_executor_after_normal_completion() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(3);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
@@ -2429,7 +2437,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_sink_break_looks_ahead_before_suspending() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(5);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         // One row per batch; break once two rows have been pushed.
@@ -2453,7 +2461,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_sink_break_at_end_reports_exhausted() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(2);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::breaking_at(2);
@@ -2466,7 +2474,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_closes_executor_on_next_error() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (mut executor, counts) = MockExecutor::with_shared_rows(5);
         executor.fail_next_after = Some(2);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
@@ -2484,7 +2492,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_closes_executor_on_open_failure() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (mut executor, counts) = MockExecutor::with_shared_rows(3);
         executor.fail_open = true;
 
@@ -2509,7 +2517,8 @@ mod drive_tests {
 
     #[test]
     fn open_query_cancellation_aborts_and_closes() {
-        let cancel = AtomicBool::new(true);
+        let cancel = QueryCancel::new();
+        cancel.request(CancelReason::UserRequest);
         let (executor, counts) = MockExecutor::with_shared_rows(3);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
@@ -2526,7 +2535,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_sink_error_closes_executor() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(3);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = FailingSink;
@@ -2543,7 +2552,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_fetch_suspends_and_resumes() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let executor = MockExecutor::with_rows(5);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
 
@@ -2560,7 +2569,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_exact_limit_reports_exhausted() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let executor = MockExecutor::with_rows(3);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
@@ -2573,7 +2582,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_zero_row_fetch_buffers_next_row() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let executor = MockExecutor::with_rows(2);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut first = TestSink::new();
@@ -2590,7 +2599,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_zero_row_fetch_preserves_pending_row() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let executor = MockExecutor::with_rows(2);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
 
@@ -2620,7 +2629,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_closes_on_exhaustion_and_close_is_idempotent() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(1);
         let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();
         let mut sink = TestSink::new();
@@ -2635,7 +2644,7 @@ mod drive_tests {
 
     #[test]
     fn open_query_drop_closes_suspended_executor() {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let (executor, counts) = MockExecutor::with_shared_rows(3);
         {
             let mut query = OpenQuery::from_executor(&cancel, Box::new(executor)).unwrap();

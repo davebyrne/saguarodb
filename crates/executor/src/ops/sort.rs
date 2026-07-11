@@ -4,7 +4,7 @@ use common::{ColumnInfo, ExecRow, Result, StatementContext, Value};
 use planner::BoundOrderByItem;
 
 use crate::eval_expr;
-use crate::query::{PlanExecutor, collect_all};
+use crate::query::{PlanExecutor, collect_all_cancelable};
 
 pub struct SortOp<'a> {
     ctx: StatementContext,
@@ -42,7 +42,8 @@ impl PlanExecutor for SortOp<'_> {
         self.index = 0;
         self.rows.clear();
         let mut keyed = Vec::new();
-        for row in collect_all(self.source.as_mut())? {
+        for row in collect_all_cancelable(self.source.as_mut(), self.ctx.cancel.as_ref())? {
+            self.ctx.cancel.check()?;
             let keys = self
                 .order_by
                 .iter()
@@ -50,7 +51,17 @@ impl PlanExecutor for SortOp<'_> {
                 .collect::<Result<Vec<_>>>()?;
             keyed.push((row, keys));
         }
-        keyed.sort_by(|left, right| compare_keys(&left.1, &right.1, &self.order_by));
+        self.ctx.cancel.check()?;
+        keyed.sort_by(|left, right| {
+            if self.ctx.cancel.reason().is_some() {
+                // Once canceled, make the remaining comparisons cheap; the check
+                // immediately below returns the reason-specific error.
+                Ordering::Equal
+            } else {
+                compare_keys(&left.1, &right.1, &self.order_by)
+            }
+        });
+        self.ctx.cancel.check()?;
         self.rows = keyed.into_iter().map(|(row, _)| row).collect();
         Ok(())
     }

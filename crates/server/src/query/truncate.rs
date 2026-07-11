@@ -1,9 +1,6 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 
-use common::{DbError, RelationKind, Result, SqlState, StatementContext};
+use common::{DbError, QueryCancel, RelationKind, Result, SqlState, StatementContext};
 use executor::ExecutionResult;
 use parser::Statement;
 
@@ -19,7 +16,11 @@ impl QueryService {
     /// is flushed, catalog/storage publish the new generations while the relation
     /// publish gate blocks new snapshot capture from observing the committed
     /// pre-publish gap.
-    pub(super) fn run_truncate(&self, statement: Statement) -> Result<ExecutionResult> {
+    pub(super) fn run_truncate(
+        &self,
+        statement: Statement,
+        cancel: &Arc<QueryCancel>,
+    ) -> Result<ExecutionResult> {
         let Statement::Truncate { table } = statement else {
             return Err(DbError::internal(
                 "run_truncate called with a non-TRUNCATE statement",
@@ -28,7 +29,9 @@ impl QueryService {
         let components = &self.components;
 
         {
-            let _guard = components.concurrency.begin_checkpoint()?;
+            let _guard = components
+                .concurrency
+                .begin_checkpoint_cancelable(cancel.as_ref())?;
             let schema = components
                 .catalog
                 .get_table_by_name(&table)?
@@ -62,10 +65,8 @@ impl QueryService {
                     return Err(err);
                 }
             };
-            let ctx = StatementContext::new(txn_id).with_conflict_waiter(
-                components.lock_manager.clone(),
-                Arc::new(AtomicBool::new(false)),
-            );
+            let ctx = StatementContext::new(txn_id)
+                .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
             if let Err(err) = components
                 .storage
                 .prepare_truncate_table(&ctx, &plan, &update)
@@ -81,6 +82,11 @@ impl QueryService {
                     return Err(DbError::internal("relation publish gate poisoned"));
                 }
             };
+            if let Err(err) = cancel.check() {
+                drop(publish_gate);
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
             if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
                 drop(publish_gate);
                 self.rollback_pre_durable_or_die(txn_id, None);

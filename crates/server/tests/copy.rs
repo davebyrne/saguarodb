@@ -36,6 +36,52 @@ async fn copy_from_stdin_text_inserts_rows() {
 }
 
 #[tokio::test]
+async fn statement_timeout_drains_copy_from_and_reports_one_terminal_error() {
+    let (_server, mut conn) = server_with_table().await;
+    conn.ok("set statement_timeout = '100 ms'").await.rows();
+    conn.begin_copy_from("copy t from stdin").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let copy = conn.finish_copy_from(&[b"1\ttoo late\n"]).await.unwrap();
+    assert_eq!(copy.error_code.as_deref(), Some("57014"));
+    assert_eq!(copy.error_count, 1);
+    assert_eq!(copy.command_tag, None);
+    assert_eq!(copy.status, b'I');
+
+    conn.ok("reset statement_timeout").await.rows();
+    assert_eq!(
+        conn.ok("select count(*) from t").await.rows(),
+        vec![vec![Some("0".to_string())]],
+        "timed-out COPY must not commit buffered rows"
+    );
+}
+
+#[tokio::test]
+async fn cancel_request_wakes_idle_copy_from_without_more_copy_data() {
+    let (server, mut conn) = server_with_table().await;
+    conn.begin_copy_from("copy t from stdin").await.unwrap();
+    let (process_id, secret_key) = conn.backend_key();
+
+    server.send_cancel(process_id, secret_key).await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(2), conn.wait_for_copy_error())
+        .await
+        .expect("CancelRequest should wake an idle COPY connection")
+        .unwrap();
+    assert_eq!(err.code, SqlState::QueryCanceled);
+    assert!(err.message.contains("user request"));
+
+    // ErrorResponse is immediate, but ReadyForQuery remains correctly deferred
+    // until COPY's terminator restores framing synchronization.
+    let completion = conn.finish_copy_from(&[]).await.unwrap();
+    assert_eq!(completion.error_count, 0);
+    assert_eq!(completion.status, b'I');
+    assert_eq!(
+        conn.ok("select count(*) from t").await.rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn copy_from_stdin_csv_skips_header_and_splits_chunks() {
     let (_server, mut conn) = server_with_table().await;
 

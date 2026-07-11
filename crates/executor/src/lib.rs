@@ -1209,7 +1209,7 @@ mod tests {
         storage
             .create_table(&StatementContext::new(0), &schema)
             .unwrap();
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = common::QueryCancel::new();
         let ctx = ExecutionContext {
             statement: StatementContext::new(1),
             relations: storage.capture_relation_snapshot().unwrap(),
@@ -1290,7 +1290,8 @@ mod tests {
             .execute("insert into users (id, name) values (1, 'Ada')")
             .unwrap();
 
-        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let cancel = common::QueryCancel::new();
+        cancel.request(common::CancelReason::UserRequest);
         let err = harness
             .execute_with_cancel("select id from users", &cancel)
             .unwrap_err();

@@ -85,6 +85,36 @@ impl DictStore {
         Ok(())
     }
 
+    /// Remove a dictionary whose creating statement failed before durable commit.
+    /// Also clears a temporary file left by a failed save. Idempotent when neither
+    /// path exists; the directory fsync makes the removal durable before service
+    /// continues.
+    pub fn remove(&self, dict_id: u32) -> Result<()> {
+        let path = self.path(dict_id);
+        let tmp = self.dir.join(format!("{dict_id}.dict.tmp"));
+        let mut removed = false;
+        for candidate in [&path, &tmp] {
+            match fs::remove_file(candidate) {
+                Ok(()) => removed = true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(DbError::io(format!(
+                        "failed to remove dictionary file {}: {err}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        if removed {
+            File::open(&self.dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|err| {
+                    DbError::io(format!("failed to fsync dictionary directory: {err}"))
+                })?;
+        }
+        Ok(())
+    }
+
     /// Load every `*.dict` file, CRC-validated: `(dict_id, table_id, bytes)`.
     pub fn load_all(&self) -> Result<Vec<(u32, u32, Vec<u8>)>> {
         let mut out = Vec::new();
@@ -164,5 +194,16 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 0xFF;
         std::fs::write(&path, bytes).unwrap();
         assert!(store.load_all().is_err());
+    }
+
+    #[test]
+    fn dict_store_remove_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DictStore::open(dir.path().join("dicts")).unwrap();
+        store.save(7, 42, b"prepared-dictionary").unwrap();
+
+        store.remove(7).unwrap();
+        assert!(store.load_all().unwrap().is_empty());
+        store.remove(7).unwrap();
     }
 }

@@ -8,7 +8,8 @@ use crate::query::{CopyInChunk, CopySnapshots};
 use crate::shutdown::InFlightQueryGuard;
 
 use super::{
-    CopyInSession, Session, TransactionState, error_response, protocol_error, write_messages,
+    CopyInSession, Session, TransactionState, error_response, protocol_error, wait_cancelable,
+    write_messages,
 };
 
 impl Session {
@@ -43,15 +44,16 @@ impl Session {
         let (sender, receiver) = mpsc::channel::<CopyInChunk>(64);
         let service = self.app.query_service.clone();
         let txn = self.txn.take();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
         let session = self.query_session_context(cancel);
         let task = tokio::task::spawn_blocking(move || {
             service.run_copy_in_stream(job, txn, session, snapshots, receiver)
         });
         self.copy_in = Some(CopyInSession {
-            sender,
-            task,
+            sender: Some(sender),
+            task: Some(task),
             insert_failed: false,
+            draining_after_cancel: false,
             _guard: guard,
         });
         Ok(())
@@ -59,15 +61,40 @@ impl Session {
 
     /// Forward one `CopyData` payload to the insert task. If the task has exited
     /// early (a row failed), discard further data until the terminator.
-    pub(super) async fn handle_copy_data(&mut self, bytes: Vec<u8>) -> Result<()> {
-        let Some(copy) = self.copy_in.as_mut() else {
+    pub(super) async fn handle_copy_data<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+        bytes: Vec<u8>,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let Some(copy) = self.copy_in.as_ref() else {
             return Err(protocol_error(
                 "CopyData received outside of an active COPY",
             ));
         };
-        if !copy.insert_failed && copy.sender.send(CopyInChunk::Chunk(bytes)).await.is_err() {
+        if copy.draining_after_cancel {
+            return Ok(());
+        }
+        let sender = copy
+            .sender
+            .as_ref()
+            .expect("running COPY has an input sender")
+            .clone();
+        let insert_failed = copy.insert_failed;
+        let send =
+            wait_cancelable(self.cancel.as_ref(), sender.send(CopyInChunk::Chunk(bytes))).await;
+        if send.is_err() {
+            drop(sender);
+            return self.cancel_copy_in(stream, codec).await;
+        }
+        if !insert_failed && send.expect("cancellation handled above").is_err() {
             // The receiver was dropped because the insert task exited on a row error.
-            copy.insert_failed = true;
+            if let Some(copy) = self.copy_in.as_mut() {
+                copy.insert_failed = true;
+            }
         }
         Ok(())
     }
@@ -89,7 +116,17 @@ impl Session {
             .copy_in
             .take()
             .expect("finish_copy_in called with no active COPY");
+        if copy.draining_after_cancel {
+            self.stop_statement_timer().await;
+            return write_messages(
+                stream,
+                codec,
+                &[ServerMessage::ReadyForQuery(self.status_byte())],
+            )
+            .await;
+        }
         let insert_failed = copy.insert_failed;
+        let sender = copy.sender.expect("running COPY has an input sender");
         if !insert_failed {
             // Signal a clean end (`Done` → commit) or a client abort (`Fail`).
             let signal = if fail_message.is_some() {
@@ -97,10 +134,11 @@ impl Session {
             } else {
                 CopyInChunk::Done
             };
-            let _ = copy.sender.send(signal).await;
+            let _ = sender.send(signal).await;
         }
-        drop(copy.sender);
-        let (txn, result) = match copy.task.await {
+        drop(sender);
+        let task = copy.task.expect("running COPY has a worker task");
+        let (txn, result) = match task.await {
             Ok(pair) => pair,
             Err(join_err) => (
                 None,
@@ -112,7 +150,7 @@ impl Session {
         let status = self.status_byte();
         self.end_activity();
 
-        match result {
+        let response = match result {
             Ok(count) => {
                 write_messages(
                     stream,
@@ -141,7 +179,57 @@ impl Session {
                 )
                 .await
             }
+        };
+        self.stop_statement_timer().await;
+        response
+    }
+
+    /// Stop a canceled COPY FROM worker, report the cancellation once, then retain a
+    /// lightweight draining state until the client sends CopyDone/CopyFail.
+    pub(super) async fn cancel_copy_in<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let (sender, task) = {
+            let copy = self
+                .copy_in
+                .as_mut()
+                .expect("cancel_copy_in called with no active COPY");
+            if copy.draining_after_cancel {
+                return Ok(());
+            }
+            (copy.sender.take(), copy.task.take())
+        };
+
+        if let Some(sender) = sender {
+            let _ = sender.try_send(CopyInChunk::Fail);
+            drop(sender);
         }
+        let (txn, _) = match task.expect("running COPY has a worker task").await {
+            Ok(pair) => pair,
+            Err(_) => (None, Err(DbError::internal("timed-out COPY task failed"))),
+        };
+        self.txn = txn;
+        self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
+        self.end_activity();
+        self.copy_in
+            .as_mut()
+            .expect("COPY draining state remains installed")
+            .draining_after_cancel = true;
+        self.stop_statement_timer().await;
+
+        let err = match self.cancel.check() {
+            Err(err) => err,
+            Ok(()) => DbError::execute(
+                SqlState::QueryCanceled,
+                "canceling statement due to statement timeout",
+            ),
+        };
+        write_messages(stream, codec, &[error_response(&err)]).await
     }
 
     /// Run `COPY ... TO STDOUT` inline: send `CopyOutResponse`, stream rendered
@@ -174,25 +262,40 @@ impl Session {
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(8);
         let service = self.app.query_service.clone();
         let txn = self.txn.take();
-        let cancel = self.begin_cancelable();
+        let cancel = self.cancel_token();
+        let io_cancel = cancel.clone();
         let session = self.query_session_context(cancel);
         let task = tokio::task::spawn_blocking(move || {
             service.run_copy_out_stream(job, txn, session, snapshots, frame_tx)
         });
 
         let mut write_err = None;
-        while let Some(frame) = frame_rx.recv().await {
-            if let Err(err) = write_messages(stream, codec, &[ServerMessage::CopyData(frame)]).await
+        let mut stream_cancel = None;
+        loop {
+            let frame = match wait_cancelable(io_cancel.as_ref(), frame_rx.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(err) => {
+                    stream_cancel = Some(err);
+                    break;
+                }
+            };
+            if let Err(err) = wait_cancelable(
+                io_cancel.as_ref(),
+                write_messages(stream, codec, &[ServerMessage::CopyData(frame)]),
+            )
+            .await
+            .and_then(|result| result)
             {
                 write_err = Some(err);
                 break;
             }
         }
-        // Drop the receiver so the producer's next `blocking_send` fails fast if we
-        // broke out early on a socket error.
+        // Drop the receiver so the producer's next send fails fast if we broke out
+        // early on a socket error.
         drop(frame_rx);
 
-        let (txn, result) = match task.await {
+        let (txn, mut result) = match task.await {
             Ok(pair) => pair,
             Err(join_err) => (
                 None,
@@ -200,6 +303,12 @@ impl Session {
             ),
         };
         self.txn = txn;
+        if let Some(err) = stream_cancel {
+            if let Some(txn) = self.txn.as_mut() {
+                txn.mark_failed();
+            }
+            result = Err(err);
+        }
         self.tx = TransactionState::from(crate::query::slot_status(&self.txn));
         let status = self.status_byte();
 

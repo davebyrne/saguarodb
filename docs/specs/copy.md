@@ -216,8 +216,8 @@ between validation and protocol mode.
    awaiting the task (step 5).
 4. The async forwarder loop reacts both to inbound messages and to the insert
    task:
-   - `CopyData` → `channel.send(payload).await` (the `await` provides TCP
-     backpressure when the channel is full). **If the send fails** — the receiver
+   - `CopyData` → a bounded, cancellation-aware channel send (the wait provides
+     TCP backpressure when the channel is full). **If the send fails** — the receiver
      was dropped because the insert task exited early on a row error — the
      forwarder stops forwarding and switches to drain mode (see step 5).
    - `CopyDone` → close the channel (clean end-of-input) and await the insert
@@ -237,6 +237,11 @@ between validation and protocol mode.
      followed by `ReadyForQuery` — never emitting `ReadyForQuery` while copy-in
      bytes are still in flight (PostgreSQL simple-query COPY error recovery).
      See §7.
+   - If `statement_timeout` expires while input is idle or the channel is full,
+     the server wakes the worker, emits one `QueryCanceled` error immediately,
+     and retains only the drain state. Later `CopyData` is discarded until the
+     client terminates COPY with `CopyDone` or `CopyFail`; that terminator emits
+     the sole `ReadyForQuery` and no duplicate error.
 
 ### 5.2 COPY TO STDOUT (bounded streaming)
 
@@ -245,8 +250,10 @@ between validation and protocol mode.
 3. Spawn the producer task (blocking): build the read context (snapshot), open a
    pull-based plan executor that scans the table and projects the COPY columns,
    format each row (plus an optional `HEADER` line first), batch the encoded
-   bytes into ~`CopyData` frames, and push them over a bounded channel.
-4. The async loop writes each `CopyData` frame, then `CopyDone`,
+   bytes into ~`CopyData` frames, and push them over a bounded channel using a
+   retry loop that polls statement cancellation while backpressured.
+4. The async loop races channel receives and socket writes against statement
+   cancellation, writes each `CopyData` frame, then `CopyDone`,
    `CommandComplete("COPY n")`, and `ReadyForQuery`.
 5. If the producer errors after `CopyOutResponse` (e.g. a storage read error),
    the server sends `ErrorResponse` then `ReadyForQuery` in place of `CopyDone`/
@@ -286,6 +293,16 @@ inside a transaction it uses the transaction's snapshot.
   `ReadyForQuery` is never emitted mid-stream.
 - COPY TO error after `CopyOutResponse` (see §5.2 step 5): `ErrorResponse` then
   `ReadyForQuery`, never a partial `CopyDone`/`CommandComplete`.
+- `CancelRequest` and `statement_timeout` use the same reason-aware token during
+  both COPY directions. Cancellation observed between outbound frames returns
+  `QueryCanceled` (`57014`) with matching reason text. If COPY TO cancellation
+  interrupts an in-progress socket `write_all`, the `CopyData` frame may be
+  partial, so the protocol-safe outcome is connection close rather than appending
+  an error frame. A `CancelRequest` also wakes a connection blocked waiting for COPY
+  input, so the error is emitted without requiring another `CopyData` frame;
+  framing still defers `ReadyForQuery` until `CopyDone`/`CopyFail`. Autocommit COPY
+  FROM checks cancellation immediately before its durable commit record, so an
+  expiration before that boundary rolls back.
 - Two `common::SqlState` variants are added: `InvalidTextRepresentation`
   (`22P02`) for bad field values and `BadCopyFileFormat` (`22P04`) for malformed
   rows.

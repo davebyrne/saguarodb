@@ -20,7 +20,7 @@ use planner::{BoundExpr, BoundQuery, BoundStatement, PhysicalPlan, logical_plan,
 
 use planner::rewrite_plan_exprs;
 
-use crate::query::{ExecutionContext, build_executor, collect_all};
+use crate::query::{ExecutionContext, build_executor};
 
 /// Rewrite every subquery expression in `plan` to a constant by executing it,
 /// via the shared structural rewriter (`docs/specs/subqueries.md` §5.3).
@@ -146,7 +146,7 @@ fn materialize_subquery(ctx: &ExecutionContext<'_>, query: &BoundQuery) -> Resul
     let physical = physical_plan(&logical, ctx.catalog)?;
     let resolved = resolve_plan_subqueries(ctx, &physical)?;
     let mut executor = build_executor(ctx, &resolved)?;
-    let rows = collect_all(executor.as_mut())?;
+    let rows = crate::query::collect_all_cancelable(executor.as_mut(), ctx.cancel)?;
     Ok(rows.into_iter().map(|row| row.row).collect())
 }
 

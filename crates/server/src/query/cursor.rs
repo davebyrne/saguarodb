@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::{ColumnInfo, DbError, IsolationLevel, Result, SqlState};
+use common::{ColumnInfo, DbError, IsolationLevel, QueryCancel, Result, SqlState};
 use executor::FetchStatus;
 use parser::{Query, Statement};
 use planner::{bind, logical_plan, physical_plan};
@@ -243,7 +243,7 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
     if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
         return send_setup_error(setup_tx, None, default_isolation, err);
     }
-    let captured = match service.capture_consistent_snapshots(0) {
+    let captured = match service.capture_consistent_snapshots_cancelable(0, session.cancel()) {
         Ok(captured) => captured,
         Err(err) => return send_setup_error(setup_tx, None, default_isolation, err),
     };
@@ -259,7 +259,12 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
     ) {
         return send_setup_error(setup_tx, None, default_isolation, err);
     }
-    let runtime = session.statement_runtime(default_isolation, default_isolation);
+    let stream_cancel = session.cancel().clone();
+    let runtime = session.statement_runtime(
+        default_isolation,
+        default_isolation,
+        session.statement_timeout_ms(),
+    );
     let ctx = match service.execution_context(ExecutionContextInput {
         txn_id: 0,
         snapshot: captured.snapshot,
@@ -290,7 +295,7 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
         default_isolation,
         result: Ok(StartedCursorSetup { columns }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx);
+    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
 }
 
 fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction) {
@@ -330,7 +335,7 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
     if let Err(err) = service.validate_prepared_schema_versions(&prepared.schema_versions) {
         return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err);
     }
-    let snapshots = match service.snapshots_for_transaction(&mut txn) {
+    let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
         Ok(snapshots) => snapshots,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
@@ -354,9 +359,11 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
     } = snapshots;
     let _cursor_advertised =
         advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
+    let stream_cancel = session.cancel().clone();
     let runtime = session.statement_runtime(
         txn.current_default_isolation(default_isolation),
         txn.isolation,
+        txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
     let ctx = match service.execution_context(ExecutionContextInput {
         txn_id: txn.writing_xid(),
@@ -388,7 +395,7 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         default_isolation,
         result: Ok(StartedCursorSetup { columns }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx);
+    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
 }
 
 fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
@@ -414,7 +421,7 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         );
     }
 
-    let snapshots = match service.snapshots_for_transaction(&mut txn) {
+    let snapshots = match service.snapshots_for_transaction(&mut txn, session.cancel()) {
         Ok(snapshots) => snapshots,
         Err(err) => return send_failed_txn_setup_error(setup_tx, txn, default_isolation, err),
     };
@@ -457,9 +464,11 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
     } = snapshots;
     let _cursor_advertised =
         advertised.or_else(|| Some(service.components.active_txns.advertise_xmin(snapshot.xmin)));
+    let stream_cancel = session.cancel().clone();
     let runtime = session.statement_runtime(
         txn.current_default_isolation(default_isolation),
         txn.isolation,
+        txn.current_statement_timeout_ms(session.statement_timeout_ms()),
     );
     let ctx = match service.execution_context(ExecutionContextInput {
         txn_id: txn.writing_xid(),
@@ -491,12 +500,13 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         default_isolation,
         result: Ok(StartedCursorSetup { columns }),
     });
-    drive_cursor_commands(&mut query, &mut cmd_rx);
+    drive_cursor_commands(&mut query, &mut cmd_rx, stream_cancel);
 }
 
 fn drive_cursor_commands(
     query: &mut executor::OpenQuery<'_>,
     cmd_rx: &mut mpsc::Receiver<CursorCommand>,
+    cancel: Arc<QueryCancel>,
 ) {
     while let Some(command) = cmd_rx.blocking_recv() {
         match command {
@@ -505,7 +515,7 @@ fn drive_cursor_commands(
                 row_tx,
                 reply_tx,
             } => {
-                let mut sink = super::ChannelRowSink::new(row_tx);
+                let mut sink = super::ChannelRowSink::new(row_tx, cancel.clone());
                 let result = query.fetch(max_rows, &mut sink, STREAM_BATCH_ROWS);
                 let terminal = !matches!(result, Ok(FetchStatus::Suspended { .. }));
                 let reply = result.map(|status| match status {

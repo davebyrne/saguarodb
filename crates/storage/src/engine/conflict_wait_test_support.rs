@@ -9,9 +9,8 @@
 //! produces on retry (committed ⇒ `23505`/`40001`; aborted ⇒ the write proceeds).
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use common::{ConflictWaiter, Result, StatementContext};
+use common::{ConflictWaiter, QueryCancel, Result, StatementContext};
 use wal::{WalManager, WalRecord, WalRecordKind};
 
 /// On `wait_for`, settle the blocker in the WAL (so the engine's retry sees a
@@ -30,7 +29,7 @@ impl std::fmt::Debug for SettleBlockerOnWait {
 }
 
 impl ConflictWaiter for SettleBlockerOnWait {
-    fn wait_for(&self, _waiter: u64, blocker: u64, _cancel: &AtomicBool) -> Result<()> {
+    fn wait_for(&self, _waiter: u64, blocker: u64, _cancel: &QueryCancel) -> Result<()> {
         let kind = if self.commit {
             WalRecordKind::Commit
         } else {
@@ -55,7 +54,7 @@ pub(super) fn committing_blocker(
 ) -> StatementContext {
     ctx.with_conflict_waiter(
         Arc::new(SettleBlockerOnWait { wal, commit: true }),
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(QueryCancel::new()),
     )
 }
 
@@ -68,6 +67,6 @@ pub(super) fn aborting_blocker(
 ) -> StatementContext {
     ctx.with_conflict_waiter(
         Arc::new(SettleBlockerOnWait { wal, commit: false }),
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(QueryCancel::new()),
     )
 }

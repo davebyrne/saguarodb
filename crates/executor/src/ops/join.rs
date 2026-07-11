@@ -4,7 +4,7 @@ use common::{ColumnInfo, DbError, ExecRow, Result, Row, StatementContext, Value}
 use planner::{BoundExpr, JoinSide, JoinType};
 
 use crate::ops::predicate_matches;
-use crate::query::{PlanExecutor, collect_all};
+use crate::query::{PlanExecutor, collect_all_cancelable};
 
 pub struct NestedLoopJoinOp<'a> {
     ctx: StatementContext,
@@ -63,15 +63,19 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
         self.rows.clear();
         self.index = 0;
 
-        let left_rows = collect_all(self.left.as_mut())?;
-        let right_rows = collect_all(self.right.as_mut())?;
+        let left_rows = collect_all_cancelable(self.left.as_mut(), self.ctx.cancel.as_ref())?;
+        let right_rows = collect_all_cancelable(self.right.as_mut(), self.ctx.cancel.as_ref())?;
 
         // Semi/anti joins emit the left ExecRow itself (row identity intact,
         // no right columns) at most once per left row.
         if self.join_type.is_semi_or_anti() {
             for left in left_rows {
+                self.ctx.cancel.check()?;
                 let mut matched = false;
-                for right in &right_rows {
+                for (right_index, right) in right_rows.iter().enumerate() {
+                    if right_index % 256 == 0 {
+                        self.ctx.cancel.check()?;
+                    }
                     let joined = join_row_refs(&left, right);
                     if join_condition_matches(&self.ctx, &self.condition, &joined)? {
                         matched = true;
@@ -87,8 +91,12 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
 
         let mut matched_right = vec![false; right_rows.len()];
         for left in &left_rows {
+            self.ctx.cancel.check()?;
             let mut matched_left = false;
             for (right_index, right) in right_rows.iter().enumerate() {
+                if right_index % 256 == 0 {
+                    self.ctx.cancel.check()?;
+                }
                 let mut joined = join_row_refs(left, right);
                 if self.join_type == JoinType::Cross
                     || join_condition_matches(&self.ctx, &self.condition, &joined)?
@@ -109,6 +117,7 @@ impl PlanExecutor for NestedLoopJoinOp<'_> {
 
         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
             for (right, matched) in right_rows.iter().zip(matched_right) {
+                self.ctx.cancel.check()?;
                 if !matched {
                     self.rows.push(join_with_null_left(self.left_width, right));
                 }
@@ -184,6 +193,7 @@ fn join_with_null_left(left_width: usize, right: &ExecRow) -> ExecRow {
 /// columns, then probes it with each left row. `left_keys`/`right_keys` are
 /// paired column slots into the left and right child rows.
 pub struct HashJoinOp<'a> {
+    ctx: StatementContext,
     left: Box<dyn PlanExecutor + 'a>,
     right: Box<dyn PlanExecutor + 'a>,
     left_keys: Vec<usize>,
@@ -199,6 +209,7 @@ pub struct HashJoinOp<'a> {
 
 impl<'a> HashJoinOp<'a> {
     pub fn new(
+        ctx: StatementContext,
         left: Box<dyn PlanExecutor + 'a>,
         right: Box<dyn PlanExecutor + 'a>,
         left_keys: Vec<usize>,
@@ -211,6 +222,7 @@ impl<'a> HashJoinOp<'a> {
             output_schema.extend_from_slice(right.output_schema());
         }
         Self {
+            ctx,
             left,
             right,
             left_keys,
@@ -233,11 +245,12 @@ impl PlanExecutor for HashJoinOp<'_> {
         self.rows.clear();
         self.index = 0;
 
-        let left_rows = collect_all(self.left.as_mut())?;
-        let right_rows = collect_all(self.right.as_mut())?;
+        let left_rows = collect_all_cancelable(self.left.as_mut(), self.ctx.cancel.as_ref())?;
+        let right_rows = collect_all_cancelable(self.right.as_mut(), self.ctx.cancel.as_ref())?;
 
         let mut table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
         for (right_index, right) in right_rows.iter().enumerate() {
+            self.ctx.cancel.check()?;
             if let Some(key) = join_key(&right.row.values, &self.right_keys)? {
                 table.entry(key).or_default().push(right_index);
             }
@@ -249,6 +262,7 @@ impl PlanExecutor for HashJoinOp<'_> {
             // is a non-match: dropped for semi, emitted for anti — exactly
             // the [NOT] EXISTS equality semantics decorrelation relies on.
             for left in left_rows {
+                self.ctx.cancel.check()?;
                 let matched = match join_key(&left.row.values, &self.left_keys)? {
                     Some(key) => table.contains_key(&key),
                     None => false,
@@ -261,11 +275,13 @@ impl PlanExecutor for HashJoinOp<'_> {
         }
 
         for left in &left_rows {
+            self.ctx.cancel.check()?;
             let Some(key) = join_key(&left.row.values, &self.left_keys)? else {
                 continue;
             };
             if let Some(matches) = table.get(&key) {
                 for &right_index in matches {
+                    self.ctx.cancel.check()?;
                     let mut joined = join_row_refs(left, &right_rows[right_index]);
                     if self.identity_from == Some(JoinSide::Left) {
                         joined.identity = left.identity.clone();

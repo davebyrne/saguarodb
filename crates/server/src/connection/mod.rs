@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use common::{
-    ColumnInfo, DbError, IsolationLevel, PgType, Result, Row, SessionInfo, SessionSequenceState,
-    SessionState, SqlState, Value,
+    ColumnInfo, DbError, IsolationLevel, PgType, QueryCancel, Result, Row, SessionInfo,
+    SessionSequenceState, SessionState, SqlState, Value,
 };
 use protocol::{
     ClientMessage, ConnectionState, PostgresCodec, PostgresConnectionState, ProtocolCodec,
@@ -13,7 +14,7 @@ use protocol::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::app::AppState;
@@ -28,16 +29,23 @@ use crate::shutdown::InFlightQueryGuard;
 mod copy;
 mod extended;
 mod simple;
+mod timeout;
+
+use timeout::StatementTimer;
 
 /// State for an in-progress `COPY ... FROM STDIN`. The blocking task owns the
 /// transaction and inserts rows pulled from `sender`; the connection loop forwards
 /// `CopyData` into it and finalizes on `CopyDone`/`CopyFail`/disconnect.
 struct CopyInSession {
-    sender: mpsc::Sender<CopyInChunk>,
-    task: JoinHandle<(Option<Transaction>, Result<u64>)>,
+    sender: Option<mpsc::Sender<CopyInChunk>>,
+    task: Option<JoinHandle<(Option<Transaction>, Result<u64>)>>,
     /// Set once the insert task has exited early on a row error: we then discard
     /// further `CopyData` and report the task's error on the terminator.
     insert_failed: bool,
+    /// The worker has been stopped and its timeout ErrorResponse has already
+    /// been sent. Further CopyData is discarded until CopyDone/CopyFail restores
+    /// protocol synchronization and emits the sole ReadyForQuery.
+    draining_after_cancel: bool,
     /// Keeps the COPY counted as an in-flight query for its whole streaming
     /// lifetime, so graceful shutdown's `wait_for_idle` accounts for it (the insert
     /// task holds the shared writer guard, which the final checkpoint must drain).
@@ -274,7 +282,9 @@ struct Session {
     reported_application_name: String,
     /// Shared with the running query's `ExecutionContext`; set from another
     /// connection's `CancelRequest` to abort the in-flight query.
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<QueryCancel>,
+    /// Wakes the protocol loop when a separate connection delivers CancelRequest.
+    cancel_wake: Arc<Notify>,
     /// This connection's cancellation key, registered at startup and removed on
     /// disconnect.
     backend_key: Option<BackendKey>,
@@ -284,6 +294,13 @@ struct Session {
     /// are routed as copy-in data until `CopyDone`/`CopyFail`. On disconnect this
     /// drops, closing the channel so the blocking task aborts the COPY.
     copy_in: Option<CopyInSession>,
+    /// Race-safe per-connection timer for the current simple statement or
+    /// extended-query cycle.
+    statement_timer: StatementTimer,
+    /// True from statement arm through terminal response, including timeout-zero
+    /// statements whose timer has no task. Prevents an idle CancelRequest from
+    /// generating a spurious ErrorResponse.
+    statement_active: bool,
 }
 
 impl Drop for Session {
@@ -317,11 +334,21 @@ async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    enum InputEvent {
+        Read(std::io::Result<usize>),
+        StatementCanceled,
+    }
+
     let mut session = Session::new(app);
     let mut buf = [0; 8192];
 
     loop {
-        for message in batch {
+        for message in std::mem::take(&mut batch) {
+            if session.statement_timer.is_expired() {
+                session
+                    .handle_idle_statement_timeout(&mut stream, &codec)
+                    .await?;
+            }
             if session
                 .handle(&mut stream, &codec, message)
                 .await?
@@ -331,10 +358,38 @@ where
             }
         }
 
-        let read = stream
-            .read(&mut buf)
-            .await
-            .map_err(|err| DbError::io(format!("failed to read socket: {err}")))?;
+        let mut timeout_rx = session.statement_timer.subscribe();
+        if StatementTimer::receiver_is_expired(&timeout_rx) {
+            session
+                .handle_idle_statement_timeout(&mut stream, &codec)
+                .await?;
+            continue;
+        }
+        let event = tokio::select! {
+            biased;
+            changed = timeout_rx.changed() => {
+                if changed.is_ok() && StatementTimer::receiver_is_expired(&timeout_rx) {
+                    InputEvent::StatementCanceled
+                } else {
+                    continue;
+                }
+            },
+            _ = session.cancel_wake.notified() => InputEvent::StatementCanceled,
+            read = stream.read(&mut buf) => InputEvent::Read(read),
+        };
+        let read = match event {
+            InputEvent::Read(read) => {
+                read.map_err(|err| DbError::io(format!("failed to read socket: {err}")))?
+            }
+            InputEvent::StatementCanceled => {
+                if session.statement_active && session.cancel.reason().is_some() {
+                    session
+                        .handle_idle_statement_timeout(&mut stream, &codec)
+                        .await?;
+                }
+                continue;
+            }
+        };
         if read == 0 {
             return Ok(());
         }
@@ -375,10 +430,13 @@ impl Session {
             session_info: Arc::new(SessionInfo::default()),
             session_gucs: Arc::new(SessionGucs::default()),
             reported_application_name: String::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(QueryCancel::new()),
+            cancel_wake: Arc::new(Notify::new()),
             backend_key: None,
             activity: None,
             copy_in: None,
+            statement_timer: StatementTimer::new(),
+            statement_active: false,
         }
     }
 
@@ -388,15 +446,54 @@ impl Session {
         self.tx.status_byte()
     }
 
-    /// Clear the cancellation flag and hand a shared clone to the query about to
-    /// run, so a `CancelRequest` received during execution aborts it (and a
-    /// cancellation requested between queries is ignored).
-    fn begin_cancelable(&self) -> Arc<AtomicBool> {
-        self.cancel.store(false, Ordering::Relaxed);
+    fn cancel_token(&self) -> Arc<QueryCancel> {
         self.cancel.clone()
     }
 
-    fn query_session_context(&self, cancel: Arc<AtomicBool>) -> QuerySessionContext {
+    fn effective_statement_timeout_ms(&self) -> u64 {
+        let session_timeout_ms = self.session_gucs.statement_timeout_ms();
+        self.txn
+            .as_ref()
+            .map(|txn| txn.current_statement_timeout_ms(session_timeout_ms))
+            .unwrap_or(session_timeout_ms)
+    }
+
+    async fn start_statement_timer(&mut self) {
+        let timeout = Duration::from_millis(self.effective_statement_timeout_ms());
+        self.statement_timer.arm(timeout, self.cancel.clone()).await;
+        self.statement_active = true;
+    }
+
+    async fn stop_statement_timer(&mut self) {
+        self.statement_timer.disarm().await;
+        self.statement_active = false;
+    }
+
+    async fn handle_idle_statement_timeout<S>(
+        &mut self,
+        stream: &mut S,
+        codec: &PostgresCodec,
+    ) -> Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if self.copy_in.is_some() {
+            return self.cancel_copy_in(stream, codec).await;
+        }
+        self.stop_statement_timer().await;
+        self.failed = true;
+        self.mark_current_transaction_failed();
+        let err = match self.cancel.check() {
+            Err(err) => err,
+            Ok(()) => DbError::execute(
+                SqlState::QueryCanceled,
+                "canceling statement due to statement timeout",
+            ),
+        };
+        write_messages(stream, codec, &[error_response(&err)]).await
+    }
+
+    fn query_session_context(&self, cancel: Arc<QueryCancel>) -> QuerySessionContext {
         QuerySessionContext::new(
             cancel,
             self.session_sequences.clone(),
@@ -452,7 +549,9 @@ impl Session {
         // else is a protocol violation.
         if self.copy_in.is_some() {
             match message {
-                ClientMessage::CopyData(bytes) => self.handle_copy_data(bytes).await?,
+                ClientMessage::CopyData(bytes) => {
+                    self.handle_copy_data(stream, codec, bytes).await?
+                }
                 ClientMessage::CopyDone => self.finish_copy_in(stream, codec, None).await?,
                 ClientMessage::CopyFail(message) => {
                     self.finish_copy_in(stream, codec, Some(message)).await?
@@ -467,9 +566,30 @@ impl Session {
             }
             return Ok(ControlFlow::Continue(()));
         }
+        // After any extended-cycle error, PostgreSQL discards every frontend
+        // command until Sync restores a message boundary. Terminate remains
+        // immediately effective; handling this as one gate avoids an incomplete
+        // per-variant skip list.
+        if self.failed && !matches!(&message, ClientMessage::Sync | ClientMessage::Terminate) {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if !self.failed
+            && matches!(
+                &message,
+                ClientMessage::Parse { .. }
+                    | ClientMessage::Bind { .. }
+                    | ClientMessage::Describe { .. }
+                    | ClientMessage::Execute { .. }
+            )
+        {
+            self.start_statement_timer().await;
+        }
         match message {
-            ClientMessage::Query(sql) => return self.run_query(stream, codec, sql).await,
+            ClientMessage::Query(sql) if !self.failed => {
+                return self.run_query(stream, codec, sql).await;
+            }
             ClientMessage::Sync => {
+                self.stop_statement_timer().await;
                 self.failed = false;
                 self.close_autocommit_suspended_portals();
                 write_messages(
@@ -515,12 +635,6 @@ impl Session {
             ClientMessage::Execute { portal, max_rows } if !self.failed => {
                 self.run_execute(stream, codec, &portal, max_rows).await?;
             }
-            // Extended messages while in the failed state are skipped until Sync.
-            ClientMessage::Parse { .. }
-            | ClientMessage::Bind { .. }
-            | ClientMessage::Describe { .. }
-            | ClientMessage::Close { .. }
-            | ClientMessage::Execute { .. } => {}
             ClientMessage::Startup {
                 user,
                 database,
@@ -543,7 +657,7 @@ impl Session {
                     .app
                     .components
                     .cancel_registry
-                    .register(self.cancel.clone());
+                    .register(self.cancel.clone(), self.cancel_wake.clone());
                 self.backend_key = Some(key);
                 self.session_info = Arc::new(SessionInfo {
                     user: session_user,
@@ -691,6 +805,49 @@ where
             .map_err(|err| DbError::io(format!("failed to write socket response: {err}")))?;
     }
     Ok(())
+}
+
+async fn wait_cancelable<T>(
+    cancel: &QueryCancel,
+    future: impl Future<Output = T>,
+) -> std::result::Result<T, DbError> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => return Ok(output),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                cancel.check()?;
+            }
+        }
+    }
+}
+
+/// Reconcile cancellation observed by the async stream consumer with the
+/// blocking producer's authoritative result. A completed autocommit direct result
+/// may already be durable, so it must remain successful; streaming/COPY work was
+/// interrupted before its terminal response, and explicit-transaction work can
+/// still be safely poisoned.
+fn apply_stream_consumer_cancel(
+    txn: &mut Option<Transaction>,
+    outcome: &mut Result<StreamOutcome>,
+    err: DbError,
+) {
+    if outcome.is_err() {
+        return;
+    }
+    let durable_or_complete_autocommit = txn.is_none()
+        && matches!(
+            outcome,
+            Ok(StreamOutcome::Direct(_) | StreamOutcome::SessionReset(_))
+        );
+    if durable_or_complete_autocommit {
+        return;
+    }
+    if let Some(txn) = txn.as_mut() {
+        txn.mark_failed();
+    }
+    *outcome = Err(err);
 }
 
 /// Encode each column of a result row to its wire bytes, choosing each column's

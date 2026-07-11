@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use buffer::{BufferPool, MemoryBufferPool, PageStore};
 use common::{
-    ColumnDef, CompressionSetting, DataType, IndexSchema, PageFlushInfo, RelationKind, Row,
-    Snapshot, StatementContext, TableSchema, ToastOptions, Value,
+    CancelReason, ColumnDef, CompressionSetting, DataType, IndexSchema, PageFlushInfo, QueryCancel,
+    RelationKind, Row, Snapshot, SqlState, StatementContext, TableSchema, ToastOptions, Value,
 };
 use compress::CompressionRegistry;
 use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
@@ -359,4 +359,18 @@ fn sample_heap_pages_returns_page_images_capped() {
         .unwrap();
     assert!(samples.len() <= 4);
     assert!(samples.iter().all(|s| s.len() == buffer::PAGE_SIZE));
+}
+
+#[test]
+fn sample_heap_pages_cancelable_observes_statement_timeout() {
+    let fixture = Fixture::new();
+    fixture.insert_rows(102, 10);
+    let cancel = QueryCancel::new();
+    cancel.request(CancelReason::StatementTimeout);
+
+    let err = fixture
+        .engine
+        .sample_heap_pages_cancelable(&users_schema_zstd(), 4, &cancel)
+        .unwrap_err();
+    assert_eq!(err.code, SqlState::QueryCanceled);
 }

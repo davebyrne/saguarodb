@@ -19,8 +19,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
-use common::TxnId;
+use common::{QueryCancel, Result, TxnId};
+
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The latched state of the registry: the in-progress transaction ids and a
 /// refcounted multiset of `xmin`s advertised by currently-live snapshots.
@@ -309,6 +312,18 @@ impl ActiveTxnRegistry {
         }
     }
 
+    pub(crate) fn wait_for_snapshot_exclusion_clear_cancelable(
+        &self,
+        cancel: &QueryCancel,
+    ) -> Result<()> {
+        let mut guard = self.lock();
+        while guard.snapshot_exclusion {
+            cancel.check()?;
+            guard = self.wait_for(guard, CANCEL_POLL_INTERVAL);
+        }
+        Ok(())
+    }
+
     /// Capture the active set and allocator boundary without advertising the
     /// snapshot's `xmin`, and without waiting on snapshot exclusion. This is only
     /// for schema-rewrite DDL after [`begin_snapshot_exclusion`](Self::begin_snapshot_exclusion)
@@ -332,6 +347,7 @@ impl ActiveTxnRegistry {
     /// around open transactions: the DDL waits for already-advertised snapshots first,
     /// while transactions that already hold a writer guard may still capture the
     /// statement snapshots they need to finish and release that guard.
+    #[cfg(test)]
     pub(crate) fn begin_snapshot_exclusion(&self) -> SnapshotExclusionGuard {
         let mut guard = self.lock();
         while guard.snapshot_exclusion {
@@ -344,6 +360,30 @@ impl ActiveTxnRegistry {
         SnapshotExclusionGuard {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    pub(crate) fn begin_snapshot_exclusion_cancelable(
+        &self,
+        cancel: &QueryCancel,
+    ) -> Result<SnapshotExclusionGuard> {
+        let mut guard = self.lock();
+        while guard.snapshot_exclusion {
+            cancel.check()?;
+            guard = self.wait_for(guard, CANCEL_POLL_INTERVAL);
+        }
+        guard.snapshot_exclusion = true;
+        while !guard.xmins.is_empty() {
+            if let Err(err) = cancel.check() {
+                guard.snapshot_exclusion = false;
+                drop(guard);
+                self.shared.cvar.notify_all();
+                return Err(err);
+            }
+            guard = self.wait_for(guard, CANCEL_POLL_INTERVAL);
+        }
+        Ok(SnapshotExclusionGuard {
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// Release one advertisement of `xmin`: decrement its count and drop the key at
@@ -382,6 +422,17 @@ impl ActiveTxnRegistry {
             .cvar
             .wait(guard)
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_for<'a>(
+        &self,
+        guard: MutexGuard<'a, RegistryState>,
+        timeout: Duration,
+    ) -> MutexGuard<'a, RegistryState> {
+        match self.shared.cvar.wait_timeout(guard, timeout) {
+            Ok((guard, _)) => guard,
+            Err(poisoned) => poisoned.into_inner().0,
+        }
     }
 }
 

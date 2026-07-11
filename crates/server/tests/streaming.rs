@@ -5,10 +5,13 @@
 
 mod support;
 
+use std::time::Duration;
+
+use common::SqlState;
 use support::{Connection, TestServer};
 
 /// Rows buffered before the producer blocks: capacity 64 batches × 64 rows/batch.
-/// A result larger than this forces the producer to block on `blocking_send`.
+/// A result larger than this forces the producer into its retrying backpressure loop.
 const CHANNEL_ROW_CAPACITY: i64 = 64 * 64;
 
 /// Insert `id` values `1..=n` into a single-column table, in chunks to keep each
@@ -27,6 +30,52 @@ async fn insert_sequential_ids(conn: &mut Connection, n: i64) {
     }
 }
 
+async fn insert_large_payloads(conn: &mut Connection, n: i64, payload_bytes: usize) {
+    let payload = "x".repeat(payload_bytes);
+    let mut next = 1;
+    while next <= n {
+        let end = (next + 19).min(n);
+        let values = (next..=end)
+            .map(|id| format!("({id},'{payload}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.ok(&format!(
+            "insert into slow_rows (id, payload) values {values}"
+        ))
+        .await;
+        next = end + 1;
+    }
+}
+
+fn has_complete_frame(bytes: &[u8], expected_tag: u8) -> bool {
+    complete_frame_body(bytes, expected_tag).is_some()
+}
+
+fn complete_frame_body(bytes: &[u8], expected_tag: u8) -> Option<&[u8]> {
+    let mut offset = 0;
+    while offset + 5 <= bytes.len() {
+        let tag = bytes[offset];
+        let len = i32::from_be_bytes(bytes[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        if len < 4 || offset + 1 + len > bytes.len() {
+            return None;
+        }
+        if tag == expected_tag {
+            return Some(&bytes[offset + 5..offset + 1 + len]);
+        }
+        offset += 1 + len;
+    }
+    None
+}
+
+fn assert_statement_timeout(outcome: &support::QueryOutcome) {
+    let err = match &outcome.result {
+        Err(err) => err,
+        Ok(_) => panic!("long-running query should time out"),
+    };
+    assert_eq!(err.code, SqlState::QueryCanceled);
+    assert!(err.message.contains("statement timeout"));
+}
+
 /// Assert `rows` is exactly `[[1], [2], … [n]]` as text.
 fn assert_ids_in_order(rows: &[Vec<Option<String>>], n: i64) {
     assert_eq!(rows.len(), n as usize, "every streamed row must arrive");
@@ -36,8 +85,8 @@ fn assert_ids_in_order(rows: &[Vec<Option<String>>], n: i64) {
 }
 
 /// A result set far larger than the channel can buffer must come back complete
-/// and in order. 5000 rows exceeds the buffer, so the producer blocks on
-/// `blocking_send` while the consumer drains — checking multi-batch ordering and
+/// and in order. 5000 rows exceeds the buffer, so the producer applies
+/// backpressure while the consumer drains — checking multi-batch ordering and
 /// guarding against a regression that awaited the producer task before draining
 /// (which would deadlock the moment the channel filled, tripping the timeout).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -52,6 +101,128 @@ async fn large_select_streams_all_rows_in_order() {
     let outcome = conn.ok("select id from t order by id").await;
     assert_eq!(outcome.status, b'I');
     assert_ids_in_order(&outcome.rows(), n);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statement_timeout_stops_streamed_select_and_connection_is_reusable() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+    insert_sequential_ids(&mut conn, 300).await;
+    conn.ok("set statement_timeout = '50 ms'").await.rows();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        conn.ok("select a.id from t a cross join t b cross join t c"),
+    )
+    .await
+    .expect("streamed SELECT should observe statement timeout");
+    assert_statement_timeout(&outcome);
+    assert_eq!(outcome.status, b'I');
+
+    conn.ok("reset statement_timeout").await.rows();
+    assert_eq!(
+        conn.ok("select count(*) from t").await.rows(),
+        vec![vec![Some("300".to_string())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statement_timeout_poisons_transaction_until_rollback() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+    insert_sequential_ids(&mut conn, 300).await;
+    conn.ok("set statement_timeout = '50 ms'").await.rows();
+    assert_eq!(conn.ok("begin").await.status, b'T');
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        conn.ok("select a.id from t a cross join t b cross join t c"),
+    )
+    .await
+    .expect("in-transaction SELECT should observe statement timeout");
+    assert_statement_timeout(&outcome);
+    assert_eq!(outcome.status, b'E');
+    let rejected = conn.ok("select count(*) from t").await;
+    assert!(rejected.result.is_err());
+    assert_eq!(rejected.status, b'E');
+
+    assert_eq!(conn.ok("rollback").await.status, b'I');
+    conn.ok("reset statement_timeout").await.rows();
+    assert_eq!(
+        conn.ok("select count(*) from t").await.rows(),
+        vec![vec![Some("300".to_string())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_statement_timeout_stops_execute_and_sync_recovers() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table t (id integer primary key)").await;
+    insert_sequential_ids(&mut conn, 300).await;
+    conn.ok("set statement_timeout = '50 ms'").await.rows();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        conn.extended_execute("select a.id from t a cross join t b cross join t c"),
+    )
+    .await
+    .expect("extended Execute should observe statement timeout")
+    .unwrap();
+    assert_statement_timeout(&outcome);
+    assert_eq!(outcome.status, b'I', "Sync restores the extended cycle");
+
+    conn.ok("reset statement_timeout").await.rows();
+    assert_eq!(
+        conn.extended_execute("select count(*) from t")
+            .await
+            .unwrap()
+            .rows(),
+        vec![vec![Some("300".to_string())]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statement_timeout_interrupts_active_stream_under_client_backpressure() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table slow_rows (id integer primary key, payload text)")
+        .await;
+    // Nearly five MiB of protocol payload exceeds the loopback socket's send
+    // buffer once the client pauses after its first row.
+    insert_large_payloads(&mut conn, 600, 8 * 1024).await;
+    conn.ok("set statement_timeout = '200 ms'").await.rows();
+
+    let prefix = conn
+        .begin_query_until_data_row("select id, payload from slow_rows")
+        .await
+        .unwrap();
+    assert!(has_complete_frame(&prefix, b'T'), "RowDescription arrived");
+    assert!(
+        has_complete_frame(&prefix, b'D'),
+        "at least one DataRow arrived"
+    );
+
+    // Stop draining long enough for server-side channel/socket backpressure and
+    // the statement timer to overlap, then accept either a framed timeout reply or
+    // the safe connection-close path if cancellation interrupted write_all.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (tail, closed) = conn
+        .read_until_ready_or_close(Duration::from_secs(3))
+        .await
+        .unwrap();
+    if !closed {
+        let error = complete_frame_body(&tail, b'E')
+            .expect("active stream must return a timeout error or close safely");
+        assert!(error.windows(5).any(|window| window == b"57014"));
+        assert!(
+            error
+                .windows("statement timeout".len())
+                .any(|window| window == b"statement timeout")
+        );
+    }
 }
 
 /// An empty SELECT still streams a schema (RowDescription) and a `SELECT 0` tag,

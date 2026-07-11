@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{ColumnInfo, ExecRow, Result, Row, Value};
+use common::{ColumnInfo, ExecRow, QueryCancel, Result, Row, StatementContext, Value};
 use planner::SetOp;
 
-use crate::query::{PlanExecutor, collect_all};
+use crate::query::{PlanExecutor, collect_all_cancelable};
 
 /// Executes a set operation (`UNION`/`INTERSECT`/`EXCEPT`) over two sub-plans.
 ///
@@ -20,6 +20,7 @@ use crate::query::{PlanExecutor, collect_all};
 /// de-duplicated. Both arms produce identically-typed rows (reconciled by the
 /// binder), so the output schema is the left arm's.
 pub struct SetOpOp<'a> {
+    ctx: StatementContext,
     op: SetOp,
     all: bool,
     left: Box<dyn PlanExecutor + 'a>,
@@ -31,6 +32,7 @@ pub struct SetOpOp<'a> {
 
 impl<'a> SetOpOp<'a> {
     pub fn new(
+        ctx: StatementContext,
         op: SetOp,
         all: bool,
         left: Box<dyn PlanExecutor + 'a>,
@@ -38,6 +40,7 @@ impl<'a> SetOpOp<'a> {
     ) -> Self {
         let output_schema = left.output_schema().to_vec();
         Self {
+            ctx,
             op,
             all,
             left,
@@ -56,9 +59,10 @@ impl PlanExecutor for SetOpOp<'_> {
 
     fn open(&mut self) -> Result<()> {
         // `collect_all` opens, drains, and closes each child.
-        let left = collect_all(self.left.as_mut())?;
-        let right = collect_all(self.right.as_mut())?;
-        self.result = combine(self.op, self.all, left, right);
+        let left = collect_all_cancelable(self.left.as_mut(), self.ctx.cancel.as_ref())?;
+        let right = collect_all_cancelable(self.right.as_mut(), self.ctx.cancel.as_ref())?;
+        self.ctx.cancel.check()?;
+        self.result = combine(self.op, self.all, left, right, self.ctx.cancel.as_ref())?;
         self.index = 0;
         Ok(())
     }
@@ -90,65 +94,88 @@ impl PlanExecutor for SetOpOp<'_> {
 ///   left order); `EXCEPT` emits the distinct left rows absent from the right.
 ///
 /// All forms use structural whole-row equality with `NULL == NULL`.
-fn combine(op: SetOp, all: bool, left: Vec<ExecRow>, right: Vec<ExecRow>) -> Vec<Row> {
+fn combine(
+    op: SetOp,
+    all: bool,
+    left: Vec<ExecRow>,
+    right: Vec<ExecRow>,
+    cancel: &QueryCancel,
+) -> Result<Vec<Row>> {
+    let mut output = Vec::new();
     match op {
-        SetOp::Union if all => left
-            .into_iter()
-            .chain(right)
-            .map(|exec_row| exec_row.row)
-            .collect(),
+        SetOp::Union if all => {
+            for exec_row in left.into_iter().chain(right) {
+                cancel.check()?;
+                output.push(exec_row.row);
+            }
+        }
         SetOp::Union => {
             let mut seen = BTreeSet::new();
-            left.into_iter()
-                .chain(right)
-                .filter_map(|exec_row| keep_first(&mut seen, exec_row.row))
-                .collect()
+            for exec_row in left.into_iter().chain(right) {
+                cancel.check()?;
+                if let Some(row) = keep_first(&mut seen, exec_row.row) {
+                    output.push(row);
+                }
+            }
         }
         // INTERSECT ALL: emit a left row while the right arm still has an unmatched
         // copy of it, consuming one right occurrence per emitted row (so the count
         // emitted is min(left, right)).
         SetOp::Intersect if all => {
-            let mut remaining = occurrence_counts(right);
-            left.into_iter()
-                .filter_map(|exec_row| {
-                    consume_one(&mut remaining, &exec_row.row.values).then_some(exec_row.row)
-                })
-                .collect()
+            let mut remaining = occurrence_counts(right, cancel)?;
+            for exec_row in left {
+                cancel.check()?;
+                if consume_one(&mut remaining, &exec_row.row.values) {
+                    output.push(exec_row.row);
+                }
+            }
         }
         SetOp::Intersect => {
-            let right_rows: BTreeSet<Vec<Value>> = right
-                .into_iter()
-                .map(|exec_row| exec_row.row.values)
-                .collect();
+            let mut right_rows = BTreeSet::new();
+            for exec_row in right {
+                cancel.check()?;
+                right_rows.insert(exec_row.row.values);
+            }
             let mut emitted = BTreeSet::new();
-            left.into_iter()
-                .filter(|exec_row| right_rows.contains(&exec_row.row.values))
-                .filter_map(|exec_row| keep_first(&mut emitted, exec_row.row))
-                .collect()
+            for exec_row in left {
+                cancel.check()?;
+                if right_rows.contains(&exec_row.row.values)
+                    && let Some(row) = keep_first(&mut emitted, exec_row.row)
+                {
+                    output.push(row);
+                }
+            }
         }
         // EXCEPT ALL: drop a left row while the right arm still has an unmatched
         // copy of it (cancelling one right occurrence); emit the surplus (so the
         // count emitted is max(0, left - right)).
         SetOp::Except if all => {
-            let mut remaining = occurrence_counts(right);
-            left.into_iter()
-                .filter_map(|exec_row| {
-                    (!consume_one(&mut remaining, &exec_row.row.values)).then_some(exec_row.row)
-                })
-                .collect()
+            let mut remaining = occurrence_counts(right, cancel)?;
+            for exec_row in left {
+                cancel.check()?;
+                if !consume_one(&mut remaining, &exec_row.row.values) {
+                    output.push(exec_row.row);
+                }
+            }
         }
         SetOp::Except => {
-            let right_rows: BTreeSet<Vec<Value>> = right
-                .into_iter()
-                .map(|exec_row| exec_row.row.values)
-                .collect();
+            let mut right_rows = BTreeSet::new();
+            for exec_row in right {
+                cancel.check()?;
+                right_rows.insert(exec_row.row.values);
+            }
             let mut emitted = BTreeSet::new();
-            left.into_iter()
-                .filter(|exec_row| !right_rows.contains(&exec_row.row.values))
-                .filter_map(|exec_row| keep_first(&mut emitted, exec_row.row))
-                .collect()
+            for exec_row in left {
+                cancel.check()?;
+                if !right_rows.contains(&exec_row.row.values)
+                    && let Some(row) = keep_first(&mut emitted, exec_row.row)
+                {
+                    output.push(row);
+                }
+            }
         }
     }
+    Ok(output)
 }
 
 /// Return `row` only the first time its values are seen (recording them in `seen`).
@@ -157,12 +184,16 @@ fn keep_first(seen: &mut BTreeSet<Vec<Value>>, row: Row) -> Option<Row> {
 }
 
 /// Count how many times each distinct row occurs.
-fn occurrence_counts(rows: Vec<ExecRow>) -> BTreeMap<Vec<Value>, usize> {
+fn occurrence_counts(
+    rows: Vec<ExecRow>,
+    cancel: &QueryCancel,
+) -> Result<BTreeMap<Vec<Value>, usize>> {
     let mut counts = BTreeMap::new();
     for exec_row in rows {
+        cancel.check()?;
         *counts.entry(exec_row.row.values).or_insert(0) += 1;
     }
-    counts
+    Ok(counts)
 }
 
 /// Consume one occurrence of `values` from `counts` if present; returns whether a
@@ -174,5 +205,76 @@ fn consume_one(counts: &mut BTreeMap<Vec<Value>, usize>, values: &[Value]) -> bo
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::{CancelReason, SqlState};
+
+    use super::*;
+
+    fn rows(values: &[i64]) -> Vec<ExecRow> {
+        values
+            .iter()
+            .map(|value| ExecRow {
+                row: Row {
+                    values: vec![Value::Integer(*value)],
+                },
+                identity: None,
+            })
+            .collect()
+    }
+
+    fn ints(rows: Vec<Row>) -> Vec<i64> {
+        rows.into_iter()
+            .map(|row| match row.values.as_slice() {
+                [Value::Integer(value)] => *value,
+                other => panic!("unexpected set-op row: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancelable_combine_preserves_set_and_multiset_semantics() {
+        let cancel = QueryCancel::new();
+        assert_eq!(
+            ints(
+                combine(
+                    SetOp::Union,
+                    false,
+                    rows(&[1, 1, 2]),
+                    rows(&[2, 3]),
+                    &cancel,
+                )
+                .unwrap()
+            ),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ints(
+                combine(
+                    SetOp::Intersect,
+                    true,
+                    rows(&[1, 1, 2]),
+                    rows(&[1, 2, 2]),
+                    &cancel,
+                )
+                .unwrap()
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ints(combine(SetOp::Except, true, rows(&[1, 1, 2]), rows(&[1]), &cancel,).unwrap()),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn combine_stops_on_statement_cancellation() {
+        let cancel = QueryCancel::new();
+        cancel.request(CancelReason::StatementTimeout);
+        let err = combine(SetOp::Union, false, rows(&[1, 2]), rows(&[3]), &cancel).unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
     }
 }

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-01
 **Status:** Implemented for SELECT streaming, extended-protocol portal
-suspension, and SQL cursors; statement timeouts remain follow-on work.
+suspension, SQL cursors, and responsive statement cancellation/timeouts.
 
 ## 1. Overview
 
@@ -18,9 +18,9 @@ boundary that already existed and was already proven by the COPY-out path.
 - **Adds TCP backpressure.** A slow client naturally throttles the scan: when the
   channel fills, the producer blocks on send, pinning bounded memory instead of
   running ahead.
-- **Makes cancellation responsive.** `ctx.cancel` is already polled at row
-  boundaries; streaming means a `CancelRequest` (or a future statement timeout)
-  stops the scan mid-result rather than after full materialization.
+- **Makes cancellation responsive.** `ctx.cancel` is polled at row and bounded
+  channel boundaries, so a `CancelRequest` or statement timeout stops a scan
+  mid-result rather than after full materialization.
 
 ### Scope
 
@@ -43,7 +43,7 @@ boundary that already existed and was already proven by the COPY-out path.
 **Also implemented on this foundation:** extended-protocol portal `max_rows` +
 `PortalSuspended` for read-only SELECT portals, plus simple-query SQL cursors.
 
-**Still deliberately unblocked (see §8):** responsive statement timeouts.
+Statement timeouts reuse the same reason-aware cancellation path (see §8).
 
 ## 2. Precedent: the COPY-out bridge
 
@@ -55,8 +55,8 @@ producer/consumer split, and the SELECT bridge mirrors its shape:
 - The **blocking producer** (`spawn_blocking`) owns the whole read: it captures
   the snapshot, holds the GC-horizon advertisement across the entire scan, builds
   the `ExecutionContext`, drives the operator tree, and pushes results into the
-  channel via `blocking_send` (which blocks — and thus applies backpressure —
-  when the channel is full).
+  channel via a retrying `try_send` loop (which applies backpressure while also
+  polling cancellation when the channel is full).
 - The **async consumer** drains the channel and writes protocol messages.
 - The transaction slot is threaded into the producer and returned through
   `task.await`; the async side gets it back only after the stream completes.
@@ -74,7 +74,7 @@ mpsc::channel(64)                        owns snapshot + GC-horizon advert
 spawn producer(row_tx) ───────────────►  + ExecutionContext + PlanExecutor + txn
 recv() loop:                             open() → sink.start(columns)
   Start{columns} → RowDescription        loop: pull ≤N rows → sink.push(batch)
-  Rows(batch)    → DataRow*                    (blocking_send → backpressure)
+  Rows(batch)    → DataRow*                    (retry send → backpressure/cancel)
                                          close(); drop advertisement; drop ctx
 (task.await) ◄──────────────────────────  return (txn, default_iso, Outcome)
 CommandComplete + ReadyForQuery
@@ -191,7 +191,7 @@ New server entry points (mirroring the existing `execute_simple_*` /
 - `execute_simple_streamed(sql, txn, default_isolation, session_ctx, row_tx)
   -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>)`
 - analogous `execute_prepared_*_streamed` entry points for the extended `Execute`
-  path. `session_ctx` carries the connection's cancellation flag,
+  path. `session_ctx` carries the connection's cancellation token,
   `SessionSequenceState`, `SessionInfo`, and `SessionGucs`.
 
 For a `Read` statement that is a plain SELECT, the read helpers build a
@@ -268,9 +268,9 @@ invariant holds exactly as it does for `copy_out_autocommit` /
 | Case | Behavior |
 |---|---|
 | Pre-stream error (parse/bind/plan/`open`) | No `Start` is sent; `task.await` yields `Err`. Simple path: `ErrorResponse` + `ReadyForQuery`. Extended path: `ErrorResponse`, session marked failed. No `RowDescription`. |
-| Mid-stream error (storage read, cancellation) | `RowDescription` + some `DataRow`s already sent; then `ErrorResponse` (+ `ReadyForQuery` on the simple path). Valid in the PostgreSQL protocol. Inside a transaction the block is poisoned (`txn.failed = true`). |
-| Client / socket write error | The consumer records the error, stops reading, and drops the receiver; the producer's next `blocking_send` fails, the sink returns `Break`, the executor is closed, and the producer returns. The connection then errors out. Mirrors COPY-out's `write_err` handling. |
-| Cancellation (`CancelRequest`) | `ctx.cancel` is polled per row in the drive loop, producing `QueryCanceled` mid-stream. This is the foundation for responsive statement timeouts. |
+| Mid-stream error (storage read, cancellation) | `RowDescription` + some `DataRow`s may already have been sent. If cancellation is observed between protocol frames, the server sends `ErrorResponse` (+ `ReadyForQuery` on the simple path). If it interrupts an in-progress socket `write_all`, the frame may be partial, so the only protocol-safe outcome is to close the connection rather than append an error frame to a corrupted stream. Inside a transaction the block is poisoned (`txn.failed = true`) before either terminal path. |
+| Client / socket write error | The consumer records the error, stops reading, and drops the receiver; the producer's next send fails, the sink returns `Break`, the executor is closed, and the producer returns. The connection then errors out. Mirrors COPY-out's `write_err` handling. |
+| Cancellation (`CancelRequest` or statement timer) | `ctx.cancel` is polled per row in the drive loop and while materializing blocking operator inputs/builds, producing reason-specific `QueryCanceled` even before the first output row. |
 | Zero-row SELECT | `sink.start` fires before the drive loop, so `RowDescription` is always emitted (matching current behavior). |
 
 ## 7. Backpressure, batching, and tuning
@@ -293,8 +293,8 @@ invariant holds exactly as it does for `copy_out_autocommit` /
 ## 8. Follow-On Unlocks
 
 The streaming design positioned the following features as localized, additive
-changes rather than reworks. Portal suspension and SQL cursors are now
-implemented on that foundation; timeouts remain follow-on work.
+changes rather than reworks. Portal suspension, SQL cursors, and statement
+timeouts are implemented on that foundation.
 
 - **Portal `max_rows` + `PortalSuspended`.** Implemented for read-only SELECT
   portals by parking an `OpenQuery` worker behind the portal registry. The worker
@@ -303,9 +303,11 @@ implemented on that foundation; timeouts remain follow-on work.
   discarded, invalidated by transaction end, or the connection drops.
 - **`DECLARE`/`FETCH` cursors.** Implemented with the same parked-worker shape
   behind a SQL cursor registry instead of the extended-protocol portal registry.
-- **Responsive statement timeouts.** Cancellation is already observed per row in
-  the drive loop; a timeout simply sets `ctx.cancel` from a timer, and the stream
-  stops at the next batch boundary.
+- **Responsive statement timeouts.** A timer records `StatementTimeout` in the
+  shared token. The drive loop polls it per row; a producer blocked by
+  backpressure polls it while retrying the bounded send; and the async consumer
+  races channel receives and socket writes against it. This prevents either side
+  of the bridge from hiding expiration indefinitely.
 - **Homes that already exist.** The extended-protocol portal registry stores
   suspended portal workers; SQL cursors use a sibling session registry for named
   cursors.
@@ -323,8 +325,10 @@ extended-protocol incremental fetch; SQL cursors add transaction-scoped
   failure and mid-drive error both close the executor.
 - **Server integration (both protocols):** streamed SELECT correctness;
   zero-row SELECT emits `RowDescription`; a result larger than the channel
-  capacity exercises backpressure without deadlock; mid-stream cancellation
-  yields `ErrorResponse` after some `DataRow`s; client disconnect aborts the scan;
+  capacity exercises backpressure without deadlock; a slow/non-reading client
+  verifies timeout after `RowDescription`/`DataRow` and accepts the documented
+  reason-specific error between frames or safe close during a partial socket write;
+  client disconnect aborts the scan;
   an in-transaction SELECT preserves snapshot semantics and poisons the block on a
   mid-stream error; a streamed SELECT concurrent with VACUUM confirms the
   advertisement holds (no reclaim of visible versions).
@@ -341,4 +345,5 @@ extended-protocol incremental fetch; SQL cursors add transaction-scoped
   `PortalSuspended` frame; SQL cursors add only the documented
   transaction-scoped cursor statements.
 - No change to DML, DDL, EXPLAIN, or COPY SQL semantics.
-- No implementation of statement timeouts (see §8).
+- No server-wide or transaction-wide timeout; `statement_timeout` is scoped to
+  the protocol statement lifecycle described by the server specification.

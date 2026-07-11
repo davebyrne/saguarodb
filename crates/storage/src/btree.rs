@@ -32,7 +32,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 
 use buffer::{BufferPool, PageWriteGuard};
-use common::{DbError, FileId, Key, KeyRange, PageNum, Result, SqlState};
+use common::{DbError, FileId, Key, KeyRange, PageNum, QueryCancel, Result, SqlState};
 use wal::{WalManager, WalRecord};
 
 use crate::codec::{decode_key, decode_key_prefix, encode_key};
@@ -377,8 +377,16 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// matches every row sharing the indexed value. Entries are returned with their
     /// full key.
     pub(crate) fn range(&self, range: &KeyRange) -> Result<Vec<(Key, V)>> {
+        self.range_cancelable(range, None)
+    }
+
+    pub(crate) fn range_cancelable(
+        &self,
+        range: &KeyRange,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<Vec<(Key, V)>> {
         let mut out = Vec::new();
-        self.range_for_each(range, |key, value| {
+        self.range_for_each_cancelable(range, cancel, |key, value| {
             out.push((key, value));
             Ok(())
         })?;
@@ -388,13 +396,28 @@ impl<'a, V: IndexValue> BTree<'a, V> {
     /// Visit entries within `range` in `(key, value)` order, buffering only one
     /// leaf page at a time so callers can process large ranges without building
     /// one table-sized vector.
-    pub(crate) fn range_for_each<F>(&self, range: &KeyRange, mut visitor: F) -> Result<()>
+    pub(crate) fn range_for_each<F>(&self, range: &KeyRange, visitor: F) -> Result<()>
+    where
+        F: FnMut(Key, V) -> Result<()>,
+    {
+        self.range_for_each_cancelable(range, None, visitor)
+    }
+
+    fn range_for_each_cancelable<F>(
+        &self,
+        range: &KeyRange,
+        cancel: Option<&QueryCancel>,
+        mut visitor: F,
+    ) -> Result<()>
     where
         F: FnMut(Key, V) -> Result<()>,
     {
         let prefix_len = comparison_prefix_len(range);
         let mut page_num = self.start_leaf(range)?;
         loop {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let (entries, next, done) = {
                 let guard = self.buffer.read_page(self.file_id, page_num)?;
                 let data = guard.data();
@@ -856,10 +879,20 @@ impl<'a> BTree<'a, RowLocation> {
     ///
     /// The whole pass runs under the index's per-index structural latch (held by the
     /// engine caller), so it never races another structural writer on this index.
+    #[cfg(test)]
     pub(crate) fn remove_values_in(
         &self,
         txn_id: u64,
         dead: &std::collections::HashSet<RowLocation>,
+    ) -> Result<usize> {
+        self.remove_values_in_cancelable(txn_id, dead, None)
+    }
+
+    pub(crate) fn remove_values_in_cancelable(
+        &self,
+        txn_id: u64,
+        dead: &std::collections::HashSet<RowLocation>,
+        cancel: Option<&QueryCancel>,
     ) -> Result<usize> {
         if dead.is_empty() {
             return Ok(0);
@@ -867,6 +900,9 @@ impl<'a> BTree<'a, RowLocation> {
         let mut page_num = self.first_leaf()?;
         let mut removed = 0usize;
         loop {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let mut guard = self.buffer.write_page(self.file_id, page_num, txn_id)?;
             let mut image = *guard.data();
             // Walk entries from the end so each `remove_entry` shift never disturbs the

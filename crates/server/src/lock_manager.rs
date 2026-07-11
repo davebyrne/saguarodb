@@ -15,11 +15,10 @@
 //! partial `ROLLBACK TO` that deregisters only that subxid frees its waiter.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{ConflictWaiter, DbError, Result, SqlState, TxnId};
+use common::{ConflictWaiter, DbError, QueryCancel, Result, SqlState, TxnId};
 
 use crate::registry::ActiveTxnRegistry;
 
@@ -83,7 +82,12 @@ impl LockManager {
 }
 
 impl ConflictWaiter for LockManager {
-    fn wait_for(&self, waiter_subxid: u64, blocker_subxid: u64, cancel: &AtomicBool) -> Result<()> {
+    fn wait_for(
+        &self,
+        waiter_subxid: u64,
+        blocker_subxid: u64,
+        cancel: &QueryCancel,
+    ) -> Result<()> {
         let waiter_top = self.registry.top_of(waiter_subxid);
         let blocker_top = self.registry.top_of(blocker_subxid);
 
@@ -97,11 +101,8 @@ impl ConflictWaiter for LockManager {
             if !self.registry.is_active(blocker_subxid) {
                 break Ok(());
             }
-            if cancel.load(Ordering::Relaxed) {
-                break Err(DbError::execute(
-                    SqlState::QueryCanceled,
-                    "canceling statement due to user request",
-                ));
+            if let Err(err) = cancel.check() {
+                break Err(err);
             }
             // Ignore WHY we woke (a poll timeout, or an unrelated transaction's
             // `notify_all`): detection is purely time-based. Gating on `timed_out`

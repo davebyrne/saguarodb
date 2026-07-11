@@ -424,7 +424,7 @@ pub struct StatementContext {
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
     pub conflict_waiter: Arc<dyn ConflictWaiter>,   // docs/specs/deadlock.md
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: Arc<QueryCancel>,
     pub live_txns: Arc<[u64]>,                      // docs/specs/savepoints.md §4
     pub gc_horizon: u64,                            // §10 Milestone H3 (HOT prune)
     pub ssi_tracker: Arc<dyn SsiTracker>,           // docs/specs/ssi.md
@@ -783,7 +783,10 @@ design, because index entries accumulate per version as well as heap tuples.
     (NORMAL roots, REDIRECT roots, DEAD-pending-index-vacuum roots) stay stable** —
     indexes address them — so no index entry is touched by the byte move. `vacuum_heap`
     returns only the **DEAD root TIDs** (fully-dead chains, plus non-HOT/aborted dead
-    rows as one-member chains) for F3a + F3b; a `REDIRECT` root keeps a LIVE index entry
+    rows as one-member chains, plus pre-existing DEAD roots left by an interrupted
+    earlier pass) for F3a + F3b; this rediscovery makes cancellation/crash between
+    phases restartable without ever reusing a slot that may retain an index entry. A
+    `REDIRECT` root keeps a LIVE index entry
     (NOT returned, so F3a skips it) and heap-only members freed to `UNUSED` never had an
     entry. A stale/smaller horizon only collapses less, never unsafely.
   - **Abort-cleanup (F4c root-cause).** For each KEPT (not-reclaimed) `NORMAL` slot whose

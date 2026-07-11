@@ -1604,9 +1604,8 @@ mod tests {
     fn crashed_in_flight_transaction_is_not_resurrected_by_vacuum() {
         use super::open_app;
         use crate::checkpoint::run_checkpoint;
-        use common::IsolationLevel;
+        use common::{IsolationLevel, QueryCancel};
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
 
         let dir = tempfile::tempdir().unwrap();
         // Tiny buffer pool forces eviction (steal) of the uncommitted transaction's
@@ -1635,7 +1634,7 @@ mod tests {
                 .unwrap();
             run_checkpoint(&app.components).unwrap();
 
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(QueryCancel::new());
             let (mut slot, mut iso, res) = app.query_service.execute_simple(
                 "begin",
                 None,
@@ -1697,9 +1696,8 @@ mod tests {
     fn crashed_subtransaction_writes_are_not_resurrected() {
         use super::open_app;
         use crate::checkpoint::run_checkpoint;
-        use common::IsolationLevel;
+        use common::{IsolationLevel, QueryCancel};
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
 
         let dir = tempfile::tempdir().unwrap();
         let config = || crate::config::Config {
@@ -1718,7 +1716,7 @@ mod tests {
                 .unwrap();
             run_checkpoint(&app.components).unwrap();
 
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(QueryCancel::new());
             let payload = "x".repeat(300);
             let (mut slot, mut iso, res) = app.query_service.execute_simple(
                 "begin",
@@ -1782,9 +1780,8 @@ mod tests {
     fn crashed_in_flight_delete_does_not_drop_committed_rows() {
         use super::open_app;
         use crate::checkpoint::run_checkpoint;
-        use common::IsolationLevel;
+        use common::{IsolationLevel, QueryCancel};
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
 
         let dir = tempfile::tempdir().unwrap();
         let config = || crate::config::Config {
@@ -1812,7 +1809,7 @@ mod tests {
             }
             run_checkpoint(&app.components).unwrap();
 
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(QueryCancel::new());
             let (mut slot, mut iso, res) = app.query_service.execute_simple(
                 "begin",
                 None,
@@ -1870,9 +1867,8 @@ mod tests {
     fn resolved_in_flight_abort_survives_restart_and_vacuum() {
         use super::open_app;
         use crate::checkpoint::run_checkpoint;
-        use common::IsolationLevel;
+        use common::{IsolationLevel, QueryCancel};
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
 
         let dir = tempfile::tempdir().unwrap();
         let config = || crate::config::Config {
@@ -1891,7 +1887,7 @@ mod tests {
                 .unwrap();
             run_checkpoint(&app.components).unwrap();
 
-            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(QueryCancel::new());
             let payload = "x".repeat(300);
             let (mut slot, mut iso, res) = app.query_service.execute_simple(
                 "begin",

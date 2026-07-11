@@ -1,10 +1,49 @@
 mod support;
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use common::{KeyRange, RelationKind, StatementContext};
 use saguarodb_server::config::Config;
 use support::{Connection, TestServer};
+
+#[tokio::test]
+async fn statement_timeout_cancels_vacuum_waiting_for_writers() {
+    let server = TestServer::start().await.unwrap();
+    let mut writer = Connection::connect(&server).await.unwrap();
+    let mut maintenance = Connection::connect(&server).await.unwrap();
+    writer
+        .ok("create table timeout_vacuum (id integer primary key, value integer)")
+        .await;
+    writer
+        .ok("insert into timeout_vacuum (id, value) values (1, 10)")
+        .await;
+    writer.ok("begin").await.rows();
+    writer
+        .ok("update timeout_vacuum set value = 11 where id = 1")
+        .await;
+
+    maintenance
+        .ok("set statement_timeout = '100 ms'")
+        .await
+        .rows();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        maintenance.ok("vacuum timeout_vacuum"),
+    )
+    .await
+    .expect("VACUUM guard wait should be interrupted");
+    let err = match outcome.result {
+        Err(err) => err,
+        Ok(_) => panic!("VACUUM should time out"),
+    };
+    assert_eq!(err.code, common::SqlState::QueryCanceled);
+    assert!(err.message.contains("statement timeout"));
+
+    writer.ok("rollback").await.rows();
+    maintenance.ok("reset statement_timeout").await.rows();
+    maintenance.ok("vacuum timeout_vacuum").await.rows();
+}
 
 /// A config with a known checkpoint cadence and auto-vacuum threshold for the F4b
 /// tests. Checkpoints are NOT fired automatically by commits (cadence is huge); the

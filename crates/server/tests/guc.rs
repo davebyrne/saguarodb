@@ -1,5 +1,7 @@
 mod support;
 
+use std::time::Duration;
+
 use support::{Connection, QueryOutcome, TestServer};
 
 fn error_message(outcome: &QueryOutcome) -> String {
@@ -86,6 +88,153 @@ async fn set_show_reset_and_accept_all_gucs_are_session_local() {
 
     let message = error_message(&conn_a.ok("SHOW no_such_parameter").await);
     assert!(message.contains("C=42704"), "got {message}");
+}
+
+#[tokio::test]
+async fn statement_timeout_is_validated_and_displayed_with_postgres_units() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+
+    conn.ok("SET statement_timeout = '1.5 s'").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("1500ms".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select current_setting('statement_timeout')")
+            .await
+            .rows(),
+        vec![vec![Some("1500ms".to_string())]]
+    );
+    assert_eq!(
+        conn.ok("select setting from pg_settings where name = 'statement_timeout'")
+            .await
+            .rows(),
+        vec![vec![Some("1500".to_string())]]
+    );
+
+    let invalid = conn.ok("SET statement_timeout = '-1 ms'").await;
+    assert!(error_message(&invalid).contains("22023"));
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("1500ms".to_string())]]
+    );
+
+    conn.ok("RESET statement_timeout").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn statement_timeout_obeys_transaction_and_savepoint_scope() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    conn.ok("SET statement_timeout = '1 s'").await.rows();
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET statement_timeout = '2 s'").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("2s".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("1s".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET statement_timeout = '2 s'").await.rows();
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("2s".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SET LOCAL statement_timeout = '3 s'").await.rows();
+    assert_eq!(
+        conn.ok("select setting from pg_settings where name = 'statement_timeout'")
+            .await
+            .rows(),
+        vec![vec![Some("3000".to_string())]]
+    );
+    conn.ok("SAVEPOINT before_change").await.rows();
+    conn.ok("SET LOCAL statement_timeout = '4 s'").await.rows();
+    conn.ok("ROLLBACK TO SAVEPOINT before_change").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("3s".to_string())]]
+    );
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("2s".to_string())]]
+    );
+
+    conn.ok("SET LOCAL statement_timeout = '5 s'").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("2s".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("RESET ALL").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("0".to_string())]]
+    );
+    conn.ok("ROLLBACK").await.rows();
+    assert_eq!(
+        conn.ok("SHOW statement_timeout").await.rows(),
+        vec![vec![Some("2s".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn statement_timeout_cancels_lock_wait_and_connection_is_reusable() {
+    let server = TestServer::start().await.unwrap();
+    let mut blocker = Connection::connect(&server).await.unwrap();
+    let mut waiting = Connection::connect(&server).await.unwrap();
+
+    blocker
+        .ok("create table timeout_rows (id integer primary key, value integer)")
+        .await;
+    blocker
+        .ok("insert into timeout_rows (id, value) values (1, 10)")
+        .await;
+    blocker.ok("BEGIN").await.rows();
+    blocker
+        .ok("update timeout_rows set value = 11 where id = 1")
+        .await;
+
+    waiting.ok("SET statement_timeout = '100 ms'").await.rows();
+    let timed_out = tokio::time::timeout(
+        Duration::from_secs(2),
+        waiting.ok("update timeout_rows set value = 12 where id = 1"),
+    )
+    .await
+    .expect("statement timeout should interrupt the lock wait");
+    let message = error_message(&timed_out);
+    assert!(message.contains("C=57014"), "got {message}");
+    assert!(message.contains("statement timeout"), "got {message}");
+
+    blocker.ok("ROLLBACK").await.rows();
+    waiting.ok("RESET statement_timeout").await.rows();
+    assert_eq!(
+        waiting
+            .ok("select value from timeout_rows where id = 1")
+            .await
+            .rows(),
+        vec![vec![Some("10".to_string())]]
+    );
 }
 
 #[tokio::test]

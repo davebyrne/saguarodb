@@ -7,7 +7,7 @@ use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
 use crate::eval_expr;
 use crate::expr::integer_overflow;
-use crate::query::{PlanExecutor, collect_all};
+use crate::query::{PlanExecutor, collect_all_cancelable};
 
 pub struct AggregateOp<'a> {
     ctx: StatementContext,
@@ -47,9 +47,10 @@ impl PlanExecutor for AggregateOp<'_> {
     fn open(&mut self) -> Result<()> {
         self.rows.clear();
         self.index = 0;
-        let input = collect_all(self.source.as_mut())?;
+        let input = collect_all_cancelable(self.source.as_mut(), self.ctx.cancel.as_ref())?;
         let groups = build_groups(&self.ctx, &self.group_by, input)?;
         for (group_key, rows) in groups {
+            self.ctx.cancel.check()?;
             let mut values = group_key;
             for aggregate in &self.aggregates {
                 values.push(evaluate_aggregate(&self.ctx, aggregate, &rows)?);
@@ -88,6 +89,7 @@ fn build_groups(
 
     let mut groups: BTreeMap<Vec<Value>, Vec<ExecRow>> = BTreeMap::new();
     for row in input {
+        ctx.cancel.check()?;
         let key = group_by
             .iter()
             .map(|expr| eval_expr(ctx, expr, &row))
@@ -420,6 +422,7 @@ fn aggregate_values(
     let mut values = Vec::with_capacity(rows.len());
     let mut distinct = BTreeSet::new();
     for row in rows {
+        ctx.cancel.check()?;
         let value = eval_expr(ctx, arg, row)?;
         if aggregate.distinct && !distinct.insert(value.clone()) {
             continue;

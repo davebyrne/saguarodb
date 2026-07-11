@@ -80,6 +80,12 @@ impl CompressionRegistry {
         self.dicts.read().contains_key(&dict_id)
     }
 
+    /// Remove a dictionary prepared by a statement that failed before commit.
+    /// Idempotent because preparation may fail before registration completes.
+    pub fn remove_dictionary(&self, dict_id: u32) {
+        self.dicts.write().remove(&dict_id);
+    }
+
     fn dictionary(&self, dict_id: u32) -> Option<Arc<LoadedDictionary>> {
         self.dicts.read().get(&dict_id).cloned()
     }
@@ -315,6 +321,19 @@ mod tests {
                 .is_none()
         );
         assert!(registry.compress_fpi(10, &image).is_none());
+    }
+
+    #[test]
+    fn prepared_dictionary_can_be_removed() {
+        let registry = CompressionRegistry::new();
+        let samples: Vec<Vec<u8>> = (0..64).map(|i| sample_image(i as u8)).collect();
+        let dict = train_dictionary(&samples).unwrap();
+        registry.register_dictionary(7, &dict).unwrap();
+        assert!(registry.has_dictionary(7));
+
+        registry.remove_dictionary(7);
+        assert!(!registry.has_dictionary(7));
+        registry.remove_dictionary(7);
     }
 
     #[test]

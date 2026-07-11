@@ -322,7 +322,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 ```rust
 /// Passed to every storage operation. Carries the transaction id, the MVCC
 /// snapshot used for visibility, the isolation level, the GC horizon, and the
-/// server-installed runtime handles (row-lock conflict waiter, cancel flag,
+/// server-installed runtime handles (row-lock conflict waiter, cancellation token,
 /// live subxid set, SSI tracker, sequence runtime, session identity, system state,
 /// and catalog introspection provider).
 /// docs/specs/crates/common.md "Statement Context" is the authoritative
@@ -332,7 +332,7 @@ pub struct StatementContext {
     pub snapshot: Arc<Snapshot>,
     pub isolation: IsolationLevel,
     pub conflict_waiter: Arc<dyn ConflictWaiter>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: Arc<QueryCancel>,
     pub live_txns: Arc<[u64]>,
     pub gc_horizon: u64,
     pub ssi_tracker: Arc<dyn SsiTracker>,
@@ -372,8 +372,8 @@ pub trait FlushPolicy: Send + Sync {
 ```rust
 /// Coarse concurrency control. Server query orchestration acquires a guard
 /// before executing DML, DDL, checkpoint, or maintenance statements. Readers are
-/// lock-free and take no guard; `begin_writer()` yields a SHARED writer guard
-/// (concurrent DML writers run simultaneously); `begin_checkpoint()` yields
+/// lock-free and take no guard; writer acquisition yields a SHARED writer guard
+/// (concurrent DML writers run simultaneously); checkpoint acquisition yields
 /// an EXCLUSIVE guard used by checkpoint, maintenance, and autocommit DDL, which
 /// drains in-flight writers while readers stay lock-free.
 ///
@@ -384,7 +384,9 @@ pub trait FlushPolicy: Send + Sync {
 /// checkpoint/maintenance/autocommit DDL take it exclusively. Readers take no guard.
 pub trait ConcurrencyController: Send + Sync {
     fn begin_writer(&self) -> Result<WriteGuard>;
+    fn begin_writer_cancelable(&self, cancel: &QueryCancel) -> Result<WriteGuard>;
     fn begin_checkpoint(&self) -> Result<CheckpointGuard>;
+    fn begin_checkpoint_cancelable(&self, cancel: &QueryCancel) -> Result<CheckpointGuard>;
     fn begin_shared(&self) -> Result<WriteGuard> { self.begin_writer() }
 }
 
@@ -1510,7 +1512,7 @@ pub trait PlanExecutor {
 }
 ```
 
-A cooperative cancellation token: `ExecutionContext.cancel` is an `&AtomicBool` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. A `CancelRequest` on a side connection sets that flag via the server's `CancelRegistry`. Operators themselves stay cancellation-free; the polling lives in the query engine, so a future statement-timeout can reuse the same token without changing operator semantics.
+A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` the query engine checks between rows (and between rows of INSERT/UPDATE/DELETE write loops), aborting with `SqlState::QueryCanceled`. The token atomically retains the first `CancelReason` until reset, so a `CancelRequest` on a side connection reports `due to user request` and a statement timer reports `due to statement timeout`. Materializing paths drain children through a cancel-aware collector; blocking join, sort, aggregate, and set-operation work also polls at practical build/scan boundaries so expiration cannot remain hidden until a large `open()` finishes. Row-lock and storage maintenance waits use the same token.
 
 `next_batch` has a default implementation so operators only implement `next()`. A future vectorized engine overrides `next_batch` with columnar processing. `output_schema()` allows callers to know the shape of rows without pulling, which is needed for `RowDescription`, EXPLAIN, and projection validation.
 
@@ -2051,11 +2053,11 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full
 
 Data writes coordinate through the `ConcurrencyController`'s **shared** writer guard, so multiple DML writers run concurrently; write-write safety comes from row-conflict coordination plus per-index and per-heap structural latches (lock order: structural → frame → WAL). If a writer finds an in-progress row-lock holder, it waits through the installed `ConflictWaiter`/server `LockManager`, which runs timeout-based deadlock detection (`SqlState::DeadlockDetected`, `40P01`) and honors cancellation (`SqlState::QueryCanceled`, `57014`). If the blocker settles into a state that makes the row version conflict with the waiting writer's snapshot, the waiter fails with `SqlState::SerializationFailure` (`40001`). DDL is non-transactional and instead takes the **exclusive** guard for its autocommit statement so catalog rollback cannot race another committed DDL change. The protocol for a single autocommit DML statement:
 
-1. Acquire a shared writer guard via `controller.begin_writer()` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers)
+1. Acquire a shared writer guard via `controller.begin_writer_cancelable(cancel)` (concurrent with other writers; only checkpoint/VACUUM, holding the exclusive guard, drains writers). Timed lock polling returns the reason-specific cancellation error.
 2. Assign a `txn_id` and register it in the active-transaction registry (`ServerComponents.active_txns`). The CLOG status is `InProgress` implicitly (the default for any unsettled normal id).
 3. Execute the statement through the storage engine (which appends WAL records for each logical operation: insert, update, delete).
 4. If execution fails: append an `Abort` record (which records the txn `Aborted` in the in-memory CLOG; not fsynced) and only then deregister it from the active-transaction registry, then `storage.rollback_txn(txn_id)` (DDL-metadata restore, deletion of unpublished truncate replacement files, and retired-generation protection for rollback-removed published generations), `buffer_pool.rollback(txn_id)` (bookkeeping clear; no page undo), and catalog restore only for catalog-mutating DDL; return error to client and drop the statement guard if cleanup succeeds. Abort is **status-based** with MVCC (`docs/specs/mvcc.md` §4 Decision 3): the failed statement's heap versions stay in place, hidden by the CLOG (`Aborted`) and reclaimed by VACUUM — there is no before-image page undo. If the Abort append fails before the commit record is durable, log the failure, attempt to flush WAL, and exit without deregistering the transaction. If post-abort cleanup fails, normal query paths also exit fatally rather than returning with uncertain DDL metadata; direct internal callers surface the cleanup error for tests.
-5. Append a `Commit` record for this `txn_id`
+5. Check the cancellation token at the last safe pre-durable boundary, then append a `Commit` record for this `txn_id`. Cancellation before this boundary follows the abort path; after the durable flush begins, cleanup and success reporting remain authoritative.
 6. Flush WAL through the commit record to disk (`fsync`)
 7. The statement is now durable and must not be rolled back or reported as a normal SQL failure
 8. `storage.commit_txn(txn_id)` and `buffer_pool.commit(txn_id)` — cleanup-only (the buffer pool tracks no rollback metadata under status-based abort); deregister the txn from the active-transaction registry (its CLOG status is already `Committed`, set when the WAL flush made the `Commit` durable)
@@ -2443,7 +2445,16 @@ The `server` crate is the binary entry point.
 
 Recovery computes `next_txn_id` by scanning all retained records from `WalManager::replay_from(0)`, including committed operations, uncommitted operations, `Commit` records, committed subxids in `CommitWithSubxids`, and the `Checkpoint` marker's high-water, while ignoring `txn_id = 0` records. Scanning all retained records, not only records after the control `checkpoint_lsn`, covers a crash after the manifest/CLOG checkpoint is durable but before the checkpoint marker is appended; after a completed truncation, the retained marker preserves the allocation boundary. `next_txn_id` starts at `max_txn_id + 1`, or `FIRST_NORMAL_XID` when no user transaction records remain. If the maximum retained user transaction ID is `u64::MAX`, startup fails with a structured WAL/internal error instead of wrapping or saturating the next transaction ID. Step 13 transitions to normal operation where `StorageEngine` methods append WAL records.
 
-The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, and `30000`. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
+The server binary accepts `--data-dir <PATH>`, `--port <PORT>`, `--buffer-pool-frames <N>`, `--checkpoint-every-n-commits <N>`, `--checkpoint-wal-bytes <BYTES>`, `--auto-vacuum-dead-rows <N>`, `--shutdown-timeout-ms <MS>`, `--deadlock-timeout-ms <MS>`, `--tls-cert-file <PATH>`, `--tls-key-file <PATH>`, and `--help`. Defaults are `./data`, `5433`, `1024`, `100`, `67108864`, `10000`, `30000`, and `1000` milliseconds for deadlock detection. `--auto-vacuum-dead-rows` is the checkpoint auto-prune threshold (committed dead versions since the last auto-prune; a checkpoint folds in a VACUUM pass once it is reached); `0` disables auto-prune. TLS is off unless both `--tls-cert-file` and `--tls-key-file` are supplied (providing only one is an error). The server parses these flags with `std::env::args`; `--port` accepts `1..=65535`, the other numeric flags must be positive nonzero integers except `--auto-vacuum-dead-rows`, which also accepts `0` to disable auto-prune, and invalid input prints usage to stderr and exits with code `2`.
+
+`statement_timeout` is session configuration rather than a startup flag. Its
+canonical value is an integer number of milliseconds (`0` disables it), while
+`SET` accepts PostgreSQL time units and `SHOW` renders an exact human-readable
+unit. Regular and `LOCAL` assignments follow transaction/savepoint rollback and
+commit rules. The simple protocol times a `Query` lifecycle; extended protocol
+cycles time/restart on `Parse`/`Bind`/`Describe`/`Execute` and recover at `Sync`.
+Expiration records `CancelReason::StatementTimeout` in the same reason-aware token
+used by `CancelRequest`, returning SQLSTATE `57014`.
 
 ### Connection Handling
 
@@ -2469,12 +2480,12 @@ The production executor crate never owns SQL strings. It executes `PhysicalPlan`
 All statement-level concurrency is coordinated through the `ConcurrencyController` trait (defined in `common`):
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, then binds and plans without a `ConcurrencyController` guard. `SELECT` invokes `QueryEngine`; `EXPLAIN` formats the inner physical plan and does not invoke the executor. Readers are lock-free: multiple readers proceed concurrently with each other and with writers, but schema-generation rewrites can block new snapshot capture until they publish the new generation.
-- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus row-conflict coordination: an in-progress row-lock holder makes the waiter block through the server `LockManager` and retry after the blocker settles; deadlock cycles return `SqlState::DeadlockDetected` (`40P01`), cancellation returns `SqlState::QueryCanceled` (`57014`), and committed-superseded conflicts still return `SqlState::SerializationFailure` (`40001`).
-- **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY` also get a stable physical chain view for backfill/validation. `ALTER TABLE ... ADD/DROP COLUMN` acquires the active-transaction registry's snapshot-exclusion guard before waiting for the checkpoint guard because these statements can publish a new storage generation and conditional no-op preflight is not stable until the exclusive guard is held. The fence blocks new snapshot captures while advertised snapshots drain. Transactions that already hold a writer guard may still capture statement snapshots so they can release the guard the DDL is waiting on; read-only transactions wait so they cannot bind one schema generation and scan another. Under the exclusive guard, the executor repeats catalog preflight and returns conditional no-ops before scanning rows.
-- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <table>`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Implemented maintenance work takes the **exclusive** concurrency guard (`begin_checkpoint`), which drains in-flight writers so it runs with no concurrent writer (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs a relation-generation swap: fresh heap/index storage ids are prepared and logged before commit, then catalog/storage publish the empty generation after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
+- **DML statements** (`INSERT`, `UPDATE`, `DELETE`): server query orchestration parses SQL to classify the statement, advertises the statement snapshot, calls `begin_writer_cancelable()`, receives a **shared** writer guard, binds and plans, allocates the `txn_id`, then invokes `QueryEngine`. DML writers run **concurrently**. Write-write safety comes from per-index and per-heap-file structural write latches (lock order: structural → frame → WAL) plus row-conflict coordination: an in-progress row-lock holder makes the waiter block through the server `LockManager` and retry after the blocker settles; deadlock cycles return `SqlState::DeadlockDetected` (`40P01`), cancellation returns `SqlState::QueryCanceled` (`57014`), and committed-superseded conflicts still return `SqlState::SerializationFailure` (`40001`).
+- **DDL statements** (`CREATE TABLE` including `IF NOT EXISTS`, `DROP TABLE` including `IF EXISTS`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE/REPLACE/DROP VIEW`, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL calls `begin_checkpoint_cancelable()`, receives the **exclusive** guard, then binds, plans, allocates the `txn_id`, and invokes `QueryEngine`. It runs with no concurrent writer so catalog snapshot restore cannot overwrite another committed DDL change; `CREATE INDEX` and `ALTER TABLE ... ADD PRIMARY KEY` also get a stable physical chain view for backfill/validation. `ALTER TABLE ... ADD/DROP COLUMN` acquires the active-transaction registry's cancelable snapshot-exclusion guard before waiting for the checkpoint guard because these statements can publish a new storage generation and conditional no-op preflight is not stable until the exclusive guard is held. The fence blocks new snapshot captures while advertised snapshots drain. Transactions that already hold a writer guard may still capture statement snapshots so they can release the guard the DDL is waiting on; read-only transactions wait so they cannot bind one schema generation and scan another. Under the exclusive guard, the executor repeats catalog preflight and returns conditional no-ops before scanning rows.
+- **Maintenance statements** (`VACUUM [table]`, `TRUNCATE [TABLE] <table>`, and supported `ALTER TABLE` maintenance forms): not relational — they do not bind or plan, and they are rejected inside an explicit transaction block. Foreground maintenance takes the **exclusive** concurrency guard through `begin_checkpoint_cancelable`, which drains in-flight writers while polling the statement token (readers stay lock-free). `VACUUM` commits hidden chunk deletes before pruning parent tuples that own those chunks, then vacuums the hidden relation. `TRUNCATE` performs a relation-generation swap: fresh heap/index storage ids are prepared and logged before commit, then catalog/storage publish the empty generation after the commit flush while `relation_publish_gate` blocks lock-free snapshot capture from the committed-but-not-published gap. Primary-key ALTERs validate/rebuild the storage identity tree under the exclusive guard. See `docs/specs/mvcc.md` §9/§10 Milestone F and `docs/specs/crates/storage.md` for the VACUUM orchestration, TOAST cleanup, and GC-horizon safety argument.
 - The guard is held for the entire statement lifetime. Checkpoint runs under the exclusive guard (it drains writers), and `WalFlushPolicy` admits any WAL-durable page — uncommitted/aborted pages may reach the heap but are hidden by the CLOG and reclaimed by VACUUM.
 
-The concrete `ConcurrencyController` is an `RwLock`: `begin_writer()` takes it shared (DML writers run together), and `begin_checkpoint()` takes it exclusively for checkpoint, VACUUM, and DDL. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.
+The concrete `ConcurrencyController` is an `RwLock`: writer acquisition takes it shared (DML writers run together), and checkpoint/maintenance/DDL acquisition takes it exclusively. Foreground SQL uses cancelable timed-poll forms; background checkpoint uses the unconditional form. Readers take no guard. This boundary keeps lock-free readers, concurrent DML writers, catalog-mutating DDL, and redo-all recovery correct.
 
 **Other latches:**
 - **Buffer pool:** Frame-level read/write latches managed by page guards.
@@ -2502,6 +2513,7 @@ pub struct Config {
     pub checkpoint_wal_bytes: u64,    // default: 64 * 1024 * 1024
     pub auto_vacuum_dead_rows: u64,   // default: 10000 (0 disables auto-prune)
     pub shutdown_timeout_ms: u64,     // default: 30000
+    pub deadlock_timeout_ms: u64,     // default: 1000
     pub tls_cert_file: Option<PathBuf>, // default: None (PEM cert chain)
     pub tls_key_file: Option<PathBuf>,  // default: None (PEM private key)
 }
@@ -2512,8 +2524,6 @@ Loaded from command-line args only. There is no environment-variable or config-f
 ## 13. Future Work (Designed For, Not Implemented)
 
 - **Transactional DDL:** DDL takes the exclusive guard and commits immediately; it cannot be rolled back inside a transaction block.
-- **Statement Timeouts:** Query cancellation is implemented via `CancelRequest`;
-  server-side timeout timers are not yet implemented.
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among primary-key identity access and catalog indexes, preferring primary-key identity access when available; a cost model would replace that heuristic.

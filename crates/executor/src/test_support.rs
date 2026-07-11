@@ -1,13 +1,13 @@
 use catalog::{CatalogManager, MemoryCatalog};
 use common::{
     ColumnId, ColumnInfo, CopyOptions, DataType, DbError, IndexConstraintKind, IndexId,
-    IndexSchema, Key, KeyRange, ParsedColumnDef, Result, Row, RowId, SqlState, StatementContext,
-    StoredRow, TableId, TableSchema, Value,
+    IndexSchema, Key, KeyRange, ParsedColumnDef, QueryCancel, Result, Row, RowId, SqlState,
+    StatementContext, StoredRow, TableId, TableSchema, Value,
 };
 use planner::{PhysicalPlan, bind, format_explain, logical_plan, physical_plan};
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::{RelationSnapshot, RowIterator, SchemaOperations, StorageEngine};
 
@@ -71,10 +71,10 @@ impl ExecutorHarness {
     }
 
     pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
-        self.execute_with_cancel(sql, &AtomicBool::new(false))
+        self.execute_with_cancel(sql, &QueryCancel::new())
     }
 
-    pub fn execute_with_cancel(&self, sql: &str, cancel: &AtomicBool) -> Result<ExecutionResult> {
+    pub fn execute_with_cancel(&self, sql: &str, cancel: &QueryCancel) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
         let bound = bind(&statement, &self.catalog)?;
         let logical = logical_plan(&bound)?;
@@ -140,7 +140,7 @@ impl ExecutorHarness {
         let bound = bind(&statement, &self.catalog)?;
         let logical = logical_plan(&bound)?;
         let physical = physical_plan(&logical, &self.catalog)?;
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
             relations: self.storage.capture_relation_snapshot()?,
@@ -191,7 +191,7 @@ impl ExecutorHarness {
         chunks: &[&[u8]],
     ) -> Result<u64> {
         let (schema, column_ids) = self.resolve_columns(table, columns);
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let statement = StatementContext::new(1);
         let txn_id = statement.txn_id;
         let ctx = ExecutionContext {
@@ -235,7 +235,7 @@ impl ExecutorHarness {
         columns: &[ColumnId],
         options: CopyOptions,
     ) -> Result<Vec<u8>> {
-        let cancel = AtomicBool::new(false);
+        let cancel = QueryCancel::new();
         let ctx = ExecutionContext {
             statement: StatementContext::new(0),
             relations: self.storage.capture_relation_snapshot()?,

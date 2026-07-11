@@ -409,7 +409,8 @@ pass (F3b, below). All are reached from the live VACUUM orchestration
 `vacuum_heap(schema, horizon) -> (Vec<RowLocation>, usize)` is the engine heap-prune
 pass (`mvcc.md` §9 / Milestone F2b + H3). It reclaims the tuples that are
 dead-to-everyone at `horizon` from every heap page of `schema`'s table, collapsing HOT
-chains, and returns `(dead_root_tids, freed_member_count)`: the DEAD-root TIDs feed
+chains, and returns `(dead_root_tids, freed_member_count)`: newly produced and
+pre-existing DEAD-root TIDs feed
 F3a/F3b, and `freed_member_count` (heap-only members freed straight to `UNUSED`, which
 carry no index entry) is folded into the VACUUM command tag's reclaimed count. It is
 the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
@@ -469,7 +470,10 @@ the first phase of the live VACUUM orchestration `vacuum` (F4a, below).
   back into the live frame only after every mutation plus the `FullPageImage` append
   succeeds; on any error the frame is left byte-identical (a valid, stale checksum), so a
   malformed plan can never corrupt the page.
-- **Return.** Only **DEAD-root TIDs** are returned for index/line-pointer reclaim; a
+- **Return.** Only **DEAD-root TIDs** are returned for index/line-pointer reclaim,
+  including DEAD roots left by a crash or canceled earlier pass. Rediscovering
+  them makes F2b/F3a/F3b restartable: a later pass finishes dangling-index cleanup
+  before making the slot reusable. A
   `REDIRECT` root keeps a LIVE index entry (NOT returned, so F3a skips it) and heap-only
   members freed to `UNUSED` never had an entry (`freed_member_count` only).
 - **Full-extent scan.** It iterates `0..BufferPool::page_count(heap_file_id)`,
@@ -581,7 +585,12 @@ mandatory order on one dead-TID set**:
 3. `reclaim_line_pointers(schema, &dead)` (F3b) — flip the now entry-free line
    pointers `DEAD → UNUSED`.
 
-When the heap prune finds nothing dead, the index and line-pointer phases are skipped.
+When the heap scan finds neither newly dead nor pre-existing DEAD roots, the index
+and line-pointer phases are skipped. Foreground cancelable variants poll the token
+at heap pages, B-tree leaves, index boundaries, line-pointer pages, and TOAST-owner
+scan pages. Returning between phases is safe because a partially processed root
+remains `DEAD` (never reusable) and a later heap scan rediscovers it; F3b still runs
+only after the current pass completes F3a for the full dead-TID set.
 The order is the safety invariant: F3b must run only after F3a removed every index
 entry for these TIDs, or `insert_row`'s `UNUSED`-slot reuse could resolve a stale index
 entry to the new tuple (silent corruption). The server's `run_vacuum` calls this under
@@ -1198,7 +1207,8 @@ into `write_page`'s encode step and `load_page`'s decode step.
   TABLE ... SET (compression = 'zstd')` to build a dictionary-training corpus.
   The caller holds the exclusive checkpoint guard, so the sampled images are a
   stable snapshot; an abandoned fresh-page hole is skipped without being
-  faulted in.
+  faulted in. Foreground compression ALTER uses the cancelable variant, which
+  polls the statement token at each sampled page.
 - **`sample_toast_values(ctx, schema, max_samples, max_bytes)`.** Returns
   bounded logical `TEXT`/`BYTEA` samples for TOAST value-dictionary training.
   It walks heap pages directly instead of calling the public scan iterator so
@@ -1210,8 +1220,10 @@ into `write_page`'s encode step and `load_page`'s decode step.
   remaining byte budget; oversized compressed/external values are skipped before
   decompression or hidden-chunk reads. Invisible rows are skipped without decoding
   varlena bodies or reading hidden chunks. Empty values and non-toastable columns are
-  skipped. The server calls this under the exclusive maintenance guard for `ALTER
-  TABLE ... SET (toast_compression = zstd_dict)`.
+  skipped. The scan polls `ctx.cancel` at heap-page and row boundaries, so sparse or
+  mostly-unsuitable tables remain responsive to statement cancellation. The server
+  calls this under the exclusive maintenance guard for `ALTER TABLE ... SET
+  (toast_compression = zstd_dict)`.
 - **`rewrite_table_pages(schema)`.** Re-encodes every **initialized** page —
   heap AND index (`page::is_any_page_initialized`, which accepts both
   `PAGE_TYPE_DATA` and `PAGE_TYPE_INDEX`, unlike the heap-only check
@@ -1327,6 +1339,12 @@ impl PageBackedStorageEngine {
     /// Up to `cap` evenly-sampled initialized heap page images, for
     /// dictionary training.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>>;
+    pub fn sample_heap_pages_cancelable(
+        &self,
+        schema: &TableSchema,
+        cap: usize,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<Vec<u8>>>;
     /// Bounded logical TEXT/BYTEA value bytes for TOAST dictionary training.
     pub fn sample_toast_values(
         &self,

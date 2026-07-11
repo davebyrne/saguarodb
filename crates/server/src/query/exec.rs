@@ -2,7 +2,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use catalog::CatalogManager;
-use common::{CopyDirection, DbError, IsolationLevel, Result, SqlState, TableId};
+use common::{CopyDirection, DbError, IsolationLevel, QueryCancel, Result, SqlState, TableId};
 use executor::{CopyJob, ExecutionResult, RowSink};
 use parser::Statement;
 use planner::{BoundStatement, bind, format_explain, logical_plan, physical_plan};
@@ -44,8 +44,13 @@ impl QueryService {
         };
 
         if let StatementClass::TransactionControl(kind) = class {
-            let (slot, default_isolation, result) =
-                self.handle_transaction_control(kind, slot, default_isolation, session.cancel());
+            let (slot, default_isolation, result) = self.handle_transaction_control(
+                kind,
+                slot,
+                default_isolation,
+                session.cancel(),
+                session.gucs(),
+            );
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
@@ -107,7 +112,8 @@ impl QueryService {
             return (
                 None,
                 default_isolation,
-                self.run_maintenance(statement).map(StreamOutcome::Direct),
+                self.run_maintenance(statement, session.cancel())
+                    .map(StreamOutcome::Direct),
             );
         }
 
@@ -117,8 +123,13 @@ impl QueryService {
         // carried into the streaming driver so a schema rewrite cannot publish a
         // different relation generation between COPY bind and COPY execution.
         if let StatementClass::Copy(direction) = class {
-            let (slot, default_isolation, result) =
-                self.dispatch_copy(direction, statement, slot, default_isolation);
+            let (slot, default_isolation, result) = self.dispatch_copy(
+                direction,
+                statement,
+                slot,
+                default_isolation,
+                session.cancel(),
+            );
             return (slot, default_isolation, result);
         }
 
@@ -128,6 +139,7 @@ impl QueryService {
                 let runtime = session.statement_runtime(
                     txn.current_default_isolation(default_isolation),
                     txn.isolation,
+                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
                 );
                 let (slot, result) = self.run_in_transaction(txn, class, statement, runtime, sink);
                 (slot, default_isolation, result)
@@ -150,6 +162,7 @@ impl QueryService {
         statement: Statement,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
+        cancel: &Arc<QueryCancel>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         if let Some(txn) = &slot
             && txn.failed
@@ -170,7 +183,7 @@ impl QueryService {
                 // Capture before a first-write COPY acquires the writer guard. A
                 // transaction that already held the guard may bypass a pending
                 // schema-rewrite fence so it can finish and release that guard.
-                let snapshots = match self.snapshots_for_transaction(txn) {
+                let snapshots = match self.snapshots_for_transaction(txn, cancel.as_ref()) {
                     Ok(snapshots) => snapshots,
                     Err(err) => {
                         txn.failed = true;
@@ -180,7 +193,7 @@ impl QueryService {
                 txn.first_statement_ran = true;
                 CopySnapshots::Transaction(snapshots)
             }
-            None => match self.capture_consistent_snapshots(0) {
+            None => match self.capture_consistent_snapshots_cancelable(0, cancel.as_ref()) {
                 Ok(snapshots) => CopySnapshots::Autocommit {
                     snapshots,
                     write_guard: None,
@@ -243,7 +256,7 @@ impl QueryService {
         if matches!(direction, CopyDirection::From) {
             if let Some(txn) = slot.as_mut() {
                 let acquired_guard = if txn.write_guard.is_none() {
-                    if let Err(err) = self.acquire_write_guard(txn) {
+                    if let Err(err) = self.acquire_write_guard(txn, cancel.as_ref()) {
                         txn.failed = true;
                         return (slot, default_isolation, Err(err));
                     }
@@ -270,7 +283,11 @@ impl QueryService {
                 write_guard,
             } = &mut snapshots
             {
-                let guard = match self.components.concurrency.begin_writer() {
+                let guard = match self
+                    .components
+                    .concurrency
+                    .begin_writer_cancelable(cancel.as_ref())
+                {
                     Ok(guard) => WriteUnitGuard::Shared(guard),
                     Err(err) => return (slot, default_isolation, Err(err)),
                 };
@@ -329,6 +346,7 @@ impl QueryService {
         runtime: StatementRuntime<'_>,
         sink: Option<&mut dyn RowSink>,
     ) -> (Option<Transaction>, Result<StreamOutcome>) {
+        let cancel = runtime.cancel.clone();
         // While failed ('E'), reject everything but COMMIT/ROLLBACK (handled in
         // `handle_transaction_control`, never reaching here).
         if txn.failed {
@@ -363,18 +381,21 @@ impl QueryService {
         // rewrites fence new snapshot captures before waiting for the checkpoint
         // guard, so this ordering prevents a transaction from holding a writer
         // guard while blocked on the rewrite fence.
-        let captured_snapshot = match self.snapshots_for_transaction(&mut txn) {
-            Ok(snapshots) => snapshots,
-            Err(err) => {
-                txn.failed = true;
-                return (Some(txn), Err(err));
-            }
-        };
+        let captured_snapshot =
+            match self.snapshots_for_transaction(&mut txn, runtime.cancel.as_ref()) {
+                Ok(snapshots) => snapshots,
+                Err(err) => {
+                    txn.failed = true;
+                    return (Some(txn), Err(err));
+                }
+            };
         txn.first_statement_ran = true;
 
         let acquired_for_syntactic_write =
             matches!(initial_class, StatementClass::Write) && !had_write_guard;
-        if acquired_for_syntactic_write && let Err(err) = self.acquire_write_guard(&mut txn) {
+        if acquired_for_syntactic_write
+            && let Err(err) = self.acquire_write_guard(&mut txn, runtime.cancel.as_ref())
+        {
             txn.failed = true;
             return (Some(txn), Err(err));
         }
@@ -444,7 +465,7 @@ impl QueryService {
             // bind, and schema rewrites wait for advertised snapshots before taking
             // the checkpoint guard, so acquiring the writer guard here does not
             // create a DDL deadlock.
-            if let Err(err) = self.acquire_write_guard(&mut txn) {
+            if let Err(err) = self.acquire_write_guard(&mut txn, runtime.cancel.as_ref()) {
                 txn.failed = true;
                 return (Some(txn), Err(err));
             }
@@ -507,6 +528,10 @@ impl QueryService {
         // The snapshot can no longer be used to read once `run_plan` has returned;
         // drop the per-statement advertisement now (a no-op under Repeatable Read).
         drop(advertised);
+        let result = result.and_then(|outcome| {
+            cancel.check()?;
+            Ok(outcome)
+        });
         match result {
             Ok(outcome) => {
                 // Accumulate this statement's dead-version count on the transaction
@@ -550,12 +575,17 @@ impl QueryService {
     ) -> Result<StreamOutcome> {
         match class {
             StatementClass::Read => {
-                let captured = self.capture_consistent_snapshots(0)?;
+                let captured =
+                    self.capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())?;
                 let bound = bind(&statement, self.components.catalog.as_ref())?;
                 match classify_bound(class, &bound) {
                     StatementClass::Read => self.autocommit_read_with_snapshot(
                         bound,
-                        session.statement_runtime(default_isolation, default_isolation),
+                        session.statement_runtime(
+                            default_isolation,
+                            default_isolation,
+                            session.statement_timeout_ms(),
+                        ),
                         sink,
                         captured,
                     ),
@@ -565,7 +595,11 @@ impl QueryService {
                     StatementClass::Write => self
                         .autocommit_prepared_bound_write_with_snapshot(
                             bound,
-                            session.statement_runtime(default_isolation, default_isolation),
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
                             None,
                             captured,
                         )
@@ -576,7 +610,11 @@ impl QueryService {
             StatementClass::Write | StatementClass::Ddl => self
                 .autocommit_write(
                     statement,
-                    session.statement_runtime(default_isolation, default_isolation),
+                    session.statement_runtime(
+                        default_isolation,
+                        default_isolation,
+                        session.statement_timeout_ms(),
+                    ),
                 )
                 .map(StreamOutcome::Direct),
             // Maintenance never reaches here: `dispatch` runs it via
@@ -681,13 +719,18 @@ impl QueryService {
         statement: Statement,
         runtime: StatementRuntime<'_>,
     ) -> Result<ExecutionResult> {
+        let cancel = runtime.cancel.clone();
         if statement_is_syntactic_dml(&statement) {
             // Advertise the statement snapshot before waiting for the writer guard.
             // Schema rewrites fence snapshot capture before waiting for the
             // checkpoint guard; taking the snapshot first keeps data writers from
             // holding a writer guard while blocked on that fence.
-            let captured = self.capture_consistent_snapshots(0)?;
-            let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
+            let captured = self.capture_consistent_snapshots_cancelable(0, cancel.as_ref())?;
+            let guard = WriteUnitGuard::Shared(
+                self.components
+                    .concurrency
+                    .begin_writer_cancelable(cancel.as_ref())?,
+            );
             let bound = bind(&statement, self.components.catalog.as_ref())?;
             return self.autocommit_bound_write_with_guard(
                 bound,
@@ -699,15 +742,27 @@ impl QueryService {
             );
         }
         let schema_snapshot_guard = if statement_may_rewrite_table_storage(&statement) {
-            Some(self.components.active_txns.begin_snapshot_exclusion())
+            Some(
+                self.components
+                    .active_txns
+                    .begin_snapshot_exclusion_cancelable(cancel.as_ref())?,
+            )
         } else {
             None
         };
         let needs_exclusive = statement_needs_exclusive_guard(&statement);
         let guard = if needs_exclusive {
-            WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
+            WriteUnitGuard::Exclusive(
+                self.components
+                    .concurrency
+                    .begin_checkpoint_cancelable(cancel.as_ref())?,
+            )
         } else {
-            WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
+            WriteUnitGuard::Shared(
+                self.components
+                    .concurrency
+                    .begin_writer_cancelable(cancel.as_ref())?,
+            )
         };
         let bound = bind(&statement, self.components.catalog.as_ref())?;
         self.autocommit_bound_write_with_guard(
@@ -726,11 +781,12 @@ impl QueryService {
         runtime: StatementRuntime<'_>,
         prepared_schema_versions: Option<&[(TableId, u64)]>,
     ) -> Result<ExecutionResult> {
+        let cancel = runtime.cancel.clone();
         if let Some(schema_versions) = prepared_schema_versions {
             self.validate_prepared_schema_versions(schema_versions)?;
         }
         if !bound_needs_exclusive_guard(&bound) {
-            let captured = self.capture_consistent_snapshots(0)?;
+            let captured = self.capture_consistent_snapshots_cancelable(0, cancel.as_ref())?;
             return self.autocommit_prepared_bound_write_with_snapshot(
                 bound,
                 runtime,
@@ -742,15 +798,27 @@ impl QueryService {
         // here. Acquire the write/checkpoint guard before planning/execution.
         let schema_snapshot_guard =
             if bound_rewrites_table_storage(&bound, self.components.catalog.as_ref())? {
-                Some(self.components.active_txns.begin_snapshot_exclusion())
+                Some(
+                    self.components
+                        .active_txns
+                        .begin_snapshot_exclusion_cancelable(cancel.as_ref())?,
+                )
             } else {
                 None
             };
         let needs_exclusive = bound_needs_exclusive_guard(&bound);
         let guard = if needs_exclusive {
-            WriteUnitGuard::Exclusive(self.components.concurrency.begin_checkpoint()?)
+            WriteUnitGuard::Exclusive(
+                self.components
+                    .concurrency
+                    .begin_checkpoint_cancelable(cancel.as_ref())?,
+            )
         } else {
-            WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?)
+            WriteUnitGuard::Shared(
+                self.components
+                    .concurrency
+                    .begin_writer_cancelable(cancel.as_ref())?,
+            )
         };
         self.autocommit_bound_write_with_guard(
             bound,
@@ -769,7 +837,11 @@ impl QueryService {
         prepared_schema_versions: Option<&[(TableId, u64)]>,
         captured: CapturedSnapshots,
     ) -> Result<ExecutionResult> {
-        let guard = WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?);
+        let guard = WriteUnitGuard::Shared(
+            self.components
+                .concurrency
+                .begin_writer_cancelable(runtime.cancel.as_ref())?,
+        );
         self.autocommit_bound_write_with_guard(
             bound,
             guard,
@@ -789,6 +861,7 @@ impl QueryService {
         schema_snapshot_guard: Option<SnapshotExclusionGuard>,
         snapshot_override: Option<CapturedSnapshots>,
     ) -> Result<ExecutionResult> {
+        let cancel = runtime.cancel.clone();
         if let Some(schema_versions) = prepared_schema_versions {
             self.validate_prepared_schema_versions(schema_versions)?;
         }
@@ -829,7 +902,7 @@ impl QueryService {
                 snapshot,
                 relations,
                 advertised,
-            } = self.capture_consistent_snapshots(txn_id)?;
+            } = self.capture_consistent_snapshots_cancelable(txn_id, cancel.as_ref())?;
             (snapshot, relations, Some(advertised))
         };
         let schema_versions = match prepared_schema_versions {
@@ -885,6 +958,11 @@ impl QueryService {
                 return Err(DbError::internal("statement execution panicked"));
             }
         };
+
+        if let Err(err) = cancel.check() {
+            self.rollback_pre_durable_or_die(txn_id, catalog_before);
+            return Err(err);
+        }
 
         // An autocommit unit has no savepoints, so no committed subxids.
         if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {

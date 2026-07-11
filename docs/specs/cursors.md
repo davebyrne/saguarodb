@@ -67,7 +67,7 @@ pub enum FetchStatus {
 }
 
 pub struct OpenQuery<'a> {
-    // stores output columns, Box<dyn PlanExecutor + 'a>, cancel flag,
+    // stores output columns, Box<dyn PlanExecutor + 'a>, cancellation token,
     // pending lookahead row, and close/exhaustion state
 }
 
@@ -147,7 +147,7 @@ Lifecycle rules:
 - A dropped row receiver is treated as early stop for that fetch, not as a leaked
   cursor. The cursor remains usable unless the worker itself hit an error.
 - Closing or replacing the portal drops the worker handle. Cancellation is
-  delivered through the session's shared cancel flag. Worker error, exhaustion,
+  delivered through the session's shared cancellation token. Worker error, exhaustion,
   cancellation, or connection drop closes the executor and releases
   snapshots/page pins.
 
@@ -318,7 +318,7 @@ Transaction end:
 - A cursor worker counts as an in-flight query while it is actively fetching, not
   while it is merely parked between fetches. Its open snapshot still contributes
   to the GC horizon through its advertisement.
-- `CancelRequest` during a fetch sets the same session cancel flag and the worker
+- `CancelRequest` during a fetch records a reason on the same session cancellation token and the worker
   observes it at row boundaries.
 - A parked cursor should not keep `pg_stat_activity.state = active`; the session
   remains idle-in-transaction while the cursor is open but not fetching.

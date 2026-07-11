@@ -10,13 +10,16 @@ use parser::{SetScope, Statement};
 
 use super::{QueryService, Transaction, mark_failed_on_error, reset_complete, set_complete};
 
+const STATEMENT_TIMEOUT: &str = "statement_timeout";
+const MAX_STATEMENT_TIMEOUT_MS: u64 = i32::MAX as u64;
+
 /// Per-connection accept-all GUC store for driver compatibility.
 ///
 /// PostgreSQL rejects unknown parameters. SaguaroDB deliberately stores arbitrary
 /// names so client handshake/introspection statements can run. A few parameters
-/// with real server behavior (`transaction_isolation`,
-/// `default_transaction_isolation`) are derived from transaction state instead of
-/// living in this map.
+/// with real server behavior are validated before storage. Isolation parameters
+/// are derived from transaction state instead of living in this map;
+/// `statement_timeout` is stored canonically as integer milliseconds.
 #[derive(Debug)]
 pub struct SessionGucs {
     defaults: BTreeMap<String, String>,
@@ -36,6 +39,7 @@ impl SessionGucs {
             ("server_encoding", "UTF8"),
             ("server_version", POSTGRES_COMPAT_VERSION),
             ("standard_conforming_strings", "on"),
+            (STATEMENT_TIMEOUT, "0"),
             ("timezone", "UTC"),
         ] {
             defaults.insert(name.to_string(), value.to_string());
@@ -75,6 +79,7 @@ impl SessionGucs {
         &self,
         default_isolation: IsolationLevel,
         transaction_isolation: IsolationLevel,
+        statement_timeout_ms: u64,
     ) -> Vec<GucSetting> {
         let settings = self.lock().clone();
         let mut rows = settings
@@ -95,6 +100,17 @@ impl SessionGucs {
                 }
             })
             .collect::<Vec<_>>();
+        if let Some(setting) = rows
+            .iter_mut()
+            .find(|setting| setting.name == STATEMENT_TIMEOUT)
+        {
+            setting.setting = statement_timeout_ms.to_string();
+            setting.source = if statement_timeout_ms == 0 {
+                "default".to_string()
+            } else {
+                "session".to_string()
+            };
+        }
         let boot_val = isolation_setting(IsolationLevel::default()).to_string();
         rows.push(GucSetting {
             name: "default_transaction_isolation".to_string(),
@@ -124,6 +140,12 @@ impl SessionGucs {
 
     pub fn application_name(&self) -> String {
         self.get("application_name").unwrap_or_default()
+    }
+
+    pub(crate) fn statement_timeout_ms(&self) -> u64 {
+        self.get(STATEMENT_TIMEOUT)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
@@ -240,6 +262,20 @@ impl QueryService {
                 };
                 set_default_transaction_isolation(scope, level, slot, default_isolation)
             }
+            STATEMENT_TIMEOUT => {
+                let timeout_ms = if value.eq_ignore_ascii_case("default") {
+                    0
+                } else {
+                    match parse_statement_timeout_setting(&value) {
+                        Ok(timeout_ms) => timeout_ms,
+                        Err(err) => {
+                            return (mark_failed_on_error(slot), default_isolation, Err(err));
+                        }
+                    }
+                };
+                let slot = set_statement_timeout(scope, timeout_ms, slot, gucs);
+                (slot, default_isolation, Ok(set_complete()))
+            }
             _ if value.eq_ignore_ascii_case("default") => {
                 gucs.reset(&name);
                 (slot, default_isolation, Ok(set_complete()))
@@ -273,12 +309,21 @@ impl QueryService {
                 );
                 (slot, default_isolation, result.map(|_| reset_complete()))
             }
+            Some(STATEMENT_TIMEOUT) => {
+                let slot = set_statement_timeout(SetScope::Session, 0, slot, gucs);
+                (slot, default_isolation, Ok(reset_complete()))
+            }
             Some(name) => {
                 gucs.reset(name);
                 (slot, default_isolation, Ok(reset_complete()))
             }
             None => {
+                let session_timeout_ms = gucs.statement_timeout_ms();
                 gucs.reset_all();
+                if slot.is_some() {
+                    gucs.set(STATEMENT_TIMEOUT, session_timeout_ms.to_string());
+                }
+                let slot = set_statement_timeout(SetScope::Session, 0, slot, gucs);
                 let (slot, default_isolation, result) = set_default_transaction_isolation(
                     SetScope::Session,
                     IsolationLevel::default(),
@@ -289,6 +334,159 @@ impl QueryService {
             }
         }
     }
+}
+
+fn set_statement_timeout(
+    scope: SetScope,
+    timeout_ms: u64,
+    slot: Option<Transaction>,
+    gucs: &SessionGucs,
+) -> Option<Transaction> {
+    match (scope, slot) {
+        (SetScope::Local, None) => None,
+        (SetScope::Session, None) => {
+            gucs.set(STATEMENT_TIMEOUT, timeout_ms.to_string());
+            None
+        }
+        (SetScope::Local, Some(mut txn)) => {
+            txn.set_local_statement_timeout(timeout_ms);
+            Some(txn)
+        }
+        (SetScope::Session, Some(mut txn)) => {
+            txn.set_statement_timeout(timeout_ms);
+            Some(txn)
+        }
+    }
+}
+
+fn effective_statement_timeout_ms(slot: &Option<Transaction>, gucs: &SessionGucs) -> u64 {
+    let session_timeout_ms = gucs.statement_timeout_ms();
+    slot.as_ref()
+        .map(|txn| txn.current_statement_timeout_ms(session_timeout_ms))
+        .unwrap_or(session_timeout_ms)
+}
+
+fn parse_statement_timeout_setting(value: &str) -> Result<u64> {
+    parse_timeout_ms(value).ok_or_else(|| {
+        DbError::execute(
+            SqlState::InvalidParameterValue,
+            format!("invalid value for parameter \"{STATEMENT_TIMEOUT}\": \"{value}\""),
+        )
+    })
+}
+
+fn parse_timeout_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (number, remainder) = split_timeout_number(value)?;
+    let unit = remainder.trim();
+    let numeric_value = parse_postgres_number(number)?;
+    if !numeric_value.is_finite() {
+        return None;
+    }
+
+    let (multiplier, next_smaller) = match unit {
+        "" => (1.0, None),
+        "d" => (86_400_000.0, Some(3_600_000.0)),
+        "h" => (3_600_000.0, Some(60_000.0)),
+        "min" => (60_000.0, Some(1_000.0)),
+        "s" => (1_000.0, Some(1.0)),
+        "ms" => (1.0, Some(0.001)),
+        "us" => (0.001, None),
+        _ => return None,
+    };
+    let mut timeout_ms = numeric_value * multiplier;
+    if let Some(next_smaller) = next_smaller {
+        timeout_ms = (timeout_ms / next_smaller).round_ties_even() * next_smaller;
+    }
+    timeout_ms = timeout_ms.round_ties_even();
+    if !(0.0..=MAX_STATEMENT_TIMEOUT_MS as f64).contains(&timeout_ms) {
+        return None;
+    }
+    Some(timeout_ms as u64)
+}
+
+fn split_timeout_number(value: &str) -> Option<(&str, &str)> {
+    let bytes = value.as_bytes();
+    let mut cursor = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    if bytes.get(cursor) == Some(&b'0') && matches!(bytes.get(cursor + 1), Some(b'x') | Some(b'X'))
+    {
+        cursor += 2;
+        let digits_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_hexdigit) {
+            cursor += 1;
+        }
+        return (cursor > digits_start).then_some((&value[..cursor], &value[cursor..]));
+    }
+
+    let digits_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    let mut has_digits = cursor > digits_start;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let fraction_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        has_digits |= cursor > fraction_start;
+    }
+    if !has_digits {
+        return None;
+    }
+    if matches!(bytes.get(cursor), Some(b'e') | Some(b'E')) {
+        cursor += 1;
+        if matches!(bytes.get(cursor), Some(b'+') | Some(b'-')) {
+            cursor += 1;
+        }
+        let exponent_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == exponent_start {
+            return None;
+        }
+    }
+    Some((&value[..cursor], &value[cursor..]))
+}
+
+fn parse_postgres_number(number: &str) -> Option<f64> {
+    let unsigned = number
+        .strip_prefix('+')
+        .or_else(|| number.strip_prefix('-'))
+        .unwrap_or(number);
+    let sign = if number.starts_with('-') { -1.0 } else { 1.0 };
+    if let Some(hex) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16)
+            .ok()
+            .map(|value| sign * value as f64);
+    }
+    if unsigned.len() > 1 && unsigned.starts_with('0') && !unsigned.contains(['.', 'e', 'E']) {
+        return u64::from_str_radix(unsigned, 8)
+            .ok()
+            .map(|value| sign * value as f64);
+    }
+    number.parse().ok()
+}
+
+pub(super) fn display_statement_timeout(timeout_ms: u64) -> String {
+    if timeout_ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, divisor) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("min", 60_000),
+        ("s", 1_000),
+    ] {
+        if timeout_ms.is_multiple_of(divisor) {
+            return format!("{}{unit}", timeout_ms / divisor);
+        }
+    }
+    format!("{timeout_ms}ms")
 }
 
 fn set_default_transaction_isolation(
@@ -385,6 +583,9 @@ fn show_value(
         "default_transaction_isolation" => Some(
             isolation_setting(effective_default_isolation(slot, default_isolation)).to_string(),
         ),
+        STATEMENT_TIMEOUT => Some(display_statement_timeout(effective_statement_timeout_ms(
+            slot, gucs,
+        ))),
         _ => gucs.get(name),
     }
 }
@@ -424,6 +625,12 @@ fn show_all_result(
     default_isolation: IsolationLevel,
 ) -> ExecutionResult {
     let mut settings = gucs.all();
+    if let Some((_, setting)) = settings
+        .iter_mut()
+        .find(|(name, _)| name == STATEMENT_TIMEOUT)
+    {
+        *setting = display_statement_timeout(effective_statement_timeout_ms(slot, gucs));
+    }
     settings.push((
         "default_transaction_isolation".to_string(),
         isolation_setting(effective_default_isolation(slot, default_isolation)).to_string(),
@@ -502,5 +709,73 @@ mod tests {
         );
         assert_eq!(parse_isolation_setting("snapshot"), None);
         assert_eq!(parse_isolation_setting("bogus"), None);
+    }
+
+    #[test]
+    fn statement_timeout_values_are_parsed_as_canonical_milliseconds() {
+        for (value, expected) in [
+            ("0", 0),
+            ("1.5", 2),
+            ("2.5", 2),
+            ("1e3", 1_000),
+            ("010", 8),
+            ("0x10", 16),
+            ("250", 250),
+            ("250ms", 250),
+            ("250 ms", 250),
+            ("1500us", 2),
+            ("0.5 s", 500),
+            ("1.5min", 90_000),
+            ("1h", 3_600_000),
+            ("0.5d", 43_200_000),
+            ("+1 s", 1_000),
+            ("-0.5", 0),
+            ("2147483647", MAX_STATEMENT_TIMEOUT_MS),
+        ] {
+            assert_eq!(parse_timeout_ms(value), Some(expected), "value: {value}");
+        }
+    }
+
+    #[test]
+    fn statement_timeout_rejects_invalid_or_out_of_range_values() {
+        for value in [
+            "",
+            "-1",
+            "08",
+            "0x",
+            "1e",
+            "1 sec",
+            "1MS",
+            "NaN",
+            "infinity",
+            "2147483648",
+            "1000000000000000000000000000000000000000d",
+        ] {
+            let err = parse_statement_timeout_setting(value).unwrap_err();
+            assert_eq!(err.code, SqlState::InvalidParameterValue, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn statement_timeout_defaults_to_disabled_and_is_stored_canonically() {
+        let gucs = SessionGucs::default();
+        assert_eq!(gucs.get(STATEMENT_TIMEOUT).as_deref(), Some("0"));
+
+        let timeout_ms = parse_statement_timeout_setting("1.5 s").unwrap();
+        gucs.set(STATEMENT_TIMEOUT, timeout_ms.to_string());
+        assert_eq!(gucs.get(STATEMENT_TIMEOUT).as_deref(), Some("1500"));
+
+        gucs.reset(STATEMENT_TIMEOUT);
+        assert_eq!(gucs.get(STATEMENT_TIMEOUT).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn statement_timeout_display_uses_the_largest_exact_time_unit() {
+        assert_eq!(display_statement_timeout(0), "0");
+        assert_eq!(display_statement_timeout(999), "999ms");
+        assert_eq!(display_statement_timeout(1_000), "1s");
+        assert_eq!(display_statement_timeout(1_500), "1500ms");
+        assert_eq!(display_statement_timeout(120_000), "2min");
+        assert_eq!(display_statement_timeout(86_400_000), "1d");
     }
 }

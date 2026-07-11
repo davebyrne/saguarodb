@@ -46,10 +46,10 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use buffer::{BufferPool, PageWriteGuard};
 use common::{
     ColumnDef, ColumnId, ColumnInfo, CompressionSetting, DataType, DbError, FileId, IndexId,
-    IndexSchema, Key, KeyRange, Lsn, PageNum, RelationKind, Result, Row, RowId, SequenceId,
-    SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow, TableId,
-    TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TxnStatusView, UniqueConflict, Value,
-    WriteConflict, classify_unique_conflict, is_visible, write_conflict,
+    IndexSchema, Key, KeyRange, Lsn, PageNum, QueryCancel, RelationKind, Result, Row, RowId,
+    SequenceId, SequenceManager, SequenceSchema, Snapshot, SqlState, StatementContext, StoredRow,
+    TableId, TableSchema, TruncateCatalogUpdate, TruncateTablePlan, TxnStatusView, UniqueConflict,
+    Value, WriteConflict, classify_unique_conflict, is_visible, write_conflict,
 };
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use wal::{WalManager, WalRecord, WalRecordKind};
@@ -1187,7 +1187,8 @@ impl PageBackedStorageEngine {
 
         let mut entries = Vec::new();
         let mut live_primary_key_rows = HashSet::new();
-        for root in self.heap_identity_roots(&old_schema)? {
+        for root in self.heap_identity_roots(&old_schema, ctx.cancel.as_ref())? {
+            ctx.cancel.check()?;
             let versions = self.collect_chain_versions(&old_schema, root)?;
             let mut live_entries = Vec::new();
             for (_loc, decoded) in &versions {
@@ -1238,11 +1239,16 @@ impl PageBackedStorageEngine {
         Ok(entries)
     }
 
-    fn heap_identity_roots(&self, schema: &TableSchema) -> Result<Vec<RowLocation>> {
+    fn heap_identity_roots(
+        &self,
+        schema: &TableSchema,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<RowLocation>> {
         let heap_file = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(heap_file)?;
         let mut roots = Vec::new();
         for page_num in 0..page_count {
+            cancel.check()?;
             if self.buffer_pool.is_page_abandoned(heap_file, page_num) {
                 continue;
             }
@@ -1357,6 +1363,24 @@ impl PageBackedStorageEngine {
     /// Evenly-sampled initialized heap page images for dictionary training.
     /// Caller holds the exclusive guard, so the images are stable.
     pub fn sample_heap_pages(&self, schema: &TableSchema, cap: usize) -> Result<Vec<Vec<u8>>> {
+        self.sample_heap_pages_inner(schema, cap, None)
+    }
+
+    pub fn sample_heap_pages_cancelable(
+        &self,
+        schema: &TableSchema,
+        cap: usize,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.sample_heap_pages_inner(schema, cap, Some(cancel))
+    }
+
+    fn sample_heap_pages_inner(
+        &self,
+        schema: &TableSchema,
+        cap: usize,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<Vec<Vec<u8>>> {
         let file_id = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(file_id)?;
         if page_count == 0 || cap == 0 {
@@ -1366,6 +1390,9 @@ impl PageBackedStorageEngine {
         let mut samples = Vec::new();
         let mut page_num = 0;
         while page_num < page_count {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             if !self.buffer_pool.is_page_abandoned(file_id, page_num) {
                 let guard = self.buffer_pool.read_page(file_id, page_num)?;
                 if page::is_initialized(guard.data()) {
@@ -1373,6 +1400,9 @@ impl PageBackedStorageEngine {
                 }
             }
             page_num += step;
+        }
+        if let Some(cancel) = cancel {
+            cancel.check()?;
         }
         Ok(samples)
     }
@@ -1411,6 +1441,7 @@ impl PageBackedStorageEngine {
         let page_count = self.buffer_pool.page_count(file_id)?;
         let relations = self.capture_pagebacked_relation_snapshot()?;
         'pages: for page_num in 0..page_count {
+            ctx.cancel.check()?;
             if self.buffer_pool.is_page_abandoned(file_id, page_num) {
                 continue;
             }
@@ -1431,6 +1462,7 @@ impl PageBackedStorageEngine {
             };
 
             for bytes in page_rows {
+                ctx.cancel.check()?;
                 let (xmin, xmax, _t_ctid, infomask) = decode_mvcc_header(&bytes)?;
                 if !is_visible(
                     xmin,
@@ -2638,7 +2670,11 @@ impl SchemaOperations for PageBackedStorageEngine {
         // range and does not re-check them), so we abort with a retryable `40001`.
         let secondary = self.secondary_btree(schema);
         secondary.create(ctx.txn_id)?;
-        for (_pk, root) in self.btree(pk_file_id).range(&KeyRange::All)? {
+        for (_pk, root) in self
+            .btree(pk_file_id)
+            .range_cancelable(&KeyRange::All, Some(ctx.cancel.as_ref()))?
+        {
+            ctx.cancel.check()?;
             // The physically-present versions reachable from this chain root (the root
             // plus any heap-only HOT-chain members on its page), in chain order.
             let versions = self.collect_chain_versions(&table_schema, root)?;

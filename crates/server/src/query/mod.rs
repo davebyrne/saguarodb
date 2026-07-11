@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use catalog::{
     CatalogManager, check_constraint_oid, index_oid, primary_key_constraint_oid,
@@ -9,9 +8,9 @@ use catalog::{
 };
 use common::{
     CatalogIntrospectionProvider, CheckpointGuard, ColumnDefault, ColumnInfo, CopyDirection,
-    DataType, DbError, GucSetting, IndexConstraintKind, IsolationLevel, PgType, RelationKind,
-    Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot, SqlState,
-    SystemStateProvider, TableId, Value, WriteGuard,
+    DataType, DbError, GucSetting, IndexConstraintKind, IsolationLevel, PgType, QueryCancel,
+    RelationKind, Result, SessionActivityRow, SessionInfo, SessionSequenceState, Snapshot,
+    SqlState, SystemStateProvider, TableId, Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -57,7 +56,7 @@ pub struct QueryService {
 /// statement execution consumes and returns them.
 #[derive(Clone)]
 pub struct QuerySessionContext {
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<QueryCancel>,
     session_sequences: Arc<SessionSequenceState>,
     session_info: Arc<SessionInfo>,
     gucs: Arc<SessionGucs>,
@@ -68,7 +67,7 @@ pub struct QuerySessionContext {
 
 impl QuerySessionContext {
     pub fn new(
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<QueryCancel>,
         session_sequences: Arc<SessionSequenceState>,
         session_info: Arc<SessionInfo>,
         gucs: Arc<SessionGucs>,
@@ -105,7 +104,7 @@ impl QuerySessionContext {
         self
     }
 
-    fn cancel(&self) -> &Arc<AtomicBool> {
+    fn cancel(&self) -> &Arc<QueryCancel> {
         &self.cancel
     }
 
@@ -117,10 +116,15 @@ impl QuerySessionContext {
         self.gucs.as_ref()
     }
 
+    fn statement_timeout_ms(&self) -> u64 {
+        self.gucs.statement_timeout_ms()
+    }
+
     fn statement_runtime(
         &self,
         default_isolation: IsolationLevel,
         transaction_isolation: IsolationLevel,
+        statement_timeout_ms: u64,
     ) -> StatementRuntime<'_> {
         let system_state = self.system_state_override.clone().unwrap_or_else(|| {
             Arc::new(QuerySystemState {
@@ -128,6 +132,7 @@ impl QuerySessionContext {
                 session_registry: self.session_registry.clone(),
                 default_isolation,
                 transaction_isolation,
+                statement_timeout_ms,
             })
         });
         StatementRuntime::new(
@@ -150,12 +155,26 @@ struct QuerySystemState {
     session_registry: Option<Arc<SessionRegistry>>,
     default_isolation: IsolationLevel,
     transaction_isolation: IsolationLevel,
+    statement_timeout_ms: u64,
 }
 
 impl SystemStateProvider for QuerySystemState {
     fn settings(&self) -> Vec<GucSetting> {
-        self.gucs
-            .settings(self.default_isolation, self.transaction_isolation)
+        self.gucs.settings(
+            self.default_isolation,
+            self.transaction_isolation,
+            self.statement_timeout_ms,
+        )
+    }
+
+    fn setting(&self, name: &str) -> Option<String> {
+        if name.eq_ignore_ascii_case("statement_timeout") {
+            return Some(gucs::display_statement_timeout(self.statement_timeout_ms));
+        }
+        self.settings()
+            .into_iter()
+            .find(|setting| setting.name.eq_ignore_ascii_case(name))
+            .map(|setting| setting.setting)
     }
 
     fn sessions(&self) -> Vec<SessionActivityRow> {
@@ -525,6 +544,9 @@ pub struct Transaction {
     /// plain `SET` visible immediately but only persists it if the surrounding
     /// transaction commits; `SET LOCAL` is visible only until transaction end.
     default_isolation_override: Option<DefaultIsolationOverride>,
+    /// Transactional changes to `statement_timeout`, with the same `SET` versus
+    /// `SET LOCAL` lifetime rules as PostgreSQL GUCs.
+    statement_timeout_override: Option<StatementTimeoutOverride>,
     /// `true` once the transaction has run its first query/data statement (i.e.
     /// captured its snapshot). `SET TRANSACTION ISOLATION LEVEL` is only valid
     /// while this is `false` (Postgres: "SET TRANSACTION ... must be called before
@@ -583,11 +605,18 @@ struct DefaultIsolationOverride {
     on_commit: Option<IsolationLevel>,
 }
 
+#[derive(Clone, Copy)]
+struct StatementTimeoutOverride {
+    current_ms: u64,
+    on_commit_ms: Option<u64>,
+}
+
 /// One open savepoint: its name and the subxid that owns writes made under it.
 struct SavepointLevel {
     name: String,
     subxid: u64,
     default_isolation_override: Option<DefaultIsolationOverride>,
+    statement_timeout_override: Option<StatementTimeoutOverride>,
 }
 
 impl Transaction {
@@ -617,6 +646,35 @@ impl Transaction {
         self.default_isolation_override = Some(DefaultIsolationOverride {
             current: level,
             on_commit,
+        });
+    }
+
+    pub(crate) fn current_statement_timeout_ms(&self, session_timeout_ms: u64) -> u64 {
+        self.statement_timeout_override
+            .map(|override_state| override_state.current_ms)
+            .unwrap_or(session_timeout_ms)
+    }
+
+    fn committed_statement_timeout_ms(&self, session_timeout_ms: u64) -> u64 {
+        self.statement_timeout_override
+            .and_then(|override_state| override_state.on_commit_ms)
+            .unwrap_or(session_timeout_ms)
+    }
+
+    fn set_statement_timeout(&mut self, timeout_ms: u64) {
+        self.statement_timeout_override = Some(StatementTimeoutOverride {
+            current_ms: timeout_ms,
+            on_commit_ms: Some(timeout_ms),
+        });
+    }
+
+    fn set_local_statement_timeout(&mut self, timeout_ms: u64) {
+        let on_commit_ms = self
+            .statement_timeout_override
+            .and_then(|override_state| override_state.on_commit_ms);
+        self.statement_timeout_override = Some(StatementTimeoutOverride {
+            current_ms: timeout_ms,
+            on_commit_ms,
         });
     }
 
@@ -710,7 +768,7 @@ impl QueryService {
         sql: &str,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
         self.execute_simple_with_session_sequences(
             sql,
@@ -727,7 +785,7 @@ impl QueryService {
         sql: &str,
         slot: Option<Transaction>,
         default_isolation: IsolationLevel,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
         session_sequences: Arc<SessionSequenceState>,
         gucs: Arc<SessionGucs>,
     ) -> (Option<Transaction>, IsolationLevel, Result<ExecutionResult>) {
@@ -783,14 +841,14 @@ impl QueryService {
         };
         // The sink owns `row_tx` for the whole dispatch; when it drops (as this
         // function returns) the channel closes, ending the consumer's drain loop.
-        let mut sink = ChannelRowSink::new(row_tx);
+        let mut sink = ChannelRowSink::new(row_tx, session.cancel().clone());
         self.dispatch(parsed, slot, default_isolation, &session, Some(&mut sink))
     }
 
     /// Backwards-compatible autocommit entry point: run one SQL string with no
     /// surrounding transaction. Used by the prepared-statement path and by tests.
     pub fn execute_sql(&self, sql: &str) -> Result<ExecutionResult> {
-        self.execute_sql_cancelable(sql, &Arc::new(AtomicBool::new(false)))
+        self.execute_sql_cancelable(sql, &Arc::new(QueryCancel::new()))
     }
 
     /// Like `execute_sql`, but aborts with `QueryCanceled` if `cancel` becomes
@@ -799,7 +857,7 @@ impl QueryService {
     pub fn execute_sql_cancelable(
         &self,
         sql: &str,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         // The autocommit helper has no persistent session: pass the built-in default
         // and discard the returned (possibly updated) default. A bare `SET SESSION
@@ -919,7 +977,7 @@ impl QueryService {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        self.execute_prepared_cancelable(prepared, params, &Arc::new(AtomicBool::new(false)))
+        self.execute_prepared_cancelable(prepared, params, &Arc::new(QueryCancel::new()))
     }
 
     /// Like `execute_prepared`, but cancelable mid-flight via `cancel`. Runs as an
@@ -938,7 +996,7 @@ impl QueryService {
         &self,
         prepared: &PreparedStatement,
         params: &[Value],
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
         let session = QuerySessionContext::new(
             cancel.clone(),
@@ -972,7 +1030,7 @@ impl QueryService {
         // arm is reached only if a caller bypasses that routing — keep it total.
         if let StatementClass::Maintenance = prepared.class {
             return self
-                .run_prepared_maintenance(prepared)
+                .run_prepared_maintenance(prepared, session.cancel())
                 .map(StreamOutcome::Direct);
         }
         if let StatementClass::SessionConfig = prepared.class {
@@ -985,13 +1043,18 @@ impl QueryService {
         let class = classify_bound(prepared.class, &bound);
         match prepared.class {
             StatementClass::Read => {
-                let captured = self.capture_consistent_snapshots(0)?;
+                let captured =
+                    self.capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())?;
                 match class {
                     StatementClass::Read => {
                         self.validate_prepared_schema_versions(&prepared.schema_versions)?;
                         self.autocommit_read_with_snapshot(
                             bound,
-                            session.statement_runtime(default_isolation, default_isolation),
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
                             sink,
                             captured,
                         )
@@ -1001,7 +1064,11 @@ impl QueryService {
                     StatementClass::Write => self
                         .autocommit_prepared_bound_write_with_snapshot(
                             bound,
-                            session.statement_runtime(default_isolation, default_isolation),
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
                             Some(&prepared.schema_versions),
                             captured,
                         )
@@ -1012,7 +1079,11 @@ impl QueryService {
             StatementClass::Write | StatementClass::Ddl => self
                 .autocommit_prepared_bound_write(
                     bound,
-                    session.statement_runtime(default_isolation, default_isolation),
+                    session.statement_runtime(
+                        default_isolation,
+                        default_isolation,
+                        session.statement_timeout_ms(),
+                    ),
                     Some(&prepared.schema_versions),
                 )
                 .map(StreamOutcome::Direct),
@@ -1059,7 +1130,7 @@ impl QueryService {
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> Result<StreamOutcome> {
         let session = self.with_catalog_introspection(session);
-        let mut sink = ChannelRowSink::new(row_tx);
+        let mut sink = ChannelRowSink::new(row_tx, session.cancel().clone());
         self.execute_prepared_cancelable_with_session_context(
             prepared,
             params,
@@ -1095,8 +1166,13 @@ impl QueryService {
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let session = self.with_catalog_introspection(session.clone());
         if let StatementClass::TransactionControl(kind) = prepared.class {
-            let (slot, default_isolation, result) =
-                self.handle_transaction_control(kind, slot, default_isolation, session.cancel());
+            let (slot, default_isolation, result) = self.handle_transaction_control(
+                kind,
+                slot,
+                default_isolation,
+                session.cancel(),
+                session.gucs(),
+            );
             return (slot, default_isolation, result.map(StreamOutcome::Direct));
         }
 
@@ -1149,7 +1225,7 @@ impl QueryService {
             return (
                 None,
                 default_isolation,
-                self.run_prepared_maintenance(prepared)
+                self.run_prepared_maintenance(prepared, session.cancel())
                     .map(StreamOutcome::Direct),
             );
         }
@@ -1167,6 +1243,7 @@ impl QueryService {
                 let runtime = session.statement_runtime(
                     txn.current_default_isolation(default_isolation),
                     txn.isolation,
+                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
                 );
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
@@ -1187,7 +1264,9 @@ impl QueryService {
                 let result = match prepared.class {
                     StatementClass::Read => {
                         let class = classify_bound(prepared.class, &bound);
-                        let captured = match self.capture_consistent_snapshots(0) {
+                        let captured = match self
+                            .capture_consistent_snapshots_cancelable(0, session.cancel().as_ref())
+                        {
                             Ok(captured) => captured,
                             Err(err) => return (None, default_isolation, Err(err)),
                         };
@@ -1201,6 +1280,7 @@ impl QueryService {
                                         session.statement_runtime(
                                             default_isolation,
                                             default_isolation,
+                                            session.statement_timeout_ms(),
                                         ),
                                         sink,
                                         captured,
@@ -1211,7 +1291,11 @@ impl QueryService {
                             StatementClass::Write => self
                                 .autocommit_prepared_bound_write_with_snapshot(
                                     bound,
-                                    session.statement_runtime(default_isolation, default_isolation),
+                                    session.statement_runtime(
+                                        default_isolation,
+                                        default_isolation,
+                                        session.statement_timeout_ms(),
+                                    ),
                                     Some(&prepared.schema_versions),
                                     captured,
                                 )
@@ -1222,7 +1306,11 @@ impl QueryService {
                     StatementClass::Write | StatementClass::Ddl => self
                         .autocommit_prepared_bound_write(
                             bound,
-                            session.statement_runtime(default_isolation, default_isolation),
+                            session.statement_runtime(
+                                default_isolation,
+                                default_isolation,
+                                session.statement_timeout_ms(),
+                            ),
                             Some(&prepared.schema_versions),
                         )
                         .map(StreamOutcome::Direct),
@@ -1268,7 +1356,7 @@ impl QueryService {
         session: QuerySessionContext,
         row_tx: mpsc::Sender<StreamMessage>,
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
-        let mut sink = ChannelRowSink::new(row_tx);
+        let mut sink = ChannelRowSink::new(row_tx, session.cancel().clone());
         self.execute_prepared_in_session_with_context(
             prepared,
             params,
@@ -2155,7 +2243,7 @@ impl QueryService {
         &self,
         sql: &str,
         slot: Option<Transaction>,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<QueryCancel>,
     ) -> (Option<Transaction>, Result<ExecutionResult>) {
         let (slot, _default, result) =
             self.execute_simple(sql, slot, IsolationLevel::default(), cancel);
@@ -2177,11 +2265,11 @@ mod tests {
         primary_key_constraint_oid, table_oid,
     };
     use common::{
-        CatalogIntrospectionProvider, ConcurrencyController, DbError, FlushPolicy, IndexId,
-        IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, PgType, RelationKind,
-        Result, RwLockConcurrencyController, SequenceId, SequenceOptions, SequenceSchema,
-        SessionInfo, SessionSequenceState, SqlState, TableId, TableSchema, ToastCompression,
-        ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
+        CancelReason, CatalogIntrospectionProvider, ConcurrencyController, DbError, FlushPolicy,
+        IndexId, IndexSchema, IsolationLevel, Lsn, PageFlushInfo, ParsedColumnDef, PgType,
+        QueryCancel, RelationKind, Result, RwLockConcurrencyController, SequenceId,
+        SequenceOptions, SequenceSchema, SessionInfo, SessionSequenceState, SqlState, TableId,
+        TableSchema, ToastCompression, ToastMode, TxnId, TxnStatus, TxnStatusView, Value,
     };
     use control::{ControlData, ControlStore};
     use executor::ExecutionResult;
@@ -2921,7 +3009,7 @@ mod tests {
             err.message
         );
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(QueryCancel::new());
         let (slot, begin) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -3099,7 +3187,7 @@ mod tests {
 
         begin_writer_calls.store(0, Ordering::SeqCst);
         let session = super::QuerySessionContext::new(
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(QueryCancel::new()),
             Arc::new(SessionSequenceState::new()),
             Arc::new(SessionInfo::default()),
             Arc::new(super::SessionGucs::default()),
@@ -3687,7 +3775,8 @@ mod tests {
             .execute_sql("insert into users (id) values (1)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(true));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+        cancel.request(CancelReason::UserRequest);
         let err = app
             .query_service
             .execute_sql_cancelable("select id from users", &cancel)
@@ -3703,7 +3792,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key, name text)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         // BEGIN; INSERT; SELECT (sees own insert); COMMIT;
         let (slot, result) = app
             .query_service
@@ -3752,7 +3841,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key, name text)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, result) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -3785,7 +3874,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, result) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -3824,7 +3913,7 @@ mod tests {
             .execute_sql("create table users (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -3859,7 +3948,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -3882,7 +3971,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, result) = app
             .query_service
             .execute_simple_default("commit", None, &cancel);
@@ -3900,7 +3989,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, _) = app
             .query_service
             .execute_simple_default("begin", None, &cancel);
@@ -4105,7 +4194,7 @@ mod tests {
             .prepare_sql("select to_regclass('override_target')", &[])
             .unwrap();
         let session = super::QuerySessionContext::new(
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(QueryCancel::new()),
             Arc::new(SessionSequenceState::new()),
             Arc::new(SessionInfo::default()),
             Arc::new(super::SessionGucs::default()),
@@ -4140,7 +4229,7 @@ mod tests {
             )
             .unwrap();
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(QueryCancel::new());
         let (row_tx, _row_rx) = tokio::sync::mpsc::channel(super::STREAM_CHANNEL_CAPACITY);
         let (slot, _, result) = app.query_service.execute_simple_streamed(
             "copy copy_probe (id) from stdin",
@@ -4236,7 +4325,7 @@ mod tests {
             .unwrap();
         begin_writer_calls.store(0, Ordering::SeqCst);
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(QueryCancel::new());
         let session_sequences = Arc::new(SessionSequenceState::new());
         let gucs = Arc::new(super::SessionGucs::default());
         let (_slot, iso, err) = app.query_service.execute_simple_with_session_sequences(
@@ -4353,7 +4442,7 @@ mod tests {
             )
             .unwrap();
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(QueryCancel::new());
         let session_sequences = Arc::new(SessionSequenceState::new());
         let gucs = Arc::new(super::SessionGucs::default());
         let (_slot, iso, result) = app.query_service.execute_simple_with_session_sequences(
@@ -4430,7 +4519,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
 
         // Contrast: with the session default Read Committed, the second SELECT in an
         // open transaction sees the concurrently-committed row.
@@ -4518,7 +4607,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (_slot, session_default, res) = app.query_service.execute_simple(
             "set session characteristics as transaction isolation level repeatable read",
             None,
@@ -4594,7 +4683,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (_slot, sd, res) = app.query_service.execute_simple(
             "set session characteristics as transaction isolation level repeatable read",
             None,
@@ -4649,7 +4738,7 @@ mod tests {
             .execute_sql("create table t (id integer primary key)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         // Open an explicit Read Committed transaction and capture its first snapshot.
         let (slot, sd, res) = app.query_service.execute_simple(
             "begin isolation level read committed",
@@ -4739,7 +4828,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, sd, res) = app.query_service.execute_simple(
             "set session characteristics as transaction read write",
             None,
@@ -4763,7 +4852,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
         let (slot, sd, res) =
             app.query_service
                 .execute_simple("begin", None, IsolationLevel::default(), &cancel);
@@ -4820,7 +4909,8 @@ mod tests {
             .execute_sql("insert into users (id) values (1)")
             .unwrap();
 
-        let cancel = std::sync::Arc::new(AtomicBool::new(true));
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+        cancel.request(CancelReason::UserRequest);
         let err = app
             .query_service
             .execute_sql_cancelable("insert into users (id) values (2)", &cancel)
@@ -5704,7 +5794,7 @@ mod tests {
             tokio::sync::mpsc::channel::<super::StreamMessage>(super::STREAM_CHANNEL_CAPACITY);
         drop(row_rx);
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(QueryCancel::new());
         let session = super::QuerySessionContext::new(
             cancel,
             Arc::new(SessionSequenceState::new()),

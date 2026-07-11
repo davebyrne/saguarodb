@@ -61,10 +61,20 @@ impl PageBackedStorageEngine {
     /// else `copy_from_slice` + force the record LSN), independent of the record's
     /// `txn_id` — so a crash mid-VACUUM leaves every pruned page either pre-prune or
     /// exactly the compacted image, never torn.
+    #[cfg(test)]
     pub(crate) fn vacuum_heap(
         &self,
         schema: &TableSchema,
         horizon: u64,
+    ) -> Result<(Vec<RowLocation>, usize)> {
+        self.vacuum_heap_cancelable(schema, horizon, None)
+    }
+
+    fn vacuum_heap_cancelable(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: Option<&QueryCancel>,
     ) -> Result<(Vec<RowLocation>, usize)> {
         let file_id = heap_file_id(schema.storage_id);
         let page_count = self.buffer_pool.page_count(file_id)?;
@@ -76,6 +86,9 @@ impl PageBackedStorageEngine {
         let mut reclaimed: Vec<RowLocation> = Vec::new();
         let mut freed_count: usize = 0;
         for page_num in 0..page_count {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             if self.buffer_pool.is_page_abandoned(file_id, page_num) {
                 continue;
             }
@@ -83,6 +96,18 @@ impl PageBackedStorageEngine {
                 let guard = self.buffer_pool.read_page(file_id, page_num)?;
                 if !page::is_initialized(guard.data()) {
                     continue;
+                }
+                // Include DEAD roots left by a crash or an interrupted prior VACUUM.
+                // They are never reusable until every index entry is removed, so
+                // resuming them here makes cancellation between phases restartable.
+                for slot_num in 0..page::next_slot(guard.data())? {
+                    if page::slot_state(guard.data(), slot_num)? == page::LinePointer::Dead {
+                        reclaimed.push(RowLocation {
+                            file_id,
+                            page_num,
+                            slot_num,
+                        });
+                    }
                 }
             }
 
@@ -582,10 +607,20 @@ impl PageBackedStorageEngine {
     /// Called by [`vacuum`](Self::vacuum) as F4a's middle phase (F2b → **F3a** →
     /// F3b). It does **not** reclaim line pointers `DEAD → UNUSED` (F3b); the slots
     /// stay `DEAD` until that later step.
+    #[cfg(test)]
     pub(crate) fn vacuum_indexes(
         &self,
         schema: &TableSchema,
         dead_tids: &HashSet<RowLocation>,
+    ) -> Result<()> {
+        self.vacuum_indexes_cancelable(schema, dead_tids, None)
+    }
+
+    fn vacuum_indexes_cancelable(
+        &self,
+        schema: &TableSchema,
+        dead_tids: &HashSet<RowLocation>,
+        cancel: Option<&QueryCancel>,
     ) -> Result<()> {
         if dead_tids.is_empty() {
             return Ok(());
@@ -597,17 +632,20 @@ impl PageBackedStorageEngine {
             let latch = self.structural_latch(pk_file_id);
             let _pk_guard = latch.lock();
             self.btree(pk_file_id)
-                .remove_values_in(VACUUM_TXN, dead_tids)?;
+                .remove_values_in_cancelable(VACUUM_TXN, dead_tids, cancel)?;
         }
 
         // Every live secondary index, each under its own structural latch (one at a
         // time — rule 1: never two structural latches simultaneously).
         for index in self.current_table_indexes(schema.id)? {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let secondary_file_id = secondary_index_file_id(index.storage_id);
             let latch = self.structural_latch(secondary_file_id);
             let _index_guard = latch.lock();
             self.secondary_btree(&index)
-                .remove_values_in(VACUUM_TXN, dead_tids)?;
+                .remove_values_in_cancelable(VACUUM_TXN, dead_tids, cancel)?;
         }
 
         Ok(())
@@ -645,10 +683,20 @@ impl PageBackedStorageEngine {
     /// never torn.
     ///
     /// Called by [`vacuum`](Self::vacuum) as F4a's final phase (F2b → F3a → **F3b**).
+    #[cfg(test)]
     pub(crate) fn reclaim_line_pointers(
         &self,
         schema: &TableSchema,
         dead_tids: &HashSet<RowLocation>,
+    ) -> Result<()> {
+        self.reclaim_line_pointers_cancelable(schema, dead_tids, None)
+    }
+
+    fn reclaim_line_pointers_cancelable(
+        &self,
+        schema: &TableSchema,
+        dead_tids: &HashSet<RowLocation>,
+        cancel: Option<&QueryCancel>,
     ) -> Result<()> {
         if dead_tids.is_empty() {
             return Ok(());
@@ -672,6 +720,9 @@ impl PageBackedStorageEngine {
         }
 
         for (page_num, slots) in by_page {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             // Lock order: structural latch → frame write latch → (WAL mutex inside the
             // append). Both released at the end of each iteration so no latch is held
             // across pages (rule 1; forward-looking for a concurrent VACUUM).
@@ -701,6 +752,24 @@ impl PageBackedStorageEngine {
         schema: &TableSchema,
         horizon: u64,
     ) -> Result<Vec<u64>> {
+        self.toast_value_ids_pending_vacuum_inner(schema, horizon, None)
+    }
+
+    pub fn toast_value_ids_pending_vacuum_cancelable(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<u64>> {
+        self.toast_value_ids_pending_vacuum_inner(schema, horizon, Some(cancel))
+    }
+
+    fn toast_value_ids_pending_vacuum_inner(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<Vec<u64>> {
         if schema.toast_table_id.is_none() || !matches!(schema.relation_kind, RelationKind::User) {
             return Ok(Vec::new());
         }
@@ -709,6 +778,9 @@ impl PageBackedStorageEngine {
         let page_count = self.buffer_pool.page_count(file_id)?;
         let mut value_ids = BTreeSet::new();
         for page_num in 0..page_count {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             if self.buffer_pool.is_page_abandoned(file_id, page_num) {
                 continue;
             }
@@ -757,6 +829,7 @@ impl PageBackedStorageEngine {
         unique_value_ids.sort_unstable();
         unique_value_ids.dedup();
         for value_id in unique_value_ids {
+            ctx.cancel.check()?;
             if value_id == 0 || value_id > crate::toast::MAX_TOAST_VALUE_ID {
                 return Err(crate::toast::toast_corruption(format!(
                     "TOAST value_id {value_id} is invalid"
@@ -771,6 +844,7 @@ impl PageBackedStorageEngine {
             )?;
             let mut keys = Vec::new();
             while let Some(stored) = iter.next()? {
+                ctx.cancel.check()?;
                 let (row_value_id, seq, _data) = toast_chunk_parts(&stored.row)?;
                 if row_value_id != value_id || stored.key != toast_chunk_key(row_value_id, seq)? {
                     return Err(crate::toast::toast_corruption(format!(
@@ -780,6 +854,7 @@ impl PageBackedStorageEngine {
                 keys.push(stored.key);
             }
             for key in keys {
+                ctx.cancel.check()?;
                 if <Self as StorageEngine>::delete(self, ctx, &relations, toast_table_id, &key)? {
                     deleted += 1;
                 }
@@ -790,6 +865,24 @@ impl PageBackedStorageEngine {
     }
 
     pub fn vacuum_hidden_toast_relation(&self, base: &TableSchema, horizon: u64) -> Result<usize> {
+        self.vacuum_hidden_toast_relation_inner(base, horizon, None)
+    }
+
+    pub fn vacuum_hidden_toast_relation_cancelable(
+        &self,
+        base: &TableSchema,
+        horizon: u64,
+        cancel: &QueryCancel,
+    ) -> Result<usize> {
+        self.vacuum_hidden_toast_relation_inner(base, horizon, Some(cancel))
+    }
+
+    fn vacuum_hidden_toast_relation_inner(
+        &self,
+        base: &TableSchema,
+        horizon: u64,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<usize> {
         let Some(toast_table_id) = base.toast_table_id else {
             return Ok(0);
         };
@@ -797,7 +890,7 @@ impl PageBackedStorageEngine {
         let toast_handle = self.table_handle(&relations, toast_table_id)?;
         let toast_schema = toast_handle.schema.clone();
         crate::toast::ensure_toast_relation(&toast_schema)?;
-        self.vacuum_relation(&toast_schema, horizon)
+        self.vacuum_relation(&toast_schema, horizon, cancel)
     }
 
     /// VACUUM one table (`docs/specs/mvcc.md` §9, §10 Milestone F4a): the live
@@ -829,31 +922,63 @@ impl PageBackedStorageEngine {
     /// reader that starts mid-pass freezes `xmin >= horizon` (the deleter is in its
     /// settled past). VACUUM therefore never reclaims a version a snapshot needs.
     pub fn vacuum(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
+        self.vacuum_inner(schema, horizon, None)
+    }
+
+    pub fn vacuum_cancelable(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: &QueryCancel,
+    ) -> Result<usize> {
+        self.vacuum_inner(schema, horizon, Some(cancel))
+    }
+
+    fn vacuum_inner(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<usize> {
         if matches!(schema.relation_kind, RelationKind::User)
             && schema.toast_table_id.is_some()
             && !self
-                .toast_value_ids_pending_vacuum(schema, horizon)?
+                .toast_value_ids_pending_vacuum_inner(schema, horizon, cancel)?
                 .is_empty()
         {
             return Err(storage_internal(
                 "TOAST-enabled parent vacuum requires coordinated TOAST chunk cleanup/check first",
             ));
         }
-        self.vacuum_relation(schema, horizon)
+        self.vacuum_relation(schema, horizon, cancel)
     }
 
     /// Run parent-table VACUUM after the caller has performed the coordinated
     /// TOAST chunk cleanup/check required by [`Self::toast_value_ids_pending_vacuum`].
     pub fn vacuum_after_toast_cleanup(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
-        self.vacuum_relation(schema, horizon)
+        self.vacuum_relation(schema, horizon, None)
     }
 
-    fn vacuum_relation(&self, schema: &TableSchema, horizon: u64) -> Result<usize> {
+    pub fn vacuum_after_toast_cleanup_cancelable(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: &QueryCancel,
+    ) -> Result<usize> {
+        self.vacuum_relation(schema, horizon, Some(cancel))
+    }
+
+    fn vacuum_relation(
+        &self,
+        schema: &TableSchema,
+        horizon: u64,
+        cancel: Option<&QueryCancel>,
+    ) -> Result<usize> {
         // Phase F2b — heap-prune dead-to-all tuples + collapse HOT chains, collecting
         // the DEAD-root TIDs (the slots whose index entries F3a must strip and F3b must
         // reclaim) and the total count of reclaimed slots (DEAD roots + heap-only
         // members freed straight to UNUSED, which carry no index entry — the HOT win).
-        let (dead, freed_in_chains) = self.vacuum_heap(schema, horizon)?;
+        let (dead, freed_in_chains) = self.vacuum_heap_cancelable(schema, horizon, cancel)?;
         let reclaimed = dead.len() + freed_in_chains;
         if !dead.is_empty() {
             let dead: HashSet<RowLocation> = dead.into_iter().collect();
@@ -861,10 +986,10 @@ impl PageBackedStorageEngine {
             // REDIRECT roots are NOT in this set (their index entry stays live), and
             // heap-only members freed to UNUSED never had an entry, so neither reaches
             // F3a/F3b — exactly the H3 invariant (`docs/specs/mvcc.md` §9/§10 H3).
-            self.vacuum_indexes(schema, &dead)?;
+            self.vacuum_indexes_cancelable(schema, &dead, cancel)?;
             // Phase F3b — reclaim the now entry-free line pointers DEAD → UNUSED.
             // MUST follow F3a (above): see this method's ordering invariant.
-            self.reclaim_line_pointers(schema, &dead)?;
+            self.reclaim_line_pointers_cancelable(schema, &dead, cancel)?;
         }
         Ok(reclaimed)
     }

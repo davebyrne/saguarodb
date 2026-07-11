@@ -1,17 +1,17 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use common::{
-    ColumnInfo, DataType, ErrorKind, IsolationLevel, PgType, Result, Row, SqlState, Value,
+    CancelReason, ColumnInfo, DataType, ErrorKind, IsolationLevel, PgType, QueryCancel, Result,
+    Row, SqlState, Value,
 };
 
 use super::{
-    StreamOutcome, TransactionState, encode_row, handle_connection, resolve_result_formats,
-    sqlstate_code, streamed_task_result,
+    StreamOutcome, TransactionState, apply_stream_consumer_cancel, encode_row, handle_connection,
+    resolve_result_formats, sqlstate_code, streamed_task_result,
 };
 use crate::app::AppState;
 
@@ -20,6 +20,29 @@ fn transaction_state_maps_to_postgres_status_byte() {
     assert_eq!(TransactionState::Idle.status_byte(), b'I');
     assert_eq!(TransactionState::InTransaction.status_byte(), b'T');
     assert_eq!(TransactionState::Failed.status_byte(), b'E');
+}
+
+#[test]
+fn late_consumer_cancellation_preserves_completed_autocommit_direct_result() {
+    let mut txn = None;
+    let mut outcome = Ok(StreamOutcome::Direct(executor::ExecutionResult::Modified {
+        command: "INSERT".to_string(),
+        count: 1,
+    }));
+    apply_stream_consumer_cancel(
+        &mut txn,
+        &mut outcome,
+        common::DbError::execute(SqlState::QueryCanceled, "late timeout"),
+    );
+    assert!(matches!(outcome, Ok(StreamOutcome::Direct(_))));
+
+    let mut streamed = Ok(StreamOutcome::Streamed { count: 1 });
+    apply_stream_consumer_cancel(
+        &mut txn,
+        &mut streamed,
+        common::DbError::execute(SqlState::QueryCanceled, "stream timeout"),
+    );
+    assert!(matches!(streamed, Err(err) if err.code == SqlState::QueryCanceled));
 }
 
 #[test]
@@ -863,8 +886,11 @@ async fn cancel_request_signals_the_target_backend() {
     let dir = tempfile::tempdir().unwrap();
     let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
     // Register a flag as if a connection were running a query.
-    let flag = Arc::new(AtomicBool::new(false));
-    let key = app.components.cancel_registry.register(flag.clone());
+    let cancel = Arc::new(QueryCancel::new());
+    let key = app
+        .components
+        .cancel_registry
+        .register(cancel.clone(), Arc::new(tokio::sync::Notify::new()));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -884,7 +910,11 @@ async fn cancel_request_signals_the_target_backend() {
     let mut buf = [0u8; 8];
     let n = client.read(&mut buf).await.unwrap();
     assert_eq!(n, 0, "CancelRequest gets no reply and the socket closes");
-    assert!(flag.load(Ordering::Relaxed), "target backend was signaled");
+    assert_eq!(
+        cancel.reason(),
+        Some(CancelReason::UserRequest),
+        "target backend was signaled"
+    );
 
     server.await.unwrap();
 }
@@ -963,6 +993,75 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
     assert!(
         response.windows(8).any(|w| w == expected_field),
         "binary int4 result value (length 4 + value)"
+    );
+
+    client.write_all(&terminate_bytes()).await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn extended_parse_timeout_reports_error_while_waiting_for_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = Arc::new(AppState::open_for_test(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        handle_connection(socket, app).await.unwrap();
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(&startup_bytes("dave")).await.unwrap();
+    read_until_ready(&mut client).await;
+    client
+        .write_all(&query_bytes("set statement_timeout = '100 ms'"))
+        .await
+        .unwrap();
+    read_until_ready(&mut client).await;
+
+    client
+        .write_all(&parse_bytes("waiting", "select 1", &[]))
+        .await
+        .unwrap();
+    let response = read_until_message(&mut client, b"57014").await;
+    assert!(
+        response
+            .windows(5)
+            .any(|window| window == [b'1', 0, 0, 0, 4]),
+        "Parse completes before the idle extended cycle times out"
+    );
+    assert!(
+        response
+            .windows(b"statement timeout".len())
+            .any(|window| window == b"statement timeout")
+    );
+
+    let mut recovery = tagged(b'd', b"unexpected copy data");
+    recovery.extend(query_bytes(
+        "create table skipped_query (id integer primary key)",
+    ));
+    recovery.extend(sync_bytes());
+    client.write_all(&recovery).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert_ready_status(&response, b'I');
+    assert_eq!(
+        message_tag_count(&response, b'Z'),
+        1,
+        "the skipped simple Query must not emit its own ReadyForQuery"
+    );
+
+    client
+        .write_all(&query_bytes(
+            "create table skipped_query (id integer primary key)",
+        ))
+        .await
+        .unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response
+            .windows(13)
+            .any(|window| window == b"CREATE TABLE\0"),
+        "the Query sent before Sync was skipped"
     );
 
     client.write_all(&terminate_bytes()).await.unwrap();

@@ -1246,6 +1246,43 @@ fn vacuum_orchestrates_heap_index_and_line_pointers_in_order() {
 }
 
 #[test]
+fn vacuum_resumes_dead_roots_left_by_an_interrupted_heap_phase() {
+    let fixture = Fixture::new();
+    fixture
+        .engine
+        .create_index(&ctx(101), &name_index(), 0)
+        .unwrap();
+    fixture.commit(101);
+
+    let gone = fixture.insert_committed(10, row(1, "gone"));
+    fixture.delete(20, 1);
+    fixture.commit(20);
+
+    // Model cancellation/crash after F2b: the heap root is DEAD while both index
+    // entries still dangle. A later VACUUM must discover that pre-existing DEAD
+    // root rather than considering only roots pruned by its own heap pass.
+    let (dead, _) = fixture.engine.vacuum_heap(&users_schema(), 30).unwrap();
+    assert_eq!(dead, vec![gone]);
+    assert!(pk_index_tids(&fixture.engine).contains(&gone));
+    assert!(name_index_tids(&fixture.engine).contains(&gone));
+
+    assert_eq!(fixture.engine.vacuum(&users_schema(), 30).unwrap(), 1);
+    assert!(!pk_index_tids(&fixture.engine).contains(&gone));
+    assert!(!name_index_tids(&fixture.engine).contains(&gone));
+
+    let replacement = fixture
+        .engine
+        .insert(&ctx(40), TABLE_ID, row(2, "replacement"))
+        .unwrap();
+    fixture.commit(40);
+    assert_eq!(
+        (replacement.page_num, replacement.slot_num),
+        (gone.page_num, gone.slot_num),
+        "resumed VACUUM reclaims the old DEAD slot for reuse"
+    );
+}
+
+#[test]
 fn vacuum_with_nothing_dead_reclaims_zero_and_logs_no_wal() {
     let fixture = Fixture::new();
     let live = fixture.insert_committed(10, row(1, "live"));

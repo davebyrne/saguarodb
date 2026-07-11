@@ -110,7 +110,7 @@ pub struct ExecutionContext<'a> {
     pub catalog: &'a dyn CatalogManager,
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
-    pub cancel: &'a AtomicBool,
+    pub cancel: &'a QueryCancel,
 }
 
 pub struct QueryEngine;
@@ -122,7 +122,7 @@ impl QueryEngine {
 
 `QueryEngine::execute` passes `ctx.statement` to storage and schema operations. It does not allocate transaction IDs, append commit records, flush WAL, or call storage/buffer commit or rollback; server query orchestration owns those statement-level concerns.
 
-`ctx.cancel` is polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops; when it is set (from another connection's `CancelRequest`), execution aborts with `DbError::execute(SqlState::QueryCanceled, "canceling statement due to user request")`. Cancellation is observed at these row boundaries, not mid-operator (e.g. during a sort or join build phase).
+`ctx.cancel` is a `QueryCancel` polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops. Its first recorded `CancelReason` selects the `QueryCanceled` message (`due to user request` or `due to statement timeout`). Materializing executor paths use `collect_all_cancelable`, which polls while draining children; nested-loop and hash join builds poll their outer/inner build loops; aggregate evaluation polls input rows; sort makes remaining comparisons cheap after cancellation and returns the token error; and every set-operation combine/count/build loop polls directly. A long blocking `open()` therefore cannot hide an expired statement timer until the full result has been built.
 
 ## Operators
 

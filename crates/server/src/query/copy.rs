@@ -1,10 +1,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use common::{DbError, IsolationLevel, Result, SqlState};
 use executor::{CopyIn, CopyJob, CopyOut, ExecutionContext};
 use tokio::sync::mpsc;
 
+use super::stream::send_cancelable;
 use super::{
     CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService, QuerySessionContext,
     Transaction, TransactionSnapshots, WriteUnitGuard,
@@ -90,7 +93,11 @@ impl QueryService {
         } = snapshots;
         let guard = match write_guard {
             Some(guard) => guard,
-            None => WriteUnitGuard::Shared(self.components.concurrency.begin_writer()?),
+            None => WriteUnitGuard::Shared(
+                self.components
+                    .concurrency
+                    .begin_writer_cancelable(session.cancel().as_ref())?,
+            ),
         };
         let txn_id = self.register_active_txn();
         let gc_horizon = self.components.gc_horizon();
@@ -103,8 +110,11 @@ impl QueryService {
             isolation: IsolationLevel::default(),
             gc_horizon,
             live_txns: Arc::from([txn_id]),
-            runtime: session
-                .statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
+            runtime: session.statement_runtime(
+                IsolationLevel::default(),
+                IsolationLevel::default(),
+                session.statement_timeout_ms(),
+            ),
         })?;
 
         let outcome = catch_unwind(AssertUnwindSafe(|| drive_copy_in(&ctx, job, rx)));
@@ -123,6 +133,13 @@ impl QueryService {
                 return Err(DbError::internal("COPY FROM execution panicked"));
             }
         };
+
+        if let Err(err) = ctx.cancel.check() {
+            drop(ctx);
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
+        drop(ctx);
 
         if let Err(err) = self.append_and_flush_commit(txn_id, &[]) {
             self.rollback_pre_durable_or_die(txn_id, None);
@@ -153,7 +170,7 @@ impl QueryService {
         rx: mpsc::Receiver<CopyInChunk>,
     ) -> (Option<Transaction>, Result<u64>) {
         if txn.write_guard.is_none()
-            && let Err(err) = self.acquire_write_guard(&mut txn)
+            && let Err(err) = self.acquire_write_guard(&mut txn, session.cancel().as_ref())
         {
             txn.failed = true;
             return (Some(txn), Err(err));
@@ -178,6 +195,7 @@ impl QueryService {
                 runtime: session.statement_runtime(
                     txn.current_default_isolation(IsolationLevel::default()),
                     txn.isolation,
+                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
                 ),
             })?;
             let result = drive_copy_in(&ctx, job, rx);
@@ -254,8 +272,11 @@ impl QueryService {
             isolation: IsolationLevel::default(),
             gc_horizon: 0,
             live_txns: Arc::from([0]),
-            runtime: session
-                .statement_runtime(IsolationLevel::default(), IsolationLevel::default()),
+            runtime: session.statement_runtime(
+                IsolationLevel::default(),
+                IsolationLevel::default(),
+                session.statement_timeout_ms(),
+            ),
         })?;
         drive_copy_out(&ctx, job, frame_tx)
     }
@@ -289,6 +310,7 @@ impl QueryService {
                 runtime: session.statement_runtime(
                     txn.current_default_isolation(IsolationLevel::default()),
                     txn.isolation,
+                    txn.current_statement_timeout_ms(session.statement_timeout_ms()),
                 ),
             })?;
             let result = drive_copy_out(&ctx, job, frame_tx);
@@ -322,11 +344,15 @@ fn drive_copy_in(
         job.check_exprs,
     )?;
     loop {
-        match rx.blocking_recv() {
-            Some(CopyInChunk::Chunk(bytes)) => copy_in.push_chunk(&bytes)?,
-            Some(CopyInChunk::Done) => return copy_in.finish().map_err(CopyInError::from),
+        ctx.cancel.check().map_err(CopyInError::Db)?;
+        match rx.try_recv() {
+            Ok(CopyInChunk::Chunk(bytes)) => copy_in.push_chunk(&bytes)?,
+            Ok(CopyInChunk::Done) => {
+                ctx.cancel.check().map_err(CopyInError::Db)?;
+                return copy_in.finish().map_err(CopyInError::from);
+            }
             // The connection loop substitutes the client's message for a CopyFail.
-            Some(CopyInChunk::Fail) => {
+            Ok(CopyInChunk::Fail) => {
                 return Err(CopyInError::Db(DbError::execute(
                     SqlState::QueryCanceled,
                     "COPY from stdin aborted",
@@ -334,7 +360,12 @@ fn drive_copy_in(
             }
             // A disconnect has no session left to receive a returned transaction
             // slot, so the caller must abort the transaction itself.
-            None => return Err(CopyInError::Disconnected),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(CopyInError::Disconnected);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
@@ -360,17 +391,21 @@ fn drive_copy_out(
         frame.extend_from_slice(&header);
     }
     let mut count = 0u64;
-    while let Some(row) = out.next_row()? {
+    loop {
+        ctx.cancel.check()?;
+        let Some(row) = out.next_row()? else {
+            break;
+        };
         frame.extend_from_slice(&row);
         count += 1;
         if frame.len() >= COPY_OUT_FRAME_BYTES {
             let full = std::mem::take(&mut frame);
-            if frame_tx.blocking_send(full).is_err() {
+            if !send_cancelable(&frame_tx, ctx.cancel, full)? {
                 return Err(DbError::io("COPY to stdout client disconnected"));
             }
         }
     }
-    if !frame.is_empty() && frame_tx.blocking_send(frame).is_err() {
+    if !frame.is_empty() && !send_cancelable(&frame_tx, ctx.cancel, frame)? {
         return Err(DbError::io("COPY to stdout client disconnected"));
     }
     Ok(count)

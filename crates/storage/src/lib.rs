@@ -27,10 +27,10 @@ mod tests {
 
     use buffer::{BufferPool, MemoryBufferPool, PAGE_SIZE, PageData};
     use common::{
-        ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID, IndexSchema, Key,
-        KeyRange, Lsn, RelationKind, Result, Row, SequenceManager, SequenceSchema, SqlState,
-        StatementContext, TableSchema, ToastCompression, ToastMode, ToastOptions, TxnId, TxnStatus,
-        TxnStatusView, Value, toast_schema,
+        CancelReason, ColumnDef, CompressionSetting, DataType, DbError, FileId, INVALID_XID,
+        IndexSchema, Key, KeyRange, Lsn, RelationKind, Result, Row, SequenceManager,
+        SequenceSchema, SqlState, StatementContext, TableSchema, ToastCompression, ToastMode,
+        ToastOptions, TxnId, TxnStatus, TxnStatusView, Value, toast_schema,
     };
     use wal::{WalManager, WalRecord, WalRecordKind};
 
@@ -2397,6 +2397,38 @@ mod tests {
             .sample_toast_values(&sample_ctx, &base, 16, 1024)
             .unwrap();
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn sample_toast_values_observes_statement_cancellation() {
+        let harness = StorageHarness::new();
+        let insert_ctx = StatementContext::new(1);
+        let sample_ctx = StatementContext::new(2);
+        let (base, toast) = base_and_toast_schema();
+        harness.storage.create_table(&insert_ctx, &base).unwrap();
+        harness.storage.create_table(&insert_ctx, &toast).unwrap();
+        harness
+            .storage
+            .insert(
+                &insert_ctx,
+                base.id,
+                Row {
+                    values: vec![
+                        Value::Integer(1),
+                        Value::Text("sample".to_string()),
+                        Value::Boolean(true),
+                        Value::Null,
+                    ],
+                },
+            )
+            .unwrap();
+        sample_ctx.cancel.request(CancelReason::StatementTimeout);
+
+        let err = harness
+            .storage
+            .sample_toast_values(&sample_ctx, &base, 16, 1024)
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::QueryCanceled);
     }
 
     #[test]
