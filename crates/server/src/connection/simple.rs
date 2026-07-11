@@ -13,8 +13,8 @@ use crate::shutdown::InFlightQueryGuard;
 
 use super::{
     Session, SqlCursor, TransactionState, apply_stream_consumer_cancel, command_complete_tag,
-    encode_row, error_response, streamed_task_result, wait_cancelable, write_messages,
-    write_terminal_response,
+    encode_row, error_response, streamed_task_result, wait_cancelable, wait_cancelable_write,
+    write_messages, write_terminal_response,
 };
 
 impl Session {
@@ -161,7 +161,7 @@ impl Session {
             let write_result = match message {
                 StreamMessage::Start { columns } => {
                     stream_columns = columns.clone();
-                    wait_cancelable(
+                    wait_cancelable_write(
                         io_cancel.as_ref(),
                         write_messages(
                             stream,
@@ -176,7 +176,7 @@ impl Session {
                     .and_then(|result| result)
                 }
                 StreamMessage::Rows(rows) => match encode_data_rows(&rows, &stream_columns) {
-                    Ok(messages) => wait_cancelable(
+                    Ok(messages) => wait_cancelable_write(
                         io_cancel.as_ref(),
                         write_messages(stream, codec, &messages),
                     )
@@ -233,7 +233,7 @@ impl Session {
         if let Some(message) = self.application_name_status_change() {
             if outcome.is_ok() {
                 if matches!(outcome, Ok(StreamOutcome::Direct(_))) {
-                    wait_cancelable(
+                    wait_cancelable_write(
                         io_cancel.as_ref(),
                         write_messages(stream, codec, &[message]),
                     )
@@ -256,7 +256,7 @@ impl Session {
                     drop(guard);
                 }
                 self.end_activity();
-                wait_cancelable(
+                wait_cancelable_write(
                     io_cancel.as_ref(),
                     write_messages(
                         stream,
@@ -300,7 +300,7 @@ impl Session {
                     drop(guard);
                 }
                 self.end_activity();
-                wait_cancelable(
+                wait_cancelable_write(
                     io_cancel.as_ref(),
                     write_execution_result(stream, codec, result, status),
                 )
@@ -414,7 +414,7 @@ impl Session {
                         query_text: sql.to_string(),
                     },
                 );
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(
                         stream,
@@ -477,7 +477,7 @@ impl Session {
         match fetch {
             Ok(fetched) => {
                 self.cursors.insert(name, cursor);
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(
                         stream,
@@ -536,7 +536,7 @@ impl Session {
             return Ok(ControlFlow::Continue(()));
         }
         let _guard = self.retain_query_guard_for_writer(guard);
-        wait_cancelable(
+        wait_cancelable_write(
             self.cancel.as_ref(),
             write_messages(
                 stream,
@@ -679,7 +679,7 @@ where
         FetchCount::All => None,
     };
     if cursor.handle.is_none() {
-        wait_cancelable(
+        wait_cancelable_write(
             cancel,
             write_messages(
                 stream,
@@ -705,7 +705,7 @@ where
         .start_fetch(max_rows, row_tx)
         .await
         .map_err(SqlCursorFetchError::Worker)?;
-    wait_cancelable(
+    wait_cancelable_write(
         cancel,
         write_messages(
             stream,
@@ -756,7 +756,7 @@ where
             StreamMessage::Rows(rows) => {
                 let messages =
                     encode_data_rows(&rows, columns).map_err(SqlCursorFetchError::Stream)?;
-                wait_cancelable(cancel, write_messages(stream, codec, &messages))
+                wait_cancelable_write(cancel, write_messages(stream, codec, &messages))
                     .await
                     .and_then(|result| result)
                     .map_err(SqlCursorFetchError::Stream)?;

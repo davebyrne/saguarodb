@@ -851,6 +851,26 @@ async fn wait_cancelable<T>(
     }
 }
 
+/// Wait for a protocol write without letting cancellation observed at the same
+/// instant as a completed write turn a fully emitted frame into a connection
+/// error. Cancellation still interrupts a pending write; callers must treat that
+/// as fatal because the socket may contain a partial frame.
+async fn wait_cancelable_write<T>(
+    cancel: &QueryCancel,
+    future: impl Future<Output = T>,
+) -> std::result::Result<T, DbError> {
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => return Ok(output),
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                cancel.check()?;
+            }
+        }
+    }
+}
+
 /// Write a terminal success response without allowing cancellation observed after
 /// an authoritative durable boundary to replace that success.
 async fn write_terminal_response(response: impl Future<Output = Result<()>>) -> Result<()> {

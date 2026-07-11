@@ -9,7 +9,7 @@ use crate::shutdown::InFlightQueryGuard;
 
 use super::{
     CopyInSession, Session, TransactionState, error_response, protocol_error, wait_cancelable,
-    write_messages, write_terminal_response,
+    wait_cancelable_write, write_messages, write_terminal_response,
 };
 
 impl Session {
@@ -29,7 +29,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         let column_formats = vec![0i16; job.columns.len()];
-        wait_cancelable(
+        wait_cancelable_write(
             self.cancel.as_ref(),
             write_messages(
                 stream,
@@ -188,7 +188,7 @@ impl Session {
                 if success_is_durable {
                     write_terminal_response(response).await
                 } else {
-                    wait_cancelable(self.cancel.as_ref(), response)
+                    wait_cancelable_write(self.cancel.as_ref(), response)
                         .await
                         .and_then(|result| result)
                 }
@@ -291,7 +291,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         let column_formats = vec![0i16; job.columns.len()];
-        wait_cancelable(
+        wait_cancelable_write(
             self.cancel.as_ref(),
             write_messages(
                 stream,
@@ -326,7 +326,7 @@ impl Session {
                     break;
                 }
             };
-            if let Err(err) = wait_cancelable(
+            if let Err(err) = wait_cancelable_write(
                 io_cancel.as_ref(),
                 write_messages(stream, codec, &[ServerMessage::CopyData(frame)]),
             )
@@ -376,7 +376,7 @@ impl Session {
         }
         self.end_activity();
         match result {
-            Ok(count) => wait_cancelable(
+            Ok(count) => wait_cancelable_write(
                 io_cancel.as_ref(),
                 write_messages(
                     stream,

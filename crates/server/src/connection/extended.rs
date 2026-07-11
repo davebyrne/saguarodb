@@ -13,8 +13,8 @@ use crate::query::{
 use super::{
     BoundPortal, Portal, Session, SuspendedPortal, TransactionState, apply_stream_consumer_cancel,
     command_complete_tag, encode_row, error_response, protocol_error, resolve_format,
-    resolve_result_formats, streamed_task_result, wait_cancelable, write_messages,
-    write_terminal_response,
+    resolve_result_formats, streamed_task_result, wait_cancelable, wait_cancelable_write,
+    write_messages, write_terminal_response,
 };
 
 struct LimitedBoundExecute {
@@ -202,7 +202,7 @@ impl Session {
                 }
                 StreamMessage::Rows(rows) => {
                     match encode_portal_rows(&rows, &stream_columns, &result_formats) {
-                        Ok(messages) => wait_cancelable(
+                        Ok(messages) => wait_cancelable_write(
                             io_cancel.as_ref(),
                             write_messages(stream, codec, &messages),
                         )
@@ -262,7 +262,7 @@ impl Session {
                     messages.push(message);
                 }
                 messages.push(ServerMessage::CommandComplete(format!("SELECT {count}")));
-                wait_cancelable(io_cancel.as_ref(), write_messages(stream, codec, &messages))
+                wait_cancelable_write(io_cancel.as_ref(), write_messages(stream, codec, &messages))
                     .await
                     .and_then(|result| result)
             }
@@ -279,14 +279,14 @@ impl Session {
             Ok(StreamOutcome::Direct(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
-                    wait_cancelable(
+                    wait_cancelable_write(
                         io_cancel.as_ref(),
                         write_messages(stream, codec, &[message]),
                     )
                     .await
                     .and_then(|result| result)?;
                 }
-                wait_cancelable(
+                wait_cancelable_write(
                     io_cancel.as_ref(),
                     write_portal_result(stream, codec, result, &result_formats),
                 )
@@ -415,7 +415,7 @@ impl Session {
                         transaction_scoped,
                     }),
                 );
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(stream, codec, &[ServerMessage::PortalSuspended]),
                 )
@@ -424,7 +424,7 @@ impl Session {
             }
             Ok(CursorFetchStatus::Exhausted { count }) => {
                 self.end_activity();
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(
                         stream,
@@ -481,7 +481,7 @@ impl Session {
                 portal.rows_sent = portal.rows_sent.saturating_add(count);
                 self.portals
                     .insert(portal_name.to_string(), Portal::Suspended(portal));
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(stream, codec, &[ServerMessage::PortalSuspended]),
                 )
@@ -491,7 +491,7 @@ impl Session {
             Ok(CursorFetchStatus::Exhausted { count }) => {
                 self.end_activity();
                 let total = portal.rows_sent.saturating_add(count);
-                wait_cancelable(
+                wait_cancelable_write(
                     self.cancel.as_ref(),
                     write_messages(
                         stream,
@@ -621,7 +621,7 @@ impl Session {
         S: AsyncWrite + Unpin,
     {
         match result {
-            Ok(messages) => wait_cancelable(
+            Ok(messages) => wait_cancelable_write(
                 self.cancel.as_ref(),
                 write_messages(stream, codec, &messages),
             )
@@ -726,7 +726,7 @@ where
             StreamMessage::Rows(rows) => {
                 let messages = encode_portal_rows(&rows, &stream_columns, result_formats)
                     .map_err(PortalFetchError::Stream)?;
-                wait_cancelable(cancel, write_messages(stream, codec, &messages))
+                wait_cancelable_write(cancel, write_messages(stream, codec, &messages))
                     .await
                     .and_then(|result| result)
                     .map_err(PortalFetchError::Stream)?;

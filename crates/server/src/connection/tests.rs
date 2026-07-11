@@ -87,6 +87,26 @@ async fn wait_cancelable_checks_cancellation_when_future_is_already_ready() {
 }
 
 #[tokio::test]
+async fn cancelable_write_completes_a_ready_frame_when_cancellation_is_pending() {
+    let codec = PostgresCodec::new();
+    let cancel = QueryCancel::new();
+    cancel.request(CancelReason::StatementTimeout);
+    let (mut writer, mut reader) = tokio::io::duplex(128);
+
+    super::wait_cancelable_write(
+        &cancel,
+        super::write_messages(&mut writer, &codec, &[ServerMessage::ParseComplete]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let mut frame = [0; 5];
+    reader.read_exact(&mut frame).await.unwrap();
+    assert_eq!(frame, [b'1', 0, 0, 0, 4]);
+}
+
+#[tokio::test]
 async fn authoritative_terminal_response_writes_complete_frame() {
     let codec = PostgresCodec::new();
     let (mut writer, mut reader) = tokio::io::duplex(128);
