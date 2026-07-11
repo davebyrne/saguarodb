@@ -66,6 +66,10 @@ pub(crate) enum StreamOutcome {
     /// Any non-streamed result — DML, DDL, EXPLAIN, or a SELECT run on the
     /// materializing path — returned in full.
     Direct(ExecutionResult),
+    /// A non-streamed autocommit result that crossed its durable/irreversible
+    /// completion boundary. A timeout noticed slightly later by the async
+    /// consumer must not replace this success with an error.
+    Durable(ExecutionResult),
     /// `COPY ... FROM STDIN`: the connection loop sends `CopyInResponse` and
     /// streams client data while holding `snapshots` for the COPY lifetime.
     BeginCopyIn {
@@ -90,7 +94,9 @@ impl StreamOutcome {
     /// panicking.
     pub(crate) fn into_direct_result(self) -> Result<ExecutionResult> {
         match self {
-            StreamOutcome::Direct(result) | StreamOutcome::SessionReset(result) => Ok(result),
+            StreamOutcome::Direct(result)
+            | StreamOutcome::Durable(result)
+            | StreamOutcome::SessionReset(result) => Ok(result),
             StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. } => {
                 Err(DbError::plan(
                     SqlState::FeatureNotSupported,

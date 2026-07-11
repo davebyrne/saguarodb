@@ -824,8 +824,9 @@ async fn wait_cancelable<T>(
 }
 
 /// Reconcile cancellation observed by the async stream consumer with the
-/// blocking producer's authoritative result. A completed autocommit direct result
-/// may already be durable, so it must remain successful; streaming/COPY work was
+/// blocking producer's authoritative result. Only an explicitly durable outcome
+/// remains successful; a direct read/session result has no commit boundary and
+/// must honor the timeout observed by the consumer. Streaming/COPY work was
 /// interrupted before its terminal response, and explicit-transaction work can
 /// still be safely poisoned.
 fn apply_stream_consumer_cancel(
@@ -836,12 +837,7 @@ fn apply_stream_consumer_cancel(
     if outcome.is_err() {
         return;
     }
-    let durable_or_complete_autocommit = txn.is_none()
-        && matches!(
-            outcome,
-            Ok(StreamOutcome::Direct(_) | StreamOutcome::SessionReset(_))
-        );
-    if durable_or_complete_autocommit {
+    if txn.is_none() && matches!(outcome, Ok(StreamOutcome::Durable(_))) {
         return;
     }
     if let Some(txn) = txn.as_mut() {

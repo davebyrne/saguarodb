@@ -1031,7 +1031,7 @@ impl QueryService {
         if let StatementClass::Maintenance = prepared.class {
             return self
                 .run_prepared_maintenance(prepared, session.cancel())
-                .map(StreamOutcome::Direct);
+                .map(StreamOutcome::Durable);
         }
         if let StatementClass::SessionConfig = prepared.class {
             return Err(DbError::plan(
@@ -1072,7 +1072,7 @@ impl QueryService {
                             Some(&prepared.schema_versions),
                             captured,
                         )
-                        .map(StreamOutcome::Direct),
+                        .map(StreamOutcome::Durable),
                     _ => unreachable!("classify_bound only promotes reads to writes"),
                 }
             }
@@ -1086,7 +1086,7 @@ impl QueryService {
                     ),
                     Some(&prepared.schema_versions),
                 )
-                .map(StreamOutcome::Direct),
+                .map(StreamOutcome::Durable),
             StatementClass::Maintenance => {
                 unreachable!("maintenance is dispatched above before substitution")
             }
@@ -1166,6 +1166,7 @@ impl QueryService {
     ) -> (Option<Transaction>, IsolationLevel, Result<StreamOutcome>) {
         let session = self.with_catalog_introspection(session.clone());
         if let StatementClass::TransactionControl(kind) = prepared.class {
+            let durable = matches!(kind, TransactionControl::Commit) && slot.is_some();
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,
@@ -1173,7 +1174,14 @@ impl QueryService {
                 session.cancel(),
                 session.gucs(),
             );
-            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+            let result = result.map(|result| {
+                if durable {
+                    StreamOutcome::Durable(result)
+                } else {
+                    StreamOutcome::Direct(result)
+                }
+            });
+            return (slot, default_isolation, result);
         }
 
         if let StatementClass::SessionConfig = prepared.class {
@@ -1226,7 +1234,7 @@ impl QueryService {
                 None,
                 default_isolation,
                 self.run_prepared_maintenance(prepared, session.cancel())
-                    .map(StreamOutcome::Direct),
+                    .map(StreamOutcome::Durable),
             );
         }
 
@@ -1299,7 +1307,7 @@ impl QueryService {
                                     Some(&prepared.schema_versions),
                                     captured,
                                 )
-                                .map(StreamOutcome::Direct),
+                                .map(StreamOutcome::Durable),
                             _ => unreachable!("classify_bound only promotes reads to writes"),
                         }
                     }
@@ -1313,7 +1321,7 @@ impl QueryService {
                             ),
                             Some(&prepared.schema_versions),
                         )
-                        .map(StreamOutcome::Direct),
+                        .map(StreamOutcome::Durable),
                     StatementClass::Maintenance => {
                         unreachable!("maintenance is dispatched above before substitution")
                     }

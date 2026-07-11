@@ -23,18 +23,45 @@ fn transaction_state_maps_to_postgres_status_byte() {
 }
 
 #[test]
-fn late_consumer_cancellation_preserves_completed_autocommit_direct_result() {
+fn late_consumer_cancellation_preserves_only_explicitly_durable_results() {
     let mut txn = None;
-    let mut outcome = Ok(StreamOutcome::Direct(executor::ExecutionResult::Modified {
-        command: "INSERT".to_string(),
-        count: 1,
-    }));
+    let mut outcome = Ok(StreamOutcome::Durable(
+        executor::ExecutionResult::Modified {
+            command: "INSERT".to_string(),
+            count: 1,
+        },
+    ));
     apply_stream_consumer_cancel(
         &mut txn,
         &mut outcome,
         common::DbError::execute(SqlState::QueryCanceled, "late timeout"),
     );
-    assert!(matches!(outcome, Ok(StreamOutcome::Direct(_))));
+    assert!(matches!(outcome, Ok(StreamOutcome::Durable(_))));
+
+    let mut direct = Ok(StreamOutcome::Direct(
+        executor::ExecutionResult::Explanation {
+            text: "SeqScan".to_string(),
+        },
+    ));
+    apply_stream_consumer_cancel(
+        &mut txn,
+        &mut direct,
+        common::DbError::execute(SqlState::QueryCanceled, "explain timeout"),
+    );
+    assert!(matches!(direct, Err(err) if err.code == SqlState::QueryCanceled));
+
+    let mut session_reset = Ok(StreamOutcome::SessionReset(
+        executor::ExecutionResult::Modified {
+            command: "DISCARD ALL".to_string(),
+            count: 0,
+        },
+    ));
+    apply_stream_consumer_cancel(
+        &mut txn,
+        &mut session_reset,
+        common::DbError::execute(SqlState::QueryCanceled, "discard timeout"),
+    );
+    assert!(matches!(session_reset, Err(err) if err.code == SqlState::QueryCanceled));
 
     let mut streamed = Ok(StreamOutcome::Streamed { count: 1 });
     apply_stream_consumer_cancel(

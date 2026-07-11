@@ -180,6 +180,8 @@ enum StreamOutcome {
     Streamed { count: u64 },
     /// Everything else — handled by the async side exactly as today.
     Direct(ExecutionResult),
+    /// Autocommit work that crossed its durable/irreversible boundary.
+    Durable(ExecutionResult),
     /// `DISCARD ALL`: write the result and clear connection-owned objects.
     SessionReset(ExecutionResult),
 }
@@ -197,9 +199,10 @@ New server entry points (mirroring the existing `execute_simple_*` /
 For a `Read` statement that is a plain SELECT, the read helpers build a
 channel-backed `RowSink` and call `execute_query_streamed`, returning
 `Streamed { count }`. EXPLAIN (also a `Read`) returns `Direct(Explanation)`; the
-sink is used only for the plain-SELECT sub-case. All non-read arms return
-`Direct(result)` (or `SessionReset(result)` for `DISCARD ALL`) and never touch the
-channel.
+sink is used only for the plain-SELECT sub-case. Successful autocommit writes,
+maintenance, and COMMIT return `Durable(result)` after their last safe
+cancellation boundary. Other non-read arms return `Direct(result)` (or
+`SessionReset(result)` for `DISCARD ALL`) and never touch the channel.
 
 ### 4.2 Sink threading
 
@@ -239,6 +242,9 @@ current materialize/return path.
      drives `BeginCopyIn`/`BeginCopyOut` (the in-flight-query guard is retained in
      the async task until the outcome is known, then handed to the COPY driver or
      dropped, exactly as today).
+   - `Durable(result)` uses the same result writer, but records that a cancellation
+     observed by the async consumer arrived too late to replace the successful
+     outcome.
 
 The in-flight-query guard is held in the async task for the whole streaming
 duration so the statement keeps counting as in-flight for graceful-shutdown

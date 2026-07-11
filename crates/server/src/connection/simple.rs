@@ -265,7 +265,7 @@ impl Session {
             }
             // A non-streamed result (DML, DML RETURNING, or EXPLAIN); a `SELECT`
             // never lands here because reads stream when a sink is supplied.
-            Ok(StreamOutcome::Direct(result)) => {
+            Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
                 drop(guard);
                 self.end_activity();
                 write_execution_result(stream, codec, result, status).await?
@@ -700,7 +700,8 @@ where
 fn successful_rollback_command(outcome: &Result<StreamOutcome>) -> bool {
     matches!(
         outcome,
-        Ok(StreamOutcome::Direct(ExecutionResult::Modified { command, .. }))
+        Ok(StreamOutcome::Direct(ExecutionResult::Modified { command, .. })
+            | StreamOutcome::Durable(ExecutionResult::Modified { command, .. }))
             if command == "ROLLBACK"
     )
 }

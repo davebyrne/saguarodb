@@ -11,8 +11,8 @@ use storage::StorageEngine;
 use super::{
     BindSource, CapturedSnapshots, CopySnapshots, ExecutionContextInput, QueryService,
     QuerySessionContext, StatementClass, StatementRuntime, StreamOutcome, Transaction,
-    TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in, exec_or_stream,
-    mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
+    TransactionControl, TransactionSnapshots, WriteUnitGuard, classify_bound, dead_versions_in,
+    exec_or_stream, mark_failed_on_error, prepared_schema_versions, run_plan, statement_class,
 };
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
 use crate::registry::SnapshotExclusionGuard;
@@ -44,6 +44,7 @@ impl QueryService {
         };
 
         if let StatementClass::TransactionControl(kind) = class {
+            let durable = matches!(kind, TransactionControl::Commit) && slot.is_some();
             let (slot, default_isolation, result) = self.handle_transaction_control(
                 kind,
                 slot,
@@ -51,7 +52,14 @@ impl QueryService {
                 session.cancel(),
                 session.gucs(),
             );
-            return (slot, default_isolation, result.map(StreamOutcome::Direct));
+            let result = result.map(|result| {
+                if durable {
+                    StreamOutcome::Durable(result)
+                } else {
+                    StreamOutcome::Direct(result)
+                }
+            });
+            return (slot, default_isolation, result);
         }
 
         if let StatementClass::SessionConfig = class {
@@ -113,7 +121,7 @@ impl QueryService {
                 None,
                 default_isolation,
                 self.run_maintenance(statement, session.cancel())
-                    .map(StreamOutcome::Direct),
+                    .map(StreamOutcome::Durable),
             );
         }
 
@@ -542,9 +550,9 @@ impl QueryService {
                 // A streamed outcome is always a read, which leaves no dead versions.
                 let dead = match &outcome {
                     StreamOutcome::Streamed { .. } => 0,
-                    StreamOutcome::Direct(result) | StreamOutcome::SessionReset(result) => {
-                        dead_versions_in(result)
-                    }
+                    StreamOutcome::Direct(result)
+                    | StreamOutcome::Durable(result)
+                    | StreamOutcome::SessionReset(result) => dead_versions_in(result),
                     StreamOutcome::BeginCopyIn { .. } | StreamOutcome::BeginCopyOut { .. } => 0,
                 };
                 txn.dead_versions_pending = txn.dead_versions_pending.saturating_add(dead);
@@ -603,7 +611,7 @@ impl QueryService {
                             None,
                             captured,
                         )
-                        .map(StreamOutcome::Direct),
+                        .map(StreamOutcome::Durable),
                     _ => unreachable!("classify_bound only promotes reads to writes"),
                 }
             }
@@ -616,7 +624,7 @@ impl QueryService {
                         session.statement_timeout_ms(),
                     ),
                 )
-                .map(StreamOutcome::Direct),
+                .map(StreamOutcome::Durable),
             // Maintenance never reaches here: `dispatch` runs it via
             // `run_maintenance` before the autocommit data path.
             StatementClass::Maintenance => Err(DbError::internal(
@@ -873,7 +881,13 @@ impl QueryService {
         // settles it.
         let txn_id = self.register_active_txn();
         let catalog_before = if bound_mutates_catalog(&bound) {
-            Some(self.components.catalog.snapshot()?)
+            match self.components.catalog.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            }
         } else {
             None
         };
@@ -884,26 +898,35 @@ impl QueryService {
         // function returns on every path (success, statement error, panic), exactly
         // bracketing when the snapshot can still be used to read.
         let rewrite_snapshot = schema_snapshot_guard.is_some();
-        let (snapshot, relations, advertised) = if let Some(CapturedSnapshots {
-            snapshot,
-            relations,
-            advertised,
-        }) = snapshot_override
-        {
-            (snapshot, relations, Some(advertised))
-        } else if rewrite_snapshot {
-            (
-                self.capture_unadvertised_snapshot(txn_id),
-                self.components.storage.capture_relation_snapshot()?,
-                None,
-            )
-        } else {
-            let CapturedSnapshots {
+        let snapshots = (|| {
+            if let Some(CapturedSnapshots {
                 snapshot,
                 relations,
                 advertised,
-            } = self.capture_consistent_snapshots_cancelable(txn_id, cancel.as_ref())?;
-            (snapshot, relations, Some(advertised))
+            }) = snapshot_override
+            {
+                Ok((snapshot, relations, Some(advertised)))
+            } else if rewrite_snapshot {
+                Ok((
+                    self.capture_unadvertised_snapshot(txn_id),
+                    self.components.storage.capture_relation_snapshot()?,
+                    None,
+                ))
+            } else {
+                let CapturedSnapshots {
+                    snapshot,
+                    relations,
+                    advertised,
+                } = self.capture_consistent_snapshots_cancelable(txn_id, cancel.as_ref())?;
+                Ok((snapshot, relations, Some(advertised)))
+            }
+        })();
+        let (snapshot, relations, advertised) = match snapshots {
+            Ok(snapshots) => snapshots,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
         };
         let schema_versions = match prepared_schema_versions {
             Some(schema_versions) => schema_versions.to_vec(),
@@ -934,7 +957,7 @@ impl QueryService {
         // a stale/smaller horizon only prunes LESS — never unsafely — so capturing it
         // here (before execution) is sound. Other statements ignore it.
         let gc_horizon = self.components.gc_horizon();
-        let ctx = self.execution_context(ExecutionContextInput {
+        let ctx = match self.execution_context(ExecutionContextInput {
             txn_id,
             snapshot,
             relations,
@@ -942,7 +965,14 @@ impl QueryService {
             gc_horizon,
             live_txns: Arc::from([txn_id]),
             runtime,
-        })?;
+        }) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                drop(advertised);
+                self.rollback_pre_durable_or_die(txn_id, catalog_before);
+                return Err(err);
+            }
+        };
 
         let result = catch_unwind(AssertUnwindSafe(|| self.engine.execute(&ctx, &physical)));
         drop(ctx);
@@ -1107,8 +1137,12 @@ fn bound_mutates_catalog(bound: &BoundStatement) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use catalog::MemoryCatalog;
-    use common::{DataType, ParsedColumnDef};
+    use common::{CancelReason, DataType, ParsedColumnDef, SessionInfo, SessionSequenceState};
+
+    use crate::app::AppState;
 
     use super::*;
 
@@ -1166,5 +1200,30 @@ mod tests {
             column: "c".to_string(),
         };
         assert!(!bound_rewrites_table_storage(&drop, &catalog).unwrap());
+    }
+
+    #[test]
+    fn canceled_snapshot_capture_after_registration_rolls_back_xid() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let statement = parser::parse("create table t (id integer primary key)").unwrap();
+        let bound = bind(&statement, app.components.catalog.as_ref()).unwrap();
+        let guard =
+            WriteUnitGuard::Exclusive(app.components.concurrency.begin_checkpoint().unwrap());
+        let cancel = Arc::new(QueryCancel::new());
+        cancel.request(CancelReason::StatementTimeout);
+        let runtime = StatementRuntime::new(
+            &cancel,
+            Arc::new(SessionSequenceState::new()),
+            Arc::new(SessionInfo::default()),
+        );
+
+        let err = app
+            .query_service
+            .autocommit_bound_write_with_guard(bound, guard, runtime, None, None, None)
+            .unwrap_err();
+
+        assert_eq!(err.code, SqlState::QueryCanceled);
+        assert!(app.components.active_txns.active_ids().is_empty());
     }
 }

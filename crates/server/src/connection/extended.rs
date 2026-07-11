@@ -263,7 +263,7 @@ impl Session {
                 }
                 write_portal_result(stream, codec, result, &result_formats).await
             }
-            Ok(StreamOutcome::Direct(result)) => {
+            Ok(StreamOutcome::Direct(result) | StreamOutcome::Durable(result)) => {
                 self.end_activity();
                 if let Some(message) = self.application_name_status_change() {
                     write_messages(stream, codec, &[message]).await?;

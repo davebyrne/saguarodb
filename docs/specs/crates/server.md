@@ -470,7 +470,9 @@ when it is exhausted, explicitly closed, replaced by `Bind`, discarded by
 `DISCARD ALL`, invalidated by a successful `ROLLBACK TO SAVEPOINT` that changes
 the transaction's live subxid set, when the transaction ends, or when the
 connection closes. Every other statement is returned whole as
-`StreamOutcome::Direct` or, for `DISCARD ALL`, `StreamOutcome::SessionReset`, and
+`StreamOutcome::Direct`, `StreamOutcome::Durable` after an autocommit
+durable/irreversible boundary, or, for `DISCARD ALL`,
+`StreamOutcome::SessionReset`, and
 `max_rows` does not limit it. `Execute` participates in the session's CURRENT transaction:
 when an explicit transaction is open on the session (`Session.txn` is `Some`), the
 portal runs *inside* that transaction via `QueryService::execute_prepared_in_session_streamed`
@@ -556,10 +558,13 @@ that statement commit cannot turn it into an error and cleanup runs to completio
 VACUUM is nontransactional and may durably commit a hidden-TOAST cleanup
 subtransaction, then observe cancellation before parent/hidden physical vacuum;
 that restart-safe partial maintenance is reported as `QueryCanceled`, and a later
-VACUUM resumes the remaining work. After joining a blocking producer, the connection therefore preserves
-a successful autocommit direct outcome even if the async channel wait observed a
-late cancellation; only an interrupted stream/COPY or still-open explicit
-transaction can be converted to a cancellation error at that boundary.
+VACUUM resumes the remaining work. After joining a blocking producer, the connection
+therefore preserves only an explicit `StreamOutcome::Durable` if the async channel
+wait observed a late cancellation. `Direct`, `SessionReset`, interrupted
+stream/COPY, and still-open explicit-transaction outcomes remain cancelable at
+that boundary. Once an autocommit xid has been registered, every fallible snapshot
+or execution-context setup path uses the normal pre-durable rollback so timeout
+cannot leave an `InProgress` xid pinning snapshots or GC.
 
 ## Graceful Shutdown
 
