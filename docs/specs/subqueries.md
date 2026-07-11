@@ -1,9 +1,9 @@
 # Correlated Subqueries, LATERAL, and Join-Sourced DML
 
-**Status:** In implementation on branch `subqueries` — milestones S0–S3
+**Status:** In implementation on branch `subqueries` — milestones S0–S4
 implemented (correlated subqueries execute via Apply in `WHERE`, the `SELECT`
-list, and `HAVING`; equality shapes decorrelate to semi/anti joins); S4+ are
-design (§12).
+list, and `HAVING`; equality shapes decorrelate to semi/anti joins; `LATERAL`
+derived tables); S5+ are design (§12).
 
 This document specifies correlated subquery execution and the features built on
 it: correlated `(SELECT ...)` / `[NOT] EXISTS` / `[NOT] IN`, semi/anti joins,
@@ -333,13 +333,35 @@ with correlation keys) is deliberately deferred; it runs as Apply.
 
 ## 7. LATERAL
 
-`[INNER | LEFT] JOIN LATERAL (subquery) alias ON ...` and the comma form
+`[INNER | LEFT] JOIN LATERAL (subquery) alias ON <cond>` and the comma form
 `, LATERAL (subquery) alias` make FROM items to the left visible inside the
-derived table. The binder gives the lateral body a scope whose parent is the
-partial FROM row assembled so far; the planner produces a **lateral Apply**: a
-generalization of `ApplyKind` where the inner is a full table expression and
-the appended columns are the inner's entire output schema, with inner-join
-(row dropped when inner is empty) and left-join (null-padded) variants.
+derived table. The binder binds the lateral body through the same
+correlated-child-query path as subquery expressions — the partial FROM scope
+assembled so far is the immediate parent, so sibling references become
+correlation entries on the derived `BoundQuery` and enclosing-scope
+references chain outward as usual. FROM lowering produces
+`ApplyKind::Lateral`: the subplan is the full derived query, the appended
+columns are its entire output schema, and per outer row every matching inner
+row yields one output row (`left_join` emits one null-padded row when none
+match). The `ON` condition evaluates per combined (outer ++ inner) row inside
+the operator — its slots are the FROM scope's, which already match. The memo
+stores the **unfiltered** inner rows per correlation key, since the condition
+may reference outer columns.
+
+Restrictions:
+
+- `LATERAL` on the nullable side of a `RIGHT`/`FULL` join is rejected
+  (`FeatureNotSupported`).
+- A sibling-referencing `LATERAL` must be the **right** side of its explicit
+  join, and that join must be the **first FROM item** — the Apply's input is
+  the join's left subtree, and sibling slots are FROM-scope slots, which only
+  align when nothing precedes the join (`FeatureNotSupported` otherwise;
+  comma-form FROM lists fold left-deep, so a comma-form lateral always sees
+  the whole preceding prefix and is unrestricted). A lateral whose
+  correlations are purely chained (enclosing-scope only) is unrestricted: it
+  lowers to an Apply over a unit `VALUES` row, carrying its correlation list
+  for the enclosing Apply to substitute.
+
 Non-`LATERAL` derived tables remain uncorrelated scopes: sibling references
 still fail name resolution, and cross-level outer references keep the §1.1
 `FeatureNotSupported` rejection after S4.

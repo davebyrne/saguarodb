@@ -629,7 +629,13 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         | PhysicalPlan::Limit { source, .. } => output_width(source, catalog),
         // Both arms have equal width (the binder reconciled them); use the left.
         PhysicalPlan::SetOp { left, .. } => output_width(left, catalog),
-        PhysicalPlan::Apply { input, .. } => Ok(output_width(input, catalog)? + 1),
+        PhysicalPlan::Apply { input, kind, .. } => {
+            let appended = match kind {
+                ApplyKind::Lateral { output_schema, .. } => output_schema.len(),
+                _ => 1,
+            };
+            Ok(output_width(input, catalog)? + appended)
+        }
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
         | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),

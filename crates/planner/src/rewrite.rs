@@ -149,6 +149,18 @@ pub fn rewrite_plan_exprs(
                     operand: Box::new(rewrite_expr(operand, f)?),
                     negated: *negated,
                 },
+                ApplyKind::Lateral {
+                    left_join,
+                    condition,
+                    output_schema,
+                } => ApplyKind::Lateral {
+                    left_join: *left_join,
+                    condition: condition
+                        .as_deref()
+                        .map(|condition| rewrite_expr(condition, f).map(Box::new))
+                        .transpose()?,
+                    output_schema: output_schema.clone(),
+                },
                 other => other.clone(),
             },
         },

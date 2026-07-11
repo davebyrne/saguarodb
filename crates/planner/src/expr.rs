@@ -237,6 +237,17 @@ pub enum ApplyKind {
         operand: Box<BoundExpr>,
         negated: bool,
     },
+    /// A `LATERAL` derived table (`docs/specs/subqueries.md` §7): the subplan
+    /// is a full table expression whose entire output row is appended, and an
+    /// outer row produces one output row per matching inner row — or, for
+    /// `left_join`, one null-padded row when none match. `condition` is the
+    /// join's `ON` predicate over the combined (outer ++ inner) row;
+    /// `output_schema` is the derived table's columns.
+    Lateral {
+        left_join: bool,
+        condition: Option<Box<BoundExpr>>,
+        output_schema: Vec<common::ColumnInfo>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

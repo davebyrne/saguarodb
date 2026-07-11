@@ -546,6 +546,25 @@ pub(crate) fn build_executor<'a>(
             // construction (docs/specs/subqueries.md section 5.2); the
             // statement-level pre-pass deliberately did not descend into it.
             let subplan = crate::subquery::resolve_plan_subqueries(ctx, subplan)?;
+            if let planner::ApplyKind::Lateral {
+                left_join,
+                condition,
+                output_schema,
+            } = kind
+            {
+                // The ON condition's own uncorrelated subqueries were already
+                // resolved by whichever pre-pass walked this Apply node (the
+                // rewriter's Apply arm covers the Lateral condition).
+                return Ok(Box::new(crate::ops::LateralApplyOp::new(
+                    ctx,
+                    build_executor(ctx, input)?,
+                    subplan,
+                    correlations.clone(),
+                    *left_join,
+                    condition.as_deref().cloned(),
+                    output_schema.clone(),
+                )));
+            }
             Ok(Box::new(crate::ops::ApplyOp::new(
                 ctx,
                 build_executor(ctx, input)?,

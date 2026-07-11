@@ -337,9 +337,6 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
             subquery,
             alias,
         } => {
-            if *lateral {
-                return unsupported("LATERAL derived tables are not supported");
-            }
             let Some(alias) = alias else {
                 return unsupported("a subquery in FROM must have an alias");
             };
@@ -352,6 +349,7 @@ fn convert_table_factor(table: &sql::TableFactor) -> Result<FromItem> {
                 subquery: Box::new(convert_query((**subquery).clone())?),
                 alias: ident_name(&alias.name)?,
                 column_aliases,
+                lateral: *lateral,
             })
         }
         _ => unsupported("unsupported table factor"),

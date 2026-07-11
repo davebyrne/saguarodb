@@ -393,13 +393,16 @@ pub enum FromItem {
         name: String,
         alias: Option<String>,
     },
-    /// A derived table: `(SELECT ...) AS alias [(col, ...)]`. A subquery in the
-    /// FROM clause. The alias is required; `column_aliases` optionally renames the
-    /// subquery's output columns left to right.
+    /// A derived table: `[LATERAL] (SELECT ...) AS alias [(col, ...)]`. A
+    /// subquery in the FROM clause. The alias is required; `column_aliases`
+    /// optionally renames the subquery's output columns left to right.
+    /// `lateral` lets the body reference FROM items to its left
+    /// (`docs/specs/subqueries.md` §7).
     Derived {
         subquery: Box<Query>,
         alias: String,
         column_aliases: Vec<String>,
+        lateral: bool,
     },
     Join {
         left: Box<FromItem>,

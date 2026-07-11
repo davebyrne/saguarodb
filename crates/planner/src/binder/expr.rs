@@ -3,10 +3,7 @@ use parser::{Expr, FunctionArg, Query};
 
 use crate::{AggregateFunc, BinOp, BoundExpr, BoundQuery, CorrelatedColumn, UnaryOp};
 
-use super::query::bind_query;
-use super::{
-    BindContext, Binding, OuterLink, input_ref, plan_error, reject_aggregate, require_type,
-};
+use super::{BindContext, Binding, input_ref, plan_error, reject_aggregate, require_type};
 
 pub(super) fn bind_boolean_expr(ctx: &mut BindContext, expr: &Expr) -> Result<BoundExpr> {
     let bound = bind_expr(ctx, expr, Some(DataType::Boolean))?;
@@ -106,57 +103,14 @@ fn bind_expr_with_pg_type(
     }
 }
 
-/// Bind a subquery's inner query in a child scope that may reference the
-/// enclosing scopes (correlation), reusing the outer parameter declarations so
-/// `$n` placeholders inside the subquery resolve the same way. Correlated
-/// references recorded during the body's bind are translated into the
-/// returned query's `correlations` list: entries that resolved past the
-/// immediately enclosing scope are re-interned into `ctx`'s own accumulator
-/// and chained through an `OuterRef` (`docs/specs/subqueries.md` §4.2).
+/// Bind a subquery expression's inner query in a child scope that may
+/// reference the enclosing scopes (correlation), reusing the outer parameter
+/// declarations so `$n` placeholders inside the subquery resolve the same
+/// way. A subquery result has no external type context, so no `expected`
+/// types are supplied. Shared with LATERAL derived tables via
+/// `bind_correlated_child_query`.
 fn bind_subquery(ctx: &mut BindContext, subquery: &Query) -> Result<BoundQuery> {
-    // A subquery is bound in its own binding scope but still sees the enclosing
-    // query's CTEs. A subquery result has no external type context, so no
-    // `expected` types are supplied.
-    let mut pending = Vec::new();
-    let mut query = {
-        let mut chain = Vec::with_capacity(1 + ctx.outer.len());
-        chain.push(OuterLink { ctx, reject: None });
-        chain.extend(ctx.outer.iter().copied());
-        bind_query(
-            ctx.catalog,
-            subquery,
-            &ctx.declared_params,
-            &ctx.cte_scope,
-            None,
-            &chain,
-            &mut pending,
-        )?
-    };
-    query.correlations = pending
-        .into_iter()
-        .map(|entry| {
-            if entry.depth == 1 {
-                entry.column
-            } else {
-                // Resolved past the immediate parent: intern one level up and
-                // chain. `bind_column_ref` already rejected any reference that
-                // crossed a reject-marked link, so this intern is always legal.
-                let data_type = entry.column.data_type.clone();
-                let nullable = entry.column.nullable;
-                let slot = ctx.intern_correlation(entry.depth - 1, entry.column);
-                CorrelatedColumn {
-                    outer: BoundExpr::OuterRef {
-                        slot,
-                        data_type: data_type.clone(),
-                        nullable,
-                    },
-                    data_type,
-                    nullable,
-                }
-            }
-        })
-        .collect();
-    Ok(query)
+    super::query::bind_correlated_child_query(ctx, subquery)
 }
 
 /// Require that a subquery used where a single value is expected (a scalar

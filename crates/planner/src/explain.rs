@@ -170,6 +170,12 @@ fn format_node(plan: &PhysicalPlan, indent: usize, output: &mut String) {
                 ApplyKind::Exists { negated: true } => "Not Exists",
                 ApplyKind::In { negated: false, .. } => "In",
                 ApplyKind::In { negated: true, .. } => "Not In",
+                ApplyKind::Lateral {
+                    left_join: false, ..
+                } => "Lateral",
+                ApplyKind::Lateral {
+                    left_join: true, ..
+                } => "Lateral Left",
             };
             output.push_str(&format!(
                 "{padding}Apply ({kind}) correlations={}\n",

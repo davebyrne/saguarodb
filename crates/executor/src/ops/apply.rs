@@ -48,6 +48,9 @@ impl<'a> ApplyOp<'a> {
             data_type: match &kind {
                 ApplyKind::Scalar { data_type } => data_type.clone(),
                 ApplyKind::Exists { .. } | ApplyKind::In { .. } => DataType::Boolean,
+                ApplyKind::Lateral { .. } => {
+                    unreachable!("Lateral applies are built as LateralApplyOp")
+                }
             },
             table_id: None,
             column_id: None,
@@ -74,23 +77,7 @@ impl<'a> ApplyOp<'a> {
     /// Substitute this outer row's correlation values into the template and
     /// build the inner executor.
     fn build_inner(&self, key: &[Value]) -> Result<Box<dyn PlanExecutor + 'a>> {
-        let substituted = rewrite_plan_exprs(&self.subplan, &mut |expr| match expr {
-            BoundExpr::OuterRef {
-                slot,
-                data_type,
-                nullable,
-            } => {
-                let value = key.get(*slot).cloned().ok_or_else(|| {
-                    DbError::internal(format!("correlation slot {slot} out of bounds"))
-                })?;
-                Ok(Some(BoundExpr::Literal {
-                    value,
-                    data_type: data_type.clone(),
-                    nullable: *nullable,
-                }))
-            }
-            _ => Ok(None),
-        })?;
+        let substituted = substitute_template(&self.subplan, key)?;
         build_executor(self.ctx, &substituted)
     }
 
@@ -135,6 +122,9 @@ impl<'a> ApplyOp<'a> {
                         column.push(single_value(row.row)?);
                     }
                     MemoEntry::Column(Rc::new(column))
+                }
+                ApplyKind::Lateral { .. } => {
+                    unreachable!("Lateral applies are built as LateralApplyOp")
                 }
             })
         })();
@@ -199,6 +189,172 @@ impl PlanExecutor for ApplyOp<'_> {
             // Apply inside a DML source keeps UPDATE/DELETE targetable.
             identity: outer.identity,
         }))
+    }
+}
+
+/// Substitute one outer row's correlation values (`key`, indexed by `OuterRef`
+/// slot) into a subquery template.
+fn substitute_template(subplan: &PhysicalPlan, key: &[Value]) -> Result<PhysicalPlan> {
+    rewrite_plan_exprs(subplan, &mut |expr| match expr {
+        BoundExpr::OuterRef {
+            slot,
+            data_type,
+            nullable,
+        } => {
+            let value = key.get(*slot).cloned().ok_or_else(|| {
+                DbError::internal(format!("correlation slot {slot} out of bounds"))
+            })?;
+            Ok(Some(BoundExpr::Literal {
+                value,
+                data_type: data_type.clone(),
+                nullable: *nullable,
+            }))
+        }
+        _ => Ok(None),
+    })
+}
+
+/// The LATERAL Apply operator (`docs/specs/subqueries.md` §7): per outer row
+/// the derived-table template re-executes with sibling references
+/// substituted, and every matching inner row is appended after the outer
+/// columns (one output row per match); `left_join` emits one null-padded row
+/// when nothing matches. The memo stores the UNFILTERED inner rows per
+/// correlation key — the ON condition may reference outer columns, so it is
+/// evaluated per outer row against each combined row.
+pub struct LateralApplyOp<'a> {
+    ctx: &'a ExecutionContext<'a>,
+    input: Box<dyn PlanExecutor + 'a>,
+    subplan: PhysicalPlan,
+    correlations: Vec<BoundExpr>,
+    left_join: bool,
+    condition: Option<BoundExpr>,
+    output_schema: Vec<ColumnInfo>,
+    inner_width: usize,
+    memo: Option<HashMap<Vec<Value>, Rc<Vec<Row>>>>,
+    /// Combined rows for the current outer row, emitted one per `next` call.
+    pending: std::collections::VecDeque<ExecRow>,
+}
+
+impl<'a> LateralApplyOp<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        ctx: &'a ExecutionContext<'a>,
+        input: Box<dyn PlanExecutor + 'a>,
+        subplan: PhysicalPlan,
+        correlations: Vec<BoundExpr>,
+        left_join: bool,
+        condition: Option<BoundExpr>,
+        inner_schema: Vec<ColumnInfo>,
+    ) -> Self {
+        let mut output_schema = input.output_schema().to_vec();
+        let inner_width = inner_schema.len();
+        output_schema.extend(inner_schema);
+        let memo = if plan_has_volatile_exprs(&subplan) {
+            None
+        } else {
+            Some(HashMap::new())
+        };
+        Self {
+            ctx,
+            input,
+            subplan,
+            correlations,
+            left_join,
+            condition,
+            output_schema,
+            inner_width,
+            memo,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// The template's materialized rows for one correlation-value tuple.
+    fn inner_rows(&mut self, key: Vec<Value>) -> Result<Rc<Vec<Row>>> {
+        if let Some(memo) = &self.memo
+            && let Some(rows) = memo.get(&key)
+        {
+            return Ok(Rc::clone(rows));
+        }
+        let substituted = substitute_template(&self.subplan, &key)?;
+        let mut inner = build_executor(self.ctx, &substituted)?;
+        open_executor(inner.as_mut())?;
+        let result = (|| {
+            let mut rows = Vec::new();
+            while let Some(row) = inner.next()? {
+                rows.push(row.row);
+            }
+            Ok(rows)
+        })();
+        let rows = Rc::new(close_after(inner.as_mut(), result)?);
+        if let Some(memo) = &mut self.memo {
+            memo.insert(key, Rc::clone(&rows));
+        }
+        Ok(rows)
+    }
+}
+
+impl PlanExecutor for LateralApplyOp<'_> {
+    fn output_schema(&self) -> &[ColumnInfo] {
+        &self.output_schema
+    }
+
+    fn open(&mut self) -> Result<()> {
+        self.pending.clear();
+        self.input.open()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.pending.clear();
+        self.input.close()
+    }
+
+    fn next(&mut self) -> Result<Option<ExecRow>> {
+        loop {
+            if let Some(row) = self.pending.pop_front() {
+                return Ok(Some(row));
+            }
+            let Some(outer) = self.input.next()? else {
+                return Ok(None);
+            };
+            let statement = &self.ctx.statement;
+            let key = self
+                .correlations
+                .iter()
+                .map(|expr| eval_expr(statement, expr, &outer))
+                .collect::<Result<Vec<_>>>()?;
+            let rows = self.inner_rows(key)?;
+
+            for inner in rows.iter() {
+                let mut values = outer.row.values.clone();
+                values.extend(inner.values.iter().cloned());
+                let combined = ExecRow {
+                    row: Row { values },
+                    // Physical row identity passes through from the outer
+                    // side, as for every Apply.
+                    identity: outer.identity.clone(),
+                };
+                let matches = match &self.condition {
+                    Some(condition) => {
+                        matches!(
+                            eval_expr(statement, condition, &combined)?,
+                            Value::Boolean(true)
+                        )
+                    }
+                    None => true,
+                };
+                if matches {
+                    self.pending.push_back(combined);
+                }
+            }
+            if self.pending.is_empty() && self.left_join {
+                let mut values = outer.row.values;
+                values.extend(std::iter::repeat_n(Value::Null, self.inner_width));
+                self.pending.push_back(ExecRow {
+                    row: Row { values },
+                    identity: outer.identity,
+                });
+            }
+        }
     }
 }
 

@@ -100,6 +100,58 @@ pub(super) fn bind_query<'a>(
     }
 }
 
+/// Bind a child query whose body may reference `ctx`'s scope and the scopes
+/// beyond it (a subquery expression body, or a LATERAL derived table's body).
+/// Correlated references recorded during the bind are translated into the
+/// returned query's `correlations` list: entries that resolved past the
+/// immediately enclosing scope are re-interned into `ctx`'s own accumulator
+/// and chained through an `OuterRef` (`docs/specs/subqueries.md` §4.2).
+pub(super) fn bind_correlated_child_query(
+    ctx: &mut BindContext,
+    subquery: &Query,
+) -> Result<BoundQuery> {
+    let mut pending = Vec::new();
+    let mut query = {
+        let mut chain = Vec::with_capacity(1 + ctx.outer.len());
+        chain.push(OuterLink { ctx, reject: None });
+        chain.extend(ctx.outer.iter().copied());
+        bind_query(
+            ctx.catalog,
+            subquery,
+            &ctx.declared_params,
+            &ctx.cte_scope,
+            None,
+            &chain,
+            &mut pending,
+        )?
+    };
+    query.correlations = pending
+        .into_iter()
+        .map(|entry| {
+            if entry.depth == 1 {
+                entry.column
+            } else {
+                // Resolved past the immediate parent: intern one level up and
+                // chain. `bind_column_ref` already rejected any reference that
+                // crossed a reject-marked link, so this intern is always legal.
+                let data_type = entry.column.data_type.clone();
+                let nullable = entry.column.nullable;
+                let slot = ctx.intern_correlation(entry.depth - 1, entry.column);
+                crate::CorrelatedColumn {
+                    outer: BoundExpr::OuterRef {
+                        slot,
+                        data_type: data_type.clone(),
+                        nullable,
+                    },
+                    data_type,
+                    nullable,
+                }
+            }
+        })
+        .collect();
+    Ok(query)
+}
+
 /// Mark every link of an outer chain as rejected: the scopes stay walkable so
 /// an outer reference produces a `FeatureNotSupported` error naming
 /// `construct`, but no correlation can be recorded through them
@@ -703,16 +755,69 @@ fn bind_from_item(
             subquery,
             alias,
             column_aliases,
-        } => bind_derived_table(catalog, ctx, subquery, alias, column_aliases),
+            lateral,
+        } => bind_derived_table(catalog, ctx, subquery, alias, column_aliases, *lateral),
         FromItem::Join {
             left,
             right,
             join_type,
             condition,
         } => {
-            let left = bind_from_item(catalog, ctx, left)?;
-            let right = bind_from_item(catalog, ctx, right)?;
             let join_type = convert_join_type(join_type.clone());
+            if matches!(join_type, JoinType::Right | JoinType::Full)
+                && matches!(**right, FromItem::Derived { lateral: true, .. })
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "LATERAL is not supported on the nullable side of a RIGHT or FULL join",
+                ));
+            }
+            let slots_before = ctx.next_slot;
+            let left = bind_from_item(catalog, ctx, left)?;
+            // A LATERAL body referencing its siblings must be the RIGHT side
+            // of its join: the plan lowers it to an Apply whose input is the
+            // join's left subtree, which cannot supply columns from OUTSIDE
+            // that subtree. Sibling-free (purely chained) laterals are fine
+            // anywhere — the enclosing Apply substitutes them.
+            if let BoundFrom::Derived {
+                lateral: true,
+                query,
+                ..
+            } = &left
+                && query
+                    .correlations
+                    .iter()
+                    .any(|correlation| !matches!(correlation.outer, BoundExpr::OuterRef { .. }))
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "a LATERAL derived table referencing its siblings must be \
+                     the right side of its join",
+                ));
+            }
+            let right = bind_from_item(catalog, ctx, right)?;
+            // A sibling-referencing LATERAL lowers to an Apply whose input is
+            // THIS join's left subtree, but its correlation slots are global
+            // FROM-scope slots: they only align when the join is the first
+            // FROM item. Purely chained (enclosing-scope) laterals carry no
+            // sibling slots and are unrestricted.
+            if slots_before > 0
+                && let BoundFrom::Derived {
+                    lateral: true,
+                    query,
+                    ..
+                } = &right
+                && query
+                    .correlations
+                    .iter()
+                    .any(|correlation| !matches!(correlation.outer, BoundExpr::OuterRef { .. }))
+            {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "a sibling-referencing LATERAL derived table is only supported \
+                     when its join is the first FROM item",
+                ));
+            }
             let condition = match (join_type, condition) {
                 (JoinType::Cross, None) => None,
                 (JoinType::Cross, Some(_)) => {
@@ -941,6 +1046,8 @@ fn bind_cte_reference(ctx: &mut BindContext, cte: CteBinding, alias: Option<Stri
         binding,
         alias: visible_name,
         schema: columns,
+        // An inlined CTE reference is never LATERAL.
+        lateral: false,
     }
 }
 
@@ -953,23 +1060,30 @@ fn bind_derived_table(
     subquery: &Query,
     alias: &str,
     column_aliases: &[String],
+    lateral: bool,
 ) -> Result<BoundFrom> {
-    // The derived subquery is bound in its own binding scope but still sees the
-    // enclosing query's CTEs. It does not see the enclosing query's own FROM
-    // bindings (non-LATERAL semantics), and outer references past the derived
-    // boundary are rejected rather than recorded — the enclosing chain is
-    // threaded reject-marked purely so the error names the construct
-    // (`docs/specs/subqueries.md` §1.1).
-    let derived_outer = rejected_links(&ctx.outer, "a derived table");
-    let query = bind_query(
-        catalog,
-        subquery,
-        &ctx.declared_params,
-        &ctx.cte_scope,
-        None,
-        &derived_outer,
-        &mut Vec::new(),
-    )?;
+    // The derived subquery is bound in its own binding scope but still sees
+    // the enclosing query's CTEs. A LATERAL body additionally sees the FROM
+    // bindings registered in `ctx` so far (its left siblings) plus the
+    // enclosing scopes, recorded as correlations. A non-LATERAL body sees no
+    // sibling bindings, and outer references past the derived boundary are
+    // rejected rather than recorded — the enclosing chain is threaded
+    // reject-marked purely so the error names the construct
+    // (`docs/specs/subqueries.md` §1.1, §7).
+    let query = if lateral {
+        bind_correlated_child_query(ctx, subquery)?
+    } else {
+        let derived_outer = rejected_links(&ctx.outer, "a derived table");
+        bind_query(
+            catalog,
+            subquery,
+            &ctx.declared_params,
+            &ctx.cte_scope,
+            None,
+            &derived_outer,
+            &mut Vec::new(),
+        )?
+    };
     let columns = derive_alias_columns(&query.output_columns(), column_aliases, || {
         format!("table \"{alias}\"")
     })?;
@@ -993,6 +1107,7 @@ fn bind_derived_table(
         binding,
         alias: alias.to_string(),
         schema: columns,
+        lateral,
     })
 }
 

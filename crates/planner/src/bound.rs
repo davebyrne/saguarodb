@@ -354,14 +354,18 @@ pub enum BoundFrom {
         alias: Option<String>,
         schema: Vec<ColumnDef>,
     },
-    /// A derived table `(SELECT ...) AS alias [(cols)]`. The inner SELECT is bound
-    /// in its own scope; `schema` is the derived columns (renamed by the optional
-    /// column-alias list) projected into the outer scope at `binding`'s slots.
+    /// A derived table `[LATERAL] (SELECT ...) AS alias [(cols)]`. The inner
+    /// SELECT is bound in its own scope; `schema` is the derived columns
+    /// (renamed by the optional column-alias list) projected into the outer
+    /// scope at `binding`'s slots. A `lateral` body may reference FROM items
+    /// to its left — its sibling references live in the bound query's
+    /// `correlations` (`docs/specs/subqueries.md` §7).
     Derived {
         query: Box<BoundQuery>,
         binding: common::BindingId,
         alias: String,
         schema: Vec<ColumnDef>,
+        lateral: bool,
     },
     /// A user-defined view inlined as a derived query. It is kept distinct from a
     /// plain derived table so dependency tracking can invalidate prepared plans

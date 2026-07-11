@@ -610,9 +610,50 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
         // A derived table lowers to its inner query's plan. Its columns already
         // sit at the derived binding's slots, so an outer WHERE (the standalone
         // case) is applied as a Filter above it — it cannot be pushed into the
-        // inner scan.
+        // inner scan. A correlated LATERAL in this position (standalone, or
+        // the left item of a join) has no siblings, only chained
+        // enclosing-scope entries; it still lowers to an Apply — over a unit
+        // Values row — so its correlation list is carried on the plan node
+        // and substituted by slot like every other Apply, instead of the
+        // body's OuterRefs being embedded against a possibly divergent
+        // enclosing index space.
         BoundFrom::Derived { query, .. } | BoundFrom::View { query, .. } => {
-            let plan = plan_query(query)?;
+            let plan = if let BoundFrom::Derived {
+                lateral: true,
+                schema,
+                ..
+            } = from
+                && !query.correlations.is_empty()
+            {
+                LogicalPlan::Apply {
+                    input: Box::new(LogicalPlan::Values {
+                        rows: vec![vec![]],
+                        output_schema: Vec::new(),
+                    }),
+                    subplan: Box::new(plan_query(query)?),
+                    correlations: query
+                        .correlations
+                        .iter()
+                        .map(|correlation| correlation.outer.clone())
+                        .collect(),
+                    kind: ApplyKind::Lateral {
+                        left_join: false,
+                        condition: None,
+                        output_schema: schema
+                            .iter()
+                            .map(|column| ColumnInfo {
+                                name: column.name.clone(),
+                                data_type: column.data_type.clone(),
+                                table_id: None,
+                                column_id: None,
+                                pg_type: column.pg_type.clone(),
+                            })
+                            .collect(),
+                    },
+                }
+            } else {
+                plan_query(query)?
+            };
             Ok(match filter {
                 Some(predicate) => LogicalPlan::Filter {
                     source: Box::new(plan),
@@ -627,11 +668,49 @@ fn plan_from(from: &BoundFrom, filter: Option<BoundExpr>) -> Result<LogicalPlan>
             condition,
             join_type,
         } => {
-            let mut plan = LogicalPlan::Join {
-                left: Box::new(plan_from(left, None)?),
-                right: Box::new(plan_from(right, None)?),
-                condition: condition.clone(),
-                join_type: *join_type,
+            // A LATERAL derived table on the right lowers to an Apply: its
+            // body re-executes per left row with the sibling references
+            // substituted, appending the derived columns
+            // (`docs/specs/subqueries.md` §7). The ON condition binds in the
+            // full FROM scope, whose slots already match the combined
+            // (left ++ derived) row.
+            let mut plan = if let BoundFrom::Derived {
+                query,
+                schema,
+                lateral: true,
+                ..
+            } = &**right
+            {
+                LogicalPlan::Apply {
+                    input: Box::new(plan_from(left, None)?),
+                    subplan: Box::new(plan_query(query)?),
+                    correlations: query
+                        .correlations
+                        .iter()
+                        .map(|correlation| correlation.outer.clone())
+                        .collect(),
+                    kind: ApplyKind::Lateral {
+                        left_join: matches!(join_type, JoinType::Left),
+                        condition: condition.clone().map(Box::new),
+                        output_schema: schema
+                            .iter()
+                            .map(|column| ColumnInfo {
+                                name: column.name.clone(),
+                                data_type: column.data_type.clone(),
+                                table_id: None,
+                                column_id: None,
+                                pg_type: column.pg_type.clone(),
+                            })
+                            .collect(),
+                    },
+                }
+            } else {
+                LogicalPlan::Join {
+                    left: Box::new(plan_from(left, None)?),
+                    right: Box::new(plan_from(right, None)?),
+                    condition: condition.clone(),
+                    join_type: *join_type,
+                }
             };
             if let Some(filter) = filter {
                 plan = LogicalPlan::Filter {

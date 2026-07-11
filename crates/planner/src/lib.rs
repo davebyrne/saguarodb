@@ -4033,4 +4033,119 @@ mod tests {
             "uncorrelated subqueries stay with the pre-pass, got {plan:?}"
         );
     }
+
+    // --- LATERAL (docs/specs/subqueries.md §7, milestone S4) ---
+
+    #[test]
+    fn comma_lateral_lowers_to_lateral_apply() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select u.id, l.m from users u, \
+             lateral (select max(id) as m from accounts a where a.owner = u.name) l",
+            &catalog,
+        );
+        let PhysicalPlan::Projection { source, .. } = plan else {
+            panic!("expected Projection, got {plan:?}");
+        };
+        let PhysicalPlan::Apply {
+            input,
+            correlations,
+            kind:
+                ApplyKind::Lateral {
+                    left_join: false,
+                    condition: None,
+                    output_schema,
+                },
+            ..
+        } = *source
+        else {
+            panic!("expected Apply(Lateral), got {source:?}");
+        };
+        assert!(matches!(*input, PhysicalPlan::SeqScan { .. }));
+        assert_eq!(correlations.len(), 1);
+        assert_eq!(output_schema.len(), 1);
+        assert_eq!(output_schema[0].name, "m");
+    }
+
+    #[test]
+    fn left_join_lateral_null_pads() {
+        let catalog = catalog_with_users_and_accounts();
+        let plan = plan_sql(
+            "select u.id from users u left join \
+             lateral (select id from accounts a where a.owner = u.name) l on true",
+            &catalog,
+        );
+        assert!(
+            format!("{plan:?}").contains("left_join: true"),
+            "expected a left lateral Apply, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_lateral_join_after_comma_items_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        // The lateral's join is not the first FROM item: its sibling slots
+        // are FROM-scope slots that would misalign with the join-subtree
+        // input (silently wrong data before the guard).
+        let err = bind(
+            &parse(
+                "select l.x from users u2, accounts a join \
+                 lateral (select a.id as x) l on true",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("first FROM item"), "{}", err.message);
+    }
+
+    #[test]
+    fn chained_only_lateral_lowers_to_unit_input_apply() {
+        let catalog = catalog_with_users_and_accounts();
+        // Two chained-only laterals at the same level: each must carry its
+        // OWN correlation list on an Apply node (embedding the body OuterRefs
+        // against the enclosing accumulator would misalign l2's slot).
+        let plan = plan_sql(
+            "select id from users u where exists \
+             (select 1 from lateral (select u.id as p) l1, \
+              lateral (select u.name as y) l2 where l2.y = u.name)",
+            &catalog,
+        );
+        let plan_text = format!("{plan:?}");
+        assert_eq!(
+            plan_text.matches("kind: Lateral").count(),
+            2,
+            "expected two lateral Apply nodes, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn lateral_restrictions_are_rejected() {
+        let catalog = catalog_with_users_and_accounts();
+        // RIGHT/FULL JOIN LATERAL.
+        let err = bind(
+            &parse(
+                "select u.id from users u right join \
+                 lateral (select id from accounts a where a.owner = u.name) l on true",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+
+        // A sibling-referencing LATERAL as the LEFT item of an explicit join.
+        let err = bind(
+            &parse(
+                "select 1 from users u, \
+                 lateral (select u.id as x) l join accounts a on a.id = l.x",
+            )
+            .unwrap(),
+            &catalog,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, SqlState::FeatureNotSupported);
+        assert!(err.message.contains("right side"), "{}", err.message);
+    }
 }

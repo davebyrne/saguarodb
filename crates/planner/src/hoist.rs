@@ -168,7 +168,10 @@ pub(crate) fn hoist_correlated_subqueries(
             kind,
         } => LogicalPlan::Apply {
             input: Box::new(hoist_correlated_subqueries(*input, catalog)?),
-            subplan,
+            // A LATERAL Apply is created during FROM lowering with a raw
+            // subplan; expression-hoisted Applies arrive already hoisted, for
+            // which this recursion is an idempotent no-op.
+            subplan: Box::new(hoist_correlated_subqueries(*subplan, catalog)?),
             correlations,
             kind,
         },
@@ -835,7 +838,13 @@ fn logical_output_width(plan: &LogicalPlan, catalog: &dyn CatalogManager) -> Res
         | LogicalPlan::Aggregate { output_schema, .. }
         | LogicalPlan::Values { output_schema, .. } => output_schema.len(),
         LogicalPlan::SetOp { left, .. } => logical_output_width(left, catalog)?,
-        LogicalPlan::Apply { input, .. } => logical_output_width(input, catalog)? + 1,
+        LogicalPlan::Apply { input, kind, .. } => {
+            let appended = match kind {
+                ApplyKind::Lateral { output_schema, .. } => output_schema.len(),
+                _ => 1,
+            };
+            logical_output_width(input, catalog)? + appended
+        }
         other => {
             return Err(DbError::internal(format!(
                 "plan node has no row width: {other:?}"

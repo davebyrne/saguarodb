@@ -3595,6 +3595,180 @@ async fn e2e_correlated_nested_volatile_subquery_not_memoized() {
 }
 
 #[tokio::test]
+async fn e2e_lateral_derived_tables() {
+    // docs/specs/subqueries.md section 7: LATERAL derived tables see their
+    // left siblings and re-execute per outer row.
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table users (id integer primary key, name text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("create table accounts (id integer primary key, owner text, amount integer)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into users (id, name) values (1, 'Ada'), (2, 'Grace'), (3, 'Alan')")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into accounts (id, owner, amount) values \
+             (10, 'Ada', 100), (11, 'Ada', 5), (20, 'Grace', 50)",
+        )
+        .await
+        .unwrap();
+
+    // Comma-form LATERAL with an aggregate body (always one row).
+    let rows = server
+        .simple_query(
+            "select u.id, l.m from users u, \
+             lateral (select max(amount) as m from accounts a where a.owner = u.name) l \
+             order by u.id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("100".to_string())],
+            vec![Some("2".to_string()), Some("50".to_string())],
+            vec![Some("3".to_string()), None],
+        ]
+    );
+
+    // Top-1-per-group: ORDER BY + LIMIT inside the lateral body; inner-join
+    // semantics drop Alan (no matching rows).
+    let rows = server
+        .simple_query(
+            "select u.id, l.amount from users u, \
+             lateral (select amount from accounts a where a.owner = u.name \
+                      order by amount desc limit 1) l \
+             order by u.id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("100".to_string())],
+            vec![Some("2".to_string()), Some("50".to_string())],
+        ]
+    );
+
+    // LEFT JOIN LATERAL null-pads outer rows with no matches.
+    let rows = server
+        .simple_query(
+            "select u.id, l.amount from users u left join \
+             lateral (select amount from accounts a where a.owner = u.name \
+                      order by amount desc limit 1) l on true \
+             order by u.id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("100".to_string())],
+            vec![Some("2".to_string()), Some("50".to_string())],
+            vec![Some("3".to_string()), None],
+        ]
+    );
+
+    // INNER JOIN LATERAL with an ON condition over the combined row.
+    let rows = server
+        .simple_query(
+            "select u.id, l.amount from users u join \
+             lateral (select amount from accounts a where a.owner = u.name) l \
+             on l.amount > 60 order by u.id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".to_string()), Some("100".to_string())]]
+    );
+
+    // A lateral body chaining through to an enclosing subquery boundary:
+    // FROM-less body referencing both the sibling (a) and the outer query (u).
+    let rows = server
+        .simple_query(
+            "select id from users u where exists \
+             (select 1 from accounts a, lateral (select a.amount + u.id as x) l \
+              where a.owner = u.name and l.x > 100)",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+
+    // Multiple matches multiply the outer row (Ada has two accounts).
+    let rows = server
+        .simple_query(
+            "select u.id, l.amount from users u, \
+             lateral (select amount from accounts a where a.owner = u.name) l \
+             where u.id = 1 order by l.amount",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("5".to_string())],
+            vec![Some("1".to_string()), Some("100".to_string())],
+        ]
+    );
+
+    // Two chained-only laterals at the same level: each Apply carries its
+    // own correlation list, so l2 gets u.name — not l1's u.id (a slot-space
+    // mix-up here previously produced a type-confusion error).
+    let rows = server
+        .simple_query(
+            "select id from users u where exists \
+             (select 1 from lateral (select u.id as p) l1, \
+              lateral (select u.name as y) l2 where l2.y = u.name) order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string())],
+            vec![Some("2".to_string())],
+            vec![Some("3".to_string())],
+        ]
+    );
+
+    // Non-LATERAL derived tables still cannot see siblings.
+    let err = server
+        .simple_query(
+            "select u.id from users u, \
+             (select amount from accounts a where a.owner = u.name) d",
+        )
+        .await
+        .err()
+        .expect("non-lateral sibling reference should fail");
+    assert!(err.message.contains("42703"), "{}", err.message);
+
+    // LATERAL under a RIGHT/FULL join is rejected.
+    let err = server
+        .simple_query(
+            "select u.id from users u right join \
+             lateral (select amount from accounts a where a.owner = u.name) l on true",
+        )
+        .await
+        .err()
+        .expect("RIGHT JOIN LATERAL should be rejected");
+    assert!(err.message.contains("0A000"), "{}", err.message);
+}
+
+#[tokio::test]
 async fn e2e_correlated_subqueries_unsupported_positions() {
     // Positions the hoisting pass does not cover keep the 0A000 guard
     // (docs/specs/subqueries.md section 10).
