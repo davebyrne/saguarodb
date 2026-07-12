@@ -72,6 +72,13 @@ async fn e2e_array_constructors_storage_subscripts_comparisons_and_any() {
         .err()
         .expect("oversized array element should fail");
     assert_eq!(err.code, common::SqlState::StringDataRightTruncation);
+
+    let err = server
+        .simple_query("select ARRAY[ARRAY[], ARRAY[]]::integer[]")
+        .await
+        .err()
+        .expect("nested empty array shape should fail during binding");
+    assert_eq!(err.code, common::SqlState::DatatypeMismatch);
 }
 
 #[tokio::test]

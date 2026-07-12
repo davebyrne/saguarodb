@@ -2477,6 +2477,26 @@ mod tests {
     }
 
     #[test]
+    fn array_constructor_infers_leading_parameter_from_later_element() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select ARRAY[$1, 1]").unwrap();
+        let (_, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        assert_eq!(params, vec![DataType::Integer]);
+
+        let stmt = parse("select ARRAY[1, $1]").unwrap();
+        let (_, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        assert_eq!(params, vec![DataType::Integer]);
+    }
+
+    #[test]
+    fn binder_rejects_nested_empty_array_shape() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select ARRAY[ARRAY[], ARRAY[]]::integer[]").unwrap();
+        let err = bind(&stmt, &catalog).unwrap_err();
+        assert_eq!(err.code, SqlState::DatatypeMismatch);
+    }
+
+    #[test]
     fn binds_insert_parameters_by_column_type() {
         let catalog = catalog_with_users();
         let stmt = parse("insert into users (id, name) values ($1, $2)").unwrap();

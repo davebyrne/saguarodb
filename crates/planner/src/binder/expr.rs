@@ -306,7 +306,12 @@ fn bind_array(
         None => {
             let candidate = scalars
                 .iter()
-                .find(|expr| !matches!(expr, Expr::Literal(Value::Null)))
+                .find(|expr| !matches!(expr, Expr::Literal(Value::Null) | Expr::Placeholder(_)))
+                .or_else(|| {
+                    scalars
+                        .iter()
+                        .find(|expr| !matches!(expr, Expr::Literal(Value::Null)))
+                })
                 .ok_or_else(|| {
                     plan_error(
                         SqlState::DatatypeMismatch,
@@ -367,6 +372,12 @@ fn array_dimensions(elements: &[Expr]) -> Result<Vec<u32>> {
     }
     let mut nested = nested;
     let first = array_dimensions(nested.next().expect("non-empty nested array"))?;
+    if first.is_empty() || first.contains(&0) {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "multidimensional arrays cannot contain an empty inner dimension",
+        ));
+    }
     for elements in nested {
         if array_dimensions(elements)? != first {
             return Err(plan_error(
