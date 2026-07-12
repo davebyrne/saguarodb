@@ -346,7 +346,7 @@ dictionary file, which is harmless and whose id startup reserves (§7).
    is skipped/fails, `active_dict_id` becomes `None`.
 4. Append + flush WAL: `CreateDictionary` (if trained) and a logical
    `AlterTableCompression { table_id, compression, active_dict_id }` DDL
-   record, then the commit record (immediate-commit DDL, like other DDL).
+   record, then the commit record (immediate-commit maintenance DDL).
    Recovery applies `AlterTableCompression` to the catalog CLOG-gated,
    exactly like other DDL records.
 5. Update the in-memory catalog and the store's file configs (heap + all

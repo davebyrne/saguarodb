@@ -17,8 +17,8 @@ pub use truncate_overlay::TruncateCatalogOverlay;
 use common::{
     ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId, IndexConstraintKind,
     IndexId, IndexSchema, NamespaceSchema, ParsedColumnDef, PgType, Result, SchemaId, SequenceId,
-    SequenceOptions, SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate,
-    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    SequenceOptions, SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions,
+    TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,19 +449,17 @@ pub trait CatalogManager: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::collections::HashMap;
 
     use common::{
-        ColumnDef, ColumnDefault, ColumnStatistics, CompressionSetting, DataType, ErrorKind,
-        IndexConstraintKind, IndexSchema, NDistinct, OrderedF64, ParsedColumnDef, PgType,
-        RelationKind, SequenceOptions, SequenceSchema, SqlState, TableSchema, TableStatistics,
-        ToastCompression, ToastMode, ToastOptions, Value, ViewColumn, ViewDependency, toast_schema,
+        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexConstraintKind,
+        IndexSchema, ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema,
+        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
+        ViewDependency, toast_schema,
     };
 
     use crate::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, TruncateCatalogOverlay,
-        deserialize_catalog, serialize_catalog,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
         system::{MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
         validate_create_table_definition,
     };

@@ -1,6 +1,7 @@
 use common::{
     ColumnId, CompressionSetting, FileId, IndexId, IndexSchema, Lsn, NamespaceSchema, PageNum,
-    SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, ToastOptions, ViewSchema,
+    SchemaId, SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions,
+    ViewSchema,
 };
 use serde::{Deserialize, Serialize};
 

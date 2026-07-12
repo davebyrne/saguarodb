@@ -2151,7 +2151,10 @@ fn prepared_maintenance_schema_versions(
     catalog: &dyn CatalogManager,
 ) -> Result<Vec<PreparedRelationVersion>> {
     let names: Vec<&QualifiedName> = match statement {
-        Statement::Vacuum { table: Some(table) }
+        Statement::Vacuum {
+            table: Some(table), ..
+        }
+        | Statement::Analyze { table: Some(table) }
         | Statement::AlterTableSetCompression { table, .. }
         | Statement::AlterTableSetOptions { table, .. }
         | Statement::AlterTableAddPrimaryKey { table, .. }

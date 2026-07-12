@@ -228,6 +228,11 @@ pub enum Statement {
     /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
     Vacuum {
         table: Option<QualifiedName>,
+        analyze: bool,
+    },
+    /// `ANALYZE` (all user tables) or `ANALYZE <table>` (one table).
+    Analyze {
+        table: Option<QualifiedName>,
     },
     /// `TRUNCATE [TABLE] <name> [, ...]` — immediate table truncation. A
     /// maintenance command that does not bind/plan relationally. Targets retain

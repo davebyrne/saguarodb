@@ -1620,7 +1620,7 @@ The `ExecRow` then flows through the entire executor pipeline with identity pres
 
 ### Storage Engine Traits
 
-Data operations and DDL are separate traits because DDL includes file creation and catalog updates while DML operates within existing table pages. Both run under the shared writer guard; table modes and the server catalog publication gate provide their distinct logical exclusion. Keeping the traits split also leaves room for broader transactional DDL later.
+Data operations and DDL are separate traits because DDL includes file creation and catalog updates while DML operates within existing table pages. Both run under the shared writer guard; table modes and the server catalog publication gate provide their distinct logical exclusion. Transactional DDL stages catalog changes in the transaction-local overlay and publishes them after durable commit.
 
 ```rust
 pub trait StorageEngine: Send + Sync {
@@ -1959,7 +1959,7 @@ The control record uses a versioned binary envelope: magic `SGMF`, a `u32` versi
 
 ## 10. Write-Ahead Log (WAL)
 
-The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
+The `wal` crate provides durability with a **physiological redo WAL**: physical-redo records describe page changes (`HeapInit`, `HeapInsert`, `HeapDelete`, `HeapUpdateHeader`, `FullPageImage`) gated by a per-page LSN, alongside logical DDL records (`CreateTable`, `DropTable`, `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`, `CreateView`, `ReplaceView`, `DropView`, `CreateSchema`, `DropSchema`, `AlterTableCompression`, `AlterTableToast`, `TruncateTable`, `AlterTablePrimaryKey`, `UpdateTableSchema`, `CreateDictionary`), non-transactional sequence value records (`SequenceAdvance`, `SetSequenceValue`), and the `Commit`/`Abort`/`Checkpoint` markers. Recovery is **redo-all**: it replays every physical record under PageLSN gating regardless of the transaction's outcome, and the CLOG (rebuilt from `Commit`/`Abort`) decides visibility afterward; an aborted/in-flight transaction's replayed versions are invisible. Logical DDL records install objects only for committed transactions; skipped aborted/in-flight create/truncate/schema-rewrite records still reserve their schema/table/view/index/sequence/dictionary/storage IDs or carried rewrite storage IDs so orphan page files, catalog IDs, dictionary IDs, or relation files cannot be reused. Sequence value records replay unconditionally because sequence advancement is non-transactional. (See `docs/specs/mvcc.md` §8 for the full recovery contract.)
 
 ### Durability Model: Heap Files + Redo WAL + Flush Checkpoint
 
@@ -2589,10 +2589,6 @@ Loaded from command-line args only. There is no environment-variable or config-f
 
 ## 13. Future Work (Designed For, Not Implemented)
 
-- **General transactional DDL:** CREATE, DROP, and ALTER commit immediately and
-  cannot be rolled back inside a transaction block.
-  Transactional `TRUNCATE` is the targeted relation-generation exception and does
-  not imply general catalog MVCC (`docs/specs/table-locks.md`).
 - **Time-Travel / As-Of Queries:** In-heap versions make snapshot reads cheap, but there is no syntax to read as of a historical point.
 - **Concurrent B-link Writer Protocol:** Index writers serialize on per-index structural latches; a fully concurrent B-link tree writer protocol and fuzzy checkpointing are future work. Row-level blocking and deadlock detection are already implemented by the server lock manager.
 - **Cost-Based Optimizer:** `LogicalPlan` → `PhysicalPlan` boundary exists. A cost-based optimizer slots between them, choosing physical access methods and join algorithms without changing the executor. The current rule-based planner already chooses among primary-key identity access and catalog indexes, preferring primary-key identity access when available; a cost model would replace that heuristic.

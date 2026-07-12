@@ -1,6 +1,6 @@
 use common::{
     DbError, FileId, IndexId, IndexSchema, NamespaceSchema, RelationKind, Result, SchemaId,
-    SequenceId, SequenceSchema, TableId, TableSchema, ViewSchema,
+    SequenceId, SequenceSchema, TableId, TableSchema, TableStatistics, ViewSchema,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,7 @@ struct CatalogV2<'a> {
     views: Vec<&'a ViewSchema>,
     indexes: Vec<&'a IndexSchema>,
     sequences: Vec<&'a SequenceSchema>,
+    statistics: Vec<(TableId, &'a TableStatistics)>,
     next_schema_id: SchemaId,
     next_table_id: TableId,
     next_index_id: IndexId,
@@ -32,6 +33,8 @@ struct OwnedCatalogV2 {
     views: Vec<ViewSchema>,
     indexes: Vec<IndexSchema>,
     sequences: Vec<SequenceSchema>,
+    #[serde(default)]
+    statistics: Vec<(TableId, TableStatistics)>,
     next_schema_id: SchemaId,
     next_table_id: TableId,
     next_index_id: IndexId,
@@ -51,6 +54,12 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
     indexes.sort_by_key(|index| index.id);
     let mut sequences: Vec<_> = snapshot.sequences_by_id.values().collect();
     sequences.sort_by_key(|sequence| sequence.id);
+    let mut statistics: Vec<_> = snapshot
+        .statistics
+        .iter()
+        .map(|(table, statistics)| (*table, statistics))
+        .collect();
+    statistics.sort_by_key(|(table, _)| *table);
 
     serde_json::to_vec(&CatalogV2 {
         version: CATALOG_FORMAT_VERSION,
@@ -59,6 +68,7 @@ pub fn serialize_catalog(snapshot: &CatalogSnapshot) -> Result<Vec<u8>> {
         views,
         indexes,
         sequences,
+        statistics,
         next_schema_id: snapshot.next_schema_id,
         next_table_id: snapshot.next_table_id,
         next_index_id: snapshot.next_index_id,
@@ -121,6 +131,10 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         .map(|sequence| (sequence.name.clone(), sequence.id))
         .collect();
     let sequences_by_id = collect_unique(catalog.sequences, |sequence| sequence.id, "sequence")?;
+    let statistics = collect_unique(catalog.statistics, |(table, _)| *table, "statistics")?
+        .into_iter()
+        .map(|(table, (_, statistics))| (table, statistics))
+        .collect();
 
     Ok(CatalogSnapshot {
         schemas_by_name,
@@ -139,6 +153,7 @@ pub fn deserialize_catalog(bytes: &[u8]) -> Result<CatalogSnapshot> {
         next_sequence_id: catalog.next_sequence_id,
         next_dictionary_id: catalog.next_dictionary_id,
         next_storage_id: catalog.next_storage_id,
+        statistics,
     })
 }
 

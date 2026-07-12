@@ -204,6 +204,7 @@ pub(crate) fn hoist_correlated_subqueries(
         plan @ (LogicalPlan::Scan { .. }
         | LogicalPlan::SystemScan { .. }
         | LogicalPlan::Values { .. }
+        | LogicalPlan::TableFunction { .. }
         | LogicalPlan::CreateSchema { .. }
         | LogicalPlan::DropSchema { .. }
         | LogicalPlan::CreateTable { .. }

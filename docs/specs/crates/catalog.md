@@ -9,11 +9,13 @@
 
 The catalog's internal lock protects data-structure consistency. Separately, the
 server wraps SQL binding/name lookup and system-catalog capture in the shared
-catalog publication gate. DDL holds the exclusive side after object locking and
-through Commit or restore, allowing existing immediate catalog mutation/rollback
-without exposing provisional state. Startup/recovery precedes user access and does
-not need the gate. Transactional TRUNCATE instead uses a transaction-local overlay
-and publishes it only at top-level commit.
+catalog publication gate. DDL stages object replacements and tombstones in a
+transaction-local `CatalogOverlay`; its own binding sees that overlay while other
+sessions continue to see the public catalog. After object locking, DDL takes the
+exclusive side briefly for revalidation/materialization. Top-level commit takes
+it again to publish the overlay atomically after the Commit record is durable;
+rollback discards the overlay. Startup/recovery precedes user access and does not
+need the gate.
 
 `CatalogOverlay` generalizes that publication model for transactional DDL. It
 stores object replacements and tombstones rather than a frozen whole-catalog
@@ -373,7 +375,19 @@ pub trait CatalogManager: Send + Sync {
 }
 ```
 
-Methods return owned schema copies. The catalog is stored behind an `RwLock`. `snapshot` and `restore` are used by server DDL rollback to restore metadata if storage or WAL work fails before statement success. `restore` reinstalls the snapshot's object maps but must not lower `next_table_id`, `next_index_id`, `next_sequence_id`, or `next_storage_id` below the current in-memory high-water mark; failed DDL can leave aborted page/index artifacts behind, so future IDs are still monotonically assigned and never reused. `reserve_table_id` / `reserve_index_id` / `reserve_sequence_id` / `reserve_storage_id` advance only the allocator high-water marks and install no object maps; recovery uses them for skipped aborted/in-flight `CreateTable` / `CreateIndex` / `CreateSequence` / `TruncateTable` / `UpdateTableSchema` WAL records whose physical page records may still replay or whose IDs and rewrite storage IDs must not be reused. `apply_update_table_and_index_schemas` is the committed-recovery path for schema-evolution replay: it validates the replayed table schema and all carried index schemas in one candidate snapshot before publishing any of them.
+Methods return owned schema copies. The catalog is stored behind an `RwLock`.
+Normal transactional DDL uses `CatalogOverlay` journaling rather than restoring a
+public before-image. `snapshot` and `restore` remain the validated persistence and
+maintenance primitives; `restore` reinstalls the snapshot's object maps but must
+not lower any allocator below the current in-memory high-water mark. Failed DDL
+can leave aborted page/index artifacts behind, so future IDs remain monotonic and
+are never reused. The `reserve_*_id` methods advance only allocator high-water
+marks and install no object maps; recovery uses them for skipped aborted/in-flight
+schema/table/index/sequence/dictionary creates and relation rewrites whose IDs or
+physical files must not be reused. `apply_update_table_and_index_schemas` is the
+committed-recovery path for schema-evolution replay: it validates the replayed
+table schema and all carried index schemas in one candidate snapshot before
+publishing any of them.
 
 The concrete implementation is `MemoryCatalog`. It is constructed with `MemoryCatalog::empty()` (or the equivalent `Default`) for a fresh database, or `MemoryCatalog::try_from_snapshot(snapshot)` to load a persisted snapshot through the validated path; the unchecked `from_snapshot` constructor is crate-internal.
 
@@ -585,31 +599,47 @@ owned-sequence-default columns.
 
 The catalog serializes into the control record (`manifest.dat`) at each checkpoint. The wire format is JSON via `serde_json`; the crate exposes the free functions `serialize_catalog` / `deserialize_catalog`. The index and sequence fields carry `#[serde(default)]`, so absent fields deserialize as empty maps and initial allocator values; validated startup still rejects any user table that declares a primary key without a matching primary-key constraint index. `ColumnDef.default` likewise carries `#[serde(default)]`, so a catalog persisted before column defaults existed deserializes with `default = None`; the brief legacy bare-`Value` default form deserializes as `ColumnDefault::Const(value)`. `TableSchema.compression` and `TableSchema.active_dict_id` carry `#[serde(default)]` too (`compression` defaults to `CompressionSetting::None`, `active_dict_id` to `None`), and `CatalogSnapshot.next_dictionary_id` carries `#[serde(default = "default_next_dictionary_id")]` (`= 1`), so a catalog persisted before compression existed deserializes with every table dict-less and the dictionary-id allocator starting fresh. `TableSchema.storage_id`, `IndexSchema.storage_id`, and `CatalogSnapshot.next_storage_id` are also serde-defaulted. The validated load path treats `storage_id == 0` as a legacy-missing value, assigns missing table storage ids from the logical table id when that id is valid and unused among table/TOAST relations, assigns missing index storage ids from the logical index id when valid and unused among secondary indexes, otherwise assigns fresh ids, and sets `next_storage_id` above every live or migrated storage id.
 
+The schema maps and `next_schema_id` also carry serde defaults for snapshots
+written before namespaces existed: loading supplies the mandatory `public`
+schema and starts user allocation at `FIRST_USER_SCHEMA_ID`. Snapshot validation
+requires `public` to retain its fixed id/name, schema name/id maps to be
+bidirectionally consistent with unique names and ids, and `next_schema_id` to be
+greater than every installed schema id.
+
 On startup:
 
 1. The control store loads the current catalog bytes from the control record.
 2. Catalog deserializes into memory.
-3. Recovery replays committed post-checkpoint `CreateTable`, `DropTable`,
-   `CreateIndex`, `DropIndex`, `CreateSequence`, `DropSequence`,
-   `CreateDictionary`, and `AlterTableCompression` records. Table/index/sequence
-   records update both catalog and storage. Aborted or in-flight create
-   records are not installed, but recovery still calls the matching
-   `reserve_*_id` method so IDs are never reused.
+3. Recovery replays every committed post-checkpoint logical catalog record,
+   including schema, table/schema-evolution, index, sequence, view, dictionary,
+   TRUNCATE generation, compression, TOAST, and primary-key changes. Records
+   with a storage representation update both catalog and storage. Aborted or
+   in-flight create/rewrite records are not installed, but recovery still calls
+   the matching `reserve_*_id` methods so IDs and storage generations are never
+   reused.
 
-Catalog mutations update memory immediately. Durability before the next checkpoint is provided by WAL records.
+Transactional catalog mutations update the private overlay immediately; only
+allocator high-water reservations update the live catalog before commit. WAL
+records provide durability until the next checkpoint, and durable top-level
+commit precedes public overlay publication.
 
 `restore` and startup loading must validate catalog snapshots before installing them. Public construction from persisted snapshots must use the validated path; unchecked snapshot installation is an implementation detail internal to the crate. Validation requires every table name index entry to point at an existing user-table schema with the same name and ID, every user-table schema to have a reverse name index entry, every hidden TOAST relation to be stored by ID only (not in the name index), every view name index entry to point at an existing view schema with the same name and ID, no table and view to share a relation name or relation id, nonzero table/view schema versions, column IDs assigned in declared order starting at zero, unique column IDs, unique column names, every primary-key column ID to exist, every primary-key column to be non-null, no duplicate primary-key column, every constant column default to be finite (non-finite constants cannot round-trip the JSON encodings; unreachable from any real durable artifact for the same reason), table IDs/default-column IDs/CHECK counts to fit the virtual catalog OID encoding limits, and `next_table_id >= max(table_or_view_id) + 1`. View validation additionally requires at least one output column, dense output column IDs, unique output column names, no column defaults on view output columns, non-empty SQL definition text, no self-dependency, no duplicate dependency entries, every dependency relation to exist, no dependency on a view or hidden TOAST relation, no dependency with both `all_columns = true` and named columns, and every named dependency column to exist. TOAST policy validation requires every table's `toast.tuple_target` to be in `ToastOptions::MIN_TOAST_TUPLE_TARGET..=ToastOptions::MAX_TOAST_TUPLE_TARGET`, `toast.min_value_size >= ToastOptions::MIN_TOAST_MIN_VALUE_SIZE`, every user table with TOAST enabled to name an existing hidden TOAST relation, every hidden TOAST relation to point back to the owning user table without recursively naming another TOAST relation, and every hidden TOAST relation to match `common::toast_schema(base, toast_id)` exactly except for its storage id (name, columns, primary key, compression disabled, no nested TOAST metadata). Index validation additionally requires every index name entry to point at an existing index with the same name and ID, every index schema to have a reverse name entry, the index ID to differ from the reserved `PRIMARY_KEY_INDEX_ID`, the referenced table to exist, a non-empty column list, every index column to exist on the referenced table, unique index column IDs, primary-key constraint indexes to be unique and to match the table's primary-key column list, every user table with a non-empty primary key to have exactly one primary-key constraint index, and `next_index_id >= max(index_id) + 1`. Storage-id validation requires every live table and secondary index to have a nonzero storage id, no storage id to contain file-kind high bits, no duplicate storage ids among live table/TOAST relations, no duplicate storage ids among live secondary indexes, and `next_storage_id` to be greater than every live storage id (or equal to the one-past-end sentinel after exhaustion). Sequence validation requires every sequence name entry to point at an existing sequence with the same name and ID, every sequence schema to have a reverse name entry, a nonzero increment, `MINVALUE <= MAXVALUE`, `START` and `last_value` within range, and `next_sequence_id >= max(sequence_id) + 1`. After per-kind validation succeeds, the same public relation namespace rule used by runtime DDL is enforced across user table names, user view names, user-visible index names, public sequence names, and primary-key auto-names; hidden TOAST names and their helper names remain outside that namespace. **Dictionary-id validation** (`validate_dictionary_ids`) requires `next_dictionary_id >= 1` (dictionary id `0` is reserved to mean "no dictionary" and is never a valid high-water mark) and, for every table with `active_dict_id = Some(id)` or `toast.active_dict_id = Some(id)`, both `id != 0` (a table must never name the reserved sentinel — use `None` instead) and `id < next_dictionary_id`. Invalid loaded snapshots return `InternalError` because they represent durable catalog corruption. Rollback `restore` validates the supplied snapshot and then preserves allocator monotonicity by taking the max of the restored and current `next_*_id` values (including `next_dictionary_id` and `next_storage_id`); startup uses `try_from_snapshot` instead, so persisted high-water marks load exactly as validated.
 
 ## WAL Interaction
 
-`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE SEQUENCE`,
-`DROP SEQUENCE`, `CreateDictionary`, `AlterTableCompression`, `AlterTableToast`,
-`AlterTablePrimaryKey`, `TruncateTable`, `UpdateTableSchema`, `CREATE VIEW`,
-`CREATE OR REPLACE VIEW`, and `DROP VIEW` are logged.
-The executor/storage orchestration must ensure catalog mutation and storage
-file mutation are part of the same statement-level commit.
+All catalog-changing SQL is logged with logical DDL records: CREATE/DROP for
+schemas, tables, indexes, and sequences; CREATE/REPLACE/DROP for views; table
+schema evolution; and relation-generation, dictionary, compression, TOAST, and
+primary-key changes. The exact record variants and payload contracts are
+authoritative in `docs/specs/crates/wal.md`.
+The executor/storage orchestration must stage catalog and storage mutations under
+the same transaction and make them durable at top-level commit.
 
-If a normal DDL statement fails after catalog mutation but before statement success, the caller must restore the previous catalog snapshot before returning the error.
+If normal DDL fails after staging catalog changes, an explicit transaction enters
+the failed state. Transaction rollback discards all staged state; an explicit
+`ROLLBACK TO SAVEPOINT` restores the overlay/storage journal position captured by
+that savepoint. Neither path replaces the public catalog with a whole-catalog
+before-image.
 
 Recovery apply methods must update catalog state consistently with storage state.
 

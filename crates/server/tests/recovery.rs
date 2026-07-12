@@ -7,7 +7,9 @@ use std::time::Duration;
 use common::{
     KeyRange, QueryCancel, RelationKind, SqlState, StatementContext, ToastCompression, ToastMode,
 };
-use support::{Connection, TestServer, write_uncommitted_record_for_test};
+use support::{
+    Connection, TestServer, write_uncommitted_record_for_test, write_uncommitted_schema_for_test,
+};
 
 #[tokio::test]
 async fn committed_data_survives_restart_with_checkpoint_and_wal() {
@@ -1139,6 +1141,97 @@ async fn committed_alter_table_schema_evolution_survives_restart() {
             .unwrap()
             .unwrap_rows(),
         vec![vec![Some("2".to_string())]]
+    );
+}
+
+#[tokio::test]
+async fn transactional_schema_ddl_commit_and_rollback_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+        let mut conn = Connection::connect(&server).await.unwrap();
+        conn.ok("begin").await;
+        conn.ok("create schema app").await;
+        conn.ok("create table app.events (id integer primary key, note text)")
+            .await;
+        conn.ok("insert into app.events values (1, 'committed')")
+            .await;
+        conn.ok("commit").await;
+
+        conn.ok("begin").await;
+        conn.ok("create schema discarded").await;
+        conn.ok("create table discarded.events (id integer)").await;
+        conn.ok("rollback").await;
+
+        conn.ok("create schema removed").await;
+        conn.ok("begin").await;
+        conn.ok("drop schema removed").await;
+        conn.ok("commit").await;
+
+        conn.ok("create schema preserved").await;
+        conn.ok("begin").await;
+        conn.ok("drop schema preserved").await;
+        conn.ok("rollback").await;
+    }
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert_eq!(
+        server
+            .simple_query("select id, note from app.events")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some("1".to_string()), Some("committed".to_string()),]]
+    );
+    let err = match server.simple_query("select * from discarded.events").await {
+        Ok(_) => panic!("rolled-back schema DDL must remain absent after restart"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, SqlState::InvalidSchemaName);
+
+    let err = match server.simple_query("select * from removed.events").await {
+        Ok(_) => panic!("committed DROP SCHEMA must survive restart"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code, SqlState::InvalidSchemaName);
+    server
+        .simple_query("create table preserved.events (id integer)")
+        .await
+        .expect("rolled-back DROP SCHEMA must leave the schema present after restart");
+}
+
+#[tokio::test]
+async fn in_flight_create_schema_is_skipped_but_its_id_is_reserved() {
+    const CRASHED_SCHEMA_ID: u32 = 50;
+    let dir = tempfile::tempdir().unwrap();
+    write_uncommitted_schema_for_test(dir.path(), CRASHED_SCHEMA_ID).unwrap();
+
+    let server = TestServer::start_with_data_dir(dir.path()).await.unwrap();
+    assert!(
+        server
+            .simple_query(
+                "select oid from pg_catalog.pg_namespace where nspname = 'crashed_schema'",
+            )
+            .await
+            .unwrap()
+            .unwrap_rows()
+            .is_empty(),
+        "in-flight CREATE SCHEMA must not become visible after recovery",
+    );
+
+    server
+        .simple_query("create schema after_crash")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .simple_query("select oid from pg_catalog.pg_namespace where nspname = 'after_crash'")
+            .await
+            .unwrap()
+            .unwrap_rows(),
+        vec![vec![Some(
+            catalog::schema_oid(CRASHED_SCHEMA_ID + 1).to_string()
+        )]]
     );
 }
 

@@ -371,7 +371,7 @@ impl QueryService {
     /// the targets.
     pub(super) fn run_analyze_pass(
         &self,
-        table: Option<String>,
+        table: Option<common::QualifiedName>,
         cancel: &Arc<QueryCancel>,
         statistics_target: u32,
     ) -> Result<()> {
@@ -381,7 +381,7 @@ impl QueryService {
                 .catalog_publication_gate
                 .read()
                 .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-            resolve_analyze_tables(components, table.as_deref())?
+            resolve_analyze_tables(components, table.as_ref())?
         };
         let txn_id = components
             .active_txns
@@ -420,7 +420,7 @@ impl QueryService {
                         return Err(DbError::internal("catalog publication gate poisoned"));
                     }
                 };
-                match resolve_analyze_tables(components, table.as_deref()) {
+                match resolve_analyze_tables(components, table.as_ref()) {
                     Ok(tables) => tables,
                     Err(err) => {
                         self.rollback_pre_durable_or_die(txn_id, None);
@@ -610,20 +610,35 @@ pub(crate) fn checkpoint_auto_analyze(components: &ServerComponents) -> Result<(
 /// relations are never analyzed: a named non-user relation reads as undefined.
 fn resolve_analyze_tables(
     components: &ServerComponents,
-    table: Option<&str>,
+    table: Option<&common::QualifiedName>,
 ) -> Result<Vec<TableSchema>> {
     match table {
-        Some(name) => components
-            .catalog
-            .get_table_by_name(name)?
-            .filter(|schema| schema.relation_kind == RelationKind::User)
-            .map(|schema| vec![schema])
-            .ok_or_else(|| {
-                DbError::plan(
-                    SqlState::UndefinedTable,
-                    format!("table {name} does not exist"),
-                )
-            }),
+        Some(name) => {
+            let schema_id = match name.schema.as_deref() {
+                Some(schema) => components
+                    .catalog
+                    .get_schema_by_name(schema)?
+                    .map(|schema| schema.id)
+                    .ok_or_else(|| {
+                        DbError::plan(
+                            SqlState::InvalidSchemaName,
+                            format!("schema {schema} does not exist"),
+                        )
+                    })?,
+                None => common::PUBLIC_SCHEMA_ID,
+            };
+            components
+                .catalog
+                .get_table_in_schema(schema_id, &name.name)?
+                .filter(|schema| schema.relation_kind == RelationKind::User)
+                .map(|schema| vec![schema])
+                .ok_or_else(|| {
+                    DbError::plan(
+                        SqlState::UndefinedTable,
+                        format!("table {} does not exist", name.name),
+                    )
+                })
+        }
         None => {
             let mut tables = components
                 .catalog

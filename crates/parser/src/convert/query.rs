@@ -6,8 +6,10 @@ use crate::{
     SelectItem, SetOp,
 };
 
-use super::expr::convert_expr;
-use super::{ident_name, parse_error, relation_name, simple_object_name, unsupported};
+use super::expr::{convert_expr, convert_function_arg};
+use super::{
+    function_name, ident_name, parse_error, relation_name, simple_object_name, unsupported,
+};
 
 /// Convert a top-level `SELECT` (a sqlparser `Query`) into a [`Query`]. The
 /// `WITH` CTEs and query-level `ORDER BY`/`LIMIT`/`OFFSET` become the wrapper's

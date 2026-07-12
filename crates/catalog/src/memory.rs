@@ -6,8 +6,8 @@ use common::{
     FIRST_USER_SCHEMA_ID, FileId, IndexConstraintKind, IndexId, IndexSchema, NamespaceSchema,
     PRIMARY_KEY_INDEX_ID, PUBLIC_SCHEMA_ID, ParsedColumnDef, ParsedDefault, PgType, RelationKind,
     Result, SchemaId, SequenceId, SequenceOptions, SequenceSchema, SqlState, TableId, TableSchema,
-    ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency,
-    ViewSchema, needs_toast_relation, toast_schema,
+    TableStatistics, ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
+    ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
 };
 
 use crate::{

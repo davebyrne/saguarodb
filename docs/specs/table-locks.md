@@ -255,10 +255,10 @@ only data-path operation that waits for the exclusive checkpoint guard.
 - CREATE INDEX takes `Share`, permitting readers but blocking target writers.
 - VACUUM initially takes `Share` and retains writer-draining safety. A future
   storage-concurrency project may weaken this.
-- Schema-scoped catalog-name resources are available for CREATE and relation-name
-  conflicts. Until transactional DDL call sites adopt them, those paths retain
-  catalog-publication-gate serialization; the adoption occurs atomically with
-  transactional catalog publication.
+- Schema-scoped catalog-name resources protect CREATE and relation-name conflicts.
+  Transactional DDL retains those locks through top-level commit or rollback;
+  the catalog publication gate is used for atomic overlay publication and short
+  revalidation/mutation critical sections.
 - DROP SEQUENCE and owned-sequence cascades take `SequenceExclusive`; sequence
   calls/defaults take `SequenceAccess` for their statement/transaction lifetime.
 
@@ -266,10 +266,10 @@ The server catalog publication gate is an RW lock separate from the catalog's
 internal data latch. Binding/name lookup/system-catalog capture takes its shared
 side and releases it before waiting for any object lock. After object locks are
 held, execution reacquires the shared side for revalidation. DDL takes the
-exclusive side after object locks and holds it across public catalog/storage
-mutation, WAL Commit flush, and either commit publication or rollback restore.
-Thus no catalog reader observes provisional CREATE/DROP/ALTER state and
-whole-catalog restore cannot overlap another catalog change. The universal
+exclusive side after object locks for catalog revalidation and overlay
+materialization/publication. Provisional CREATE/DROP/ALTER state remains private
+in the transaction-local overlay; top-level commit publishes it only after the
+Commit record is durable. The universal
 mutation order is shared writer guard, all schema/name/table/sequence locks, exclusive catalog
 gate, then storage latches. No path waits for an object lock while holding either
 side of the gate.

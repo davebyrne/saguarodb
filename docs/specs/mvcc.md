@@ -191,10 +191,9 @@ catalog overlay. Top-level commit publishes the overlay after the commit record 
 durable; rollback and rollback-to-savepoint restore/discard journaled state.
 DDL uses the shared writer guard, table locks, and a catalog-DDL mutex so catalog
 rollback cannot overwrite another committed DDL change and index builds see a
-stable target-table physical view. *Chosen
-over* transactional DDL, which requires making the catalog itself MVCC
-(versioned, abort-undoable) plus transactional file lifecycle — a second large
-subsystem orthogonal to data MVCC. Defers cleanly and additively.
+stable target-table physical view. The transaction-local overlay was chosen over
+exposing provisional changes in the public catalog and restoring a whole-catalog
+before-image on abort, which could overwrite concurrent committed DDL.
 
 ---
 
@@ -1466,10 +1465,10 @@ savepoints via sub-transaction xids (optional, deferred).
   correct.
 - **Per-tuple CLOG-probe contention** — reducing repeated CLOG probes on hot
   tuples (beyond the `infomask` hint bits) under concurrent writers.
-- **General transactional DDL** — requires catalog MVCC + transactional file
-  lifecycle; additive later, does not invalidate data MVCC. Transactional
-  `TRUNCATE` uses targeted generation undo and is the narrow exception described
-  in `docs/specs/table-locks.md`.
+- ~~**General transactional DDL**~~ — **implemented** with a transaction-local
+  catalog overlay, savepoint journaling, transactional relation-generation
+  lifecycle, and durable-commit publication (`docs/specs/crates/catalog.md`,
+  `docs/specs/table-locks.md`).
 - **Serializable (SSI)** — layer predicate/SIREAD tracking on snapshot isolation.
 - ~~**Savepoints / sub-transactions**~~ — **implemented** via sub-transaction
   xids + CLOG, no undo (`docs/specs/savepoints.md`).

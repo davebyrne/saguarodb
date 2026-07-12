@@ -823,6 +823,30 @@ pub fn write_uncommitted_record_for_test(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Append a durable `CreateSchema` without a transaction outcome so recovery
+/// must skip the object while still reserving its id.
+pub fn write_uncommitted_schema_for_test(path: &Path, schema_id: u32) -> Result<()> {
+    fs::create_dir_all(path).map_err(|err| {
+        common::DbError::io(format!(
+            "failed to create test WAL directory {}: {err}",
+            path.display()
+        ))
+    })?;
+    let wal = FileWalManager::open(path.join("wal.dat"))?;
+    wal.append(WalRecord {
+        lsn: 0,
+        txn_id: common::FIRST_NORMAL_XID,
+        kind: WalRecordKind::CreateSchema {
+            schema: common::NamespaceSchema {
+                id: schema_id,
+                name: "crashed_schema".to_string(),
+            },
+        },
+    })?;
+    wal.flush()?;
+    Ok(())
+}
+
 pub struct WorkspaceGraph {
     crates: BTreeMap<String, CrateManifest>,
 }

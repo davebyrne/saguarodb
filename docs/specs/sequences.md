@@ -445,7 +445,6 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
 | `DEFAULT` expr beyond literal/`nextval` | `FeatureNotSupported` |
 | `DEFAULT nextval('missing')` at `CREATE TABLE` | `42P01` UndefinedTable |
 | Explicit `DEFAULT nextval('<owned-serial-sequence>')` | `2BP01` DependentObjectsStillExist |
-| `CREATE`/`DROP SEQUENCE` inside a txn block | existing DDL-in-block error |
 | `DROP SEQUENCE` of a sequence referenced by a column default | `2BP01` DependentObjectsStillExist |
 | `INCREMENT BY 0`, or `MINVALUE > MAXVALUE`, etc. | `22023` InvalidParameterValue |
 
@@ -462,8 +461,8 @@ fills the value before the key/uniqueness checks run in `build_insert_row`.
   wrap and `NO CYCLE` exhaustion; concurrent `nextval` from parallel writers
   yields all-unique values.
 - **server integration**: `setval` repositioning; `SELECT nextval(...)` routes
-  through the write path and is durable; DDL-in-transaction rejection of
-  `CREATE`/`DROP SEQUENCE`; end-to-end SERIAL insert and id read-back via
+  through the write path and is durable; transactional commit, rollback, and
+  savepoint behavior for `CREATE`/`DROP SEQUENCE`; end-to-end SERIAL insert and id read-back via
   `INSERT ... RETURNING id` (primary idiom) and `currval`; `DROP TABLE`
   cascade-dropping the owned sequence; `DROP SEQUENCE` of an owned sequence
   erroring.

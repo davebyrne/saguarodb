@@ -1304,7 +1304,7 @@ fn is_vacuum_option_keyword(token: &str) -> bool {
 /// (`command` names the statement in error messages). The name must be a
 /// bare unquoted identifier: no parenthesized options, no `schema.table`
 /// qualification, no quoting — consistent with the v1 identifier rules elsewhere.
-fn normalize_vacuum_target(target: &str) -> Result<QualifiedName> {
+fn normalize_maintenance_target(command: &str, target: &str) -> Result<QualifiedName> {
     if target.starts_with('(') {
         return unsupported(format!("{command} with options is not supported in v1"));
     }

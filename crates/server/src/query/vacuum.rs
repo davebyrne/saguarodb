@@ -47,7 +47,10 @@ impl QueryService {
             Ok(())
         };
         match &mut statement {
-            Statement::Vacuum { table: Some(table) }
+            Statement::Vacuum {
+                table: Some(table), ..
+            }
+            | Statement::Analyze { table: Some(table) }
             | Statement::AlterTableSetCompression { table, .. }
             | Statement::AlterTableSetOptions { table, .. }
             | Statement::AlterTableAddPrimaryKey { table, .. }
@@ -90,7 +93,11 @@ impl QueryService {
         }
         identity_guard.acquire_many(&identity_requests, session.cancel())?;
         self.validate_prepared_schema_versions(&prepared.schema_versions)?;
-        self.run_maintenance(statement.clone(), session.cancel())
+        self.run_maintenance(
+            statement.clone(),
+            session.cancel(),
+            session.gucs().default_statistics_target(),
+        )
     }
 
     /// Shared entry point for every maintenance command: dispatches to the
@@ -278,7 +285,10 @@ impl QueryService {
 
 fn maintenance_target_names(statement: &Statement) -> Vec<&QualifiedName> {
     match statement {
-        Statement::Vacuum { table: Some(table) }
+        Statement::Vacuum {
+            table: Some(table), ..
+        }
+        | Statement::Analyze { table: Some(table) }
         | Statement::AlterTableSetCompression { table, .. }
         | Statement::AlterTableSetOptions { table, .. }
         | Statement::AlterTableAddPrimaryKey { table, .. }

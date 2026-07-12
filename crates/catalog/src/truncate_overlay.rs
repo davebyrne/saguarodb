@@ -4,8 +4,8 @@ use std::sync::Arc;
 use common::{
     ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
     NamespaceSchema, ParsedColumnDef, Result, SchemaId, SequenceId, SequenceOptions,
-    SequenceSchema, TableId, TableSchema, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    ViewColumn, ViewDependency, ViewSchema,
+    SequenceSchema, TableId, TableSchema, TableStatistics, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
 };
 
 use crate::{

@@ -764,7 +764,8 @@ fn output_width(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> R
         }
         PhysicalPlan::Projection { output_schema, .. }
         | PhysicalPlan::Aggregate { output_schema, .. }
-        | PhysicalPlan::Values { output_schema, .. } => Ok(output_schema.len()),
+        | PhysicalPlan::Values { output_schema, .. }
+        | PhysicalPlan::TableFunction { output_schema, .. } => Ok(output_schema.len()),
         PhysicalPlan::CreateSchema { .. }
         | PhysicalPlan::DropSchema { .. }
         | PhysicalPlan::CreateTable { .. }

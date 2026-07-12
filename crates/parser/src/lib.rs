@@ -1179,6 +1179,7 @@ mod tests {
                 parse(sql).unwrap(),
                 Statement::Vacuum {
                     table: Some(qn("users")),
+                    analyze: false,
                 },
                 "for `{sql}`"
             );
@@ -1204,6 +1205,7 @@ mod tests {
                 parse(sql).unwrap(),
                 Statement::Vacuum {
                     table: Some(qn("users")),
+                    analyze: true,
                 },
                 "for `{sql}`"
             );
@@ -1225,7 +1227,7 @@ mod tests {
             assert_eq!(
                 parse(sql).unwrap(),
                 Statement::Analyze {
-                    table: Some("users".to_string()),
+                    table: Some(qn("users")),
                 },
                 "for `{sql}`"
             );
@@ -1237,7 +1239,6 @@ mod tests {
         for sql in [
             "analyze verbose",      // options are unsupported
             "analyze users orders", // multiple tables
-            "analyze public.users", // qualified name
             "analyze \"Users\"",    // quoted identifier
             "analyze users (name)", // column list
         ] {

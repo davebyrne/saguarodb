@@ -38,6 +38,7 @@ pub(crate) fn rows_for(
         SystemView::PgRoles => Ok(pg_roles_rows(ctx)),
         SystemView::PgSettings => Ok(pg_settings_rows(ctx)),
         SystemView::PgStatActivity => Ok(pg_stat_activity_rows(ctx)),
+        SystemView::PgStats => pg_stats_rows(catalog),
         SystemView::InformationSchemaSchemata => information_schema_schemata_rows(catalog, ctx),
         SystemView::InformationSchemaTables => information_schema_tables_rows(catalog, ctx),
         SystemView::InformationSchemaColumns => information_schema_columns_rows(catalog, ctx),
@@ -822,6 +823,107 @@ fn pg_stat_activity_row(session: SessionActivityRow) -> Row {
         text(session.query),
         text("client backend"),
     ])
+}
+
+fn pg_stats_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
+    let mut tables = catalog
+        .list_tables()?
+        .into_iter()
+        .filter(|table| table.relation_kind == RelationKind::User)
+        .collect::<Vec<_>>();
+    tables.sort_unstable_by_key(|table| table.id);
+    let schemas = catalog
+        .list_schemas()?
+        .into_iter()
+        .map(|schema| (schema.id, schema.name))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut rows = Vec::new();
+    for table in &tables {
+        let Some(statistics) = catalog.get_table_statistics(table.id)? else {
+            continue;
+        };
+        for column in &table.columns {
+            let Some(column_stats) = statistics.columns.get(&column.id) else {
+                continue;
+            };
+            let n_distinct = match &column_stats.n_distinct {
+                common::NDistinct::Count(count) => *count as f32,
+                common::NDistinct::Fraction(fraction) => -(fraction.get() as f32),
+            };
+            let mcv_vals = non_empty_array_text(
+                column_stats
+                    .most_common
+                    .iter()
+                    .map(|(value, _)| stat_value_text(value)),
+            );
+            let mcv_freqs = non_empty_array_text(
+                column_stats
+                    .most_common
+                    .iter()
+                    .map(|(_, freq)| common::float::format_double(freq.get())),
+            );
+            let histogram =
+                non_empty_array_text(column_stats.histogram_bounds.iter().map(stat_value_text));
+            rows.push(row(vec![
+                text(
+                    schemas
+                        .get(&table.schema_id)
+                        .map_or("public", String::as_str),
+                ),
+                text(&table.name),
+                text(&column.name),
+                real(column_stats.null_frac.get() as f32),
+                int(i64::from(column_stats.avg_width)),
+                real(n_distinct),
+                nullable_text(mcv_vals),
+                nullable_text(mcv_freqs),
+                nullable_text(histogram),
+                Value::Null,
+            ]));
+        }
+    }
+    Ok(rows)
+}
+
+fn stat_value_text(value: &Value) -> String {
+    crate::copy::value_text(value).unwrap_or_default()
+}
+
+fn non_empty_array_text(elements: impl Iterator<Item = String>) -> Option<String> {
+    let mut out = String::from("{");
+    let mut any = false;
+    for element in elements {
+        if any {
+            out.push(',');
+        }
+        any = true;
+        if array_element_needs_quotes(&element) {
+            out.push('"');
+            for ch in element.chars() {
+                if ch == '"' || ch == '\\' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&element);
+        }
+    }
+    if !any {
+        return None;
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn array_element_needs_quotes(element: &str) -> bool {
+    element.is_empty()
+        || element.eq_ignore_ascii_case("null")
+        || element
+            .chars()
+            .any(|ch| matches!(ch, '{' | '}' | ',' | '"' | '\\') || ch.is_whitespace())
 }
 
 fn information_schema_schemata_rows(

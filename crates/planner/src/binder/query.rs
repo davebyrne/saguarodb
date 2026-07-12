@@ -1295,6 +1295,11 @@ fn stabilize_from_relations(
             }
         }
         FromItem::Table { .. } => {}
+        FromItem::TableFunction { args, .. } => {
+            for arg in args {
+                stabilize_expr_relations(arg, relations, ctes);
+            }
+        }
         FromItem::Derived { subquery, .. } => stabilize_query_relations(subquery, relations, ctes),
         FromItem::Join {
             left,
@@ -1341,6 +1346,21 @@ fn stabilize_expr_relations(
                     stabilize_expr_relations(expr, relations, ctes);
                 }
             }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                stabilize_expr_relations(item, relations, ctes);
+            }
+        }
+        Expr::ArraySubscript { array, subscripts } => {
+            stabilize_expr_relations(array, relations, ctes);
+            for index in subscripts {
+                stabilize_expr_relations(index, relations, ctes);
+            }
+        }
+        Expr::Any { left, array, .. } => {
+            stabilize_expr_relations(left, relations, ctes);
+            stabilize_expr_relations(array, relations, ctes);
         }
         Expr::InList { expr, list, .. } => {
             stabilize_expr_relations(expr, relations, ctes);

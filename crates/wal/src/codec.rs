@@ -38,8 +38,9 @@ pub(crate) const TYPE_UPDATE_TABLE_SCHEMA: u8 = 24;
 pub(crate) const TYPE_CREATE_VIEW: u8 = 25;
 pub(crate) const TYPE_REPLACE_VIEW: u8 = 26;
 pub(crate) const TYPE_DROP_VIEW: u8 = 27;
-pub(crate) const TYPE_CREATE_SCHEMA: u8 = 28;
-pub(crate) const TYPE_DROP_SCHEMA: u8 = 29;
+pub(crate) const TYPE_UPDATE_TABLE_STATISTICS: u8 = 28;
+pub(crate) const TYPE_CREATE_SCHEMA: u8 = 29;
+pub(crate) const TYPE_DROP_SCHEMA: u8 = 30;
 
 pub fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {
     let payload = encode_payload(&record.kind)?;
