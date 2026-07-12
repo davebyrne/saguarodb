@@ -5,8 +5,8 @@ use common::{
     ColumnDef, ColumnDefault, ColumnId, CompressionSetting, DataType, DbError, FileId,
     IndexConstraintKind, IndexId, IndexSchema, PRIMARY_KEY_INDEX_ID, ParsedColumnDef,
     ParsedDefault, RelationKind, Result, SequenceId, SequenceOptions, SequenceSchema, SqlState,
-    TableId, TableSchema, ToastMode, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
-    ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
+    TableId, TableSchema, TableStatistics, ToastMode, ToastOptions, TruncateCatalogUpdate,
+    TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_schema,
 };
 
 use crate::{
@@ -52,6 +52,10 @@ pub struct CatalogSnapshot {
     // before relation generations existed migrate from logical ids.
     #[serde(default = "default_next_storage_id")]
     pub next_storage_id: FileId,
+    // Optimizer statistics per analyzed user table (docs/specs/statistics.md).
+    // Defaults so catalogs written before ANALYZE existed still deserialize.
+    #[serde(default)]
+    pub statistics: HashMap<TableId, TableStatistics>,
 }
 
 impl Default for CatalogSnapshot {
@@ -70,6 +74,7 @@ impl Default for CatalogSnapshot {
             next_sequence_id: default_next_sequence_id(),
             next_dictionary_id: default_next_dictionary_id(),
             next_storage_id: default_next_storage_id(),
+            statistics: HashMap::new(),
         }
     }
 }
@@ -113,6 +118,7 @@ impl MemoryCatalog {
 
     pub fn try_from_snapshot(mut snapshot: CatalogSnapshot) -> Result<Self> {
         normalize_snapshot_storage_ids(&mut snapshot)?;
+        prune_orphan_statistics(&mut snapshot);
         validate_snapshot(&snapshot)?;
         Ok(Self::from_snapshot(snapshot))
     }
@@ -309,6 +315,7 @@ impl CatalogManager for MemoryCatalog {
                 snapshot.tables_by_name.remove(&schema.name);
             }
             drop_indexes_for_table(&mut snapshot, table_id);
+            snapshot.statistics.remove(&table_id);
         }
         Ok(())
     }
@@ -724,6 +731,45 @@ impl CatalogManager for MemoryCatalog {
         snapshot.indexes_by_name.remove(&index_schema.name);
         snapshot.tables_by_id.insert(table, schema.clone());
         Ok(schema)
+    }
+
+    fn get_table_statistics(&self, table: TableId) -> Result<Option<TableStatistics>> {
+        Ok(self.read_snapshot()?.statistics.get(&table).cloned())
+    }
+
+    fn set_table_statistics(&self, table: TableId, statistics: TableStatistics) -> Result<()> {
+        let mut snapshot = self.write_snapshot()?;
+        let schema = snapshot
+            .tables_by_id
+            .get(&table)
+            .ok_or_else(|| undefined_table(format!("table id {table} does not exist")))?;
+        if schema.relation_kind != RelationKind::User {
+            return Err(DbError::internal(format!(
+                "cannot set statistics on hidden relation {}",
+                schema.name
+            )));
+        }
+        if let Some(unknown) = statistics
+            .columns
+            .keys()
+            .find(|column_id| !schema.columns.iter().any(|column| column.id == **column_id))
+        {
+            return Err(DbError::internal(format!(
+                "statistics for table {} reference unknown column id {unknown}",
+                schema.name
+            )));
+        }
+        // The manifest's catalog payload is JSON: serde_json writes a
+        // non-finite float as `null` and fails to read it back, so accepting
+        // one here would make the next startup unable to load the catalog.
+        if !statistics.is_finite() {
+            return Err(DbError::internal(format!(
+                "statistics for table {} contain a non-finite number",
+                schema.name
+            )));
+        }
+        snapshot.statistics.insert(table, statistics);
+        Ok(())
     }
 
     fn allocate_dictionary_id(&self) -> Result<u32> {
@@ -3109,6 +3155,7 @@ fn replace_table_and_index_schemas(
 
     let mut candidate = snapshot.clone();
     carry_view_dependencies_for_table_update(&old, &schema, &mut candidate.views_by_id)?;
+    reconcile_statistics_for_table_update(&old, &schema, &mut candidate.statistics);
     if old.relation_kind == RelationKind::User {
         if old.name != schema.name {
             reject_duplicate_relation_name(snapshot, "table", &schema.name)?;
@@ -3375,6 +3422,64 @@ fn reject_index_dependency(
         }
     }
     Ok(())
+}
+
+/// Preserves a table's optimizer statistics across a schema replacement only
+/// when every prior column is unchanged — same id, name, and type, i.e. a pure
+/// ADD COLUMN or a metadata-only update. Column ids are dense and shift on
+/// DROP COLUMN, so any other column change clears the per-column statistics
+/// (row and page counts stay valid) rather than risk attaching them to the
+/// wrong column. Every COLUMN-CHANGING schema replacement (live DDL and
+/// recovery replay) funnels through this path; the primary-key, compression,
+/// and TOAST setters and the truncate apply paths (which only swap storage
+/// ids) bypass it via direct `tables_by_id` inserts, which is sound only
+/// because they never change a column's id, name, or type — a future
+/// column-shape-changing path must come through here.
+fn reconcile_statistics_for_table_update(
+    old: &TableSchema,
+    new: &TableSchema,
+    statistics: &mut HashMap<TableId, TableStatistics>,
+) {
+    let Some(stats) = statistics.get_mut(&old.id) else {
+        return;
+    };
+    let columns_preserved = old.columns.len() <= new.columns.len()
+        && old
+            .columns
+            .iter()
+            .zip(&new.columns)
+            .all(|(old_column, new_column)| {
+                old_column.id == new_column.id
+                    && old_column.name == new_column.name
+                    && old_column.data_type == new_column.data_type
+            });
+    if !columns_preserved {
+        stats.columns.clear();
+    }
+}
+
+/// Drops statistics that no longer reference a live user table, and per-column
+/// entries whose column id the table no longer has. Statistics are advisory:
+/// a stale manifest entry must never block startup, so orphans are pruned
+/// rather than rejected by validation.
+fn prune_orphan_statistics(snapshot: &mut CatalogSnapshot) {
+    let CatalogSnapshot {
+        statistics,
+        tables_by_id,
+        ..
+    } = snapshot;
+    statistics.retain(|table_id, stats| {
+        let Some(schema) = tables_by_id.get(table_id) else {
+            return false;
+        };
+        if schema.relation_kind != RelationKind::User {
+            return false;
+        }
+        stats
+            .columns
+            .retain(|column_id, _| schema.columns.iter().any(|column| column.id == *column_id));
+        true
+    });
 }
 
 fn remap_columns_after_drop(schema: &mut TableSchema, dropped: ColumnId) {

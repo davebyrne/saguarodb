@@ -3796,6 +3796,18 @@ mod tests {
             self.inner.reserve_table_id(id)
         }
 
+        fn get_table_statistics(&self, table: TableId) -> Result<Option<common::TableStatistics>> {
+            self.inner.get_table_statistics(table)
+        }
+
+        fn set_table_statistics(
+            &self,
+            table: TableId,
+            statistics: common::TableStatistics,
+        ) -> Result<()> {
+            self.inner.set_table_statistics(table, statistics)
+        }
+
         fn apply_create_table(&self, schema: TableSchema) -> Result<()> {
             self.inner.apply_create_table(schema)
         }

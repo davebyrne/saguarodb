@@ -4,7 +4,8 @@ use std::sync::Arc;
 use common::{
     ColumnId, CompressionSetting, DbError, FileId, IndexConstraintKind, IndexId, IndexSchema,
     ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
-    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
+    ViewDependency, ViewSchema,
 };
 
 use crate::{CatalogManager, CatalogSnapshot, MemoryCatalog, TableColumnAlteration};
@@ -223,6 +224,16 @@ impl CatalogManager for TruncateCatalogOverlay {
         _table: TableId,
         _index: IndexId,
     ) -> Result<TableSchema> {
+        Self::read_only()
+    }
+
+    // Transactional TRUNCATE leaves statistics untouched (they go stale until
+    // the next ANALYZE), so the overlay reads them straight from the base.
+    fn get_table_statistics(&self, table: TableId) -> Result<Option<TableStatistics>> {
+        self.base.get_table_statistics(table)
+    }
+
+    fn set_table_statistics(&self, _table: TableId, _statistics: TableStatistics) -> Result<()> {
         Self::read_only()
     }
 

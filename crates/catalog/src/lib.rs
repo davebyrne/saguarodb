@@ -15,7 +15,8 @@ pub use truncate_overlay::TruncateCatalogOverlay;
 use common::{
     ColumnId, CompressionSetting, FileId, IndexConstraintKind, IndexId, IndexSchema,
     ParsedColumnDef, Result, SequenceId, SequenceOptions, SequenceSchema, TableId, TableSchema,
-    ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn, ViewDependency, ViewSchema,
+    TableStatistics, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
+    ViewDependency, ViewSchema,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +133,18 @@ pub trait CatalogManager: Send + Sync {
     /// backing primary-key constraint index. Dropping a primary key does not restore
     /// prior nullability on the former key columns.
     fn drop_table_primary_key_index(&self, table: TableId, index: IndexId) -> Result<TableSchema>;
+    /// Optimizer statistics for a live user table, if it has been analyzed
+    /// (`docs/specs/statistics.md`). Statistics are advisory: absent means
+    /// "never analyzed (or cleared by a schema change)".
+    fn get_table_statistics(&self, table: TableId) -> Result<Option<TableStatistics>>;
+    /// Replaces a live user table's optimizer statistics (ANALYZE today; the
+    /// planned `UpdateTableStatistics` replay — `docs/specs/statistics.md` §4
+    /// — will also come through here, skipping records whose table no longer
+    /// exists). Statistics changes do not bump `schema_version`. Rejects
+    /// unknown tables, non-user relations, statistics that reference column
+    /// ids the table does not have, and non-finite numbers (the JSON manifest
+    /// payload cannot round-trip them).
+    fn set_table_statistics(&self, table: TableId, statistics: TableStatistics) -> Result<()>;
     /// Allocates the next dictionary id (monotonic; `0` is reserved to mean
     /// "no dictionary").
     fn allocate_dictionary_id(&self) -> Result<u32>;
@@ -219,17 +232,19 @@ pub trait CatalogManager: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use common::{
-        ColumnDef, ColumnDefault, CompressionSetting, DataType, ErrorKind, IndexConstraintKind,
-        IndexSchema, ParsedColumnDef, PgType, RelationKind, SequenceOptions, SequenceSchema,
-        SqlState, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewColumn,
-        ViewDependency, toast_schema,
+        ColumnDef, ColumnDefault, ColumnStatistics, CompressionSetting, DataType, ErrorKind,
+        IndexConstraintKind, IndexSchema, NDistinct, OrderedF64, ParsedColumnDef, PgType,
+        RelationKind, SequenceOptions, SequenceSchema, SqlState, TableSchema, TableStatistics,
+        ToastCompression, ToastMode, ToastOptions, Value, ViewColumn, ViewDependency, toast_schema,
     };
 
     use crate::{
-        CatalogManager, CatalogSnapshot, MemoryCatalog, deserialize_catalog, serialize_catalog,
+        CatalogManager, CatalogSnapshot, MemoryCatalog, TruncateCatalogOverlay,
+        deserialize_catalog, serialize_catalog,
         system::{MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
         validate_create_table_definition,
     };
@@ -1869,6 +1884,7 @@ mod tests {
             next_storage_id: 4,
             views_by_name: HashMap::new(),
             views_by_id: HashMap::new(),
+            statistics: HashMap::new(),
         };
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
@@ -3526,5 +3542,340 @@ mod tests {
 
         let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
         assert_eq!(catalog.allocate_dictionary_id().unwrap(), 1);
+    }
+
+    /// Statistics for `catalog_with_users`: column 0 is `id` (unique integer),
+    /// column 1 is `name` (skewed text with NULLs).
+    fn sample_statistics() -> TableStatistics {
+        TableStatistics {
+            row_count: 1000,
+            page_count: 10,
+            columns: BTreeMap::from([
+                (
+                    0,
+                    ColumnStatistics {
+                        null_frac: OrderedF64::new(0.0),
+                        avg_width: 8,
+                        n_distinct: NDistinct::Fraction(OrderedF64::new(1.0)),
+                        most_common: Vec::new(),
+                        histogram_bounds: vec![
+                            Value::Integer(1),
+                            Value::Integer(500),
+                            Value::Integer(1000),
+                        ],
+                    },
+                ),
+                (
+                    1,
+                    ColumnStatistics {
+                        null_frac: OrderedF64::new(0.25),
+                        avg_width: 12,
+                        n_distinct: NDistinct::Count(3),
+                        most_common: vec![
+                            (Value::Text("carol".to_string()), OrderedF64::new(0.5)),
+                            (Value::Text("bob".to_string()), OrderedF64::new(0.25)),
+                        ],
+                        histogram_bounds: Vec::new(),
+                    },
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn statistics_survive_snapshot_serialization_round_trip() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        let bytes = serialize_catalog(&catalog.snapshot().unwrap()).unwrap();
+        let restored =
+            MemoryCatalog::try_from_snapshot(deserialize_catalog(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            restored.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+    }
+
+    #[test]
+    fn snapshot_without_statistics_field_deserializes_to_no_statistics() {
+        // A catalog persisted before ANALYZE existed.
+        let json = r#"{
+            "tables_by_name": {"users": 1},
+            "tables_by_id": {"1": {
+                "id": 1,
+                "name": "users",
+                "columns": [{"id": 0, "name": "id", "data_type": "Integer", "nullable": false}],
+                "primary_key": []
+            }},
+            "next_table_id": 2
+        }"#;
+
+        let snapshot = deserialize_catalog(json.as_bytes()).unwrap();
+        assert!(snapshot.statistics.is_empty());
+
+        let catalog = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        assert_eq!(catalog.get_table_statistics(1).unwrap(), None);
+    }
+
+    #[test]
+    fn drop_table_removes_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog.drop_table(table.id).unwrap();
+        assert!(catalog.snapshot().unwrap().statistics.is_empty());
+    }
+
+    #[test]
+    fn drop_column_clears_column_statistics_and_keeps_counts() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog.drop_table_column(table.id, "name").unwrap();
+        let stats = catalog.get_table_statistics(table.id).unwrap().unwrap();
+        assert_eq!(stats.row_count, 1000);
+        assert_eq!(stats.page_count, 10);
+        assert!(
+            stats.columns.is_empty(),
+            "column ids shift on DROP COLUMN, so per-column statistics must be cleared"
+        );
+    }
+
+    #[test]
+    fn rename_column_clears_column_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog
+            .rename_table_column(table.id, "name", "full_name".to_string())
+            .unwrap();
+        let stats = catalog.get_table_statistics(table.id).unwrap().unwrap();
+        assert_eq!(stats.row_count, 1000);
+        assert!(stats.columns.is_empty());
+    }
+
+    #[test]
+    fn add_column_preserves_column_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog
+            .add_table_column(
+                table.id,
+                ParsedColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    max_length: None,
+                    default: None,
+                    pg_type: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+    }
+
+    #[test]
+    fn rename_table_preserves_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog
+            .rename_table(table.id, "customers".to_string())
+            .unwrap();
+        assert_eq!(
+            catalog.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+    }
+
+    #[test]
+    fn set_statistics_rejects_unknown_table_and_unknown_column() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+
+        let err = catalog
+            .set_table_statistics(999, sample_statistics())
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::UndefinedTable);
+
+        let mut stats = sample_statistics();
+        stats.columns.insert(
+            7,
+            ColumnStatistics {
+                null_frac: OrderedF64::new(0.0),
+                avg_width: 4,
+                n_distinct: NDistinct::Count(1),
+                most_common: Vec::new(),
+                histogram_bounds: Vec::new(),
+            },
+        );
+        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+    }
+
+    #[test]
+    fn set_statistics_rejects_non_finite_numbers() {
+        // serde_json writes NaN/Infinity as `null` and cannot read that back,
+        // so a non-finite float accepted here would leave the next startup
+        // unable to load the manifest's catalog payload.
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+
+        let mut stats = sample_statistics();
+        stats.columns.get_mut(&0).unwrap().null_frac = OrderedF64::new(f64::NAN);
+        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+
+        let mut stats = sample_statistics();
+        stats
+            .columns
+            .get_mut(&0)
+            .unwrap()
+            .histogram_bounds
+            .push(Value::Float(OrderedF64::new(f64::INFINITY)));
+        let err = catalog.set_table_statistics(table.id, stats).unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
+
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+    }
+
+    #[test]
+    fn try_from_snapshot_prunes_orphan_statistics() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        let mut snapshot = catalog.snapshot().unwrap();
+        snapshot.statistics.insert(999, sample_statistics());
+        snapshot
+            .statistics
+            .get_mut(&table.id)
+            .unwrap()
+            .columns
+            .insert(
+                7,
+                ColumnStatistics {
+                    null_frac: OrderedF64::new(0.0),
+                    avg_width: 4,
+                    n_distinct: NDistinct::Count(1),
+                    most_common: Vec::new(),
+                    histogram_bounds: Vec::new(),
+                },
+            );
+
+        let restored = MemoryCatalog::try_from_snapshot(snapshot).unwrap();
+        assert_eq!(restored.get_table_statistics(999).unwrap(), None);
+        assert_eq!(
+            restored.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics()),
+            "the orphan column entry is pruned, live columns keep their statistics"
+        );
+    }
+
+    #[test]
+    fn funnel_bypassing_setters_preserve_statistics() {
+        // The primary-key, compression, and TOAST setters replace table
+        // schemas without going through the reconciliation funnel, which is
+        // sound only while they never change a column's id, name, or type
+        // (see reconcile_statistics_for_table_update). Pin that: statistics
+        // must survive all of them untouched.
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        catalog
+            .set_table_compression(table.id, CompressionSetting::Zstd, None)
+            .unwrap();
+        catalog
+            .set_table_toast_metadata(table.id, table.toast.clone(), table.toast_table_id)
+            .unwrap();
+        let pkey = IndexSchema {
+            id: 7,
+            storage_id: 7,
+            table: table.id,
+            name: "users_pkey".to_string(),
+            columns: vec![0],
+            unique: true,
+            constraint: IndexConstraintKind::PrimaryKey,
+        };
+        catalog
+            .add_table_primary_key_index(table.id, vec![0], pkey.clone())
+            .unwrap();
+        catalog.set_table_primary_key(table.id, vec![0]).unwrap();
+        catalog
+            .drop_table_primary_key_index(table.id, pkey.id)
+            .unwrap();
+
+        assert_eq!(
+            catalog.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+    }
+
+    #[test]
+    fn apply_truncate_preserves_statistics() {
+        // docs/specs/statistics.md §3: TRUNCATE leaves statistics untouched
+        // (stale until the next ANALYZE). Pin that on the real truncate path,
+        // which swaps storage generations via direct schema inserts.
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        let plan = catalog.prepare_truncate_table(table.id).unwrap();
+        catalog.apply_truncate_table(&plan).unwrap();
+
+        assert_eq!(
+            catalog.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+    }
+
+    #[test]
+    fn truncate_overlay_reads_base_statistics_and_rejects_writes() {
+        let catalog = catalog_with_users_without_primary_key();
+        let table = catalog.get_table_by_name("users").unwrap().unwrap();
+        catalog
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap();
+
+        let overlay = TruncateCatalogOverlay::new(Arc::new(catalog), Vec::new());
+        assert_eq!(
+            overlay.get_table_statistics(table.id).unwrap(),
+            Some(sample_statistics())
+        );
+        let err = overlay
+            .set_table_statistics(table.id, sample_statistics())
+            .unwrap_err();
+        assert_eq!(err.code, SqlState::InternalError);
     }
 }

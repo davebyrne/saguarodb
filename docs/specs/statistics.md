@@ -85,12 +85,22 @@ pub struct TableStatistics {
     pub row_count: u64,
     /// Heap page count at collection time.
     pub page_count: u64,
-    /// Keyed by ColumnId, so statistics survive column renames and are
-    /// dropped precisely with DROP COLUMN. BTreeMap for deterministic
-    /// serialization.
+    /// Keyed by ColumnId. BTreeMap for deterministic serialization.
     pub columns: BTreeMap<ColumnId, ColumnStatistics>,
 }
 ```
+
+Column ids are **dense** and are remapped by `DROP COLUMN` (ids above the
+dropped column shift down, mirroring the catalog's index remapping), so
+per-column statistics cannot blindly survive schema changes — after a drop
+they would attach to the wrong columns, and the generic `UpdateTableSchema`
+replay path cannot know which column was dropped. The catalog therefore
+applies one conservative reconciliation rule in its single schema-replacement
+funnel (used by both live DDL and recovery replay): statistics survive a
+schema replacement only when every prior `(id, name, type)` column is
+unchanged — i.e. pure `ADD COLUMN` or metadata-only updates, including table
+renames. Any other column change (drop, rename) clears the per-column map but
+keeps `row_count`/`page_count`; the next ANALYZE restores the rest.
 
 All fields use `OrderedF64` (not raw `f64`) so the types keep `Eq`/`Hash` —
 required because they ride inside `WalRecordKind`, which derives `Eq`. `Value`
@@ -107,12 +117,14 @@ independently of them:
   secondary indexes, sequences, and dictionaries were added
   (`crates/catalog/src/memory.rs`). Old manifests deserialize with empty
   statistics; no manifest (`SGMF`) version bump.
-- Catalog API: `get_table_statistics(TableId)`,
-  `set_table_statistics(TableId, TableStatistics)`, and removal hooks:
-  `DROP TABLE` removes the entry; `DROP COLUMN` removes that column's entry
-  (by `ColumnId`); `ADD COLUMN` leaves statistics untouched (the new column
-  has none until the next ANALYZE); `RENAME` (column or table) is a no-op
-  (keys are IDs).
+- Catalog API: `get_table_statistics(TableId)` and
+  `set_table_statistics(TableId, TableStatistics)` (set validates the table is
+  a live user relation and every statistics column id exists). Schema-change
+  behavior follows the reconciliation rule above (§2): `ADD COLUMN` and
+  renames of the table keep statistics; `DROP COLUMN` and `RENAME COLUMN`
+  clear the per-column map (counts stay); `DROP TABLE` removes the entry.
+  Snapshot load prunes orphan statistics rather than rejecting them —
+  advisory data must never block startup.
 - **`schema_version` is NOT bumped** by a statistics update. Cached prepared
   plans stay valid and keep their old estimates until re-prepare — an
   intentional, documented divergence from PostgreSQL's relcache invalidation.
@@ -208,6 +220,13 @@ With sample size `n`, distinct-in-sample `d`, values appearing exactly once
 - **Histogram**: equi-height bounds over the sampled values not in the MCV
   list — `statistics_target + 1` bounds from min to max. Omitted when the MCV
   list covers every sampled distinct value.
+- **Non-finite values**: a sampled `DOUBLE PRECISION`/`REAL` value that is NaN
+  or ±Infinity is excluded from the MCV list and histogram bounds (it still
+  counts toward `n_distinct` and the width/null fractions). The catalog's JSON
+  manifest payload cannot round-trip non-finite floats — serde_json writes
+  them as `null` and fails to read that back — so the catalog rejects
+  non-finite statistics at the durable boundary
+  (`set_table_statistics`), and the collector must never produce them.
 
 `statistics_target` comes from a new integer session GUC
 `default_statistics_target` (default `100`, range `1..=1000`), registered in

@@ -16,6 +16,7 @@ pub mod numeric;
 pub mod pg_type;
 pub mod row;
 pub mod schema;
+pub mod statistics;
 pub mod uuid;
 pub mod value;
 
@@ -66,4 +67,5 @@ pub use schema::{
     ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name,
     toast_schema,
 };
+pub use statistics::{ColumnStatistics, NDistinct, TableStatistics};
 pub use value::{Value, parse_bool_text};

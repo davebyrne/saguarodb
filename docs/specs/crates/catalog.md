@@ -54,6 +54,8 @@ pub struct CatalogSnapshot {
     pub next_sequence_id: SequenceId,
     pub next_dictionary_id: u32,
     pub next_storage_id: FileId,
+    // Optimizer statistics per analyzed user table (`docs/specs/statistics.md`).
+    pub statistics: HashMap<TableId, TableStatistics>,
 }
 ```
 
@@ -73,10 +75,29 @@ per-table identity index and is never assigned to a catalog index.
 reserved to mean "no dictionary", never assigned to a real dictionary).
 `next_storage_id` starts at `1`; storage id `0` is the legacy/missing sentinel,
 and ids with storage file-kind high bits set are invalid. The index, sequence,
-dictionary-id, and storage-id fields deserialize with defaults (empty maps and
-initial allocator values). A persisted user table that declares a primary key
-must have a matching primary-key constraint index; manifests from the older
-implicit-primary-key-index format are rejected rather than migrated.
+dictionary-id, storage-id, and statistics fields deserialize with defaults
+(empty maps and initial allocator values). A persisted user table that declares
+a primary key must have a matching primary-key constraint index; manifests from
+the older implicit-primary-key-index format are rejected rather than migrated.
+
+Statistics are advisory and follow three rules (`docs/specs/statistics.md`):
+`get_table_statistics`/`set_table_statistics` read and replace one live user
+table's entry without bumping `schema_version` (set rejects unknown tables,
+non-user relations, unknown column ids, and statistics containing non-finite
+numbers — the JSON manifest payload cannot round-trip NaN/Infinity, so
+accepting one would make the next startup unable to load the catalog); every
+**column-changing** schema replacement (live DDL and recovery replay) funnels
+through one reconciliation — statistics survive only when each prior column is
+unchanged (same id, name, and type — pure ADD COLUMN or metadata-only updates,
+including table rename); any other column change clears the per-column map but
+keeps the row/page counts, because column ids are dense and shift on DROP
+COLUMN. (The primary-key/compression/TOAST setters and the truncate apply
+paths — which only swap storage ids — bypass the funnel and never change
+column shape.) `DROP TABLE` removes the entry. Snapshot load *prunes*
+orphan statistics (missing table, non-user relation, or unknown column id)
+instead of rejecting them — a stale advisory entry must never block startup.
+The transactional-TRUNCATE overlay reads statistics from the base catalog
+unchanged and rejects writes.
 
 The crate also exposes a static virtual system-catalog registry. This registry
 describes view names, schemas, columns, and deterministic virtual OIDs for the
