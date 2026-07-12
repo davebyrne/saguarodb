@@ -333,21 +333,30 @@ visible EXPLAIN output; the format is specified in `planner.md`.
 
 ### 9.2 First cost-based decisions (Milestone G)
 
-Constants (v1 `const`s, GUCs later): `seq_page_cost = 1.0`,
-`random_page_cost = 4.0`, `cpu_tuple_cost = 0.01`,
+Constants (v1 `const`s in `planner::estimate`, GUCs later):
+`seq_page_cost = 1.0`, `random_page_cost = 4.0`, `cpu_tuple_cost = 0.01`,
 `cpu_operator_cost = 0.0025`.
 
-- **Hash-join build side**: today `HashJoinOp` always builds the right input.
-  When both inputs have estimates, the planner swaps an **inner** hash join's
-  children so the smaller estimated input is the build side, wrapping the
-  join in a projection that restores the original output column order.
-  Semi/anti joins (asymmetric) and joins without estimates are not swapped.
+- **Hash-join build side**: `PhysicalPlan::HashJoin` carries a `build_left`
+  flag. `HashJoinOp` builds its in-memory hash table over the flagged side
+  and **streams** the other, probing one row at a time (only the build side
+  and the current probe row's matches are resident); output column order is
+  left ++ right either way, so no restoring projection is needed. The planner
+  sets `build_left` only for a plain inner join, outside a DML spine
+  (`identity_from` unset — duplicate-identity dedup order stays stable), when
+  BOTH inputs are **fully analyzed** (every base relation beneath them has
+  statistics; `plan_fully_analyzed`) and the left side estimates smaller.
+  Semi/anti joins always build right and probe with left. Un-analyzed inputs
+  keep the historical build-right shape exactly. EXPLAIN shows
+  `build=left|right` on the HashJoin line.
 - **Seq-vs-index choice**: today an eligible predicate always chooses
-  `IndexScan`. With statistics:
+  `IndexScan`. With statistics on the table:
   `cost(seq) = pages·seq_page_cost + rows·cpu_tuple_cost`;
-  `cost(index) = matches·(random_page_cost + cpu_tuple_cost) + descent`.
-  The cheaper wins. **Without statistics the current always-index rule is
-  preserved unchanged** — un-analyzed databases plan exactly as today.
+  `cost(index) = matches·(random_page_cost + cpu_tuple_cost) + descent`
+  where `matches` is the index scan's row estimate (via `full_filter`) and
+  `descent = log2(rows)·cpu_operator_cost`. The cheaper wins (ties keep the
+  index). **Without statistics the current always-index rule is preserved
+  unchanged** — un-analyzed databases plan exactly as today.
 
 Index-predicate *eligibility* (literal-only comparands, single column) is
 explicitly unchanged by this project.

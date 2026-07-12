@@ -265,6 +265,118 @@ async fn pg_stats_quotes_array_elements_that_need_it() {
 }
 
 #[tokio::test]
+async fn analyzed_plans_swap_the_hash_build_side_and_still_join_correctly() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table small (id integer primary key)").await;
+    conn.ok("insert into small (id) values (1), (2), (3)").await;
+    conn.ok("create table big (id integer primary key)").await;
+    let mut insert = String::from("insert into big (id) values ");
+    for id in 0..200 {
+        if id > 0 {
+            insert.push(',');
+        }
+        insert.push_str(&format!("({id})"));
+    }
+    conn.ok(&insert).await;
+
+    // Un-analyzed: historical build-right shape.
+    let plan = conn
+        .ok("explain select small.id from small join big on small.id = big.id")
+        .await
+        .rows();
+    let plan_text = plan[0][0].as_deref().unwrap().to_string();
+    assert!(plan_text.contains("build=right"), "{plan_text}");
+
+    conn.ok("analyze").await;
+
+    let plan = conn
+        .ok("explain select small.id from small join big on small.id = big.id")
+        .await
+        .rows();
+    let plan_text = plan
+        .iter()
+        .map(|row| row[0].as_deref().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("build=left"),
+        "the 3-row side should become the build side:\n{plan_text}"
+    );
+
+    // The swapped join still returns the right rows in left ++ right order.
+    let rows = conn
+        .ok("select small.id, big.id from small join big on small.id = big.id order by small.id")
+        .await
+        .rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".to_string()), Some("1".to_string())],
+            vec![Some("2".to_string()), Some("2".to_string())],
+            vec![Some("3".to_string()), Some("3".to_string())],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn swapped_hash_join_handles_duplicate_and_null_keys() {
+    // The build=left assembly path with the realistic shape: a small build
+    // side with duplicate join keys and a NULL key, joined N:M into a larger
+    // probe side with several matches per key and its own NULL key.
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table small (id integer primary key, k integer, tag text)")
+        .await;
+    conn.ok("insert into small (id, k, tag) values (1, 10, 'a'), (2, 10, 'b'), (3, null, 'c')")
+        .await;
+    conn.ok("create table big (id integer primary key, k integer, val text)")
+        .await;
+    let mut insert = String::from("insert into big (id, k, val) values ");
+    for id in 0..100 {
+        // Filler keys that never match small's.
+        insert.push_str(&format!("({id}, {}, 'f{id}'),", id + 1000));
+    }
+    insert.push_str("(101, 10, 'x1'), (102, 10, 'x2'), (103, 10, 'x3'), (104, null, 'xnull')");
+    conn.ok(&insert).await;
+    conn.ok("analyze").await;
+
+    let plan = conn
+        .ok("explain select small.tag from small join big on small.k = big.k")
+        .await
+        .rows();
+    let plan_text = plan
+        .iter()
+        .map(|row| row[0].as_deref().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan_text.contains("build=left"), "{plan_text}");
+
+    let rows = conn
+        .ok(
+            "select small.tag, big.val from small join big on small.k = big.k \
+             order by small.tag, big.val",
+        )
+        .await
+        .rows();
+    let expected: Vec<Vec<Option<String>>> = [
+        ("a", "x1"),
+        ("a", "x2"),
+        ("a", "x3"),
+        ("b", "x1"),
+        ("b", "x2"),
+        ("b", "x3"),
+    ]
+    .iter()
+    .map(|(tag, val)| vec![Some(tag.to_string()), Some(val.to_string())])
+    .collect();
+    assert_eq!(
+        rows, expected,
+        "duplicate keys join N:M with distinct side values; NULL keys never match"
+    );
+}
+
+#[tokio::test]
 async fn analyze_runs_through_the_extended_protocol() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

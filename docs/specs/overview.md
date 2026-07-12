@@ -1558,7 +1558,7 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the storage identity index, `index_scan` for a catalog index — and applies residual `IndexScan.filter` when present. If a catalog index is unavailable in the statement's captured relation generation, falls back to a table scan and applies `IndexScan.full_filter` |
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
 | `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
-| `HashJoinOp` | Inner equi-join: builds a probe table over the right input keyed by `right_keys`, probes with `left_keys`; rows with a NULL key never match. |
+| `HashJoinOp` | Inner equi-join: builds an in-memory hash table over one side (right by default; left when the planner chose the smaller analyzed input — `docs/specs/statistics.md` §9.2) and streams the other, probing one row at a time; rows with a NULL key never match. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
 | `SortOp` | Materializes all input, sorts in memory, emits in order. Blocking operator. |

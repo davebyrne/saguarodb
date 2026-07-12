@@ -169,6 +169,13 @@ pub enum PhysicalPlan {
         join_type: JoinType,
         /// `Some(Left)` on a DML-source join spine (§8.1).
         identity_from: Option<JoinSide>,
+        /// Build the in-memory hash table over the LEFT input and stream the
+        /// right (`docs/specs/statistics.md` §9.2). Chosen only for a plain
+        /// inner join whose inputs are both fully analyzed and whose left
+        /// side estimates smaller; the executor's output column order is
+        /// left ++ right either way. `false` is the historical
+        /// build-right/stream-left behavior.
+        build_left: bool,
     },
     Filter {
         source: Box<PhysicalPlan>,
@@ -505,6 +512,19 @@ fn plan_join(
         let hashable = !split.left_keys.is_empty()
             && (join_type == JoinType::Inner || split.residual.is_none());
         if hashable {
+            // First cost-based decision (docs/specs/statistics.md §9.2):
+            // build the hash table over the smaller estimated input. Only for
+            // a plain inner join (semi/anti stream the left side by
+            // construction), only outside a DML spine (conservative: which
+            // duplicate identity row wins dedup stays order-stable), and only
+            // when BOTH inputs are fully analyzed — un-analyzed plans keep
+            // the historical build-right shape exactly.
+            let build_left = join_type == JoinType::Inner
+                && identity_from.is_none()
+                && crate::estimate::plan_fully_analyzed(&left_plan, catalog)
+                && crate::estimate::plan_fully_analyzed(&right_plan, catalog)
+                && crate::estimate::estimated_rows(&left_plan, catalog)
+                    < crate::estimate::estimated_rows(&right_plan, catalog);
             let hash = PhysicalPlan::HashJoin {
                 left: Box::new(left_plan),
                 right: Box::new(right_plan),
@@ -512,6 +532,7 @@ fn plan_join(
                 right_keys: split.right_keys,
                 join_type,
                 identity_from,
+                build_left,
             };
             return Ok(match split.residual {
                 Some(predicate) => PhysicalPlan::Filter {
@@ -736,15 +757,32 @@ fn plan_scan(
 
     if let Some((index, candidate)) = best_index_scan(&schema, table, &filter_expr, catalog)? {
         let full_filter = Some(filter_expr.clone());
-        let residual = residual_filter(filter_expr, &candidate.consumed);
-        return Ok(PhysicalPlan::IndexScan {
+        let residual = residual_filter(filter_expr.clone(), &candidate.consumed);
+        let index_scan = PhysicalPlan::IndexScan {
             table,
-            table_name,
+            table_name: table_name.clone(),
             index,
             range: candidate.range,
             full_filter,
             filter: residual,
-        });
+        };
+        // Second cost-based decision (docs/specs/statistics.md §9.2): with
+        // statistics, a high-selectivity index scan (one random heap fetch
+        // per match) can lose to one sequential pass. Without statistics the
+        // historical always-index rule is preserved exactly.
+        if let Some(statistics) = catalog.get_table_statistics(table)? {
+            let matches = crate::estimate::estimated_rows(&index_scan, catalog);
+            let seq = crate::estimate::seq_scan_cost(statistics.page_count, statistics.row_count);
+            let index_cost = crate::estimate::index_scan_cost(matches, statistics.row_count);
+            if seq < index_cost {
+                return Ok(PhysicalPlan::SeqScan {
+                    table,
+                    table_name,
+                    filter: Some(filter_expr),
+                });
+            }
+        }
+        return Ok(index_scan);
     }
 
     Ok(PhysicalPlan::SeqScan {

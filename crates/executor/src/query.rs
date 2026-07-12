@@ -527,6 +527,7 @@ pub(crate) fn build_executor<'a>(
             right_keys,
             join_type,
             identity_from,
+            build_left,
         } => {
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
@@ -538,6 +539,7 @@ pub(crate) fn build_executor<'a>(
                 right_keys.clone(),
                 *join_type,
                 *identity_from,
+                *build_left,
             )))
         }
         PhysicalPlan::Apply {

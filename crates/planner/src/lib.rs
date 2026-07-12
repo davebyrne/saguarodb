@@ -4475,6 +4475,105 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_builds_over_the_smaller_analyzed_input() {
+        let catalog = catalog_with_users();
+        analyze_users(&catalog);
+
+        // Left side estimates 10 rows via LIMIT, right 1000: build left.
+        let stmt = parse(
+            "select a.id from (select * from users limit 10) as a \
+             join users as b on a.id = b.id",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let text = format_explain(&physical, &catalog);
+        assert!(text.contains("build=left"), "{text}");
+
+        // Mirrored shape: the right side is smaller, keep the default.
+        let stmt = parse(
+            "select a.id from users as a \
+             join (select * from users limit 10) as b on a.id = b.id",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let text = format_explain(&physical, &catalog);
+        assert!(text.contains("build=right"), "{text}");
+    }
+
+    #[test]
+    fn hash_join_keeps_the_build_right_shape_without_statistics() {
+        let catalog = catalog_with_users();
+        let stmt = parse(
+            "select a.id from (select * from users limit 10) as a \
+             join users as b on a.id = b.id",
+        )
+        .unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let text = format_explain(&physical, &catalog);
+        assert!(
+            text.contains("build=right"),
+            "un-analyzed plans must keep the historical shape: {text}"
+        );
+    }
+
+    #[test]
+    fn semi_joins_never_swap_the_build_side() {
+        let catalog = catalog_with_users();
+        analyze_users(&catalog);
+        let stmt = parse("select * from users where name in (select name from users)").unwrap();
+        let bound = bind(&stmt, &catalog).unwrap();
+        let logical = logical_plan(&bound).unwrap();
+        let physical = physical_plan(&logical, &catalog).unwrap();
+        let text = format_explain(&physical, &catalog);
+        assert!(text.contains("type=Semi"), "{text}");
+        assert!(text.contains("build=right"), "{text}");
+    }
+
+    #[test]
+    fn scan_choice_is_cost_based_only_with_statistics() {
+        let catalog = catalog_with_users();
+
+        // Un-analyzed: an eligible predicate always takes the index.
+        let text = {
+            let stmt = parse("select * from users where id < 900").unwrap();
+            let bound = bind(&stmt, &catalog).unwrap();
+            let logical = logical_plan(&bound).unwrap();
+            let physical = physical_plan(&logical, &catalog).unwrap();
+            format_explain(&physical, &catalog)
+        };
+        assert!(text.contains("IndexScan"), "{text}");
+
+        analyze_users(&catalog);
+        // ~900 of 1000 rows match: one random heap fetch per match costs far
+        // more than one sequential pass over 10 pages.
+        let text = {
+            let stmt = parse("select * from users where id < 900").unwrap();
+            let bound = bind(&stmt, &catalog).unwrap();
+            let logical = logical_plan(&bound).unwrap();
+            let physical = physical_plan(&logical, &catalog).unwrap();
+            format_explain(&physical, &catalog)
+        };
+        assert!(text.contains("SeqScan"), "{text}");
+        assert!(!text.contains("IndexScan"), "{text}");
+
+        // A unique-key equality still takes the index.
+        let text = {
+            let stmt = parse("select * from users where id = 5").unwrap();
+            let bound = bind(&stmt, &catalog).unwrap();
+            let logical = logical_plan(&bound).unwrap();
+            let physical = physical_plan(&logical, &catalog).unwrap();
+            format_explain(&physical, &catalog)
+        };
+        assert!(text.contains("IndexScan"), "{text}");
+    }
+
+    #[test]
     fn explain_appends_row_estimates_to_data_nodes_only() {
         let catalog = catalog_with_users();
         analyze_users(&catalog);

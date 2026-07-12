@@ -189,9 +189,13 @@ fn join_with_null_left(left_width: usize, right: &ExecRow) -> ExecRow {
     }
 }
 
-/// Inner equi-join. Builds a probe table over the right input keyed by its join
-/// columns, then probes it with each left row. `left_keys`/`right_keys` are
-/// paired column slots into the left and right child rows.
+/// Inner equi-join. Builds an in-memory hash table over ONE input (the right
+/// by default; the left when the planner chose `build_left` — the smaller
+/// estimated side, `docs/specs/statistics.md` §9.2) and STREAMS the other,
+/// probing one row at a time, so only the build side and the current probe
+/// row's matches are resident. Output column order is left ++ right either
+/// way. `left_keys`/`right_keys` are paired column slots into the left and
+/// right child rows.
 pub struct HashJoinOp<'a> {
     ctx: StatementContext,
     left: Box<dyn PlanExecutor + 'a>,
@@ -202,12 +206,18 @@ pub struct HashJoinOp<'a> {
     join_type: JoinType,
     /// `Some(Left)` on a DML-source spine (`docs/specs/subqueries.md` §8.1).
     identity_from: Option<JoinSide>,
+    /// Build over the left input, stream the right. The planner sets this
+    /// only for plain inner joins; semi/anti always build right and stream
+    /// (probe with) left.
+    build_left: bool,
     output_schema: Vec<ColumnInfo>,
-    rows: Vec<ExecRow>,
-    index: usize,
+    table: HashMap<Vec<Value>, Vec<ExecRow>>,
+    /// Remaining joined rows for the current probe row, next-first.
+    pending: Vec<ExecRow>,
 }
 
 impl<'a> HashJoinOp<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: StatementContext,
         left: Box<dyn PlanExecutor + 'a>,
@@ -216,7 +226,14 @@ impl<'a> HashJoinOp<'a> {
         right_keys: Vec<usize>,
         join_type: JoinType,
         identity_from: Option<JoinSide>,
+        build_left: bool,
     ) -> Self {
+        // The planner sets build_left only for plain inner joins; a semi/anti
+        // probe would otherwise read right rows with left key slots.
+        debug_assert!(
+            !build_left || join_type == JoinType::Inner,
+            "build_left is only valid for inner hash joins"
+        );
         let mut output_schema = left.output_schema().to_vec();
         if !join_type.is_semi_or_anti() {
             output_schema.extend_from_slice(right.output_schema());
@@ -229,9 +246,18 @@ impl<'a> HashJoinOp<'a> {
             right_keys,
             join_type,
             identity_from,
+            build_left,
             output_schema,
-            rows: Vec::new(),
-            index: 0,
+            table: HashMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn probe_input(&mut self) -> &mut (dyn PlanExecutor + 'a) {
+        if self.build_left {
+            self.right.as_mut()
+        } else {
+            self.left.as_mut()
         }
     }
 }
@@ -242,70 +268,83 @@ impl PlanExecutor for HashJoinOp<'_> {
     }
 
     fn open(&mut self) -> Result<()> {
-        self.rows.clear();
-        self.index = 0;
+        self.table.clear();
+        self.pending.clear();
 
-        let left_rows = collect_all_cancelable(self.left.as_mut(), self.ctx.cancel.as_ref())?;
-        let right_rows = collect_all_cancelable(self.right.as_mut(), self.ctx.cancel.as_ref())?;
-
-        let mut table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
-        for (right_index, right) in right_rows.iter().enumerate() {
+        let (build_input, build_keys) = if self.build_left {
+            (self.left.as_mut(), &self.left_keys)
+        } else {
+            (self.right.as_mut(), &self.right_keys)
+        };
+        let build_rows = collect_all_cancelable(build_input, self.ctx.cancel.as_ref())?;
+        for row in build_rows {
             self.ctx.cancel.check()?;
-            if let Some(key) = join_key(&right.row.values, &self.right_keys)? {
-                table.entry(key).or_default().push(right_index);
+            if let Some(key) = join_key(&row.row.values, build_keys)? {
+                self.table.entry(key).or_default().push(row);
             }
         }
 
-        if self.join_type.is_semi_or_anti() {
-            // Semi/anti probes emit the left ExecRow itself (identity intact)
-            // at most once. A NULL in a left key never equals anything, so it
-            // is a non-match: dropped for semi, emitted for anti — exactly
-            // the [NOT] EXISTS equality semantics decorrelation relies on.
-            for left in left_rows {
-                self.ctx.cancel.check()?;
-                let matched = match join_key(&left.row.values, &self.left_keys)? {
-                    Some(key) => table.contains_key(&key),
-                    None => false,
-                };
-                if matched == (self.join_type == JoinType::Semi) {
-                    self.rows.push(left);
-                }
-            }
-            return Ok(());
-        }
-
-        for left in &left_rows {
-            self.ctx.cancel.check()?;
-            let Some(key) = join_key(&left.row.values, &self.left_keys)? else {
-                continue;
-            };
-            if let Some(matches) = table.get(&key) {
-                for &right_index in matches {
-                    self.ctx.cancel.check()?;
-                    let mut joined = join_row_refs(left, &right_rows[right_index]);
-                    if self.identity_from == Some(JoinSide::Left) {
-                        joined.identity = left.identity.clone();
-                    }
-                    self.rows.push(joined);
-                }
-            }
-        }
-
-        Ok(())
+        self.probe_input().open()
     }
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
-        let Some(row) = self.rows.get(self.index).cloned() else {
-            return Ok(None);
-        };
-        self.index += 1;
-        Ok(Some(row))
+        loop {
+            if let Some(row) = self.pending.pop() {
+                return Ok(Some(row));
+            }
+            self.ctx.cancel.check()?;
+            let Some(probe) = self.probe_input().next()? else {
+                return Ok(None);
+            };
+
+            if self.join_type.is_semi_or_anti() {
+                // Semi/anti probe with the left input (the planner never sets
+                // build_left for them) and emit the left ExecRow itself
+                // (identity intact) at most once. A NULL in a left key never
+                // equals anything, so it is a non-match: dropped for semi,
+                // emitted for anti — exactly the [NOT] EXISTS equality
+                // semantics decorrelation relies on.
+                let matched = match join_key(&probe.row.values, &self.left_keys)? {
+                    Some(key) => self.table.contains_key(&key),
+                    None => false,
+                };
+                if matched == (self.join_type == JoinType::Semi) {
+                    return Ok(Some(probe));
+                }
+                continue;
+            }
+
+            let probe_keys = if self.build_left {
+                &self.right_keys
+            } else {
+                &self.left_keys
+            };
+            let Some(key) = join_key(&probe.row.values, probe_keys)? else {
+                continue;
+            };
+            if let Some(matches) = self.table.get(&key) {
+                // Emit in build order: `pending` pops from the back.
+                for build_row in matches.iter().rev() {
+                    self.ctx.cancel.check()?;
+                    let (left, right) = if self.build_left {
+                        (build_row, &probe)
+                    } else {
+                        (&probe, build_row)
+                    };
+                    let mut joined = join_row_refs(left, right);
+                    if self.identity_from == Some(JoinSide::Left) {
+                        joined.identity = left.identity.clone();
+                    }
+                    self.pending.push(joined);
+                }
+            }
+        }
     }
 
     fn close(&mut self) -> Result<()> {
-        self.rows.clear();
-        self.index = 0;
-        Ok(())
+        self.table.clear();
+        self.pending.clear();
+        self.probe_input().close()
     }
 }
 

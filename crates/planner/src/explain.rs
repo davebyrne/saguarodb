@@ -185,6 +185,7 @@ fn format_node(
             right,
             left_keys,
             join_type,
+            build_left,
             ..
         } => {
             let label = match join_type {
@@ -192,8 +193,9 @@ fn format_node(
                 JoinType::Anti => "HashJoin type=Anti",
                 _ => "HashJoin",
             };
+            let build = if *build_left { "left" } else { "right" };
             output.push_str(&format!(
-                "{padding}{label} keys={}{rows_suffix}\n",
+                "{padding}{label} keys={} build={build}{rows_suffix}\n",
                 left_keys.len()
             ));
             format_node(left, indent + 1, catalog, output);

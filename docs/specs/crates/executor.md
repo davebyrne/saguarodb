@@ -138,7 +138,7 @@ ordinary data statements.
 | `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a planned secondary index is defensively unavailable in the statement-captured relation generation, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. Missing table generations are execution errors. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
 | `SystemScanOp` | Materializes virtual catalog rows from the immutable statement catalog/provider snapshot captured by the server after lock convergence; applies filters and emits rows with no identity |
 | `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
-| `HashJoinOp` | Inner equi-join: builds a probe table over the right side keyed by `right_keys`, probes with `left_keys`; rows with a NULL key column never match; emits concatenated rows, clears identity |
+| `HashJoinOp` | Inner equi-join: builds an in-memory hash table over one side (right by default; left when the planner set `build_left` — `docs/specs/statistics.md` §9.2) and streams the other, probing one row at a time; rows with a NULL key column never match; emits concatenated left ++ right rows regardless of build side, clears identity (kept for a DML spine) |
 | `FilterOp` | Evaluates predicate, preserves identity |
 | `ProjectionOp` | Rewrites row values, preserves identity |
 | `SortOp` | Materializes all input, sorts in memory, preserves identity |

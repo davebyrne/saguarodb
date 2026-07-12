@@ -24,6 +24,58 @@ const DEFAULT_NUM_DISTINCT: f64 = 200.0;
 /// Fraction of the left side surviving a semi/anti join without statistics.
 const DEFAULT_SEMI_SELECTIVITY: f64 = 0.5;
 
+// Cost constants (docs/specs/statistics.md §9.2), PostgreSQL's defaults.
+const SEQ_PAGE_COST: f64 = 1.0;
+const RANDOM_PAGE_COST: f64 = 4.0;
+const CPU_TUPLE_COST: f64 = 0.01;
+const CPU_OPERATOR_COST: f64 = 0.0025;
+
+/// Sequential-scan cost over `pages` heap pages holding `rows` rows.
+pub(crate) fn seq_scan_cost(pages: u64, rows: u64) -> f64 {
+    pages as f64 * SEQ_PAGE_COST + rows as f64 * CPU_TUPLE_COST
+}
+
+/// Index-scan cost fetching `matches` rows from a `table_rows`-row table:
+/// one random heap page per match plus a logarithmic B-tree descent.
+pub(crate) fn index_scan_cost(matches: u64, table_rows: u64) -> f64 {
+    let descent = (table_rows.max(2) as f64).log2() * CPU_OPERATOR_COST;
+    matches as f64 * (RANDOM_PAGE_COST + CPU_TUPLE_COST) + descent
+}
+
+/// True when every base relation under `plan` has ANALYZE statistics, so its
+/// row estimate is informed rather than a fixed default. Cost-based choices
+/// (docs/specs/statistics.md §9.2) require this for BOTH inputs — un-analyzed
+/// databases must plan exactly as the rule-based planner always has.
+pub(crate) fn plan_fully_analyzed(
+    plan: &PhysicalPlan,
+    catalog: &dyn catalog::CatalogManager,
+) -> bool {
+    match plan {
+        PhysicalPlan::SeqScan { table, .. } | PhysicalPlan::IndexScan { table, .. } => {
+            table_statistics(catalog, *table).is_some()
+        }
+        // Virtual views have no statistics; VALUES row counts are exact.
+        PhysicalPlan::SystemScan { .. } => false,
+        PhysicalPlan::Values { .. } => true,
+        PhysicalPlan::Filter { source, .. }
+        | PhysicalPlan::Projection { source, .. }
+        | PhysicalPlan::Sort { source, .. }
+        | PhysicalPlan::Limit { source, .. }
+        | PhysicalPlan::Distinct { source, .. }
+        | PhysicalPlan::Aggregate { source, .. } => plan_fully_analyzed(source, catalog),
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. }
+        | PhysicalPlan::SetOp { left, right, .. } => {
+            plan_fully_analyzed(left, catalog) && plan_fully_analyzed(right, catalog)
+        }
+        PhysicalPlan::Apply { input, subplan, .. } => {
+            plan_fully_analyzed(input, catalog) && plan_fully_analyzed(subplan, catalog)
+        }
+        // DML/DDL nodes never appear under a join or scan-choice decision.
+        _ => false,
+    }
+}
+
 /// Estimated output row count for `plan`, rounded for display. Non-relational
 /// nodes (DDL) estimate as one row.
 pub fn estimated_rows(plan: &PhysicalPlan, catalog: &dyn catalog::CatalogManager) -> u64 {
