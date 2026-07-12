@@ -1,6 +1,6 @@
 use common::{
-    ColumnDef, DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum, Result, Row,
-    SqlState, TableSchema, TxnId, Value, XMIN_COMMITTED,
+    ArrayDimension, ColumnDef, DataType, DbError, Decimal, FROZEN_XID, INVALID_XID, Key, PageNum,
+    Result, Row, SqlArray, SqlState, TableSchema, TxnId, Value, XMIN_COMMITTED,
 };
 
 /// On-page row encoding version emitted by the legacy `encode_row` helper. The
@@ -197,6 +197,8 @@ const KEY_TAG_REAL: u8 = 10;
 const KEY_TAG_TIME: u8 = 11;
 const KEY_TAG_TIMESTAMPTZ: u8 = 12;
 const KEY_TAG_INTERVAL: u8 = 13;
+const KEY_TAG_ARRAY: u8 = 14;
+const ARRAY_PAYLOAD_VERSION: u8 = 1;
 
 /// Serialize an `INTERVAL` as `[months: i32][days: i32][micros: i64]` (16 bytes LE).
 fn put_interval(bytes: &mut Vec<u8>, value: &common::Interval) {
@@ -227,6 +229,258 @@ fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
     let scale = u32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes"));
     Decimal::try_from_i128_with_scale(mantissa, scale)
         .map_err(|_| corrupt_row("invalid numeric value"))
+}
+
+pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
+    let cardinality = u32::try_from(array.cardinality()).map_err(|_| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "array has too many elements",
+        )
+    })?;
+    let ndim = u8::try_from(array.dimensions().len()).map_err(|_| {
+        DbError::storage(
+            SqlState::ProgramLimitExceeded,
+            "array has too many dimensions",
+        )
+    })?;
+    let mut bytes = vec![ARRAY_PAYLOAD_VERSION];
+    encode_array_element_type(&mut bytes, array.element_type())?;
+    bytes.push(ndim);
+    bytes.extend_from_slice(&cardinality.to_le_bytes());
+    for dimension in array.dimensions() {
+        bytes.extend_from_slice(&dimension.len().to_le_bytes());
+        bytes.extend_from_slice(&dimension.lower_bound().to_le_bytes());
+    }
+    let bitmap_len = array.cardinality().div_ceil(8);
+    let bitmap_start = bytes.len();
+    bytes.resize(bitmap_start + bitmap_len, 0);
+    for (index, value) in array.elements().iter().enumerate() {
+        if matches!(value, Value::Null) {
+            bytes[bitmap_start + index / 8] |= 1 << (index % 8);
+        } else {
+            encode_array_element(&mut bytes, array.element_type(), value)?;
+        }
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
+    let mut offset = 0;
+    let version = read_exact(bytes, &mut offset, 1)?[0];
+    if version != ARRAY_PAYLOAD_VERSION {
+        return Err(corrupt_row(format!(
+            "unknown array payload version {version}"
+        )));
+    }
+    let element_type = decode_array_element_type(bytes, &mut offset)?;
+    let ndim = usize::from(read_exact(bytes, &mut offset, 1)?[0]);
+    if ndim > common::MAX_ARRAY_DIMENSIONS {
+        return Err(corrupt_row("array has too many dimensions"));
+    }
+    let cardinality = read_u32(bytes, &mut offset)? as usize;
+    let mut dimensions = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        let len = read_u32(bytes, &mut offset)?;
+        let lower_bound = i32::from_le_bytes(
+            read_exact(bytes, &mut offset, 4)?
+                .try_into()
+                .expect("4 bytes"),
+        );
+        dimensions.push(ArrayDimension::new(len, lower_bound));
+    }
+    if cardinality == 0 && ndim != 0 {
+        return Err(corrupt_row("empty array payload must have zero dimensions"));
+    }
+    if cardinality != 0 && ndim == 0 {
+        return Err(corrupt_row("non-empty array payload must have dimensions"));
+    }
+    let described = dimensions.iter().try_fold(1_usize, |product, dimension| {
+        product
+            .checked_mul(dimension.len() as usize)
+            .ok_or_else(|| corrupt_row("array dimension product overflows"))
+    })?;
+    if cardinality != 0 && described != cardinality {
+        return Err(corrupt_row("array dimensions do not match cardinality"));
+    }
+    let bitmap_len = cardinality.div_ceil(8);
+    let bitmap = read_exact(bytes, &mut offset, bitmap_len)?;
+    if !cardinality.is_multiple_of(8)
+        && bitmap
+            .last()
+            .is_some_and(|last| *last & !((1_u8 << (cardinality % 8)) - 1) != 0)
+    {
+        return Err(corrupt_row("array null bitmap has nonzero padding bits"));
+    }
+    let mut elements = Vec::with_capacity(cardinality);
+    for index in 0..cardinality {
+        if bitmap[index / 8] & (1 << (index % 8)) != 0 {
+            elements.push(Value::Null);
+        } else {
+            elements.push(decode_array_element(bytes, &mut offset, &element_type)?);
+        }
+    }
+    if offset != bytes.len() {
+        return Err(corrupt_row("array payload has trailing bytes"));
+    }
+    SqlArray::new(element_type, dimensions, elements)
+        .map_err(|error| corrupt_row(format!("invalid array payload: {}", error.message)))
+}
+
+fn encode_array_element_type(bytes: &mut Vec<u8>, data_type: &DataType) -> Result<()> {
+    validate_array_numeric_type(data_type, false)?;
+    let tag = match data_type {
+        DataType::Integer => 0,
+        DataType::Text => 1,
+        DataType::Boolean => 2,
+        DataType::Date => 3,
+        DataType::Timestamp => 4,
+        DataType::Time => 5,
+        DataType::TimestampTz => 6,
+        DataType::Interval => 7,
+        DataType::Bytea => 8,
+        DataType::Uuid => 9,
+        DataType::Double => 10,
+        DataType::Real => 11,
+        DataType::Numeric { .. } => 12,
+        DataType::Array(_) => {
+            return Err(DbError::storage(
+                SqlState::DatatypeMismatch,
+                "nested array element type is invalid",
+            ));
+        }
+    };
+    bytes.push(tag);
+    if let DataType::Numeric { precision, scale } = data_type {
+        bytes.extend_from_slice(&precision.unwrap_or(u32::MAX).to_le_bytes());
+        bytes.extend_from_slice(&scale.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn decode_array_element_type(bytes: &[u8], offset: &mut usize) -> Result<DataType> {
+    let data_type = match read_exact(bytes, offset, 1)?[0] {
+        0 => DataType::Integer,
+        1 => DataType::Text,
+        2 => DataType::Boolean,
+        3 => DataType::Date,
+        4 => DataType::Timestamp,
+        5 => DataType::Time,
+        6 => DataType::TimestampTz,
+        7 => DataType::Interval,
+        8 => DataType::Bytea,
+        9 => DataType::Uuid,
+        10 => DataType::Double,
+        11 => DataType::Real,
+        12 => {
+            let precision = read_u32(bytes, offset)?;
+            let scale = read_u32(bytes, offset)?;
+            DataType::Numeric {
+                precision: (precision != u32::MAX).then_some(precision),
+                scale,
+            }
+        }
+        _ => return Err(corrupt_row("unknown array element type tag")),
+    };
+    validate_array_numeric_type(&data_type, true)?;
+    Ok(data_type)
+}
+
+fn validate_array_numeric_type(data_type: &DataType, decoded: bool) -> Result<()> {
+    let DataType::Numeric { precision, scale } = data_type else {
+        return Ok(());
+    };
+    let valid = match precision {
+        Some(precision) => (1..=28).contains(precision) && scale <= precision,
+        None => *scale == 0,
+    };
+    if valid {
+        Ok(())
+    } else if decoded {
+        Err(corrupt_row("invalid numeric array element type modifier"))
+    } else {
+        Err(DbError::storage(
+            SqlState::DatatypeMismatch,
+            "invalid numeric array element type modifier",
+        ))
+    }
+}
+
+fn encode_array_element(bytes: &mut Vec<u8>, data_type: &DataType, value: &Value) -> Result<()> {
+    match (data_type, value) {
+        (DataType::Integer, Value::Integer(value))
+        | (DataType::Date, Value::Date(value))
+        | (DataType::Timestamp, Value::Timestamp(value))
+        | (DataType::Time, Value::Time(value))
+        | (DataType::TimestampTz, Value::TimestampTz(value)) => {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        (DataType::Text, Value::Text(value)) => put_array_bytes(bytes, value.as_bytes())?,
+        (DataType::Boolean, Value::Boolean(value)) => bytes.push(u8::from(*value)),
+        (DataType::Interval, Value::Interval(value)) => put_interval(bytes, value),
+        (DataType::Bytea, Value::Bytes(value)) => put_array_bytes(bytes, value)?,
+        (DataType::Uuid, Value::Uuid(value)) => bytes.extend_from_slice(value),
+        (DataType::Double, Value::Float(value)) => bytes.extend_from_slice(&value.0.to_le_bytes()),
+        (DataType::Real, Value::Real(value)) => bytes.extend_from_slice(&value.0.to_le_bytes()),
+        (DataType::Numeric { .. }, Value::Numeric(value)) => put_numeric(bytes, value),
+        _ => {
+            return Err(DbError::storage(
+                SqlState::DatatypeMismatch,
+                "array element does not match its element type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_array_element(bytes: &[u8], offset: &mut usize, data_type: &DataType) -> Result<Value> {
+    Ok(match data_type {
+        DataType::Integer => Value::Integer(read_i64(bytes, offset)?),
+        DataType::Text => Value::Text(
+            String::from_utf8(read_array_bytes(bytes, offset)?.to_vec())
+                .map_err(|_| corrupt_row("array text element is not valid UTF-8"))?,
+        ),
+        DataType::Boolean => match read_exact(bytes, offset, 1)?[0] {
+            0 => Value::Boolean(false),
+            1 => Value::Boolean(true),
+            _ => return Err(corrupt_row("array boolean element is not 0 or 1")),
+        },
+        DataType::Date => Value::Date(read_i64(bytes, offset)?),
+        DataType::Timestamp => Value::Timestamp(read_i64(bytes, offset)?),
+        DataType::Time => Value::Time(read_i64(bytes, offset)?),
+        DataType::TimestampTz => Value::TimestampTz(read_i64(bytes, offset)?),
+        DataType::Interval => Value::Interval(read_interval(bytes, offset)?),
+        DataType::Bytea => Value::Bytes(read_array_bytes(bytes, offset)?.to_vec()),
+        DataType::Uuid => Value::Uuid(read_exact(bytes, offset, 16)?.try_into().expect("16 bytes")),
+        DataType::Double => Value::Float(
+            f64::from_le_bytes(read_exact(bytes, offset, 8)?.try_into().expect("8 bytes")).into(),
+        ),
+        DataType::Real => Value::Real(
+            f32::from_le_bytes(read_exact(bytes, offset, 4)?.try_into().expect("4 bytes")).into(),
+        ),
+        DataType::Numeric { .. } => Value::Numeric(read_numeric(bytes, offset)?),
+        DataType::Array(_) => return Err(corrupt_row("nested array element type is invalid")),
+    })
+}
+
+fn put_array_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+    let len = u32::try_from(value.len()).map_err(|_| {
+        DbError::storage(SqlState::ProgramLimitExceeded, "array element is too large")
+    })?;
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(value);
+    Ok(())
+}
+
+fn read_array_bytes<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    let len = read_u32(bytes, offset)? as usize;
+    read_exact(bytes, offset, len)
+}
+
+fn read_i64(bytes: &[u8], offset: &mut usize) -> Result<i64> {
+    Ok(i64::from_le_bytes(
+        read_exact(bytes, offset, 8)?.try_into().expect("8 bytes"),
+    ))
 }
 
 /// Encode a primary key into the self-describing byte form stored in B-tree
@@ -300,11 +554,14 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
                 bytes.push(KEY_TAG_REAL);
                 bytes.extend_from_slice(&value.0.to_le_bytes());
             }
-            Value::Array(_) => {
-                return Err(DbError::storage(
-                    SqlState::FeatureNotSupported,
-                    "array key encoding is not implemented",
-                ));
+            Value::Array(array) => {
+                bytes.push(KEY_TAG_ARRAY);
+                let payload = encode_array_payload(array)?;
+                let len = u32::try_from(payload.len()).map_err(|_| {
+                    DbError::storage(SqlState::ProgramLimitExceeded, "array key is too large")
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(&payload);
             }
         }
     }
@@ -393,6 +650,10 @@ pub(crate) fn decode_key_prefix(bytes: &[u8]) -> Result<(Key, usize)> {
             KEY_TAG_REAL => {
                 let raw = read_exact(bytes, &mut offset, 4)?;
                 Value::Real(f32::from_le_bytes(raw.try_into().expect("4 bytes")).into())
+            }
+            KEY_TAG_ARRAY => {
+                let len = read_u32(bytes, &mut offset)? as usize;
+                Value::Array(decode_array_payload(read_exact(bytes, &mut offset, len)?)?)
             }
             _ => return Err(corrupt_row("unknown key value tag")),
         };
@@ -501,6 +762,15 @@ pub(crate) fn encode_row_with_infomask(
             }
             Value::Uuid(value) if column.data_type == DataType::Uuid => {
                 bytes.extend_from_slice(value);
+            }
+            Value::Array(array) if matches!(&column.data_type, DataType::Array(element) if element.element_type() == array.element_type()) =>
+            {
+                let payload = encode_array_payload(array)?;
+                let len = u32::try_from(payload.len()).map_err(|_| {
+                    DbError::storage(SqlState::ProgramLimitExceeded, "array is too large")
+                })?;
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(&payload);
             }
             _ => {
                 return Err(DbError::storage(
@@ -733,9 +1003,15 @@ pub(crate) fn decode_physical_row(
                 Value::Uuid(raw.try_into().expect("16 bytes"))
             }
             DataType::Array(_) => {
-                return Err(corrupt_row(
-                    "array row decoding is not implemented for this format",
-                ));
+                values.push(decode_varlena_physical(
+                    bytes,
+                    &mut offset,
+                    version,
+                    index,
+                    column.data_type.clone(),
+                    schema.toast_table_id.is_some(),
+                )?);
+                continue;
             }
         };
         values.push(DecodedPhysicalValue::Value(value));
@@ -804,6 +1080,9 @@ fn encode_column_value_v3(bytes: &mut Vec<u8>, column: &ColumnDef, value: &Value
             bytes.extend_from_slice(value);
             Ok(())
         }
+        Value::Array(array) if matches!(&column.data_type, DataType::Array(element) if element.element_type() == array.element_type()) => {
+            put_varlena(bytes, TAG_PLAIN, &encode_array_payload(array)?)
+        }
         _ => Err(DbError::storage(
             SqlState::DatatypeMismatch,
             format!("value type does not match column {}", column.name),
@@ -821,7 +1100,10 @@ fn encode_varlena_physical(
     has_toast_relation: bool,
     physical: &VarlenaPhysical,
 ) -> Result<()> {
-    if data_type != DataType::Text && data_type != DataType::Bytea {
+    if !matches!(
+        data_type,
+        DataType::Text | DataType::Bytea | DataType::Array(_)
+    ) {
         return Err(DbError::storage(
             SqlState::DatatypeMismatch,
             "physical varlena value supplied for a fixed-width column",
@@ -832,6 +1114,14 @@ fn encode_varlena_physical(
         VarlenaPhysical::Plain(raw) => {
             if data_type == DataType::Text && std::str::from_utf8(raw).is_err() {
                 return Err(corrupt_row("text value is not valid UTF-8"));
+            }
+            if let DataType::Array(element) = &data_type {
+                let array = decode_array_payload(raw)?;
+                if array.element_type() != element.element_type() {
+                    return Err(corrupt_row(
+                        "array payload element type does not match column",
+                    ));
+                }
             }
             put_varlena(bytes, TAG_PLAIN, raw)
         }
@@ -893,6 +1183,15 @@ fn decode_varlena_physical(
                 Ok(DecodedPhysicalValue::Value(Value::Text(text)))
             }
             DataType::Bytea => Ok(DecodedPhysicalValue::Value(Value::Bytes(stored.to_vec()))),
+            DataType::Array(element) => {
+                let array = decode_array_payload(stored)?;
+                if array.element_type() != element.element_type() {
+                    return Err(corrupt_row(
+                        "array payload element type does not match column",
+                    ));
+                }
+                Ok(DecodedPhysicalValue::Value(Value::Array(array)))
+            }
             _ => Err(corrupt_row("plain varlena decoded for fixed-width column")),
         },
         TAG_COMPRESSED => decode_inline_compressed(column, stored),
@@ -1187,17 +1486,19 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 #[cfg(test)]
 mod tests {
     use common::{
-        ColumnDef, CompressionSetting, DataType, FROZEN_XID, INVALID_XID, Key, RelationKind, Row,
-        TableSchema, ToastOptions, Value, XMAX_COMMITTED, XMIN_COMMITTED,
+        ArrayDimension, ArrayType, ColumnDef, CompressionSetting, DataType, FROZEN_XID,
+        INVALID_XID, Key, RelationKind, Row, SqlArray, TableSchema, ToastOptions, Value,
+        XMAX_COMMITTED, XMIN_COMMITTED,
     };
 
     use super::{
         DecodedPhysicalValue, INVALID_TID, MvccHeader, PreparedColumnValue, ROW_FORMAT_VERSION,
         ROW_FORMAT_VERSION_V1, ROW_FORMAT_VERSION_V3, TAG_COMPRESSED, TAG_EXTERNAL, TAG_PLAIN,
         TOAST_POINTER_LEN, ToastPointer, V2_MVCC_HEADER_LEN, VARLENA_LEN_MASK, VarlenaPhysical,
-        decode_inline_compressed, decode_key, decode_physical_row, decode_row, encode_key,
-        encode_row, encode_row_v3_prepared, null_bitmap_len, pack_varlena_len, put_interval,
-        put_numeric, set_mvcc_header_fields, unpack_varlena_len,
+        decode_array_payload, decode_inline_compressed, decode_key, decode_physical_row,
+        decode_row, encode_array_payload, encode_key, encode_row, encode_row_v3_prepared,
+        null_bitmap_len, pack_varlena_len, put_interval, put_numeric, set_mvcc_header_fields,
+        unpack_varlena_len,
     };
 
     fn schema() -> TableSchema {
@@ -1254,6 +1555,26 @@ mod tests {
         let mut schema = schema();
         schema.toast_table_id = Some(2);
         schema
+    }
+
+    fn array_schema() -> TableSchema {
+        let mut schema = schema_with_toast_relation();
+        schema.columns[1].data_type = DataType::Array(ArrayType::new(DataType::Integer).unwrap());
+        schema
+    }
+
+    fn integer_array() -> SqlArray {
+        SqlArray::new(
+            DataType::Integer,
+            vec![ArrayDimension::new(2, -1), ArrayDimension::new(2, 3)],
+            vec![
+                Value::Integer(1),
+                Value::Null,
+                Value::Integer(3),
+                Value::Integer(4),
+            ],
+        )
+        .unwrap()
     }
 
     fn prepared_from_row(row: &Row) -> Vec<PreparedColumnValue> {
@@ -1747,6 +2068,52 @@ mod tests {
         let mut bytes = encode_key(&Key(vec![Value::Integer(1)])).unwrap();
         bytes.push(0);
         assert!(decode_key(&bytes).is_err());
+    }
+
+    #[test]
+    fn array_payload_and_key_round_trip_shape_nulls_and_bounds() {
+        let array = integer_array();
+        let payload = encode_array_payload(&array).unwrap();
+        assert_eq!(decode_array_payload(&payload).unwrap(), array);
+
+        let key = Key(vec![Value::Array(array)]);
+        assert_eq!(decode_key(&encode_key(&key).unwrap()).unwrap(), key);
+    }
+
+    #[test]
+    fn array_rows_round_trip_in_legacy_and_v3_formats() {
+        let row = Row {
+            values: vec![Value::Integer(7), Value::Array(integer_array())],
+        };
+        let legacy = encode_row(&array_schema(), &row, 9).unwrap();
+        assert_eq!(decode_row(&array_schema(), &legacy).unwrap().row, row);
+
+        let prepared = prepared_from_row(&row);
+        let v3 =
+            encode_row_v3_prepared(&array_schema(), &MvccHeader::fresh(9, 0), &prepared).unwrap();
+        assert_eq!(decode_row(&array_schema(), &v3).unwrap().row, row);
+    }
+
+    #[test]
+    fn array_payload_rejects_unknown_version_truncation_and_trailing_bytes() {
+        let payload = encode_array_payload(&integer_array()).unwrap();
+        let mut unknown = payload.clone();
+        unknown[0] += 1;
+        assert!(decode_array_payload(&unknown).is_err());
+        assert!(decode_array_payload(&payload[..payload.len() - 1]).is_err());
+        let mut trailing = payload;
+        trailing.push(0);
+        assert!(decode_array_payload(&trailing).is_err());
+
+        let mut bad_cardinality = encode_array_payload(&integer_array()).unwrap();
+        bad_cardinality[3..7].copy_from_slice(&5_u32.to_le_bytes());
+        assert!(decode_array_payload(&bad_cardinality).is_err());
+
+        let mut bad_numeric = vec![1, 12];
+        bad_numeric.extend_from_slice(&0_u32.to_le_bytes());
+        bad_numeric.extend_from_slice(&1_u32.to_le_bytes());
+        bad_numeric.extend_from_slice(&[0, 0, 0, 0, 0]);
+        assert!(decode_array_payload(&bad_numeric).is_err());
     }
 
     #[test]

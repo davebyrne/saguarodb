@@ -9,6 +9,15 @@ fn toast_value_for_column(schema: &TableSchema, column: usize, raw: Vec<u8>) -> 
             .map(Value::Text)
             .map_err(|_| crate::toast::toast_corruption("TOAST text value is not valid UTF-8")),
         DataType::Bytea => Ok(Value::Bytes(raw)),
+        DataType::Array(ref element_type) => {
+            let array = crate::codec::decode_array_payload(&raw)?;
+            if array.element_type() != element_type.element_type() {
+                return Err(crate::toast::toast_corruption(
+                    "TOAST array element type does not match its column",
+                ));
+            }
+            Ok(Value::Array(array))
+        }
         _ => Err(crate::toast::toast_corruption(
             "TOAST physical value references a non-varlena column",
         )),
@@ -20,7 +29,7 @@ fn validate_toast_sample_column(schema: &TableSchema, column: usize) -> Result<D
         crate::toast::toast_corruption("TOAST physical value references a missing column")
     })?;
     match column.data_type {
-        DataType::Text | DataType::Bytea => Ok(column.data_type.clone()),
+        DataType::Text | DataType::Bytea | DataType::Array(_) => Ok(column.data_type.clone()),
         _ => Err(crate::toast::toast_corruption(
             "TOAST physical value references a non-varlena column",
         )),

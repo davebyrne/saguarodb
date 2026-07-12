@@ -795,8 +795,8 @@ value.
   `FROZEN_XID = 2`; the transaction-id allocator must assign real ids strictly
   above the reserved range (`FIRST_NORMAL_XID = 3`).
 - `Integer`: 8-byte little-endian i64.
-- `Text` and `Bytea` in v1/v2: 4-byte length prefix plus UTF-8/raw bytes.
-- `Text` and `Bytea` in v3: the same 4-byte little-endian length word uses the
+- `Text`, `Bytea`, and arrays in v1/v2: 4-byte length prefix plus logical bytes.
+- `Text`, `Bytea`, and arrays in v3: the same 4-byte little-endian length word uses the
   top two bits as a physical tag and the low 30 bits as `stored_len`:
   - `00 PLAIN`: `stored_len` bytes are the raw logical bytes. This is
     byte-identical to v2 for every supported plain value; v3 plain rows add no
@@ -820,6 +820,18 @@ value.
   cap; encode attempts above it return `SqlState::ProgramLimitExceeded`.
   Decode attempts that find persisted v3 varlena metadata above this cap return
   a corruption-class storage error.
+- Array logical bytes are versioned independently of the row envelope:
+  `[version=1][element_type][ndim:u8][cardinality:u32 LE]`, followed by
+  `ndim` pairs of `[length:u32 LE][lower_bound:i32 LE]`, a one-bit-per-element
+  null bitmap, and row-major non-null scalar element payloads. Element type tags
+  `0..12` cover, in order, integer, text, boolean, date, timestamp, time,
+  timestamptz, interval, bytea, uuid, double, real, and numeric; numeric adds
+  `[precision:u32 LE][scale:u32 LE]`, with `u32::MAX` meaning unconstrained
+  precision. Text/bytea elements have `u32` lengths; other scalar encodings match
+  their row encodings. Array payloads reject unknown versions/tags, impossible
+  shapes, type mismatches, truncated data, bitmap padding bits, and trailing
+  bytes as corruption. The same complete payload, prefixed by a `u32` length,
+  is B-tree key value tag `14`; existing key tags `0..13` are unchanged.
 - External TOAST stream bytes, stored in the hidden TOAST relation's chunk rows,
   are self-describing after consulting the pointer codec:
   - `codec = 0`: `[raw_crc32:u32 LE][raw bytes]`
@@ -1468,8 +1480,8 @@ Legacy user tables with `toast_table_id = None` also encode inline-only: no
 inline compression, no externalization, and a row that cannot fit on one heap page
 returns `ProgramLimitExceeded`.
 
-For user tables with a hidden TOAST relation, non-null `TEXT` and `BYTEA` values
-whose logical byte length is at least `toast.min_value_size` are candidates.
+For user tables with a hidden TOAST relation, non-null `TEXT`, `BYTEA`, and array
+values whose logical byte length is at least `toast.min_value_size` are candidates.
 Storage computes `raw_crc32` over the logical bytes, tries the table's configured
 value compression (`none`, `zstd`, or `zstd_dict` with the active dictionary; when
 `zstd_dict` has no active dictionary it falls back to plain zstd), and keeps an

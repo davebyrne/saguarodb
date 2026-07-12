@@ -2179,6 +2179,50 @@ mod tests {
     }
 
     #[test]
+    fn external_array_is_toasted_and_materialized_on_read() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, _) = bytea_base_and_toast_schema();
+        base.columns[1].data_type =
+            DataType::Array(common::ArrayType::new(DataType::Integer).unwrap());
+        base.toast.min_value_size = 128;
+        base.toast.tuple_target = ToastOptions::MIN_TOAST_TUPLE_TARGET;
+        base.toast.compression = ToastCompression::None;
+        let toast = toast_schema(&base, 2);
+        harness.storage.create_table(&ctx, &base).unwrap();
+        harness.storage.create_table(&ctx, &toast).unwrap();
+        let elements = (0..1_000).map(Value::Integer).collect::<Vec<_>>();
+        let array = common::SqlArray::new(
+            DataType::Integer,
+            vec![common::ArrayDimension::new(1_000, 1)],
+            elements,
+        )
+        .unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Array(array)],
+        };
+        let bytes = harness
+            .storage
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
+            .unwrap();
+        assert!(matches!(
+            decode_physical_row(&base, &bytes).unwrap().values[1],
+            DecodedPhysicalValue::External { .. }
+        ));
+        seed_parent_tuple(&harness, &ctx, &base, &bytes, &pk(1));
+        assert_eq!(harness.storage.get(&ctx, 1, &pk(1)).unwrap(), Some(row));
+    }
+
+    #[test]
     fn prepare_default_auto_uses_1024_min_value_size() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);

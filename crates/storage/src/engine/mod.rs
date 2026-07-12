@@ -1443,7 +1443,11 @@ impl PageBackedStorageEngine {
             .iter()
             .enumerate()
             .filter_map(|(index, column)| {
-                matches!(column.data_type, DataType::Text | DataType::Bytea).then_some(index)
+                matches!(
+                    column.data_type,
+                    DataType::Text | DataType::Bytea | DataType::Array(_)
+                )
+                .then_some(index)
             })
             .collect();
         if max_samples == 0 || max_bytes == 0 || toastable_columns.is_empty() {

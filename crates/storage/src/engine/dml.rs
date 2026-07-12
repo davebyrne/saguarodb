@@ -95,12 +95,22 @@ fn validate_logical_index_keys_fit(
     Ok(())
 }
 
-fn toastable_raw_bytes<'a>(data_type: &DataType, value: &'a Value) -> Option<&'a [u8]> {
-    match (data_type, value) {
-        (DataType::Text, Value::Text(text)) => Some(text.as_bytes()),
-        (DataType::Bytea, Value::Bytes(bytes)) => Some(bytes),
+fn toastable_raw_bytes<'a>(
+    data_type: &DataType,
+    value: &'a Value,
+) -> Result<Option<std::borrow::Cow<'a, [u8]>>> {
+    Ok(match (data_type, value) {
+        (DataType::Text, Value::Text(text)) => Some(std::borrow::Cow::Borrowed(text.as_bytes())),
+        (DataType::Bytea, Value::Bytes(bytes)) => Some(std::borrow::Cow::Borrowed(bytes)),
+        (DataType::Array(element_type), Value::Array(array))
+            if element_type.element_type() == array.element_type() =>
+        {
+            Some(std::borrow::Cow::Owned(crate::codec::encode_array_payload(
+                array,
+            )?))
+        }
         _ => None,
-    }
+    })
 }
 
 fn supported_varlena_len(len: usize) -> Result<u32> {
@@ -197,7 +207,10 @@ fn planned_column_len(
         }
         ToastColumnPlan::Value => logical_value_v3_len(column, value),
         ToastColumnPlan::Varlena(varlena) => {
-            if column.data_type != DataType::Text && column.data_type != DataType::Bytea {
+            if !matches!(
+                column.data_type,
+                DataType::Text | DataType::Bytea | DataType::Array(_)
+            ) {
                 return Err(DbError::storage(
                     SqlState::DatatypeMismatch,
                     format!("value type does not match column {}", column.name),
@@ -205,7 +218,7 @@ fn planned_column_len(
             }
             match varlena {
                 ToastVarlenaPlan::Plain => {
-                    let raw = toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+                    let raw = toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
                         DbError::storage(
                             SqlState::DatatypeMismatch,
                             format!("value type does not match column {}", column.name),
@@ -258,6 +271,12 @@ fn logical_value_v3_len(column: &ColumnDef, value: &Value) -> Result<usize> {
             checked_varlena_len_add(4, value.len())
         }
         Value::Uuid(_) if column.data_type == DataType::Uuid => Ok(16),
+        Value::Array(array) if matches!(&column.data_type, DataType::Array(element) if element.element_type() == array.element_type()) =>
+        {
+            let len = crate::codec::encode_array_payload(array)?.len();
+            supported_varlena_len(len)?;
+            checked_varlena_len_add(4, len)
+        }
         _ => Err(DbError::storage(
             SqlState::DatatypeMismatch,
             format!("value type does not match column {}", column.name),
@@ -317,7 +336,7 @@ fn candidate_stream_payload<'a>(
     schema: &TableSchema,
     row: &'a Row,
     candidate: &'a ToastCandidate,
-) -> Result<&'a [u8]> {
+) -> Result<std::borrow::Cow<'a, [u8]>> {
     match &candidate.stream_payload {
         ToastStreamPayload::RawColumn => {
             let column = schema.columns.get(candidate.column).ok_or_else(|| {
@@ -329,14 +348,14 @@ fn candidate_stream_payload<'a>(
                     "TOAST candidate row value is missing",
                 )
             })?;
-            toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+            toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
                 DbError::storage(
                     SqlState::InternalError,
                     "TOAST raw candidate no longer references a varlena value",
                 )
             })
         }
-        ToastStreamPayload::Owned(payload) => Ok(payload),
+        ToastStreamPayload::Owned(payload) => Ok(std::borrow::Cow::Borrowed(payload)),
     }
 }
 
@@ -365,7 +384,7 @@ fn materialize_prepared_values(
                 values.push(crate::codec::PreparedColumnValue::Value(value.clone()));
             }
             ToastColumnPlan::Varlena(ToastVarlenaPlan::Plain) => {
-                let raw = toastable_raw_bytes(&column.data_type, value).ok_or_else(|| {
+                let raw = toastable_raw_bytes(&column.data_type, value)?.ok_or_else(|| {
                     DbError::storage(
                         SqlState::DatatypeMismatch,
                         format!("value type does not match column {}", column.name),
@@ -471,7 +490,7 @@ impl PageBackedStorageEngine {
                 candidate.stream_codec,
                 candidate.stream_dict_id,
                 candidate.raw_crc32,
-                payload,
+                &payload,
             )?;
             let pointer = self.write_toast_stream(
                 ctx,
@@ -543,12 +562,12 @@ impl PageBackedStorageEngine {
                 plans.push(ToastColumnPlan::Null);
                 continue;
             }
-            let Some(raw) = toastable_raw_bytes(&column.data_type, value) else {
+            let Some(raw) = toastable_raw_bytes(&column.data_type, value)? else {
                 plans.push(ToastColumnPlan::Value);
                 continue;
             };
             let raw_len = supported_varlena_len(raw.len())?;
-            let raw_crc32 = crc32fast::hash(raw);
+            let raw_crc32 = crc32fast::hash(&raw);
             let mut plan = ToastVarlenaPlan::Plain;
             let mut stream_codec = compress::CODEC_NONE;
             let mut stream_dict_id = None;
@@ -557,7 +576,7 @@ impl PageBackedStorageEngine {
 
             if raw.len() >= schema.toast.min_value_size as usize
                 && schema.toast.compression != common::ToastCompression::None
-                && let Some(compressed) = self.try_toast_value_compression(schema, raw)?
+                && let Some(compressed) = self.try_toast_value_compression(schema, &raw)?
                 && raw.len()
                     >= inline_compressed_stored_len(compressed.payload.len())
                         .saturating_add(common::ToastOptions::MIN_TOAST_COMPRESSION_SAVINGS)
