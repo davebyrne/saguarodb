@@ -8,6 +8,7 @@ license.workspace = true
 catalog = { package = "saguarodb-catalog", path = "../catalog" }
 common = { package = "saguarodb-common", path = "../common" }
 planner = { package = "saguarodb-planner", path = "../planner" }
+spill = { package = "saguarodb-spill", path = "../spill" }
 storage = { package = "saguarodb-storage", path = "../storage" }
 
 [dev-dependencies]

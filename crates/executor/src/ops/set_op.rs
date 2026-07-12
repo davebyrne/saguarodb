@@ -1,24 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Ordering;
 
-use common::{ColumnInfo, ExecRow, QueryCancel, Result, Row, StatementContext, Value};
+use common::{ColumnInfo, ExecRow, Result, StatementContext, Value};
 use planner::SetOp;
+use spill::{ExternalSorter, SortedStream, SpillConfig};
 
-use crate::query::{PlanExecutor, collect_all_cancelable};
+use crate::ops::spill_row::SpillRow;
+use crate::query::{PlanExecutor, close_after, open_executor};
 
-/// Executes a set operation (`UNION`/`INTERSECT`/`EXCEPT`) over two sub-plans.
-///
-/// Both arms are materialized on `open` and the result is computed up front, then
-/// drained by `next`. Materialization is required because de-duplication and
-/// membership tests need to see whole inputs; it matches how the engine already
-/// materializes query results. Row equality is structural over the full row with
-/// `NULL == NULL` (a `BTreeSet<Vec<Value>>`, as `DistinctOp` uses), matching SQL
-/// set semantics. Output rows carry no heap identity (a set operation's rows do
-/// not map to single source tuples), like `DistinctOp`/`AggregateOp`.
-///
-/// `all` selects multiset semantics (`UNION ALL` keeps duplicates; `INTERSECT ALL`
-/// and `EXCEPT ALL` use per-row occurrence counts); otherwise the result is
-/// de-duplicated. Both arms produce identically-typed rows (reconciled by the
-/// binder), so the output schema is the left arm's.
+/// Work-memory-bounded UNION/INTERSECT/EXCEPT execution. The first external
+/// sort makes equal rows adjacent, with right rows before left rows so counts
+/// are known before left occurrences are visited. The second sort restores the
+/// selected rows to the engine's established input order.
 pub struct SetOpOp<'a> {
     ctx: StatementContext,
     op: SetOp,
@@ -26,8 +18,8 @@ pub struct SetOpOp<'a> {
     left: Box<dyn PlanExecutor + 'a>,
     right: Box<dyn PlanExecutor + 'a>,
     output_schema: Vec<ColumnInfo>,
-    result: Vec<Row>,
-    index: usize,
+    spill: SpillConfig,
+    stream: Option<SortedStream<SpillRow>>,
 }
 
 impl<'a> SetOpOp<'a> {
@@ -37,6 +29,7 @@ impl<'a> SetOpOp<'a> {
         all: bool,
         left: Box<dyn PlanExecutor + 'a>,
         right: Box<dyn PlanExecutor + 'a>,
+        spill: SpillConfig,
     ) -> Self {
         let output_schema = left.output_schema().to_vec();
         Self {
@@ -46,8 +39,8 @@ impl<'a> SetOpOp<'a> {
             left,
             right,
             output_schema,
-            result: Vec::new(),
-            index: 0,
+            spill,
+            stream: None,
         }
     }
 }
@@ -58,223 +51,347 @@ impl PlanExecutor for SetOpOp<'_> {
     }
 
     fn open(&mut self) -> Result<()> {
-        // `collect_all` opens, drains, and closes each child.
-        let left = collect_all_cancelable(self.left.as_mut(), self.ctx.cancel.as_ref())?;
-        let right = collect_all_cancelable(self.right.as_mut(), self.ctx.cancel.as_ref())?;
-        self.ctx.cancel.check()?;
-        self.result = combine(self.op, self.all, left, right, self.ctx.cancel.as_ref())?;
-        self.index = 0;
+        self.stream = None;
+        let spill_ctx = self.spill.for_operator(self.ctx.cancel.clone());
+        let mut by_key =
+            ExternalSorter::new(spill_ctx.clone(), |left: &SpillRow, right: &SpillRow| {
+                left.keys
+                    .cmp(&right.keys)
+                    .then_with(|| right.source.cmp(&left.source))
+            });
+        let mut ordinal = 0u64;
+        drain_arm(self.left.as_mut(), 0, &mut ordinal, &mut by_key, &self.ctx)?;
+        drain_arm(self.right.as_mut(), 1, &mut ordinal, &mut by_key, &self.ctx)?;
+
+        let mut input = by_key.finish()?;
+        let mut output = ExternalSorter::new(spill_ctx, |left: &SpillRow, right: &SpillRow| {
+            left.ordinal.cmp(&right.ordinal)
+        });
+        let mut current_key: Option<Vec<Value>> = None;
+        let mut right_remaining = 0usize;
+        let mut emitted = false;
+        let mut union_first: Option<SpillRow> = None;
+        while let Some(mut record) = input.next_record()? {
+            self.ctx.cancel.check()?;
+            if current_key.as_ref() != Some(&record.keys) {
+                if let Some(record) = union_first.take() {
+                    output.push(record)?;
+                }
+                current_key = Some(record.keys.clone());
+                right_remaining = 0;
+                emitted = false;
+            }
+            record.row.identity = None;
+            match (self.op, self.all, record.source) {
+                (SetOp::Union, true, _) => output.push(record)?,
+                (SetOp::Union, false, _)
+                    if union_first
+                        .as_ref()
+                        .is_none_or(|first| record.ordinal < first.ordinal) =>
+                {
+                    union_first = Some(record);
+                }
+                (SetOp::Intersect | SetOp::Except, _, 1) => {
+                    right_remaining = right_remaining.checked_add(1).ok_or_else(|| {
+                        common::DbError::internal("set operation occurrence count overflow")
+                    })?;
+                }
+                (SetOp::Intersect, true, 0) if right_remaining > 0 => {
+                    right_remaining -= 1;
+                    output.push(record)?;
+                }
+                (SetOp::Intersect, false, 0) if right_remaining > 0 && !emitted => {
+                    emitted = true;
+                    output.push(record)?;
+                }
+                (SetOp::Except, true, 0) if right_remaining > 0 => right_remaining -= 1,
+                (SetOp::Except, true, 0) => output.push(record)?,
+                (SetOp::Except, false, 0) if right_remaining == 0 && !emitted => {
+                    emitted = true;
+                    output.push(record)?;
+                }
+                _ => {}
+            }
+        }
+        if let Some(record) = union_first {
+            output.push(record)?;
+        }
+        self.stream = Some(output.finish()?);
         Ok(())
     }
 
     fn next(&mut self) -> Result<Option<ExecRow>> {
-        let Some(row) = self.result.get(self.index) else {
-            return Ok(None);
-        };
-        self.index += 1;
-        Ok(Some(ExecRow {
-            row: row.clone(),
-            identity: None,
-        }))
+        self.stream
+            .as_mut()
+            .ok_or_else(|| common::DbError::internal("set operation is not open"))?
+            .next_record()
+            .map(|row| row.map(|row| row.row))
     }
 
     fn close(&mut self) -> Result<()> {
-        self.result = Vec::new();
-        self.index = 0;
+        self.stream = None;
         Ok(())
     }
 }
 
-/// Combine the materialized arms per the operator. The `ALL` (multiset) forms use
-/// per-row occurrence counts; the plain (distinct) forms de-duplicate:
-/// - `UNION ALL` concatenates; `UNION` concatenates and de-duplicates.
-/// - `INTERSECT ALL` emits `min(count_left, count_right)` copies of each row (in
-///   left order); `INTERSECT` emits the distinct left rows present in the right.
-/// - `EXCEPT ALL` emits `max(0, count_left - count_right)` copies of each row (in
-///   left order); `EXCEPT` emits the distinct left rows absent from the right.
-///
-/// All forms use structural whole-row equality with `NULL == NULL`.
-fn combine(
-    op: SetOp,
-    all: bool,
-    left: Vec<ExecRow>,
-    right: Vec<ExecRow>,
-    cancel: &QueryCancel,
-) -> Result<Vec<Row>> {
-    let mut output = Vec::new();
-    match op {
-        SetOp::Union if all => {
-            for exec_row in left.into_iter().chain(right) {
-                cancel.check()?;
-                output.push(exec_row.row);
-            }
+fn drain_arm<C>(
+    arm: &mut dyn PlanExecutor,
+    source: u8,
+    ordinal: &mut u64,
+    sorter: &mut ExternalSorter<SpillRow, C>,
+    ctx: &StatementContext,
+) -> Result<()>
+where
+    C: Fn(&SpillRow, &SpillRow) -> Ordering,
+{
+    open_executor(arm)?;
+    let result = (|| {
+        while let Some(row) = arm.next()? {
+            ctx.cancel.check()?;
+            sorter.push(SpillRow {
+                keys: row.row.values.clone(),
+                row,
+                ordinal: *ordinal,
+                source,
+            })?;
+            *ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| common::DbError::internal("set operation input ordinal overflow"))?;
         }
-        SetOp::Union => {
-            let mut seen = BTreeSet::new();
-            for exec_row in left.into_iter().chain(right) {
-                cancel.check()?;
-                if let Some(row) = keep_first(&mut seen, exec_row.row) {
-                    output.push(row);
-                }
-            }
-        }
-        // INTERSECT ALL: emit a left row while the right arm still has an unmatched
-        // copy of it, consuming one right occurrence per emitted row (so the count
-        // emitted is min(left, right)).
-        SetOp::Intersect if all => {
-            let mut remaining = occurrence_counts(right, cancel)?;
-            for exec_row in left {
-                cancel.check()?;
-                if consume_one(&mut remaining, &exec_row.row.values) {
-                    output.push(exec_row.row);
-                }
-            }
-        }
-        SetOp::Intersect => {
-            let mut right_rows = BTreeSet::new();
-            for exec_row in right {
-                cancel.check()?;
-                right_rows.insert(exec_row.row.values);
-            }
-            let mut emitted = BTreeSet::new();
-            for exec_row in left {
-                cancel.check()?;
-                if right_rows.contains(&exec_row.row.values)
-                    && let Some(row) = keep_first(&mut emitted, exec_row.row)
-                {
-                    output.push(row);
-                }
-            }
-        }
-        // EXCEPT ALL: drop a left row while the right arm still has an unmatched
-        // copy of it (cancelling one right occurrence); emit the surplus (so the
-        // count emitted is max(0, left - right)).
-        SetOp::Except if all => {
-            let mut remaining = occurrence_counts(right, cancel)?;
-            for exec_row in left {
-                cancel.check()?;
-                if !consume_one(&mut remaining, &exec_row.row.values) {
-                    output.push(exec_row.row);
-                }
-            }
-        }
-        SetOp::Except => {
-            let mut right_rows = BTreeSet::new();
-            for exec_row in right {
-                cancel.check()?;
-                right_rows.insert(exec_row.row.values);
-            }
-            let mut emitted = BTreeSet::new();
-            for exec_row in left {
-                cancel.check()?;
-                if !right_rows.contains(&exec_row.row.values)
-                    && let Some(row) = keep_first(&mut emitted, exec_row.row)
-                {
-                    output.push(row);
-                }
-            }
-        }
-    }
-    Ok(output)
-}
-
-/// Return `row` only the first time its values are seen (recording them in `seen`).
-fn keep_first(seen: &mut BTreeSet<Vec<Value>>, row: Row) -> Option<Row> {
-    seen.insert(row.values.clone()).then_some(row)
-}
-
-/// Count how many times each distinct row occurs.
-fn occurrence_counts(
-    rows: Vec<ExecRow>,
-    cancel: &QueryCancel,
-) -> Result<BTreeMap<Vec<Value>, usize>> {
-    let mut counts = BTreeMap::new();
-    for exec_row in rows {
-        cancel.check()?;
-        *counts.entry(exec_row.row.values).or_insert(0) += 1;
-    }
-    Ok(counts)
-}
-
-/// Consume one occurrence of `values` from `counts` if present; returns whether a
-/// count was consumed. `INTERSECT ALL` emits on `true`, `EXCEPT ALL` on `false`.
-fn consume_one(counts: &mut BTreeMap<Vec<Value>, usize>, values: &[Value]) -> bool {
-    match counts.get_mut(values) {
-        Some(count) if *count > 0 => {
-            *count -= 1;
-            true
-        }
-        _ => false,
-    }
+        Ok(())
+    })();
+    close_after(arm, result)
 }
 
 #[cfg(test)]
 mod tests {
-    use common::{CancelReason, SqlState};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use common::{CancelReason, DbError, Key, QueryCancel, Row, RowId, RowIdentity, SqlState};
 
     use super::*;
 
-    fn rows(values: &[i64]) -> Vec<ExecRow> {
-        values
-            .iter()
-            .map(|value| ExecRow {
+    struct RowsOp {
+        rows: VecDeque<ExecRow>,
+        closes: Arc<AtomicUsize>,
+        cancel_on_eof: Option<Arc<QueryCancel>>,
+        fail_next: bool,
+        fail_close: bool,
+    }
+
+    impl PlanExecutor for RowsOp {
+        fn output_schema(&self) -> &[ColumnInfo] {
+            &[]
+        }
+
+        fn open(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn next(&mut self) -> Result<Option<ExecRow>> {
+            if self.fail_next {
+                self.fail_next = false;
+                return Err(DbError::internal("test next failure"));
+            }
+            let row = self.rows.pop_front();
+            if row.is_none()
+                && let Some(cancel) = self.cancel_on_eof.take()
+            {
+                cancel.request(CancelReason::StatementTimeout);
+            }
+            Ok(row)
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.fail_close {
+                Err(DbError::internal("test close failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn input(values: Vec<Value>, closes: Arc<AtomicUsize>) -> Box<dyn PlanExecutor> {
+        Box::new(RowsOp {
+            rows: values
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, value)| ExecRow {
+                    row: Row {
+                        values: vec![value],
+                    },
+                    identity: Some(RowIdentity {
+                        row_id: RowId {
+                            page_num: 1,
+                            slot_num: ordinal as u16,
+                        },
+                        key: Key(vec![Value::Integer(ordinal as i64)]),
+                    }),
+                })
+                .collect(),
+            closes,
+            cancel_on_eof: None,
+            fail_next: false,
+            fail_close: false,
+        })
+    }
+
+    fn value(label: &str) -> Value {
+        Value::Text(format!("{label}{}", "x".repeat(1_000)))
+    }
+
+    fn execute(op: SetOp, all: bool) -> (Vec<Value>, usize, usize, u64) {
+        let left_closes = Arc::new(AtomicUsize::new(0));
+        let right_closes = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(QueryCancel::new());
+        let mut ctx = StatementContext::new(0);
+        ctx.cancel = cancel;
+        let spill = SpillConfig::new(spill::MIN_WORK_MEM_BYTES, std::env::temp_dir());
+        let stats = spill.stats.clone();
+        let mut op = SetOpOp::new(
+            ctx,
+            op,
+            all,
+            input(
+                vec![value("one"), value("one"), value("two"), Value::Null],
+                left_closes.clone(),
+            ),
+            input(
+                vec![
+                    value("one"),
+                    value("two"),
+                    value("two"),
+                    Value::Null,
+                    value("three"),
+                ],
+                right_closes.clone(),
+            ),
+            spill,
+        );
+        op.open().unwrap();
+        let mut values = Vec::new();
+        while let Some(row) = op.next().unwrap() {
+            assert!(row.identity.is_none());
+            values.push(row.row.values.into_iter().next().unwrap());
+        }
+        op.close().unwrap();
+        (
+            values,
+            left_closes.load(Ordering::SeqCst),
+            right_closes.load(Ordering::SeqCst),
+            stats.files_created(),
+        )
+    }
+
+    #[test]
+    fn external_set_operations_preserve_set_multiset_null_and_order_semantics() {
+        assert_eq!(
+            execute(SetOp::Union, true).0,
+            vec![
+                value("one"),
+                value("one"),
+                value("two"),
+                Value::Null,
+                value("one"),
+                value("two"),
+                value("two"),
+                Value::Null,
+                value("three"),
+            ]
+        );
+        assert_eq!(
+            execute(SetOp::Union, false).0,
+            vec![value("one"), value("two"), Value::Null, value("three")]
+        );
+        assert_eq!(
+            execute(SetOp::Intersect, true).0,
+            vec![value("one"), value("two"), Value::Null]
+        );
+        assert_eq!(
+            execute(SetOp::Intersect, false).0,
+            vec![value("one"), value("two"), Value::Null]
+        );
+        assert_eq!(execute(SetOp::Except, true).0, vec![value("one")]);
+        assert!(execute(SetOp::Except, false).0.is_empty());
+        for (op, all) in [
+            (SetOp::Union, true),
+            (SetOp::Union, false),
+            (SetOp::Intersect, true),
+            (SetOp::Intersect, false),
+            (SetOp::Except, true),
+            (SetOp::Except, false),
+        ] {
+            assert!(execute(op, all).3 > 0, "{op:?} all={all} did not spill");
+        }
+        let (_, left_closes, right_closes, _) = execute(SetOp::Union, false);
+        assert_eq!((left_closes, right_closes), (1, 1));
+    }
+
+    #[test]
+    fn set_operation_closes_children_on_next_close_and_cancellation_errors() {
+        let cancel = Arc::new(QueryCancel::new());
+        let left_closes = Arc::new(AtomicUsize::new(0));
+        let right_closes = Arc::new(AtomicUsize::new(0));
+        let left = RowsOp {
+            rows: VecDeque::new(),
+            closes: left_closes.clone(),
+            cancel_on_eof: Some(cancel.clone()),
+            fail_next: false,
+            fail_close: false,
+        };
+        let right = RowsOp {
+            rows: VecDeque::from([ExecRow {
                 row: Row {
-                    values: vec![Value::Integer(*value)],
+                    values: vec![Value::Integer(1)],
                 },
                 identity: None,
-            })
-            .collect()
-    }
-
-    fn ints(rows: Vec<Row>) -> Vec<i64> {
-        rows.into_iter()
-            .map(|row| match row.values.as_slice() {
-                [Value::Integer(value)] => *value,
-                other => panic!("unexpected set-op row: {other:?}"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn cancelable_combine_preserves_set_and_multiset_semantics() {
-        let cancel = QueryCancel::new();
+            }]),
+            closes: right_closes.clone(),
+            cancel_on_eof: None,
+            fail_next: false,
+            fail_close: false,
+        };
+        let mut ctx = StatementContext::new(0);
+        ctx.cancel = cancel;
+        let mut op = SetOpOp::new(
+            ctx,
+            SetOp::Union,
+            false,
+            Box::new(left),
+            Box::new(right),
+            SpillConfig::default(),
+        );
+        assert_eq!(op.open().unwrap_err().code, SqlState::QueryCanceled);
         assert_eq!(
-            ints(
-                combine(
-                    SetOp::Union,
-                    false,
-                    rows(&[1, 1, 2]),
-                    rows(&[2, 3]),
-                    &cancel,
-                )
-                .unwrap()
+            (
+                left_closes.load(Ordering::SeqCst),
+                right_closes.load(Ordering::SeqCst)
             ),
-            vec![1, 2, 3]
+            (1, 1)
         );
-        assert_eq!(
-            ints(
-                combine(
-                    SetOp::Intersect,
-                    true,
-                    rows(&[1, 1, 2]),
-                    rows(&[1, 2, 2]),
-                    &cancel,
-                )
-                .unwrap()
-            ),
-            vec![1, 2]
-        );
-        assert_eq!(
-            ints(combine(SetOp::Except, true, rows(&[1, 1, 2]), rows(&[1]), &cancel,).unwrap()),
-            vec![1, 2]
-        );
-    }
 
-    #[test]
-    fn combine_stops_on_statement_cancellation() {
-        let cancel = QueryCancel::new();
-        cancel.request(CancelReason::StatementTimeout);
-        let err = combine(SetOp::Union, false, rows(&[1, 2]), rows(&[3]), &cancel).unwrap_err();
-        assert_eq!(err.code, SqlState::QueryCanceled);
+        for (fail_next, fail_close) in [(true, false), (false, true)] {
+            let closes = Arc::new(AtomicUsize::new(0));
+            let failing = RowsOp {
+                rows: VecDeque::new(),
+                closes: closes.clone(),
+                cancel_on_eof: None,
+                fail_next,
+                fail_close,
+            };
+            let mut op = SetOpOp::new(
+                StatementContext::new(0),
+                SetOp::Union,
+                false,
+                Box::new(failing),
+                input(Vec::new(), Arc::new(AtomicUsize::new(0))),
+                SpillConfig::default(),
+            );
+            assert!(op.open().is_err());
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+        }
     }
 }

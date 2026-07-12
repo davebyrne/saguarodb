@@ -27,6 +27,11 @@ pub fn open_app(config: Config) -> Result<AppState> {
     let dict_store = Arc::new(compress::DictStore::open(config.data_dir.join("dicts"))?);
     let control: Arc<dyn ControlStore> =
         Arc::new(FileControlStore::open(&config.data_dir, PAGE_SIZE as u32)?);
+    let temp_dir = config.data_dir.join("tmp");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|err| DbError::io(format!("failed to create spill directory: {err}")))?;
+    tempfile::tempfile_in(&temp_dir)
+        .map_err(|err| DbError::io(format!("spill directory is not writable: {err}")))?;
     let store: Arc<dyn PageStore> = Arc::new(HeapPageStore::open_with_compression(
         config.data_dir.join("heap"),
         compression.clone(),
@@ -689,6 +694,15 @@ mod tests {
     use catalog::CatalogManager;
     use storage::RecoveryOperations;
     use wal::{FileWalManager, WalManager, WalRecord, WalRecordKind};
+
+    #[test]
+    fn startup_creates_a_writable_spill_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = super::open_app(super::data_dir_for_test(dir.path())).unwrap();
+        assert!(dir.path().join("tmp").is_dir());
+        tempfile::tempfile_in(dir.path().join("tmp")).unwrap();
+        drop(app);
+    }
 
     fn table_schema(id: common::TableId, name: &str) -> common::TableSchema {
         common::TableSchema {

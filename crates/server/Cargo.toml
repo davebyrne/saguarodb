@@ -17,8 +17,10 @@ control = { package = "saguarodb-control", path = "../control" }
 executor = { package = "saguarodb-executor", path = "../executor" }
 parser = { package = "saguarodb-parser", path = "../parser" }
 planner = { package = "saguarodb-planner", path = "../planner" }
+spill = { package = "saguarodb-spill", path = "../spill" }
 protocol = { package = "saguarodb-protocol", path = "../protocol" }
 storage = { package = "saguarodb-storage", path = "../storage" }
+tempfile.workspace = true
 wal = { package = "saguarodb-wal", path = "../wal" }
 getrandom = "0.2"
 rustls-pemfile.workspace = true
@@ -28,4 +30,3 @@ tokio-rustls.workspace = true
 [dev-dependencies]
 libc.workspace = true
 rcgen.workspace = true
-tempfile.workspace = true

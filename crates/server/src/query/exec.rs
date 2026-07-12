@@ -218,6 +218,7 @@ impl QueryService {
                     txn.current_default_isolation(default_isolation),
                     txn.isolation,
                     txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+                    txn.current_work_mem_kib(session.work_mem_kib()),
                 );
                 let (slot, result) = self.run_in_transaction(txn, class, statement, runtime, sink);
                 (slot, default_isolation, result)
@@ -767,6 +768,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                         )
                         .map(StreamOutcome::Direct);
@@ -793,6 +795,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                             sink,
                             captured,
@@ -810,6 +813,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                         )
                         .map(StreamOutcome::Direct)
@@ -824,6 +828,7 @@ impl QueryService {
                         default_isolation,
                         default_isolation,
                         session.statement_timeout_ms(),
+                        session.work_mem_kib(),
                     ),
                 )
                 .map(StreamOutcome::Direct),

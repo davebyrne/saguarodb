@@ -28,6 +28,7 @@ pub(super) struct StatementRuntime<'a> {
     system_state: Arc<dyn SystemStateProvider>,
     catalog_introspection: Arc<dyn CatalogIntrospectionProvider>,
     catalog_introspection_is_explicit: bool,
+    work_mem_kib: u64,
 }
 
 pub(crate) struct CapturedSnapshots {
@@ -57,6 +58,7 @@ impl<'a> StatementRuntime<'a> {
         cancel: &'a Arc<QueryCancel>,
         session_sequences: Arc<SessionSequenceState>,
         session_info: Arc<SessionInfo>,
+        work_mem_kib: u64,
     ) -> Self {
         Self {
             cancel,
@@ -66,6 +68,7 @@ impl<'a> StatementRuntime<'a> {
             system_state: no_system_state(),
             catalog_introspection: no_catalog_introspection(),
             catalog_introspection_is_explicit: false,
+            work_mem_kib,
         }
     }
 
@@ -167,11 +170,13 @@ impl QueryService {
                     let committed_default = txn.committed_default_isolation(default_isolation);
                     let committed_statement_timeout =
                         txn.committed_statement_timeout_ms(gucs.statement_timeout_ms());
+                    let committed_work_mem = txn.committed_work_mem_kib(gucs.work_mem_kib());
                     let result = self
                         .commit_transaction(txn, cancel.as_ref())
                         .map(|()| commit_complete());
                     let default_isolation = if result.is_ok() {
                         gucs.set("statement_timeout", committed_statement_timeout.to_string());
+                        gucs.set("work_mem", committed_work_mem.to_string());
                         committed_default
                     } else {
                         default_isolation
@@ -257,6 +262,7 @@ impl QueryService {
                     relation_generation_changed: txn.relation_generation_changed,
                     catalog_overlay,
                     storage,
+                    work_mem_override: txn.work_mem_override,
                 });
                 (Some(txn), default_isolation, Ok(savepoint_complete()))
             }
@@ -300,6 +306,7 @@ impl QueryService {
                             txn.savepoints[idx].relation_generation_changed;
                         let catalog_overlay = txn.savepoints[idx].catalog_overlay.clone();
                         let storage = txn.savepoints[idx].storage.clone();
+                        let work_mem_override = txn.savepoints[idx].work_mem_override;
                         let rolled: Vec<u64> = txn
                             .live_subxids
                             .iter()
@@ -345,6 +352,7 @@ impl QueryService {
                         txn.statement_timeout_override = statement_timeout_override;
                         txn.truncate_updates = truncate_updates.clone();
                         txn.relation_generation_changed = relation_generation_changed;
+                        txn.work_mem_override = work_mem_override;
                         // Re-establish the named level with a fresh subxid so work can
                         // continue under it (PostgreSQL keeps the savepoint active).
                         let fresh = self.register_active_subxid(txn.txn_id);
@@ -358,6 +366,7 @@ impl QueryService {
                             relation_generation_changed,
                             catalog_overlay,
                             storage,
+                            work_mem_override,
                         });
                         // ROLLBACK TO recovers a failed ('E') block to this savepoint.
                         txn.failed = false;
@@ -492,6 +501,7 @@ impl QueryService {
             isolation,
             default_isolation_override: None,
             statement_timeout_override: None,
+            work_mem_override: None,
             first_statement_ran: false,
             failed: false,
             physically_aborted: false,
@@ -1188,6 +1198,10 @@ impl QueryService {
             schema_ops: self.components.storage.as_ref(),
             gc_horizon,
             cancel: runtime.cancel.as_ref(),
+            spill: spill::SpillConfig::new(
+                runtime.work_mem_kib.saturating_mul(1024),
+                self.components.config.data_dir.join("tmp"),
+            ),
         })
     }
 

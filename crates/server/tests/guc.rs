@@ -91,6 +91,49 @@ async fn set_show_reset_and_accept_all_gucs_are_session_local() {
 }
 
 #[tokio::test]
+async fn work_mem_is_validated_displayed_and_transactional() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+
+    assert_eq!(
+        conn.ok("SHOW work_mem").await.rows(),
+        vec![vec![Some("4MB".to_string())]]
+    );
+    conn.ok("SET work_mem = '1536kB'").await.rows();
+    assert_eq!(
+        conn.ok("select current_setting('work_mem')").await.rows(),
+        vec![vec![Some("1536kB".to_string())]]
+    );
+
+    conn.ok("BEGIN").await.rows();
+    conn.ok("SAVEPOINT before_local").await.rows();
+    conn.ok("SET LOCAL work_mem = '2MB'").await.rows();
+    assert_eq!(
+        conn.ok("SHOW work_mem").await.rows(),
+        vec![vec![Some("2MB".to_string())]]
+    );
+    conn.ok("ROLLBACK TO SAVEPOINT before_local").await.rows();
+    assert_eq!(
+        conn.ok("SHOW work_mem").await.rows(),
+        vec![vec![Some("1536kB".to_string())]]
+    );
+    conn.ok("SET work_mem = '3MB'").await.rows();
+    conn.ok("COMMIT").await.rows();
+    assert_eq!(
+        conn.ok("SHOW work_mem").await.rows(),
+        vec![vec![Some("3MB".to_string())]]
+    );
+
+    conn.ok("RESET work_mem").await.rows();
+    assert_eq!(
+        conn.ok("SHOW work_mem").await.rows(),
+        vec![vec![Some("4MB".to_string())]]
+    );
+    let message = error_message(&conn.ok("SET work_mem = '63kB'").await);
+    assert!(message.contains("C=22023"), "got {message}");
+}
+
+#[tokio::test]
 async fn statement_timeout_is_validated_and_displayed_with_postgres_units() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

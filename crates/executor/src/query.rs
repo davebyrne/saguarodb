@@ -22,8 +22,8 @@ use crate::eval_expr;
 use crate::expr::cast_value_to_pg_type;
 use crate::ops::SystemScanOp;
 use crate::ops::{
-    AggregateOp, DistinctOp, FilterOp, HashJoinOp, IndexScanInput, IndexScanOp, LimitOp,
-    NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, TableFunctionOp, ValuesOp,
+    AggregateOp, DistinctOp, FilterOp, HashJoinInput, HashJoinOp, IndexScanInput, IndexScanOp,
+    LimitOp, NestedLoopJoinOp, ProjectionOp, SeqScanOp, SetOpOp, SortOp, TableFunctionOp, ValuesOp,
 };
 
 pub struct ExecutionContext<'a> {
@@ -41,6 +41,9 @@ pub struct ExecutionContext<'a> {
     /// Set from another connection's `CancelRequest`; the engine polls it
     /// between rows and aborts with `QueryCanceled` when it becomes true.
     pub cancel: &'a QueryCancel,
+    /// Per-operator memory budget and temporary-file location for blocking
+    /// relational operators.
+    pub spill: spill::SpillConfig,
 }
 
 /// Abort with `QueryCanceled` if a cancellation has been requested. Called
@@ -552,6 +555,7 @@ pub(crate) fn build_executor<'a>(
                 condition.clone(),
                 *join_type,
                 *identity_from,
+                ctx.spill.clone(),
             )))
         }
         PhysicalPlan::HashJoin {
@@ -565,16 +569,17 @@ pub(crate) fn build_executor<'a>(
         } => {
             let left = build_executor(ctx, left)?;
             let right = build_executor(ctx, right)?;
-            Ok(Box::new(HashJoinOp::new(
-                ctx.statement.clone(),
+            Ok(Box::new(HashJoinOp::new(HashJoinInput {
+                ctx: ctx.statement.clone(),
                 left,
                 right,
-                left_keys.clone(),
-                right_keys.clone(),
-                *join_type,
-                *identity_from,
-                *build_left,
-            )))
+                left_keys: left_keys.clone(),
+                right_keys: right_keys.clone(),
+                join_type: *join_type,
+                identity_from: *identity_from,
+                build_left: *build_left,
+                spill: ctx.spill.clone(),
+            })))
         }
         PhysicalPlan::Apply {
             input,
@@ -632,11 +637,13 @@ pub(crate) fn build_executor<'a>(
             ctx.statement.clone(),
             build_executor(ctx, source)?,
             on_keys.clone(),
+            ctx.spill.clone(),
         ))),
         PhysicalPlan::Sort { source, order_by } => Ok(Box::new(SortOp::new(
             ctx.statement.clone(),
             build_executor(ctx, source)?,
             order_by.clone(),
+            ctx.spill.clone(),
         ))),
         PhysicalPlan::Limit {
             source,
@@ -659,6 +666,7 @@ pub(crate) fn build_executor<'a>(
             group_by.clone(),
             aggregates.clone(),
             output_schema.clone(),
+            ctx.spill.clone(),
         ))),
         PhysicalPlan::Values {
             rows,
@@ -689,6 +697,7 @@ pub(crate) fn build_executor<'a>(
             *all,
             build_executor(ctx, left)?,
             build_executor(ctx, right)?,
+            ctx.spill.clone(),
         ))),
         PhysicalPlan::CreateSchema { .. }
         | PhysicalPlan::DropSchema { .. }

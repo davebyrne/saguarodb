@@ -133,11 +133,16 @@ impl QuerySessionContext {
         self.gucs.statement_timeout_ms()
     }
 
+    fn work_mem_kib(&self) -> u64 {
+        self.gucs.work_mem_kib()
+    }
+
     fn statement_runtime(
         &self,
         default_isolation: IsolationLevel,
         transaction_isolation: IsolationLevel,
         statement_timeout_ms: u64,
+        work_mem_kib: u64,
     ) -> StatementRuntime<'_> {
         let system_state = self.system_state_override.clone().unwrap_or_else(|| {
             Arc::new(QuerySystemState {
@@ -146,12 +151,14 @@ impl QuerySessionContext {
                 default_isolation,
                 transaction_isolation,
                 statement_timeout_ms,
+                work_mem_kib,
             })
         });
         StatementRuntime::new(
             &self.cancel,
             self.session_sequences.clone(),
             self.session_info.clone(),
+            work_mem_kib,
         )
         .with_search_path_names(self.gucs.search_path_names(&self.session_info.user))
         .with_system_state(system_state)
@@ -171,6 +178,7 @@ struct QuerySystemState {
     default_isolation: IsolationLevel,
     transaction_isolation: IsolationLevel,
     statement_timeout_ms: u64,
+    work_mem_kib: u64,
 }
 
 impl SystemStateProvider for QuerySystemState {
@@ -179,12 +187,16 @@ impl SystemStateProvider for QuerySystemState {
             self.default_isolation,
             self.transaction_isolation,
             self.statement_timeout_ms,
+            self.work_mem_kib,
         )
     }
 
     fn setting(&self, name: &str) -> Option<String> {
         if name.eq_ignore_ascii_case("statement_timeout") {
             return Some(gucs::display_statement_timeout(self.statement_timeout_ms));
+        }
+        if name.eq_ignore_ascii_case("work_mem") {
+            return Some(gucs::display_work_mem(self.work_mem_kib));
         }
         self.settings()
             .into_iter()
@@ -673,6 +685,8 @@ pub struct Transaction {
     /// Transactional changes to `statement_timeout`, with the same `SET` versus
     /// `SET LOCAL` lifetime rules as PostgreSQL GUCs.
     statement_timeout_override: Option<StatementTimeoutOverride>,
+    /// Transactional changes to `work_mem`, parallel to `statement_timeout`.
+    work_mem_override: Option<WorkMemOverride>,
     /// `true` once the transaction has run its first query/data statement (i.e.
     /// captured its snapshot). `SET TRANSACTION ISOLATION LEVEL` is only valid
     /// while this is `false` (Postgres: "SET TRANSACTION ... must be called before
@@ -750,6 +764,12 @@ struct StatementTimeoutOverride {
     on_commit_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct WorkMemOverride {
+    current_kib: u64,
+    on_commit_kib: Option<u64>,
+}
+
 /// One open savepoint: its name and the subxid that owns writes made under it.
 struct SavepointLevel {
     name: String,
@@ -760,6 +780,7 @@ struct SavepointLevel {
     relation_generation_changed: bool,
     catalog_overlay: CatalogOverlaySavepoint,
     storage: storage::StorageSavepoint,
+    work_mem_override: Option<WorkMemOverride>,
 }
 
 impl Transaction {
@@ -818,6 +839,35 @@ impl Transaction {
         self.statement_timeout_override = Some(StatementTimeoutOverride {
             current_ms: timeout_ms,
             on_commit_ms,
+        });
+    }
+
+    pub(crate) fn current_work_mem_kib(&self, session_work_mem_kib: u64) -> u64 {
+        self.work_mem_override
+            .map(|override_state| override_state.current_kib)
+            .unwrap_or(session_work_mem_kib)
+    }
+
+    fn committed_work_mem_kib(&self, session_work_mem_kib: u64) -> u64 {
+        self.work_mem_override
+            .and_then(|override_state| override_state.on_commit_kib)
+            .unwrap_or(session_work_mem_kib)
+    }
+
+    fn set_work_mem(&mut self, work_mem_kib: u64) {
+        self.work_mem_override = Some(WorkMemOverride {
+            current_kib: work_mem_kib,
+            on_commit_kib: Some(work_mem_kib),
+        });
+    }
+
+    fn set_local_work_mem(&mut self, work_mem_kib: u64) {
+        let on_commit_kib = self
+            .work_mem_override
+            .and_then(|override_state| override_state.on_commit_kib);
+        self.work_mem_override = Some(WorkMemOverride {
+            current_kib: work_mem_kib,
+            on_commit_kib,
         });
     }
 
@@ -1673,6 +1723,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                             sink,
                             captured,
@@ -1688,6 +1739,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                             Some(&prepared.schema_versions),
                         )
@@ -1702,6 +1754,7 @@ impl QueryService {
                         default_isolation,
                         default_isolation,
                         session.statement_timeout_ms(),
+                        session.work_mem_kib(),
                     ),
                     Some(&prepared.schema_versions),
                 )
@@ -1910,6 +1963,7 @@ impl QueryService {
                     txn.current_default_isolation(default_isolation),
                     txn.isolation,
                     txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+                    txn.current_work_mem_kib(session.work_mem_kib()),
                 );
                 let (slot, result) = self.run_bound_in_transaction(
                     txn,
@@ -1949,6 +2003,7 @@ impl QueryService {
                                                     default_isolation,
                                                     default_isolation,
                                                     session.statement_timeout_ms(),
+                                                    session.work_mem_kib(),
                                                 ),
                                                 sink,
                                                 captured,
@@ -1965,6 +2020,7 @@ impl QueryService {
                                         default_isolation,
                                         default_isolation,
                                         session.statement_timeout_ms(),
+                                        session.work_mem_kib(),
                                     ),
                                     Some(&prepared.schema_versions),
                                 )
@@ -1979,6 +2035,7 @@ impl QueryService {
                                 default_isolation,
                                 default_isolation,
                                 session.statement_timeout_ms(),
+                                session.work_mem_kib(),
                             ),
                             Some(&prepared.schema_versions),
                         )

@@ -962,6 +962,7 @@ dependencies = [
  "saguarodb-common",
  "saguarodb-parser",
  "saguarodb-planner",
+ "saguarodb-spill",
  "saguarodb-storage",
 ]
 
@@ -1007,11 +1008,20 @@ dependencies = [
  "saguarodb-parser",
  "saguarodb-planner",
  "saguarodb-protocol",
+ "saguarodb-spill",
  "saguarodb-storage",
  "saguarodb-wal",
  "tempfile",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "saguarodb-spill"
+version = "0.1.0"
+dependencies = [
+ "saguarodb-common",
+ "tempfile",
 ]
 
 [[package]]

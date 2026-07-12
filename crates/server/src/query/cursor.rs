@@ -273,6 +273,7 @@ fn run_autocommit_cursor_worker(input: CursorWorkerInput) {
         default_isolation,
         default_isolation,
         session.statement_timeout_ms(),
+        session.work_mem_kib(),
     );
     let ctx = match service.execution_context_for_bound(
         ExecutionContextInput {
@@ -414,6 +415,7 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         txn.current_default_isolation(default_isolation),
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+        txn.current_work_mem_kib(session.work_mem_kib()),
     );
     let ctx = match service.execution_context_with_selected_catalog(
         ExecutionContextInput {
@@ -560,6 +562,7 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
         txn.current_default_isolation(default_isolation),
         txn.isolation,
         txn.current_statement_timeout_ms(session.statement_timeout_ms()),
+        txn.current_work_mem_kib(session.work_mem_kib()),
     );
     let ctx = match service.execution_context_with_selected_catalog(
         ExecutionContextInput {

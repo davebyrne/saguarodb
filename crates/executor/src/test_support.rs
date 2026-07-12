@@ -75,6 +75,15 @@ impl ExecutorHarness {
     }
 
     pub fn execute_with_cancel(&self, sql: &str, cancel: &QueryCancel) -> Result<ExecutionResult> {
+        self.execute_with_spill(sql, cancel, spill::SpillConfig::default())
+    }
+
+    pub fn execute_with_spill(
+        &self,
+        sql: &str,
+        cancel: &QueryCancel,
+        spill: spill::SpillConfig,
+    ) -> Result<ExecutionResult> {
         let statement = parser::parse(sql)?;
         let bound = bind(&statement, self.catalog.as_ref())?;
         let logical = logical_plan(&bound)?;
@@ -90,6 +99,7 @@ impl ExecutorHarness {
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel,
+            spill,
         };
         let result = self.engine.execute(&ctx, &physical);
         if is_read {
@@ -149,6 +159,7 @@ impl ExecutorHarness {
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         self.engine
             .execute_query_streamed(&ctx, &physical, sink, batch_size)
@@ -202,6 +213,7 @@ impl ExecutorHarness {
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let result = (|| {
             let mut copy_in =
@@ -244,6 +256,7 @@ impl ExecutorHarness {
             schema_ops: &self.storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let mut out = CopyOut::new(&ctx, schema, columns, options)?;
         let mut bytes = Vec::new();

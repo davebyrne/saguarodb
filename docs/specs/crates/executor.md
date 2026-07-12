@@ -20,6 +20,7 @@ user object's schema.
 - `catalog`
 - `storage`
 - `planner` plan types
+- `spill` query-local memory budgets, temporary tapes, and external sorting
 
 ## Execution Model
 
@@ -118,6 +119,7 @@ pub struct ExecutionContext<'a> {
     pub storage: &'a dyn StorageEngine,
     pub schema_ops: &'a dyn SchemaOperations,
     pub cancel: &'a QueryCancel,
+    pub spill: spill::SpillConfig,
 }
 
 pub struct QueryEngine;
@@ -127,6 +129,12 @@ impl QueryEngine {
 }
 ```
 
+`spill` is captured when a query or portal is opened. Every blocking/stateful
+physical operator derives an independent operator budget; multiple spill
+structures internal to one operator share that operator's budget. Library/test
+contexts may use `SpillConfig::default`; the server supplies the effective
+session `work_mem` and `<data-dir>/tmp`.
+
 The owned catalog handle is normally the live catalog. For statements that scan
 virtual system catalogs, the server instead installs an immutable statement
 snapshot captured under its shared catalog-publication gate after object-lock
@@ -135,7 +143,7 @@ ordinary data statements.
 
 `QueryEngine::execute` passes `ctx.statement` to storage and schema operations. It does not allocate transaction IDs, append commit records, flush WAL, or call storage/buffer commit or rollback; server query orchestration owns those statement-level concerns.
 
-`ctx.cancel` is a `QueryCancel` polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops. Its first recorded `CancelReason` selects the `QueryCanceled` message (`due to user request` or `due to statement timeout`). Materializing executor paths use `collect_all_cancelable`, which polls while draining children; scan/filter/distinct row-suppression loops and LIMIT offset skipping poll directly; nested-loop and hash join builds poll their outer/inner build loops; aggregate evaluation polls input rows; sort builds stable 256-row sorted runs and merges them bottom-up while polling between runs and every 256 merged rows; and every set-operation combine/count/build loop polls directly. A long blocking `open()` therefore cannot hide an expired statement timer until the full result has been built.
+`ctx.cancel` is a `QueryCancel` polled between rows in the row-producing loop and the INSERT/UPDATE/DELETE write loops. Its first recorded `CancelReason` selects the `QueryCanceled` message (`due to user request` or `due to statement timeout`). Materializing executor paths use `collect_all_cancelable`, which polls while draining children; scan/filter row-suppression loops and LIMIT offset skipping poll directly; nested-loop and hash join builds poll their outer/inner build loops; aggregate evaluation polls input rows; and the external sorter polls while accepting, sorting, spilling, merging, and emitting records. DISTINCT and set-operation drain/group loops also poll directly. A long blocking `open()` therefore cannot hide an expired statement timer until the full result has been built.
 
 ## Operators
 
@@ -144,14 +152,15 @@ ordinary data statements.
 | `SeqScanOp` | Calls `StorageEngine::scan`, converts `StoredRow` to `ExecRow`, and applies the scan filter. A missing table generation is an execution error; statement locking/revalidation must make it unreachable during normal execution |
 | `IndexScanOp` | For the primary-key index calls `StorageEngine::scan_range`; for a secondary index calls `StorageEngine::index_scan`. If a planned secondary index is defensively unavailable in the statement-captured relation generation, falls back to `StorageEngine::scan` and applies `PhysicalPlan::IndexScan.full_filter`. Missing table generations are execution errors. Converts `StoredRow` to `ExecRow`, then applies the active filter (`filter` for normal index scans, `full_filter` for fallback) when present |
 | `SystemScanOp` | Materializes virtual catalog rows from the immutable statement catalog/provider snapshot captured by the server after lock convergence; applies filters and emits rows with no identity |
-| `NestedLoopJoinOp` | Buffers right side, implements inner/cross/left/right/full joins with NULL extension for missing side rows, emits concatenated rows, clears identity |
-| `HashJoinOp` | Inner equi-join: builds an in-memory hash table over one side (right by default; left when the planner set `build_left` — `docs/specs/statistics.md` §9.2) and streams the other, probing one row at a time; rows with a NULL key column never match; emits concatenated left ++ right rows regardless of build side, clears identity (kept for a DML spine) |
+| `NestedLoopJoinOp` | Stores both inputs in `work_mem`-bounded rewindable spill tapes, streams inner/cross/semi/anti/left/right/full results, records matched right ordinals in a bounded external sorter so volatile predicates run only once per pair, and applies NULL extension; clears identity except documented semi/anti and DML-spine cases |
+| `HashJoinOp` | Builds the planner-selected side (right by default; left when statistics estimate it is smaller) in a reservation-accounted, key-sorted contiguous table while it fits, then releases it and falls back to a bounded rewindable spill-tape probe. NULL keys never match; output remains logical left ++ right regardless of build side and is streamed rather than buffered |
 | `FilterOp` | Evaluates predicate, preserves identity |
 | `ProjectionOp` | Rewrites row values, preserves identity |
-| `SortOp` | Materializes all input, sorts in memory, preserves identity |
-| `DistinctOp` | Streams input, emitting the first row of each distinct `on_keys` tuple (tracked in a `BTreeSet`) and dropping later duplicates; NULL keys collapse together; clears identity |
+| `SortOp` | Evaluates sort keys once, uses the query's `work_mem`-bounded stable external sorter, spills anonymous runs under the configured temporary directory when needed, streams the merged result, and preserves identity |
+| `DistinctOp` | Uses bounded external key and ordinal sorts to emit the first input row of each distinct `on_keys` tuple in input order; NULL keys collapse together; clears identity |
 | `LimitOp` | Skips offset, emits count rows, preserves identity |
-| `AggregateOp` | Groups input by the `GROUP BY` expressions (a single group when there is none), emits one row per group, de-duplicates `DISTINCT` aggregate arguments, clears identity |
+| `AggregateOp` | Global aggregates fold directly without a group sort. Grouped aggregates use a bounded external key sort and stream one group at a time through constant-memory non-DISTINCT states; each DISTINCT expression uses a bounded argument sorter sharing the operator budget (metadata/file use scales with the number of DISTINCT expressions), variance uses an online state, and identity is cleared |
+| `SetOpOp` | Uses bounded external key and ordinal sorts for UNION/INTERSECT/EXCEPT distinct and multiset semantics, preserves the established left-to-right output order, and clears identity |
 | `ValuesOp` | Emits literal rows, identity is `None` |
 
 `COPY TO` uses the same table scan and row decoding as SELECT, then formats the

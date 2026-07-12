@@ -31,9 +31,9 @@ mod tests {
     };
     use planner::{BinOp, BoundExpr, PhysicalPlan, UnaryOp};
 
-    use crate::ops::{join_rows, project_row};
+    use crate::ops::{NestedLoopJoinOp, ValuesOp, join_rows, project_row};
     use crate::test_support::{ExecutorHarness, MemoryStorage};
-    use crate::{ExecutionContext, ExecutionResult, QueryEngine, eval_expr};
+    use crate::{ExecutionContext, ExecutionResult, PlanExecutor, QueryEngine, eval_expr};
     use storage::{SchemaOperations, StorageEngine};
 
     #[derive(Debug, Default)]
@@ -118,6 +118,269 @@ mod tests {
             eval_expr(&StatementContext::new(0), &expr, &row).unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn sort_spills_under_a_small_work_mem_budget() {
+        let harness = ExecutorHarness::with_users();
+        let values = (0..100)
+            .rev()
+            .map(|id| format!("({id}, '{}')", "x".repeat(200)))
+            .collect::<Vec<_>>()
+            .join(",");
+        harness
+            .execute(&format!("INSERT INTO users VALUES {values}"))
+            .unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let spill = spill::SpillConfig::new(spill::MIN_WORK_MEM_BYTES, temp_dir);
+        let stats = spill.stats.clone();
+        let result = harness
+            .execute_with_spill(
+                "SELECT id FROM users ORDER BY id",
+                &common::QueryCancel::new(),
+                spill,
+            )
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = result else {
+            panic!("expected query result");
+        };
+
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].values, vec![Value::Integer(0)]);
+        assert_eq!(rows[99].values, vec![Value::Integer(99)]);
+        assert!(stats.files_created() > 0);
+    }
+
+    #[test]
+    fn distinct_and_set_operations_spill_under_a_small_work_mem_budget() {
+        let harness = ExecutorHarness::with_users();
+        let values = (0..100)
+            .map(|id| format!("({id}, 'group{}{}')", id % 7, "x".repeat(100)))
+            .collect::<Vec<_>>()
+            .join(",");
+        harness
+            .execute(&format!("INSERT INTO users VALUES {values}"))
+            .unwrap();
+        let cancel = common::QueryCancel::new();
+
+        let distinct_spill =
+            spill::SpillConfig::new(spill::MIN_WORK_MEM_BYTES, std::env::temp_dir());
+        let distinct_stats = distinct_spill.stats.clone();
+        let distinct = harness
+            .execute_with_spill("SELECT DISTINCT name FROM users", &cancel, distinct_spill)
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = distinct else {
+            panic!("expected query result");
+        };
+        assert_eq!(rows.len(), 7);
+        assert!(distinct_stats.files_created() > 0);
+
+        let set_spill = spill::SpillConfig::new(spill::MIN_WORK_MEM_BYTES, std::env::temp_dir());
+        let set_stats = set_spill.stats.clone();
+        let set_result = harness
+            .execute_with_spill(
+                "SELECT id FROM users WHERE id < 80 INTERSECT SELECT id FROM users WHERE id >= 20",
+                &cancel,
+                set_spill,
+            )
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = set_result else {
+            panic!("expected query result");
+        };
+        assert_eq!(rows.len(), 60);
+        assert_eq!(rows[0].values, vec![Value::Integer(20)]);
+        assert_eq!(rows[59].values, vec![Value::Integer(79)]);
+        assert!(set_stats.files_created() > 0);
+    }
+
+    #[test]
+    fn nested_loop_and_hash_joins_spill_under_a_small_work_mem_budget() {
+        let harness = ExecutorHarness::with_users();
+        let values = (0..100)
+            .map(|id| {
+                if id % 10 == 0 {
+                    format!("({id}, NULL)")
+                } else {
+                    format!("({id}, '{}')", "x".repeat(200))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        harness
+            .execute(&format!("INSERT INTO users VALUES {values}"))
+            .unwrap();
+        let cancel = common::QueryCancel::new();
+
+        for sql in [
+            "SELECT l.id, r.id FROM users l JOIN users r ON l.id < r.id",
+            "SELECT l.id, r.id FROM users l JOIN users r ON l.id = r.id",
+            "SELECT l.id, r.id FROM users l CROSS JOIN users r",
+            "SELECT l.id, r.id FROM users l LEFT JOIN users r ON l.id + 1 = r.id",
+            "SELECT l.id, r.id FROM users l RIGHT JOIN users r ON l.id + 1 = r.id",
+            "SELECT l.id, r.id FROM users l FULL JOIN users r ON l.id + 1 = r.id",
+            "SELECT l.id, r.id FROM users l JOIN users r ON l.name = r.name",
+        ] {
+            let expected = harness.execute(sql).unwrap();
+            let spill = spill::SpillConfig::new(spill::MIN_WORK_MEM_BYTES, std::env::temp_dir());
+            let stats = spill.stats.clone();
+            let result = harness.execute_with_spill(sql, &cancel, spill).unwrap();
+            let ExecutionResult::Query { rows, .. } = result else {
+                panic!("expected query result");
+            };
+            let ExecutionResult::Query {
+                rows: expected_rows,
+                ..
+            } = expected
+            else {
+                panic!("expected query result");
+            };
+            assert_eq!(rows, expected_rows, "memory/spill mismatch: {sql}");
+            assert!(stats.files_created() > 0, "join did not spill: {sql}");
+            assert!(stats.peak_reserved_bytes() <= spill::MIN_WORK_MEM_BYTES);
+        }
+    }
+
+    #[test]
+    fn small_nested_loop_join_stays_in_memory() {
+        let harness = ExecutorHarness::with_users();
+        harness
+            .execute("INSERT INTO users VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let spill = spill::SpillConfig::new(64 * 1024, std::env::temp_dir());
+        let stats = spill.stats.clone();
+        let result = harness
+            .execute_with_spill(
+                "SELECT l.id, r.id FROM users l JOIN users r ON l.id < r.id",
+                &common::QueryCancel::new(),
+                spill,
+            )
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = result else {
+            panic!("expected query result");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(stats.files_created(), 0);
+
+        let spill = spill::SpillConfig::new(64 * 1024, std::env::temp_dir());
+        let stats = spill.stats.clone();
+        let result = harness
+            .execute_with_spill(
+                "SELECT l.id FROM users l JOIN users r ON l.id = r.id",
+                &common::QueryCancel::new(),
+                spill,
+            )
+            .unwrap();
+        let ExecutionResult::Query { rows, .. } = result else {
+            panic!("expected query result");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(stats.files_created(), 0);
+        assert!(stats.peak_reserved_bytes() <= 64 * 1024);
+    }
+
+    #[test]
+    fn right_join_does_not_reevaluate_volatile_predicate_for_unmatched_rows() {
+        let sequences = Arc::new(TestSequenceManager::with_next_values(vec![1, 2, 3, 4, 5]));
+        let mut statement = StatementContext::new(0);
+        statement.sequence_manager = sequences.clone();
+        let literal_row = |value| {
+            vec![BoundExpr::Literal {
+                value: Value::Integer(value),
+                data_type: DataType::Integer,
+                nullable: false,
+            }]
+        };
+        let left = Box::new(ValuesOp::new(
+            statement.clone(),
+            vec![literal_row(1), literal_row(2)],
+            Vec::new(),
+        ));
+        let right = Box::new(ValuesOp::new(
+            statement.clone(),
+            vec![literal_row(3), literal_row(4)],
+            Vec::new(),
+        ));
+        let condition = BoundExpr::BinaryOp {
+            left: Box::new(BoundExpr::Nextval {
+                sequence: 1,
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            op: BinOp::Lt,
+            right: Box::new(BoundExpr::Literal {
+                value: Value::Integer(0),
+                data_type: DataType::Integer,
+                nullable: false,
+            }),
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let mut join = NestedLoopJoinOp::new(
+            statement,
+            left,
+            right,
+            Some(condition),
+            planner::JoinType::Right,
+            None,
+            spill::SpillConfig::default(),
+        );
+
+        join.open().unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = join.next().unwrap() {
+            rows.push(row);
+        }
+        join.close().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(sequences.next_values.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn grouped_and_distinct_aggregates_spill_under_a_small_work_mem_budget() {
+        let harness = ExecutorHarness::with_users();
+        let values = (0..200)
+            .map(|id| {
+                if id % 20 == 0 {
+                    format!("({id}, NULL)")
+                } else {
+                    format!("({id}, 'group{}{}')", id % 5, "x".repeat(100))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        harness
+            .execute(&format!("INSERT INTO users VALUES {values}"))
+            .unwrap();
+        let cancel = common::QueryCancel::new();
+
+        for (sql, expected_rows) in [
+            (
+                "SELECT name, COUNT(*), COUNT(DISTINCT id), SUM(id) FROM users GROUP BY name",
+                6,
+            ),
+            (
+                "SELECT name, VAR_POP(CAST(id AS REAL)), VAR_POP(CAST(id AS NUMERIC)) FROM users GROUP BY name",
+                6,
+            ),
+            (
+                "SELECT COUNT(DISTINCT name), MIN(DISTINCT name), SUM(DISTINCT id), VAR_POP(DISTINCT CAST(id AS REAL)), VAR_POP(DISTINCT CAST(id AS NUMERIC)) FROM users",
+                1,
+            ),
+        ] {
+            let spill = spill::SpillConfig::new(spill::MIN_WORK_MEM_BYTES, std::env::temp_dir());
+            let stats = spill.stats.clone();
+            let expected = harness.execute(sql).unwrap();
+            let actual = harness.execute_with_spill(sql, &cancel, spill).unwrap();
+            assert_eq!(actual, expected);
+            let ExecutionResult::Query { rows, .. } = actual else {
+                panic!("expected query result");
+            };
+            assert_eq!(rows.len(), expected_rows);
+            assert!(stats.files_created() > 0);
+            assert!(stats.peak_reserved_bytes() <= spill::MIN_WORK_MEM_BYTES);
+        }
     }
 
     #[test]
@@ -1220,6 +1483,7 @@ mod tests {
             schema_ops: &storage,
             gc_horizon: common::FIRST_NORMAL_XID,
             cancel: &cancel,
+            spill: spill::SpillConfig::default(),
         };
         let plan = PhysicalPlan::Insert {
             table: schema.id,

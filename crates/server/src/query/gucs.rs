@@ -18,6 +18,10 @@ const DEFAULT_STATISTICS_TARGET: &str = "default_statistics_target";
 /// PostgreSQL's 1..=10000.
 pub(crate) const DEFAULT_STATISTICS_TARGET_DEFAULT: u32 = 100;
 const STATISTICS_TARGET_RANGE: std::ops::RangeInclusive<i64> = 1..=1000;
+const WORK_MEM: &str = "work_mem";
+const DEFAULT_WORK_MEM_KIB: u64 = 4096;
+const MIN_WORK_MEM_KIB: u64 = 64;
+const MAX_WORK_MEM_KIB: u64 = i32::MAX as u64;
 
 /// Per-connection accept-all GUC store for driver compatibility.
 ///
@@ -48,6 +52,7 @@ impl SessionGucs {
             ("standard_conforming_strings", "on"),
             (STATEMENT_TIMEOUT, "0"),
             ("timezone", "UTC"),
+            (WORK_MEM, "4096"),
         ] {
             defaults.insert(name.to_string(), value.to_string());
         }
@@ -106,6 +111,7 @@ impl SessionGucs {
         default_isolation: IsolationLevel,
         transaction_isolation: IsolationLevel,
         statement_timeout_ms: u64,
+        work_mem_kib: u64,
     ) -> Vec<GucSetting> {
         let settings = self.lock().clone();
         let mut rows = settings
@@ -132,6 +138,14 @@ impl SessionGucs {
         {
             setting.setting = statement_timeout_ms.to_string();
             setting.source = if statement_timeout_ms == 0 {
+                "default".to_string()
+            } else {
+                "session".to_string()
+            };
+        }
+        if let Some(setting) = rows.iter_mut().find(|setting| setting.name == WORK_MEM) {
+            setting.setting = work_mem_kib.to_string();
+            setting.source = if work_mem_kib == DEFAULT_WORK_MEM_KIB {
                 "default".to_string()
             } else {
                 "session".to_string()
@@ -181,6 +195,12 @@ impl SessionGucs {
         self.get(DEFAULT_STATISTICS_TARGET)
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_STATISTICS_TARGET_DEFAULT)
+    }
+
+    pub(crate) fn work_mem_kib(&self) -> u64 {
+        self.get(WORK_MEM)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_WORK_MEM_KIB)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
@@ -324,6 +344,20 @@ impl QueryService {
                     Err(err) => (mark_failed_on_error(slot), default_isolation, Err(err)),
                 }
             }
+            WORK_MEM => {
+                let work_mem_kib = if value.eq_ignore_ascii_case("default") {
+                    DEFAULT_WORK_MEM_KIB
+                } else {
+                    match parse_work_mem_setting(&value) {
+                        Ok(work_mem_kib) => work_mem_kib,
+                        Err(err) => {
+                            return (mark_failed_on_error(slot), default_isolation, Err(err));
+                        }
+                    }
+                };
+                let slot = set_work_mem(scope, work_mem_kib, slot, gucs);
+                (slot, default_isolation, Ok(set_complete()))
+            }
             _ if value.eq_ignore_ascii_case("default") => {
                 gucs.reset(&name);
                 (slot, default_isolation, Ok(set_complete()))
@@ -361,17 +395,24 @@ impl QueryService {
                 let slot = set_statement_timeout(SetScope::Session, 0, slot, gucs);
                 (slot, default_isolation, Ok(reset_complete()))
             }
+            Some(WORK_MEM) => {
+                let slot = set_work_mem(SetScope::Session, DEFAULT_WORK_MEM_KIB, slot, gucs);
+                (slot, default_isolation, Ok(reset_complete()))
+            }
             Some(name) => {
                 gucs.reset(name);
                 (slot, default_isolation, Ok(reset_complete()))
             }
             None => {
                 let session_timeout_ms = gucs.statement_timeout_ms();
+                let session_work_mem_kib = gucs.work_mem_kib();
                 gucs.reset_all();
                 if slot.is_some() {
                     gucs.set(STATEMENT_TIMEOUT, session_timeout_ms.to_string());
+                    gucs.set(WORK_MEM, session_work_mem_kib.to_string());
                 }
                 let slot = set_statement_timeout(SetScope::Session, 0, slot, gucs);
+                let slot = set_work_mem(SetScope::Session, DEFAULT_WORK_MEM_KIB, slot, gucs);
                 let (slot, default_isolation, result) = set_default_transaction_isolation(
                     SetScope::Session,
                     IsolationLevel::default(),
@@ -432,6 +473,79 @@ fn parse_statistics_target_setting(value: &str) -> Result<u32> {
         ));
     }
     Ok(parsed as u32)
+}
+
+fn set_work_mem(
+    scope: SetScope,
+    work_mem_kib: u64,
+    slot: Option<Transaction>,
+    gucs: &SessionGucs,
+) -> Option<Transaction> {
+    match (scope, slot) {
+        (SetScope::Local, None) => None,
+        (SetScope::Session, None) => {
+            gucs.set(WORK_MEM, work_mem_kib.to_string());
+            None
+        }
+        (SetScope::Local, Some(mut txn)) => {
+            txn.set_local_work_mem(work_mem_kib);
+            Some(txn)
+        }
+        (SetScope::Session, Some(mut txn)) => {
+            txn.set_work_mem(work_mem_kib);
+            Some(txn)
+        }
+    }
+}
+
+fn effective_work_mem_kib(slot: &Option<Transaction>, gucs: &SessionGucs) -> u64 {
+    let session_work_mem_kib = gucs.work_mem_kib();
+    slot.as_ref()
+        .map(|txn| txn.current_work_mem_kib(session_work_mem_kib))
+        .unwrap_or(session_work_mem_kib)
+}
+
+fn parse_work_mem_setting(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let (number, remainder) = split_timeout_number(value).ok_or_else(|| invalid_work_mem(value))?;
+    let numeric = parse_postgres_number(number).ok_or_else(|| invalid_work_mem(value))?;
+    if !numeric.is_finite() || numeric < 0.0 {
+        return Err(invalid_work_mem(value));
+    }
+    let unit = remainder.trim();
+    let kib_multiplier = match unit {
+        "" | "kB" => 1.0,
+        "B" => 1.0 / 1024.0,
+        "MB" => 1024.0,
+        "GB" => 1024.0 * 1024.0,
+        "TB" => 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(invalid_work_mem(value)),
+    };
+    let kib = (numeric * kib_multiplier).round_ties_even();
+    if !(MIN_WORK_MEM_KIB as f64..=MAX_WORK_MEM_KIB as f64).contains(&kib) {
+        return Err(invalid_work_mem(value));
+    }
+    Ok(kib as u64)
+}
+
+fn invalid_work_mem(value: &str) -> DbError {
+    DbError::execute(
+        SqlState::InvalidParameterValue,
+        format!("invalid value for parameter \"{WORK_MEM}\": \"{value}\""),
+    )
+}
+
+pub(super) fn display_work_mem(work_mem_kib: u64) -> String {
+    for (unit, divisor) in [
+        ("TB", 1024_u64 * 1024 * 1024),
+        ("GB", 1024_u64 * 1024),
+        ("MB", 1024_u64),
+    ] {
+        if work_mem_kib.is_multiple_of(divisor) {
+            return format!("{}{unit}", work_mem_kib / divisor);
+        }
+    }
+    format!("{work_mem_kib}kB")
 }
 
 fn parse_statement_timeout_setting(value: &str) -> Result<u64> {
@@ -654,6 +768,7 @@ fn show_value(
         STATEMENT_TIMEOUT => Some(display_statement_timeout(effective_statement_timeout_ms(
             slot, gucs,
         ))),
+        WORK_MEM => Some(display_work_mem(effective_work_mem_kib(slot, gucs))),
         _ => gucs.get(name),
     }
 }
@@ -698,6 +813,9 @@ fn show_all_result(
         .find(|(name, _)| name == STATEMENT_TIMEOUT)
     {
         *setting = display_statement_timeout(effective_statement_timeout_ms(slot, gucs));
+    }
+    if let Some((_, setting)) = settings.iter_mut().find(|(name, _)| name == WORK_MEM) {
+        *setting = display_work_mem(effective_work_mem_kib(slot, gucs));
     }
     settings.push((
         "default_transaction_isolation".to_string(),
@@ -854,5 +972,36 @@ mod tests {
         assert_eq!(display_statement_timeout(1_500), "1500ms");
         assert_eq!(display_statement_timeout(120_000), "2min");
         assert_eq!(display_statement_timeout(86_400_000), "1d");
+    }
+
+    #[test]
+    fn work_mem_values_use_postgres_binary_units() {
+        for (value, expected) in [
+            ("64", 64),
+            ("65536B", 64),
+            ("1MB", 1024),
+            ("1.5MB", 1536),
+            ("1GB", 1024 * 1024),
+            ("1TB", 1024 * 1024 * 1024),
+        ] {
+            assert_eq!(parse_work_mem_setting(value).unwrap(), expected, "{value}");
+        }
+        assert_eq!(display_work_mem(4096), "4MB");
+        assert_eq!(display_work_mem(1536), "1536kB");
+    }
+
+    #[test]
+    fn work_mem_rejects_invalid_or_out_of_range_values() {
+        for value in ["63", "-1", "NaN", "1mb", "1XB", "2147483648"] {
+            let err = parse_work_mem_setting(value).unwrap_err();
+            assert_eq!(err.code, SqlState::InvalidParameterValue, "{value}");
+        }
+    }
+
+    #[test]
+    fn work_mem_defaults_to_four_megabytes() {
+        let gucs = SessionGucs::default();
+        assert_eq!(gucs.work_mem_kib(), 4096);
+        assert_eq!(gucs.get(WORK_MEM).as_deref(), Some("4096"));
     }
 }

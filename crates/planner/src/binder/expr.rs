@@ -1115,7 +1115,10 @@ fn bind_aggregate(
                 ));
             };
             let arg_type = arg.data_type();
-            if !matches!(arg_type, DataType::Integer | DataType::Double) {
+            if !matches!(
+                arg_type,
+                DataType::Integer | DataType::Double | DataType::Real | DataType::Numeric { .. }
+            ) {
                 return Err(plan_error(
                     SqlState::DatatypeMismatch,
                     format!("STDDEV and VARIANCE require a numeric argument, got {arg_type:?}"),

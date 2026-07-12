@@ -1560,14 +1560,15 @@ A cooperative cancellation token: `ExecutionContext.cancel` is a `&QueryCancel` 
 | `SeqScanOp` | Iterates all rows in a table via storage, applies optional filter |
 | `IndexScanOp` | Looks up rows through the chosen index — `scan_range` for the storage identity index, `index_scan` for a catalog index — and applies residual `IndexScan.filter` when present. If a catalog index is unavailable in the statement's captured relation generation, falls back to a table scan and applies `IndexScan.full_filter` |
 | `SystemScanOp` | Emits computed rows for `pg_catalog` and `information_schema` virtual views, applies optional filter, and carries no row identity |
-| `NestedLoopJoinOp` | For each left row, scans right for matches. Buffers right side on first pass. |
-| `HashJoinOp` | Inner equi-join: builds an in-memory hash table over one side (right by default; left when the planner chose the smaller analyzed input — `docs/specs/statistics.md` §9.2) and streams the other, probing one row at a time; rows with a NULL key never match. |
+| `NestedLoopJoinOp` | Uses `work_mem`-bounded rewindable tapes for both inputs and streams matches/NULL extension; right/full unmatched detection uses externally sorted matched ordinals without re-evaluating predicates. |
+| `HashJoinOp` | Builds the planner-selected side (right by default; left when statistics estimate it is smaller) in a reservation-accounted, key-sorted contiguous table while it fits, then releases it and falls back to a bounded rewindable spill-tape probe; NULL keys never match and output remains logical left ++ right. |
 | `FilterOp` | Passes through rows matching the predicate |
 | `ProjectionOp` | Evaluates expressions, outputs narrowed columns |
-| `SortOp` | Materializes all input, sorts in memory, emits in order. Blocking operator. |
-| `DistinctOp` | Streams input, emitting the first row of each distinct `on_keys` tuple (tracked in a `BTreeSet`) and dropping the rest; NULL keys collapse together. Clears row identity. |
+| `SortOp` | Evaluates keys once and uses a stable `work_mem`-bounded external sort, spilling anonymous runs below the configured temp directory; preserves row identity. Blocking operator. |
+| `DistinctOp` | Uses bounded external key and ordinal sorts to retain the first row of each distinct key in input order; NULL keys collapse together and identity is cleared. Blocking operator. |
 | `LimitOp` | Stops pulling after N rows |
-| `AggregateOp` | Groups rows by key in a hash map, computes aggregates, emits results. Blocking operator. |
+| `AggregateOp` | Folds global aggregates directly; grouped aggregates use a bounded external key sort, online non-DISTINCT states, and bounded per-expression DISTINCT argument sorts sharing one budget; streams one result per group and clears identity. Blocking operator. |
+| `SetOpOp` | Uses bounded external key and ordinal sorts for UNION/INTERSECT/EXCEPT distinct and multiset semantics, preserves left-to-right output order, and clears identity. Blocking operator. |
 
 ### Expression Evaluator
 
