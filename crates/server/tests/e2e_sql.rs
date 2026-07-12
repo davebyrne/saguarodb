@@ -37,6 +37,43 @@ async fn e2e_array_agg_and_string_agg() {
         .unwrap()
         .unwrap_rows();
     assert_eq!(rows, vec![vec![None, None]]);
+
+    server
+        .simple_query("create table aggregate_edges (id integer, value text, delimiter text)")
+        .await
+        .unwrap();
+    server
+        .simple_query(
+            "insert into aggregate_edges values \
+             (1, 'a', ','), (1, 'a', ','), (NULL, NULL, ','), (NULL, NULL, ','), \
+             (2, 'a', ';'), (3, 'b', NULL)",
+        )
+        .await
+        .unwrap();
+    let rows = server
+        .simple_query(
+            "select array_agg(distinct id), string_agg(distinct value, delimiter), \
+             string_agg(value, delimiter) from aggregate_edges",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("{1,NULL,2,3}".into()),
+            Some("a;ab".into()),
+            Some("a,a;ab".into()),
+        ]]
+    );
+    let rows = server
+        .simple_query(
+            "select string_agg(value, delimiter) from aggregate_edges where value is null",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![None]]);
 }
 
 #[tokio::test]
