@@ -24,8 +24,8 @@ pub mod value;
 pub const POSTGRES_COMPAT_VERSION: &str = "16.0";
 
 pub use array::{
-    ArrayDimension, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, SqlArray, parse_array_text_structure,
-    value_matches_type,
+    ArrayDimension, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, SqlArray,
+    format_array_text_structure, parse_array_text_structure, value_matches_type,
 };
 pub use cancel::{CancelReason, QueryCancel};
 pub use concurrency::{

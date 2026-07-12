@@ -8,6 +8,7 @@ use crate::{DataType, DbError, Result, SqlState, Value};
 pub const MAX_ARRAY_DIMENSIONS: usize = 6;
 /// Practical allocation guard for one SQL array value.
 pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
+const MAX_ARRAY_TEXT_NODES: usize = (MAX_ARRAY_DIMENSIONS + 1) * MAX_ARRAY_ELEMENTS;
 
 /// Parse PostgreSQL array text into dimensions and scalar text tokens. Scalar
 /// conversion is deliberately left to the caller so COPY and protocol paths can
@@ -19,6 +20,7 @@ pub fn parse_array_text_structure(
         bytes: text.as_bytes(),
         offset: 0,
         nodes: 0,
+        elements: 0,
     };
     parser.whitespace();
     let bounds = parser.bounds()?;
@@ -75,6 +77,7 @@ struct ArrayTextParser<'a> {
     bytes: &'a [u8],
     offset: usize,
     nodes: usize,
+    elements: usize,
 }
 
 impl ArrayTextParser<'_> {
@@ -178,6 +181,10 @@ impl ArrayTextParser<'_> {
 
     fn element(&mut self) -> Result<ArrayTextNode> {
         self.count_node()?;
+        self.elements += 1;
+        if self.elements > MAX_ARRAY_ELEMENTS {
+            return Err(invalid_array("array text has too many elements"));
+        }
         let quoted = self.bytes.get(self.offset) == Some(&b'"');
         if quoted {
             self.offset += 1;
@@ -236,10 +243,90 @@ impl ArrayTextParser<'_> {
 
     fn count_node(&mut self) -> Result<()> {
         self.nodes += 1;
-        if self.nodes > MAX_ARRAY_ELEMENTS {
+        if self.nodes > MAX_ARRAY_TEXT_NODES {
             return Err(invalid_array("array text has too many nodes"));
         }
         Ok(())
+    }
+}
+
+/// Format an array's structure as PostgreSQL array text. The callback supplies
+/// the text representation of each non-null scalar element.
+pub fn format_array_text_structure<E>(
+    array: &SqlArray,
+    mut format_element: impl FnMut(&Value) -> std::result::Result<String, E>,
+) -> std::result::Result<String, E> {
+    if array.elements().is_empty() {
+        return Ok("{}".to_string());
+    }
+    let mut output = String::new();
+    if array
+        .dimensions()
+        .iter()
+        .any(|dimension| dimension.lower_bound() != 1)
+    {
+        for dimension in array.dimensions() {
+            let upper = i64::from(dimension.lower_bound()) + i64::from(dimension.len()) - 1;
+            output.push_str(&format!("[{}:{upper}]", dimension.lower_bound()));
+        }
+        output.push('=');
+    }
+    let mut element_index = 0;
+    format_array_text_level(
+        &mut output,
+        array,
+        0,
+        &mut element_index,
+        &mut format_element,
+    )?;
+    Ok(output)
+}
+
+fn format_array_text_level<E>(
+    output: &mut String,
+    array: &SqlArray,
+    depth: usize,
+    element_index: &mut usize,
+    format_element: &mut impl FnMut(&Value) -> std::result::Result<String, E>,
+) -> std::result::Result<(), E> {
+    output.push('{');
+    for index in 0..array.dimensions()[depth].len() as usize {
+        if index != 0 {
+            output.push(',');
+        }
+        if depth + 1 < array.dimensions().len() {
+            format_array_text_level(output, array, depth + 1, element_index, format_element)?;
+        } else {
+            let value = &array.elements()[*element_index];
+            *element_index += 1;
+            if matches!(value, Value::Null) {
+                output.push_str("NULL");
+            } else {
+                write_array_text_element(output, &format_element(value)?);
+            }
+        }
+    }
+    output.push('}');
+    Ok(())
+}
+
+fn write_array_text_element(output: &mut String, text: &str) {
+    let quote = text.is_empty()
+        || text.eq_ignore_ascii_case("NULL")
+        || text
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '{' | '}' | ',' | '"' | '\\'));
+    if quote {
+        output.push('"');
+    }
+    for ch in text.chars() {
+        if matches!(ch, '"' | '\\') {
+            output.push('\\');
+        }
+        output.push(ch);
+    }
+    if quote {
+        output.push('"');
     }
 }
 

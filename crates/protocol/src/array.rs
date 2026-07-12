@@ -1,6 +1,6 @@
 use common::{
     ArrayDimension, DbError, MAX_ARRAY_DIMENSIONS, MAX_ARRAY_ELEMENTS, PgType, Result, SqlArray,
-    SqlState, Value,
+    SqlState, Value, format_array_text_structure, parse_array_text_structure,
 };
 
 pub(crate) fn encode(array: &SqlArray, element_type: &PgType, binary: bool) -> Result<Vec<u8>> {
@@ -135,127 +135,24 @@ fn decode_binary(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
 }
 
 fn encode_text(array: &SqlArray, element_type: &PgType) -> Result<Vec<u8>> {
-    let mut output = String::new();
-    if array
-        .dimensions()
-        .iter()
-        .any(|dimension| dimension.lower_bound() != 1)
-    {
-        for dimension in array.dimensions() {
-            let upper = i64::from(dimension.lower_bound()) + i64::from(dimension.len()) - 1;
-            output.push_str(&format!("[{}:{upper}]", dimension.lower_bound()));
-        }
-        output.push('=');
-    }
-    if array.dimensions().is_empty() {
-        output.push_str("{}");
-        return Ok(output.into_bytes());
-    }
-    let mut element_index = 0;
-    write_text_level(&mut output, array, element_type, 0, &mut element_index)?;
-    Ok(output.into_bytes())
-}
-
-fn write_text_level(
-    output: &mut String,
-    array: &SqlArray,
-    element_type: &PgType,
-    depth: usize,
-    element_index: &mut usize,
-) -> Result<()> {
-    output.push('{');
-    let len = array.dimensions()[depth].len() as usize;
-    for index in 0..len {
-        if index != 0 {
-            output.push(',');
-        }
-        if depth + 1 < array.dimensions().len() {
-            write_text_level(output, array, element_type, depth + 1, element_index)?;
-        } else {
-            let value = &array.elements()[*element_index];
-            *element_index += 1;
-            if matches!(value, Value::Null) {
-                output.push_str("NULL");
-                continue;
-            }
-            let bytes = crate::codec::encode_value_with_type(value, element_type, 0)?
-                .ok_or_else(|| array_error("non-null array element encoded as NULL"))?;
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| array_error("array element text is not UTF-8"))?;
-            write_text_element(output, text);
-        }
-    }
-    output.push('}');
-    Ok(())
-}
-
-fn write_text_element(output: &mut String, text: &str) {
-    let quote = text.is_empty()
-        || text.eq_ignore_ascii_case("NULL")
-        || text
-            .chars()
-            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '{' | '}' | ',' | '"' | '\\'));
-    if quote {
-        output.push('"');
-    }
-    for ch in text.chars() {
-        if matches!(ch, '"' | '\\') {
-            output.push('\\');
-        }
-        output.push(ch);
-    }
-    if quote {
-        output.push('"');
-    }
+    format_array_text_structure(array, |value| {
+        let bytes = crate::codec::encode_value_with_type(value, element_type, 0)?
+            .ok_or_else(|| array_error("non-null array element encoded as NULL"))?;
+        std::str::from_utf8(&bytes)
+            .map(str::to_owned)
+            .map_err(|_| array_error("array element text is not UTF-8"))
+    })
+    .map(String::into_bytes)
 }
 
 fn decode_text(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
     let text = std::str::from_utf8(bytes).map_err(|_| array_error("array text is not UTF-8"))?;
-    let mut parser = TextParser::new(text);
-    let bounds = parser.bounds()?;
-    let node = parser.node(0)?;
-    parser.whitespace();
-    if !parser.done() {
-        return Err(array_error("array text has trailing input"));
-    }
-    let mut lengths = Vec::new();
-    validate_shape(&node, 0, &mut lengths)?;
-    let mut tokens = Vec::new();
-    flatten(node, &mut tokens);
-    if tokens.len() > MAX_ARRAY_ELEMENTS {
-        return Err(array_error("array text has too many elements"));
-    }
+    let (dimensions, tokens) =
+        parse_array_text_structure(text).map_err(|error| array_error(error.message))?;
     if tokens.is_empty() {
-        if lengths != [0] {
-            return Err(array_error(
-                "empty array text must have one empty brace level",
-            ));
-        }
-        if !bounds.is_empty()
-            && (bounds.len() != 1 || i64::from(bounds[0].1) - i64::from(bounds[0].0) + 1 != 0)
-        {
-            return Err(array_error("array bounds do not match empty contents"));
-        }
         return SqlArray::empty(element_type.data_type())
             .map_err(|error| array_error(error.message));
     }
-    if !bounds.is_empty() && bounds.len() != lengths.len() {
-        return Err(array_error("array bounds do not match dimensionality"));
-    }
-    let dimensions = lengths
-        .into_iter()
-        .enumerate()
-        .map(|(index, len)| {
-            let lower = bounds.get(index).map_or(1, |bound| bound.0);
-            if let Some((_, upper)) = bounds.get(index) {
-                let declared = i64::from(*upper) - i64::from(lower) + 1;
-                if declared != len as i64 {
-                    return Err(array_error("array bounds do not match contents"));
-                }
-            }
-            Ok(ArrayDimension::new(len as u32, lower))
-        })
-        .collect::<Result<Vec<_>>>()?;
     let elements = tokens
         .into_iter()
         .map(|token| match token {
@@ -272,227 +169,6 @@ fn decode_text(bytes: &[u8], element_type: &PgType) -> Result<SqlArray> {
         .collect::<Result<Vec<_>>>()?;
     SqlArray::new(element_type.data_type(), dimensions, elements)
         .map_err(|error| array_error(error.message))
-}
-
-#[derive(Debug)]
-enum Node {
-    List(Vec<Node>),
-    Element(Option<String>),
-}
-
-fn validate_shape(node: &Node, depth: usize, lengths: &mut Vec<usize>) -> Result<()> {
-    let Node::List(items) = node else {
-        return Err(array_error("array root must be braced"));
-    };
-    if lengths.len() == depth {
-        lengths.push(items.len());
-    } else if lengths[depth] != items.len() {
-        return Err(array_error("multidimensional array is not rectangular"));
-    }
-    let has_lists = items.iter().any(|item| matches!(item, Node::List(_)));
-    let has_elements = items.iter().any(|item| matches!(item, Node::Element(_)));
-    if has_lists && has_elements {
-        return Err(array_error("array mixes nested and scalar elements"));
-    }
-    if has_lists {
-        for item in items {
-            validate_shape(item, depth + 1, lengths)?;
-        }
-    }
-    Ok(())
-}
-
-fn flatten(node: Node, output: &mut Vec<Option<String>>) {
-    match node {
-        Node::List(items) => {
-            for item in items {
-                flatten(item, output);
-            }
-        }
-        Node::Element(value) => output.push(value),
-    }
-}
-
-struct TextParser<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    element_count: usize,
-}
-
-impl<'a> TextParser<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            bytes: text.as_bytes(),
-            offset: 0,
-            element_count: 0,
-        }
-    }
-
-    fn bounds(&mut self) -> Result<Vec<(i32, i32)>> {
-        self.whitespace();
-        let mut bounds = Vec::new();
-        while self.peek() == Some(b'[') {
-            self.offset += 1;
-            let lower = self.signed_integer()?;
-            self.expect(b':')?;
-            let upper = self.signed_integer()?;
-            self.expect(b']')?;
-            bounds.push((lower, upper));
-            if bounds.len() > MAX_ARRAY_DIMENSIONS {
-                return Err(array_error("array has too many dimension bounds"));
-            }
-        }
-        if !bounds.is_empty() {
-            self.expect(b'=')?;
-        }
-        Ok(bounds)
-    }
-
-    fn node(&mut self, depth: usize) -> Result<Node> {
-        if depth >= MAX_ARRAY_DIMENSIONS {
-            return Err(array_error("array has too many dimensions"));
-        }
-        self.whitespace();
-        self.expect(b'{')?;
-        self.whitespace();
-        let mut items = Vec::new();
-        if self.peek() == Some(b'}') {
-            self.offset += 1;
-            return Ok(Node::List(items));
-        }
-        loop {
-            self.whitespace();
-            let item = if self.peek() == Some(b'{') {
-                self.node(depth + 1)?
-            } else {
-                let element = self.element()?;
-                self.element_count += 1;
-                if self.element_count > MAX_ARRAY_ELEMENTS {
-                    return Err(array_error("array text has too many elements"));
-                }
-                Node::Element(element)
-            };
-            items.push(item);
-            self.whitespace();
-            match self.peek() {
-                Some(b',') => self.offset += 1,
-                Some(b'}') => {
-                    self.offset += 1;
-                    break;
-                }
-                _ => return Err(array_error("array element must end with comma or brace")),
-            }
-        }
-        Ok(Node::List(items))
-    }
-
-    fn element(&mut self) -> Result<Option<String>> {
-        if self.peek() == Some(b'"') {
-            self.offset += 1;
-            let mut output = Vec::new();
-            loop {
-                match self.peek() {
-                    None => return Err(array_error("unterminated quoted array element")),
-                    Some(b'"') => {
-                        self.offset += 1;
-                        break;
-                    }
-                    Some(b'\\') => {
-                        self.offset += 1;
-                        output.push(self.take_byte()?);
-                    }
-                    Some(byte) => {
-                        self.offset += 1;
-                        output.push(byte);
-                    }
-                }
-            }
-            return String::from_utf8(output)
-                .map(Some)
-                .map_err(|_| array_error("array element is not UTF-8"));
-        }
-        let start = self.offset;
-        let mut output = Vec::new();
-        while let Some(byte) = self.peek() {
-            if matches!(byte, b',' | b'}') {
-                break;
-            }
-            if matches!(byte, b'{' | b'"') {
-                return Err(array_error(
-                    "unquoted array element contains an unescaped delimiter",
-                ));
-            }
-            if byte == b'\\' {
-                self.offset += 1;
-                output.push((self.take_byte()?, true));
-            } else {
-                self.offset += 1;
-                output.push((byte, false));
-            }
-        }
-        if self.offset == start {
-            return Err(array_error("array element is empty"));
-        }
-        let first = output
-            .iter()
-            .position(|(byte, escaped)| *escaped || !byte.is_ascii_whitespace())
-            .unwrap_or(output.len());
-        let last = output
-            .iter()
-            .rposition(|(byte, escaped)| *escaped || !byte.is_ascii_whitespace())
-            .map_or(first, |index| index + 1);
-        let value = String::from_utf8(output[first..last].iter().map(|(byte, _)| *byte).collect())
-            .map_err(|_| array_error("array element is not UTF-8"))?;
-        if value.is_empty() {
-            return Err(array_error("unquoted array element is empty"));
-        }
-        Ok((!value.eq_ignore_ascii_case("NULL")).then_some(value))
-    }
-
-    fn signed_integer(&mut self) -> Result<i32> {
-        self.whitespace();
-        let start = self.offset;
-        if matches!(self.peek(), Some(b'+' | b'-')) {
-            self.offset += 1;
-        }
-        while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
-            self.offset += 1;
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.offset])
-            .map_err(|_| array_error("invalid array bound"))?;
-        text.parse().map_err(|_| array_error("invalid array bound"))
-    }
-
-    fn whitespace(&mut self) {
-        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            self.offset += 1;
-        }
-    }
-
-    fn expect(&mut self, expected: u8) -> Result<()> {
-        self.whitespace();
-        if self.peek() != Some(expected) {
-            return Err(array_error("invalid array text syntax"));
-        }
-        self.offset += 1;
-        Ok(())
-    }
-
-    fn take_byte(&mut self) -> Result<u8> {
-        let byte = self
-            .peek()
-            .ok_or_else(|| array_error("trailing array escape"))?;
-        self.offset += 1;
-        Ok(byte)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.offset).copied()
-    }
-
-    fn done(&self) -> bool {
-        self.offset == self.bytes.len()
-    }
 }
 
 struct Cursor<'a> {
