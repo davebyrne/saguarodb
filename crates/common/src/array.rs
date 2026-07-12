@@ -148,10 +148,9 @@ impl ArrayTextParser<'_> {
             return Err(invalid_array("array text must start with '{'"));
         }
         self.offset += 1;
-        let before_whitespace = self.offset;
         self.whitespace();
         let mut items = Vec::new();
-        if self.bytes.get(self.offset) == Some(&b'}') && self.offset == before_whitespace {
+        if self.bytes.get(self.offset) == Some(&b'}') {
             self.offset += 1;
             return Ok(ArrayTextNode::List(items));
         }
@@ -185,7 +184,7 @@ impl ArrayTextParser<'_> {
         if quoted {
             self.offset += 1;
         }
-        let mut value = Vec::new();
+        let mut value: Vec<(u8, bool)> = Vec::new();
         loop {
             let Some(&byte) = self.bytes.get(self.offset) else {
                 return Err(invalid_array("unterminated array element"));
@@ -195,7 +194,7 @@ impl ArrayTextParser<'_> {
                 let Some(&escaped) = self.bytes.get(self.offset) else {
                     return Err(invalid_array("unterminated array escape"));
                 };
-                value.push(escaped);
+                value.push((escaped, true));
                 self.offset += 1;
                 continue;
             }
@@ -211,16 +210,20 @@ impl ArrayTextParser<'_> {
                     "array element contains an unescaped special character",
                 ));
             }
-            value.push(byte);
+            value.push((byte, false));
             self.offset += 1;
         }
-        let text =
-            String::from_utf8(value).map_err(|_| invalid_array("array element is not UTF-8"))?;
-        let text = if quoted {
-            text
-        } else {
-            text.trim().to_string()
-        };
+        let (mut start, mut end) = (0, value.len());
+        if !quoted {
+            while start < end && !value[start].1 && value[start].0.is_ascii_whitespace() {
+                start += 1;
+            }
+            while end > start && !value[end - 1].1 && value[end - 1].0.is_ascii_whitespace() {
+                end -= 1;
+            }
+        }
+        let text = String::from_utf8(value[start..end].iter().map(|(byte, _)| *byte).collect())
+            .map_err(|_| invalid_array("array element is not UTF-8"))?;
         if !quoted && text.is_empty() {
             return Err(invalid_array("array element must not be empty"));
         }
@@ -558,7 +561,6 @@ mod tests {
             "[1:1][1:1][1:1][1:1][1:1][1:1][1:1]={{{{{{{1}}}}}}}",
             "{,}",
             "{1,}",
-            "{ }",
             "{a\"b}",
             "{a{b}",
             "{{}}",
@@ -570,6 +572,14 @@ mod tests {
             );
         }
         assert!(parse_array_text_structure("[ 1 : 0 ] = {}").is_ok());
+        assert_eq!(
+            parse_array_text_structure("{ }").unwrap().1,
+            Vec::<Option<String>>::new()
+        );
+        assert_eq!(
+            parse_array_text_structure("{\\ }").unwrap().1,
+            vec![Some(" ".to_string())]
+        );
     }
 
     #[test]

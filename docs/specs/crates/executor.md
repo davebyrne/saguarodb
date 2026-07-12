@@ -177,10 +177,9 @@ constants for unsupported features (no inheritance, missing values, ACLs, or
 per-column options). `pg_proc` exposes compatibility rows from
 `common::pg_proc_catalog_entries()` for SaguaroDB built-in/probe functions;
 `concat` sets `provariadic` for its variadic text signature.
-`pg_type` exposes rows for the scalar and catalog presentation types SaguaroDB
-reports; `typelem` is populated for `int2vector`, `oidvector`, `_int2`, and
-`_oid`, and `typarray` is nonzero only for array rows that are also present in
-the exposed `pg_type` set.
+`pg_type` exposes rows for the scalar, array, and catalog presentation types
+SaguaroDB reports. `typelem` is populated for vector and exposed array rows;
+`typarray` is populated on scalar rows whose companion array row is exposed.
 `pg_database` and `pg_roles` expose the current session database/user. `pg_settings` combines
 `StatementContext.system_state.settings()` with synthesized transaction isolation
 rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`; the
