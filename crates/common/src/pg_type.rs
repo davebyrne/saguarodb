@@ -48,7 +48,18 @@ pub enum PgType {
     Int2Array,
     /// A real PostgreSQL array wire type. The pre-existing `Int2Array` and
     /// `OidArray` variants remain as durable aliases for their element types.
-    Array(Box<PgType>),
+    Array(PgArrayType),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PgArrayType(Box<PgType>);
+
+impl PgArrayType {
+    #[must_use]
+    pub fn element_type(&self) -> &PgType {
+        &self.0
+    }
 }
 
 impl PgType {
@@ -68,25 +79,29 @@ impl PgType {
             30 => PgType::OidVector,
             700 => PgType::Float4,
             701 => PgType::Float8,
-            1005 => PgType::Int2Array,
-            1000 => PgType::Array(Box::new(PgType::Bool)),
-            1001 => PgType::Array(Box::new(PgType::Bytea)),
-            1007 => PgType::Array(Box::new(PgType::Int4)),
-            1009 => PgType::Array(Box::new(PgType::Text)),
-            1014 => PgType::Array(Box::new(PgType::Bpchar(decode_length_typmod(typmod)))),
-            1015 => PgType::Array(Box::new(PgType::Varchar(decode_length_typmod(typmod)))),
-            1016 => PgType::Array(Box::new(PgType::Int8)),
-            1021 => PgType::Array(Box::new(PgType::Float4)),
-            1022 => PgType::Array(Box::new(PgType::Float8)),
-            1028 => PgType::OidArray,
-            1115 => PgType::Array(Box::new(PgType::Timestamp)),
-            1182 => PgType::Array(Box::new(PgType::Date)),
-            1183 => PgType::Array(Box::new(PgType::Time)),
-            1185 => PgType::Array(Box::new(PgType::Timestamptz)),
-            1187 => PgType::Array(Box::new(PgType::Interval)),
+            1005 => PgType::Array(PgArrayType(Box::new(PgType::Int2))),
+            1000 => PgType::Array(PgArrayType(Box::new(PgType::Bool))),
+            1001 => PgType::Array(PgArrayType(Box::new(PgType::Bytea))),
+            1007 => PgType::Array(PgArrayType(Box::new(PgType::Int4))),
+            1009 => PgType::Array(PgArrayType(Box::new(PgType::Text))),
+            1014 => PgType::Array(PgArrayType(Box::new(PgType::Bpchar(decode_length_typmod(
+                typmod,
+            ))))),
+            1015 => PgType::Array(PgArrayType(Box::new(PgType::Varchar(
+                decode_length_typmod(typmod),
+            )))),
+            1016 => PgType::Array(PgArrayType(Box::new(PgType::Int8))),
+            1021 => PgType::Array(PgArrayType(Box::new(PgType::Float4))),
+            1022 => PgType::Array(PgArrayType(Box::new(PgType::Float8))),
+            1028 => PgType::Array(PgArrayType(Box::new(PgType::Oid))),
+            1115 => PgType::Array(PgArrayType(Box::new(PgType::Timestamp))),
+            1182 => PgType::Array(PgArrayType(Box::new(PgType::Date))),
+            1183 => PgType::Array(PgArrayType(Box::new(PgType::Time))),
+            1185 => PgType::Array(PgArrayType(Box::new(PgType::Timestamptz))),
+            1187 => PgType::Array(PgArrayType(Box::new(PgType::Interval))),
             1231 => {
                 let (precision, scale) = decode_numeric_typmod(typmod);
-                PgType::Array(Box::new(PgType::Numeric { precision, scale }))
+                PgType::Array(PgArrayType(Box::new(PgType::Numeric { precision, scale })))
             }
             1042 => PgType::Bpchar(decode_length_typmod(typmod)),
             1043 => PgType::Varchar(decode_length_typmod(typmod)),
@@ -100,7 +115,7 @@ impl PgType {
                 PgType::Numeric { precision, scale }
             }
             2950 => PgType::Uuid,
-            2951 => PgType::Array(Box::new(PgType::Uuid)),
+            2951 => PgType::Array(PgArrayType(Box::new(PgType::Uuid))),
             _ => return None,
         })
     }
@@ -190,7 +205,7 @@ impl PgType {
             PgType::Int2Vector => "int2vector".to_string(),
             PgType::OidArray => "oid[]".to_string(),
             PgType::Int2Array => "smallint[]".to_string(),
-            PgType::Array(element) => format!("{}[]", element.format_type_name()),
+            PgType::Array(element) => format!("{}[]", element.0.format_type_name()),
         }
     }
 
@@ -219,8 +234,8 @@ impl PgType {
             PgType::Int2Vector => 22,
             PgType::OidArray => 1028,
             PgType::Int2Array => 1005,
-            PgType::Array(element) => array_oid(element)
-                .expect("PgType::Array must contain a supported scalar element type"),
+            PgType::Array(element) => array_oid(&element.0)
+                .expect("PgArrayType construction guarantees a supported scalar element"),
         }
     }
 
@@ -275,7 +290,7 @@ impl PgType {
                 };
                 ((i64::from(precision) << 16) | i64::from(scale)) + i64::from(VARHDRSZ)
             }
-            PgType::Array(element) => return element.typmod(),
+            PgType::Array(element) => return element.0.typmod(),
             _ => return -1,
         };
         i32::try_from(modifier).unwrap_or(-1)
@@ -303,7 +318,10 @@ impl PgType {
             | PgType::Int2Vector
             | PgType::OidArray
             | PgType::Int2Array => DataType::Text,
-            PgType::Array(element) => DataType::Array(Box::new(element.data_type())),
+            PgType::Array(element) => DataType::Array(
+                crate::ArrayType::new(element.0.data_type())
+                    .expect("PgArrayType always contains a scalar element"),
+            ),
             PgType::Bytea => DataType::Bytea,
             PgType::Uuid => DataType::Uuid,
             PgType::Date => DataType::Date,
@@ -440,7 +458,7 @@ impl From<&DataType> for PgType {
                 precision: *precision,
                 scale: *scale,
             },
-            DataType::Array(element) => PgType::array(PgType::from(element.as_ref()))
+            DataType::Array(element) => PgType::array(PgType::from(element.element_type()))
                 .expect("DataType arrays always have supported scalar elements"),
         }
     }
@@ -466,11 +484,7 @@ impl PgType {
                 ),
             ));
         }
-        Ok(match element {
-            PgType::Int2 => PgType::Int2Array,
-            PgType::Oid => PgType::OidArray,
-            other => PgType::Array(Box::new(other)),
-        })
+        Ok(PgType::Array(PgArrayType(Box::new(element))))
     }
 }
 
@@ -590,16 +604,16 @@ mod tests {
     fn array_constructor_rejects_non_scalar_wire_types() {
         assert!(PgType::array(PgType::OidVector).is_err());
         assert!(PgType::array(PgType::Int2Vector).is_err());
-        assert!(PgType::array(PgType::Array(Box::new(PgType::Text))).is_err());
-        assert_eq!(PgType::array(PgType::Int2).unwrap(), PgType::Int2Array);
-        assert_eq!(PgType::array(PgType::Oid).unwrap(), PgType::OidArray);
+        assert!(PgType::array(PgType::array(PgType::Text).unwrap()).is_err());
+        assert_eq!(PgType::array(PgType::Int2).unwrap().oid(), 1005);
+        assert_eq!(PgType::array(PgType::Oid).unwrap().oid(), 1028);
         assert_eq!(PgType::array(PgType::Text).unwrap().oid(), 1009);
     }
 
     #[test]
     fn pg_type_deserialization_rejects_invalid_array_elements() {
         let text: PgType = serde_json::from_str(r#"{"Array":"Text"}"#).unwrap();
-        assert_eq!(text, PgType::Array(Box::new(PgType::Text)));
+        assert_eq!(text, PgType::array(PgType::Text).unwrap());
 
         for json in [
             r#"{"Array":{"Array":"Text"}}"#,
@@ -663,12 +677,13 @@ mod tests {
         assert_eq!((typmod - 4) & 0xFFFF, 2);
 
         for pg_type in [
-            PgType::Array(Box::new(PgType::Varchar(Some(10)))),
-            PgType::Array(Box::new(PgType::Bpchar(Some(5)))),
-            PgType::Array(Box::new(PgType::Numeric {
+            PgType::array(PgType::Varchar(Some(10))).unwrap(),
+            PgType::array(PgType::Bpchar(Some(5))).unwrap(),
+            PgType::array(PgType::Numeric {
                 precision: Some(10),
                 scale: 2,
-            })),
+            })
+            .unwrap(),
         ] {
             let decoded =
                 PgType::from_oid_typmod(i64::from(pg_type.oid()), i64::from(pg_type.typmod()))
@@ -791,7 +806,7 @@ mod tests {
                 precision: Some(10),
                 scale: 2,
             },
-            DataType::Array(Box::new(DataType::Text)),
+            DataType::Array(crate::ArrayType::new(DataType::Text).unwrap()),
         ];
         for data_type in all {
             assert_eq!(PgType::from(&data_type).data_type(), data_type);

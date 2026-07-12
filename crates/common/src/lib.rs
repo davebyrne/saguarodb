@@ -56,10 +56,11 @@ pub use numeric::{Decimal, RoundingStrategy};
 pub use pg_type::PgType;
 pub use row::{ExecRow, Key, KeyRange, Row, RowIdentity, StoredRow};
 pub use schema::{
-    ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType, INITIAL_SCHEMA_VERSION,
-    IndexConstraintKind, IndexSchema, ParsedColumnDef, ParsedDefault, RelationKind,
-    SequenceOptions, SequenceSchema, TableOptionPatch, TableSchema, ToastCompression, ToastMode,
-    ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan, ViewColumn,
-    ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name, toast_schema,
+    ArrayType, ColumnDef, ColumnDefault, ColumnInfo, CompressionSetting, DataType,
+    INITIAL_SCHEMA_VERSION, IndexConstraintKind, IndexSchema, ParsedColumnDef, ParsedDefault,
+    RelationKind, SequenceOptions, SequenceSchema, TableOptionPatch, TableSchema, ToastCompression,
+    ToastMode, ToastOptionPatch, ToastOptions, TruncateCatalogUpdate, TruncateTablePlan,
+    ViewColumn, ViewDependency, ViewSchema, needs_toast_relation, toast_relation_name,
+    toast_schema,
 };
 pub use value::{Value, parse_bool_text};

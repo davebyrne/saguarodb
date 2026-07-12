@@ -1234,7 +1234,7 @@ fn sql_data_type(pg_type: &PgType) -> String {
 
 fn pg_type_name(pg_type: &PgType) -> String {
     if let PgType::Array(element) = pg_type {
-        return format!("_{}", pg_type_name(element));
+        return format!("_{}", pg_type_name(element.element_type()));
     }
     match pg_type {
         PgType::Int2 => "int2",

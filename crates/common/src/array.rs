@@ -239,7 +239,7 @@ pub fn value_matches_type(value: &Value, data_type: &DataType) -> bool {
         | (Value::Real(_), DataType::Real)
         | (Value::Numeric(_), DataType::Numeric { .. }) => true,
         (Value::Array(array), DataType::Array(element_type)) => {
-            array.element_type() == element_type.as_ref()
+            array.element_type() == element_type.element_type()
         }
         _ => false,
     }

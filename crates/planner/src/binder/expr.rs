@@ -260,7 +260,10 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Bytes(_) => (DataType::Bytea, false),
         Value::Uuid(_) => (DataType::Uuid, false),
         Value::Array(array) => (
-            DataType::Array(Box::new(array.element_type().clone())),
+            DataType::Array(
+                common::ArrayType::new(array.element_type().clone())
+                    .expect("SqlArray always has a scalar element type"),
+            ),
             false,
         ),
     };

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{ColumnId, FileId, IndexId, PgType, SequenceId, TableId, Value};
+use crate::{ColumnId, DbError, FileId, IndexId, PgType, SequenceId, SqlState, TableId, Value};
 
 pub const INITIAL_SCHEMA_VERSION: u64 = 1;
 
@@ -44,7 +44,28 @@ pub enum DataType {
     },
     /// A rectangular PostgreSQL array. Multidimensionality belongs to the value's
     /// shape; the boxed type is always a non-array scalar element type.
-    Array(Box<DataType>),
+    Array(ArrayType),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ArrayType(Box<DataType>);
+
+impl ArrayType {
+    pub fn new(element_type: DataType) -> crate::Result<Self> {
+        if matches!(element_type, DataType::Array(_)) {
+            return Err(DbError::plan(
+                SqlState::DatatypeMismatch,
+                "array elements cannot themselves be arrays",
+            ));
+        }
+        Ok(Self(Box::new(element_type)))
+    }
+
+    #[must_use]
+    pub fn element_type(&self) -> &DataType {
+        &self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for DataType {
@@ -92,7 +113,7 @@ impl<'de> Deserialize<'de> for DataType {
                     if matches!(element, DataType::Array(_)) {
                         return Err(E::custom("array elements cannot themselves be arrays"));
                     }
-                    DataType::Array(Box::new(element))
+                    DataType::Array(ArrayType(Box::new(element)))
                 }
             };
             Ok(value)
@@ -579,8 +600,9 @@ pub struct TruncateCatalogUpdate {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColumnDef, ColumnInfo, CompressionSetting, DataType, INITIAL_SCHEMA_VERSION, PgType,
-        RelationKind, TableSchema, ToastCompression, ToastMode, ToastOptions, ViewDependency,
+        ArrayType, ColumnDef, ColumnInfo, CompressionSetting, DataType, INITIAL_SCHEMA_VERSION,
+        PgType, RelationKind, TableSchema, ToastCompression, ToastMode, ToastOptions,
+        ViewDependency,
     };
 
     #[test]
@@ -648,7 +670,10 @@ mod tests {
     #[test]
     fn data_type_deserialization_rejects_nested_arrays() {
         let scalar: DataType = serde_json::from_str(r#"{"Array":"Integer"}"#).unwrap();
-        assert_eq!(scalar, DataType::Array(Box::new(DataType::Integer)));
+        assert_eq!(
+            scalar,
+            DataType::Array(ArrayType::new(DataType::Integer).unwrap())
+        );
 
         let error =
             serde_json::from_str::<DataType>(r#"{"Array":{"Array":"Integer"}}"#).unwrap_err();
