@@ -615,6 +615,15 @@ pub fn encode_value_with_type(
     pg_type: &PgType,
     format: i16,
 ) -> Result<Option<Vec<u8>>> {
+    if let (Value::Array(array), PgType::Array(element_type)) = (value, pg_type) {
+        let format = ValueFormat::from_code(format)?;
+        return crate::array::encode(
+            array,
+            element_type.element_type(),
+            format == ValueFormat::Binary,
+        )
+        .map(Some);
+    }
     if let Value::Integer(int) = value
         && ValueFormat::from_code(format)? == ValueFormat::Binary
     {
@@ -644,6 +653,14 @@ pub fn encode_value_with_type(
 /// in the shared signed integer value.
 pub fn decode_value_with_type(bytes: &[u8], pg_type: &PgType, format: i16) -> Result<Value> {
     let value_format = ValueFormat::from_code(format)?;
+    if let PgType::Array(element_type) = pg_type {
+        return crate::array::decode(
+            bytes,
+            element_type.element_type(),
+            value_format == ValueFormat::Binary,
+        )
+        .map(Value::Array);
+    }
     if matches!(
         pg_type,
         PgType::Int2Vector

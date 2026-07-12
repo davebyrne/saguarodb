@@ -789,45 +789,16 @@ where
 
 /// Map a client-declared parameter type OID to its wire type. Accepts the
 /// exposed PostgreSQL wire identities; `0` is the unspecified marker (the server
-/// infers the type). Text-backed catalog vector/array identities are accepted so
-/// catalog-driven probes can feed `pg_proc.proargtypes` back into Parse, though
-/// they still decode through the collapsed text storage type. The wire type is
-/// remembered so `ParameterDescription` can echo the exact OID the client
+/// infers the type). Real PostgreSQL array OIDs resolve to first-class array
+/// wire types; the historical catalog pseudo-types are output-only metadata.
+/// The wire type is remembered so `ParameterDescription` can echo the exact OID the client
 /// declared, and its `DataType` drives binding/decoding.
 fn oid_to_pg_type(oid: i32) -> Result<Option<PgType>> {
-    let pg_type = match oid {
-        0 => return Ok(None),
-        16 => PgType::Bool,
-        17 => PgType::Bytea,
-        20 => PgType::Int8,
-        21 => PgType::Int2,
-        22 => PgType::Int2Vector,
-        23 => PgType::Int4,
-        25 => PgType::Text,
-        26 => PgType::Oid,
-        30 => PgType::OidVector,
-        700 => PgType::Float4,
-        701 => PgType::Float8,
-        1005 => PgType::CatalogInt2ArrayText,
-        1028 => PgType::CatalogOidArrayText,
-        1042 => PgType::Bpchar(None),
-        1043 => PgType::Varchar(None),
-        1082 => PgType::Date,
-        1083 => PgType::Time,
-        1114 => PgType::Timestamp,
-        1184 => PgType::Timestamptz,
-        1186 => PgType::Interval,
-        1700 => PgType::Numeric {
-            precision: None,
-            scale: 0,
-        },
-        2950 => PgType::Uuid,
-        other => {
-            return Err(protocol_error(format!(
-                "unsupported parameter type OID {other}"
-            )));
-        }
-    };
+    if oid == 0 {
+        return Ok(None);
+    }
+    let pg_type = PgType::from_oid_typmod(i64::from(oid), -1)
+        .ok_or_else(|| protocol_error(format!("unsupported parameter type OID {oid}")))?;
     Ok(Some(pg_type))
 }
 
@@ -963,5 +934,28 @@ where
         ExecutionResult::BeginCopyIn(_) | ExecutionResult::BeginCopyOut(_) => Err(
             DbError::internal("COPY is not valid in the extended query protocol"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod array_oid_tests {
+    use common::{DataType, PgType};
+
+    use super::oid_to_pg_type;
+
+    #[test]
+    fn parse_parameter_oids_resolve_to_first_class_arrays() {
+        for oid in [
+            1000, 1001, 1005, 1007, 1009, 1014, 1015, 1016, 1021, 1022, 1028, 1115, 1182, 1183,
+            1185, 1187, 1231, 2951,
+        ] {
+            let pg_type = oid_to_pg_type(oid).unwrap().unwrap();
+            assert!(matches!(pg_type, PgType::Array(_)), "OID {oid}");
+            assert!(
+                matches!(pg_type.data_type(), DataType::Array(_)),
+                "OID {oid}"
+            );
+            assert_eq!(pg_type.oid(), oid);
+        }
     }
 }

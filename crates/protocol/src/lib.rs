@@ -1,3 +1,4 @@
+mod array;
 mod codec;
 mod messages;
 mod state;

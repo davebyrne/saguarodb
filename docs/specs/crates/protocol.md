@@ -171,8 +171,9 @@ that `DataType` intentionally collapses:
 - integers: `Int2` (`21`, size `2`), `Int4` (`23`, size `4`), `Int8` (`20`, size `8`)
 - catalog integers: `Oid` (`26`, size `4`, unsigned on the PostgreSQL binary wire)
 - character: `Text` (`25`), `Varchar` (`1043`), `Bpchar` (`1042`), all size `-1`
-- catalog vectors/arrays used by virtual system views: `Int2Vector` (`22`),
-  `OidVector` (`30`), `Int2Array` (`1005`), `OidArray` (`1028`), all size `-1`
+- catalog vectors/pseudo-arrays used by virtual system views: `Int2Vector` (`22`),
+  `OidVector` (`30`), `CatalogInt2ArrayText` (`1005`),
+  `CatalogOidArrayText` (`1028`), all size `-1`
 - `Bool` (`16`, `1`), `Bytea` (`17`, `-1`), `Uuid` (`2950`, `16`)
 - `Float4` (`700`, `4`), `Float8` (`701`, `8`), `Numeric` (`1700`, `-1`)
 - temporal: `Date` (`1082`, `4`), `Time` (`1083`, `8`), `Timestamp` (`1114`, `8`),
@@ -186,11 +187,11 @@ The accepted OIDs are the wire types above plus `0` (unspecified — the server
 infers the type): the distinct integer widths `int2` (`21`), `int4` (`23`),
 `int8` (`20`) and `oid` (`26`) all resolve to the single integer type, and
 `varchar` (`1043`) / `bpchar` (`1042`) / `text` (`25`) all resolve to text.
-Catalog vector/array parameter OIDs (`int2vector` `22`, `oidvector` `30`,
-`int2[]` `1005`, `oid[]` `1028`) are accepted for catalog-driven probes and
-decode through the same text-backed storage representation; binary input for
-those text-backed identities is unsupported until SaguaroDB has real vector/array
-values. Any other OID is rejected with an "unsupported parameter type OID" error.
+Catalog vector parameter OIDs (`int2vector` `22`, `oidvector` `30`) remain
+text-backed. PostgreSQL array OIDs resolve to first-class `PgType::Array`
+metadata, including `int2[]` (`1005`) and `oid[]` (`1028`); the historical
+catalog pseudo-array variants are output-only metadata. Any other OID is
+rejected with an "unsupported parameter type OID" error.
 The server remembers each declared wire type so `ParameterDescription` echoes the
 exact OID the client declared. For unspecified parameters, the planner may still infer a
 more specific PostgreSQL wire identity from unambiguous catalog-function
@@ -210,11 +211,19 @@ or 4 big-endian bytes (not the 8-byte `int8` form), and an `oid` value is encode
 as 4 unsigned big-endian bytes, via `encode_value_with_type`. A value that does
 not fit its declared width/range — only reachable for data that predates or
 bypasses the write-time range check, or for a virtual OID bug — is rejected
-rather than silently truncated. Virtual-catalog vector/array identities
-(`int2vector`, `oidvector`, `int2[]`, `oid[]`) use text storage; if an extended
-client requests binary results for such a column, the server reports and sends
-that column in text format so clients do not receive invalid binary
-array/vector bytes.
+rather than silently truncated. Text-backed virtual-catalog vector and
+pseudo-array fields are forced to text results so clients do not receive invalid
+binary bytes.
+
+First-class arrays support PostgreSQL text and binary formats for every scalar
+element type. Text input accepts optional `[lower:upper]...=` bounds, nested
+rectangular braces, quoted/unquoted elements, backslash escaping, and unquoted
+case-insensitive `NULL`; output emits bounds when any lower bound differs from
+one and quotes or escapes elements when required. Binary arrays use PostgreSQL's
+`ndim`, null flag, element OID, dimension `(length, lower-bound)` headers, and
+length-prefixed element values (`-1` for NULL). Decoding validates dimension and
+cardinality limits, rectangular shape, bounds, element OID/type, scalar element
+encoding, null metadata, truncation, and trailing bytes.
 
 ## PostgreSQL Wire Encoding Details
 

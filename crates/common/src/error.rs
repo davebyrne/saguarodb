@@ -60,6 +60,8 @@ pub enum SqlState {
     /// `22P02`: a text field could not be parsed into its target type (e.g. a
     /// non-numeric value for an `INTEGER` column in `COPY ... FROM`).
     InvalidTextRepresentation,
+    /// `22P03`: a binary wire value is malformed for its declared SQL type.
+    InvalidBinaryRepresentation,
     /// `22P04`: a `COPY ... FROM` input row is structurally malformed — the
     /// wrong number of columns, or an unterminated CSV quote.
     BadCopyFileFormat,
@@ -135,6 +137,7 @@ impl SqlState {
             SqlState::NumericValueOutOfRange => "22003",
             SqlState::StringDataRightTruncation => "22001",
             SqlState::InvalidTextRepresentation => "22P02",
+            SqlState::InvalidBinaryRepresentation => "22P03",
             SqlState::BadCopyFileFormat => "22P04",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
@@ -176,6 +179,7 @@ impl SqlState {
             "22003" => SqlState::NumericValueOutOfRange,
             "22001" => SqlState::StringDataRightTruncation,
             "22P02" => SqlState::InvalidTextRepresentation,
+            "22P03" => SqlState::InvalidBinaryRepresentation,
             "22P04" => SqlState::BadCopyFileFormat,
             "23502" => SqlState::NotNullViolation,
             "23505" => SqlState::UniqueViolation,
@@ -269,6 +273,7 @@ mod tests {
             SqlState::NumericValueOutOfRange,
             SqlState::StringDataRightTruncation,
             SqlState::InvalidTextRepresentation,
+            SqlState::InvalidBinaryRepresentation,
             SqlState::BadCopyFileFormat,
             SqlState::NotNullViolation,
             SqlState::UniqueViolation,
