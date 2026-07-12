@@ -15,6 +15,15 @@ waiting, the checkpoint guard, or schema-generation validation. They coordinate
 which operations may use or replace a logical table and participate in the same
 deadlock graph as row waits.
 
+The same manager defines schema and catalog-name resources for transactional-DDL
+rollout. Schema resources
+are keyed by `SchemaId`; catalog-name resources are keyed by `(SchemaId,
+normalized_name)`, allowing same-name creators to serialize before an object id
+exists. Catalog locks have `Access` and `Exclusive` modes: access locks coexist,
+while exclusive conflicts with both. Multi-resource requests use the global
+order schema → catalog name → table → sequence, with ids/names sorted within a
+resource kind.
+
 ## 2. Lock modes
 
 The first implementation has four modes, ordered from weakest to strongest:
@@ -68,8 +77,9 @@ sequence DDL no longer uses the global exclusive guard:
   by the catalog publication gate and publishes the new id before it can be referenced.
 
 Sequence locks use the same owner, queue, cancellation, and deadlock graph as
-table locks. Resource ordering is all table resources by ascending `TableId`, then
-all sequence resources by ascending `SequenceId`. Binding collects referenced
+the other object locks. The complete resource ordering is schemas by `SchemaId`,
+catalog names by `(SchemaId, normalized_name)`, tables by `TableId`, then
+sequences by `SequenceId`. Binding collects referenced
 sequence ids as well as table ids before acquisition. This prevents a bound
 sequence call from racing removal and lets table/sequence cycles be detected.
 
@@ -211,7 +221,7 @@ partial subxid abort notify all waiters; every waiter always rechecks compatibil
 Lock ordering is:
 
 1. A shared writer guard, when the operation writes data, catalog, or WAL.
-2. Table locks, then sequence locks, in their stable resource order.
+2. Schema, catalog-name, table, then sequence locks, in their stable resource order.
 3. The catalog publication gate, when catalog mutation/undo requires it.
 4. Existing per-file structural latch.
 5. Buffer frame latch.
@@ -235,8 +245,10 @@ only data-path operation that waits for the exclusive checkpoint guard.
 - CREATE INDEX takes `Share`, permitting readers but blocking target writers.
 - VACUUM initially takes `Share` and retains writer-draining safety. A future
   storage-concurrency project may weaken this.
-- CREATE and public relation-name conflicts remain serialized by the catalog/DDL
-  boundary until name-keyed namespace locks or operation-scoped catalog undo land.
+- Schema-scoped catalog-name resources are available for CREATE and relation-name
+  conflicts. Until transactional DDL call sites adopt them, those paths retain
+  catalog-publication-gate serialization; the adoption occurs atomically with
+  transactional catalog publication.
 - DROP SEQUENCE and owned-sequence cascades take `SequenceExclusive`; sequence
   calls/defaults take `SequenceAccess` for their statement/transaction lifetime.
 
@@ -248,7 +260,7 @@ exclusive side after object locks and holds it across public catalog/storage
 mutation, WAL Commit flush, and either commit publication or rollback restore.
 Thus no catalog reader observes provisional CREATE/DROP/ALTER state and
 whole-catalog restore cannot overlap another catalog change. The universal
-mutation order is shared writer guard, all table/sequence locks, exclusive catalog
+mutation order is shared writer guard, all schema/name/table/sequence locks, exclusive catalog
 gate, then storage latches. No path waits for an object lock while holding either
 side of the gate.
 

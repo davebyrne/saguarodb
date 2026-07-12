@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use common::{ConflictWaiter, DbError, QueryCancel, Result, SequenceId, SqlState, TableId, TxnId};
+use common::{
+    ConflictWaiter, DbError, QueryCancel, Result, SchemaId, SequenceId, SqlState, TableId, TxnId,
+};
 
 use crate::registry::ActiveTxnRegistry;
 
@@ -24,8 +26,22 @@ pub enum LockOwner {
 }
 
 /// A lockable catalog object. Variant order is the global acquisition order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NormalizedCatalogName(String);
+
+impl NormalizedCatalogName {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self(name.as_ref().to_ascii_lowercase())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LockResource {
+    Schema(SchemaId),
+    CatalogName {
+        schema: SchemaId,
+        name: NormalizedCatalogName,
+    },
     Table(TableId),
     Sequence(SequenceId),
 }
@@ -44,8 +60,15 @@ pub enum SequenceLockMode {
     Exclusive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CatalogLockMode {
+    Access,
+    Exclusive,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectLockMode {
+    Catalog(CatalogLockMode),
     Relation(RelationLockMode),
     Sequence(SequenceLockMode),
 }
@@ -53,6 +76,10 @@ pub enum ObjectLockMode {
 impl ObjectLockMode {
     fn compatible(self, other: Self) -> bool {
         match (self, other) {
+            (Self::Catalog(CatalogLockMode::Access), Self::Catalog(CatalogLockMode::Access)) => {
+                true
+            }
+            (Self::Catalog(_), Self::Catalog(_)) => false,
             (Self::Relation(left), Self::Relation(right)) => relation_compatible(left, right),
             (
                 Self::Sequence(SequenceLockMode::Access),
@@ -66,6 +93,7 @@ impl ObjectLockMode {
 
     fn covers(self, requested: Self) -> bool {
         match (self, requested) {
+            (Self::Catalog(held), Self::Catalog(requested)) => held >= requested,
             (Self::Relation(held), Self::Relation(requested)) => held >= requested,
             (Self::Sequence(held), Self::Sequence(requested)) => held >= requested,
             _ => false,
@@ -74,6 +102,7 @@ impl ObjectLockMode {
 
     fn strongest(self, other: Self) -> Self {
         match (self, other) {
+            (Self::Catalog(left), Self::Catalog(right)) => Self::Catalog(left.max(right)),
             (Self::Relation(left), Self::Relation(right)) => Self::Relation(left.max(right)),
             (Self::Sequence(left), Self::Sequence(right)) => Self::Sequence(left.max(right)),
             _ => panic!("lock mode does not match resource type"),
@@ -91,13 +120,30 @@ fn relation_compatible(left: RelationLockMode, right: RelationLockMode) -> bool 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectLockRequest {
     pub resource: LockResource,
     pub mode: ObjectLockMode,
 }
 
 impl ObjectLockRequest {
+    pub fn schema(schema: SchemaId, mode: CatalogLockMode) -> Self {
+        Self {
+            resource: LockResource::Schema(schema),
+            mode: ObjectLockMode::Catalog(mode),
+        }
+    }
+
+    pub fn catalog_name(schema: SchemaId, name: impl Into<String>) -> Self {
+        Self {
+            resource: LockResource::CatalogName {
+                schema,
+                name: NormalizedCatalogName::new(name.into()),
+            },
+            mode: ObjectLockMode::Catalog(CatalogLockMode::Exclusive),
+        }
+    }
+
     pub fn table(table_id: TableId, mode: RelationLockMode) -> Self {
         Self {
             resource: LockResource::Table(table_id),
@@ -221,7 +267,7 @@ impl LockManager {
         request: ObjectLockRequest,
         cancel: &QueryCancel,
     ) -> Result<()> {
-        validate_request(request)?;
+        validate_request(&request)?;
         let mut state = self.lock();
         if state
             .grants
@@ -236,7 +282,7 @@ impl LockManager {
         assert_ne!(request_id, u64::MAX, "object lock request id exhausted");
         state
             .queues
-            .entry(request.resource)
+            .entry(request.resource.clone())
             .or_default()
             .push_back(QueuedRequest {
                 id: request_id,
@@ -248,17 +294,22 @@ impl LockManager {
 
         loop {
             if let Err(err) = cancel.check() {
-                remove_request(&mut state, request.resource, request_id);
+                remove_request(&mut state, request.resource.clone(), request_id);
                 state.waits_for.remove(&owner);
                 self.cond.notify_all();
                 return Err(err);
             }
 
-            let blockers =
-                request_blockers(&state, request.resource, request_id, owner, request.mode);
+            let blockers = request_blockers(
+                &state,
+                request.resource.clone(),
+                request_id,
+                owner,
+                request.mode,
+            );
             if blockers.is_empty() {
-                remove_request(&mut state, request.resource, request_id);
-                let grants = state.grants.entry(request.resource).or_default();
+                remove_request(&mut state, request.resource.clone(), request_id);
+                let grants = state.grants.entry(request.resource.clone()).or_default();
                 grants
                     .entry(owner)
                     .and_modify(|held| *held = held.strongest(request.mode))
@@ -277,7 +328,7 @@ impl LockManager {
             if last_detection.elapsed() >= self.deadlock_timeout {
                 last_detection = Instant::now();
                 if on_cycle(&state.waits_for, owner) {
-                    remove_request(&mut state, request.resource, request_id);
+                    remove_request(&mut state, request.resource.clone(), request_id);
                     state.waits_for.remove(&owner);
                     self.cond.notify_all();
                     return Err(DbError::execute(
@@ -294,7 +345,9 @@ impl LockManager {
         let grants = state
             .grants
             .iter()
-            .filter_map(|(resource, owners)| owners.get(&owner).map(|mode| (*resource, *mode)))
+            .filter_map(|(resource, owners)| {
+                owners.get(&owner).map(|mode| (resource.clone(), *mode))
+            })
             .collect();
         OwnerGrantSnapshot {
             manager_id: self.id,
@@ -338,7 +391,7 @@ impl LockManager {
         for (resource, mode) in &snapshot.grants {
             state
                 .grants
-                .entry(*resource)
+                .entry(resource.clone())
                 .or_default()
                 .insert(owner, *mode);
         }
@@ -474,10 +527,12 @@ impl ConflictWaiter for LockManager {
     }
 }
 
-fn validate_request(request: ObjectLockRequest) -> Result<()> {
+fn validate_request(request: &ObjectLockRequest) -> Result<()> {
     let valid = matches!(
-        (request.resource, request.mode),
-        (LockResource::Table(_), ObjectLockMode::Relation(_))
+        (&request.resource, request.mode),
+        (LockResource::Schema(_), ObjectLockMode::Catalog(_))
+            | (LockResource::CatalogName { .. }, ObjectLockMode::Catalog(_))
+            | (LockResource::Table(_), ObjectLockMode::Relation(_))
             | (LockResource::Sequence(_), ObjectLockMode::Sequence(_))
     );
     if valid {
@@ -492,9 +547,9 @@ fn validate_request(request: ObjectLockRequest) -> Result<()> {
 fn normalize_requests(requests: &[ObjectLockRequest]) -> Result<Vec<ObjectLockRequest>> {
     let mut normalized = BTreeMap::<LockResource, ObjectLockMode>::new();
     for request in requests {
-        validate_request(*request)?;
+        validate_request(request)?;
         normalized
-            .entry(request.resource)
+            .entry(request.resource.clone())
             .and_modify(|mode| *mode = mode.strongest(request.mode))
             .or_insert(request.mode);
     }
@@ -629,16 +684,24 @@ mod tests {
     #[test]
     fn requests_are_deduplicated_strongest_and_resource_sorted() {
         let requests = normalize_requests(&[
+            ObjectLockRequest::catalog_name(2, "zeta"),
+            ObjectLockRequest::schema(2, CatalogLockMode::Access),
             ObjectLockRequest::sequence(2, SequenceLockMode::Access),
             ObjectLockRequest::table(9, RelationLockMode::AccessShare),
             ObjectLockRequest::table(2, RelationLockMode::RowExclusive),
             ObjectLockRequest::table(9, RelationLockMode::AccessExclusive),
             ObjectLockRequest::sequence(2, SequenceLockMode::Exclusive),
+            ObjectLockRequest::catalog_name(2, "alpha"),
+            ObjectLockRequest::catalog_name(2, "ALPHA"),
+            ObjectLockRequest::schema(2, CatalogLockMode::Exclusive),
         ])
         .unwrap();
         assert_eq!(
             requests,
             vec![
+                ObjectLockRequest::schema(2, CatalogLockMode::Exclusive),
+                ObjectLockRequest::catalog_name(2, "alpha"),
+                ObjectLockRequest::catalog_name(2, "zeta"),
                 ObjectLockRequest::table(2, RelationLockMode::RowExclusive),
                 ObjectLockRequest::table(9, RelationLockMode::AccessExclusive),
                 ObjectLockRequest::sequence(2, SequenceLockMode::Exclusive),
