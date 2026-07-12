@@ -45,6 +45,9 @@ pub enum SqlState {
     /// `42P03`: a cursor declaration used a name that is already open in the
     /// current session.
     DuplicateCursor,
+    /// `42P18`: a value such as an empty array or bare placeholder has no type
+    /// context from which its concrete type can be inferred.
+    IndeterminateDatatype,
     DatatypeMismatch,
     DivisionByZero,
     /// `22023`: a validly typed argument or option has an invalid value, e.g.
@@ -125,6 +128,7 @@ impl SqlState {
             SqlState::WrongObjectType => "42809",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateCursor => "42P03",
+            SqlState::IndeterminateDatatype => "42P18",
             SqlState::DatatypeMismatch => "42804",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
@@ -165,6 +169,7 @@ impl SqlState {
             "42809" => SqlState::WrongObjectType,
             "42P07" => SqlState::DuplicateTable,
             "42P03" => SqlState::DuplicateCursor,
+            "42P18" => SqlState::IndeterminateDatatype,
             "42804" => SqlState::DatatypeMismatch,
             "22012" => SqlState::DivisionByZero,
             "22023" => SqlState::InvalidParameterValue,

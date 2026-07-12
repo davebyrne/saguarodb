@@ -712,6 +712,7 @@ fn value_type(value: &Value) -> Option<DataType> {
         Value::Interval(_) => Some(DataType::Interval),
         Value::Bytes(_) => Some(DataType::Bytea),
         Value::Uuid(_) => Some(DataType::Uuid),
+        Value::Array(array) => Some(DataType::Array(Box::new(array.element_type().clone()))),
     }
 }
 

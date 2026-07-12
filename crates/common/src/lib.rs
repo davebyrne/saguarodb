@@ -1,3 +1,4 @@
+pub mod array;
 pub mod bytea;
 pub mod cancel;
 pub mod concurrency;
@@ -22,6 +23,7 @@ pub mod value;
 /// `server_version`, startup `ParameterStatus`, and `version()`.
 pub const POSTGRES_COMPAT_VERSION: &str = "16.0";
 
+pub use array::{ArrayDimension, MAX_ARRAY_DIMENSIONS, SqlArray, value_matches_type};
 pub use cancel::{CancelReason, QueryCancel};
 pub use concurrency::{
     CheckpointGuard, ConcurrencyController, RwLockConcurrencyController, WriteGuard,

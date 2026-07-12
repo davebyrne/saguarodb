@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::SqlArray;
 use crate::float::{OrderedF32, OrderedF64};
 use crate::interval::Interval;
 use crate::numeric::Decimal;
@@ -41,6 +42,9 @@ pub enum Value {
     /// `UUID`, stored as its 16 bytes. `[u8; 16]` ordering is the canonical
     /// (network-order) byte ordering, matching PostgreSQL.
     Uuid([u8; 16]),
+    /// A homogeneous rectangular SQL array. Appended after every pre-array value
+    /// variant because declaration order is the durable decoded B-tree ordering.
+    Array(SqlArray),
 }
 
 /// Parse PostgreSQL boolean input text, returning `None` for unrecognized input

@@ -8,7 +8,7 @@ fn initial_schema_version() -> u64 {
     INITIAL_SCHEMA_VERSION
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DataType {
     Integer,
     Text,
@@ -42,6 +42,9 @@ pub enum DataType {
         precision: Option<u32>,
         scale: u32,
     },
+    /// A rectangular PostgreSQL array. Multidimensionality belongs to the value's
+    /// shape; the boxed type is always a non-array scalar element type.
+    Array(Box<DataType>),
 }
 
 /// Per-table at-rest page compression setting (`docs/specs/compression.md`
@@ -381,10 +384,12 @@ pub struct ViewSchema {
 
 pub fn needs_toast_relation(schema: &TableSchema) -> bool {
     schema.relation_kind == RelationKind::User
-        && schema
-            .columns
-            .iter()
-            .any(|column| matches!(column.data_type, DataType::Text | DataType::Bytea))
+        && schema.columns.iter().any(|column| {
+            matches!(
+                column.data_type,
+                DataType::Text | DataType::Bytea | DataType::Array(_)
+            )
+        })
 }
 
 pub fn toast_relation_name(base_table: TableId) -> String {

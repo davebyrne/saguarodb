@@ -985,6 +985,7 @@ fn render_literal(value: &Value) -> String {
         Value::Interval(value) => format!("'{}'", interval::format_interval(value)),
         Value::Bytes(value) => format!("'{}'", bytea::format_hex(value)),
         Value::Uuid(value) => format!("'{}'", uuid::format_uuid(value)),
+        Value::Array(array) => format!("ARRAY{:?}", array.elements()),
     }
 }
 
@@ -1186,7 +1187,8 @@ fn type_storage(pg_type: &PgType) -> &'static str {
         | PgType::OidVector
         | PgType::Int2Vector
         | PgType::OidArray
-        | PgType::Int2Array => "x",
+        | PgType::Int2Array
+        | PgType::Array(_) => "x",
         _ => "p",
     }
 }
@@ -1198,7 +1200,10 @@ fn type_collation_oid(pg_type: &PgType) -> i64 {
     }
 }
 
-fn sql_data_type(pg_type: &PgType) -> &'static str {
+fn sql_data_type(pg_type: &PgType) -> String {
+    if matches!(pg_type, PgType::Array(_)) {
+        return pg_type.format_type_name();
+    }
     match pg_type {
         PgType::Int2 => "smallint",
         PgType::Int4 => "integer",
@@ -1222,10 +1227,15 @@ fn sql_data_type(pg_type: &PgType) -> &'static str {
         PgType::Int2Vector => "int2vector",
         PgType::OidArray => "oid[]",
         PgType::Int2Array => "smallint[]",
+        PgType::Array(_) => unreachable!("handled above"),
     }
+    .to_string()
 }
 
-fn pg_type_name(pg_type: &PgType) -> &'static str {
+fn pg_type_name(pg_type: &PgType) -> String {
+    if let PgType::Array(element) = pg_type {
+        return format!("_{}", pg_type_name(element));
+    }
     match pg_type {
         PgType::Int2 => "int2",
         PgType::Int4 => "int4",
@@ -1249,7 +1259,9 @@ fn pg_type_name(pg_type: &PgType) -> &'static str {
         PgType::Int2Vector => "int2vector",
         PgType::OidArray => "_oid",
         PgType::Int2Array => "_int2",
+        PgType::Array(_) => unreachable!("handled above"),
     }
+    .to_string()
 }
 
 fn character_maximum_length(pg_type: &PgType) -> Option<u32> {

@@ -2262,6 +2262,7 @@ fn _type_name(data_type: &DataType) -> &'static str {
         DataType::Double => "DOUBLE PRECISION",
         DataType::Numeric { .. } => "NUMERIC",
         DataType::Real => "REAL",
+        DataType::Array(_) => "ARRAY",
     }
 }
 

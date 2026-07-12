@@ -137,6 +137,7 @@ pub enum Value {
     Interval(Interval),// months/days/micros; compares by canonical estimate
     Bytes(Vec<u8>),// BYTEA, raw bytes
     Uuid([u8; 16]),// UUID, 16 bytes
+    Array(SqlArray),// homogeneous rectangular SQL array
 }
 
 /// An ordered sequence of values representing one tuple.
@@ -167,7 +168,7 @@ pub enum KeyRange {
 }
 ```
 
-`Value` derives `Ord`/`Eq`/`Hash` from its declaration order, and that derived order **is** the durable B-tree key ordering (the on-disk index compares decoded `Key(Vec<Value>)` values directly). Variant order in `Value` (and, by the same conservatism, `DataType`) is therefore a durable on-disk contract: new variants must be **appended** at the end of the enum — never inserted or reordered mid-enum — unless the key ordering/encoding is deliberately revisited and migrated. `crates/common/src/value.rs` is the authoritative definition; see `docs/specs/crates/common.md`.
+`Value` derives `Ord`/`Eq`/`Hash` from its declaration order, and that derived order **is** the durable B-tree key ordering (the on-disk index compares decoded `Key(Vec<Value>)` values directly). Variant order in `Value` (and, by the same conservatism, `DataType`) is therefore a durable on-disk contract: new variants must be **appended** at the end of the enum — never inserted or reordered mid-enum — unless the key ordering/encoding is deliberately revisited and migrated. `Array` is appended after `Uuid`; its `SqlArray` payload preserves a scalar element type, up to six dimensions with lower bounds, and flattened row-major elements. `crates/common/src/value.rs` is the authoritative definition; see `docs/specs/crates/common.md`.
 
 #### Data Types
 
@@ -187,6 +188,7 @@ pub enum DataType {
     Double,
     Real,
     Numeric { precision: Option<u32>, scale: u32 },
+    Array(Box<DataType>),
 }
 
 pub enum ToastMode {

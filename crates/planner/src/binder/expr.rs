@@ -259,6 +259,10 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         Value::Interval(_) => (DataType::Interval, false),
         Value::Bytes(_) => (DataType::Bytea, false),
         Value::Uuid(_) => (DataType::Uuid, false),
+        Value::Array(array) => (
+            DataType::Array(Box::new(array.element_type().clone())),
+            false,
+        ),
     };
     Ok(BoundExpr::Literal {
         value: value.clone(),

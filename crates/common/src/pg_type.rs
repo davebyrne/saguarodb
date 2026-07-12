@@ -46,6 +46,9 @@ pub enum PgType {
     Int2Vector,
     OidArray,
     Int2Array,
+    /// A real PostgreSQL array wire type. The pre-existing `Int2Array` and
+    /// `OidArray` variants remain as durable aliases for their element types.
+    Array(Box<PgType>),
 }
 
 impl PgType {
@@ -66,7 +69,25 @@ impl PgType {
             700 => PgType::Float4,
             701 => PgType::Float8,
             1005 => PgType::Int2Array,
+            1000 => PgType::Array(Box::new(PgType::Bool)),
+            1001 => PgType::Array(Box::new(PgType::Bytea)),
+            1007 => PgType::Array(Box::new(PgType::Int4)),
+            1009 => PgType::Array(Box::new(PgType::Text)),
+            1014 => PgType::Array(Box::new(PgType::Bpchar(None))),
+            1015 => PgType::Array(Box::new(PgType::Varchar(None))),
+            1016 => PgType::Array(Box::new(PgType::Int8)),
+            1021 => PgType::Array(Box::new(PgType::Float4)),
+            1022 => PgType::Array(Box::new(PgType::Float8)),
             1028 => PgType::OidArray,
+            1115 => PgType::Array(Box::new(PgType::Timestamp)),
+            1182 => PgType::Array(Box::new(PgType::Date)),
+            1183 => PgType::Array(Box::new(PgType::Time)),
+            1185 => PgType::Array(Box::new(PgType::Timestamptz)),
+            1187 => PgType::Array(Box::new(PgType::Interval)),
+            1231 => PgType::Array(Box::new(PgType::Numeric {
+                precision: None,
+                scale: 0,
+            })),
             1042 => PgType::Bpchar(decode_length_typmod(typmod)),
             1043 => PgType::Varchar(decode_length_typmod(typmod)),
             1082 => PgType::Date,
@@ -79,6 +100,7 @@ impl PgType {
                 PgType::Numeric { precision, scale }
             }
             2950 => PgType::Uuid,
+            2951 => PgType::Array(Box::new(PgType::Uuid)),
             _ => return None,
         })
     }
@@ -152,6 +174,7 @@ impl PgType {
             PgType::Int2Vector => "int2vector".to_string(),
             PgType::OidArray => "oid[]".to_string(),
             PgType::Int2Array => "smallint[]".to_string(),
+            PgType::Array(element) => format!("{}[]", element.format_type_name()),
         }
     }
 
@@ -180,6 +203,7 @@ impl PgType {
             PgType::Int2Vector => 22,
             PgType::OidArray => 1028,
             PgType::Int2Array => 1005,
+            PgType::Array(element) => array_oid(element).unwrap_or(0),
         }
     }
 
@@ -204,6 +228,7 @@ impl PgType {
             | PgType::Int2Vector
             | PgType::OidArray
             | PgType::Int2Array => -1,
+            PgType::Array(_) => -1,
         }
     }
 
@@ -260,6 +285,7 @@ impl PgType {
             | PgType::Int2Vector
             | PgType::OidArray
             | PgType::Int2Array => DataType::Text,
+            PgType::Array(element) => DataType::Array(Box::new(element.data_type())),
             PgType::Bytea => DataType::Bytea,
             PgType::Uuid => DataType::Uuid,
             PgType::Date => DataType::Date,
@@ -328,8 +354,51 @@ impl From<&DataType> for PgType {
                 precision: *precision,
                 scale: *scale,
             },
+            DataType::Array(element) => PgType::array(PgType::from(element.as_ref()))
+                .expect("DataType arrays always have supported scalar elements"),
         }
     }
+}
+
+impl PgType {
+    pub fn array(element: PgType) -> crate::Result<Self> {
+        if matches!(
+            element,
+            PgType::Array(_) | PgType::Int2Array | PgType::OidArray
+        ) {
+            return Err(crate::DbError::plan(
+                crate::SqlState::DatatypeMismatch,
+                "array elements cannot themselves be arrays",
+            ));
+        }
+        Ok(match element {
+            PgType::Int2 => PgType::Int2Array,
+            PgType::Oid => PgType::OidArray,
+            other => PgType::Array(Box::new(other)),
+        })
+    }
+}
+
+fn array_oid(element: &PgType) -> Option<i32> {
+    Some(match element {
+        PgType::Bool => 1000,
+        PgType::Bytea => 1001,
+        PgType::Int4 => 1007,
+        PgType::Text => 1009,
+        PgType::Bpchar(_) => 1014,
+        PgType::Varchar(_) => 1015,
+        PgType::Int8 => 1016,
+        PgType::Float4 => 1021,
+        PgType::Float8 => 1022,
+        PgType::Timestamp => 1115,
+        PgType::Date => 1182,
+        PgType::Time => 1183,
+        PgType::Timestamptz => 1185,
+        PgType::Interval => 1187,
+        PgType::Numeric { .. } => 1231,
+        PgType::Uuid => 2951,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -558,6 +627,7 @@ mod tests {
                 precision: Some(10),
                 scale: 2,
             },
+            DataType::Array(Box::new(DataType::Text)),
         ];
         for data_type in all {
             assert_eq!(PgType::from(&data_type).data_type(), data_type);

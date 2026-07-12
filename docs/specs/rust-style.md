@@ -102,7 +102,7 @@ If clippy warns on code that is clearer as written, add the narrowest possible `
 - Do not implement implicit casts. Type mismatches return `SqlState::DatatypeMismatch`.
 - `NULL` may be accepted where the target column or expression is nullable.
 - SQL three-valued logic belongs in executor expression evaluation, not in `Value` ordering.
-- `Value::Ord` is storage key ordering only, derived from `common::Value`'s declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid`, with natural ordering inside each variant.
+- `Value::Ord` is storage key ordering only, derived from `common::Value`'s declaration order: `Null < Boolean < Integer < Float < Real < Numeric < Text < Date < Timestamp < Time < TimestampTz < Interval < Bytes < Uuid < Array`, with natural ordering inside each variant. `SqlArray` orders by element type, row-major elements, cardinality, and dimensional metadata.
 - Composite (multi-column) primary keys are supported end to end: the catalog records the ordered key column list, the storage key encoding (`Key(Vec<Value>)`) covers all key columns, and a leading-column equality uses the prefix-matching primary-key range scan.
 
 ## Modules and File Size

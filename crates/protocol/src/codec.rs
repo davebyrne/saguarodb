@@ -593,6 +593,11 @@ pub fn encode_value(value: &Value, format: i16) -> Result<Option<Vec<u8>>> {
             ValueFormat::Text => common::uuid::format_uuid(raw).into_bytes(),
             ValueFormat::Binary => raw.to_vec(),
         },
+        Value::Array(_) => {
+            return Err(protocol_error(
+                "array wire encoding requires a declared element wire type",
+            ));
+        }
     };
     Ok(Some(bytes))
 }
@@ -852,6 +857,9 @@ pub fn decode_value(bytes: &[u8], data_type: DataType, format: i16) -> Result<Va
                 .map_err(|_| protocol_error("binary uuid parameter must be 16 bytes"))?;
             Ok(Value::Uuid(array))
         }
+        (DataType::Array(_), _) => Err(protocol_error(
+            "array parameter decoding requires a declared element wire type",
+        )),
     }
 }
 

@@ -181,6 +181,10 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Interval => common::interval::parse_interval(text)
             .map(Value::Interval)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for interval: \"{text}\""))),
+        DataType::Array(_) => Err(DbError::execute(
+            SqlState::FeatureNotSupported,
+            "COPY array input is not implemented",
+        )),
     }
 }
 
@@ -440,6 +444,7 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Time(micros) => Some(common::datetime::format_time(*micros)),
         Value::TimestampTz(micros) => Some(common::datetime::format_timestamptz(*micros)),
         Value::Interval(iv) => Some(common::interval::format_interval(iv)),
+        Value::Array(array) => Some(format!("{array:?}")),
     }
 }
 

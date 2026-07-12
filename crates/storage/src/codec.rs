@@ -300,6 +300,12 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
                 bytes.push(KEY_TAG_REAL);
                 bytes.extend_from_slice(&value.0.to_le_bytes());
             }
+            Value::Array(_) => {
+                return Err(DbError::storage(
+                    SqlState::FeatureNotSupported,
+                    "array key encoding is not implemented",
+                ));
+            }
         }
     }
     Ok(bytes)
@@ -725,6 +731,11 @@ pub(crate) fn decode_physical_row(
             DataType::Uuid => {
                 let raw = read_exact(bytes, &mut offset, 16)?;
                 Value::Uuid(raw.try_into().expect("16 bytes"))
+            }
+            DataType::Array(_) => {
+                return Err(corrupt_row(
+                    "array row decoding is not implemented for this format",
+                ));
             }
         };
         values.push(DecodedPhysicalValue::Value(value));
@@ -1284,6 +1295,7 @@ mod tests {
                 Value::Float(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
                 Value::Numeric(value) => put_numeric(&mut bytes, value),
                 Value::Real(value) => bytes.extend_from_slice(&value.0.to_le_bytes()),
+                Value::Array(_) => panic!("legacy test encoder does not support arrays"),
             }
         }
         bytes
