@@ -38,6 +38,7 @@ pub(crate) fn rows_for(
         SystemView::PgRoles => Ok(pg_roles_rows(ctx)),
         SystemView::PgSettings => Ok(pg_settings_rows(ctx)),
         SystemView::PgStatActivity => Ok(pg_stat_activity_rows(ctx)),
+        SystemView::PgStats => pg_stats_rows(catalog),
         SystemView::InformationSchemaSchemata => Ok(information_schema_schemata_rows(ctx)),
         SystemView::InformationSchemaTables => information_schema_tables_rows(catalog, ctx),
         SystemView::InformationSchemaColumns => information_schema_columns_rows(catalog, ctx),
@@ -74,6 +75,7 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
             .any(|index| index.constraint == IndexConstraintKind::PrimaryKey);
         rows.push(pg_class_table_row(
             table,
+            catalog.get_table_statistics(table.id)?.as_ref(),
             !indexes.is_empty() || (!table.primary_key.is_empty() && !has_primary_key_index),
         ));
         for index in indexes {
@@ -108,8 +110,17 @@ fn pg_class_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-fn pg_class_table_row(table: &TableSchema, relhasindex: bool) -> Row {
+/// `relpages`/`reltuples` come from stored ANALYZE statistics when present
+/// (`docs/specs/statistics.md` §8); a never-analyzed table keeps PostgreSQL's
+/// "unknown" convention (`0` pages, `-1` tuples).
+fn pg_class_table_row(
+    table: &TableSchema,
+    statistics: Option<&common::TableStatistics>,
+    relhasindex: bool,
+) -> Row {
     let oid = table_oid(table.id);
+    let relpages = statistics.map_or(0, |stats| stats.page_count as i64);
+    let reltuples = statistics.map_or(-1.0, |stats| stats.row_count as f32);
     row(vec![
         int(oid),
         text(relation_name(table)),
@@ -119,8 +130,8 @@ fn pg_class_table_row(table: &TableSchema, relhasindex: bool) -> Row {
         int(0),
         int(oid),
         int(0),
-        int(0),
-        real(-1.0),
+        int(relpages),
+        real(reltuples),
         int(0),
         int(0),
         bool_value(relhasindex),
@@ -793,6 +804,107 @@ fn pg_stat_activity_row(session: SessionActivityRow) -> Row {
     ])
 }
 
+/// One `pg_stats` row per analyzed column (`docs/specs/statistics.md` §8),
+/// sorted by table id then column id. MCV/histogram values render in their
+/// wire text form inside PostgreSQL-style `{...}` array text; `n_distinct`
+/// follows the PostgreSQL sign convention (positive count, negative fraction
+/// of the row count); `correlation` is always NULL in v1.
+fn pg_stats_rows(catalog: &dyn CatalogManager) -> Result<Vec<Row>> {
+    let mut tables = catalog
+        .list_tables()?
+        .into_iter()
+        .filter(|table| table.relation_kind == RelationKind::User)
+        .collect::<Vec<_>>();
+    tables.sort_unstable_by_key(|table| table.id);
+
+    let mut rows = Vec::new();
+    for table in &tables {
+        let Some(statistics) = catalog.get_table_statistics(table.id)? else {
+            continue;
+        };
+        for column in &table.columns {
+            let Some(column_stats) = statistics.columns.get(&column.id) else {
+                continue;
+            };
+            let n_distinct = match &column_stats.n_distinct {
+                common::NDistinct::Count(count) => *count as f32,
+                common::NDistinct::Fraction(fraction) => -(fraction.get() as f32),
+            };
+            let mcv_vals = non_empty_array_text(
+                column_stats
+                    .most_common
+                    .iter()
+                    .map(|(value, _)| stat_value_text(value)),
+            );
+            let mcv_freqs = non_empty_array_text(
+                column_stats
+                    .most_common
+                    .iter()
+                    .map(|(_, freq)| common::float::format_double(freq.get())),
+            );
+            let histogram =
+                non_empty_array_text(column_stats.histogram_bounds.iter().map(stat_value_text));
+            rows.push(row(vec![
+                text("public"),
+                text(&table.name),
+                text(&column.name),
+                real(column_stats.null_frac.get() as f32),
+                int(i64::from(column_stats.avg_width)),
+                real(n_distinct),
+                nullable_text(mcv_vals),
+                nullable_text(mcv_freqs),
+                nullable_text(histogram),
+                Value::Null,
+            ]));
+        }
+    }
+    Ok(rows)
+}
+
+/// A statistics value's display text: the wire text form (never NULL — MCV
+/// and histogram entries are non-null by construction).
+fn stat_value_text(value: &Value) -> String {
+    crate::copy::value_text(value).unwrap_or_default()
+}
+
+/// PostgreSQL-style array output (`{a,b,c}`), or `None` for an empty list
+/// (rendered as SQL NULL, matching pg_stats for absent statistics).
+fn non_empty_array_text(elements: impl Iterator<Item = String>) -> Option<String> {
+    let mut out = String::from("{");
+    let mut any = false;
+    for element in elements {
+        if any {
+            out.push(',');
+        }
+        any = true;
+        if array_element_needs_quotes(&element) {
+            out.push('"');
+            for ch in element.chars() {
+                if ch == '"' || ch == '\\' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            out.push('"');
+        } else {
+            out.push_str(&element);
+        }
+    }
+    if !any {
+        return None;
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn array_element_needs_quotes(element: &str) -> bool {
+    element.is_empty()
+        || element.eq_ignore_ascii_case("null")
+        || element
+            .chars()
+            .any(|ch| matches!(ch, '{' | '}' | ',' | '"' | '\\') || ch.is_whitespace())
+}
+
 fn information_schema_schemata_rows(ctx: &StatementContext) -> Vec<Row> {
     ["pg_catalog", "public", "information_schema"]
         .into_iter()
@@ -1332,5 +1444,38 @@ fn datetime_precision(pg_type: &PgType) -> Option<u32> {
     match pg_type {
         PgType::Time | PgType::Timestamp | PgType::Timestamptz | PgType::Interval => Some(6),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::non_empty_array_text;
+
+    fn array_text(elements: &[&str]) -> Option<String> {
+        non_empty_array_text(elements.iter().map(|element| element.to_string()))
+    }
+
+    #[test]
+    fn array_text_quotes_per_postgres_array_output_rules() {
+        // Plain elements stay bare.
+        assert_eq!(array_text(&["a", "b2", "0.25"]).unwrap(), "{a,b2,0.25}");
+        // Whitespace, commas, and braces force quotes.
+        assert_eq!(
+            array_text(&["Jo hn", "Sm,ith", "{x}", "a}b"]).unwrap(),
+            r#"{"Jo hn","Sm,ith","{x}","a}b"}"#
+        );
+        // Embedded quotes and backslashes are backslash-escaped inside quotes.
+        assert_eq!(
+            array_text(&[r#"say "hi""#, r"back\slash"]).unwrap(),
+            r#"{"say \"hi\"","back\\slash"}"#
+        );
+        // Empty strings and the literal word NULL (any case) must be quoted so
+        // they cannot be misread as SQL NULL elements.
+        assert_eq!(
+            array_text(&["", "NULL", "null"]).unwrap(),
+            r#"{"","NULL","null"}"#
+        );
+        // No elements: SQL NULL, not an empty array literal.
+        assert_eq!(array_text(&[]), None);
     }
 }

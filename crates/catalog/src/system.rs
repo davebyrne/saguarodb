@@ -64,6 +64,7 @@ pub enum SystemView {
     PgRoles,
     PgSettings,
     PgStatActivity,
+    PgStats,
     InformationSchemaSchemata,
     InformationSchemaTables,
     InformationSchemaColumns,
@@ -84,6 +85,7 @@ impl SystemView {
         SystemView::PgRoles,
         SystemView::PgSettings,
         SystemView::PgStatActivity,
+        SystemView::PgStats,
         SystemView::InformationSchemaSchemata,
         SystemView::InformationSchemaTables,
         SystemView::InformationSchemaColumns,
@@ -103,7 +105,8 @@ impl SystemView {
             | SystemView::PgDatabase
             | SystemView::PgRoles
             | SystemView::PgSettings
-            | SystemView::PgStatActivity => SystemSchema::PgCatalog,
+            | SystemView::PgStatActivity
+            | SystemView::PgStats => SystemSchema::PgCatalog,
             SystemView::InformationSchemaSchemata
             | SystemView::InformationSchemaTables
             | SystemView::InformationSchemaColumns => SystemSchema::InformationSchema,
@@ -125,6 +128,7 @@ impl SystemView {
             SystemView::PgRoles => "pg_roles",
             SystemView::PgSettings => "pg_settings",
             SystemView::PgStatActivity => "pg_stat_activity",
+            SystemView::PgStats => "pg_stats",
             SystemView::InformationSchemaSchemata => "schemata",
             SystemView::InformationSchemaTables => "tables",
             SystemView::InformationSchemaColumns => "columns",
@@ -150,6 +154,7 @@ impl SystemView {
             SystemView::PgSettings => 13_100,
             SystemView::PgStatActivity => 13_101,
             SystemView::PgRoles => 13_102,
+            SystemView::PgStats => 13_103,
             SystemView::InformationSchemaSchemata => 13_200,
             SystemView::InformationSchemaTables => 13_201,
             SystemView::InformationSchemaColumns => 13_202,
@@ -389,6 +394,18 @@ impl SystemView {
                 text_col(14, "state"),
                 text_col(15, "query"),
                 text_col(16, "backend_type"),
+            ],
+            SystemView::PgStats => vec![
+                name_col(0, "schemaname"),
+                name_col(1, "tablename"),
+                name_col(2, "attname"),
+                col(3, "null_frac", DataType::Real, PgType::Float4, false),
+                int4_col(4, "avg_width"),
+                col(5, "n_distinct", DataType::Real, PgType::Float4, false),
+                nullable_text_col(6, "most_common_vals"),
+                nullable_text_col(7, "most_common_freqs"),
+                nullable_text_col(8, "histogram_bounds"),
+                col(9, "correlation", DataType::Real, PgType::Float4, true),
             ],
             SystemView::InformationSchemaSchemata => vec![
                 text_col(0, "catalog_name"),

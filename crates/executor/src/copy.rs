@@ -441,8 +441,10 @@ pub fn format_header(names: &[&str], options: &CopyOptions) -> Vec<u8> {
     line.into_bytes()
 }
 
-/// The on-wire string of a value, or `None` for NULL (emitted as the NULL string).
-fn value_text(value: &Value) -> Option<String> {
+/// The on-wire string of a value, or `None` for NULL (emitted as the NULL
+/// string). Shared with the `pg_stats` virtual view, which renders MCV and
+/// histogram values in their wire text form.
+pub(crate) fn value_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
         Value::Integer(int) => Some(int.to_string()),

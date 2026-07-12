@@ -125,6 +125,7 @@ pub enum SystemView {
     PgRoles,
     PgSettings,
     PgStatActivity,
+    PgStats,
     InformationSchemaSchemata,
     InformationSchemaTables,
     InformationSchemaColumns,

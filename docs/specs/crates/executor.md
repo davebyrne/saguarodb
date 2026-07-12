@@ -184,7 +184,14 @@ SaguaroDB reports. `typelem` is populated for vector and exposed array rows;
 `StatementContext.system_state.settings()` with synthesized transaction isolation
 rows. `pg_stat_activity` reflects `StatementContext.system_state.sessions()`; the
 server wires this to its live `SessionRegistry`, while the no-op provider used by
-library tests is empty.
+library tests is empty. `pg_stats` exposes one row per analyzed column
+(`docs/specs/statistics.md` §8), sorted by table id then column id: `null_frac`,
+`avg_width`, `n_distinct` (PostgreSQL sign convention — positive count,
+negative fraction of the row count), and MCV/histogram values rendered in
+their wire text form inside PostgreSQL-style `{...}` array text (quoted per
+array-output rules); empty lists render as SQL NULL and `correlation` is
+always NULL. `pg_class.relpages`/`reltuples` report stored statistics for
+analyzed user tables and keep the `0`/`-1` "unknown" convention otherwise.
 
 Rows are rebuilt for each execution, sorted deterministically, and filtered with
 the bound scan predicate using the same `predicate_matches` semantics as storage

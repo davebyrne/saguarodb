@@ -187,6 +187,84 @@ async fn analyze_does_not_block_behind_an_open_writer() {
 }
 
 #[tokio::test]
+async fn pg_class_and_pg_stats_expose_statistics() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    create_skewed_users(&mut conn).await;
+
+    // Never analyzed: PostgreSQL's "unknown" convention and no pg_stats rows.
+    let rows = conn
+        .ok("select relpages, reltuples from pg_class where relname = 'users'")
+        .await
+        .rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("0".to_string()), Some("-1".to_string())]]
+    );
+    let rows = conn
+        .ok("select count(*) from pg_stats where tablename = 'users'")
+        .await
+        .rows();
+    assert_eq!(rows, vec![vec![Some("0".to_string())]]);
+
+    conn.ok("analyze users").await;
+
+    let rows = conn
+        .ok("select relpages, reltuples from pg_class where relname = 'users'")
+        .await
+        .rows();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0][0].as_deref().unwrap().parse::<i64>().unwrap() >= 1);
+    assert_eq!(rows[0][1].as_deref(), Some("100"));
+
+    let rows = conn
+        .ok(
+            "select attname, null_frac, avg_width, n_distinct, most_common_vals, \
+             most_common_freqs, histogram_bounds, correlation \
+             from pg_stats where tablename = 'users' order by attname",
+        )
+        .await
+        .rows();
+    assert_eq!(rows.len(), 2);
+    // `id` is unique: negative-fraction n_distinct, histogram only.
+    assert_eq!(rows[0][0].as_deref(), Some("id"));
+    assert_eq!(rows[0][1].as_deref(), Some("0"));
+    assert_eq!(rows[0][3].as_deref(), Some("-1"));
+    assert_eq!(rows[0][4], None, "unique column has no MCVs");
+    assert!(rows[0][6].as_deref().unwrap().starts_with("{0,"));
+    assert_eq!(rows[0][7], None, "correlation is NULL in v1");
+    // `name` has four heavy values: MCVs cover everything, no histogram.
+    assert_eq!(rows[1][0].as_deref(), Some("name"));
+    assert_eq!(rows[1][3].as_deref(), Some("4"));
+    assert_eq!(
+        rows[1][4].as_deref(),
+        Some("{name0,name1,name2,name3}"),
+        "ties break by value order"
+    );
+    assert_eq!(rows[1][5].as_deref(), Some("{0.25,0.25,0.25,0.25}"));
+    assert_eq!(rows[1][6], None, "MCVs cover every sampled value");
+}
+
+#[tokio::test]
+async fn pg_stats_quotes_array_elements_that_need_it() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table people (id integer primary key, name text)")
+        .await;
+    // A repeated value containing a space and a comma must come back quoted
+    // in the PostgreSQL array-output form.
+    conn.ok("insert into people (id, name) values (1, 'Smith, Jo'), (2, 'Smith, Jo'), (3, 'x')")
+        .await;
+    conn.ok("analyze people").await;
+
+    let rows = conn
+        .ok("select most_common_vals from pg_stats where tablename = 'people' and attname = 'name'")
+        .await
+        .rows();
+    assert_eq!(rows, vec![vec![Some(r#"{"Smith, Jo"}"#.to_string())]]);
+}
+
+#[tokio::test]
 async fn analyze_runs_through_the_extended_protocol() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
