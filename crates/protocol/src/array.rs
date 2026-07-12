@@ -702,6 +702,17 @@ mod tests {
                 .code,
             SqlState::NumericValueOutOfRange
         );
+
+        let extreme_date = SqlArray::new(
+            DataType::Date,
+            vec![ArrayDimension::new(1, 1)],
+            vec![Value::Date(i64::MIN)],
+        )
+        .unwrap();
+        assert_eq!(
+            encode(&extreme_date, &PgType::Date, true).unwrap_err().code,
+            SqlState::NumericValueOutOfRange
+        );
     }
 
     #[test]

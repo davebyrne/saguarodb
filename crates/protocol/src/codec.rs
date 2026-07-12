@@ -733,8 +733,14 @@ const PG_DATE_EPOCH_OFFSET_DAYS: i64 = 10957;
 const PG_TIMESTAMP_EPOCH_OFFSET_MICROS: i64 = 10957 * 86_400 * 1_000_000;
 
 fn date_to_pg_binary(days: i64) -> Result<i32> {
-    i32::try_from(days - PG_DATE_EPOCH_OFFSET_DAYS)
-        .map_err(|_| protocol_error("date is out of range for the binary wire format"))
+    days.checked_sub(PG_DATE_EPOCH_OFFSET_DAYS)
+        .and_then(|days| i32::try_from(days).ok())
+        .ok_or_else(|| {
+            DbError::protocol(
+                SqlState::NumericValueOutOfRange,
+                "date is out of range for the binary wire format",
+            )
+        })
 }
 
 /// Decode a non-NULL parameter's wire bytes into a `Value` of the target type,
@@ -1010,7 +1016,7 @@ mod integer_param_tests {
 #[cfg(test)]
 mod date_value_tests {
     use super::{decode_value, encode_value};
-    use common::{DataType, Value};
+    use common::{DataType, SqlState, Value};
 
     #[test]
     fn date_text_round_trips_and_formats() {
@@ -1039,6 +1045,18 @@ mod date_value_tests {
     #[test]
     fn invalid_date_text_is_rejected() {
         assert!(decode_value(b"2023-02-29", DataType::Date, 0).is_err());
+    }
+
+    #[test]
+    fn extreme_date_binary_encoding_is_a_range_error() {
+        assert_eq!(
+            encode_value(&Value::Date(i64::MIN), 1).unwrap_err().code,
+            SqlState::NumericValueOutOfRange
+        );
+        assert_eq!(
+            encode_value(&Value::Date(i64::MAX), 1).unwrap_err().code,
+            SqlState::NumericValueOutOfRange
+        );
     }
 }
 
