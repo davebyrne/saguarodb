@@ -192,18 +192,7 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }),
         sql::Expr::Interval(interval) => convert_interval(interval),
         sql::Expr::Function(function) => convert_function(function),
-        sql::Expr::Array(array) => {
-            if !array.named {
-                return unsupported("array constructors require ARRAY[...] syntax");
-            }
-            Ok(Expr::Array(
-                array
-                    .elem
-                    .iter()
-                    .map(convert_expr)
-                    .collect::<Result<Vec<_>>>()?,
-            ))
-        }
+        sql::Expr::Array(array) => convert_array(array, false),
         sql::Expr::Substring {
             expr,
             substring_from,
@@ -227,6 +216,22 @@ pub(super) fn convert_expr(expr: &sql::Expr) -> Result<Expr> {
         }
         _ => unsupported("unsupported expression"),
     }
+}
+
+fn convert_array(array: &sql::Array, nested: bool) -> Result<Expr> {
+    if !array.named && !nested {
+        return unsupported("array constructors require ARRAY[...] syntax");
+    }
+    Ok(Expr::Array(
+        array
+            .elem
+            .iter()
+            .map(|element| match element {
+                sql::Expr::Array(inner) => convert_array(inner, true),
+                element => convert_expr(element),
+            })
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 fn is_regclass_type(data_type: &sql::DataType) -> Result<bool> {

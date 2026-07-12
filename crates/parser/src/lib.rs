@@ -2656,6 +2656,34 @@ mod tests {
                 ..
             }
         ));
+
+        let Statement::CreateTable { columns, .. } =
+            parse("create table matrix (values integer[][])").unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(
+            columns[0].pg_type,
+            Some(PgType::array(PgType::Int4).unwrap())
+        );
+
+        let Statement::Query(Query {
+            body: QueryBody::Select(select),
+            ..
+        }) = parse("select ARRAY[[1, 2], [3, 4]]::integer[][]").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert!(matches!(
+            select.columns[0],
+            SelectItem::Expression {
+                expr: Expr::Cast {
+                    pg_type: PgType::Array(_),
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

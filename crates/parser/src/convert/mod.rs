@@ -651,7 +651,7 @@ fn map_isolation_level(level: sql::TransactionIsolationLevel) -> IsolationLevel 
 fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
     match data_type {
         sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(element, None)) => {
-            PgType::array(convert_pg_type(element)?)
+            PgType::array(convert_array_element_type(element)?)
         }
         sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(_, Some(_))) => {
             unsupported("array type dimensions must not declare a size")
@@ -721,6 +721,21 @@ fn convert_pg_type(data_type: &sql::DataType) -> Result<PgType> {
             Ok(PgType::Numeric { precision, scale })
         }
         _ => unsupported("unsupported data type"),
+    }
+}
+
+/// PostgreSQL's array type OID identifies only the scalar element type. Repeated
+/// `[]` suffixes declare value dimensionality, not nested array element types.
+fn convert_array_element_type(data_type: &sql::DataType) -> Result<PgType> {
+    match data_type {
+        sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(element, None)) => {
+            convert_array_element_type(element)
+        }
+        sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(_, Some(_))) => {
+            unsupported("array type dimensions must not declare a size")
+        }
+        sql::DataType::Array(_) => unsupported("unsupported array type syntax"),
+        scalar => convert_pg_type(scalar),
     }
 }
 
