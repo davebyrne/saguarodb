@@ -18,7 +18,7 @@ pub fn parse_array_text_structure(
     let mut parser = ArrayTextParser {
         bytes: text.as_bytes(),
         offset: 0,
-        elements: 0,
+        nodes: 0,
     };
     parser.whitespace();
     let bounds = parser.bounds()?;
@@ -74,7 +74,7 @@ enum ArrayTextNode {
 struct ArrayTextParser<'a> {
     bytes: &'a [u8],
     offset: usize,
-    elements: usize,
+    nodes: usize,
 }
 
 impl ArrayTextParser<'_> {
@@ -140,6 +140,7 @@ impl ArrayTextParser<'_> {
     }
 
     fn list(&mut self, depth: usize) -> Result<ArrayTextNode> {
+        self.count_node()?;
         if depth >= MAX_ARRAY_DIMENSIONS {
             return Err(invalid_array("array text has too many dimensions"));
         }
@@ -176,10 +177,7 @@ impl ArrayTextParser<'_> {
     }
 
     fn element(&mut self) -> Result<ArrayTextNode> {
-        self.elements += 1;
-        if self.elements > MAX_ARRAY_ELEMENTS {
-            return Err(invalid_array("array text has too many elements"));
-        }
+        self.count_node()?;
         let quoted = self.bytes.get(self.offset) == Some(&b'"');
         if quoted {
             self.offset += 1;
@@ -234,6 +232,14 @@ impl ArrayTextParser<'_> {
                 Some(text)
             },
         ))
+    }
+
+    fn count_node(&mut self) -> Result<()> {
+        self.nodes += 1;
+        if self.nodes > MAX_ARRAY_ELEMENTS {
+            return Err(invalid_array("array text has too many nodes"));
+        }
+        Ok(())
     }
 }
 
@@ -580,6 +586,11 @@ mod tests {
             parse_array_text_structure("{\\ }").unwrap().1,
             vec![Some(" ".to_string())]
         );
+
+        let mut too_many_nodes = String::from("{");
+        too_many_nodes.push_str(&"{},".repeat(MAX_ARRAY_ELEMENTS));
+        too_many_nodes.push_str("{}}");
+        assert!(parse_array_text_structure(&too_many_nodes).is_err());
     }
 
     #[test]
