@@ -11,7 +11,7 @@ use common::{
 };
 
 use crate::{
-    CatalogManager, TableColumnAlteration,
+    CatalogAllocatorState, CatalogManager, TableColumnAlteration,
     system::{MAX_COMPOUND_OID_SUB_ID, MAX_COMPOUND_OID_TABLE_ID, MAX_VIRTUAL_OID_PAYLOAD},
 };
 
@@ -171,6 +171,29 @@ impl Default for MemoryCatalog {
 }
 
 impl CatalogManager for MemoryCatalog {
+    fn claim_allocators(
+        &self,
+        expected: CatalogAllocatorState,
+        desired: CatalogAllocatorState,
+    ) -> Result<bool> {
+        let mut snapshot = self.write_snapshot()?;
+        if CatalogAllocatorState::from_snapshot(&snapshot) != expected {
+            return Ok(false);
+        }
+        if !desired.is_at_least(expected) {
+            return Err(DbError::internal(
+                "catalog allocator claim would rewind an allocator",
+            ));
+        }
+        snapshot.next_schema_id = desired.next_schema_id;
+        snapshot.next_table_id = desired.next_table_id;
+        snapshot.next_index_id = desired.next_index_id;
+        snapshot.next_sequence_id = desired.next_sequence_id;
+        snapshot.next_dictionary_id = desired.next_dictionary_id;
+        snapshot.next_storage_id = desired.next_storage_id;
+        Ok(true)
+    }
+
     fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
         let snapshot = self.read_snapshot()?;
         Ok(snapshot

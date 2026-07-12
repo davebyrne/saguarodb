@@ -15,6 +15,14 @@ without exposing provisional state. Startup/recovery precedes user access and do
 not need the gate. Transactional TRUNCATE instead uses a transaction-local overlay
 and publishes it only at top-level commit.
 
+`CatalogOverlay` generalizes that publication model for transactional DDL. It
+stores object replacements and tombstones rather than a frozen whole-catalog
+copy. Materialization starts from the current live catalog, so unrelated commits
+remain visible, then applies transaction-local changes. Object/storage allocator
+reservations advance the live high-water marks immediately (ids are never
+reused), but objects remain private until `publish` performs one validated
+catalog restore while the caller holds the publication gate.
+
 ## Depends On
 
 - `common`

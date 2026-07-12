@@ -8,7 +8,9 @@ use common::{
     ViewColumn, ViewDependency, ViewSchema,
 };
 
-use crate::{CatalogManager, CatalogSnapshot, MemoryCatalog, TableColumnAlteration};
+use crate::{
+    CatalogAllocatorState, CatalogManager, CatalogSnapshot, MemoryCatalog, TableColumnAlteration,
+};
 
 /// Read-only catalog view that overlays transaction-local TRUNCATE generations
 /// on the live catalog. Unrelated objects continue to come from `base`, avoiding
@@ -54,6 +56,14 @@ impl TruncateCatalogOverlay {
 }
 
 impl CatalogManager for TruncateCatalogOverlay {
+    fn claim_allocators(
+        &self,
+        _expected: CatalogAllocatorState,
+        _desired: CatalogAllocatorState,
+    ) -> Result<bool> {
+        Self::read_only()
+    }
+
     fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
         self.base.get_schema_by_name(name)
     }

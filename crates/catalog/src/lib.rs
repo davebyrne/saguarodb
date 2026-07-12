@@ -1,8 +1,10 @@
+mod catalog_overlay;
 mod memory;
 mod serialize;
 pub mod system;
 mod truncate_overlay;
 
+pub use catalog_overlay::CatalogOverlay;
 pub use memory::{CatalogSnapshot, MemoryCatalog, validate_create_table_definition};
 pub use serialize::{deserialize_catalog, serialize_catalog};
 pub use system::{
@@ -25,6 +27,38 @@ pub enum TableColumnAlteration {
     Rewrite,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogAllocatorState {
+    pub next_schema_id: SchemaId,
+    pub next_table_id: TableId,
+    pub next_index_id: IndexId,
+    pub next_sequence_id: SequenceId,
+    pub next_dictionary_id: u32,
+    pub next_storage_id: FileId,
+}
+
+impl CatalogAllocatorState {
+    pub fn from_snapshot(snapshot: &CatalogSnapshot) -> Self {
+        Self {
+            next_schema_id: snapshot.next_schema_id,
+            next_table_id: snapshot.next_table_id,
+            next_index_id: snapshot.next_index_id,
+            next_sequence_id: snapshot.next_sequence_id,
+            next_dictionary_id: snapshot.next_dictionary_id,
+            next_storage_id: snapshot.next_storage_id,
+        }
+    }
+
+    fn is_at_least(self, other: Self) -> bool {
+        self.next_schema_id >= other.next_schema_id
+            && self.next_table_id >= other.next_table_id
+            && self.next_index_id >= other.next_index_id
+            && self.next_sequence_id >= other.next_sequence_id
+            && self.next_dictionary_id >= other.next_dictionary_id
+            && self.next_storage_id >= other.next_storage_id
+    }
+}
+
 impl TableColumnAlteration {
     pub fn rewrites_storage(self) -> bool {
         matches!(self, Self::Rewrite)
@@ -32,6 +66,15 @@ impl TableColumnAlteration {
 }
 
 pub trait CatalogManager: Send + Sync {
+    fn claim_allocators(
+        &self,
+        _expected: CatalogAllocatorState,
+        _desired: CatalogAllocatorState,
+    ) -> Result<bool> {
+        Err(DbError::internal(
+            "catalog does not support allocator claims",
+        ))
+    }
     fn get_schema_by_name(&self, name: &str) -> Result<Option<NamespaceSchema>> {
         let snapshot = self.snapshot()?;
         Ok(snapshot
