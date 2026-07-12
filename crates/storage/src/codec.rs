@@ -265,6 +265,43 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn encoded_array_payload_len(array: &SqlArray) -> Result<usize> {
+    let type_len = 1 + usize::from(matches!(array.element_type(), DataType::Numeric { .. })) * 8;
+    let mut len = 1_usize
+        .checked_add(type_len)
+        .and_then(|len| len.checked_add(1 + 4))
+        .and_then(|len| len.checked_add(array.dimensions().len() * 8))
+        .and_then(|len| len.checked_add(array.cardinality().div_ceil(8)))
+        .ok_or_else(|| array_size_error("array payload length overflows"))?;
+    for value in array.elements() {
+        let element_len = match value {
+            Value::Null => Some(0),
+            Value::Integer(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::Time(_)
+            | Value::TimestampTz(_)
+            | Value::Float(_) => Some(8),
+            Value::Text(value) => 4_usize.checked_add(value.len()),
+            Value::Boolean(_) => Some(1),
+            Value::Interval(_) | Value::Uuid(_) => Some(16),
+            Value::Bytes(value) => 4_usize.checked_add(value.len()),
+            Value::Numeric(_) => Some(20),
+            Value::Real(_) => Some(4),
+            Value::Array(_) => None,
+        }
+        .ok_or_else(|| array_size_error("array element length overflows"))?;
+        len = len
+            .checked_add(element_len)
+            .ok_or_else(|| array_size_error("array payload length overflows"))?;
+    }
+    Ok(len)
+}
+
+fn array_size_error(message: &'static str) -> DbError {
+    DbError::storage(SqlState::ProgramLimitExceeded, message)
+}
+
 pub(crate) fn decode_array_payload(bytes: &[u8]) -> Result<SqlArray> {
     let mut offset = 0;
     let version = read_exact(bytes, &mut offset, 1)?[0];
@@ -558,9 +595,17 @@ pub(crate) fn encode_key(key: &Key) -> Result<Vec<u8>> {
                 bytes.extend_from_slice(&value.0.to_le_bytes());
             }
             Value::Array(array) => {
+                let payload_len = encoded_array_payload_len(array)?;
+                if payload_len > buffer::PAGE_SIZE {
+                    return Err(DbError::storage(
+                        SqlState::ProgramLimitExceeded,
+                        "array key is too large for a B-tree page",
+                    ));
+                }
                 bytes.push(KEY_TAG_ARRAY);
                 let payload = encode_array_payload(array)?;
-                let len = u32::try_from(payload.len()).map_err(|_| {
+                debug_assert_eq!(payload.len(), payload_len);
+                let len = u32::try_from(payload_len).map_err(|_| {
                     DbError::storage(SqlState::ProgramLimitExceeded, "array key is too large")
                 })?;
                 bytes.extend_from_slice(&len.to_le_bytes());
@@ -1490,7 +1535,7 @@ fn corrupt_row(message: impl Into<String>) -> common::DbError {
 mod tests {
     use common::{
         ArrayDimension, ArrayType, ColumnDef, CompressionSetting, DataType, FROZEN_XID,
-        INVALID_XID, Key, RelationKind, Row, SqlArray, TableSchema, ToastOptions, Value,
+        INVALID_XID, Key, RelationKind, Row, SqlArray, SqlState, TableSchema, ToastOptions, Value,
         XMAX_COMMITTED, XMIN_COMMITTED,
     };
 
@@ -2081,6 +2126,15 @@ mod tests {
 
         let key = Key(vec![Value::Array(array)]);
         assert_eq!(decode_key(&encode_key(&key).unwrap()).unwrap(), key);
+
+        let oversized = SqlArray::new(
+            DataType::Text,
+            vec![ArrayDimension::new(1, 1)],
+            vec![Value::Text("x".repeat(buffer::PAGE_SIZE))],
+        )
+        .unwrap();
+        let error = encode_key(&Key(vec![Value::Array(oversized)])).unwrap_err();
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
     }
 
     #[test]

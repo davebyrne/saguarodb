@@ -580,25 +580,30 @@ impl PageBackedStorageEngine {
             };
             let raw_len = supported_varlena_len(raw.len())?;
             let raw_crc32 = crc32fast::hash(&raw);
-            let cached_payload = match &raw {
+            let (borrowed_payload, cached_payload) = match raw {
                 std::borrow::Cow::Owned(payload) => {
-                    Some(std::sync::Arc::<[u8]>::from(payload.clone()))
+                    (None, Some(std::sync::Arc::<[u8]>::from(payload)))
                 }
-                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Borrowed(payload) => (Some(payload), None),
             };
+            let raw = cached_payload
+                .as_deref()
+                .or(borrowed_payload)
+                .expect("one TOAST payload representation is present");
             let mut plan = ToastVarlenaPlan::Plain {
                 cached_payload: cached_payload.clone(),
             };
             let mut stream_codec = compress::CODEC_NONE;
             let mut stream_dict_id = None;
             let mut stream_payload = cached_payload
+                .clone()
                 .map(ToastStreamPayload::Owned)
                 .unwrap_or(ToastStreamPayload::RawColumn);
             let mut current_stored_len = raw.len();
 
             if raw.len() >= schema.toast.min_value_size as usize
                 && schema.toast.compression != common::ToastCompression::None
-                && let Some(compressed) = self.try_toast_value_compression(schema, &raw)?
+                && let Some(compressed) = self.try_toast_value_compression(schema, raw)?
                 && raw.len()
                     >= inline_compressed_stored_len(compressed.payload.len())
                         .saturating_add(common::ToastOptions::MIN_TOAST_COMPRESSION_SAVINGS)
