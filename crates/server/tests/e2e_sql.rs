@@ -108,6 +108,13 @@ async fn e2e_unnest_and_generate_series_table_functions() {
         .err()
         .expect("lateral table-function column dependency should block DROP COLUMN");
     assert_eq!(err.code, common::SqlState::DependentObjectsStillExist);
+
+    let err = server
+        .simple_query("select * from series_inputs, unnest(array_agg(id)) as u(value)")
+        .await
+        .err()
+        .expect("aggregate table-function argument should fail during binding");
+    assert_eq!(err.code, common::SqlState::DatatypeMismatch);
 }
 
 #[tokio::test]

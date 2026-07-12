@@ -956,6 +956,9 @@ fn bind_table_function(
             "subqueries in table-function arguments are not supported",
         ));
     }
+    for arg in &bound_args {
+        reject_aggregate(arg)?;
+    }
     let visible_name = alias.unwrap_or(name).to_string();
     let column_name = column_aliases
         .first()
