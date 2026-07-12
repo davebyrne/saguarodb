@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    ColumnInfo, DataType, DbError, Decimal, ExecRow, Result, Row, SqlState, StatementContext, Value,
+    ArrayDimension, ColumnInfo, DataType, DbError, Decimal, ExecRow, Result, Row, SqlArray,
+    SqlState, StatementContext, Value,
 };
 use planner::{AggregateExpr, AggregateFunc, BoundExpr};
 
@@ -120,7 +121,63 @@ fn evaluate_aggregate(
         }
         AggregateFunc::BoolAnd => bool_aggregate(ctx, aggregate, rows, true),
         AggregateFunc::BoolOr => bool_aggregate(ctx, aggregate, rows, false),
+        AggregateFunc::ArrayAgg => array_aggregate(ctx, aggregate, rows),
+        AggregateFunc::StringAgg => string_aggregate(ctx, aggregate, rows),
     }
+}
+
+fn array_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+) -> Result<Value> {
+    let values = aggregate_values(ctx, aggregate, rows)?;
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let DataType::Array(array_type) = &aggregate.data_type else {
+        return Err(DbError::internal("ARRAY_AGG result type is not an array"));
+    };
+    let len = u32::try_from(values.len())
+        .map_err(|_| DbError::execute(SqlState::ProgramLimitExceeded, "array is too large"))?;
+    Ok(Value::Array(SqlArray::new(
+        array_type.element_type().clone(),
+        vec![ArrayDimension::new(len, 1)],
+        values,
+    )?))
+}
+
+fn string_aggregate(
+    ctx: &StatementContext,
+    aggregate: &AggregateExpr,
+    rows: &[ExecRow],
+) -> Result<Value> {
+    let mut output = String::new();
+    let mut seen = false;
+    for pair in aggregate_values(ctx, aggregate, rows)? {
+        let Value::Array(pair) = pair else {
+            return Err(DbError::internal("STRING_AGG arguments are not a pair"));
+        };
+        let [value, delimiter] = pair.elements() else {
+            return Err(DbError::internal("STRING_AGG arguments are not a pair"));
+        };
+        let Value::Text(value) = value else {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            return Err(DbError::internal("STRING_AGG value is not text"));
+        };
+        if seen && let Value::Text(delimiter) = delimiter {
+            output.push_str(delimiter);
+        }
+        output.push_str(value);
+        seen = true;
+    }
+    Ok(if seen {
+        Value::Text(output)
+    } else {
+        Value::Null
+    })
 }
 
 /// Whether a variance/stddev divides by `n - 1` (sample) or `n` (population).

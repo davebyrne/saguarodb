@@ -968,31 +968,55 @@ fn bind_aggregate(
     args: &[FunctionArg],
     distinct: bool,
 ) -> Result<BoundExpr> {
-    let arg = match args {
-        [FunctionArg::Wildcard] if distinct => {
+    let arg = if func == AggregateFunc::StringAgg {
+        let [FunctionArg::Expr(value), FunctionArg::Expr(delimiter)] = args else {
             return Err(plan_error(
                 SqlState::SyntaxError,
-                "DISTINCT is not supported with a wildcard aggregate argument",
+                "STRING_AGG requires value and delimiter arguments",
             ));
-        }
-        [FunctionArg::Wildcard] if func == AggregateFunc::Count => None,
-        [FunctionArg::Wildcard] => {
-            return Err(plan_error(
-                SqlState::SyntaxError,
-                "only COUNT supports wildcard aggregate argument",
-            ));
-        }
-        [FunctionArg::Expr(expr)] => {
-            let arg = bind_expr(ctx, expr, None)?;
-            reject_aggregate(&arg)?;
-            reject_outer_only_aggregate_arg(&arg)?;
-            Some(Box::new(arg))
-        }
-        _ => {
-            return Err(plan_error(
-                SqlState::SyntaxError,
-                "aggregate functions require exactly one argument",
-            ));
+        };
+        let value = bind_expr(ctx, value, Some(DataType::Text))?;
+        let delimiter = bind_expr(ctx, delimiter, Some(DataType::Text))?;
+        require_type(&value, DataType::Text)?;
+        require_type(&delimiter, DataType::Text)?;
+        reject_aggregate(&value)?;
+        reject_aggregate(&delimiter)?;
+        reject_outer_only_aggregate_arg(&value)?;
+        reject_outer_only_aggregate_arg(&delimiter)?;
+        Some(Box::new(BoundExpr::Array {
+            elements: vec![value, delimiter],
+            dimensions: vec![2],
+            element_type: DataType::Text,
+            data_type: DataType::Array(common::ArrayType::new(DataType::Text)?),
+            nullable: false,
+        }))
+    } else {
+        match args {
+            [FunctionArg::Wildcard] if distinct => {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "DISTINCT is not supported with a wildcard aggregate argument",
+                ));
+            }
+            [FunctionArg::Wildcard] if func == AggregateFunc::Count => None,
+            [FunctionArg::Wildcard] => {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "only COUNT supports wildcard aggregate argument",
+                ));
+            }
+            [FunctionArg::Expr(expr)] => {
+                let arg = bind_expr(ctx, expr, None)?;
+                reject_aggregate(&arg)?;
+                reject_outer_only_aggregate_arg(&arg)?;
+                Some(Box::new(arg))
+            }
+            _ => {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "aggregate functions require exactly one argument",
+                ));
+            }
         }
     };
 
@@ -1072,6 +1096,23 @@ fn bind_aggregate(
             }
             (DataType::Boolean, true)
         }
+        AggregateFunc::ArrayAgg => {
+            let Some(arg) = &arg else {
+                return Err(plan_error(
+                    SqlState::SyntaxError,
+                    "ARRAY_AGG requires an argument",
+                ));
+            };
+            let element_type = arg.data_type();
+            if matches!(element_type, DataType::Array(_)) {
+                return Err(plan_error(
+                    SqlState::FeatureNotSupported,
+                    "ARRAY_AGG of arrays is not supported",
+                ));
+            }
+            (DataType::Array(common::ArrayType::new(element_type)?), true)
+        }
+        AggregateFunc::StringAgg => (DataType::Text, true),
     };
 
     Ok(BoundExpr::AggregateCall {
@@ -1631,6 +1672,8 @@ fn aggregate_func(name: &str) -> Option<AggregateFunc> {
         "var_pop" => Some(AggregateFunc::VarPop),
         "bool_and" => Some(AggregateFunc::BoolAnd),
         "bool_or" => Some(AggregateFunc::BoolOr),
+        "array_agg" => Some(AggregateFunc::ArrayAgg),
+        "string_agg" => Some(AggregateFunc::StringAgg),
         _ => None,
     }
 }

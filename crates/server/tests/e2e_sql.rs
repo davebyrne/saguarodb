@@ -8,6 +8,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
+async fn e2e_array_agg_and_string_agg() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table aggregate_values (id integer, label text)")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into aggregate_values values (1, 'a'), (2, NULL), (NULL, 'b')")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query("select array_agg(id), string_agg(label, ',') from aggregate_values")
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("{1,2,NULL}".into()), Some("a,b".into())]]
+    );
+
+    let rows = server
+        .simple_query(
+            "select array_agg(id), string_agg(label, ',') from aggregate_values where id > 99",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(rows, vec![vec![None, None]]);
+}
+
+#[tokio::test]
 async fn e2e_array_constructors_storage_subscripts_comparisons_and_any() {
     let server = TestServer::start().await.unwrap();
     server

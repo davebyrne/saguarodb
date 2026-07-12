@@ -308,6 +308,10 @@ pub enum AggregateFunc {
     BoolAnd,
     /// `BOOL_OR` — true when any non-NULL input is true.
     BoolOr,
+    /// `ARRAY_AGG` — one-dimensional array containing input values, including NULLs.
+    ArrayAgg,
+    /// `STRING_AGG(value, delimiter)` — concatenated non-NULL text values.
+    StringAgg,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

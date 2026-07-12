@@ -998,6 +998,8 @@ fn aggregate_name(func: AggregateFunc) -> &'static str {
         AggregateFunc::VarPop => "VAR_POP",
         AggregateFunc::BoolAnd => "BOOL_AND",
         AggregateFunc::BoolOr => "BOOL_OR",
+        AggregateFunc::ArrayAgg => "ARRAY_AGG",
+        AggregateFunc::StringAgg => "STRING_AGG",
     }
 }
 
