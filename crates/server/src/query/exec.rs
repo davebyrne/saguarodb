@@ -172,8 +172,12 @@ impl QueryService {
             return (
                 None,
                 default_isolation,
-                self.run_maintenance(statement, session.cancel())
-                    .map(StreamOutcome::Durable),
+                self.run_maintenance(
+                    statement,
+                    session.cancel(),
+                    session.gucs().default_statistics_target(),
+                )
+                .map(StreamOutcome::Durable),
             );
         }
 

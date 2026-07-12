@@ -1163,7 +1163,10 @@ mod tests {
         for sql in ["vacuum", "VACUUM", "vacuum;", "  VACUUM ;  "] {
             assert_eq!(
                 parse(sql).unwrap(),
-                Statement::Vacuum { table: None },
+                Statement::Vacuum {
+                    table: None,
+                    analyze: false,
+                },
                 "for `{sql}`"
             );
         }
@@ -1173,16 +1176,20 @@ mod tests {
                 parse(sql).unwrap(),
                 Statement::Vacuum {
                     table: Some("users".to_string()),
+                    analyze: false,
                 },
                 "for `{sql}`"
             );
         }
-        // ANALYZE is a compatibility-only modifier and is discarded because the
-        // rule-based planner has no optimizer statistics.
+        // The ANALYZE modifier requests the statistics pass after reclamation
+        // (docs/specs/statistics.md §7).
         for sql in ["vacuum analyze", "VACUUM ANALYZE;"] {
             assert_eq!(
                 parse(sql).unwrap(),
-                Statement::Vacuum { table: None },
+                Statement::Vacuum {
+                    table: None,
+                    analyze: true,
+                },
                 "for `{sql}`"
             );
         }
@@ -1195,10 +1202,50 @@ mod tests {
                 parse(sql).unwrap(),
                 Statement::Vacuum {
                     table: Some("users".to_string()),
+                    analyze: true,
                 },
                 "for `{sql}`"
             );
         }
+    }
+
+    #[test]
+    fn parses_analyze_with_optional_table() {
+        // ANALYZE is intercepted before sqlparser like VACUUM
+        // (docs/specs/statistics.md §7).
+        for sql in ["analyze", "ANALYZE", "analyze;", "  ANALYZE ;  "] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Analyze { table: None },
+                "for `{sql}`"
+            );
+        }
+        for sql in ["analyze users", "ANALYZE Users", "analyze users ;"] {
+            assert_eq!(
+                parse(sql).unwrap(),
+                Statement::Analyze {
+                    table: Some("users".to_string()),
+                },
+                "for `{sql}`"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_analyze_forms() {
+        for sql in [
+            "analyze verbose",      // options are unsupported
+            "analyze users orders", // multiple tables
+            "analyze public.users", // qualified name
+            "analyze \"Users\"",    // quoted identifier
+            "analyze users (name)", // column list
+        ] {
+            let err = parse(sql).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Parse, "for `{sql}`");
+            assert_eq!(err.code, SqlState::SyntaxError, "for `{sql}`");
+        }
+        // `analyzefoo` is not an ANALYZE at all; it falls through to sqlparser.
+        assert!(parse("analyzefoo").is_err());
     }
 
     #[test]

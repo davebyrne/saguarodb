@@ -82,13 +82,17 @@ precedence.
   `SET TRANSACTION ISOLATION LEVEL <level>`, and session-scoped
   `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL <level>`
   (per-connection default), plus `SET`/`SHOW`/`RESET` of session configuration
-  parameters (including PostgreSQL-compatible `transaction_isolation` and
-  `default_transaction_isolation`) and `DISCARD ALL` — Read Committed /
+  parameters (including PostgreSQL-compatible `transaction_isolation`,
+  `default_transaction_isolation`, and `default_statistics_target`) and
+  `DISCARD ALL` — Read Committed /
   Repeatable Read / Serializable,
   with SERIALIZABLE implemented as Serializable Snapshot Isolation
   (`docs/specs/ssi.md`)), the maintenance
-  command `VACUUM [table]` (non-relational: it does not bind/plan, takes the
-  exclusive guard, and is rejected inside a transaction block), and
+  command `VACUUM [ANALYZE] [table]` (non-relational: it does not bind/plan,
+  takes the exclusive guard, and is rejected inside a transaction block; with
+  `ANALYZE` the reclamation pass is followed by a statistics-collection pass),
+  the maintenance command `ANALYZE [table]` (collect optimizer statistics
+  under `AccessShare` target locks; `docs/specs/statistics.md`), and
   `ALTER TABLE <table> SET (compression = 'none' | 'zstd')` (also a
   maintenance command: does not bind/plan relationally, takes the exclusive
   guard, is rejected inside a transaction block, and performs a full rewrite of

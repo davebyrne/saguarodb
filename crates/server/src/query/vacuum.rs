@@ -14,29 +14,51 @@ use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
 impl QueryService {
     /// Run a prepared (extended-protocol) maintenance command. The statement
     /// carries no bound payload — it is the raw maintenance `Statement` parsed at
-    /// `prepare_sql` time.
+    /// `prepare_sql` time. `statistics_target` is the session's
+    /// `default_statistics_target`, consumed only by ANALYZE.
     pub(super) fn run_prepared_maintenance(
         &self,
         prepared: &PreparedStatement,
         cancel: &Arc<QueryCancel>,
+        statistics_target: u32,
     ) -> Result<ExecutionResult> {
         let statement = prepared.maintenance.as_ref().ok_or_else(|| {
             DbError::internal("maintenance prepared statement has no carried payload")
         })?;
-        self.run_maintenance(statement.clone(), cancel)
+        self.run_maintenance(statement.clone(), cancel, statistics_target)
     }
 
     /// Shared entry point for every maintenance command: dispatches to the
     /// statement-specific implementation. Both the simple-query and
     /// extended-protocol paths route maintenance through this one router.
+    /// `statistics_target` is the session's `default_statistics_target`,
+    /// consumed only by the ANALYZE passes.
     pub(super) fn run_maintenance(
         &self,
         statement: Statement,
         cancel: &Arc<QueryCancel>,
+        statistics_target: u32,
     ) -> Result<ExecutionResult> {
         cancel.check()?;
         match &statement {
-            Statement::Vacuum { .. } => self.run_vacuum(statement, cancel),
+            Statement::Vacuum { table, analyze } => {
+                let analyze_target = analyze.then(|| table.clone());
+                let result = self.run_vacuum(statement.clone(), cancel)?;
+                // VACUUM ANALYZE: the statistics pass runs after reclamation
+                // over the same targets; the tag stays VACUUM
+                // (docs/specs/statistics.md §7).
+                if let Some(table) = analyze_target {
+                    self.run_analyze_pass(table, cancel, statistics_target)?;
+                }
+                Ok(result)
+            }
+            Statement::Analyze { table } => {
+                self.run_analyze_pass(table.clone(), cancel, statistics_target)?;
+                Ok(ExecutionResult::Modified {
+                    command: "ANALYZE".to_string(),
+                    count: 0,
+                })
+            }
             Statement::Truncate { .. } => self.run_truncate(statement, cancel),
             Statement::AlterTableSetCompression { .. } => {
                 self.run_alter_table_compression(statement, cancel)
@@ -79,7 +101,7 @@ impl QueryService {
         statement: Statement,
         cancel: &Arc<QueryCancel>,
     ) -> Result<ExecutionResult> {
-        let Statement::Vacuum { table } = statement else {
+        let Statement::Vacuum { table, .. } = statement else {
             return Err(DbError::internal(
                 "run_vacuum called with a non-VACUUM statement",
             ));
@@ -381,7 +403,10 @@ fn delete_toast_values_pending_parent_vacuum(
     Ok(Some(txn_id))
 }
 
-fn append_and_flush_maintenance_commit(components: &ServerComponents, txn_id: u64) -> Result<()> {
+pub(super) fn append_and_flush_maintenance_commit(
+    components: &ServerComponents,
+    txn_id: u64,
+) -> Result<()> {
     components.wal.append(WalRecord {
         lsn: 0,
         txn_id,
@@ -411,7 +436,7 @@ fn rollback_toast_cleanup_txn_or_die(components: &ServerComponents, txn_id: u64)
     }
 }
 
-fn cleanup_after_durable_maintenance_commit(
+pub(super) fn cleanup_after_durable_maintenance_commit(
     components: &ServerComponents,
     txn_id: u64,
 ) -> Result<()> {
@@ -420,7 +445,10 @@ fn cleanup_after_durable_maintenance_commit(
     Ok(())
 }
 
-fn fatal_after_durable_maintenance_commit(components: &ServerComponents, err: DbError) -> ! {
+pub(super) fn fatal_after_durable_maintenance_commit(
+    components: &ServerComponents,
+    err: DbError,
+) -> ! {
     eprintln!("fatal TOAST cleanup failure after durable commit: {err}");
     let _ = components.wal.flush();
     std::process::exit(1);

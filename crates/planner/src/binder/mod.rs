@@ -472,13 +472,15 @@ fn bind_inner(
             SqlState::FeatureNotSupported,
             "session control statements do not bind",
         )),
-        // VACUUM/TRUNCATE are maintenance commands dispatched before binding (they
-        // are not relational and never bind/plan). These defensive arms keep the
-        // public `bind` API total if called directly.
-        Statement::Vacuum { .. } | Statement::Truncate { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "maintenance commands do not bind",
-        )),
+        // VACUUM/ANALYZE/TRUNCATE are maintenance commands dispatched before
+        // binding (they are not relational and never bind/plan). These defensive
+        // arms keep the public `bind` API total if called directly.
+        Statement::Vacuum { .. } | Statement::Analyze { .. } | Statement::Truncate { .. } => {
+            Err(plan_error(
+                SqlState::FeatureNotSupported,
+                "maintenance commands do not bind",
+            ))
+        }
         // ALTER TABLE maintenance commands are dispatched before binding; this
         // arm keeps `bind` total while schema-evolution ALTER TABLE binds above.
         Statement::AlterTableSetCompression { .. }

@@ -12,6 +12,12 @@ use super::{QueryService, Transaction, mark_failed_on_error, reset_complete, set
 
 const STATEMENT_TIMEOUT: &str = "statement_timeout";
 const MAX_STATEMENT_TIMEOUT_MS: u64 = i32::MAX as u64;
+const DEFAULT_STATISTICS_TARGET: &str = "default_statistics_target";
+/// ANALYZE samples `300 x default_statistics_target` rows
+/// (`docs/specs/statistics.md` §6); the range mirrors a bounded slice of
+/// PostgreSQL's 1..=10000.
+const DEFAULT_STATISTICS_TARGET_DEFAULT: u32 = 100;
+const STATISTICS_TARGET_RANGE: std::ops::RangeInclusive<i64> = 1..=1000;
 
 /// Per-connection accept-all GUC store for driver compatibility.
 ///
@@ -33,6 +39,7 @@ impl SessionGucs {
             ("application_name", application_name.as_str()),
             ("client_encoding", "UTF8"),
             ("datestyle", "ISO"),
+            (DEFAULT_STATISTICS_TARGET, "100"),
             ("extra_float_digits", "1"),
             ("integer_datetimes", "on"),
             ("search_path", "\"$user\", public"),
@@ -146,6 +153,15 @@ impl SessionGucs {
         self.get(STATEMENT_TIMEOUT)
             .and_then(|value| value.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// The session's ANALYZE statistics target (`docs/specs/statistics.md`
+    /// §6). Values are validated on SET, so the parse fallback only covers a
+    /// never-set/foreign value.
+    pub(crate) fn default_statistics_target(&self) -> u32 {
+        self.get(DEFAULT_STATISTICS_TARGET)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_STATISTICS_TARGET_DEFAULT)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
@@ -276,6 +292,19 @@ impl QueryService {
                 let slot = set_statement_timeout(scope, timeout_ms, slot, gucs);
                 (slot, default_isolation, Ok(set_complete()))
             }
+            DEFAULT_STATISTICS_TARGET => {
+                if value.eq_ignore_ascii_case("default") {
+                    gucs.reset(&name);
+                    return (slot, default_isolation, Ok(set_complete()));
+                }
+                match parse_statistics_target_setting(&value) {
+                    Ok(target) => {
+                        gucs.set(&name, target.to_string());
+                        (slot, default_isolation, Ok(set_complete()))
+                    }
+                    Err(err) => (mark_failed_on_error(slot), default_isolation, Err(err)),
+                }
+            }
             _ if value.eq_ignore_ascii_case("default") => {
                 gucs.reset(&name);
                 (slot, default_isolation, Ok(set_complete()))
@@ -364,6 +393,26 @@ fn effective_statement_timeout_ms(slot: &Option<Transaction>, gucs: &SessionGucs
     slot.as_ref()
         .map(|txn| txn.current_statement_timeout_ms(session_timeout_ms))
         .unwrap_or(session_timeout_ms)
+}
+
+fn parse_statistics_target_setting(value: &str) -> Result<u32> {
+    let parsed = value.trim().parse::<i64>().map_err(|_| {
+        DbError::execute(
+            SqlState::InvalidParameterValue,
+            format!("invalid value for parameter \"{DEFAULT_STATISTICS_TARGET}\": \"{value}\""),
+        )
+    })?;
+    if !STATISTICS_TARGET_RANGE.contains(&parsed) {
+        return Err(DbError::execute(
+            SqlState::InvalidParameterValue,
+            format!(
+                "{parsed} is outside the valid range for parameter \"{DEFAULT_STATISTICS_TARGET}\" ({} .. {})",
+                STATISTICS_TARGET_RANGE.start(),
+                STATISTICS_TARGET_RANGE.end()
+            ),
+        ));
+    }
+    Ok(parsed as u32)
 }
 
 fn parse_statement_timeout_setting(value: &str) -> Result<u64> {

@@ -207,12 +207,23 @@ pub enum Statement {
     /// `DISCARD ALL` — reset session configuration and other per-session state.
     DiscardAll,
     /// `VACUUM [ANALYZE]` (all user tables) or `VACUUM [ANALYZE] <table>` (one
-    /// table). `ANALYZE` is a discarded compatibility modifier because the
-    /// rule-based planner has no optimizer statistics. A maintenance command that
-    /// reclaims dead MVCC versions; `table` is the lowercase-normalized identifier,
-    /// `None` for the whole database. sqlparser 0.56 does not parse `VACUUM`, so it
-    /// is intercepted in `parse_statement` before sqlparser runs.
+    /// table). A maintenance command that reclaims dead MVCC versions; with
+    /// `analyze` it then collects optimizer statistics over the same targets
+    /// (`docs/specs/statistics.md` §7). `table` is the lowercase-normalized
+    /// identifier, `None` for the whole database. sqlparser 0.56 does not parse
+    /// `VACUUM`, so it is intercepted in `parse_statement` before sqlparser runs.
     Vacuum {
+        table: Option<String>,
+        analyze: bool,
+    },
+    /// `ANALYZE` (all user tables) or `ANALYZE <table>` (one table) — collect
+    /// optimizer statistics (`docs/specs/statistics.md` §5). A maintenance
+    /// command that does not bind/plan relationally; `table` is the
+    /// lowercase-normalized identifier, `None` for the whole database.
+    /// Intercepted in `parse_statement` like `VACUUM` (statement-initial
+    /// keyword only, so `EXPLAIN ANALYZE` still reaches — and is rejected by —
+    /// the EXPLAIN path).
+    Analyze {
         table: Option<String>,
     },
     /// `TRUNCATE [TABLE] <name> [, ...]` — immediate table truncation. A

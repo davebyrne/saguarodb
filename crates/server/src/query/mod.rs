@@ -1435,7 +1435,11 @@ impl QueryService {
         // arm is reached only if a caller bypasses that routing — keep it total.
         if let StatementClass::Maintenance = prepared.class {
             return self
-                .run_prepared_maintenance(prepared, session.cancel())
+                .run_prepared_maintenance(
+                    prepared,
+                    session.cancel(),
+                    session.gucs().default_statistics_target(),
+                )
                 .map(StreamOutcome::Durable);
         }
         if let StatementClass::SessionConfig = prepared.class {
@@ -1683,8 +1687,12 @@ impl QueryService {
             return (
                 None,
                 default_isolation,
-                self.run_prepared_maintenance(prepared, session.cancel())
-                    .map(StreamOutcome::Durable),
+                self.run_prepared_maintenance(
+                    prepared,
+                    session.cancel(),
+                    session.gucs().default_statistics_target(),
+                )
+                .map(StreamOutcome::Durable),
             );
         }
 
@@ -3012,7 +3020,9 @@ fn statement_class(statement: &Statement) -> Result<StatementClass> {
         | Statement::ResetVariable { .. }
         | Statement::ShowVariable { .. }
         | Statement::DiscardAll => Ok(StatementClass::SessionConfig),
-        Statement::Vacuum { .. } | Statement::Truncate { .. } => Ok(StatementClass::Maintenance),
+        Statement::Vacuum { .. } | Statement::Analyze { .. } | Statement::Truncate { .. } => {
+            Ok(StatementClass::Maintenance)
+        }
         Statement::AlterTableSetCompression { .. }
         | Statement::AlterTableSetOptions { .. }
         | Statement::AlterTableAddPrimaryKey { .. }

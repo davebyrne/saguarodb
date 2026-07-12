@@ -1,19 +1,28 @@
-//! ANALYZE statistics collection (`docs/specs/statistics.md` §5–§6): reservoir
-//! sampling over a snapshot-visible heap scan and the estimator math that
-//! turns a sample into [`TableStatistics`].
-//!
-//! This module is pure collection and computation. The SQL surface, target
-//! locking, and WAL/commit orchestration are Milestone D's `run_analyze`
-//! (`docs/specs/statistics.md` §5); the estimators are deterministic given a
-//! seed so tests can pin exact outputs.
+//! ANALYZE (`docs/specs/statistics.md` §5–§6): reservoir sampling over a
+//! snapshot-visible heap scan, the estimator math that turns a sample into
+//! [`TableStatistics`], and the `run_analyze_pass` orchestration (target
+//! resolution, AccessShare locking, and durable WAL/catalog publication).
+//! The estimators are deterministic given a seed so tests can pin outputs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use common::{
-    ColumnId, ColumnStatistics, NDistinct, OrderedF64, Result, Row, StatementContext, TableSchema,
-    TableStatistics, Value, value_is_finite,
+    ColumnId, ColumnStatistics, DbError, NDistinct, OrderedF64, QueryCancel, RelationKind, Result,
+    Row, SqlState, StatementContext, TableSchema, TableStatistics, Value, value_is_finite,
 };
 use storage::{PageBackedStorageEngine, RelationSnapshot, StorageEngine};
+use wal::{WalRecord, WalRecordKind};
+
+use super::QueryService;
+use super::txn::CapturedSnapshots;
+use super::vacuum::{
+    append_and_flush_maintenance_commit, cleanup_after_durable_maintenance_commit,
+    fatal_after_durable_maintenance_commit,
+};
+use crate::app::ServerComponents;
+use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
 
 /// Sample size per unit of `default_statistics_target`, matching PostgreSQL's
 /// 300× rule (`docs/specs/statistics.md` §5).
@@ -341,6 +350,216 @@ fn value_width(value: &Value) -> u64 {
         Value::Text(text) => text.len() as u64,
         Value::Bytes(bytes) => bytes.len() as u64,
     }
+}
+
+impl QueryService {
+    /// Run the ANALYZE pass (`docs/specs/statistics.md` §5): collect
+    /// statistics for one named user table or every user table, under
+    /// `AccessShare` target locks (writers keep flowing; concurrent ANALYZE of
+    /// the same table is a benign last-committed-wins race), and publish them
+    /// durably — one `UpdateTableStatistics` WAL record per table plus the
+    /// catalog update, in one maintenance transaction whose `Commit` is
+    /// flushed before success is reported. A crash mid-pass applies none of
+    /// the targets.
+    pub(super) fn run_analyze_pass(
+        &self,
+        table: Option<String>,
+        cancel: &Arc<QueryCancel>,
+        statistics_target: u32,
+    ) -> Result<()> {
+        let components = &self.components;
+        let mut discovered = {
+            let _catalog_read = components
+                .catalog_publication_gate
+                .read()
+                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
+            resolve_analyze_tables(components, table.as_deref())?
+        };
+        let txn_id = components
+            .active_txns
+            .register_allocated(|| components.next_txn_id.fetch_add(1, Ordering::AcqRel));
+        let writer_guard = match components.concurrency.begin_writer_cancelable(cancel) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut object_guard = match components.lock_manager.transaction_owner(txn_id) {
+            Ok(guard) => guard,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        // Acquire-and-revalidate, like VACUUM: the target set discovered
+        // before locking may have changed before the locks were granted.
+        let baseline = object_guard.snapshot();
+        let tables = loop {
+            let requests = discovered
+                .iter()
+                .map(|schema| ObjectLockRequest::table(schema.id, RelationLockMode::AccessShare))
+                .collect::<Vec<_>>();
+            if let Err(err) = object_guard.acquire_many(&requests, cancel) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            let current = {
+                let _catalog_read = match components.catalog_publication_gate.read() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(DbError::internal("catalog publication gate poisoned"));
+                    }
+                };
+                match resolve_analyze_tables(components, table.as_deref()) {
+                    Ok(tables) => tables,
+                    Err(err) => {
+                        self.rollback_pre_durable_or_die(txn_id, None);
+                        return Err(err);
+                    }
+                }
+            };
+            if current
+                .iter()
+                .map(|schema| schema.id)
+                .eq(discovered.iter().map(|schema| schema.id))
+            {
+                break current;
+            }
+            if let Err(err) = object_guard.restore(&baseline) {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+            discovered = current;
+        };
+
+        // A registered reader snapshot: its advertised xmin keeps a concurrent
+        // VACUUM's GC horizon from reclaiming versions this scan still needs.
+        let CapturedSnapshots {
+            snapshot,
+            relations,
+            advertised,
+        } = match self.capture_consistent_snapshots_cancelable(txn_id, cancel) {
+            Ok(captured) => captured,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let ctx = StatementContext::with_snapshot(txn_id, snapshot)
+            .with_conflict_waiter(components.lock_manager.clone(), cancel.clone());
+        let seed = match analyze_seed() {
+            Ok(seed) => seed,
+            Err(err) => {
+                self.rollback_pre_durable_or_die(txn_id, None);
+                return Err(err);
+            }
+        };
+        let mut collected = Vec::with_capacity(tables.len());
+        for schema in &tables {
+            match collect_table_statistics(
+                &components.storage,
+                relations.as_ref(),
+                &ctx,
+                schema,
+                statistics_target,
+                seed,
+            ) {
+                Ok(statistics) => collected.push(statistics),
+                Err(err) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            }
+        }
+
+        // Publish under the catalog publication gate: WAL record before the
+        // in-memory catalog update (WAL-before-state, like DDL). The codec
+        // and set_table_statistics both refuse non-finite payloads.
+        {
+            let _catalog_write = match components.catalog_publication_gate.write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(DbError::internal("catalog publication gate poisoned"));
+                }
+            };
+            for (schema, statistics) in tables.iter().zip(&collected) {
+                if let Err(err) = components.wal.append(WalRecord {
+                    lsn: 0,
+                    txn_id,
+                    kind: WalRecordKind::UpdateTableStatistics {
+                        table_id: schema.id,
+                        statistics: statistics.clone(),
+                    },
+                }) {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+                if let Err(err) = components
+                    .catalog
+                    .set_table_statistics(schema.id, statistics.clone())
+                {
+                    self.rollback_pre_durable_or_die(txn_id, None);
+                    return Err(err);
+                }
+            }
+        }
+        if let Err(err) = append_and_flush_maintenance_commit(components, txn_id) {
+            self.rollback_pre_durable_or_die(txn_id, None);
+            return Err(err);
+        }
+        if let Err(err) = cleanup_after_durable_maintenance_commit(components, txn_id) {
+            fatal_after_durable_maintenance_commit(components, err);
+        }
+        components.active_txns.deregister(txn_id);
+        components.lock_manager.on_txn_finished();
+        drop(advertised);
+        drop(object_guard);
+        drop(writer_guard);
+        Ok(())
+    }
+}
+
+/// One named live user table, or every user table sorted by id. Hidden TOAST
+/// relations are never analyzed: a named non-user relation reads as undefined.
+fn resolve_analyze_tables(
+    components: &ServerComponents,
+    table: Option<&str>,
+) -> Result<Vec<TableSchema>> {
+    match table {
+        Some(name) => components
+            .catalog
+            .get_table_by_name(name)?
+            .filter(|schema| schema.relation_kind == RelationKind::User)
+            .map(|schema| vec![schema])
+            .ok_or_else(|| {
+                DbError::plan(
+                    SqlState::UndefinedTable,
+                    format!("table {name} does not exist"),
+                )
+            }),
+        None => {
+            let mut tables = components
+                .catalog
+                .list_tables()?
+                .into_iter()
+                .filter(|schema| schema.relation_kind == RelationKind::User)
+                .collect::<Vec<_>>();
+            tables.sort_unstable_by_key(|schema| schema.id);
+            Ok(tables)
+        }
+    }
+}
+
+/// Random sampler seed. The reservoir is deterministic given a seed; ANALYZE
+/// draws a fresh one per pass so repeated runs sample independently.
+fn analyze_seed() -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|err| DbError::internal(format!("failed to seed the ANALYZE sampler: {err}")))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]

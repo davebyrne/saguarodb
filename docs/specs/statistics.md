@@ -168,12 +168,13 @@ UpdateTableStatistics {
 ## 5. Collection: the ANALYZE pass
 
 `ANALYZE` is a **maintenance command** (`StatementClass::Maintenance`): not
-bound or planned, rejected inside an explicit transaction block
-(`SqlState::ObjectNotInPrerequisiteState`, matching VACUUM — a documented
-divergence from PostgreSQL, which allows ANALYZE in a transaction; our
-catalog mutations are non-transactional). Orchestration lives in
-`crates/server/src/query/analyze.rs` and follows `run_vacuum`'s shape
-(`crates/server/src/query/vacuum.rs`):
+bound or planned, rejected inside an explicit transaction block with the
+shared maintenance rule (`SqlState::FeatureNotSupported`, "maintenance
+commands cannot run inside a transaction block", matching VACUUM — a
+documented divergence from PostgreSQL, which allows ANALYZE in a transaction;
+our catalog mutations are non-transactional). Orchestration lives in
+`crates/server/src/query/analyze.rs` (`run_analyze_pass`) and follows
+`run_vacuum`'s shape (`crates/server/src/query/vacuum.rs`):
 
 1. Resolve targets under the catalog publication gate: one named user table,
    or every `RelationKind::User` table sorted by id. Hidden TOAST relations

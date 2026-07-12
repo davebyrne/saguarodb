@@ -34,6 +34,12 @@ pub fn parse_statement(sql: &str) -> Result<Statement> {
     if let Some(statement) = try_parse_vacuum(sql)? {
         return Ok(statement);
     }
+    // `ANALYZE [<table>]` is likewise a maintenance command intercepted ahead
+    // of sqlparser; only a statement-initial ANALYZE matches, so EXPLAIN
+    // ANALYZE still flows to (and is rejected by) the EXPLAIN path.
+    if let Some(statement) = try_parse_analyze(sql)? {
+        return Ok(statement);
+    }
     // sqlparser 0.56 does not parse PostgreSQL storage-parameter ALTER forms
     // consistently, so keep that narrow form in the hand parser and let
     // schema-evolution ALTER TABLE forms fall through to sqlparser.
@@ -1168,8 +1174,8 @@ fn reject_set_global(sql: &str) -> Result<()> {
 }
 
 /// Intercept `VACUUM [ANALYZE] [<table>]` before sqlparser, which cannot parse it.
-/// `ANALYZE` is accepted only as a PostgreSQL/pgbench compatibility modifier and is
-/// discarded because SaguaroDB has no optimizer statistics. Returns `Ok(Some(_))`
+/// The `ANALYZE` modifier requests a statistics-collection pass after the
+/// reclamation pass (`docs/specs/statistics.md` §7). Returns `Ok(Some(_))`
 /// for a VACUUM statement, `Ok(None)` when the input does not start with the
 /// `vacuum` keyword (so the normal parse path runs), and `Err` for an unsupported
 /// clause (parenthesized options, multiple tables, a qualified/quoted name). The
@@ -1192,8 +1198,9 @@ fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
         return Ok(None);
     }
 
-    // Accept ANALYZE in PostgreSQL's option position and intentionally discard it.
-    // With or without it, at most one remaining token may name the target table.
+    // Accept ANALYZE in PostgreSQL's option position; it requests the
+    // statistics pass. With or without it, at most one remaining token may
+    // name the target table.
     let first = tokens.next();
     let first_is_analyze = first.is_some_and(|token| token.eq_ignore_ascii_case("analyze"));
     let target = if first_is_analyze {
@@ -1214,11 +1221,46 @@ fn try_parse_vacuum(sql: &str) -> Result<Option<Statement>> {
             if is_vacuum_option_keyword(target) {
                 return unsupported("VACUUM option is not supported");
             }
-            Some(normalize_vacuum_target(target)?)
+            Some(normalize_maintenance_target("VACUUM", target)?)
         }
     };
 
-    Ok(Some(Statement::Vacuum { table }))
+    Ok(Some(Statement::Vacuum {
+        table,
+        analyze: first_is_analyze,
+    }))
+}
+
+/// Intercept `ANALYZE [<table>]` before sqlparser (`docs/specs/statistics.md`
+/// §7), mirroring `try_parse_vacuum`. Fires only on a statement-initial
+/// `analyze` keyword, so `EXPLAIN ANALYZE` still reaches the EXPLAIN path
+/// (which rejects it). `ANALYZE VERBOSE` and column lists are unsupported.
+fn try_parse_analyze(sql: &str) -> Result<Option<Statement>> {
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+
+    let mut tokens = body.split_whitespace();
+    let Some(keyword) = tokens.next() else {
+        return Ok(None);
+    };
+    if !keyword.eq_ignore_ascii_case("analyze") {
+        return Ok(None);
+    }
+
+    let table = match tokens.next() {
+        None => None,
+        Some(target) => {
+            if tokens.next().is_some() {
+                return unsupported("ANALYZE supports an optional single table name only in v1");
+            }
+            if target.eq_ignore_ascii_case("verbose") {
+                return unsupported("ANALYZE option is not supported");
+            }
+            Some(normalize_maintenance_target("ANALYZE", target)?)
+        }
+    };
+
+    Ok(Some(Statement::Analyze { table }))
 }
 
 /// Whether `token` is a Postgres VACUUM option keyword. `ANALYZE` is consumed before
@@ -1236,12 +1278,13 @@ fn is_vacuum_option_keyword(token: &str) -> bool {
     OPTIONS.iter().any(|opt| token.eq_ignore_ascii_case(opt))
 }
 
-/// Validate and lowercase-normalize a `VACUUM <table>` target. The name must be a
+/// Validate and lowercase-normalize a `VACUUM`/`ANALYZE` target table name
+/// (`command` names the statement in error messages). The name must be a
 /// bare unquoted identifier: no parenthesized options, no `schema.table`
 /// qualification, no quoting — consistent with the v1 identifier rules elsewhere.
-fn normalize_vacuum_target(target: &str) -> Result<String> {
+fn normalize_maintenance_target(command: &str, target: &str) -> Result<String> {
     if target.starts_with('(') {
-        return unsupported("VACUUM with options is not supported in v1");
+        return unsupported(format!("{command} with options is not supported in v1"));
     }
     if target.contains('.') {
         return unsupported("qualified names are not supported in v1");
@@ -1254,7 +1297,9 @@ fn normalize_vacuum_target(target: &str) -> Result<String> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
     if !valid {
-        return unsupported("VACUUM target must be a simple table name in v1");
+        return unsupported(format!(
+            "{command} target must be a simple table name in v1"
+        ));
     }
     Ok(target.to_ascii_lowercase())
 }
