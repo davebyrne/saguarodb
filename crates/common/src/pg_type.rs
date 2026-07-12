@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::DataType;
 
@@ -17,7 +17,7 @@ const VARHDRSZ: i32 = 4;
 /// `TEXT`) are still reported accurately to clients. Deliberately has no
 /// `Default`: a wire type is only meaningful relative to a `DataType`, so the
 /// durable fallback is an `Option<PgType>` resolved through [`PgType::from`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PgType {
     Int2,
     Int4,
@@ -73,8 +73,8 @@ impl PgType {
             1001 => PgType::Array(Box::new(PgType::Bytea)),
             1007 => PgType::Array(Box::new(PgType::Int4)),
             1009 => PgType::Array(Box::new(PgType::Text)),
-            1014 => PgType::Array(Box::new(PgType::Bpchar(None))),
-            1015 => PgType::Array(Box::new(PgType::Varchar(None))),
+            1014 => PgType::Array(Box::new(PgType::Bpchar(decode_length_typmod(typmod)))),
+            1015 => PgType::Array(Box::new(PgType::Varchar(decode_length_typmod(typmod)))),
             1016 => PgType::Array(Box::new(PgType::Int8)),
             1021 => PgType::Array(Box::new(PgType::Float4)),
             1022 => PgType::Array(Box::new(PgType::Float8)),
@@ -84,10 +84,10 @@ impl PgType {
             1183 => PgType::Array(Box::new(PgType::Time)),
             1185 => PgType::Array(Box::new(PgType::Timestamptz)),
             1187 => PgType::Array(Box::new(PgType::Interval)),
-            1231 => PgType::Array(Box::new(PgType::Numeric {
-                precision: None,
-                scale: 0,
-            })),
+            1231 => {
+                let (precision, scale) = decode_numeric_typmod(typmod);
+                PgType::Array(Box::new(PgType::Numeric { precision, scale }))
+            }
             1042 => PgType::Bpchar(decode_length_typmod(typmod)),
             1043 => PgType::Varchar(decode_length_typmod(typmod)),
             1082 => PgType::Date,
@@ -275,6 +275,7 @@ impl PgType {
                 };
                 ((i64::from(precision) << 16) | i64::from(scale)) + i64::from(VARHDRSZ)
             }
+            PgType::Array(element) => return element.typmod(),
             _ => return -1,
         };
         i32::try_from(modifier).unwrap_or(-1)
@@ -325,6 +326,74 @@ impl PgType {
             PgType::Oid if u32::try_from(value).is_err() => Some("oid"),
             _ => None,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for PgType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum SerializedPgType {
+            Int2,
+            Int4,
+            Int8,
+            Oid,
+            Bool,
+            Float4,
+            Float8,
+            Numeric { precision: Option<u32>, scale: u32 },
+            Text,
+            Varchar(Option<u32>),
+            Bpchar(Option<u32>),
+            Bytea,
+            Uuid,
+            Date,
+            Time,
+            Timestamp,
+            Timestamptz,
+            Interval,
+            OidVector,
+            Int2Vector,
+            OidArray,
+            Int2Array,
+            Array(Box<SerializedPgType>),
+        }
+
+        fn convert<E: serde::de::Error>(value: SerializedPgType) -> Result<PgType, E> {
+            let value = match value {
+                SerializedPgType::Int2 => PgType::Int2,
+                SerializedPgType::Int4 => PgType::Int4,
+                SerializedPgType::Int8 => PgType::Int8,
+                SerializedPgType::Oid => PgType::Oid,
+                SerializedPgType::Bool => PgType::Bool,
+                SerializedPgType::Float4 => PgType::Float4,
+                SerializedPgType::Float8 => PgType::Float8,
+                SerializedPgType::Numeric { precision, scale } => {
+                    PgType::Numeric { precision, scale }
+                }
+                SerializedPgType::Text => PgType::Text,
+                SerializedPgType::Varchar(length) => PgType::Varchar(length),
+                SerializedPgType::Bpchar(length) => PgType::Bpchar(length),
+                SerializedPgType::Bytea => PgType::Bytea,
+                SerializedPgType::Uuid => PgType::Uuid,
+                SerializedPgType::Date => PgType::Date,
+                SerializedPgType::Time => PgType::Time,
+                SerializedPgType::Timestamp => PgType::Timestamp,
+                SerializedPgType::Timestamptz => PgType::Timestamptz,
+                SerializedPgType::Interval => PgType::Interval,
+                SerializedPgType::OidVector => PgType::OidVector,
+                SerializedPgType::Int2Vector => PgType::Int2Vector,
+                SerializedPgType::OidArray => PgType::OidArray,
+                SerializedPgType::Int2Array => PgType::Int2Array,
+                SerializedPgType::Array(element) => PgType::array(convert::<E>(*element)?)
+                    .map_err(|error| E::custom(error.to_string()))?,
+            };
+            Ok(value)
+        }
+
+        convert(SerializedPgType::deserialize(deserializer)?)
     }
 }
 
@@ -528,6 +597,20 @@ mod tests {
     }
 
     #[test]
+    fn pg_type_deserialization_rejects_invalid_array_elements() {
+        let text: PgType = serde_json::from_str(r#"{"Array":"Text"}"#).unwrap();
+        assert_eq!(text, PgType::Array(Box::new(PgType::Text)));
+
+        for json in [
+            r#"{"Array":{"Array":"Text"}}"#,
+            r#"{"Array":"OidVector"}"#,
+            r#"{"Array":"Int2Vector"}"#,
+        ] {
+            assert!(serde_json::from_str::<PgType>(json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
     fn typmod_encodes_length_and_precision() {
         // Unconstrained types report -1.
         assert_eq!(PgType::Text.typmod(), -1);
@@ -578,6 +661,20 @@ mod tests {
         assert_eq!(typmod, ((10 << 16) | 2) + 4);
         assert_eq!((typmod - 4) >> 16, 10);
         assert_eq!((typmod - 4) & 0xFFFF, 2);
+
+        for pg_type in [
+            PgType::Array(Box::new(PgType::Varchar(Some(10)))),
+            PgType::Array(Box::new(PgType::Bpchar(Some(5)))),
+            PgType::Array(Box::new(PgType::Numeric {
+                precision: Some(10),
+                scale: 2,
+            })),
+        ] {
+            let decoded =
+                PgType::from_oid_typmod(i64::from(pg_type.oid()), i64::from(pg_type.typmod()))
+                    .unwrap();
+            assert_eq!(decoded, pg_type);
+        }
     }
 
     #[test]
