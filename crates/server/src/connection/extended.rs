@@ -572,12 +572,15 @@ impl Session {
             .collect::<Result<Vec<_>>>()?;
         let service = self.app.query_service.clone();
         let cancel = self.cancel.clone();
-        let truncate_updates = self.txn.as_ref().map(|txn| txn.truncate_updates.clone());
+        let catalog_snapshot = match self.txn.as_ref() {
+            Some(txn) => Some(service.transaction_catalog(txn)?.snapshot()?),
+            None => None,
+        };
         let prepared = tokio::task::spawn_blocking(move || {
-            service.prepare_sql_with_truncate_updates_cancelable(
+            service.prepare_sql_with_catalog_snapshot_cancelable(
                 &query,
                 &declared,
-                truncate_updates.as_ref(),
+                catalog_snapshot,
                 cancel.as_ref(),
             )
         })

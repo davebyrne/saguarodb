@@ -107,10 +107,10 @@ pub fn open_app(config: Config) -> Result<AppState> {
     //
     // LOGICAL CATALOG records (`CreateTable`/`DropTable`/`TruncateTable`/
     // `CreateIndex`/`DropIndex` and sequence DDL) are the exception: they mutate
-    // the durable catalog directly (not idempotent PageLSN-gated page bytes), so an aborted DDL's catalog record
-    // must NOT take effect. DDL is non-transactional and commits immediately (§4
-    // Decision 6), so a committed DDL replays and an aborted/in-flight one is
-    // skipped — gated by the rebuilt CLOG. Skipped CreateTable/CreateIndex/
+    // the durable catalog directly (not idempotent PageLSN-gated page bytes), so an
+    // aborted DDL's catalog record must NOT take effect. Transactional DDL records
+    // replay only for committed transactions; aborted/in-flight records are skipped,
+    // gated by the rebuilt CLOG. Skipped CreateTable/CreateIndex/
     // CreateSequence records still reserve their IDs: their index/heap page records
     // may replay as orphan files, or their sequence IDs may have been observed in
     // WAL, and a future object must not reuse those identifiers.

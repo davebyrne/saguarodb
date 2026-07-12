@@ -613,6 +613,11 @@ impl QueryService {
 
         let truncate_updates = txn.truncate_updates.values().cloned().collect::<Vec<_>>();
         let has_catalog_changes = !txn.catalog_overlay.is_empty()?;
+        let combined_catalog = if has_catalog_changes || !truncate_updates.is_empty() {
+            Some(self.transaction_catalog(&txn)?.snapshot()?)
+        } else {
+            None
+        };
         let publication = (|| {
             if truncate_updates.is_empty() && !has_catalog_changes {
                 return Ok((None, None));
@@ -661,15 +666,9 @@ impl QueryService {
             return Err(err);
         }
 
-        if !truncate_updates.is_empty()
-            && let Err(err) = self
-                .components
-                .catalog
-                .apply_truncate_updates(&truncate_updates)
+        if let Some(snapshot) = combined_catalog
+            && let Err(err) = self.components.catalog.restore(snapshot)
         {
-            self.fatal_after_durable_commit(err);
-        }
-        if has_catalog_changes && let Err(err) = txn.catalog_overlay.publish() {
             self.fatal_after_durable_commit(err);
         }
 

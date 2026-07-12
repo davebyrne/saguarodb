@@ -3,14 +3,14 @@ use std::sync::{Arc, atomic::Ordering};
 
 use catalog::CatalogManager;
 use common::{
-    DbError, IsolationLevel, QueryCancel, RelationKind, Result, SqlState, SsiTracker,
-    StatementContext, TableSchema, TruncateTablePlan,
+    DbError, IsolationLevel, PUBLIC_SCHEMA_ID, QueryCancel, RelationKind, Result, SqlState,
+    SsiTracker, StatementContext, TableSchema, TruncateTablePlan,
 };
 use executor::ExecutionResult;
 use parser::Statement;
 
 use crate::checkpoint::record_commit_and_maybe_checkpoint_after_durable_commit;
-use crate::lock_manager::{ObjectLockRequest, RelationLockMode};
+use crate::lock_manager::{CatalogLockMode, ObjectLockRequest, RelationLockMode};
 
 use super::{QueryService, Transaction};
 
@@ -60,12 +60,18 @@ impl QueryService {
             };
             let baseline = object_guard.snapshot();
             let (catalog_publication, current) = loop {
-                let requests = schemas
-                    .iter()
-                    .map(|schema| {
-                        ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
-                    })
-                    .collect::<Vec<_>>();
+                let mut requests = vec![ObjectLockRequest::schema(
+                    PUBLIC_SCHEMA_ID,
+                    CatalogLockMode::Exclusive,
+                )];
+                requests.extend(
+                    schemas
+                        .iter()
+                        .map(|schema| {
+                            ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 if let Err(err) = object_guard.acquire_many(&requests, cancel) {
                     self.rollback_pre_durable_or_die(txn_id, None);
                     return Err(err);
@@ -184,31 +190,30 @@ impl QueryService {
         };
         let updates_before = txn.truncate_updates.clone();
         let mut schemas = {
-            let _catalog_read = self
-                .components
-                .catalog_publication_gate
-                .read()
-                .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-            let catalog = self.catalog_with_truncate_updates_under_gate(&updates_before)?;
+            let catalog =
+                self.transaction_catalog_from_parts(&txn.catalog_overlay, &updates_before)?;
             resolve_truncate_tables(catalog.as_ref(), &tables)?
         };
+        let catalog_overlay = txn.catalog_overlay.clone();
         let objects = self.ensure_transaction_lock_owner(txn, cancel)?;
         let baseline = objects.snapshot();
         let (schemas, catalog) = loop {
-            let requests = schemas
-                .iter()
-                .map(|schema| {
-                    ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
-                })
-                .collect::<Vec<_>>();
+            let mut requests = vec![ObjectLockRequest::schema(
+                PUBLIC_SCHEMA_ID,
+                CatalogLockMode::Exclusive,
+            )];
+            requests.extend(
+                schemas
+                    .iter()
+                    .map(|schema| {
+                        ObjectLockRequest::table(schema.id, RelationLockMode::AccessExclusive)
+                    })
+                    .collect::<Vec<_>>(),
+            );
             objects.acquire_many(&requests, cancel)?;
             let (current, catalog) = {
-                let _catalog_read = self
-                    .components
-                    .catalog_publication_gate
-                    .read()
-                    .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-                let catalog = self.catalog_with_truncate_updates_under_gate(&updates_before)?;
+                let catalog =
+                    self.transaction_catalog_from_parts(&catalog_overlay, &updates_before)?;
                 let current = resolve_truncate_tables(catalog.as_ref(), &tables)?;
                 (current, catalog)
             };

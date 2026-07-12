@@ -113,6 +113,10 @@ impl CatalogOverlay {
             savepoint.0.clone();
         Ok(())
     }
+
+    pub fn absorb(&self, snapshot: CatalogSnapshot) -> Result<()> {
+        self.apply(|catalog| catalog.restore(snapshot.clone()))
+    }
 }
 
 fn materialize(mut snapshot: CatalogSnapshot, delta: &CatalogDelta) -> Result<CatalogSnapshot> {

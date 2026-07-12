@@ -9,9 +9,10 @@ use catalog::{
 };
 use common::{
     CatalogIntrospectionProvider, ColumnDefault, ColumnInfo, CopyDirection, DataType, DbError,
-    GucSetting, IndexConstraintKind, IsolationLevel, ParsedDefault, PgType, QueryCancel,
-    RelationKind, Result, SequenceId, SessionActivityRow, SessionInfo, SessionSequenceState,
-    Snapshot, SqlState, SystemStateProvider, TableId, TruncateCatalogUpdate, Value, WriteGuard,
+    GucSetting, IndexConstraintKind, IsolationLevel, PUBLIC_SCHEMA_ID, ParsedDefault, PgType,
+    QueryCancel, RelationKind, Result, SequenceId, SessionActivityRow, SessionInfo,
+    SessionSequenceState, Snapshot, SqlState, SystemStateProvider, TableId, TruncateCatalogUpdate,
+    Value, WriteGuard,
 };
 use executor::{ExecutionContext, ExecutionResult, QueryEngine, RowSink};
 use parser::Statement;
@@ -809,19 +810,27 @@ impl QueryService {
         )))
     }
 
-    fn transaction_catalog(&self, txn: &Transaction) -> Result<Arc<dyn CatalogManager>> {
+    pub(crate) fn transaction_catalog(&self, txn: &Transaction) -> Result<Arc<dyn CatalogManager>> {
+        self.transaction_catalog_from_parts(&txn.catalog_overlay, &txn.truncate_updates)
+    }
+
+    fn transaction_catalog_from_parts(
+        &self,
+        overlay: &CatalogOverlay,
+        truncate_updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+    ) -> Result<Arc<dyn CatalogManager>> {
         let _catalog_read = self
             .components
             .catalog_publication_gate
             .read()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-        let base: Arc<dyn CatalogManager> = Arc::new(txn.catalog_overlay.catalog()?);
-        if txn.truncate_updates.is_empty() {
+        let base: Arc<dyn CatalogManager> = Arc::new(overlay.catalog()?);
+        if truncate_updates.is_empty() {
             return Ok(base);
         }
         Ok(Arc::new(TruncateCatalogOverlay::new(
             base,
-            txn.truncate_updates.values().cloned(),
+            truncate_updates.values().cloned(),
         )))
     }
 
@@ -831,12 +840,12 @@ impl QueryService {
         bound: &BoundStatement,
         validated: Arc<dyn CatalogManager>,
     ) -> Result<(Arc<dyn CatalogManager>, bool)> {
-        if !txn.truncate_updates.is_empty() {
-            let mut references = BoundObjectReferences::default();
-            collect_bound_statement_objects(bound, &mut references)?;
-            if !references.uses_system_catalog {
-                return Ok((validated, false));
-            }
+        let mut references = BoundObjectReferences::default();
+        collect_bound_statement_objects(bound, &mut references)?;
+        if !references.uses_system_catalog {
+            return Ok((validated, false));
+        }
+        if !txn.truncate_updates.is_empty() || !txn.catalog_overlay.is_empty()? {
             let _catalog_read = self
                 .components
                 .catalog_publication_gate
@@ -853,7 +862,8 @@ impl QueryService {
     fn bind_and_lock_unprepared_in_transaction(
         &self,
         statement: &Statement,
-        updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+        overlay: Arc<CatalogOverlay>,
+        truncate_updates: BTreeMap<TableId, TruncateCatalogUpdate>,
         guard: &mut ObjectLockGuard,
         cancel: &QueryCancel,
     ) -> Result<(
@@ -863,30 +873,31 @@ impl QueryService {
     )> {
         let prior = guard.snapshot();
         loop {
+            let catalog = self.transaction_catalog_from_parts(&overlay, &truncate_updates)?;
             let discovered = {
                 let _catalog_read = self
                     .components
                     .catalog_publication_gate
                     .read()
                     .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-                let bound = planner::bind(statement, self.components.catalog.as_ref())?;
-                object_lock_requests(&bound, self.components.catalog.as_ref())?
+                let bound = planner::bind(statement, catalog.as_ref())?;
+                object_lock_requests(&bound, catalog.as_ref())?
             };
             if let Err(err) = guard.acquire_many(&discovered, cancel) {
                 guard.restore(&prior)?;
                 return Err(err);
             }
+            let catalog = self.transaction_catalog_from_parts(&overlay, &truncate_updates)?;
             let rebound = (|| {
                 let _catalog_read = self
                     .components
                     .catalog_publication_gate
                     .read()
                     .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-                let catalog = self.catalog_with_truncate_updates_under_gate(updates)?;
                 let bound = planner::bind(statement, catalog.as_ref())?;
                 let requests = object_lock_requests(&bound, catalog.as_ref())?;
                 let versions = prepared_schema_versions(&bound, catalog.as_ref())?;
-                Ok::<_, DbError>((bound, requests, versions, catalog))
+                Ok::<_, DbError>((bound, requests, versions, catalog.clone()))
             })();
             let (bound, requests, versions, catalog) = match rebound {
                 Ok(rebound) => rebound,
@@ -982,16 +993,22 @@ impl QueryService {
         bound: &BoundStatement,
         schema_versions: &[PreparedRelationVersion],
         truncate_updates: &BTreeMap<TableId, TruncateCatalogUpdate>,
+        overlay: &Arc<CatalogOverlay>,
         guard: &mut ObjectLockGuard,
         cancel: &QueryCancel,
     ) -> Result<Arc<dyn CatalogManager>> {
-        self.lock_prepared_bound_with_truncate_updates(
+        let requests = object_lock_requests(
             bound,
-            schema_versions,
-            Some(truncate_updates),
-            guard,
-            cancel,
-        )
+            self.transaction_catalog_from_parts(overlay, truncate_updates)?
+                .as_ref(),
+        )?;
+        guard.acquire_many(&requests, cancel)?;
+        let catalog = self.transaction_catalog_from_parts(overlay, truncate_updates)?;
+        validate_prepared_schema_versions_in_catalog(schema_versions, catalog.as_ref())?;
+        if object_lock_requests(bound, catalog.as_ref())? != requests {
+            return Err(prepared_schema_changed_error());
+        }
+        Ok(catalog)
     }
 
     fn lock_prepared_bound_with_truncate_updates(
@@ -1273,14 +1290,14 @@ impl QueryService {
         declared_param_types: &[Option<PgType>],
         cancel: &QueryCancel,
     ) -> Result<PreparedStatement> {
-        self.prepare_sql_with_truncate_updates_cancelable(sql, declared_param_types, None, cancel)
+        self.prepare_sql_with_catalog_snapshot_cancelable(sql, declared_param_types, None, cancel)
     }
 
-    pub(crate) fn prepare_sql_with_truncate_updates_cancelable(
+    pub(crate) fn prepare_sql_with_catalog_snapshot_cancelable(
         &self,
         sql: &str,
         declared_param_types: &[Option<PgType>],
-        truncate_updates: Option<&BTreeMap<TableId, TruncateCatalogUpdate>>,
+        catalog_snapshot: Option<catalog::CatalogSnapshot>,
         cancel: &QueryCancel,
     ) -> Result<PreparedStatement> {
         cancel.check()?;
@@ -1364,8 +1381,8 @@ impl QueryService {
             .catalog_publication_gate
             .read()
             .map_err(|_| DbError::internal("catalog publication gate poisoned"))?;
-        let catalog = match truncate_updates {
-            Some(updates) => self.catalog_with_truncate_updates_under_gate(updates)?,
+        let catalog: Arc<dyn CatalogManager> = match catalog_snapshot {
+            Some(snapshot) => Arc::new(MemoryCatalog::try_from_snapshot(snapshot)?),
             None => self.components.catalog.clone(),
         };
         let (bound, param_types) =
@@ -2570,7 +2587,58 @@ fn object_lock_requests(
         _ => {}
     }
 
-    let mut requests = Vec::with_capacity(relation_modes.len() + sequence_modes.len());
+    let mut catalog_names = BTreeSet::new();
+    let catalog_ddl = matches!(
+        bound,
+        BoundStatement::CreateTable { .. }
+            | BoundStatement::DropTable { .. }
+            | BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterTableDropColumn { .. }
+            | BoundStatement::AlterTableRenameColumn { .. }
+            | BoundStatement::AlterTableRenameTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::DropIndex { .. }
+            | BoundStatement::CreateSequence { .. }
+            | BoundStatement::DropSequence { .. }
+            | BoundStatement::CreateView { .. }
+            | BoundStatement::DropView { .. }
+    );
+    match bound {
+        BoundStatement::CreateTable { name, .. }
+        | BoundStatement::CreateIndex { name, .. }
+        | BoundStatement::CreateSequence { name, .. }
+        | BoundStatement::CreateView { name, .. }
+        | BoundStatement::DropSequence { name, .. }
+        | BoundStatement::DropView { name, .. } => {
+            catalog_names.insert(name.clone());
+        }
+        BoundStatement::DropTable { targets, .. } => {
+            catalog_names.extend(targets.iter().map(|target| target.name.clone()));
+        }
+        BoundStatement::DropIndex { index } => {
+            if let Some(index) = catalog.get_index(*index)? {
+                catalog_names.insert(index.name);
+            }
+        }
+        BoundStatement::AlterTableRenameTable { new_name, .. } => {
+            catalog_names.insert(new_name.clone());
+        }
+        _ => {}
+    }
+
+    let mut requests =
+        Vec::with_capacity(relation_modes.len() + sequence_modes.len() + catalog_names.len() + 1);
+    if catalog_ddl {
+        requests.push(ObjectLockRequest::schema(
+            PUBLIC_SCHEMA_ID,
+            crate::lock_manager::CatalogLockMode::Exclusive,
+        ));
+    }
+    requests.extend(
+        catalog_names
+            .into_iter()
+            .map(|name| ObjectLockRequest::catalog_name(PUBLIC_SCHEMA_ID, name)),
+    );
     requests.extend(
         relation_modes
             .into_iter()
@@ -3188,7 +3256,10 @@ mod tests {
 
     #[test]
     fn bound_ddl_requests_relation_and_sequence_modes() {
-        use crate::lock_manager::{ObjectLockRequest, RelationLockMode, SequenceLockMode};
+        use crate::lock_manager::{
+            CatalogLockMode, ObjectLockRequest, RelationLockMode, SequenceLockMode,
+        };
+        use common::PUBLIC_SCHEMA_ID;
 
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -3223,71 +3294,113 @@ mod tests {
             let bound = planner::bind(&statement, catalog).unwrap();
             object_lock_requests(&bound, catalog).unwrap()
         };
+        let catalog_locks = |name: &str| {
+            vec![
+                ObjectLockRequest::schema(PUBLIC_SCHEMA_ID, CatalogLockMode::Exclusive),
+                ObjectLockRequest::catalog_name(PUBLIC_SCHEMA_ID, name),
+            ]
+        };
 
         assert_eq!(
             requests("create index another_idx on dst (value)"),
-            vec![ObjectLockRequest::table(dst.id, RelationLockMode::Share)]
+            catalog_locks("another_idx")
+                .into_iter()
+                .chain([ObjectLockRequest::table(dst.id, RelationLockMode::Share)])
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("alter table dst rename column value to amount"),
-            vec![ObjectLockRequest::table(
+            [ObjectLockRequest::schema(
+                PUBLIC_SCHEMA_ID,
+                CatalogLockMode::Exclusive,
+            )]
+            .into_iter()
+            .chain([ObjectLockRequest::table(
                 dst.id,
                 RelationLockMode::AccessExclusive,
-            )]
+            )])
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             requests(
                 "alter table src add column generated bigint \
                  default nextval('default_ids') + 0",
             ),
-            vec![
+            [ObjectLockRequest::schema(
+                PUBLIC_SCHEMA_ID,
+                CatalogLockMode::Exclusive,
+            )]
+            .into_iter()
+            .chain([
                 ObjectLockRequest::table(src.id, RelationLockMode::AccessExclusive),
                 ObjectLockRequest::sequence(default_ids.id, SequenceLockMode::Access),
-            ]
+            ])
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             requests(
                 "alter table src add column generated_direct bigint \
                  default nextval('default_ids')",
             ),
-            vec![
+            [ObjectLockRequest::schema(
+                PUBLIC_SCHEMA_ID,
+                CatalogLockMode::Exclusive,
+            )]
+            .into_iter()
+            .chain([
                 ObjectLockRequest::table(src.id, RelationLockMode::AccessExclusive),
                 ObjectLockRequest::sequence(default_ids.id, SequenceLockMode::Access),
-            ]
+            ])
+            .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("drop index dst_value_idx"),
-            vec![ObjectLockRequest::table(
-                dst.id,
-                RelationLockMode::AccessExclusive,
-            )]
+            catalog_locks("dst_value_idx")
+                .into_iter()
+                .chain([ObjectLockRequest::table(
+                    dst.id,
+                    RelationLockMode::AccessExclusive,
+                )])
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("drop table dst"),
-            vec![
-                ObjectLockRequest::table(dst.id, RelationLockMode::AccessExclusive),
-                ObjectLockRequest::sequence(owned_sequence, SequenceLockMode::Exclusive),
-            ]
+            catalog_locks("dst")
+                .into_iter()
+                .chain([
+                    ObjectLockRequest::table(dst.id, RelationLockMode::AccessExclusive),
+                    ObjectLockRequest::sequence(owned_sequence, SequenceLockMode::Exclusive),
+                ])
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("drop sequence dst_id_seq"),
-            vec![ObjectLockRequest::sequence(
-                owned_sequence,
-                SequenceLockMode::Exclusive,
-            )]
+            catalog_locks("dst_id_seq")
+                .into_iter()
+                .chain([ObjectLockRequest::sequence(
+                    owned_sequence,
+                    SequenceLockMode::Exclusive,
+                )])
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             requests("create or replace view dst_view as select id from src"),
-            vec![
-                ObjectLockRequest::table(src.id, RelationLockMode::AccessShare),
-                ObjectLockRequest::table(view.id, RelationLockMode::AccessExclusive),
-            ]
+            catalog_locks("dst_view")
+                .into_iter()
+                .chain([
+                    ObjectLockRequest::table(src.id, RelationLockMode::AccessShare),
+                    ObjectLockRequest::table(view.id, RelationLockMode::AccessExclusive),
+                ])
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn catalog_write_reconverges_locks_for_targets_published_after_discovery() {
-        use crate::lock_manager::{ObjectLockRequest, RelationLockMode, SequenceLockMode};
+        use crate::lock_manager::{
+            CatalogLockMode, ObjectLockRequest, RelationLockMode, SequenceLockMode,
+        };
+        use common::PUBLIC_SCHEMA_ID;
 
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
@@ -3315,15 +3428,16 @@ mod tests {
             let statement = parser::parse(drop_sql).unwrap();
             let mut objects = app.components.lock_manager.statement_owner();
             let baseline = objects.snapshot();
-            let (bound, _) = app
+            let (bound, initial) = app
                 .query_service
-                .bind_and_lock_unprepared(&statement, &mut objects, &cancel)
+                .bind_with_object_requests(&statement)
                 .unwrap();
-            assert!(
-                object_lock_requests(&bound, app.components.catalog.as_ref())
-                    .unwrap()
-                    .is_empty()
-            );
+            let name = drop_sql.split_whitespace().last().unwrap();
+            let stable = vec![
+                ObjectLockRequest::schema(PUBLIC_SCHEMA_ID, CatalogLockMode::Exclusive),
+                ObjectLockRequest::catalog_name(PUBLIC_SCHEMA_ID, name),
+            ];
+            assert_eq!(initial, stable);
 
             app.query_service.execute_sql(create_sql).unwrap();
             let gate = app
@@ -3344,10 +3458,13 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         current,
-                        vec![ObjectLockRequest::table(
-                            table.id,
-                            RelationLockMode::AccessExclusive,
-                        )]
+                        stable
+                            .into_iter()
+                            .chain([ObjectLockRequest::table(
+                                table.id,
+                                RelationLockMode::AccessExclusive,
+                            )])
+                            .collect::<Vec<_>>()
                     );
                 }
                 "drop view if exists late_view" => {
@@ -3359,10 +3476,13 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         current,
-                        vec![ObjectLockRequest::table(
-                            view.id,
-                            RelationLockMode::AccessExclusive,
-                        )]
+                        stable
+                            .into_iter()
+                            .chain([ObjectLockRequest::table(
+                                view.id,
+                                RelationLockMode::AccessExclusive,
+                            )])
+                            .collect::<Vec<_>>()
                     );
                 }
                 "drop sequence if exists late_sequence" => {
@@ -3374,10 +3494,13 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         current,
-                        vec![ObjectLockRequest::sequence(
-                            sequence.id,
-                            SequenceLockMode::Exclusive,
-                        )]
+                        stable
+                            .into_iter()
+                            .chain([ObjectLockRequest::sequence(
+                                sequence.id,
+                                SequenceLockMode::Exclusive,
+                            )])
+                            .collect::<Vec<_>>()
                     );
                 }
                 _ => unreachable!(),
@@ -5424,7 +5547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ddl_inside_transaction_is_rejected() {
+    async fn ddl_inside_transaction_is_private_until_commit() {
         let dir = tempfile::tempdir().unwrap();
         let app = AppState::open_for_test(dir.path()).unwrap();
 
@@ -5437,13 +5560,91 @@ mod tests {
             slot,
             &cancel,
         );
-        let err = result.unwrap_err();
-        assert_eq!(err.code, SqlState::FeatureNotSupported);
-        assert_eq!(super::slot_status(&slot), SessionTxnStatus::Failed);
+        result.unwrap();
+        assert_eq!(super::slot_status(&slot), SessionTxnStatus::InTransaction);
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("insert into users values (1)", slot, &cancel);
+        result.unwrap();
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("truncate users", slot, &cancel);
+        result.unwrap();
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("select id from users", slot, &cancel);
+        assert_eq!(result.unwrap().row_count(), 0);
+        assert!(
+            app.query_service
+                .execute_sql("select id from users")
+                .is_err()
+        );
+        let (_slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
+        result.unwrap();
+        assert_eq!(
+            app.query_service
+                .execute_sql("select id from users")
+                .unwrap()
+                .row_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_ddl_rolls_back_with_transaction_and_savepoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = AppState::open_for_test(dir.path()).unwrap();
+        let cancel = std::sync::Arc::new(QueryCancel::new());
+
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple_default(
+            "create table rolled_back (id integer primary key)",
+            slot,
+            &cancel,
+        );
+        result.unwrap();
         let (_slot, result) = app
             .query_service
             .execute_simple_default("rollback", slot, &cancel);
         result.unwrap();
+        assert!(
+            app.query_service
+                .execute_sql("select * from rolled_back")
+                .is_err()
+        );
+
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("begin", None, &cancel);
+        result.unwrap();
+        let (slot, result) = app
+            .query_service
+            .execute_simple_default("savepoint s", slot, &cancel);
+        result.unwrap();
+        let (slot, result) = app.query_service.execute_simple_default(
+            "create table after_savepoint (id integer primary key)",
+            slot,
+            &cancel,
+        );
+        result.unwrap();
+        let (slot, result) =
+            app.query_service
+                .execute_simple_default("rollback to savepoint s", slot, &cancel);
+        result.unwrap();
+        let (_slot, result) = app
+            .query_service
+            .execute_simple_default("commit", slot, &cancel);
+        result.unwrap();
+        assert!(
+            app.query_service
+                .execute_sql("select * from after_savepoint")
+                .is_err()
+        );
     }
 
     #[tokio::test]

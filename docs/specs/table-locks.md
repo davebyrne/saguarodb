@@ -83,6 +83,12 @@ sequences by `SequenceId`. Binding collects referenced
 sequence ids as well as table ids before acquisition. This prevents a bound
 sequence call from racing removal and lets table/sequence cycles be detected.
 
+Namespace DDL currently takes the schema resource in `Exclusive` mode through
+transaction end. This makes detached catalog ID allocation exclusive before any
+storage/WAL side effects; the accompanying name lock records the precise logical
+conflict. Moving allocator claims ahead of physical execution may later weaken
+the schema lock without changing name-lock semantics.
+
 ## 3. Owners and lifetime
 
 There are two owner kinds:
@@ -147,6 +153,10 @@ Normalize and compare rebound table/sequence ids and modes with the granted set.
 If not covered, release the shared catalog gate, restore every grant changed by
 this acquisition attempt to its prior mode (preserving locks retained from earlier
 explicit-transaction statements), and retry discovery/acquisition in global order.
+The order applies to each acquisition batch. Because explicit transactions retain
+earlier-statement grants, a later statement may request an earlier resource class;
+cross-statement cycles are legal and are resolved by the shared deadlock detector
+rather than by releasing transaction-owned locks.
 Prepared execution returns the reprepare error for changed identity-bound
 objects. Execution-time name-resolved targets use the final catalog-mutation
 coverage loop below.

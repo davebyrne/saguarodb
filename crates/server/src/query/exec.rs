@@ -252,10 +252,11 @@ impl QueryService {
 
         let (bound, snapshots, schema_versions) = match slot.as_mut() {
             Some(txn) => {
+                let overlay = txn.catalog_overlay.clone();
                 let updates = txn.truncate_updates.clone();
                 let locked = match self.ensure_transaction_lock_owner(txn, cancel) {
                     Ok(owner) => self.bind_and_lock_unprepared_in_transaction(
-                        &statement, &updates, owner, cancel,
+                        &statement, overlay, updates, owner, cancel,
                     ),
                     Err(err) => Err(err),
                 };
@@ -478,39 +479,27 @@ impl QueryService {
             );
         }
 
-        // DDL is non-transactional (`docs/specs/mvcc.md` §4 Decision 6): reject it
-        // inside an explicit transaction block. The transaction stays healthy and
-        // open (this is a plain statement error, not a poisoning one in Postgres —
-        // but per our semantics any statement error poisons the block; do that for
-        // consistency with the 'E' gating contract).
-        if matches!(class, StatementClass::Ddl) {
-            txn.failed = true;
-            return (
-                Some(txn),
-                Err(DbError::plan(
-                    SqlState::FeatureNotSupported,
-                    "DDL is not allowed inside a transaction block",
-                )),
-            );
-        }
-
         let initial_class = class;
         let locked = match source {
             BindSource::Unbound(statement) => {
-                let discovery = self.bind_with_object_requests(&statement);
+                let discovery = self.transaction_catalog(&txn).and_then(|catalog| {
+                    let bound = planner::bind(&statement, catalog.as_ref())?;
+                    let requests = object_lock_requests(&bound, catalog.as_ref())?;
+                    Ok((bound, requests, catalog))
+                });
                 match discovery {
-                    Ok((bound, requests)) if requests.is_empty() => {
-                        self.transaction_catalog(&txn).and_then(|catalog| {
-                            prepared_schema_versions(&bound, catalog.as_ref())
-                                .map(|versions| (bound, versions, catalog))
-                        })
+                    Ok((bound, requests, catalog)) if requests.is_empty() => {
+                        prepared_schema_versions(&bound, catalog.as_ref())
+                            .map(|versions| (bound, versions, catalog))
                     }
-                    Ok(_) => {
+                    Ok((_bound, _requests, _catalog)) => {
+                        let overlay = txn.catalog_overlay.clone();
                         let updates = txn.truncate_updates.clone();
                         match self.ensure_transaction_lock_owner(&mut txn, runtime.cancel()) {
                             Ok(owner) => self.bind_and_lock_unprepared_in_transaction(
                                 &statement,
-                                &updates,
+                                overlay,
+                                updates,
                                 owner,
                                 runtime.cancel(),
                             ),
@@ -525,7 +514,10 @@ impl QueryService {
                 schema_versions,
             } => {
                 let updates = txn.truncate_updates.clone();
-                let requests = self.object_requests_for_bound(&bound);
+                let overlay = txn.catalog_overlay.clone();
+                let requests = self
+                    .transaction_catalog(&txn)
+                    .and_then(|catalog| object_lock_requests(&bound, catalog.as_ref()));
                 match requests {
                     Ok(requests) if requests.is_empty() => {
                         self.transaction_catalog(&txn).and_then(|catalog| {
@@ -542,6 +534,7 @@ impl QueryService {
                                 &bound,
                                 &schema_versions,
                                 &updates,
+                                &overlay,
                                 owner,
                                 runtime.cancel(),
                             )
@@ -565,7 +558,14 @@ impl QueryService {
         };
         let class = classify_bound(initial_class, &bound);
 
-        let is_write = matches!(class, StatementClass::Write);
+        let is_write = matches!(class, StatementClass::Write | StatementClass::Ddl);
+        if matches!(class, StatementClass::Ddl)
+            && txn.object_locks.is_none()
+            && let Err(err) = self.ensure_transaction_lock_owner(&mut txn, runtime.cancel())
+        {
+            txn.failed = true;
+            return (Some(txn), Err(err));
+        }
         txn.has_writes |= is_write;
         let captured_snapshot = match self.snapshots_for_transaction(&mut txn, runtime.cancel()) {
             Ok(snapshots) => snapshots,
@@ -604,10 +604,9 @@ impl QueryService {
         // `SET TRANSACTION` is then gated by the 'E' state instead.)
         txn.first_statement_ran = true;
         // The GC horizon is used by the H3 UPDATE update-path prune (`docs/specs/mvcc.md`
-        // §10 H3); CREATE INDEX (the other consumer) is non-transactional and rejected
-        // inside an explicit block (above), so only UPDATE reads it here. A stale/smaller
-        // horizon only prunes less, never unsafely (the prune reclaims only dead-to-all
-        // versions and mutates one latched page).
+        // §10 H3); CREATE INDEX is the other consumer. A stale/smaller horizon only
+        // prunes less, never unsafely (the prune reclaims only dead-to-all versions and
+        // mutates one latched page).
         let gc_horizon = self.components.gc_horizon();
         let (statement_catalog, catalog_is_snapshot) = match self
             .transaction_statement_catalog_from_validated(&txn, &bound, validated_catalog)
@@ -656,6 +655,19 @@ impl QueryService {
         drop(advertised);
         match result {
             Ok(outcome) => {
+                if matches!(class, StatementClass::Ddl) {
+                    let snapshot = match statement_catalog.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            txn.failed = true;
+                            return (Some(txn), Err(err));
+                        }
+                    };
+                    if let Err(err) = txn.catalog_overlay.absorb(snapshot) {
+                        txn.failed = true;
+                        return (Some(txn), Err(err));
+                    }
+                }
                 // Accumulate this statement's dead-version count on the transaction
                 // (`docs/specs/mvcc.md` §9, F4b). It is folded into the server-wide
                 // auto-prune counter only when the transaction COMMITS durably; on

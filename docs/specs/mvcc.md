@@ -28,14 +28,14 @@ and rationale; current public behavior is governed by this document,
   was Postgres-without-HOT; HOT is now implemented as a purely additive
   optimization on that model.
 
-### Non-goals and related additions
+### Related additions and remaining non-goals
 
-- **General transactional DDL** — CREATE, DROP, and ALTER stay non-transactional,
-  commit immediately, and are rejected inside an explicit transaction block.
-  Transactional `TRUNCATE` is the deliberately narrow relation-generation
-  exception specified in `docs/specs/table-locks.md`; it does not make catalog
-  names or arbitrary schema changes transactional. Statement-level guard choice
-  is owned by the server and is statement-specific.
+- **Transactional DDL** — CREATE, DROP, and schema-evolution ALTER use a
+  transaction-local catalog overlay, are visible to their owner, and publish only
+  after the top-level commit record is durable. Rollback discards them.
+  Transactional `TRUNCATE` uses the same commit/savepoint lifecycle with its
+  relation-generation storage journal. Statement-level guard choice is owned by
+  the server and is statement-specific.
 - **Time-travel / as-of queries.**
 - **Savepoints / sub-transactions** — originally deferred from the base MVCC
   model, now implemented via sub-transaction xids without undo
@@ -185,8 +185,10 @@ concurrent writers, which maximizes simultaneous unknowns. Rework is near-zero
 (Stage 1 reuses the existing lock at coarser granularity; conflict detection is
 additive) and Stage 1 is a correct, useful, shippable waypoint.
 
-**Decision 6 — DDL: non-transactional initially.**
-DDL commits immediately and is rejected inside an explicit transaction block.
+**Decision 6 — DDL is transactional.**
+DDL writes storage/WAL under the current (sub)xid and mutates a transaction-local
+catalog overlay. Top-level commit publishes the overlay after the commit record is
+durable; rollback and rollback-to-savepoint restore/discard journaled state.
 DDL uses the shared writer guard, table locks, and a catalog-DDL mutex so catalog
 rollback cannot overwrite another committed DDL change and index builds see a
 stable target-table physical view. *Chosen
@@ -624,8 +626,8 @@ becomes load-bearing once writers run concurrently (E2b).
   - **Logical catalog records** (`CreateTable`/`DropTable`/`CreateIndex`/
     `DropIndex`) are the one exception: they mutate the durable catalog directly
     (not idempotent PageLSN-gated page bytes), so redo gates them by the rebuilt
-    CLOG — only a *committed* DDL replays. DDL is non-transactional and commits
-    immediately (§4 Decision 6), so an aborted/in-flight DDL is skipped; skipped
+    CLOG — only a *committed* DDL replays. Transactional DDL that aborts or remains
+    in flight is skipped; skipped
     `CreateTable` / `CreateIndex` records still reserve their IDs, because their
     index/heap pages may replay as unreferenced, invisible orphan files that a later
     object must not reuse.
@@ -1014,9 +1016,8 @@ reference current files.
     before its first retained table/sequence lock, even for a read, and holds it
     through `COMMIT`/`ROLLBACK`/disconnect. This preserves guard-before-object
     ordering if it later writes. Autocommit reads remain guard-free; autocommit
-    writes hold the shared side for one statement. DDL commits immediately
-    (non-transactional, §4 Decision 6)
-    and is **rejected inside an explicit transaction block**; the current server
+    writes hold the shared side for one statement. DDL uses the explicit
+    transaction's retained shared guard and transaction-local catalog; the server
     spec owns the statement-specific guard policy. This is Stage 1: many readers
     concurrent with at most one writer; concurrent writers and write-write
     conflict detection are Milestone E.

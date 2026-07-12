@@ -32,10 +32,6 @@ SaguaroDB is a SQL-compatible relational database written in Rust. It is a stand
 
 ### Non-Goals
 
-- General transactional DDL (CREATE, DROP, and ALTER commit immediately and are
-  rejected inside an explicit transaction block;
-  transactional `TRUNCATE` is the targeted generation-undo exception described
-  in `docs/specs/table-locks.md`)
 - Time-travel / as-of queries
 - Mutual TLS / client-certificate authentication (optional server-side TLS is supported)
 - Authentication
@@ -2081,7 +2077,7 @@ This gives a clean invariant: **after a crash, PageLSN-gated redo-all (with full
 
 ### Write Protocol
 
-Data writes, DDL, and WAL-writing maintenance coordinate through the `ConcurrencyController`'s **shared** writer guard, so unrelated operations can run concurrently while checkpoint drains all of them. DML write-write safety comes from table/row-conflict coordination plus per-index and per-heap structural latches (lock order: table → structural → frame → WAL). DDL is non-transactional and uses a catalog publication gate so whole-catalog rollback cannot race another DDL change. The protocol for a single autocommit DML statement:
+Data writes, DDL, and WAL-writing maintenance coordinate through the `ConcurrencyController`'s **shared** writer guard, so unrelated operations can run concurrently while checkpoint drains all of them. DML write-write safety comes from table/row-conflict coordination plus per-index and per-heap structural latches (lock order: table → structural → frame → WAL). DDL is transaction-scoped and uses catalog overlays plus schema/name locks so uncommitted catalog changes remain private and commit publication cannot race another catalog change. The protocol for a single autocommit DML statement:
 
 1. Bind/preflight without mutation to discover table ids.
 2. Assign and register `txn_id`, acquire the shared writer guard through the cancelable timed-poll form, then acquire xid-owned table locks in ascending id order and revalidate. Cancellation returns the token's reason-specific error.
@@ -2544,7 +2540,7 @@ All statement-level concurrency is coordinated through the `ConcurrencyControlle
 
 - **Read-only statements** (`SELECT`, `EXPLAIN`): bind/plan first. Autocommit reads then acquire statement-owned `AccessShare` without a controller guard. An explicit transaction first acquires/retains the shared checkpoint-participant guard, then transaction-owned `AccessShare`. Both revalidate and capture the statement relation snapshot afterward.
 - **DML statements** (`INSERT`, `UPDATE`, `DELETE`): bind to discover relations, allocate/register the autocommit xid (or use the explicit transaction's top xid), acquire the shared writer guard, then acquire xid-owned table locks and revalidate before snapshot capture. Targets use `RowExclusive`; read sources use `AccessShare`. Row and table waits share the same graph node and deadlock manager.
-- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): non-transactional and rejected inside explicit transaction blocks. Autocommit DDL allocates/registers an xid, takes the shared writer guard, acquires all table/sequence locks, and only then takes the exclusive catalog publication gate to revalidate and execute. The gate blocks catalog readers from provisional mutation through Commit/rollback; object modes scope data/lifetime access.
+- **DDL statements** (`CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, sequences, views, schema-evolution `ALTER TABLE`): transaction-scoped. Explicit transactions retain their catalog overlay and schema/name/table/sequence locks through commit or rollback; autocommit uses the same lifecycle for one statement. Catalog changes become globally visible only after the transaction's commit record is durable. The publication gate makes the combined catalog snapshot visible atomically; object modes scope data/lifetime access.
 - **Maintenance statements** (`VACUUM`, `TRUNCATE`, and supported maintenance ALTER): not relational. `VACUUM` and ALTER remain rejected inside explicit blocks; TRUNCATE is the exception defined in `docs/specs/table-locks.md`. Standalone maintenance uses the shared writer guard. VACUUM takes `Share`; TRUNCATE and ALTER take `AccessExclusive`. Transactional TRUNCATE retains its locks and generation undo through top-level commit/rollback.
 - Shared writer guards are held for the operation lifetime. Actual checkpoint alone takes the exclusive guard and drains all page/WAL writers. `WalFlushPolicy` admits any WAL-durable page; uncommitted/aborted pages may reach the heap but remain hidden by CLOG.
 

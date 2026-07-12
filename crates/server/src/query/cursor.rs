@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use super::{
     ExecutionContextInput, PreparedStatement, QueryService, QuerySessionContext, STREAM_BATCH_ROWS,
     StatementClass, StreamMessage, Transaction, TransactionSnapshots, classify_bound,
-    prepared_schema_versions, validate_prepared_schema_versions_in_catalog,
+    object_lock_requests, prepared_schema_versions, validate_prepared_schema_versions_in_catalog,
 };
 
 pub(crate) enum CursorFetchStatus {
@@ -349,7 +349,10 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
         );
     }
     let updates = txn.truncate_updates.clone();
-    let requests = service.object_requests_for_bound(&bound);
+    let overlay = txn.catalog_overlay.clone();
+    let requests = service
+        .transaction_catalog(&txn)
+        .and_then(|catalog| object_lock_requests(&bound, catalog.as_ref()));
     let lock_result = match requests {
         Ok(requests) if requests.is_empty() => {
             service.transaction_catalog(&txn).and_then(|catalog| {
@@ -365,6 +368,7 @@ fn run_transaction_cursor_worker(input: CursorWorkerInput, mut txn: Transaction)
                 &bound,
                 &prepared.schema_versions,
                 &updates,
+                &overlay,
                 owner,
                 session.cancel().as_ref(),
             ),
@@ -476,20 +480,24 @@ fn run_sql_cursor_worker(input: SqlCursorWorkerInput) {
     }
 
     let statement = Statement::Query(query);
-    let initial = service.bind_with_object_requests(&statement);
+    let initial = service.transaction_catalog(&txn).and_then(|catalog| {
+        let bound = planner::bind(&statement, catalog.as_ref())?;
+        let requests = object_lock_requests(&bound, catalog.as_ref())?;
+        Ok((bound, requests, catalog))
+    });
     let locked = match initial {
-        Ok((bound, requests)) if requests.is_empty() => {
-            service.transaction_catalog(&txn).and_then(|catalog| {
-                prepared_schema_versions(&bound, catalog.as_ref())
-                    .map(|versions| (bound, versions, catalog))
-            })
+        Ok((bound, requests, catalog)) if requests.is_empty() => {
+            prepared_schema_versions(&bound, catalog.as_ref())
+                .map(|versions| (bound, versions, catalog))
         }
-        Ok(_) => {
+        Ok((_bound, _requests, _catalog)) => {
+            let overlay = txn.catalog_overlay.clone();
             let updates = txn.truncate_updates.clone();
             match service.ensure_transaction_lock_owner(&mut txn, session.cancel()) {
                 Ok(owner) => service.bind_and_lock_unprepared_in_transaction(
                     &statement,
-                    &updates,
+                    overlay,
+                    updates,
                     owner,
                     session.cancel().as_ref(),
                 ),

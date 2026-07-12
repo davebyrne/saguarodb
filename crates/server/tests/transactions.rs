@@ -130,53 +130,34 @@ async fn commit_of_aborted_block_rolls_back() {
     assert!(rows.is_empty());
 }
 
-/// DDL inside an explicit transaction is rejected (DDL is non-transactional).
+/// DDL inside an explicit transaction stays private and rolls back with the block.
 #[tokio::test]
-async fn ddl_inside_transaction_is_rejected() {
+async fn ddl_inside_transaction_is_transactional() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();
 
     conn.ok("begin").await;
-    let ddl = conn
-        .query("create table users (id integer primary key)")
-        .await
-        .unwrap();
-    let err = ddl.result.err().expect("DDL in a txn is rejected");
-    assert!(
-        err.message.to_lowercase().contains("ddl"),
-        "message was: {}",
-        err.message
-    );
+    conn.ok("create table users (id integer primary key)").await;
+    conn.ok("insert into users values (1)").await;
     conn.ok("rollback").await;
+    assert!(
+        conn.query("select * from users")
+            .await
+            .unwrap()
+            .result
+            .is_err()
+    );
 
     conn.ok("begin").await;
-    let ddl = conn
-        .query("create table if not exists users (id integer primary key)")
-        .await
-        .unwrap();
-    let err = ddl
-        .result
-        .err()
-        .expect("conditional CREATE TABLE in a txn is rejected");
-    assert!(
-        err.message.to_lowercase().contains("ddl"),
-        "message was: {}",
-        err.message
-    );
-    conn.ok("rollback").await;
+    conn.ok("create table if not exists users (id integer primary key)")
+        .await;
+    conn.ok("commit").await;
+    conn.ok("select * from users").await;
 
     conn.ok("begin").await;
-    let ddl = conn.query("drop table if exists users").await.unwrap();
-    let err = ddl
-        .result
-        .err()
-        .expect("conditional DROP TABLE in a txn is rejected");
-    assert!(
-        err.message.to_lowercase().contains("ddl"),
-        "message was: {}",
-        err.message
-    );
+    conn.ok("drop table if exists users").await;
     conn.ok("rollback").await;
+    conn.ok("select * from users").await;
 }
 
 /// COMMIT/ROLLBACK with no open transaction are no-ops that stay 'I'.
