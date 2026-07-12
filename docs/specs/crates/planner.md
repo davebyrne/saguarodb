@@ -545,6 +545,17 @@ Scalar functions remain `BoundExpr::Function`. The set of scalar functions and t
 
 `COALESCE` and `NULLIF` are not NULL-propagating, so the binder desugars them to `BoundExpr::Case` rather than leaving them as `Function`s. `COALESCE(v1, ..., vn)` becomes `CASE WHEN v1 IS NOT NULL THEN v1 ... ELSE vn END`; all arguments must share one type (no implicit cast, with a bare untyped NULL taking its type from a sibling — all-NULL is `DatatypeMismatch`), and the result is non-nullable exactly when at least one argument is. `NULLIF(a, b)` becomes `CASE WHEN a = b THEN NULL ELSE a END`; the operands must be comparable (same type) and the result type is `a`'s type, always nullable. `BinOp::IsDistinctFrom` / `IsNotDistinctFrom` bind like a comparison (same-type operands, with one untyped NULL taking the sibling's type) but always yield a non-nullable `Boolean`: two NULLs are not distinct, a NULL and a non-NULL are distinct, otherwise ordinary equality applies.
 
+Array expressions use dedicated bound nodes. `BoundExpr::Array` carries a flat
+row-major element expression list plus rectangular dimensions and one scalar
+element type; repeated SQL `[]` dimensions never create nested `DataType::Array`
+elements. An empty or all-NULL constructor needs an array type context (for
+example `ARRAY[]::integer[]`). `BoundExpr::ArraySubscript` requires integer
+indexes and returns the scalar element type, nullable for NULL or out-of-range
+indexes. `BoundExpr::Any` requires a comparison operator and an array whose
+element type exactly matches the left operand; this context infers an undeclared
+array parameter in the common `column = ANY($1)` form. Planner expression walks
+recurse through every child of these nodes.
+
 ## Logical Plan
 
 ```rust

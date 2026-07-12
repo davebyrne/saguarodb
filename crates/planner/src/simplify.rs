@@ -418,6 +418,43 @@ fn fold_children(expr: BoundExpr) -> BoundExpr {
             pg_type,
             nullable,
         },
+        BoundExpr::Array {
+            elements,
+            dimensions,
+            element_type,
+            data_type,
+            nullable,
+        } => BoundExpr::Array {
+            elements: elements.into_iter().map(fold_expr).collect(),
+            dimensions,
+            element_type,
+            data_type,
+            nullable,
+        },
+        BoundExpr::ArraySubscript {
+            array,
+            subscripts,
+            data_type,
+            nullable,
+        } => BoundExpr::ArraySubscript {
+            array: Box::new(fold_expr(*array)),
+            subscripts: subscripts.into_iter().map(fold_expr).collect(),
+            data_type,
+            nullable,
+        },
+        BoundExpr::Any {
+            left,
+            op,
+            array,
+            data_type,
+            nullable,
+        } => BoundExpr::Any {
+            left: Box::new(fold_expr(*left)),
+            op,
+            array: Box::new(fold_expr(*array)),
+            data_type,
+            nullable,
+        },
         BoundExpr::Setval {
             sequence,
             value,

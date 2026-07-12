@@ -582,6 +582,11 @@ fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        BoundExpr::Array { elements, .. } => elements.iter().any(contains_aggregate),
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => contains_aggregate(array) || subscripts.iter().any(contains_aggregate),
+        BoundExpr::Any { left, array, .. } => contains_aggregate(left) || contains_aggregate(array),
         BoundExpr::Setval {
             value, is_called, ..
         } => contains_aggregate(value) || is_called.as_deref().is_some_and(contains_aggregate),
@@ -1545,6 +1550,23 @@ fn collect_expr_dependencies(
             for arg in args {
                 collect_expr_dependencies(arg, bindings, builder);
             }
+        }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                collect_expr_dependencies(element, bindings, builder);
+            }
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            collect_expr_dependencies(array, bindings, builder);
+            for subscript in subscripts {
+                collect_expr_dependencies(subscript, bindings, builder);
+            }
+        }
+        BoundExpr::Any { left, array, .. } => {
+            collect_expr_dependencies(left, bindings, builder);
+            collect_expr_dependencies(array, bindings, builder);
         }
         BoundExpr::Setval {
             value, is_called, ..

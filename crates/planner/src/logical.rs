@@ -859,6 +859,23 @@ fn collect_aggregates(expr: &BoundExpr, output: &mut Vec<AggregateExpr>) {
                 collect_aggregates(arg, output);
             }
         }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                collect_aggregates(element, output);
+            }
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            collect_aggregates(array, output);
+            for subscript in subscripts {
+                collect_aggregates(subscript, output);
+            }
+        }
+        BoundExpr::Any { left, array, .. } => {
+            collect_aggregates(left, output);
+            collect_aggregates(array, output);
+        }
         BoundExpr::Setval {
             value, is_called, ..
         } => {
@@ -996,6 +1013,49 @@ fn rewrite_aggregate_expr(
                 .collect::<Result<Vec<_>>>()?,
             data_type: data_type.clone(),
             pg_type: pg_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::Array {
+            elements,
+            dimensions,
+            element_type,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::Array {
+            elements: elements
+                .iter()
+                .map(|e| rewrite_aggregate_expr(e, group_by, aggregates))
+                .collect::<Result<Vec<_>>>()?,
+            dimensions: dimensions.clone(),
+            element_type: element_type.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::ArraySubscript {
+            array,
+            subscripts,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::ArraySubscript {
+            array: Box::new(rewrite_aggregate_expr(array, group_by, aggregates)?),
+            subscripts: subscripts
+                .iter()
+                .map(|e| rewrite_aggregate_expr(e, group_by, aggregates))
+                .collect::<Result<Vec<_>>>()?,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        }),
+        BoundExpr::Any {
+            left,
+            op,
+            array,
+            data_type,
+            nullable,
+        } => Ok(BoundExpr::Any {
+            left: Box::new(rewrite_aggregate_expr(left, group_by, aggregates)?),
+            op: *op,
+            array: Box::new(rewrite_aggregate_expr(array, group_by, aggregates)?),
+            data_type: data_type.clone(),
             nullable: *nullable,
         }),
         BoundExpr::Setval {
@@ -1226,6 +1286,11 @@ pub(crate) fn contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => contains_aggregate(expr),
         BoundExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        BoundExpr::Array { elements, .. } => elements.iter().any(contains_aggregate),
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => contains_aggregate(array) || subscripts.iter().any(contains_aggregate),
+        BoundExpr::Any { left, array, .. } => contains_aggregate(left) || contains_aggregate(array),
         BoundExpr::Setval {
             value, is_called, ..
         } => contains_aggregate(value) || is_called.as_deref().is_some_and(contains_aggregate),

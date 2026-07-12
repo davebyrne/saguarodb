@@ -211,6 +211,17 @@ fn expr_sequences(expr: &BoundExpr, scan: SequenceScan) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => expr_sequences(expr, scan),
         BoundExpr::Function { args, .. } => args.iter().any(|arg| expr_sequences(arg, scan)),
+        BoundExpr::Array { elements, .. } => {
+            elements.iter().any(|element| expr_sequences(element, scan))
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            expr_sequences(array, scan) || subscripts.iter().any(|item| expr_sequences(item, scan))
+        }
+        BoundExpr::Any { left, array, .. } => {
+            expr_sequences(left, scan) || expr_sequences(array, scan)
+        }
         BoundExpr::AggregateCall { arg, .. } => {
             arg.as_deref().is_some_and(|arg| expr_sequences(arg, scan))
         }
@@ -2446,6 +2457,23 @@ mod tests {
 
         let substituted = substitute_params(&bound, &[Value::Integer(7)]).unwrap();
         assert!(collect_param_types(&substituted, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn binds_array_parameter_type_from_any_left_operand() {
+        let catalog = catalog_with_users();
+        let stmt = parse("select id from users where id = ANY($1)").unwrap();
+        let (bound, params) = bind_parameterized(&stmt, &catalog, &[]).unwrap();
+        let array_type = DataType::Array(common::ArrayType::new(DataType::Integer).unwrap());
+        assert_eq!(params, vec![array_type]);
+
+        let array = common::SqlArray::new(
+            DataType::Integer,
+            vec![common::ArrayDimension::new(2, 1)],
+            vec![Value::Integer(1), Value::Integer(2)],
+        )
+        .unwrap();
+        assert!(substitute_params(&bound, &[Value::Array(array)]).is_ok());
     }
 
     #[test]

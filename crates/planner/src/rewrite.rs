@@ -331,6 +331,43 @@ fn rewrite_children(
             pg_type: pg_type.clone(),
             nullable: *nullable,
         },
+        BoundExpr::Array {
+            elements,
+            dimensions,
+            element_type,
+            data_type,
+            nullable,
+        } => BoundExpr::Array {
+            elements: rewrite_vec(elements, f)?,
+            dimensions: dimensions.clone(),
+            element_type: element_type.clone(),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        },
+        BoundExpr::ArraySubscript {
+            array,
+            subscripts,
+            data_type,
+            nullable,
+        } => BoundExpr::ArraySubscript {
+            array: Box::new(rewrite_expr(array, f)?),
+            subscripts: rewrite_vec(subscripts, f)?,
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        },
+        BoundExpr::Any {
+            left,
+            op,
+            array,
+            data_type,
+            nullable,
+        } => BoundExpr::Any {
+            left: Box::new(rewrite_expr(left, f)?),
+            op: *op,
+            array: Box::new(rewrite_expr(array, f)?),
+            data_type: data_type.clone(),
+            nullable: *nullable,
+        },
         BoundExpr::Setval {
             sequence,
             value,

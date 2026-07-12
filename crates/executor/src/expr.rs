@@ -1,4 +1,7 @@
-use common::{DataType, DbError, ExecRow, PgType, Result, SqlState, StatementContext, Value};
+use common::{
+    ArrayDimension, DataType, DbError, ExecRow, PgType, Result, SqlArray, SqlState,
+    StatementContext, Value,
+};
 use planner::{AggregateFunc, BinOp, BoundExpr, UnaryOp};
 
 pub fn eval_expr(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> Result<Value> {
@@ -24,6 +27,53 @@ fn eval_expr_inner(ctx: &StatementContext, expr: &BoundExpr, row: &ExecRow) -> R
         } => eval_binary(ctx, left, *op, right, row),
         BoundExpr::UnaryOp { op, expr, .. } => eval_unary(ctx, *op, expr, row),
         BoundExpr::Function { name, args, .. } => eval_function(ctx, name, args, row),
+        BoundExpr::Array {
+            elements,
+            dimensions,
+            element_type,
+            ..
+        } => {
+            let values = elements
+                .iter()
+                .map(|element| eval_expr_inner(ctx, element, row))
+                .collect::<Result<Vec<_>>>()?;
+            let dimensions = dimensions
+                .iter()
+                .map(|len| ArrayDimension::new(*len, 1))
+                .collect();
+            Ok(Value::Array(SqlArray::new(
+                element_type.clone(),
+                dimensions,
+                values,
+            )?))
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            let array = eval_expr_inner(ctx, array, row)?;
+            if matches!(array, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let Value::Array(array) = array else {
+                return datatype_mismatch("array subscript requires an array operand");
+            };
+            let mut indexes = Vec::with_capacity(subscripts.len());
+            for subscript in subscripts {
+                match eval_expr_inner(ctx, subscript, row)? {
+                    Value::Integer(index) => indexes.push(index),
+                    Value::Null => return Ok(Value::Null),
+                    _ => return datatype_mismatch("array subscript must be an integer"),
+                }
+            }
+            Ok(array
+                .element_offset(&indexes)
+                .and_then(|offset| array.elements().get(offset))
+                .cloned()
+                .unwrap_or(Value::Null))
+        }
+        BoundExpr::Any {
+            left, op, array, ..
+        } => eval_any(ctx, left, *op, array, row),
         BoundExpr::Nextval { sequence, .. } => eval_nextval(ctx, *sequence),
         BoundExpr::Currval { sequence, .. } => eval_currval(ctx, *sequence),
         BoundExpr::Setval {
@@ -152,6 +202,37 @@ fn eval_binary(
         BinOp::IsDistinctFrom => eval_is_distinct(left, right, false),
         BinOp::IsNotDistinctFrom => eval_is_distinct(left, right, true),
     }
+}
+
+fn eval_any(
+    ctx: &StatementContext,
+    left: &BoundExpr,
+    op: BinOp,
+    array: &BoundExpr,
+    row: &ExecRow,
+) -> Result<Value> {
+    let left = eval_expr_inner(ctx, left, row)?;
+    let array = eval_expr_inner(ctx, array, row)?;
+    if matches!(array, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let Value::Array(array) = array else {
+        return datatype_mismatch("ANY requires an array operand");
+    };
+    let mut saw_null = false;
+    for element in array.elements() {
+        match compare_values(&left, op, element)? {
+            Value::Boolean(true) => return Ok(Value::Boolean(true)),
+            Value::Boolean(false) => {}
+            Value::Null => saw_null = true,
+            _ => return Err(DbError::internal("comparison returned a non-boolean value")),
+        }
+    }
+    Ok(if saw_null {
+        Value::Null
+    } else {
+        Value::Boolean(false)
+    })
 }
 
 /// NULL-safe comparison backing `IS [NOT] DISTINCT FROM`. Two NULLs are *not*
@@ -458,6 +539,7 @@ pub(crate) fn compare_values(left: &Value, op: BinOp, right: &Value) -> Result<V
         (Value::Interval(left), Value::Interval(right)) => left.cmp(right),
         (Value::Bytes(left), Value::Bytes(right)) => left.cmp(right),
         (Value::Uuid(left), Value::Uuid(right)) => left.cmp(right),
+        (Value::Array(left), Value::Array(right)) => left.cmp(right),
         _ => return datatype_mismatch("comparison operands have different types"),
     };
 
@@ -730,6 +812,19 @@ fn cast_value(value: Value, data_type: &DataType) -> Result<Value> {
     }
 
     match (value, data_type) {
+        (Value::Array(array), DataType::Array(target)) => {
+            let elements = array
+                .elements()
+                .iter()
+                .cloned()
+                .map(|element| cast_value(element, target.element_type()))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Value::Array(SqlArray::new(
+                target.element_type().clone(),
+                array.dimensions().to_vec(),
+                elements,
+            )?))
+        }
         (Value::Integer(value), DataType::Integer) => Ok(Value::Integer(value)),
         (Value::Text(value), DataType::Text) => Ok(Value::Text(value)),
         (Value::Boolean(value), DataType::Boolean) => Ok(Value::Boolean(value)),

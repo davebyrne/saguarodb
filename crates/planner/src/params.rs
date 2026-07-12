@@ -556,6 +556,25 @@ pub(crate) fn for_each_child(
             }
             Ok(())
         }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                f(element)?;
+            }
+            Ok(())
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            f(array)?;
+            for subscript in subscripts {
+                f(subscript)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Any { left, array, .. } => {
+            f(left)?;
+            f(array)
+        }
         BoundExpr::Setval {
             value, is_called, ..
         } => {
@@ -638,6 +657,25 @@ fn for_each_child_mut(
                 f(arg)?;
             }
             Ok(())
+        }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                f(element)?;
+            }
+            Ok(())
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            f(array)?;
+            for subscript in subscripts {
+                f(subscript)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Any { left, array, .. } => {
+            f(left)?;
+            f(array)
         }
         BoundExpr::Setval {
             value, is_called, ..

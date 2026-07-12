@@ -44,6 +44,26 @@ pub enum BoundExpr {
         pg_type: Option<PgType>,
         nullable: bool,
     },
+    Array {
+        elements: Vec<BoundExpr>,
+        dimensions: Vec<u32>,
+        element_type: DataType,
+        data_type: DataType,
+        nullable: bool,
+    },
+    ArraySubscript {
+        array: Box<BoundExpr>,
+        subscripts: Vec<BoundExpr>,
+        data_type: DataType,
+        nullable: bool,
+    },
+    Any {
+        left: Box<BoundExpr>,
+        op: BinOp,
+        array: Box<BoundExpr>,
+        data_type: DataType,
+        nullable: bool,
+    },
     Nextval {
         sequence: SequenceId,
         data_type: DataType,
@@ -322,6 +342,9 @@ impl BoundExpr {
             | BoundExpr::InSubquery { data_type, .. }
             | BoundExpr::Parameter { data_type, .. }
             | BoundExpr::Function { data_type, .. } => data_type.clone(),
+            BoundExpr::Array { data_type, .. }
+            | BoundExpr::ArraySubscript { data_type, .. }
+            | BoundExpr::Any { data_type, .. } => data_type.clone(),
         }
     }
 
@@ -349,6 +372,9 @@ impl BoundExpr {
             | BoundExpr::ScalarSubquery { nullable, .. }
             | BoundExpr::Exists { nullable, .. }
             | BoundExpr::InSubquery { nullable, .. } => *nullable,
+            BoundExpr::Array { nullable, .. }
+            | BoundExpr::ArraySubscript { nullable, .. }
+            | BoundExpr::Any { nullable, .. } => *nullable,
         }
     }
 

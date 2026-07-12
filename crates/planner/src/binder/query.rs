@@ -1421,6 +1421,25 @@ fn validate_grouped_expr(expr: &BoundExpr, group_by: &[BoundExpr]) -> Result<()>
             }
             Ok(())
         }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                validate_grouped_expr(element, group_by)?;
+            }
+            Ok(())
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            validate_grouped_expr(array, group_by)?;
+            for subscript in subscripts {
+                validate_grouped_expr(subscript, group_by)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Any { left, array, .. } => {
+            validate_grouped_expr(left, group_by)?;
+            validate_grouped_expr(array, group_by)
+        }
         BoundExpr::Setval {
             value, is_called, ..
         } => {
@@ -1503,6 +1522,11 @@ fn references_input(expr: &BoundExpr) -> bool {
         | BoundExpr::IsNotNull { expr, .. }
         | BoundExpr::Cast { expr, .. } => references_input(expr),
         BoundExpr::Function { args, .. } => args.iter().any(references_input),
+        BoundExpr::Array { elements, .. } => elements.iter().any(references_input),
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => references_input(array) || subscripts.iter().any(references_input),
+        BoundExpr::Any { left, array, .. } => references_input(left) || references_input(array),
         BoundExpr::Setval {
             value, is_called, ..
         } => references_input(value) || is_called.as_deref().is_some_and(references_input),

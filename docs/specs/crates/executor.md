@@ -208,6 +208,14 @@ The evaluator handles:
 - Arithmetic: `+`, `-`, `*`, `/`, `%` (and unary `-`). Both operands must share one numeric family — `INTEGER`, `DOUBLE PRECISION`, `REAL`, or `NUMERIC` (any `(p, s)`) — with no implicit coercion between families; the result is that family (`NUMERIC` arithmetic yields an unconstrained `NUMERIC`). `%` is supported for `INTEGER` and `NUMERIC` but rejected for the floating-point families (`DOUBLE PRECISION`, `REAL`). `NUMERIC` follows PostgreSQL's scale rules: `+`/`-` use the larger operand scale, `*` sums the operand scales, and `/` produces up to 28 significant digits; overflow beyond `Decimal`'s range is `SqlState::NumericValueOutOfRange`. `INTERVAL` arithmetic sits outside the numeric families: `interval ± interval` (component-wise), `interval * integer` (each component scaled), and unary `- interval` all yield `INTERVAL`; `DATE/TIMESTAMP/TIMESTAMP WITH TIME ZONE/TIME ± interval` yields the temporal type (`DATE ± interval` yields `TIMESTAMP`), where months are applied calendar-aware (clamping the day-of-month, e.g. `2024-01-31 + 1 month = 2024-02-29`) before whole days and then microseconds, and `TIME ± interval` uses only the interval's time component, wrapping into `[0, 24h)`. Overflow of any interval/temporal result is `SqlState::NumericValueOutOfRange`.
 - Comparison: `=`, `!=`, `<`, `<=`, `>`, `>=`. `DOUBLE PRECISION` and `REAL` compare with a total order matching PostgreSQL's float operators: `NaN` equals itself and sorts greater than every other value, and `-0.0` equals `+0.0`. `NUMERIC` compares by value, so `1.0`, `1.00`, and `1` are equal (and collapse together under `DISTINCT`/`GROUP BY`). `INTERVAL` compares by a canonical estimate (a month = 30 days, a day = 24 hours), so `1 mon` equals `30 days`.
 - NULL-safe comparison: `IS DISTINCT FROM` and `IS NOT DISTINCT FROM`. Two NULLs are not distinct, a NULL and a non-NULL are distinct, and otherwise ordinary equality applies; the result is always a boolean, never NULL. (`COALESCE` and `NULLIF` are desugared to `CASE` by the binder and evaluate as such.)
+- Arrays: constructors evaluate their flattened elements into a rectangular
+  `SqlArray` with one-based lower bounds. A complete subscript coordinate returns
+  the selected element; NULL, incomplete, or out-of-range coordinates return
+  NULL. Array comparisons use the durable `SqlArray` ordering. `left op
+  ANY(array)` returns true on the first true element comparison, NULL when no
+  comparison is true but at least one is NULL, and false otherwise (including an
+  empty array). Explicit array-to-array casts apply the scalar cast to every
+  element while retaining dimensions and lower bounds.
 - String concatenation: `||` over text operands, NULL-propagating; non-text operands return `SqlState::DatatypeMismatch`.
 - Boolean: `AND`, `OR`, `NOT` with SQL three-valued logic.
 - `IS NULL`, `IS NOT NULL`.

@@ -37,10 +37,9 @@ fn bind_expr_with_pg_type(
             args,
             distinct,
         } => bind_function(ctx, name, args, *distinct),
-        Expr::Array(_) | Expr::ArraySubscript { .. } | Expr::Any { .. } => Err(plan_error(
-            SqlState::FeatureNotSupported,
-            "array expressions are not yet supported by the binder",
-        )),
+        Expr::Array(elements) => bind_array(ctx, elements, expected),
+        Expr::ArraySubscript { array, subscripts } => bind_array_subscript(ctx, array, subscripts),
+        Expr::Any { left, op, array } => bind_any(ctx, left, op.clone(), array),
         Expr::IsNull(expr) => {
             let expr = Box::new(bind_expr(ctx, expr, None)?);
             Ok(BoundExpr::IsNull {
@@ -96,7 +95,13 @@ fn bind_expr_with_pg_type(
             data_type,
             pg_type,
         } => {
-            let expr = Box::new(bind_expr(ctx, expr, Some(data_type.clone()))?);
+            let expr = if matches!(data_type, DataType::Array(_)) {
+                bind_expr(ctx, expr, None)
+                    .or_else(|_| bind_expr(ctx, expr, Some(data_type.clone())))?
+            } else {
+                bind_expr(ctx, expr, Some(data_type.clone()))?
+            };
+            let expr = Box::new(expr);
             Ok(BoundExpr::Cast {
                 nullable: expr.nullable(),
                 expr,
@@ -275,6 +280,181 @@ fn bind_literal(value: &Value, expected: Option<DataType>) -> Result<BoundExpr> 
         value: value.clone(),
         data_type,
         nullable,
+    })
+}
+
+fn bind_array(
+    ctx: &mut BindContext,
+    elements: &[Expr],
+    expected: Option<DataType>,
+) -> Result<BoundExpr> {
+    let expected_element = match expected {
+        Some(DataType::Array(array)) => Some(array.element_type().clone()),
+        Some(other) => {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                format!("array expression does not match expected type {other:?}"),
+            ));
+        }
+        None => None,
+    };
+    let dimensions = array_dimensions(elements)?;
+    let mut scalars = Vec::new();
+    flatten_array_elements(elements, &mut scalars);
+    let element_type = match expected_element {
+        Some(data_type) => data_type,
+        None => {
+            let candidate = scalars
+                .iter()
+                .find(|expr| !matches!(expr, Expr::Literal(Value::Null)))
+                .ok_or_else(|| {
+                    plan_error(
+                        SqlState::DatatypeMismatch,
+                        "cannot determine type of empty or all-NULL array",
+                    )
+                })?;
+            bind_expr(ctx, candidate, None)?.data_type()
+        }
+    };
+    if matches!(element_type, DataType::Array(_)) {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "array element type must be scalar",
+        ));
+    }
+    let elements = scalars
+        .into_iter()
+        .map(|expr| {
+            let bound = bind_expr(ctx, expr, Some(element_type.clone()))?;
+            require_type(&bound, element_type.clone())?;
+            Ok(bound)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let data_type = DataType::Array(common::ArrayType::new(element_type.clone())?);
+    Ok(BoundExpr::Array {
+        elements,
+        dimensions,
+        element_type,
+        data_type,
+        nullable: false,
+    })
+}
+
+fn array_dimensions(elements: &[Expr]) -> Result<Vec<u32>> {
+    let len = u32::try_from(elements.len()).map_err(|_| {
+        plan_error(
+            SqlState::ProgramLimitExceeded,
+            "array dimension is too large",
+        )
+    })?;
+    let nested = elements.iter().filter_map(|expr| match expr {
+        Expr::Array(elements) => Some(elements.as_slice()),
+        _ => None,
+    });
+    let nested_count = nested.clone().count();
+    if nested_count == 0 {
+        return Ok(if elements.is_empty() {
+            Vec::new()
+        } else {
+            vec![len]
+        });
+    }
+    if nested_count != elements.len() {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "multidimensional arrays must have matching dimensions",
+        ));
+    }
+    let mut nested = nested;
+    let first = array_dimensions(nested.next().expect("non-empty nested array"))?;
+    for elements in nested {
+        if array_dimensions(elements)? != first {
+            return Err(plan_error(
+                SqlState::DatatypeMismatch,
+                "multidimensional arrays must have matching dimensions",
+            ));
+        }
+    }
+    let mut dimensions = vec![len];
+    dimensions.extend(first);
+    Ok(dimensions)
+}
+
+fn flatten_array_elements<'a>(elements: &'a [Expr], output: &mut Vec<&'a Expr>) {
+    for element in elements {
+        match element {
+            Expr::Array(nested) => flatten_array_elements(nested, output),
+            scalar => output.push(scalar),
+        }
+    }
+}
+
+fn bind_array_subscript(
+    ctx: &mut BindContext,
+    array: &Expr,
+    subscripts: &[Expr],
+) -> Result<BoundExpr> {
+    let array = bind_expr(ctx, array, None)?;
+    let DataType::Array(array_type) = array.data_type() else {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "array subscript requires an array operand",
+        ));
+    };
+    let subscripts = subscripts
+        .iter()
+        .map(|subscript| bind_expr(ctx, subscript, Some(DataType::Integer)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BoundExpr::ArraySubscript {
+        array: Box::new(array),
+        subscripts,
+        data_type: array_type.element_type().clone(),
+        nullable: true,
+    })
+}
+
+fn bind_any(
+    ctx: &mut BindContext,
+    left: &Expr,
+    op: parser::BinOp,
+    array: &Expr,
+) -> Result<BoundExpr> {
+    let op = convert_bin_op(op);
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    ) {
+        return Err(plan_error(
+            SqlState::DatatypeMismatch,
+            "ANY requires a comparison operator",
+        ));
+    }
+    let (left, array, array_type) = match bind_expr(ctx, left, None) {
+        Ok(left) => {
+            let array_type = DataType::Array(common::ArrayType::new(left.data_type())?);
+            let array = bind_expr(ctx, array, Some(array_type.clone()))?;
+            (left, array, array_type)
+        }
+        Err(left_error) => {
+            let array = bind_expr(ctx, array, None).map_err(|_| left_error)?;
+            let DataType::Array(array_type) = array.data_type() else {
+                return Err(plan_error(
+                    SqlState::DatatypeMismatch,
+                    "ANY requires an array operand",
+                ));
+            };
+            let left = bind_expr(ctx, left, Some(array_type.element_type().clone()))?;
+            let data_type = DataType::Array(array_type);
+            (left, array, data_type)
+        }
+    };
+    require_type(&array, array_type)?;
+    Ok(BoundExpr::Any {
+        nullable: true,
+        left: Box::new(left),
+        op,
+        array: Box::new(array),
+        data_type: DataType::Boolean,
     })
 }
 

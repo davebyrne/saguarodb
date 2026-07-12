@@ -2156,6 +2156,19 @@ fn validate_row_constraints(schema: &TableSchema, values: &[Value]) -> Result<()
                     ),
                 ));
             }
+            (Value::Array(array), Some(max))
+                if matches!(array.element_type(), DataType::Text)
+                    && array.elements().iter().any(|value| {
+                        matches!(value, Value::Text(text) if text.chars().count() > max as usize)
+                    }) => {
+                return Err(DbError::execute(
+                    SqlState::StringDataRightTruncation,
+                    format!(
+                        "array element too long for column {} (maximum {max} characters)",
+                        column.name
+                    ),
+                ));
+            }
             _ => {}
         }
         // A narrowed integer column (int2/int4) reports a distinct wire OID, so
@@ -2173,26 +2186,7 @@ fn validate_row_constraints(schema: &TableSchema, values: &[Value]) -> Result<()
 }
 
 fn validate_value_type(column: &common::ColumnDef, value: &Value) -> Result<()> {
-    if matches!(value, Value::Null) {
-        return Ok(());
-    }
-    let matches_type = matches!(
-        (&column.data_type, value),
-        (DataType::Integer, Value::Integer(_))
-            | (DataType::Double, Value::Float(_))
-            | (DataType::Real, Value::Real(_))
-            | (DataType::Numeric { .. }, Value::Numeric(_))
-            | (DataType::Text, Value::Text(_))
-            | (DataType::Boolean, Value::Boolean(_))
-            | (DataType::Date, Value::Date(_))
-            | (DataType::Timestamp, Value::Timestamp(_))
-            | (DataType::Time, Value::Time(_))
-            | (DataType::TimestampTz, Value::TimestampTz(_))
-            | (DataType::Interval, Value::Interval(_))
-            | (DataType::Bytea, Value::Bytes(_))
-            | (DataType::Uuid, Value::Uuid(_))
-    );
-    if matches_type {
+    if common::value_matches_type(value, &column.data_type) {
         return Ok(());
     }
     Err(DbError::execute(

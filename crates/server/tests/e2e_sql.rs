@@ -8,6 +8,73 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
+async fn e2e_array_constructors_storage_subscripts_comparisons_and_any() {
+    let server = TestServer::start().await.unwrap();
+    server
+        .simple_query("create table array_rows (id integer primary key, values integer[])")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into array_rows values (1, ARRAY[10, 20, NULL]), (2, ARRAY[30, 40])")
+        .await
+        .unwrap();
+
+    let rows = server
+        .simple_query(
+            "select id, values[2], 20 = ANY(values), values = ARRAY[10, 20, NULL] \
+             from array_rows order by id",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                Some("20".into()),
+                Some("t".into()),
+                Some("t".into()),
+            ],
+            vec![
+                Some("2".into()),
+                Some("40".into()),
+                Some("f".into()),
+                Some("f".into())
+            ],
+        ]
+    );
+
+    let rows = server
+        .simple_query(
+            "select ARRAY[[1, 2], [3, 4]][2][1], 9 = ANY(ARRAY[]::integer[]), \
+             (ARRAY[1, 2]::text[])[2]",
+        )
+        .await
+        .unwrap()
+        .unwrap_rows();
+    assert_eq!(
+        rows,
+        vec![vec![Some("3".into()), Some("f".into()), Some("2".into())]]
+    );
+
+    server
+        .simple_query("create table array_labels (values varchar(3)[])")
+        .await
+        .unwrap();
+    server
+        .simple_query("insert into array_labels values (ARRAY['one', 'two'])")
+        .await
+        .unwrap();
+    let err = server
+        .simple_query("insert into array_labels values (ARRAY['toolong'])")
+        .await
+        .err()
+        .expect("oversized array element should fail");
+    assert_eq!(err.code, common::SqlState::StringDataRightTruncation);
+}
+
+#[tokio::test]
 async fn e2e_returning_for_insert_update_delete() {
     let server = TestServer::start().await.unwrap();
     server

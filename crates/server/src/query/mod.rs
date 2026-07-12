@@ -2327,6 +2327,23 @@ fn collect_expr_objects(expr: &BoundExpr, references: &mut BoundObjectReferences
                 collect_expr_objects(arg, references)?;
             }
         }
+        BoundExpr::Array { elements, .. } => {
+            for element in elements {
+                collect_expr_objects(element, references)?;
+            }
+        }
+        BoundExpr::ArraySubscript {
+            array, subscripts, ..
+        } => {
+            collect_expr_objects(array, references)?;
+            for subscript in subscripts {
+                collect_expr_objects(subscript, references)?;
+            }
+        }
+        BoundExpr::Any { left, array, .. } => {
+            collect_expr_objects(left, references)?;
+            collect_expr_objects(array, references)?;
+        }
         BoundExpr::Setval {
             sequence,
             value,
