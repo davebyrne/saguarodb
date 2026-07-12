@@ -82,6 +82,19 @@ fn plain_prepared_values(row: &Row) -> Vec<crate::codec::PreparedColumnValue> {
         .collect()
 }
 
+fn plain_column_plans(row: &Row) -> Vec<ToastColumnPlan> {
+    row.values
+        .iter()
+        .map(|value| {
+            if matches!(value, Value::Null) {
+                ToastColumnPlan::Null
+            } else {
+                ToastColumnPlan::Value
+            }
+        })
+        .collect()
+}
+
 fn validate_logical_index_keys_fit(
     storage: &PageBackedStorageEngine,
     relations: &PageBackedRelationSnapshot,
@@ -282,7 +295,7 @@ fn logical_value_v3_len(column: &ColumnDef, value: &Value) -> Result<usize> {
         Value::Uuid(_) if column.data_type == DataType::Uuid => Ok(16),
         Value::Array(array) if matches!(&column.data_type, DataType::Array(element) if element.element_type() == array.element_type()) =>
         {
-            let len = crate::codec::encode_array_payload(array)?.len();
+            let len = crate::codec::encoded_array_payload_len(array)?;
             supported_varlena_len(len)?;
             checked_varlena_len_add(4, len)
         }
@@ -446,6 +459,8 @@ impl PageBackedStorageEngine {
         if matches!(schema.relation_kind, RelationKind::Toast { .. })
             || schema.toast_table_id.is_none()
         {
+            let plans = plain_column_plans(row);
+            ensure_planned_row_fits_page(schema, row, &plans)?;
             let values = plain_prepared_values(row);
             let bytes = crate::codec::encode_row_v3_prepared(schema, header, &values)?;
             ensure_row_len_fits_page(bytes.len())?;
@@ -533,6 +548,8 @@ impl PageBackedStorageEngine {
         if matches!(schema.relation_kind, RelationKind::Toast { .. })
             || schema.toast_table_id.is_none()
         {
+            let plans = plain_column_plans(row);
+            ensure_planned_row_fits_page(schema, row, &plans)?;
             let values = plain_prepared_values(row);
             let bytes = crate::codec::encode_row_v3_prepared(schema, &header, &values)?;
             ensure_row_len_fits_page(bytes.len())?;

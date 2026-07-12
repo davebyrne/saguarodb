@@ -234,11 +234,6 @@ fn read_numeric(bytes: &[u8], offset: &mut usize) -> Result<Decimal> {
 
 pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
     let encoded_len = encoded_array_payload_len(array)?;
-    if encoded_len > MAX_ARRAY_PAYLOAD_BYTES {
-        return Err(array_size_error(
-            "array payload exceeds the supported length",
-        ));
-    }
     let cardinality = u32::try_from(array.cardinality()).map_err(|_| {
         DbError::storage(
             SqlState::ProgramLimitExceeded,
@@ -277,7 +272,7 @@ pub(crate) fn encode_array_payload(array: &SqlArray) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn encoded_array_payload_len(array: &SqlArray) -> Result<usize> {
+pub(crate) fn encoded_array_payload_len(array: &SqlArray) -> Result<usize> {
     let type_len = 1 + usize::from(matches!(array.element_type(), DataType::Numeric { .. })) * 8;
     let mut len = 1_usize
         .checked_add(type_len)
@@ -307,7 +302,13 @@ fn encoded_array_payload_len(array: &SqlArray) -> Result<usize> {
             .checked_add(element_len)
             .ok_or_else(|| array_size_error("array payload length overflows"))?;
     }
-    Ok(len)
+    if len > MAX_ARRAY_PAYLOAD_BYTES {
+        Err(array_size_error(
+            "array payload exceeds the supported length",
+        ))
+    } else {
+        Ok(len)
+    }
 }
 
 fn array_size_error(message: &'static str) -> DbError {

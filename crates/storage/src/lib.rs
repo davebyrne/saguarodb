@@ -2234,6 +2234,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_table_rejects_oversized_array_before_row_materialization() {
+        let harness = StorageHarness::new();
+        let ctx = StatementContext::new(1);
+        let (mut base, _) = array_base_and_toast_schema();
+        base.toast_table_id = None;
+        harness.storage.create_table(&ctx, &base).unwrap();
+        let row = Row {
+            values: vec![Value::Integer(1), Value::Array(integer_array(0..2_000))],
+        };
+
+        let error = harness
+            .storage
+            .prepare_row_for_storage(
+                &ctx,
+                &harness
+                    .storage
+                    .capture_pagebacked_relation_snapshot()
+                    .unwrap(),
+                &base,
+                &MvccHeader::fresh(ctx.txn_id, 0),
+                &row,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, SqlState::ProgramLimitExceeded);
+    }
+
+    #[test]
     fn inline_compressed_array_is_materialized_on_read() {
         let harness = StorageHarness::new();
         let ctx = StatementContext::new(1);
