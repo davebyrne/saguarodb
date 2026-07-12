@@ -362,7 +362,10 @@ impl<'de> Deserialize<'de> for PgType {
             Bool,
             Float4,
             Float8,
-            Numeric { precision: Option<u32>, scale: u32 },
+            Numeric {
+                precision: Option<u32>,
+                scale: u32,
+            },
             Text,
             Varchar(Option<u32>),
             Bpchar(Option<u32>),
@@ -375,7 +378,9 @@ impl<'de> Deserialize<'de> for PgType {
             Interval,
             OidVector,
             Int2Vector,
+            #[serde(alias = "OidArray")]
             CatalogOidArrayText,
+            #[serde(alias = "Int2Array")]
             CatalogInt2ArrayText,
             Array(Box<SerializedPgType>),
         }
@@ -623,6 +628,18 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<PgType>(json).is_err(), "{json}");
         }
+    }
+
+    #[test]
+    fn pg_type_deserialization_accepts_legacy_catalog_array_names() {
+        assert_eq!(
+            serde_json::from_str::<PgType>(r#""OidArray""#).unwrap(),
+            PgType::CatalogOidArrayText
+        );
+        assert_eq!(
+            serde_json::from_str::<PgType>(r#""Int2Array""#).unwrap(),
+            PgType::CatalogInt2ArrayText
+        );
     }
 
     #[test]
