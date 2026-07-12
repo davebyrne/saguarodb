@@ -1,16 +1,16 @@
 # SaguaroDB Statistics & ANALYZE Specification
 
 **Date:** 2026-07-12
-**Status:** Design — implementation planned on branch `feat/statistics`. Until a
-milestone below lands, `docs/specs/overview.md` and `docs/specs/crates/*.md`
-describe the current (no-statistics) behavior and remain authoritative; each
-milestone updates them alongside the code.
+**Status:** Living contract — Milestones A–H are implemented on
+`feat/statistics`; `docs/specs/overview.md` and `docs/specs/crates/*.md` were
+updated milestone by milestone and agree with this spec.
 
 ## 1. Overview
 
-SaguaroDB has no optimizer statistics: `ANALYZE` is accepted only as a
-discarded compatibility modifier of `VACUUM`, the planner is purely rule-based,
-and `pg_class.reltuples` is synthesized. This spec adds:
+Before this feature, SaguaroDB had no optimizer statistics: `ANALYZE` was
+accepted only as a discarded compatibility modifier of `VACUUM`, the planner
+was purely rule-based, and `pg_class.reltuples` was synthesized. This spec
+defines:
 
 - A durable per-table / per-column **statistics catalog** (row counts, page
   counts, null fraction, average width, n_distinct, most-common values,
@@ -22,6 +22,7 @@ and `pg_class.reltuples` is synthesized. This spec adds:
 - **Planner consumption**, staged: cardinality/selectivity estimation with
   `rows=` estimates in `EXPLAIN`, then the first cost-based decisions
   (hash-join build side, seq-vs-index scan choice).
+- **Auto-analyze** at checkpoint behind `--auto-analyze-changed-rows`.
 
 ### Goals
 
