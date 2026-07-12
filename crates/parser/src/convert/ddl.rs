@@ -688,11 +688,7 @@ fn convert_column_def(
     // Otherwise derive the storage type from the declared wire type, folding the
     // declared character length (if any) into `varchar(n)` / `char(n)`.
     let max_length = column_char_length(&column.data_type)?;
-    let pg_type = match convert_pg_type(&column.data_type)? {
-        PgType::Varchar(_) => PgType::Varchar(max_length),
-        PgType::Bpchar(_) => PgType::Bpchar(max_length),
-        other => other,
-    };
+    let pg_type = apply_column_char_length(convert_pg_type(&column.data_type)?, max_length)?;
     Ok(ParsedColumnDef {
         name,
         data_type: pg_type.data_type(),
@@ -701,6 +697,18 @@ fn convert_column_def(
         default,
         pg_type: Some(pg_type),
     })
+}
+
+fn apply_column_char_length(pg_type: PgType, max_length: Option<u32>) -> Result<PgType> {
+    match pg_type {
+        PgType::Varchar(_) => Ok(PgType::Varchar(max_length)),
+        PgType::Bpchar(_) => Ok(PgType::Bpchar(max_length)),
+        PgType::Array(array) => PgType::array(apply_column_char_length(
+            array.element_type().clone(),
+            max_length,
+        )?),
+        other => Ok(other),
+    }
 }
 
 /// Convert a column `DEFAULT` expression into the bounded parse-time default

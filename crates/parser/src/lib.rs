@@ -2658,6 +2658,22 @@ mod tests {
         ));
 
         let Statement::CreateTable { columns, .. } =
+            parse("create table labels (a varchar(10)[], b char(3)[][])").unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(columns[0].max_length, Some(10));
+        assert_eq!(
+            columns[0].pg_type,
+            Some(PgType::array(PgType::Varchar(Some(10))).unwrap())
+        );
+        assert_eq!(columns[1].max_length, Some(3));
+        assert_eq!(
+            columns[1].pg_type,
+            Some(PgType::array(PgType::Bpchar(Some(3))).unwrap())
+        );
+
+        let Statement::CreateTable { columns, .. } =
             parse("create table matrix (values integer[][])").unwrap()
         else {
             panic!("expected CREATE TABLE");

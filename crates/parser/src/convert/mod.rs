@@ -821,6 +821,9 @@ fn column_char_length(data_type: &sql::DataType) -> Result<Option<u32>> {
         sql::DataType::Varchar(length)
         | sql::DataType::Char(length)
         | sql::DataType::Character(length) => length,
+        sql::DataType::Array(sql::ArrayElemTypeDef::SquareBracket(element, None)) => {
+            return column_char_length(element);
+        }
         _ => return Ok(None),
     };
     match length {
