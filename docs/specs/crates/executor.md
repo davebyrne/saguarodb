@@ -189,11 +189,11 @@ library tests is empty.
 
 Rows are rebuilt for each execution, sorted deterministically, and filtered with
 the bound scan predicate using the same `predicate_matches` semantics as storage
-scans. OID columns report PostgreSQL `oid` wire metadata; vector/array catalog
-fields keep text values but report PostgreSQL-compatible wire identities where
-there is no first-class SaguaroDB array/vector value. Extended-query result
-format selection keeps those vector/array fields in text even when a client asks
-for binary results. System scans never record
+scans. OID columns report PostgreSQL `oid` wire metadata. Legacy catalog-only
+vector fields keep text values while reporting PostgreSQL-compatible wire
+identities; ordinary SQL arrays are first-class `SqlArray` values. Extended-query
+result format selection keeps only those legacy vector fields in text when a
+client asks for binary results. System scans never record
 SSI reads and never carry `RowIdentity`, so they cannot be a DML source.
 
 ## Expression Evaluation

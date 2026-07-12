@@ -401,6 +401,33 @@ async fn copy_from_round_trips_through_copy_to() {
 }
 
 #[tokio::test]
+async fn copy_array_text_round_trips_shape_nulls_and_quoted_elements() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    conn.ok("create table arrays (id integer, ints integer[], words text[])")
+        .await;
+    let payload: &[u8] = b"1\t{{1,2},{3,NULL}}\t{\"a,b\",\"NULL\"}\n";
+    conn.copy_from("copy arrays from stdin", &[payload])
+        .await
+        .unwrap();
+
+    let rows = conn
+        .ok("select ints[2][1], words[1], words[2] from arrays")
+        .await
+        .rows();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("3".to_string()),
+            Some("a,b".to_string()),
+            Some("NULL".to_string())
+        ]]
+    );
+    let (data, _) = conn.copy_to("copy arrays to stdout").await.unwrap();
+    assert_eq!(data, payload);
+}
+
+#[tokio::test]
 async fn copy_from_toasted_text_and_bytea_round_trips_through_copy_to() {
     let server = TestServer::start().await.unwrap();
     let mut conn = Connection::connect(&server).await.unwrap();

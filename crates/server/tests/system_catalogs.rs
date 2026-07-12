@@ -3,6 +3,30 @@ mod support;
 use support::{Connection, TestServer, first_row_description};
 
 #[tokio::test]
+async fn pg_type_exposes_real_array_element_and_companion_oids() {
+    let server = TestServer::start().await.unwrap();
+    let mut conn = Connection::connect(&server).await.unwrap();
+    assert_eq!(
+        conn.ok("select oid, typelem, typarray from pg_catalog.pg_type \
+             where typname = '_int4'")
+            .await
+            .rows(),
+        vec![vec![
+            Some("1007".to_string()),
+            Some("23".to_string()),
+            Some("0".to_string())
+        ]]
+    );
+    assert_eq!(
+        conn.ok("select typarray from pg_catalog.pg_type \
+             where typname = 'int4'")
+            .await
+            .rows(),
+        vec![vec![Some("1007".to_string())]]
+    );
+}
+
+#[tokio::test]
 async fn system_catalog_cursor_uses_one_catalog_snapshot_for_rows_and_functions() {
     let server = TestServer::start().await.unwrap();
     let mut reader = Connection::connect(&server).await.unwrap();

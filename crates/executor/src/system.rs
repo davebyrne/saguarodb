@@ -1096,26 +1096,26 @@ struct TypeEntry {
 
 fn type_entries() -> Vec<TypeEntry> {
     vec![
-        type_entry(PgType::Bool, "bool", "B", true, 0, 0),
-        type_entry(PgType::Bytea, "bytea", "U", false, 0, 0),
-        type_entry(PgType::Int8, "int8", "N", true, 0, 0),
+        type_entry(PgType::Bool, "bool", "B", true, 0, 1000),
+        type_entry(PgType::Bytea, "bytea", "U", false, 0, 1001),
+        type_entry(PgType::Int8, "int8", "N", true, 0, 1016),
         type_entry(PgType::Int2, "int2", "N", true, 0, 1005),
         type_entry(PgType::Int2Vector, "int2vector", "A", false, 21, 0),
-        type_entry(PgType::Int4, "int4", "N", true, 0, 0),
-        type_entry(PgType::Text, "text", "S", false, 0, 0),
+        type_entry(PgType::Int4, "int4", "N", true, 0, 1007),
+        type_entry(PgType::Text, "text", "S", false, 0, 1009),
         type_entry(PgType::Oid, "oid", "N", true, 0, 1028),
         type_entry(PgType::OidVector, "oidvector", "A", false, 26, 0),
-        type_entry(PgType::Float4, "float4", "N", true, 0, 0),
-        type_entry(PgType::Float8, "float8", "N", true, 0, 0),
+        type_entry(PgType::Float4, "float4", "N", true, 0, 1021),
+        type_entry(PgType::Float8, "float8", "N", true, 0, 1022),
         type_entry(PgType::CatalogInt2ArrayText, "_int2", "A", false, 21, 0),
         type_entry(PgType::CatalogOidArrayText, "_oid", "A", false, 26, 0),
-        type_entry(PgType::Bpchar(None), "bpchar", "S", false, 0, 0),
-        type_entry(PgType::Varchar(None), "varchar", "S", false, 0, 0),
-        type_entry(PgType::Date, "date", "D", true, 0, 0),
-        type_entry(PgType::Time, "time", "D", true, 0, 0),
-        type_entry(PgType::Timestamp, "timestamp", "D", true, 0, 0),
-        type_entry(PgType::Timestamptz, "timestamptz", "D", true, 0, 0),
-        type_entry(PgType::Interval, "interval", "T", false, 0, 0),
+        type_entry(PgType::Bpchar(None), "bpchar", "S", false, 0, 1014),
+        type_entry(PgType::Varchar(None), "varchar", "S", false, 0, 1015),
+        type_entry(PgType::Date, "date", "D", true, 0, 1182),
+        type_entry(PgType::Time, "time", "D", true, 0, 1183),
+        type_entry(PgType::Timestamp, "timestamp", "D", true, 0, 1115),
+        type_entry(PgType::Timestamptz, "timestamptz", "D", true, 0, 1185),
+        type_entry(PgType::Interval, "interval", "T", false, 0, 1187),
         type_entry(
             PgType::Numeric {
                 precision: None,
@@ -1125,10 +1125,44 @@ fn type_entries() -> Vec<TypeEntry> {
             "N",
             false,
             0,
-            0,
+            1231,
         ),
-        type_entry(PgType::Uuid, "uuid", "U", false, 0, 0),
+        type_entry(PgType::Uuid, "uuid", "U", false, 0, 2951),
+        array_type_entry(PgType::Bool, "_bool"),
+        array_type_entry(PgType::Bytea, "_bytea"),
+        array_type_entry(PgType::Int8, "_int8"),
+        array_type_entry(PgType::Int4, "_int4"),
+        array_type_entry(PgType::Text, "_text"),
+        array_type_entry(PgType::Float4, "_float4"),
+        array_type_entry(PgType::Float8, "_float8"),
+        array_type_entry(PgType::Bpchar(None), "_bpchar"),
+        array_type_entry(PgType::Varchar(None), "_varchar"),
+        array_type_entry(PgType::Date, "_date"),
+        array_type_entry(PgType::Time, "_time"),
+        array_type_entry(PgType::Timestamp, "_timestamp"),
+        array_type_entry(PgType::Timestamptz, "_timestamptz"),
+        array_type_entry(PgType::Interval, "_interval"),
+        array_type_entry(
+            PgType::Numeric {
+                precision: None,
+                scale: 0,
+            },
+            "_numeric",
+        ),
+        array_type_entry(PgType::Uuid, "_uuid"),
     ]
+}
+
+fn array_type_entry(element: PgType, name: &'static str) -> TypeEntry {
+    let element_oid = i64::from(element.oid());
+    type_entry(
+        PgType::array(element).expect("catalog array element type is scalar"),
+        name,
+        "A",
+        false,
+        element_oid,
+        0,
+    )
 }
 
 fn type_entry(

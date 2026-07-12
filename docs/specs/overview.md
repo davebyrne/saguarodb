@@ -649,6 +649,13 @@ The protocol layer never touches storage directly. The `server` crate owns `Quer
 
 ## 4. SQL Parsing & AST
 
+First-class rectangular arrays are supported in columns, casts, constructors,
+comparisons, one-based subscripts, `op ANY(array)`, PostgreSQL text/binary
+parameters and results, and COPY fields. `array_agg` and `string_agg` are
+aggregates. `unnest(array)` and integer `generate_series(start, stop [, step])`
+are one-column table functions and are implicitly lateral when their arguments
+reference preceding FROM items.
+
 The `parser` crate wraps `sqlparser-rs` (PostgreSQL dialect) and translates its AST into our own internal representation. This keeps the external dependency contained and gives us a narrow, explicit definition of exactly what SaguaroDB supports. Unsupported syntax is rejected here, not deep in the executor.
 
 ### Internal AST Types

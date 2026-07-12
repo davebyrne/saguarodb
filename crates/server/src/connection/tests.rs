@@ -1247,6 +1247,18 @@ async fn extended_protocol_runs_parameterized_query_text_and_binary() {
         "CommandComplete"
     );
 
+    // Driver-common array parameter: declared int4[] OID, text array payload.
+    let mut seq = parse_bytes("", "select name from users where id = ANY($1)", &[1007]);
+    seq.extend(bind_bytes("", "", &[0], &[Some(b"{2,3}")], &[0]));
+    seq.extend(execute_bytes(""));
+    seq.extend(sync_bytes());
+    client.write_all(&seq).await.unwrap();
+    let response = read_until_ready(&mut client).await;
+    assert!(
+        response.windows(2).any(|w| w == b"Bo"),
+        "array-parameter row value"
+    );
+
     // Binary parameter (int8), binary results.
     let id = 2i64.to_be_bytes();
     let mut seq = parse_bytes("", "select name from users where id = $1", &[20]);

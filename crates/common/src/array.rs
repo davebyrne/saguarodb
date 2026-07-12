@@ -9,6 +9,235 @@ pub const MAX_ARRAY_DIMENSIONS: usize = 6;
 /// Practical allocation guard for one SQL array value.
 pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
 
+/// Parse PostgreSQL array text into dimensions and scalar text tokens. Scalar
+/// conversion is deliberately left to the caller so COPY and protocol paths can
+/// apply their own SQLSTATE boundary without introducing crate cycles.
+pub fn parse_array_text_structure(
+    text: &str,
+) -> Result<(Vec<ArrayDimension>, Vec<Option<String>>)> {
+    let mut parser = ArrayTextParser {
+        bytes: text.as_bytes(),
+        offset: 0,
+        elements: 0,
+    };
+    parser.whitespace();
+    let bounds = parser.bounds()?;
+    let node = parser.list()?;
+    parser.whitespace();
+    if parser.offset != parser.bytes.len() {
+        return Err(invalid_array("array text has trailing input"));
+    }
+    let mut lengths = Vec::new();
+    validate_text_shape(&node, 0, &mut lengths)?;
+    let mut tokens = Vec::new();
+    flatten_text_node(node, &mut tokens);
+    if !bounds.is_empty() && bounds.len() != lengths.len() {
+        return Err(invalid_array("array bounds do not match dimensionality"));
+    }
+    let dimensions = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        lengths
+            .into_iter()
+            .enumerate()
+            .map(|(index, len)| {
+                let lower = bounds.get(index).map_or(1, |bound| bound.0);
+                if let Some((_, upper)) = bounds.get(index)
+                    && i64::from(*upper) - i64::from(lower) + 1 != len as i64
+                {
+                    return Err(invalid_array("array bounds do not match contents"));
+                }
+                Ok(ArrayDimension::new(len as u32, lower))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    Ok((dimensions, tokens))
+}
+
+enum ArrayTextNode {
+    List(Vec<ArrayTextNode>),
+    Element(Option<String>),
+}
+
+struct ArrayTextParser<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    elements: usize,
+}
+
+impl ArrayTextParser<'_> {
+    fn bounds(&mut self) -> Result<Vec<(i32, i32)>> {
+        let mut bounds = Vec::new();
+        while self.bytes.get(self.offset) == Some(&b'[') {
+            self.offset += 1;
+            let lower = self.integer()?;
+            if self.bytes.get(self.offset) != Some(&b':') {
+                return Err(invalid_array("invalid array bounds"));
+            }
+            self.offset += 1;
+            let upper = self.integer()?;
+            if self.bytes.get(self.offset) != Some(&b']') {
+                return Err(invalid_array("invalid array bounds"));
+            }
+            self.offset += 1;
+            bounds.push((lower, upper));
+        }
+        if !bounds.is_empty() {
+            if self.bytes.get(self.offset) != Some(&b'=') {
+                return Err(invalid_array("array bounds must be followed by '='"));
+            }
+            self.offset += 1;
+        }
+        Ok(bounds)
+    }
+
+    fn integer(&mut self) -> Result<i32> {
+        let start = self.offset;
+        if matches!(self.bytes.get(self.offset), Some(b'+' | b'-')) {
+            self.offset += 1;
+        }
+        while self.bytes.get(self.offset).is_some_and(u8::is_ascii_digit) {
+            self.offset += 1;
+        }
+        if self.offset == start {
+            return Err(invalid_array("invalid array bound"));
+        }
+        std::str::from_utf8(&self.bytes[start..self.offset])
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| invalid_array("invalid array bound"))
+    }
+
+    fn whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.offset += 1;
+        }
+    }
+
+    fn list(&mut self) -> Result<ArrayTextNode> {
+        self.whitespace();
+        if self.bytes.get(self.offset) != Some(&b'{') {
+            return Err(invalid_array("array text must start with '{'"));
+        }
+        self.offset += 1;
+        self.whitespace();
+        let mut items = Vec::new();
+        if self.bytes.get(self.offset) == Some(&b'}') {
+            self.offset += 1;
+            return Ok(ArrayTextNode::List(items));
+        }
+        loop {
+            self.whitespace();
+            let item = if self.bytes.get(self.offset) == Some(&b'{') {
+                self.list()?
+            } else {
+                self.element()?
+            };
+            items.push(item);
+            self.whitespace();
+            match self.bytes.get(self.offset) {
+                Some(b',') => self.offset += 1,
+                Some(b'}') => {
+                    self.offset += 1;
+                    break;
+                }
+                _ => return Err(invalid_array("invalid array text syntax")),
+            }
+        }
+        Ok(ArrayTextNode::List(items))
+    }
+
+    fn element(&mut self) -> Result<ArrayTextNode> {
+        self.elements += 1;
+        if self.elements > MAX_ARRAY_ELEMENTS {
+            return Err(invalid_array("array text has too many elements"));
+        }
+        let quoted = self.bytes.get(self.offset) == Some(&b'"');
+        if quoted {
+            self.offset += 1;
+        }
+        let mut value = Vec::new();
+        loop {
+            let Some(&byte) = self.bytes.get(self.offset) else {
+                return Err(invalid_array("unterminated array element"));
+            };
+            if byte == b'\\' {
+                self.offset += 1;
+                let Some(&escaped) = self.bytes.get(self.offset) else {
+                    return Err(invalid_array("unterminated array escape"));
+                };
+                value.push(escaped);
+                self.offset += 1;
+                continue;
+            }
+            if quoted && byte == b'"' {
+                self.offset += 1;
+                break;
+            }
+            if !quoted && matches!(byte, b',' | b'}') {
+                break;
+            }
+            value.push(byte);
+            self.offset += 1;
+        }
+        let text =
+            String::from_utf8(value).map_err(|_| invalid_array("array element is not UTF-8"))?;
+        let text = if quoted {
+            text
+        } else {
+            text.trim().to_string()
+        };
+        Ok(ArrayTextNode::Element(
+            if !quoted && text.eq_ignore_ascii_case("NULL") {
+                None
+            } else {
+                Some(text)
+            },
+        ))
+    }
+}
+
+fn validate_text_shape(node: &ArrayTextNode, depth: usize, lengths: &mut Vec<usize>) -> Result<()> {
+    let ArrayTextNode::List(items) = node else {
+        return Err(invalid_array("array root must be braced"));
+    };
+    if lengths.len() == depth {
+        lengths.push(items.len());
+    } else if lengths[depth] != items.len() {
+        return Err(invalid_array("multidimensional array is not rectangular"));
+    }
+    let lists = items
+        .iter()
+        .any(|item| matches!(item, ArrayTextNode::List(_)));
+    let scalars = items
+        .iter()
+        .any(|item| matches!(item, ArrayTextNode::Element(_)));
+    if lists && scalars {
+        return Err(invalid_array("array mixes nested and scalar elements"));
+    }
+    if lists {
+        for item in items {
+            validate_text_shape(item, depth + 1, lengths)?;
+        }
+    }
+    Ok(())
+}
+
+fn flatten_text_node(node: ArrayTextNode, output: &mut Vec<Option<String>>) {
+    match node {
+        ArrayTextNode::List(items) => {
+            for item in items {
+                flatten_text_node(item, output);
+            }
+        }
+        ArrayTextNode::Element(value) => output.push(value),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ArrayDimension {
     len: u32,
@@ -268,6 +497,26 @@ fn invalid_array(message: impl Into<String>) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_array_text_structure_with_quotes_nulls_bounds_and_shape() {
+        let (dimensions, elements) =
+            parse_array_text_structure(r#"[-1:0][2:3]={{"a,b",NULL},{"NULL","x\\y"}}"#).unwrap();
+        assert_eq!(
+            dimensions,
+            vec![ArrayDimension::new(2, -1), ArrayDimension::new(2, 2)]
+        );
+        assert_eq!(
+            elements,
+            vec![
+                Some("a,b".to_string()),
+                None,
+                Some("NULL".to_string()),
+                Some("x\\y".to_string())
+            ]
+        );
+        assert!(parse_array_text_structure("{{1},{2,3}}").is_err());
+    }
 
     #[test]
     fn validates_shape_and_element_type() {

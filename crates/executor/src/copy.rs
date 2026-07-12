@@ -181,10 +181,24 @@ fn parse_field(text: &str, data_type: &DataType) -> Result<Value> {
         DataType::Interval => common::interval::parse_interval(text)
             .map(Value::Interval)
             .ok_or_else(|| invalid_value(format!("invalid input syntax for interval: \"{text}\""))),
-        DataType::Array(_) => Err(DbError::execute(
-            SqlState::FeatureNotSupported,
-            "COPY array input is not implemented",
-        )),
+        DataType::Array(array_type) => {
+            let (dimensions, tokens) = common::parse_array_text_structure(text)
+                .map_err(|error| invalid_value(error.message))?;
+            if tokens.is_empty() {
+                return common::SqlArray::empty(array_type.element_type().clone())
+                    .map(Value::Array);
+            }
+            let elements = tokens
+                .into_iter()
+                .map(|token| match token {
+                    None => Ok(Value::Null),
+                    Some(token) => parse_field(&token, array_type.element_type()),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            common::SqlArray::new(array_type.element_type().clone(), dimensions, elements)
+                .map(Value::Array)
+                .map_err(|error| invalid_value(error.message))
+        }
     }
 }
 
@@ -444,7 +458,74 @@ fn value_text(value: &Value) -> Option<String> {
         Value::Time(micros) => Some(common::datetime::format_time(*micros)),
         Value::TimestampTz(micros) => Some(common::datetime::format_timestamptz(*micros)),
         Value::Interval(iv) => Some(common::interval::format_interval(iv)),
-        Value::Array(array) => Some(format!("{array:?}")),
+        Value::Array(array) => Some(format_array_text(array)),
+    }
+}
+
+fn format_array_text(array: &common::SqlArray) -> String {
+    if array.elements().is_empty() {
+        return "{}".to_string();
+    }
+    let mut output = String::new();
+    if array
+        .dimensions()
+        .iter()
+        .any(|dimension| dimension.lower_bound() != 1)
+    {
+        for dimension in array.dimensions() {
+            let upper = i64::from(dimension.lower_bound()) + i64::from(dimension.len()) - 1;
+            output.push_str(&format!("[{}:{upper}]", dimension.lower_bound()));
+        }
+        output.push('=');
+    }
+    let mut offset = 0;
+    format_array_level(array, 0, &mut offset, &mut output);
+    output
+}
+
+fn format_array_level(
+    array: &common::SqlArray,
+    depth: usize,
+    offset: &mut usize,
+    output: &mut String,
+) {
+    output.push('{');
+    let len = array.dimensions()[depth].len() as usize;
+    for index in 0..len {
+        if index > 0 {
+            output.push(',');
+        }
+        if depth + 1 < array.dimensions().len() {
+            format_array_level(array, depth + 1, offset, output);
+        } else {
+            let value = &array.elements()[*offset];
+            *offset += 1;
+            match value_text(value) {
+                None => output.push_str("NULL"),
+                Some(text) => write_array_element(&text, output),
+            }
+        }
+    }
+    output.push('}');
+}
+
+fn write_array_element(text: &str, output: &mut String) {
+    let quote = text.is_empty()
+        || text.eq_ignore_ascii_case("NULL")
+        || text
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || matches!(ch, '{' | '}' | ',' | '"' | '\\'));
+    if quote {
+        output.push('"');
+    }
+    for ch in text.chars() {
+        if matches!(ch, '"' | '\\') {
+            output.push('\\');
+        }
+        output.push(ch);
+    }
+    if quote {
+        output.push('"');
     }
 }
 

@@ -106,6 +106,10 @@ output, `Text` = raw UTF-8. Field parsing on input:
   extended-protocol parameter path also uses); a `None` result maps to
   `InvalidTextRepresentation` on the COPY path.
 - `Text`: taken verbatim after format unescaping.
+- `Array(element)`: PostgreSQL braced array text, including rectangular nested
+  dimensions, NULL elements, quoted/escaped elements, and explicit bounds. Each
+  non-NULL element is parsed through the scalar COPY decoder for its declared
+  element type. COPY TO preserves dimensions and non-default lower bounds.
 
 ### 3.1 Text format
 
