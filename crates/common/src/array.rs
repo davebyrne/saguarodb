@@ -8,7 +8,7 @@ use crate::{DataType, DbError, Result, SqlState, Value};
 pub const MAX_ARRAY_DIMENSIONS: usize = 6;
 /// Practical allocation guard for one SQL array value.
 pub const MAX_ARRAY_ELEMENTS: usize = 1_000_000;
-const MAX_ARRAY_TEXT_NODES: usize = (MAX_ARRAY_DIMENSIONS + 1) * MAX_ARRAY_ELEMENTS;
+const MAX_ARRAY_TEXT_LISTS: usize = MAX_ARRAY_DIMENSIONS * MAX_ARRAY_ELEMENTS + 1;
 
 /// Parse PostgreSQL array text into dimensions and scalar text tokens. Scalar
 /// conversion is deliberately left to the caller so COPY and protocol paths can
@@ -19,20 +19,17 @@ pub fn parse_array_text_structure(
     let mut parser = ArrayTextParser {
         bytes: text.as_bytes(),
         offset: 0,
-        nodes: 0,
+        lists: 0,
         elements: 0,
     };
     parser.whitespace();
     let bounds = parser.bounds()?;
-    let node = parser.list(0)?;
+    let mut tokens = Vec::new();
+    let lengths = parser.list(0, &mut tokens)?;
     parser.whitespace();
     if parser.offset != parser.bytes.len() {
         return Err(invalid_array("array text has trailing input"));
     }
-    let mut lengths = Vec::new();
-    validate_text_shape(&node, 0, &mut lengths)?;
-    let mut tokens = Vec::new();
-    flatten_text_node(node, &mut tokens);
     if tokens.is_empty() {
         if lengths != [0] {
             return Err(invalid_array(
@@ -68,15 +65,10 @@ pub fn parse_array_text_structure(
     Ok((dimensions, tokens))
 }
 
-enum ArrayTextNode {
-    List(Vec<ArrayTextNode>),
-    Element(Option<String>),
-}
-
 struct ArrayTextParser<'a> {
     bytes: &'a [u8],
     offset: usize,
-    nodes: usize,
+    lists: usize,
     elements: usize,
 }
 
@@ -142,8 +134,11 @@ impl ArrayTextParser<'_> {
         }
     }
 
-    fn list(&mut self, depth: usize) -> Result<ArrayTextNode> {
-        self.count_node()?;
+    fn list(&mut self, depth: usize, tokens: &mut Vec<Option<String>>) -> Result<Vec<usize>> {
+        self.lists += 1;
+        if self.lists > MAX_ARRAY_TEXT_LISTS {
+            return Err(invalid_array("array text has too many nested lists"));
+        }
         if depth >= MAX_ARRAY_DIMENSIONS {
             return Err(invalid_array("array text has too many dimensions"));
         }
@@ -153,19 +148,35 @@ impl ArrayTextParser<'_> {
         }
         self.offset += 1;
         self.whitespace();
-        let mut items = Vec::new();
         if self.bytes.get(self.offset) == Some(&b'}') {
             self.offset += 1;
-            return Ok(ArrayTextNode::List(items));
+            return Ok(vec![0]);
         }
+        let mut item_count = 0;
+        let mut nested_shape: Option<Vec<usize>> = None;
+        let mut scalar_items = false;
         loop {
             self.whitespace();
-            let item = if self.bytes.get(self.offset) == Some(&b'{') {
-                self.list(depth + 1)?
+            if self.bytes.get(self.offset) == Some(&b'{') {
+                if scalar_items {
+                    return Err(invalid_array("array mixes nested and scalar elements"));
+                }
+                let shape = self.list(depth + 1, tokens)?;
+                if let Some(expected) = &nested_shape {
+                    if expected != &shape {
+                        return Err(invalid_array("multidimensional array is not rectangular"));
+                    }
+                } else {
+                    nested_shape = Some(shape);
+                }
             } else {
-                self.element()?
-            };
-            items.push(item);
+                if nested_shape.is_some() {
+                    return Err(invalid_array("array mixes nested and scalar elements"));
+                }
+                scalar_items = true;
+                tokens.push(self.element()?);
+            }
+            item_count += 1;
             self.whitespace();
             match self.bytes.get(self.offset) {
                 Some(b',') => self.offset += 1,
@@ -176,11 +187,14 @@ impl ArrayTextParser<'_> {
                 _ => return Err(invalid_array("invalid array text syntax")),
             }
         }
-        Ok(ArrayTextNode::List(items))
+        let mut shape = vec![item_count];
+        if let Some(nested) = nested_shape {
+            shape.extend(nested);
+        }
+        Ok(shape)
     }
 
-    fn element(&mut self) -> Result<ArrayTextNode> {
-        self.count_node()?;
+    fn element(&mut self) -> Result<Option<String>> {
         self.elements += 1;
         if self.elements > MAX_ARRAY_ELEMENTS {
             return Err(invalid_array("array text has too many elements"));
@@ -232,21 +246,11 @@ impl ArrayTextParser<'_> {
         if !quoted && text.is_empty() {
             return Err(invalid_array("array element must not be empty"));
         }
-        Ok(ArrayTextNode::Element(
-            if !quoted && text.eq_ignore_ascii_case("NULL") {
-                None
-            } else {
-                Some(text)
-            },
-        ))
-    }
-
-    fn count_node(&mut self) -> Result<()> {
-        self.nodes += 1;
-        if self.nodes > MAX_ARRAY_TEXT_NODES {
-            return Err(invalid_array("array text has too many nodes"));
-        }
-        Ok(())
+        Ok(if !quoted && text.eq_ignore_ascii_case("NULL") {
+            None
+        } else {
+            Some(text)
+        })
     }
 }
 
@@ -327,43 +331,6 @@ fn write_array_text_element(output: &mut String, text: &str) {
     }
     if quote {
         output.push('"');
-    }
-}
-
-fn validate_text_shape(node: &ArrayTextNode, depth: usize, lengths: &mut Vec<usize>) -> Result<()> {
-    let ArrayTextNode::List(items) = node else {
-        return Err(invalid_array("array root must be braced"));
-    };
-    if lengths.len() == depth {
-        lengths.push(items.len());
-    } else if lengths[depth] != items.len() {
-        return Err(invalid_array("multidimensional array is not rectangular"));
-    }
-    let lists = items
-        .iter()
-        .any(|item| matches!(item, ArrayTextNode::List(_)));
-    let scalars = items
-        .iter()
-        .any(|item| matches!(item, ArrayTextNode::Element(_)));
-    if lists && scalars {
-        return Err(invalid_array("array mixes nested and scalar elements"));
-    }
-    if lists {
-        for item in items {
-            validate_text_shape(item, depth + 1, lengths)?;
-        }
-    }
-    Ok(())
-}
-
-fn flatten_text_node(node: ArrayTextNode, output: &mut Vec<Option<String>>) {
-    match node {
-        ArrayTextNode::List(items) => {
-            for item in items {
-                flatten_text_node(item, output);
-            }
-        }
-        ArrayTextNode::Element(value) => output.push(value),
     }
 }
 
@@ -674,10 +641,36 @@ mod tests {
             vec![Some(" ".to_string())]
         );
 
-        let mut too_many_nodes = String::from("{");
-        too_many_nodes.push_str(&"{},".repeat(MAX_ARRAY_ELEMENTS));
-        too_many_nodes.push_str("{}}");
-        assert!(parse_array_text_structure(&too_many_nodes).is_err());
+        let mut at_element_limit = ArrayTextParser {
+            bytes: b"1}",
+            offset: 0,
+            lists: 0,
+            elements: MAX_ARRAY_ELEMENTS - 1,
+        };
+        assert_eq!(at_element_limit.element().unwrap(), Some("1".to_string()));
+        let mut beyond_element_limit = ArrayTextParser {
+            bytes: b"1}",
+            offset: 0,
+            lists: 0,
+            elements: MAX_ARRAY_ELEMENTS,
+        };
+        assert_eq!(
+            beyond_element_limit.element().unwrap_err().message,
+            "array text has too many elements"
+        );
+        let mut beyond_list_limit = ArrayTextParser {
+            bytes: b"{}",
+            offset: 0,
+            lists: MAX_ARRAY_TEXT_LISTS,
+            elements: 0,
+        };
+        assert_eq!(
+            beyond_list_limit
+                .list(0, &mut Vec::new())
+                .unwrap_err()
+                .message,
+            "array text has too many nested lists"
+        );
     }
 
     #[test]
